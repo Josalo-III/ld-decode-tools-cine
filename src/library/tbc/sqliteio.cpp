@@ -4,6 +4,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  * SPDX-FileCopyrightText: 2025 Simon Inns
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
  *
  * This file is part of ld-decode-tools.
  ******************************************************************************/
@@ -175,6 +176,27 @@ CREATE TABLE IF NOT EXISTS closed_caption (
     field_id INTEGER NOT NULL,
     data0 INTEGER,
     data1 INTEGER,
+    FOREIGN KEY (capture_id, field_id)
+        REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
+    PRIMARY KEY (capture_id, field_id)
+);
+
+-- Josalo-III: cinemap side table.
+-- Keyed on (capture_id, field_id); invisible to upstream consumers.
+-- is_edit_boundary is nullable: NULL = no cinemap pass run or field not
+-- touched; 1 = boundary asserted (auto or manual); 0 = manual user veto.
+-- The 0 value may only be written by SqliteWriter::writeFieldCinemapManual.
+-- cadence_id uses NULL in SQL; the C++ sentinel is -1.
+-- pulldown_role uses NULL in SQL; the C++ sentinel is QString().
+CREATE TABLE IF NOT EXISTS cinemap (
+    capture_id INTEGER NOT NULL,
+    field_id INTEGER NOT NULL,
+    is_edit_boundary INTEGER
+        CHECK (is_edit_boundary IN (0,1)),
+    cadence_id INTEGER,
+    cadence_index_presumed INTEGER
+        CHECK (cadence_index_presumed IN (0,1)),
+    pulldown_role TEXT,
     FOREIGN KEY (capture_id, field_id)
         REFERENCES field_record(capture_id, field_id) ON DELETE CASCADE,
     PRIMARY KEY (capture_id, field_id)
@@ -459,6 +481,54 @@ bool SqliteReader::readAllFieldDropouts(int captureId, QSqlQuery &dropoutsQuery)
     dropoutsQuery.addBindValue(captureId);
     return dropoutsQuery.exec();
 }
+
+// --- Josalo-III: cinemap readers ---
+
+bool SqliteReader::readFieldCinemap(int captureId, int fieldId,
+                                    bool &isEditBoundaryPresent, bool &isEditBoundary,
+                                    int &cadenceId,
+                                    bool &cadenceIndexPresumed, QString &pulldownRole)
+{
+    QSqlQuery query(db);
+    query.prepare("SELECT is_edit_boundary, cadence_id, cadence_index_presumed, pulldown_role "
+                  "FROM cinemap WHERE capture_id = ? AND field_id = ?");
+    query.addBindValue(captureId);
+    query.addBindValue(fieldId);
+
+    if (!query.exec() || !query.next()) {
+        isEditBoundaryPresent = false;
+        isEditBoundary        = false;
+        cadenceId             = -1;
+        cadenceIndexPresumed  = false;
+        pulldownRole          = QString();
+        return false;
+    }
+
+    const QVariant ieb = query.value("is_edit_boundary");
+    isEditBoundaryPresent = !ieb.isNull();
+    isEditBoundary        = isEditBoundaryPresent && (ieb.toInt() == 1);
+
+    cadenceId            = SqliteValue::toIntOrDefault(query,  "cadence_id", -1);
+    cadenceIndexPresumed = SqliteValue::toBoolOrDefault(query, "cadence_index_presumed", false);
+
+    const QVariant pr = query.value("pulldown_role");
+    pulldownRole = pr.isNull() ? QString() : pr.toString();
+
+    return true;
+}
+
+bool SqliteReader::readAllFieldCinemap(int captureId, QSqlQuery &cinemapQuery)
+{
+    cinemapQuery = QSqlQuery(db);
+    cinemapQuery.prepare("SELECT field_id, is_edit_boundary, cadence_id, "
+                         "cadence_index_presumed, pulldown_role "
+                         "FROM cinemap WHERE capture_id = ? ORDER BY field_id");
+    cinemapQuery.addBindValue(captureId);
+
+    return cinemapQuery.exec();
+}
+
+// --- end Josalo-III cinemap readers ---
 
 SqliteWriter::SqliteWriter(const QString &fileName)
 {
@@ -795,3 +865,93 @@ bool SqliteWriter::rollbackTransaction()
 {
     return db.rollback();
 }
+
+// --- Josalo-III: cinemap writers ---
+
+// Auto-detection writer.
+//
+// Invariant: the value 0 in cinemap.is_edit_boundary is a manual user veto
+// and must never be overwritten by automated detection. This function refuses
+// to write 1 over an existing 0, and never emits 0 itself.
+//
+// The other cinemap columns (cadence_id, cadence_index_presumed, pulldown_role)
+// are solver-owned and have no manual-override semantics, so they are updated
+// unconditionally.
+bool SqliteWriter::writeFieldCinemapAuto(int captureId, int fieldId,
+                                         bool isEditBoundary,
+                                         int cadenceId,
+                                         bool cadenceIndexPresumed,
+                                         const QString &pulldownRole)
+{
+    // Read any existing is_edit_boundary value so we can preserve a manual veto.
+    QSqlQuery readQuery(db);
+    readQuery.prepare("SELECT is_edit_boundary FROM cinemap "
+                      "WHERE capture_id = ? AND field_id = ?");
+    readQuery.addBindValue(captureId);
+    readQuery.addBindValue(fieldId);
+
+    QVariant iebToWrite;  // NULL by default — "no information"
+    if (readQuery.exec() && readQuery.next()) {
+        const QVariant existing = readQuery.value("is_edit_boundary");
+        if (!existing.isNull() && existing.toInt() == 0) {
+            iebToWrite = 0;                   // preserve manual veto
+        } else if (isEditBoundary) {
+            iebToWrite = 1;
+        }
+        // else: not a boundary and no existing veto — leave NULL
+    } else if (isEditBoundary) {
+        iebToWrite = 1;
+    }
+
+    QSqlQuery query(db);
+    query.prepare("INSERT OR REPLACE INTO cinemap "
+                  "(capture_id, field_id, is_edit_boundary, cadence_id, "
+                  "cadence_index_presumed, pulldown_role) "
+                  "VALUES (?, ?, ?, ?, ?, ?)");
+
+    query.addBindValue(captureId);
+    query.addBindValue(fieldId);
+    query.addBindValue(iebToWrite);
+    query.addBindValue(cadenceId == -1 ? QVariant() : cadenceId);
+    query.addBindValue(cadenceIndexPresumed ? 1 : 0);
+    query.addBindValue(pulldownRole.isEmpty() ? QVariant() : pulldownRole);
+
+    if (!query.exec()) {
+        tbcDebugStream() << "Failed to insert cinemap (auto):" << query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+// Manual-override writer.
+//
+// This is the ONLY entry point permitted to write the literal value 0 into
+// cinemap.is_edit_boundary, expressing a user veto. Call only from the
+// whitelist/blacklist application paths in ld-cinemap.
+bool SqliteWriter::writeFieldCinemapManual(int captureId, int fieldId,
+                                           bool isEditBoundary,
+                                           int cadenceId,
+                                           bool cadenceIndexPresumed,
+                                           const QString &pulldownRole)
+{
+    QSqlQuery query(db);
+    query.prepare("INSERT OR REPLACE INTO cinemap "
+                  "(capture_id, field_id, is_edit_boundary, cadence_id, "
+                  "cadence_index_presumed, pulldown_role) "
+                  "VALUES (?, ?, ?, ?, ?, ?)");
+
+    query.addBindValue(captureId);
+    query.addBindValue(fieldId);
+    query.addBindValue(isEditBoundary ? 1 : 0);
+    query.addBindValue(cadenceId == -1 ? QVariant() : cadenceId);
+    query.addBindValue(cadenceIndexPresumed ? 1 : 0);
+    query.addBindValue(pulldownRole.isEmpty() ? QVariant() : pulldownRole);
+
+    if (!query.exec()) {
+        tbcDebugStream() << "Failed to insert cinemap (manual):" << query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+// --- end Josalo-III cinemap writers ---

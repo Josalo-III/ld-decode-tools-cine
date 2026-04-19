@@ -4,6 +4,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  * SPDX-FileCopyrightText: 2025 Simon Inns
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
  *
  * This file is part of ld-decode-tools.
  ******************************************************************************/
@@ -77,6 +78,18 @@ public:
     bool readAllFieldClosedCaptions(int captureId, QSqlQuery &ccQuery);
     bool readAllFieldDropouts(int captureId, QSqlQuery &dropoutsQuery);
 
+    // --- Josalo-III: cinemap ---
+    // Single-field read (used by tools that query on demand)
+    // isEditBoundaryPresent distinguishes NULL (no information) from 0 (manual veto).
+    bool readFieldCinemap(int captureId, int fieldId,
+                          bool &isEditBoundaryPresent, bool &isEditBoundary,
+                          int &cadenceId,
+                          bool &cadenceIndexPresumed, QString &pulldownRole);
+
+    // Bulk read for all fields in a capture (used by LdDecodeMetaData::readFields)
+    bool readAllFieldCinemap(int captureId, QSqlQuery &cinemapQuery);
+    // --- end Josalo-III ---
+
 private:
     QSqlDatabase db;
     QString connectionName;
@@ -146,6 +159,26 @@ public:
     bool beginTransaction();
     bool commitTransaction();
     bool rollbackTransaction();
+
+    // --- Josalo-III: cinemap ---
+    // Two named entry points enforce the write invariant:
+    // writeFieldCinemapAuto  — automated detection; never writes 0 to is_edit_boundary,
+    //                          and preserves any existing 0 (manual veto).
+    // writeFieldCinemapManual — the ONLY entry point permitted to write 0 to
+    //                           is_edit_boundary (user veto). Call only from the
+    //                           whitelist/blacklist application paths in ld-cinemap.
+    bool writeFieldCinemapAuto(int captureId, int fieldId,
+                               bool isEditBoundary,
+                               int cadenceId,
+                               bool cadenceIndexPresumed,
+                               const QString &pulldownRole);
+
+    bool writeFieldCinemapManual(int captureId, int fieldId,
+                                 bool isEditBoundary,
+                                 int cadenceId,
+                                 bool cadenceIndexPresumed,
+                                 const QString &pulldownRole);
+    // --- end Josalo-III ---
 
 private:
     QSqlDatabase db;
