@@ -6,6 +6,7 @@
  * SPDX-FileCopyrightText: 2018-2025 Simon Inns
  * SPDX-FileCopyrightText: 2022 Ryan Holtz
  * SPDX-FileCopyrightText: 2022-2023 Adam Sampson
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
  *
  * This file is part of ld-decode-tools.
  ******************************************************************************/
@@ -235,7 +236,7 @@ void LdDecodeMetaData::Field::write(SqliteWriter &writer, int captureId) const
 {
     // Convert seqNo (1-indexed) to fieldId (0-indexed)
     int fieldId = seqNo - 1;
-    
+
     // Write main field record with NTSC data embedded
     writer.writeField(captureId, fieldId, audioSamples, decodeFaults, diskLoc,
                      efmTValues, fieldPhaseID, fileLoc, isFirstField, medianBurstIRE,
@@ -249,7 +250,40 @@ void LdDecodeMetaData::Field::write(SqliteWriter &writer, int captureId) const
     vitc.write(writer, captureId, fieldId);
     closedCaption.write(writer, captureId, fieldId);
     dropOuts.write(writer, captureId, fieldId);
+
+    // --- Josalo-III: cinemap ---
+    if (cinemap.inUse) {
+        cinemap.writeAuto(writer, captureId, fieldId);
+    }
+    // --- end Josalo-III ---
 }
+
+// --- Josalo-III: Cinemap::write implementations ---
+
+// Delegates to writeFieldCinemapAuto. Called from Field::write via the inUse gate.
+// Never writes is_edit_boundary = 0; preserves any existing manual veto.
+void LdDecodeMetaData::Cinemap::writeAuto(SqliteWriter &writer, int captureId, int fieldId) const
+{
+    writer.writeFieldCinemapAuto(captureId, fieldId,
+                                 isEditBoundary,
+                                 cadenceId,
+                                 cadenceIndexPresumed,
+                                 pulldownRole);
+}
+
+// Delegates to writeFieldCinemapManual. Call only from the whitelist/blacklist
+// application paths in ld-cinemap. This is the only path that may write
+// is_edit_boundary = 0 (manual user veto).
+void LdDecodeMetaData::Cinemap::writeManual(SqliteWriter &writer, int captureId, int fieldId) const
+{
+    writer.writeFieldCinemapManual(captureId, fieldId,
+                                   isEditBoundary,
+                                   cadenceId,
+                                   cadenceIndexPresumed,
+                                   pulldownRole);
+}
+
+// --- end Josalo-III ---
 
 LdDecodeMetaData::LdDecodeMetaData()
 {
@@ -281,7 +315,7 @@ bool LdDecodeMetaData::read(QString fileName)
 
     try {
         SqliteReader reader(fileName);
-        
+
         int captureId;
         QString system, decoder, gitBranch, gitCommit, captureNotes;
         double videoSampleRate;
@@ -359,7 +393,7 @@ bool LdDecodeMetaData::write(QString fileName) const
     // Check if we're updating an existing file or creating a new one
     bool isUpdate = QFileInfo::exists(fileName);
     int captureId = 1; // Default for new files
-    
+
     if (isUpdate) {
         // Try to read the existing capture_id from the file
         try {
@@ -370,10 +404,10 @@ bool LdDecodeMetaData::write(QString fileName) const
             int existingNumberOfSequentialFields, existingColourBurstStart, existingColourBurstEnd;
             int existingWhite16bIre, existingBlack16bIre, existingBlanking16bIre;
             bool existingIsMapped, existingIsSubcarrierLocked, existingIsWidescreen;
-            
-            if (reader.readCaptureMetadata(captureId, existingSystem, existingDecoder, 
+
+            if (reader.readCaptureMetadata(captureId, existingSystem, existingDecoder,
                                          existingGitBranch, existingGitCommit, existingVideoSampleRate,
-                                         existingActiveVideoStart, existingActiveVideoEnd, 
+                                         existingActiveVideoStart, existingActiveVideoEnd,
                                          existingFieldWidth, existingFieldHeight, existingNumberOfSequentialFields,
                                          existingColourBurstStart, existingColourBurstEnd,
                                          existingIsMapped, existingIsSubcarrierLocked, existingIsWidescreen,
@@ -393,7 +427,7 @@ bool LdDecodeMetaData::write(QString fileName) const
 
     try {
         SqliteWriter writer(fileName);
-        
+
         // Only create schema for new files
         if (!isUpdate) {
             if (!writer.createSchema()) {
@@ -413,7 +447,7 @@ bool LdDecodeMetaData::write(QString fileName) const
             // Update existing capture metadata
             if (!writer.updateCaptureMetadata(captureId, systemName, "ld-decode", // TODO: make decoder configurable
                                             videoParameters.gitBranch, videoParameters.gitCommit,
-                                            videoParameters.sampleRate, videoParameters.activeVideoStart, 
+                                            videoParameters.sampleRate, videoParameters.activeVideoStart,
                                             videoParameters.activeVideoEnd, videoParameters.fieldWidth,
                                             videoParameters.fieldHeight, videoParameters.numberOfSequentialFields,
                                             videoParameters.colourBurstStart, videoParameters.colourBurstEnd,
@@ -428,7 +462,7 @@ bool LdDecodeMetaData::write(QString fileName) const
             captureId = writer.writeCaptureMetadata(
                 systemName, "ld-decode", // TODO: make decoder configurable
                 videoParameters.gitBranch, videoParameters.gitCommit,
-                videoParameters.sampleRate, videoParameters.activeVideoStart, 
+                videoParameters.sampleRate, videoParameters.activeVideoStart,
                 videoParameters.activeVideoEnd, videoParameters.fieldWidth,
                 videoParameters.fieldHeight, videoParameters.numberOfSequentialFields,
                 videoParameters.colourBurstStart, videoParameters.colourBurstEnd,
@@ -485,6 +519,11 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
     reader.readAllFieldClosedCaptions(captureId, ccQuery);
     reader.readAllFieldDropouts(captureId, dropoutsQuery);
 
+    // --- Josalo-III: cinemap ---
+    QSqlQuery cinemapQuery;
+    reader.readAllFieldCinemap(captureId, cinemapQuery);
+    // --- end Josalo-III ---
+
     // Create lookup maps for fast field data retrieval
     QMap<int, QPair<double, double>> vitsMap;
     QMap<int, QVector<int>> vbiMap, vitcMap, ccMap;
@@ -501,8 +540,8 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
     // Populate VBI map
     while (vbiQuery.next()) {
         int fieldId = vbiQuery.value("field_id").toInt();
-        QVector<int> vbiData = {vbiQuery.value("vbi0").toInt(), 
-                               vbiQuery.value("vbi1").toInt(), 
+        QVector<int> vbiData = {vbiQuery.value("vbi0").toInt(),
+                               vbiQuery.value("vbi1").toInt(),
                                vbiQuery.value("vbi2").toInt()};
         vbiMap[fieldId] = vbiData;
     }
@@ -520,7 +559,7 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
     // Populate closed captions map
     while (ccQuery.next()) {
         int fieldId = ccQuery.value("field_id").toInt();
-        QVector<int> ccData = {ccQuery.value("data0").toInt(), 
+        QVector<int> ccData = {ccQuery.value("data0").toInt(),
                               ccQuery.value("data1").toInt()};
         ccMap[fieldId] = ccData;
     }
@@ -534,10 +573,36 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
         dropoutsMap.insert(fieldId, dropoutData);
     }
 
+    // --- Josalo-III: cinemap map ---
+    // A row present in the cinemap table means inUse = true.
+    // isEditBoundary reflects the column value directly: 1 = boundary asserted,
+    // 0 = manual veto. NULL in the database means the auto-pass ran but made
+    // no determination; SqliteValue::toBoolOrDefault returns false for NULL,
+    // which is the correct in-memory default.
+    struct CinemapRow {
+        bool isEditBoundary;
+        int cadenceId;
+        bool cadenceIndexPresumed;
+        QString pulldownRole;
+    };
+    QMap<int, CinemapRow> cinemapMap;
+
+    while (cinemapQuery.next()) {
+        int fieldId = cinemapQuery.value("field_id").toInt();
+        CinemapRow row;
+        row.isEditBoundary       = SqliteValue::toBoolOrDefault(cinemapQuery, "is_edit_boundary", false);
+        row.cadenceId            = SqliteValue::toIntOrDefault(cinemapQuery,  "cadence_id", -1);
+        row.cadenceIndexPresumed = SqliteValue::toBoolOrDefault(cinemapQuery, "cadence_index_presumed", false);
+        const QVariant pr = cinemapQuery.value("pulldown_role");
+        row.pulldownRole = pr.isNull() ? QString() : pr.toString();
+        cinemapMap[fieldId] = row;
+    }
+    // --- end Josalo-III ---
+
     // Process main field records and apply cached data
     while (fieldsQuery.next()) {
         Field field;
-        
+
         // Note: field_id in database is 0-indexed, but seqNo should be 1-indexed
         int fieldId = fieldsQuery.value("field_id").toInt();
         field.seqNo = fieldId + 1;
@@ -571,7 +636,7 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
         if (vbiMap.contains(fieldId)) {
             QVector<int> vbiData = vbiMap[fieldId];
             field.vbi.vbiData[0] = vbiData[0];
-            field.vbi.vbiData[1] = vbiData[1]; 
+            field.vbi.vbiData[1] = vbiData[1];
             field.vbi.vbiData[2] = vbiData[2];
             field.vbi.inUse = true;
         }
@@ -599,6 +664,17 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
             }
         }
 
+        // --- Josalo-III: cinemap ---
+        if (cinemapMap.contains(fieldId)) {
+            const CinemapRow &row = cinemapMap[fieldId];
+            field.cinemap.isEditBoundary       = row.isEditBoundary;
+            field.cinemap.cadenceId            = row.cadenceId;
+            field.cinemap.cadenceIndexPresumed = row.cadenceIndexPresumed;
+            field.cinemap.pulldownRole         = row.pulldownRole;
+            field.cinemap.inUse                = true;
+        }
+        // --- end Josalo-III ---
+
         fields.push_back(field);
     }
 }
@@ -612,7 +688,7 @@ void LdDecodeMetaData::writeFields(SqliteWriter &writer, int captureId) const
 }
 
 // This method returns the videoParameters metadata
-const LdDecodeMetaData::VideoParameters &LdDecodeMetaData::getVideoParameters()
+const LdDecodeMetaData::VideoParameters &LdDecodeMetaData::getVideoParameters() const
 {
     if (!videoParameters.isValid) {
         throw std::runtime_error("VideoParameters not initialized - metadata file may not have been read successfully");
@@ -736,7 +812,7 @@ void LdDecodeMetaData::LineParameters::applyTo(LdDecodeMetaData::VideoParameters
 }
 
 // This method gets the metadata for the specified sequential field number (indexed from 1 (not 0!))
-const LdDecodeMetaData::Field &LdDecodeMetaData::getField(qint32 sequentialFieldNumber)
+const LdDecodeMetaData::Field &LdDecodeMetaData::getField(qint32 sequentialFieldNumber) const
 {
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
@@ -912,7 +988,7 @@ void LdDecodeMetaData::appendField(const LdDecodeMetaData::Field &field)
 }
 
 // Method to get the available number of fields (according to the metadata)
-qint32 LdDecodeMetaData::getNumberOfFields()
+qint32 LdDecodeMetaData::getNumberOfFields() const
 {
     return fields.size();
 }

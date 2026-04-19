@@ -6,6 +6,7 @@
  * SPDX-FileCopyrightText: 2018-2025 Simon Inns
  * SPDX-FileCopyrightText: 2022 Ryan Holtz
  * SPDX-FileCopyrightText: 2022-2023 Adam Sampson
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
  *
  * This file is part of ld-decode-tools.
  ******************************************************************************/
@@ -18,6 +19,7 @@
 #include <QTemporaryFile>
 #include <QDebug>
 #include <array>
+#include <optional>
 
 #include "dropouts.h"
 
@@ -172,6 +174,35 @@ public:
         void write(SqliteWriter &writer, int captureId) const;
     };
 
+    // --- Josalo-III: cinemap ---
+    // Per-field cadence and edit-boundary metadata written by ld-cinemap.
+    // Stored in the cinemap side table; invisible to upstream consumers.
+    //
+    // inUse = false means cinemap has not run or did not touch this field.
+    // When inUse = true, isEditBoundary is meaningful: true means a boundary
+    // was asserted (auto-detection or manual whitelist); false means the field
+    // was explicitly vetoed via the blacklist. The NULL / 1 / 0 distinction in
+    // the database is preserved by write discipline: writeFieldCinemapAuto
+    // never writes 0; writeFieldCinemapManual is the only path that does.
+    //
+    // cadenceId = -1 and pulldownRole = QString() are the "not set" sentinels.
+    struct Cinemap {
+        bool inUse = false;
+
+        bool isEditBoundary = false;
+        qint32 cadenceId = -1;
+        bool cadenceIndexPresumed = false;
+        QString pulldownRole;
+
+        // write() is split into two named paths matching the SqliteWriter API.
+        // writeAuto is called from Field::write via the inUse gate.
+        // writeManual is called directly from the whitelist/blacklist paths in
+        // ld-cinemap and must not be called from anywhere else.
+        void writeAuto(SqliteWriter &writer, int captureId, int fieldId) const;
+        void writeManual(SqliteWriter &writer, int captureId, int fieldId) const;
+    };
+    // --- end Josalo-III ---
+
     // Field metadata definition
     struct Field {
         qint32 seqNo = 0;   // Note: This is the unique primary-key
@@ -188,6 +219,10 @@ public:
         ClosedCaption closedCaption;
         DropOuts dropOuts;
         bool pad = false;
+
+        // --- Josalo-III: cinemap ---
+        Cinemap cinemap;
+        // --- end Josalo-III ---
 
         double diskLoc = -1;
         qint64 fileLoc = -1;
@@ -218,7 +253,7 @@ public:
     void readFields(SqliteReader &reader, int captureId);
     void writeFields(SqliteWriter &writer, int captureId) const;
 
-    const VideoParameters &getVideoParameters();
+    const VideoParameters &getVideoParameters() const;
     void setVideoParameters(const VideoParameters &videoParameters);
 
     const PcmAudioParameters &getPcmAudioParameters();
@@ -228,7 +263,7 @@ public:
     void processLineParameters(LdDecodeMetaData::LineParameters &_lineParameters);
 
     // Get field metadata
-    const Field &getField(qint32 sequentialFieldNumber);
+    const Field &getField(qint32 sequentialFieldNumber) const;
     const VitsMetrics &getFieldVitsMetrics(qint32 sequentialFieldNumber);
     const Vbi &getFieldVbi(qint32 sequentialFieldNumber);
     const Ntsc &getFieldNtsc(qint32 sequentialFieldNumber);
@@ -249,7 +284,7 @@ public:
     void appendField(const Field &field);
 
     void setNumberOfFields(qint32 numberOfFields);
-    qint32 getNumberOfFields();
+    qint32 getNumberOfFields() const;
     qint32 getNumberOfFrames();
     qint32 getFirstFieldNumber(qint32 frameNumber);
     qint32 getSecondFieldNumber(qint32 frameNumber);
