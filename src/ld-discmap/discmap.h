@@ -41,10 +41,10 @@ class DiscMap
 public:
     DiscMap() = default;
     ~DiscMap();
-    DiscMap(const DiscMap &) = default;
-    DiscMap &operator=(const DiscMap &) = default;
+    DiscMap(const DiscMap &) = delete;
+    DiscMap &operator=(const DiscMap &) = delete;
 
-    DiscMap(const QFileInfo &metadataFileInfo, const bool reverseFieldOrder, const bool noStrict);
+    DiscMap(const QFileInfo &metadataFileInfo, bool reverseFieldOrder, bool noStrict);
 
     QString filename() const;
     bool valid() const;
@@ -53,12 +53,12 @@ public:
     bool isDiscPal() const;
     QString discType() const;
     QString discFormat() const;
+    qint32 numberOfPulldowns() const;
 
     qint32 vbiFrameNumber(qint32 frameNumber) const;
     void setVbiFrameNumber(qint32 frameNumber, qint32 vbiFrameNumber);
     qint32 seqFrameNumber(qint32 frameNumber) const;
     bool isPulldown(qint32 frameNumber) const;
-    qint32 numberOfPulldowns() const;
     bool isPictureStop(qint32 frameNumber) const;
     bool isLeadInOut(qint32 frameNumber) const;
     double frameQuality(qint32 frameNumber) const;
@@ -72,8 +72,9 @@ public:
     void sort();
     void debugFrameDetails(qint32 frameNumber);
     void addPadding(qint32 startFrame, qint32 numberOfFrames);
-    qint32 getVideoFieldLength();
-    qint32 getApproximateAudioFieldLength();
+
+    qint32 getVideoFieldLength() const;
+    qint32 getApproximateAudioFieldLength() const;
 
     qint32 getFirstFieldNumber(qint32 frameNumber) const;
     qint32 getSecondFieldNumber(qint32 frameNumber) const;
@@ -88,23 +89,22 @@ public:
     bool saveTargetMetadata(QFileInfo outputFileInfo);
 
 private:
-    // Miscellaneous
     QFileInfo m_metadataFileInfo;
-    bool m_reverseFieldOrder;
-    bool m_noStrict;
-    bool m_tbcValid;
-    qint32 m_numberOfFrames;
-    bool m_isDiscPal;
-    bool m_isDiscCav;
-    qint32 m_numberOfPulldowns;
-    qint32 m_videoFieldLength;
-    qint32 m_audioFieldByteLength;
-    qint32 m_audioFieldSampleLength;
+    bool m_reverseFieldOrder = false;
+    bool m_noStrict = false;
+    bool m_tbcValid = false;
+    qint32 m_numberOfFrames = 0;
+    bool m_isDiscPal = false;
+    bool m_isDiscCav = false;
+    qint32 m_numberOfPulldowns = 0;
+    qint32 m_videoFieldLength = 0;
+    qint32 m_audioFieldByteLength = 0;
+    qint32 m_audioFieldSampleLength = 0;
     QString m_discType;
     QString m_videoSystemDescription;
 
     std::vector<Frame> m_frames;
-    LdDecodeMetaData *ldDecodeMetaData;
+    LdDecodeMetaData *ldDecodeMetaData = nullptr;
 
     bool isNtscAmendment2ClvFrameNumber(qint32 frameNumber);
     qint32 convertFrameToVbi(qint32 frameNumber);
@@ -113,7 +113,7 @@ private:
 };
 
 // Custom streaming operator for debug
-QDebug operator<<(QDebug dbg, const DiscMap &tbcInformation);
+QDebug operator<<(QDebug dbg, const DiscMap &discMap);
 
 // Custom meta-type declaration
 Q_DECLARE_METATYPE(DiscMap)

@@ -3,7 +3,8 @@
     main.cpp
 
     ld-discmap - TBC and VBI alignment and correction
-    Copyright (C) 2019-2025 Simon Inns
+    Copyright (C) 2019-2022 Simon Inns
+    Copyright (C) 2025-2026 Joseph Burns
 
     This file is part of ld-decode-tools.
 
@@ -52,7 +53,7 @@ int main(int argc, char *argv[])
     parser.setApplicationDescription(
                 "ld-discmap - TBC and VBI alignment and correction\n"
                 "\n"
-                "(c)2019-2025 Simon Inns\n"
+                "(c)2019-2022 Simon Inns\n"
                 "GPLv3 Open-Source - github: https://github.com/happycube/ld-decode");
     parser.addHelpOption();
     parser.addVersionOption();
@@ -99,11 +100,11 @@ int main(int argc, char *argv[])
     emitDeprecatedToolWarning();
 
     // Get the options from the parser
-    bool reverse = parser.isSet(setReverseOption);
-    bool mapOnly = parser.isSet(setMapOnlyOption);
-    bool noStrict = parser.isSet(setNoStrictOption);
+    bool reverse          = parser.isSet(setReverseOption);
+    bool mapOnly          = parser.isSet(setMapOnlyOption);
+    bool noStrict         = parser.isSet(setNoStrictOption);
     bool deleteUnmappable = parser.isSet(setDeleteUnmappableOption);
-    bool noAudio = parser.isSet(setNoAudioOption);
+    bool noAudio          = parser.isSet(setNoAudioOption);
 
     // Process the command line options
     QString inputFilename;
@@ -112,26 +113,23 @@ int main(int argc, char *argv[])
     if (!mapOnly) {
         // Require source and target filenames
         if (positionalArguments.count() == 2) {
-            inputFilename = positionalArguments.at(0);
+            inputFilename  = positionalArguments.at(0);
             outputFilename = positionalArguments.at(1);
         } else {
-            // Quit with error
             qCritical("You must specify input and output TBC files");
             return -1;
         }
 
         if (inputFilename == outputFilename) {
-            // Quit with error
             qCritical("Input and output TBC files cannot have the same file names");
             return -1;
         }
     } else {
         // Require only source filename
         if (positionalArguments.count() > 0) {
-            inputFilename = positionalArguments.at(0);
+            inputFilename  = positionalArguments.at(0);
             outputFilename = "";
         } else {
-            // Quit with error
             qCritical("You must specify the input TBC file");
             return -1;
         }
@@ -141,7 +139,7 @@ int main(int argc, char *argv[])
     QFileInfo inputFileInfo(inputFilename);
     QFileInfo outputFileInfo(outputFilename);
 
-    // Check that required input TBC file exist
+    // Check that required input TBC file exists
     if (!inputFileInfo.exists()) {
         qCritical("The specified input file does not exist");
         return -1;
@@ -164,8 +162,10 @@ int main(int argc, char *argv[])
 
     // Perform disc mapping
     DiscMapper discMapper;
-    if (!discMapper.process(inputFileInfo, inputMetadataFileInfo, outputFileInfo, reverse,
-                            mapOnly, noStrict, deleteUnmappable, noAudio)) return 1;
+    if (!discMapper.process(inputFileInfo, inputMetadataFileInfo, outputFileInfo,
+                            reverse, mapOnly, noStrict, deleteUnmappable, noAudio)) {
+        return 1;
+    }
 
     // Quit with success
     return 0;

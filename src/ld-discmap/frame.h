@@ -31,9 +31,11 @@
 class Frame
 {
 public:
-    Frame(const qint32 seqFrameNumber = -1, const qint32 vbiFrameNumber = -1, const bool isPictureStop = false,
-          const bool isPullDown = false, const bool isLeadInOrOut = false, const bool isMarkedForDeletion = false,
-          const double frameQuality = 0, const bool isPadded = false, const bool isClvOffset = false,
+    Frame(const qint32 seqFrameNumber = -1, const qint32 vbiFrameNumber = -1,
+          const bool isPictureStop = false, const bool isPullDown = false,
+          const bool isLeadInOrOut = false, const bool isMarkedForDeletion = false,
+          const double frameQuality = 0, const bool isPadded = false,
+          const bool isClvOffset = false,
           const qint32 firstField = -1, const qint32 secondField = -1,
           const qint32 firstFieldPhase = -1, const qint32 secondFieldPhase = -1);
     ~Frame() = default;
@@ -76,13 +78,13 @@ public:
 private:
     qint32 m_seqFrameNumber;
     qint32 m_vbiFrameNumber;
-    bool m_isPictureStop;
-    bool m_isPullDown;
-    bool m_isLeadInOrOut;
-    bool m_isMarkedForDeletion;
+    bool   m_isPictureStop;
+    bool   m_isPullDown;
+    bool   m_isLeadInOrOut;
+    bool   m_isMarkedForDeletion;
     double m_frameQuality;
-    bool m_isPadded;
-    bool m_isClvOffset;
+    bool   m_isPadded;
+    bool   m_isClvOffset;
     qint32 m_firstField;
     qint32 m_secondField;
     qint32 m_firstFieldPhase;
