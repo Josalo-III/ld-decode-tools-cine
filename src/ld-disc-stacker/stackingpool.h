@@ -1,9 +1,10 @@
 /************************************************************************
 
-    stackingpool.cpp
+    stackingpool.h
 
     ld-disc-stacker - Disc stacking for ld-decode
     Copyright (C) 2020-2025 Simon Inns
+    Copyright (C) 2026 Joseph Burns
 
     This file is part of ld-decode-tools.
 
@@ -28,6 +29,7 @@
 #include <QObject>
 #include <QAtomicInt>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QMutex>
 #include <QThread>
 
@@ -40,23 +42,39 @@ class StackingPool : public QObject
     Q_OBJECT
 public:
     explicit StackingPool(QString _outputFilename, QString _outputMetadataFilename,
-                           qint32 _maxThreads, QVector<LdDecodeMetaData *> &_ldDecodeMetaData, QVector<SourceVideo *> &_sourceVideos,
-                           qint32 _mode, qint32 _smartThreshold, bool _reverse, bool _noDiffDod, bool _passThrough, bool _integrityCheck, bool _verbose, QObject *parent = nullptr);
+                          qint32 _maxThreads,
+                          QVector<LdDecodeMetaData *>& _ldDecodeMetaData,
+                          QVector<SourceVideo *>& _sourceVideos,
+                          qint32 _mode, qint32 _smartThreshold,
+                          bool _reverse, bool _noDiffDod, bool _passThrough,
+                          bool _integrityCheck, bool _verbose,
+                          bool _useSnrWeight, qint32 _snrWeightThreshold,
+                          QObject *parent = nullptr);
 
     bool process();
 
     // Member functions used by worker threads
     bool getInputFrame(qint32& frameNumber,
-                       QVector<qint32> &firstFieldNumber, QVector<SourceVideo::Data> &firstFieldVideoData, QVector<LdDecodeMetaData::Field> &firstFieldMetadata,
-                       QVector<qint32> &secondFieldNumber, QVector<SourceVideo::Data> &secondFieldVideoData, QVector<LdDecodeMetaData::Field> &secondFieldMetadata,
-                       QVector<LdDecodeMetaData::VideoParameters> &videoParameters,
-                       qint32& _mode, qint32& _smartThreshold, bool& _reverse, bool &_noDiffDod, bool &_passThrough,
-                       bool &_verbose, QVector<qint32> &availableSourcesForFrame);
+                       QVector<qint32>& firstFieldNumber,
+                       QVector<SourceVideo::Data>& firstFieldVideoData,
+                       QVector<LdDecodeMetaData::Field>& firstFieldMetadata,
+                       QVector<qint32>& secondFieldNumber,
+                       QVector<SourceVideo::Data>& secondFieldVideoData,
+                       QVector<LdDecodeMetaData::Field>& secondFieldMetadata,
+                       QVector<LdDecodeMetaData::VideoParameters>& videoParameters,
+                       qint32& _mode, qint32& _smartThreshold,
+                       bool& _reverse, bool& _noDiffDod, bool& _passThrough,
+                       bool& _verbose,
+                       QVector<qint32>& availableSourcesForFrame,
+                       QVector<double>& sourceSnrWeights,
+                       bool& _useSnrWeight, qint32& _snrWeightThreshold);
 
     bool setOutputFrame(qint32 frameNumber,
-                        SourceVideo::Data firstTargetFieldData, SourceVideo::Data secondTargetFieldData,
+                        SourceVideo::Data firstTargetFieldData,
+                        SourceVideo::Data secondTargetFieldData,
                         qint32 firstFieldSeqNo, qint32 secondFieldSeqNo,
-                        DropOuts firstTargetFieldDropOuts, DropOuts secondTargetFieldDropouts);
+                        DropOuts firstTargetFieldDropOuts,
+                        DropOuts secondTargetFieldDropouts);
 
 private:
     QString outputFilename;
@@ -69,22 +87,20 @@ private:
     bool passThrough;
     bool integrityCheck;
     bool verbose;
+    bool useSnrWeight;
+    qint32 snrWeightThreshold;
 
     QElapsedTimer totalTimer;
     qint32 skippedFrame;
 
-    // Atomic abort flag shared by worker threads; workers watch this, and shut
-    // down as soon as possible if it becomes true
     QAtomicInt abort;
 
-    // Input stream information (all guarded by inputMutex while threads are running)
     QMutex inputMutex;
     qint32 inputFrameNumber;
     qint32 lastFrameNumber;
-    QVector<LdDecodeMetaData *> &ldDecodeMetaData;
-    QVector<SourceVideo *> &sourceVideos;
+    QVector<LdDecodeMetaData *>& ldDecodeMetaData;
+    QVector<SourceVideo *>& sourceVideos;
 
-    // Output stream information (all guarded by outputMutex while threads are running)
     QMutex outputMutex;
 
     struct OutputFrame {
@@ -100,21 +116,27 @@ private:
     QMap<qint32, OutputFrame> pendingOutputFrames;
     QFile targetVideo;
 
-    // Local source information
-    QVector<bool> sourceDiscTypeCav;
-    QVector<qint32> sourceMinimumVbiFrame;
-    QVector<qint32> sourceMaximumVbiFrame;
+    QVector<bool>    sourceDiscTypeCav;
+    QVector<qint32>  sourceMinimumVbiFrame;
+    QVector<qint32>  sourceMaximumVbiFrame;
+
+    // Direct VBI → sequential frame number lookup per source.
+    // Replaces arithmetic conversion, which was fragile when sources started
+    // at different points on the disc (e.g. trimmed vs full-length captures).
+    QVector<QHash<qint32, qint32>> sourceVbiMap;
+
+    // Reverse map for the timemaster only: sequential → VBI.
+    QHash<qint32, qint32> timemasterSeqToVbi;
 
     bool setMinAndMaxVbiFrames();
-    qint32 convertSequentialFrameNumberToVbi(qint32 sequentialFrameNumber, qint32 sourceNumber);
-    qint32 convertVbiFrameNumberToSequential(qint32 vbiFrameNumber, qint32 sourceNumber);
     QVector<qint32> getAvailableSourcesForFrame(qint32 vbiFrameNumber);
-    bool writeOutputField(const SourceVideo::Data &fieldData);
+    bool writeOutputField(const SourceVideo::Data& fieldData);
     void correctPhaseIDs();
-    bool isIntegrityOk(const SourceVideo::Data& inputFields,const LdDecodeMetaData::VideoParameters& videoParameters);
+    bool isIntegrityOk(const SourceVideo::Data& inputFields,
+                       const LdDecodeMetaData::VideoParameters& videoParameters);
     template<int field>
     void replaceFieldMetaData(qint32 frameNumber);
-    LdDecodeMetaData &correctMetaData();
+    LdDecodeMetaData& correctMetaData();
 };
 
 #endif // STACKINGPOOL_H
