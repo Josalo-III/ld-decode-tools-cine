@@ -64,7 +64,7 @@ ld-disc-stacker [options] <source1.tbc> <source2.tbc> [...] <output.tbc>
 - `--no-diffdod`: Do not use differential dropout detection on low source pixels
 - `--no-map`: Disable mapping requirement
 - `--passthrough`: Pass-through dropouts present on every source
-- `--no-snr-weight`': Disable SNR-weighted bad-consensus override (default: enabled when VITS  metrics are present)
+- `--no-snr-weight`: Disable SNR-weighted bad-consensus override (default: enabled when VITS  metrics are present)
 - `--it, --integrity`: Check if frames contain skip or sample drop and discard bad source for specific frame
 
 #### Threading
