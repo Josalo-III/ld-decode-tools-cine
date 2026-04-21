@@ -6,6 +6,7 @@
     Copyright (C) 2018-2020 Simon Inns
     Copyright (C) 2022 Ryan Holtz
     Copyright (C) 2022-2023 Adam Sampson
+    Copyright (C) 2026 Joseph Burns
 
     This file is part of ld-decode-tools.
 
@@ -24,8 +25,6 @@
 
 ************************************************************************/
 
-// Note: Copied from the TBC library so the JSON handling code is local to the application
-
 #ifndef LDDECODEMETADATA_H
 #define LDDECODEMETADATA_H
 
@@ -34,6 +33,7 @@
 #include <QTemporaryFile>
 #include <QDebug>
 #include <array>
+#include <optional>
 
 #include "dropouts.h"
 
@@ -204,6 +204,15 @@ public:
         DropOuts dropOuts;
         bool pad = false;
 
+        // Edit boundary detection (written by ld-cinemap)
+        bool isEditBoundary = false;
+
+        // Pulldown / cadence solver fields (written by ld-cinemap)
+        qint32 cadenceId = -1;
+        bool cadenceIndexPresumed = false;
+        double cadenceConfidence = 0.0;
+        QString pulldownRole = QString();
+
         double diskLoc = -1;
         qint64 fileLoc = -1;
         qint32 decodeFaults = -1;
@@ -233,7 +242,7 @@ public:
     void readFields(JsonReader &reader);
     void writeFields(JsonWriter &writer) const;
 
-    const VideoParameters &getVideoParameters();
+    const VideoParameters &getVideoParameters() const;
     void setVideoParameters(const VideoParameters &videoParameters);
 
     const PcmAudioParameters &getPcmAudioParameters();
@@ -243,7 +252,7 @@ public:
     void processLineParameters(LdDecodeMetaData::LineParameters &_lineParameters);
 
     // Get field metadata
-    const Field &getField(qint32 sequentialFieldNumber);
+    const Field &getField(qint32 sequentialFieldNumber) const;
     const VitsMetrics &getFieldVitsMetrics(qint32 sequentialFieldNumber);
     const Vbi &getFieldVbi(qint32 sequentialFieldNumber);
     const Ntsc &getFieldNtsc(qint32 sequentialFieldNumber);
@@ -264,7 +273,7 @@ public:
     void appendField(const Field &field);
 
     void setNumberOfFields(qint32 numberOfFields);
-    qint32 getNumberOfFields();
+    qint32 getNumberOfFields() const;
     qint32 getNumberOfFrames();
     qint32 getFirstFieldNumber(qint32 frameNumber);
     qint32 getSecondFieldNumber(qint32 frameNumber);

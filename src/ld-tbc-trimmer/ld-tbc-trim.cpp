@@ -154,6 +154,14 @@ int main(int argc, char *argv[])
 
     const auto vp = srcMd.getVideoParameters();
 
+    // Guard: --decompose-edits requires ld-cinemap to have been run first.
+    // isCinemapped is set by ld-cinemap on successful completion and is the
+    // O(1) handshake that cinemap field data is present in the metadata.
+    if (doDecomposeEdits && !vp.isCinemapped) {
+        qCritical("Error: --decompose-edits requires ld-cinemap to have been run on this source first.");
+        return -1;
+    }
+
     // --- Build frame list ---
     const QVector<TbcTrimUtils::FrameInfo> frames = TbcTrimUtils::buildFrameList(&srcMd);
 

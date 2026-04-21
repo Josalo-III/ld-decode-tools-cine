@@ -258,6 +258,8 @@ bool JsonConverter::createSchema()
         "    colour_burst_end INTEGER,"
         "    is_mapped INTEGER"
         "        CHECK (is_mapped IN (0,1)),"
+        "    is_cinemapped INTEGER"
+        "        CHECK (is_cinemapped IN (0,1)),"
         "    is_subcarrier_locked INTEGER"
         "        CHECK (is_subcarrier_locked IN (0,1)),"
         "    is_widescreen INTEGER"
@@ -417,6 +419,26 @@ bool JsonConverter::createSchema()
         return false;
     }
     
+    // Create cinemap table (Josalo-III: written by ld-cinemap; empty if source had no cinemap data)
+    if (!query.exec(
+        "CREATE TABLE cinemap ("
+        "    capture_id INTEGER NOT NULL,"
+        "    field_id INTEGER NOT NULL,"
+        "    is_edit_boundary INTEGER,"
+        "    cadence_id INTEGER,"
+        "    cadence_index_presumed INTEGER"
+        "        CHECK (cadence_index_presumed IN (0,1)),"
+        "    pulldown_role TEXT,"
+        "    FOREIGN KEY (capture_id, field_id)"
+        "        REFERENCES field_record(capture_id, field_id)"
+        "        ON DELETE CASCADE,"
+        "    PRIMARY KEY (capture_id, field_id)"
+        ");"
+    )) {
+        qCritical() << "Failed to create cinemap table:" << query.lastError().text();
+        return false;
+    }
+
     qInfo() << "Database schema created successfully";
     return true;
 }
@@ -448,20 +470,35 @@ bool JsonConverter::insertData(LdDecodeMetaData &metaData)
         
         // Determine decoder from metadata or default to ld-decode
         QString decoder = "ld-decode"; // Default, could be determined from metadata if available
-        
+
+        // Pre-scan fields to detect whether any cinemap data is present.
+        // cadenceConfidence is intentionally dropped during conversion.
+        bool hasCinemapData = false;
+        const int nFields = metaData.getNumberOfFields();
+        for (qint32 fn = 1; fn <= nFields; ++fn) {
+            const LdDecodeMetaData::Field &f = metaData.getField(fn);
+            if (f.isEditBoundary || f.cadenceId != -1 || f.cadenceIndexPresumed
+                    || !f.pulldownRole.isEmpty()) {
+                hasCinemapData = true;
+                break;
+            }
+        }
+        if (hasCinemapData)
+            qInfo() << "Legacy cinemap data detected:" << nFields << "field(s) will be scanned for cinemap rows.";
+
         query.prepare(
             "INSERT INTO capture ("
             "capture_id, system, decoder, git_branch, git_commit, "
             "video_sample_rate, active_video_start, active_video_end, "
             "field_width, field_height, number_of_sequential_fields, "
-            "colour_burst_start, colour_burst_end, is_mapped, "
+            "colour_burst_start, colour_burst_end, is_mapped, is_cinemapped, "
             "is_subcarrier_locked, is_widescreen, white_16b_ire, "
             "black_16b_ire, blanking_16b_ire, capture_notes"
             ") VALUES ("
-            "1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+            "1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
             ")"
         );
-        
+
         query.bindValue(0, systemStr);
         query.bindValue(1, decoder);
         query.bindValue(2, videoParams.gitBranch.isEmpty() ? QVariant() : videoParams.gitBranch);
@@ -475,12 +512,13 @@ bool JsonConverter::insertData(LdDecodeMetaData &metaData)
         query.bindValue(10, videoParams.colourBurstStart);
         query.bindValue(11, videoParams.colourBurstEnd);
         query.bindValue(12, videoParams.isMapped ? 1 : 0);
-        query.bindValue(13, videoParams.isSubcarrierLocked ? 1 : 0);
-        query.bindValue(14, videoParams.isWidescreen ? 1 : 0);
-        query.bindValue(15, videoParams.white16bIre);
-        query.bindValue(16, videoParams.black16bIre);
-        query.bindValue(17, videoParams.black16bIre); // Legacy JSON doesn't have blanking_16b_ire, use black_16b_ire
-        query.bindValue(18, videoParams.tapeFormat.isEmpty() ? QVariant() : videoParams.tapeFormat);
+        query.bindValue(13, hasCinemapData ? 1 : 0); // is_cinemapped
+        query.bindValue(14, videoParams.isSubcarrierLocked ? 1 : 0);
+        query.bindValue(15, videoParams.isWidescreen ? 1 : 0);
+        query.bindValue(16, videoParams.white16bIre);
+        query.bindValue(17, videoParams.black16bIre);
+        query.bindValue(18, videoParams.black16bIre); // Legacy JSON doesn't have blanking_16b_ire, use black_16b_ire
+        query.bindValue(19, videoParams.tapeFormat.isEmpty() ? QVariant() : videoParams.tapeFormat);
         
         if (!query.exec()) {
             qCritical() << "Failed to insert capture record:" << query.lastError().text();
@@ -676,6 +714,33 @@ bool JsonConverter::insertData(LdDecodeMetaData &metaData)
                 }
             }
             
+            // Insert cinemap data if present for this field (cadenceConfidence dropped)
+            if (hasCinemapData) {
+                const bool hasRow = field.isEditBoundary
+                                 || field.cadenceId != -1
+                                 || field.cadenceIndexPresumed
+                                 || !field.pulldownRole.isEmpty();
+                if (hasRow) {
+                    query.prepare(
+                        "INSERT INTO cinemap "
+                        "(capture_id, field_id, is_edit_boundary, cadence_id, "
+                        "cadence_index_presumed, pulldown_role) "
+                        "VALUES (1, ?, ?, ?, ?, ?)"
+                    );
+                    query.bindValue(0, fieldId);
+                    query.bindValue(1, field.isEditBoundary ? 1 : 0);
+                    query.bindValue(2, field.cadenceId != -1 ? QVariant(field.cadenceId) : QVariant());
+                    query.bindValue(3, field.cadenceIndexPresumed ? 1 : 0);
+                    query.bindValue(4, field.pulldownRole.isEmpty() ? QVariant() : field.pulldownRole);
+
+                    if (!query.exec()) {
+                        qCritical() << "Failed to insert cinemap data for field" << fieldNum << ":" << query.lastError().text();
+                        m_database.rollback();
+                        return false;
+                    }
+                }
+            }
+
             // Progress indicator every 1000 fields
             if (fieldNum % 1000 == 0) {
                 qInfo() << "Inserted" << fieldNum << "of" << metaData.getNumberOfFields() << "fields...";

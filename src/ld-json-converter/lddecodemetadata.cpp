@@ -24,15 +24,15 @@
 
 ************************************************************************/
 
-// Note: Copied from the TBC library so the JSON handling code is local to the application
-
 #include "lddecodemetadata.h"
 
 #include "jsonio.h"
 
 #include <cassert>
 #include <fstream>
-#include "tbc/logging.h"
+#include <algorithm>
+#include <utility>
+#include <cmath>
 
 // Default values used when configuring VideoParameters for a particular video system.
 // See the comments in VideoParameters for the meanings of these values.
@@ -72,7 +72,7 @@ static constexpr VideoSystemDefaults ntscDefaults {
 
 static constexpr VideoSystemDefaults palMDefaults {
     PAL_M,
-    "PAL_M",
+    "PAL-M",
     5.0e6 * (63.0 / 88.0) * (909.0 / 910.0),
     ntscDefaults.minActiveFrameLine,
     ntscDefaults.firstActiveFieldLine, ntscDefaults.lastActiveFieldLine,
@@ -96,9 +96,6 @@ static const VideoSystemDefaults &getSystemDefaults(const LdDecodeMetaData::Vide
 // Return true and set system if found; if not found, return false.
 bool parseVideoSystemName(QString name, VideoSystem &system)
 {
-    // Accept "PAL-M" as an alias for "PAL_M"
-    if (name == "PAL-M") name = "PAL_M";
-
     // Search VIDEO_SYSTEM_DEFAULTS for a matching name
     for (const auto &defaults: VIDEO_SYSTEM_DEFAULTS) {
         if (name == defaults.name) {
@@ -234,9 +231,9 @@ void LdDecodeMetaData::VideoParameters::write(JsonWriter &writer) const
     writer.writeMember("sampleRate", sampleRate);
     writer.writeMember("system", VIDEO_SYSTEM_DEFAULTS[system].name);
     writer.writeMember("white16bIre", white16bIre);
-	if(tapeFormat != "") {
-		writer.writeMember("tapeFormat", tapeFormat);
-	}
+    if (tapeFormat != "") {
+        writer.writeMember("tapeFormat", tapeFormat);
+    }
 
     writer.endObject();
 }
@@ -457,16 +454,23 @@ void LdDecodeMetaData::Field::read(JsonReader &reader)
     while (reader.readMember(member)) {
         if (member == "audioSamples") reader.read(audioSamples);
         else if (member == "cc") closedCaption.read(reader);
+        else if (member == "cadenceConfidence") reader.read(cadenceConfidence);
+        else if (member == "cadenceId") reader.read(cadenceId);
+        else if (member == "cadenceIndexPresumed") reader.read(cadenceIndexPresumed);
         else if (member == "decodeFaults") reader.read(decodeFaults);
         else if (member == "diskLoc") reader.read(diskLoc);
         else if (member == "dropOuts") dropOuts.read(reader);
         else if (member == "efmTValues") reader.read(efmTValues);
         else if (member == "fieldPhaseID") reader.read(fieldPhaseID);
         else if (member == "fileLoc") reader.read(fileLoc);
+		else if (member == "isEditBoundary") {
+			reader.read(isEditBoundary);
+		}
         else if (member == "isFirstField") reader.read(isFirstField);
         else if (member == "medianBurstIRE") reader.read(medianBurstIRE);
         else if (member == "ntsc") ntsc.read(reader, closedCaption);
         else if (member == "pad") reader.read(pad);
+        else if (member == "pulldownRole") reader.read(pulldownRole);
         else if (member == "seqNo") reader.read(seqNo);
         else if (member == "syncConf") reader.read(syncConf);
         else if (member == "vbi") vbi.read(reader);
@@ -483,7 +487,7 @@ void LdDecodeMetaData::Field::write(JsonWriter &writer) const
 {
     writer.beginObject();
 
-    // Keep members in alphabetical order
+    // Keep members in alphabetical order (by key)
     if (audioSamples != -1) {
         writer.writeMember("audioSamples", audioSamples);
     }
@@ -491,12 +495,21 @@ void LdDecodeMetaData::Field::write(JsonWriter &writer) const
         writer.writeMember("cc");
         closedCaption.write(writer);
     }
+    if (cadenceConfidence != 0.0) {
+        writer.writeMember("cadenceConfidence", cadenceConfidence);
+    }
     if (decodeFaults != -1) {
         writer.writeMember("decodeFaults", decodeFaults);
     }
     if (diskLoc != -1) {
         writer.writeMember("diskLoc", diskLoc);
     }
+	if (cadenceId != -1) {
+		writer.writeMember("cadenceId", cadenceId);
+	}
+	if (isEditBoundary) {
+		writer.writeMember("isEditBoundary", isEditBoundary);
+	}
     if (!dropOuts.empty()) {
         writer.writeMember("dropOuts");
         dropOuts.write(writer);
@@ -509,16 +522,17 @@ void LdDecodeMetaData::Field::write(JsonWriter &writer) const
     }
     if (fileLoc != -1) {
         writer.writeMember("fileLoc", fileLoc);
-    }
+    }    
     writer.writeMember("isFirstField", isFirstField);
-    writer.writeMember("medianBurstIRE", medianBurstIRE);
     if (ntsc.inUse) {
         writer.writeMember("ntsc");
         ntsc.write(writer);
     }
     writer.writeMember("pad", pad);
+    if (!pulldownRole.isEmpty()) {
+        writer.writeMember("pulldownRole", pulldownRole);
+    }
     writer.writeMember("seqNo", seqNo);
-    writer.writeMember("syncConf", syncConf);
     if (vbi.inUse) {
         writer.writeMember("vbi");
         vbi.write(writer);
@@ -530,6 +544,9 @@ void LdDecodeMetaData::Field::write(JsonWriter &writer) const
     if (vitsMetrics.inUse) {
         writer.writeMember("vitsMetrics");
         vitsMetrics.write(writer);
+    }
+    if (cadenceIndexPresumed) {
+        writer.writeMember("cadenceIndexPresumed", cadenceIndexPresumed);
     }
 
     writer.endObject();
@@ -664,7 +681,7 @@ void LdDecodeMetaData::writeFields(JsonWriter &writer) const
 }
 
 // This method returns the videoParameters metadata
-const LdDecodeMetaData::VideoParameters &LdDecodeMetaData::getVideoParameters()
+const LdDecodeMetaData::VideoParameters &LdDecodeMetaData::getVideoParameters() const
 {
     assert(videoParameters.isValid);
     return videoParameters;
@@ -784,7 +801,7 @@ void LdDecodeMetaData::LineParameters::applyTo(LdDecodeMetaData::VideoParameters
 }
 
 // This method gets the metadata for the specified sequential field number (indexed from 1 (not 0!))
-const LdDecodeMetaData::Field &LdDecodeMetaData::getField(qint32 sequentialFieldNumber)
+const LdDecodeMetaData::Field &LdDecodeMetaData::getField(qint32 sequentialFieldNumber) const
 {
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
@@ -865,18 +882,28 @@ void LdDecodeMetaData::updateField(const LdDecodeMetaData::Field &field, qint32 
 {
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
-        qCritical() << "LdDecodeMetaData::updateFieldVitsMetrics(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        qCritical() << "LdDecodeMetaData::updateField(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
+    }
+
+    const bool oldBoundary = fields[fieldNumber].isEditBoundary;
+    const bool newBoundary = field.isEditBoundary;
+
+    if (!oldBoundary && newBoundary) {
+        qDebug() << "[UPDATE] isEditBoundary set true at field"
+                 << sequentialFieldNumber;
     }
 
     fields[fieldNumber] = field;
 }
 
-// This method sets the field VBI metadata for a field
+// This method sets the field VITS metrics metadata for a field
 void LdDecodeMetaData::updateFieldVitsMetrics(const LdDecodeMetaData::VitsMetrics &vitsMetrics, qint32 sequentialFieldNumber)
 {
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::updateFieldVitsMetrics(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].vitsMetrics = vitsMetrics;
@@ -888,6 +915,7 @@ void LdDecodeMetaData::updateFieldVbi(const LdDecodeMetaData::Vbi &vbi, qint32 s
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::updateFieldVbi(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].vbi = vbi;
@@ -899,6 +927,7 @@ void LdDecodeMetaData::updateFieldNtsc(const LdDecodeMetaData::Ntsc &ntsc, qint3
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::updateFieldNtsc(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].ntsc = ntsc;
@@ -910,6 +939,7 @@ void LdDecodeMetaData::updateFieldVitc(const LdDecodeMetaData::Vitc &vitc, qint3
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::updateFieldVitc(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].vitc = vitc;
@@ -921,6 +951,7 @@ void LdDecodeMetaData::updateFieldClosedCaption(const LdDecodeMetaData::ClosedCa
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::updateFieldClosedCaption(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].closedCaption = closedCaption;
@@ -932,6 +963,7 @@ void LdDecodeMetaData::updateFieldDropOuts(const DropOuts &dropOuts, qint32 sequ
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::updateFieldDropOuts(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].dropOuts = dropOuts;
@@ -943,6 +975,7 @@ void LdDecodeMetaData::clearFieldDropOuts(qint32 sequentialFieldNumber)
     qint32 fieldNumber = sequentialFieldNumber - 1;
     if (fieldNumber < 0 || fieldNumber >= getNumberOfFields()) {
         qCritical() << "LdDecodeMetaData::clearFieldDropOuts(): Requested field number" << sequentialFieldNumber << "out of bounds!";
+        return;
     }
 
     fields[fieldNumber].dropOuts.clear();
@@ -951,16 +984,13 @@ void LdDecodeMetaData::clearFieldDropOuts(qint32 sequentialFieldNumber)
 // This method appends a new field to the existing metadata
 void LdDecodeMetaData::appendField(const LdDecodeMetaData::Field &field)
 {
-    // Ensure appended fields receive contiguous sequential numbering
-    LdDecodeMetaData::Field fieldCopy = field;
-    fieldCopy.seqNo = fields.size() + 1;
-    fields.append(fieldCopy);
+    fields.append(field);
 
     videoParameters.numberOfSequentialFields = fields.size();
 }
 
 // Method to get the available number of fields (according to the metadata)
-qint32 LdDecodeMetaData::getNumberOfFields()
+qint32 LdDecodeMetaData::getNumberOfFields() const
 {
     return fields.size();
 }
@@ -1031,6 +1061,7 @@ void LdDecodeMetaData::setNumberOfFields(qint32 numberOfFields)
 //
 // Determining the correct setting of 'isFirstFieldFirst' is therefore outside of
 // the shared-library scope.
+// That task is now performed in ld-cinemap.
 
 // Method to get the available number of still-frames
 qint32 LdDecodeMetaData::getNumberOfFrames()
@@ -1222,7 +1253,7 @@ void LdDecodeMetaData::generatePcmAudioMap()
     pcmAudioFieldStartSampleMap.clear();
     pcmAudioFieldLengthMap.clear();
 
-    tbcDebugStream() << "LdDecodeMetaData::generatePcmAudioMap(): Generating PCM audio map...";
+    qDebug() << "LdDecodeMetaData::generatePcmAudioMap(): Generating PCM audio map...";
 
     // Get the number of fields and resize the maps
     qint32 numberOfFields = getVideoParameters().numberOfSequentialFields;
