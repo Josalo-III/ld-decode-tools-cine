@@ -54,7 +54,8 @@ public:
                            double &videoSampleRate, int &activeVideoStart, int &activeVideoEnd,
                            int &fieldWidth, int &fieldHeight, int &numberOfSequentialFields,
                            int &colourBurstStart, int &colourBurstEnd,
-                           bool &isMapped, bool &isSubcarrierLocked, bool &isWidescreen,
+                           bool &isMapped, bool &isCinemapped,
+                           bool &isSubcarrierLocked, bool &isWidescreen,
                            int &white16bIre, int &black16bIre, int &blanking16bIre, QString &captureNotes);
 
     // Read PCM audio parameters
@@ -125,7 +126,8 @@ public:
                            double videoSampleRate, int activeVideoStart, int activeVideoEnd,
                            int fieldWidth, int fieldHeight, int numberOfSequentialFields,
                            int colourBurstStart, int colourBurstEnd,
-                           bool isMapped, bool isSubcarrierLocked, bool isWidescreen,
+                           bool isMapped, bool isCinemapped,
+                           bool isSubcarrierLocked, bool isWidescreen,
                            int white16bIre, int black16bIre, int blanking16bIre, const QString &captureNotes);
 
     // Update existing capture metadata  
@@ -134,7 +136,8 @@ public:
                              double videoSampleRate, int activeVideoStart, int activeVideoEnd,
                              int fieldWidth, int fieldHeight, int numberOfSequentialFields,
                              int colourBurstStart, int colourBurstEnd,
-                             bool isMapped, bool isSubcarrierLocked, bool isWidescreen,
+                             bool isMapped, bool isCinemapped,
+                             bool isSubcarrierLocked, bool isWidescreen,
                              int white16bIre, int black16bIre, int blanking16bIre, const QString &captureNotes);
 
     // Write PCM audio parameters

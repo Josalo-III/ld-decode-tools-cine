@@ -321,13 +321,13 @@ bool LdDecodeMetaData::read(QString fileName)
         double videoSampleRate;
         int activeVideoStart, activeVideoEnd, fieldWidth, fieldHeight, numberOfSequentialFields;
         int colourBurstStart, colourBurstEnd, white16bIre, black16bIre, blanking16bIre;
-        bool isMapped, isSubcarrierLocked, isWidescreen;
+        bool isMapped, isCinemapped, isSubcarrierLocked, isWidescreen;
 
         // Read capture metadata
         if (!reader.readCaptureMetadata(captureId, system, decoder, gitBranch, gitCommit,
                                        videoSampleRate, activeVideoStart, activeVideoEnd,
                                        fieldWidth, fieldHeight, numberOfSequentialFields,
-                                       colourBurstStart, colourBurstEnd, isMapped,
+                                       colourBurstStart, colourBurstEnd, isMapped, isCinemapped,
                                        isSubcarrierLocked, isWidescreen, white16bIre,
                                        black16bIre, blanking16bIre, captureNotes)) {
             qCritical() << "Failed to read capture metadata from SQLite file";
@@ -353,6 +353,7 @@ bool LdDecodeMetaData::read(QString fileName)
         videoParameters.fieldHeight = fieldHeight;
         videoParameters.sampleRate = videoSampleRate;
         videoParameters.isMapped = isMapped;
+        videoParameters.isCinemapped = isCinemapped;
         videoParameters.tapeFormat = captureNotes;
         videoParameters.gitBranch = gitBranch;
         videoParameters.gitCommit = gitCommit;
@@ -451,7 +452,8 @@ bool LdDecodeMetaData::write(QString fileName) const
                                             videoParameters.activeVideoEnd, videoParameters.fieldWidth,
                                             videoParameters.fieldHeight, videoParameters.numberOfSequentialFields,
                                             videoParameters.colourBurstStart, videoParameters.colourBurstEnd,
-                                            videoParameters.isMapped, videoParameters.isSubcarrierLocked,
+                                            videoParameters.isMapped, videoParameters.isCinemapped,
+                                            videoParameters.isSubcarrierLocked,
                                             videoParameters.isWidescreen, videoParameters.white16bIre,
                                             videoParameters.black16bIre, videoParameters.blanking16bIre, videoParameters.tapeFormat)) {
                 writer.rollbackTransaction();
@@ -466,7 +468,8 @@ bool LdDecodeMetaData::write(QString fileName) const
                 videoParameters.activeVideoEnd, videoParameters.fieldWidth,
                 videoParameters.fieldHeight, videoParameters.numberOfSequentialFields,
                 videoParameters.colourBurstStart, videoParameters.colourBurstEnd,
-                videoParameters.isMapped, videoParameters.isSubcarrierLocked,
+                videoParameters.isMapped, videoParameters.isCinemapped,
+                videoParameters.isSubcarrierLocked,
                 videoParameters.isWidescreen, videoParameters.white16bIre,
                 videoParameters.black16bIre, videoParameters.blanking16bIre, videoParameters.tapeFormat);
 

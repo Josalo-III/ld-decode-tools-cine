@@ -73,6 +73,7 @@ public:
         double sampleRate = -1.0;
 
         bool isMapped = false;
+        bool isCinemapped = false;
         QString tapeFormat = "";
 
         QString gitBranch;

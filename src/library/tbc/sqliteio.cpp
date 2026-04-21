@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS capture (
     colour_burst_end INTEGER,
     is_mapped INTEGER
         CHECK (is_mapped IN (0,1)),
+    is_cinemapped INTEGER
+        CHECK (is_cinemapped IN (0,1)),
     is_subcarrier_locked INTEGER
         CHECK (is_subcarrier_locked IN (0,1)),
     is_widescreen INTEGER
@@ -243,7 +245,8 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
                                      double &videoSampleRate, int &activeVideoStart, int &activeVideoEnd,
                                      int &fieldWidth, int &fieldHeight, int &numberOfSequentialFields,
                                      int &colourBurstStart, int &colourBurstEnd,
-                                     bool &isMapped, bool &isSubcarrierLocked, bool &isWidescreen,
+                                     bool &isMapped, bool &isCinemapped,
+                                     bool &isSubcarrierLocked, bool &isWidescreen,
                                      int &white16bIre, int &black16bIre, int &blanking16bIre, QString &captureNotes)
 {
     // Check if blanking_16b_ire column exists (for backward compatibility)
@@ -264,7 +267,7 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
     QString queryStr = "SELECT capture_id, system, decoder, git_branch, git_commit, "
                        "video_sample_rate, active_video_start, active_video_end, "
                        "field_width, field_height, number_of_sequential_fields, "
-                       "colour_burst_start, colour_burst_end, is_mapped, is_subcarrier_locked, "
+                       "colour_burst_start, colour_burst_end, is_mapped, is_cinemapped, is_subcarrier_locked, "
                        "is_widescreen, white_16b_ire, black_16b_ire";
     if (hasBlankingColumn) {
         queryStr += ", blanking_16b_ire";
@@ -297,6 +300,7 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
     colourBurstStart = SqliteValue::toIntOrDefault(query, "colour_burst_start");
     colourBurstEnd = SqliteValue::toIntOrDefault(query, "colour_burst_end");
     isMapped = SqliteValue::toBoolOrDefault(query, "is_mapped");
+    isCinemapped = SqliteValue::toBoolOrDefault(query, "is_cinemapped");
     isSubcarrierLocked = SqliteValue::toBoolOrDefault(query, "is_subcarrier_locked");
     isWidescreen = SqliteValue::toBoolOrDefault(query, "is_widescreen");
     white16bIre = SqliteValue::toIntOrDefault(query, "white_16b_ire");
@@ -611,16 +615,17 @@ int SqliteWriter::writeCaptureMetadata(const QString &system, const QString &dec
                                      double videoSampleRate, int activeVideoStart, int activeVideoEnd,
                                      int fieldWidth, int fieldHeight, int numberOfSequentialFields,
                                      int colourBurstStart, int colourBurstEnd,
-                                     bool isMapped, bool isSubcarrierLocked, bool isWidescreen,
+                                     bool isMapped, bool isCinemapped,
+                                     bool isSubcarrierLocked, bool isWidescreen,
                                      int white16bIre, int black16bIre, int blanking16bIre, const QString &captureNotes)
 {
     QSqlQuery query(db);
     query.prepare("INSERT INTO capture (system, decoder, git_branch, git_commit, "
                  "video_sample_rate, active_video_start, active_video_end, "
                  "field_width, field_height, number_of_sequential_fields, "
-                 "colour_burst_start, colour_burst_end, is_mapped, is_subcarrier_locked, "
+                 "colour_burst_start, colour_burst_end, is_mapped, is_cinemapped, is_subcarrier_locked, "
                  "is_widescreen, white_16b_ire, black_16b_ire, blanking_16b_ire, capture_notes) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
     query.addBindValue(system);
     query.addBindValue(decoder);
@@ -635,6 +640,7 @@ int SqliteWriter::writeCaptureMetadata(const QString &system, const QString &dec
     query.addBindValue(colourBurstStart);
     query.addBindValue(colourBurstEnd);
     query.addBindValue(isMapped ? 1 : 0);
+    query.addBindValue(isCinemapped ? 1 : 0);
     query.addBindValue(isSubcarrierLocked ? 1 : 0);
     query.addBindValue(isWidescreen ? 1 : 0);
     query.addBindValue(white16bIre);
@@ -655,14 +661,15 @@ bool SqliteWriter::updateCaptureMetadata(int captureId, const QString &system, c
                                        double videoSampleRate, int activeVideoStart, int activeVideoEnd,
                                        int fieldWidth, int fieldHeight, int numberOfSequentialFields,
                                        int colourBurstStart, int colourBurstEnd,
-                                       bool isMapped, bool isSubcarrierLocked, bool isWidescreen,
+                                       bool isMapped, bool isCinemapped,
+                                       bool isSubcarrierLocked, bool isWidescreen,
                                        int white16bIre, int black16bIre, int blanking16bIre, const QString &captureNotes)
 {
     QSqlQuery query(db);
     query.prepare("UPDATE capture SET system=?, decoder=?, git_branch=?, git_commit=?, "
                  "video_sample_rate=?, active_video_start=?, active_video_end=?, "
                  "field_width=?, field_height=?, number_of_sequential_fields=?, "
-                 "colour_burst_start=?, colour_burst_end=?, is_mapped=?, is_subcarrier_locked=?, "
+                 "colour_burst_start=?, colour_burst_end=?, is_mapped=?, is_cinemapped=?, is_subcarrier_locked=?, "
                  "is_widescreen=?, white_16b_ire=?, black_16b_ire=?, blanking_16b_ire=?, capture_notes=? "
                  "WHERE capture_id=?");
 
@@ -679,6 +686,7 @@ bool SqliteWriter::updateCaptureMetadata(int captureId, const QString &system, c
     query.addBindValue(colourBurstStart);
     query.addBindValue(colourBurstEnd);
     query.addBindValue(isMapped ? 1 : 0);
+    query.addBindValue(isCinemapped ? 1 : 0);
     query.addBindValue(isSubcarrierLocked ? 1 : 0);
     query.addBindValue(isWidescreen ? 1 : 0);
     query.addBindValue(white16bIre);
