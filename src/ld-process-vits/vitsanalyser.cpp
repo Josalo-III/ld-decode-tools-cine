@@ -146,9 +146,13 @@ QVector<double> VitsAnalyser::getFieldLineSlice(const SourceVideo::Data &sourceF
 // Calculate the SNR or Percentage SNR
 double VitsAnalyser::calculateSnr(QVector<double> &data, bool usePsnr)
 {
+    if (data.isEmpty()) return 0.0;
+
     double signal = 0;
     if (usePsnr) signal = 100.0; else signal = calcMean(data); // Compute the arithmetic mean
     double noise = calcStd(data); // Compute the standard deviation
+
+    if (noise <= 0.0) return 0.0; // flat signal — SNR undefined, treat as 0
 
     return 20.0 * log10(signal / noise);
 }
@@ -186,8 +190,8 @@ double VitsAnalyser::calcStd(QVector<double> &data)
 // Round a double to x decimal places
 double VitsAnalyser::roundDouble(double in, qint32 decimalPlaces)
 {
+    if (!std::isfinite(in)) return 0.0;
+
     const double multiplier = pow(10.0, decimalPlaces);
     return ceil(in * multiplier) / multiplier;
 }
-
-
