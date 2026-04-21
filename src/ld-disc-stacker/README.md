@@ -45,7 +45,7 @@ ld-disc-stacker [options] <source1.tbc> <source2.tbc> [...] <output.tbc>
   - 4 = Neighbor
   - 5 = Local neighbor
   - 6 = Smart local neighbor
-  - 7 = Mediod
+  - 7 = Medoid
 - `--st, --smart-threshold <number>`: Range of value in 8 bit (0~128) for smart mode selection (default is 15)
 
 #### Advanced Options
