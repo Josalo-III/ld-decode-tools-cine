@@ -11,15 +11,14 @@
 #include "cinedisc.h"
 
 #include "lddecodemetadata.h"
-#include "cadence_defs.h"
-#include "field_order.h"
+#include "cadencedefs.h"
+#include "fieldorder.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
-#include <QDebug>
 #include "tbc/logging.h"
 #include <vector>
 #include <unordered_map>
