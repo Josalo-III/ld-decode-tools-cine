@@ -21,7 +21,7 @@ public:
     static std::unique_ptr<CineDiscMeta> load(const QString& tbcPath,
                                               bool reverseFieldOrder)
     {
-        const QString jsonPath = tbcPath + ".tbc.db";
+        const QString jsonPath = tbcPath + ".db";
         if (!QFileInfo::exists(jsonPath)) {
             qCritical() << "CineDiscMeta: metadata file not found:" << jsonPath;
             return nullptr;
