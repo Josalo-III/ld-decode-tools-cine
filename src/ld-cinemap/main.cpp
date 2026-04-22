@@ -2,7 +2,6 @@
 
 #include <QCoreApplication>
 #include <QCommandLineParser>
-#include <QDebug>
 #include <QFileInfo>
 #include <QTextStream>
 #include <QtGlobal>
@@ -72,12 +71,12 @@ static bool runDetectEditsOnly(CineDisc& disc,
     }
 
     // 4) Determine output metadata path
-    const QString sourcePath = disc.getTbcPath() + ".tbc.db";
+    const QString sourcePath = disc.getTbcPath() + ".db";
     const QString jsonOutPath =
         (!outputFileInfo.filePath().isEmpty()
          && outputFileInfo.filePath() != "-"
          && outputFileInfo.filePath() != sourcePath)
-        ? outputFileInfo.filePath() + ".tbc.db"
+        ? outputFileInfo.filePath() + ".db"
         : sourcePath;
 
     if (!disc.getMetaData().write(jsonOutPath)) {
@@ -93,7 +92,7 @@ static bool runDetectEditsOnly(CineDisc& disc,
 // Mode: cadence solve only (--skip-edits)
 //   - Does not run segmenter or visual edit detection
 //   - Runs CineMap cadence solve using existing edit boundaries
-//   - Sets isCinemapped flag and writes metadata back to tbcPath + ".tbc.db"
+//   - Sets isCinemapped flag and writes metadata back to tbcPath + ".db"
 // -----------------------------------------------------------------------------
 static bool runSolveOnly(CineDisc& disc,
                          CineMap::Policy policy,
@@ -109,7 +108,7 @@ static bool runSolveOnly(CineDisc& disc,
     vp.isCinemapped = true;
     disc.getMetaData().setVideoParameters(vp);
 
-    if (!disc.getMetaData().write(disc.getTbcPath() + ".tbc.db")) {
+    if (!disc.getMetaData().write(disc.getTbcPath() + ".db")) {
         qWarning() << "Failed to save cadence metadata.";
         return false;
     }
@@ -168,12 +167,12 @@ static bool runFullPipeline(CineDisc& disc,
     disc.getMetaData().setVideoParameters(vp);
 
     // 6) Write metadata
-    const QString sourcePath = disc.getTbcPath() + ".tbc.db";
+    const QString sourcePath = disc.getTbcPath() + ".db";
     const QString jsonOutPath =
         (!outputFileInfo.filePath().isEmpty()
          && outputFileInfo.filePath() != "-"
          && outputFileInfo.filePath() != sourcePath)
-        ? outputFileInfo.filePath() + ".tbc.db"
+        ? outputFileInfo.filePath() + ".db"
         : sourcePath;
 
     if (!disc.getMetaData().write(jsonOutPath)) {
@@ -278,8 +277,8 @@ int main(int argc, char* argv[])
     parser.addOption(editWhitelistOpt);
     parser.addOption(editBlacklistOpt);
 
-    parser.addPositionalArgument("tbc", "Input TBC file (metadata expected at tbc + \".tbc.db\").");
-    parser.addPositionalArgument("output", "Optional output base path (metadata will be written to output + \".tbc.db\").", "[output]");
+    parser.addPositionalArgument("tbc", "Input TBC file (metadata expected at tbc + \".db\").");
+    parser.addPositionalArgument("output", "Optional output base path (metadata will be written to output + \".db\").", "[output]");
 
     parser.process(app);
 
