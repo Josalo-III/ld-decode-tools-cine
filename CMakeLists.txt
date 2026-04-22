@@ -42,7 +42,7 @@ if(NOT REL_PATH MATCHES "^\\.\\." AND
        cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ../ld-decode-tools")
 endif()
 
-project(ld-decode-tools)
+project(ld-decode-tools-cine)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake_modules")
 include(CTest)
@@ -138,6 +138,7 @@ add_compile_definitions(APP_COMMIT=\"${APP_COMMIT}\")
 # Subdirectories
 
 add_subdirectory(src/ld-analyse)
+add_subdirectory(src/ld-cinemap)
 add_subdirectory(src/ld-chroma-decoder)
 add_subdirectory(src/ld-chroma-decoder/encoder)
 add_subdirectory(src/ld-disc-stacker)
@@ -149,6 +150,7 @@ add_subdirectory(src/ld-json-converter)
 add_subdirectory(src/ld-lds-converter)
 add_subdirectory(src/ld-process-vbi)
 add_subdirectory(src/ld-process-vits)
+add_subdirectory(src/ld-tbc-trim)
 add_subdirectory(src/library)
 add_subdirectory(src/efm-decoder)
 

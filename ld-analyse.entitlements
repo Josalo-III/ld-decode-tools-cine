@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow the native file open/save dialogs to access user-selected files -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <!-- Allow access to files in Downloads, Desktop, Documents via open panel -->
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+    <!-- Disable sandbox so the app can access arbitrary paths (TBC files can be anywhere) -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>

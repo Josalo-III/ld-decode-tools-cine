@@ -17,7 +17,7 @@
         ezpwdSrc = ezpwd;
       in
       let
-        packageVersion = "7.2.0";
+        packageVersion = "7.2.0c";
         rev = if self ? rev then self.rev else "";
         shortRev = if self ? shortRev then self.shortRev else (if rev != "" then builtins.substring 0 7 rev else "unknown");
         dirtySuffix = if self ? dirtyRev then "-dirty" else "";
@@ -26,7 +26,7 @@
       in
       {
         packages.default = pkgs.stdenv.mkDerivation {
-          pname = "ld-decode-tools";
+          pname = "ld-decode-tools-cine";
           version = packageVersion;
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -42,6 +42,8 @@
             ninja
             pkg-config
             qt6.wrapQtAppsHook
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            qt6.qttools
           ];
 
           buildInputs = with pkgs; [
@@ -51,7 +53,16 @@
             ffmpeg
             sqlite
             libGL
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            qt6.qtbase.dev
           ];
+
+          postInstall = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+            macdeployqt $out/bin/ld-analyse.app -verbose=0
+            codesign --force --deep --sign - \
+              --entitlements ${./ld-analyse.entitlements} \
+              $out/bin/ld-analyse.app
+          '';
 
           cmakeBuildType = "Release";
           cmakeFlags = [
@@ -69,6 +80,7 @@
             pkg-config
             qt6.qtbase
             qt6.qtsvg
+            qt6.qttools
             fftw
             ffmpeg
             sqlite
