@@ -586,8 +586,18 @@ bool SqliteWriter::createSchema()
 {
     tbcDebugStream() << "SqliteWriter::createSchema(): Starting schema creation";
     
+    // Strip -- comment lines from the full schema before splitting,
+    // to avoid semicolons inside comments creating spurious empty statements.
+    QStringList schemaLines = SCHEMA_SQL.split('\n');
+    QStringList cleanLines;
+    for (const QString &line : schemaLines) {
+        if (!line.trimmed().startsWith("--"))
+            cleanLines.append(line);
+    }
+    const QString cleanSchema = cleanLines.join('\n');
+
     // Split schema into individual statements and execute them
-    QStringList statements = SCHEMA_SQL.split(";", Qt::SkipEmptyParts);
+    QStringList statements = cleanSchema.split(";", Qt::SkipEmptyParts);
     
     tbcDebugStream() << "Schema has" << statements.size() << "statements";
     
