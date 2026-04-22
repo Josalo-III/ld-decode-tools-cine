@@ -404,14 +404,14 @@ bool LdDecodeMetaData::write(QString fileName) const
             int existingActiveVideoStart, existingActiveVideoEnd, existingFieldWidth, existingFieldHeight;
             int existingNumberOfSequentialFields, existingColourBurstStart, existingColourBurstEnd;
             int existingWhite16bIre, existingBlack16bIre, existingBlanking16bIre;
-            bool existingIsMapped, existingIsSubcarrierLocked, existingIsWidescreen;
+            bool existingIsMapped, existingIsCinemapped, existingIsSubcarrierLocked, existingIsWidescreen;
 
             if (reader.readCaptureMetadata(captureId, existingSystem, existingDecoder,
                                          existingGitBranch, existingGitCommit, existingVideoSampleRate,
                                          existingActiveVideoStart, existingActiveVideoEnd,
                                          existingFieldWidth, existingFieldHeight, existingNumberOfSequentialFields,
                                          existingColourBurstStart, existingColourBurstEnd,
-                                         existingIsMapped, existingIsSubcarrierLocked, existingIsWidescreen,
+                                         existingIsMapped, existingIsCinemapped, existingIsSubcarrierLocked, existingIsWidescreen,
                                          existingWhite16bIre, existingBlack16bIre, existingBlanking16bIre, existingCaptureNotes)) {
                 tbcDebugStream() << "Updating existing SQLite file with capture_id:" << captureId;
             } else {
