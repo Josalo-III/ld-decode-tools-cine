@@ -4,6 +4,7 @@
 
     ld-disc-stacker - Disc stacking for ld-decode
     Copyright (C) 2020-2025 Simon Inns
+    Copyright (C) 2025-2026 Joseph Burns
 
     This file is part of ld-decode-tools.
 
@@ -108,7 +109,10 @@ int main(int argc, char *argv[])
     // Option to select the stacking mode (-m)
     QCommandLineOption modeOption(QStringList() << "m" << "mode",
                                         QCoreApplication::translate(
-                                         "main", "Specify the stacking mode to use (default is Auto) -1 = auto / 0 = mean / 1 = median / 2 = smart mean / 3 = smart neighbor / 4 = neighbor"),
+                                         "main", "Specify the stacking mode to use (default is Auto) "
+                                         "-1 = auto / 0 = mean / 1 = median / 2 = smart mean / "
+                                         "3 = smart neighbor / 4 = neighbor / 5 = smart local neighbor / "
+                                         "6 = medoid with local neighbor / 7 = medoid"),
                                          QCoreApplication::translate("main", "number"));
     parser.addOption(modeOption);
 
@@ -143,6 +147,19 @@ int main(int argc, char *argv[])
                                          "main", "Check if frames contain skip or sample drop and discard bad source for specific frame"));
     parser.addOption(integrityOption);
 
+    // Option to weight sources by SNR when stacking
+    QCommandLineOption useSnrWeightOption(QStringList() << "snr-weight",
+                                        QCoreApplication::translate(
+                                         "main", "Weight sources by SNR during stacking (requires ld-process-vits data)"));
+    parser.addOption(useSnrWeightOption);
+
+    // Option to set the SNR weight threshold
+    QCommandLineOption snrWeightThresholdOption(QStringList() << "snr-weight-threshold",
+                                        QCoreApplication::translate(
+                                         "main", "Minimum SNR (dB) for a source to receive non-zero weight when --snr-weight is active (default 20)"),
+                                        QCoreApplication::translate("main", "number"));
+    parser.addOption(snrWeightThresholdOption);
+
     // Positional argument to specify input video file
     parser.addPositionalArgument("inputs", QCoreApplication::translate(
                                      "main", "Specify input TBC files (- as first source for piped input)"));
@@ -173,6 +190,9 @@ int main(int argc, char *argv[])
         qInfo() << "(4) neighbor        : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
         qInfo() << "                      then take the closest value to the median of the current sample from the different closest value found then average the selected sample with the median";
         qInfo() << "                      when only 2 sources are available, it take the closest sample to the neighbor";
+        qInfo() << "(5) smart local neighbor : derive a medoid from the sample set, use it to identify and exclude outliers, then apply the smart neighbor process on the inlier set";
+        qInfo() << "(6) medoid with local neighbor : derive a medoid to exclude outliers, then apply the neighbor process on the inlier set";
+        qInfo() << "(7) medoid          : return the sample with the shortest total distance to all other samples (falls back to median/mean for small sets)";
         return 0; // Exit after showing detailed help
     }
 
@@ -192,13 +212,23 @@ int main(int argc, char *argv[])
     bool noMap = parser.isSet(noMapOption);
     bool passThrough = parser.isSet(passthroughOption);
     bool integrityCheck = parser.isSet(integrityOption);
+    bool useSnrWeight = parser.isSet(useSnrWeightOption);
+
+    qint32 snrWeightThreshold = 20;
+    if (parser.isSet(snrWeightThresholdOption)) {
+        snrWeightThreshold = parser.value(snrWeightThresholdOption).toInt();
+        if (snrWeightThreshold < 0) {
+            qInfo() << "SNR weight threshold must be >= 0, using default of 20";
+            snrWeightThreshold = 20;
+        }
+    }
 
     // Get the arguments from the parser
     qint32 mode = -1;
     if (parser.isSet(modeOption)) {
         mode = parser.value(modeOption).toInt();
 
-        if (mode > 4 || mode < 0) {
+        if (mode > 7 || mode < 0) {
             qInfo() << "Specified mode (" << mode << ") is unknown using auto mode instead";
             mode = -1;
         }
@@ -423,7 +453,8 @@ int main(int argc, char *argv[])
     qInfo() << "Initial source checks are ok and sources are loaded";
     qint32 result = 0;
     StackingPool stackingPool(outputFilename, outputMetadataFilename, maxThreads,
-                                ldDecodeMetaData, sourceVideos, mode, smartThreshold, reverse, noDiffDod, passThrough, integrityCheck, verbose);
+                                ldDecodeMetaData, sourceVideos, mode, smartThreshold, reverse, noDiffDod, passThrough, integrityCheck, verbose,
+                                useSnrWeight, snrWeightThreshold);
     if (!stackingPool.process()) result = 1;
 
     // Close open source video files
