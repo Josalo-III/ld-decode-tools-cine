@@ -19,7 +19,7 @@ ld-cinemap [OPTIONS] <input.tbc> [output]
 ld-cinemap supports three operational modes, selected by flags. If no mode flag is given, the **full pipeline** runs (default).
 
 ### Full Pipeline (default)
-Runs segmentation → visual edit detection → cadence solving in sequence, writing all metadata in one pass.
+Runs segmentation (phase changes, usually per Act/Reel) → visual edit detection → cadence solving in sequence, writing all metadata in one pass.
 
 ```bash
 ld-cinemap <input.tbc> [output]
@@ -49,10 +49,10 @@ Requires: input metadata must have `isEditBoundary` flags already set (by a prio
 Exactly one policy must be selected to control how cadence is resolved:
 
 - **`--cine`**: Implement film-edited telecine reconstruction policy.  
-  Optimised for discs where film was edited before telecining, producing cadence breaks only at reel changes. Produces 3:2 pulldown locks for material with occasional resets.
+  Optimised for discs where film was edited before telecine, producing cadence breaks only at reel changes. Produces 3:2 pulldown locks for material with occasional resets.
 
 - **`--tv`** (default): Implement video-edited telecine policy.  
-  Optimised for discs where the entire telecine sequence was recorded and then edited in video. Allows more flexible cadence interpretation and is more robust to noise.
+  Optimised for discs where raw footage was telecined and then edited in video. Assumes per-shot cadence breaks and solves each shot seperately.
 
 ### Visual Edit Detection
 These options control the sensitivity and behaviour of visual edit detection (ignored with `--skip-edits`):
@@ -67,12 +67,10 @@ These options control the sensitivity and behaviour of visual edit detection (ig
   Multiplier for peak visual discontinuities. Applied to the most extreme luminance differences.
 
 - **`--edit-whitelist <keys>`**  
-  Comma-separated or space-separated list of sequential frame keys to force-mark as edit boundaries, overriding sensitivity settings.  
-  *Note: Implementation pending.*
+  Comma-separated or space-separated list of field keys to force-mark as edit boundaries, overriding sensitivity settings.  
 
 - **`--edit-blacklist <keys>`**  
-  Comma-separated or space-separated list of sequential frame keys to force-exclude from edit boundaries, overriding detection results.  
-  *Note: Implementation pending.*
+  Comma-separated or space-separated list of sequential frame keys to force-exclude from edit boundaries, overriding detection results.  Accepts ranges.
 
 ### Input/Output
 
