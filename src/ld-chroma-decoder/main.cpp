@@ -3,25 +3,22 @@
     main.cpp
 
     ld-chroma-decoder - Colourisation filter for ld-decode
-    Copyright (C) 2018-2025 Simon Inns
+    Copyright (C) 2018-2020 Simon Inns
     Copyright (C) 2019-2022 Adam Sampson
     Copyright (C) 2021 Chad Page
     Copyright (C) 2021 Phillip Blucas
+    Copyright (C) 2025 Joseph Burns
 
     This file is part of ld-decode-tools.
 
     ld-chroma-decoder is free software: you can redistribute it and/or
-    modify it under the terms of the GNU General Public License as
-    published by the Free Software Foundation, either version 3 of the
-    License, or (at your option) any later version.
+    modify it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
 
     This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+    or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
 
 ************************************************************************/
 
@@ -35,7 +32,7 @@
 
 #include "decoderpool.h"
 #include "lddecodemetadata.h"
-#include "tbc/logging.h"
+#include "logging.h"
 
 #include "comb.h"
 #include "monodecoder.h"
@@ -44,20 +41,41 @@
 #include "palcolour.h"
 #include "paldecoder.h"
 #include "transformpal.h"
+#include "cadenceassembler.h" // Added
 
-// Load the thresholds file for the Transform decoders, if specified. We must
-// do this after PalColour has been configured, so we know how many values to
-// expect.
-//
-// Return true on success; on failure, print a message and return false.
+// Enable fast FP mode (flush denormals) on supported CPUs
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
+  #include <xmmintrin.h>
+  #include <pmmintrin.h>
+#endif
+#if defined(__aarch64__)
+  #include <stdint.h>
+#endif
+
+static inline void enableFastFPUMode()
+{
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+  #if defined(_MM_DENORMALS_ZERO_MASK)
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+  #endif
+#endif
+#if defined(__aarch64__)
+    // Set FPCR: FZ (bit 24). DN (bit 25) controls Default NaN; we leave it unchanged.
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ull << 24); // FZ: Flush-to-zero for subnormals
+    asm volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+
+// Load the thresholds file for the Transform decoders, if specified.
 static bool loadTransformThresholds(QCommandLineParser &parser, QCommandLineOption &transformThresholdsOption, PalColour::Configuration &palConfig)
 {
     if (!parser.isSet(transformThresholdsOption)) {
-        // Nothing to load
         return true;
     }
 
-    // Open the file
     QString filename = parser.value(transformThresholdsOption);
     std::ifstream thresholdsFile(filename.toStdString());
     if (thresholdsFile.fail()) {
@@ -65,14 +83,11 @@ static bool loadTransformThresholds(QCommandLineParser &parser, QCommandLineOpti
         return false;
     }
 
-    // Read threshold values from the file
     palConfig.transformThresholds.clear();
     while (true) {
         double value;
         thresholdsFile >> value;
-        if (thresholdsFile.eof()) {
-            break;
-        }
+        if (thresholdsFile.eof()) break;
         if (value < 0.0 || value > 1.0) {
             qCritical() << "Values in Transform thresholds file must be between 0 and 1:" << filename;
             return false;
@@ -84,7 +99,6 @@ static bool loadTransformThresholds(QCommandLineParser &parser, QCommandLineOpti
         palConfig.transformThresholds.push_back(value);
     }
 
-    // Check we've read the right number
     if (palConfig.transformThresholds.size() != palConfig.getThresholdsSize()) {
         qCritical() << "Transform thresholds file contained" << palConfig.transformThresholds.size()
                     << "values, expecting" << palConfig.getThresholdsSize() << "values:" << filename;
@@ -100,6 +114,9 @@ int main(int argc, char *argv[])
     // Set 'binary mode' for stdin and stdout on Windows
     setBinaryMode();
 
+    // Critical on Apple Silicon and other CPUs: avoid denormal slowdowns
+    enableFastFPUMode();
+
     // Install the local debug message handler
     setDebug(true);
     qInstallMessageHandler(debugOutputHandler);
@@ -108,7 +125,7 @@ int main(int argc, char *argv[])
 
     // Set application name and version
     QCoreApplication::setApplicationName("ld-chroma-decoder");
-    QCoreApplication::setApplicationVersion(QString("ld-decode-tools - Branch: %1 / Commit: %2").arg(APP_BRANCH, APP_COMMIT));
+    QCoreApplication::setApplicationVersion(QString("Branch: %1 / Commit: %2").arg(APP_BRANCH, APP_COMMIT));
     QCoreApplication::setOrganizationDomain("domesday86.com");
 
     // Set up the command line parser
@@ -120,6 +137,7 @@ int main(int argc, char *argv[])
                 "(c)2019-2021 Adam Sampson\n"
                 "(c)2018-2021 Chad Page\n"
                 "(c)2021 Phillip Blucas\n"
+                "(c)2025 Joseph Burns\n"
                 "Contains PALcolour: Copyright (c)2018 William Andrew Steer\n"
                 "Contains Transform PAL: Copyright (c)2014 Jim Easterbrook\n"
                 "GPLv3 Open-Source - github: https://github.com/happycube/ld-decode");
@@ -131,11 +149,11 @@ int main(int argc, char *argv[])
     // Add the standard debug options --debug and --quiet
     addStandardDebugOptions(parser);
 
-    // Option to specify a different metadata input file
-    QCommandLineOption inputMetadataOption(QStringList() << "input-metadata",
-                                       QCoreApplication::translate("main", "Specify the input metadata file (default input.db)"),
+    // Option to specify a different JSON input file
+    QCommandLineOption inputJsonOption(QStringList() << "input-metadata",
+                                       QCoreApplication::translate("main", "Specify the input metadata file (default input.tbc.db)"),
                                        QCoreApplication::translate("main", "filename"));
-    parser.addOption(inputMetadataOption);
+    parser.addOption(inputJsonOption);
 
     // Option to select start frame (sequential) (-s)
     QCommandLineOption startFrameOption(QStringList() << "s" << "start",
@@ -168,11 +186,11 @@ int main(int argc, char *argv[])
 
     // Option to select the output format (-p)
     QCommandLineOption outputFormatOption(QStringList() << "p" << "output-format",
-                                       QCoreApplication::translate("main", "Output format (rgb, yuv, y4m; default rgb); RGB48, YUV444P16, GRAY16 pixel formats are supported"),
+                                       QCoreApplication::translate("main", "Output format (rgb, yuv, y4m, or explicit pixel formats RGB48, YUV444P16, GRAY16; default rgb)"),
                                        QCoreApplication::translate("main", "output-format"));
     parser.addOption(outputFormatOption);
 
-    // Option to set the black and white output flag (causes output to be black and white) (-b)
+    // Option to set the black and white output flag (-b)
     QCommandLineOption setBwModeOption(QStringList() << "b" << "blackandwhite",
                                        QCoreApplication::translate("main", "Output in black and white"));
     parser.addOption(setBwModeOption);
@@ -195,106 +213,162 @@ int main(int argc, char *argv[])
                                      QCoreApplication::translate("main", "number"));
     parser.addOption(threadsOption);
 
-    // Option to override calculated firstActiveFieldLine in our video parameters (-ffll)
+    // Options to override line parameters
     QCommandLineOption firstFieldLineOption(QStringList() << "ffll" << "first_active_field_line",
                                             QCoreApplication::translate("main", "The first visible line of a field. Range 1-259 for NTSC (default: 20), 2-308 for PAL (default: 22)"),
                                             QCoreApplication::translate("main", "number"));
     parser.addOption(firstFieldLineOption);
 
-    // Option to override calculated lastActiveFieldLine in our video parameters (-lfll)
     QCommandLineOption lastFieldLineOption(QStringList() << "lfll" << "last_active_field_line",
                                            QCoreApplication::translate("main", "The last visible line of a field. Range 1-259 for NTSC (default: 259), 2-308 for PAL (default: 308)"),
                                            QCoreApplication::translate("main", "number"));
     parser.addOption(lastFieldLineOption);
 
-    // Option to override calculated firstActiveFrameLine in our video parameters (-ffrl)
     QCommandLineOption firstFrameLineOption(QStringList() << "ffrl" << "first_active_frame_line",
                                             QCoreApplication::translate("main", "The first visible line of a frame. Range 1-525 for NTSC (default: 40), 1-620 for PAL (default: 44)"),
                                             QCoreApplication::translate("main", "number"));
     parser.addOption(firstFrameLineOption);
 
-    // Option to override calculated lastActiveFieldLine in our video parameters (-lfll)
     QCommandLineOption lastFrameLineOption(QStringList() << "lfrl" << "last_active_frame_line",
                                            QCoreApplication::translate("main", "The last visible line of a frame. Range 1-525 for NTSC (default: 525), 1-620 for PAL (default: 620)"),
                                            QCoreApplication::translate("main", "number"));
     parser.addOption(lastFrameLineOption);
 
     // -- NTSC decoder options --
-
-    // Option to overlay the adaptive filter map
     QCommandLineOption showMapOption(QStringList() << "o" << "oftest",
-                                     QCoreApplication::translate("main", "NTSC: Overlay the adaptive filter map (only used for testing)"));
+											QCoreApplication::translate("main", "NTSC: Overlay the adaptive filter map (only used for testing)"));
     parser.addOption(showMapOption);
 
-    // Option to set the chroma noise reduction level
-    QCommandLineOption chromaNROption(QStringList() << "chroma-nr",
+	QCommandLineOption chromaNROption(QStringList() << "chroma-nr",
                                       QCoreApplication::translate("main", "NTSC: Chroma noise reduction level in dB (default 0.0)"),
                                       QCoreApplication::translate("main", "number"));
     parser.addOption(chromaNROption);
 
-    // Option to set the luma noise reduction level
     QCommandLineOption lumaNROption(QStringList() << "luma-nr",
                                     QCoreApplication::translate("main", "Luma noise reduction level in dB (default 0.0)"),
                                     QCoreApplication::translate("main", "number"));
     parser.addOption(lumaNROption);
 
-    // Option to use phase compensating decoder
     QCommandLineOption ntscPhaseCompOption(QStringList() << "ntsc-phase-comp",
-                                           QCoreApplication::translate("main", "NTSC: Adjust phase per-line using burst phase"));
+                                           QCoreApplication::translate("main", "NTSC: Adjust phase per-line using burst phase -"
+                                           "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
+    
+	QCommandLineOption vdisOption(QStringList() << "vdis",
+											QCoreApplication::translate("main", "NTSC: Enable VDIS (Vertical Differential Isolation System) " 
+											"This restricts the 2d section very substantially - for use when regular output exhibits artifacts near horizontal color boundaries"));
+	parser.addOption(vdisOption);
 
-    // Option to set the 3D adaptive filter threshold
+    QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
+                                             QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
+	parser.addOption(noResidualVideoOption);
+
+	QCommandLineOption residualVideo3DOption(QStringList() << "residual-video-3d",
+										 QCoreApplication::translate("main", "Enable temporal enhancement for residual video"));
+	parser.addOption(residualVideo3DOption);
+
+	QCommandLineOption noResidualColorOption(QStringList() << "no-residual-color",
+										 QCoreApplication::translate("main", "NTSC (locked mode): Keep residual Y but disable residual color refinement"));
+	parser.addOption(noResidualColorOption);
+
     QCommandLineOption adaptThresholdOption(QStringList() << "adapt-threshold",
-                                            QCoreApplication::translate("main", "NTSC: 3D adaptive filter threshold (default 1.0, higher = more 3D)"),
-                                            QCoreApplication::translate("main", "number"));
+        QCoreApplication::translate("main",
+            "NTSC: 3D adaptive filter threshold (default 1.0). "
+            "Higher values increase the reward for temporally-agreeing candidates, "
+            "biasing selection toward 3D results. Lower values are more conservative, "
+            "preferring 2D/1D on motion. Veto for large deviations is unaffected."),
+        QCoreApplication::translate("main", "number"));
     parser.addOption(adaptThresholdOption);
 
-    // Option to set the chroma weight for 3D adaptive filter
     QCommandLineOption chromaWeightOption(QStringList() << "chroma-weight",
-                                          QCoreApplication::translate("main", "NTSC: Chroma weight for 3D adaptive filter (default 1.0, higher = more 2D)"),
-                                          QCoreApplication::translate("main", "number"));
+        QCoreApplication::translate("main",
+            "NTSC: Chroma weight for 3D adaptive filter (default 1.0). "
+            "Higher values make chroma disagreement between candidate and reference "
+            "more costly, biasing selection toward 2D/1D when colours differ."),
+        QCoreApplication::translate("main", "number"));
     parser.addOption(chromaWeightOption);
 
-    // -- PAL decoder options --
+    QCommandLineOption twoDVariantOption(
+        QStringList() << QCoreApplication::translate("main", "two-d-variant"),
+        QCoreApplication::translate("main",
+            "2D comb variant: line | field | fieldb | frame | fvf (default) Select between 2D comb filters: Frame is an interfield comb; Field and Field B are intrafield combs, B is simpler; Line is 1D - FVF (Field Vs Frame) intelligently selects per pixel from Frame and Field A/B "),
+        QCoreApplication::translate("main", "variant"),
+        QCoreApplication::translate("main", "fvf"));
+    parser.addOption(twoDVariantOption);
 
-    // Option to use Simple PAL UV filter
+    // -- Cadence / PA options --
+	QCommandLineOption setCadenceOption(
+		QStringList() << "set-cadence",
+		QCoreApplication::translate("main",
+			"Impose a global pulldown interpretation, selecting video start frames for the 5 -frame cycle, overriding cadenceId metadata from CineMap -"
+			"Values are: "
+			"1=AA, 2=AB, 3=BC, 4=CC, 5=DD"),
+		QCoreApplication::translate("main", "number"));
+	parser.addOption(setCadenceOption);
+
+    QCommandLineOption export24pOption(QStringList() << "export-24p",
+        QCoreApplication::translate("main", "Export 23.976 fps direct from consolidated telecine"
+        "- this version re-syncs to the original timing, trimming as needed)"));
+    parser.addOption(export24pOption);
+
+	// Max 24p option: emit every possible film frame (can be very long)
+    QCommandLineOption emitMax24pOption(QStringList() << "emit-max-24p",
+        QCoreApplication::translate("main",
+            "Use with --export-24p: outputs every film frame for which two opposite fields are available, "
+            "bypassing the per-segment resync (with trims) pass; thus produces longer, asynchronous output."));
+    parser.addOption(emitMax24pOption);
+
+    // Option to enable visual cadence debugging
+    QCommandLineOption debugCadenceOption(QStringList() << "debug-cadence",
+									QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
+    parser.addOption(debugCadenceOption);
+    
+    QCommandLineOption noPAOption(QStringList() << "no-pa",
+        QCoreApplication::translate("main", "Disable pulldown awareness - reverts to original 29.97 video process"));
+    parser.addOption(noPAOption);
+
+    QCommandLineOption dgDiscardOption(QStringList() << "dg-discard",
+        QCoreApplication::translate("main", "Skip pulldown consolidation and discard spare fields"
+        " - trades quality for speed"));
+    parser.addOption(dgDiscardOption);
+
+    QCommandLineOption dgOutlierOption(QStringList() << "dg-outlier-thresh",
+        QCoreApplication::translate("main", "When duplicate fields are merged, pixels are corrected instead of averaged when difference between twins is above this threshold (default 6 IRE)"),
+        QCoreApplication::translate("main", "number"));
+    parser.addOption(dgOutlierOption);
+
+    // ---- PAL decoder options ----------
+
     QCommandLineOption simplePALOption(QStringList() << "simple-pal",
-                                           QCoreApplication::translate("main", "Transform: Use 1D UV filter (default 2D)"));
+                                       QCoreApplication::translate("main", "Transform: Use 1D UV filter (default 2D)"));
     parser.addOption(simplePALOption);
 
-    // Option to select the Transform PAL threshold
     QCommandLineOption transformThresholdOption(QStringList() << "transform-threshold",
                                                 QCoreApplication::translate("main", "Transform: Uniform similarity threshold (default 0.4)"),
                                                 QCoreApplication::translate("main", "number"));
     parser.addOption(transformThresholdOption);
 
-    // Option to select the Transform PAL thresholds file
     QCommandLineOption transformThresholdsOption(QStringList() << "transform-thresholds",
                                                  QCoreApplication::translate("main", "Transform: File containing per-bin similarity thresholds"),
                                                  QCoreApplication::translate("main", "file"));
     parser.addOption(transformThresholdsOption);
 
-    // Option to overlay the FFTs
     QCommandLineOption showFFTsOption(QStringList() << "show-ffts",
                                       QCoreApplication::translate("main", "Transform: Overlay the input and output FFTs"));
     parser.addOption(showFFTsOption);
 
-    // -- Positional arguments --
-
-    // Positional argument to specify input video file
+    // Positional args
     parser.addPositionalArgument("input", QCoreApplication::translate("main", "Specify input TBC file (- for piped input)"));
-
-    // Positional argument to specify output video file
     parser.addPositionalArgument("output", QCoreApplication::translate("main", "Specify output file (omit or - for piped output)"));
 
-    // Process the command line options and arguments given by the user
+    // Process the command line options and arguments
     parser.process(a);
 
     // Standard logging options
     processStandardDebugOptions(parser);
     emitDeprecatedToolWarning();
 
-    // Get the arguments from the parser
+	// Get the arguments from the parser
     QString inputFileName;
     QString outputFileName = "-";
     QStringList positionalArguments = parser.positionalArguments();
@@ -304,19 +378,15 @@ int main(int argc, char *argv[])
     } else if (positionalArguments.count() == 1) {
         inputFileName = positionalArguments.at(0);
     } else {
-        // Quit with error
         qCritical("You must specify the input TBC and output files");
         return -1;
     }
 
-    // Check filename arguments are reasonable
-    if (inputFileName == "-" && !parser.isSet(inputMetadataOption)) {
-        // Quit with error
+    if (inputFileName == "-" && !parser.isSet(inputJsonOption)) {
         qCritical("With piped input, you must also specify the input metadata file");
         return -1;
     }
     if (inputFileName == outputFileName && outputFileName != "-") {
-        // Quit with error
         qCritical("Input and output files cannot be the same");
         return -1;
     }
@@ -328,12 +398,52 @@ int main(int argc, char *argv[])
     Comb::Configuration combConfig;
     MonoDecoder::MonoConfiguration monoConfig;
     OutputWriter::Configuration outputConfig;
+    CadenceAssembler::Configuration cadenceConfig; // Added
+
+    // Parse Cadence / PA options
+    if (parser.isSet(export24pOption)) {
+        cadenceConfig.export24p = true;
+        outputConfig.export24p = true; // Tell output writer to use 24p mode
+    }
+    if (parser.isSet(noPAOption)) cadenceConfig.noPA = true;
+    if (parser.isSet(dgDiscardOption)) cadenceConfig.dgDiscard = true;
+    if (parser.isSet(dgOutlierOption)) {
+        cadenceConfig.dgOutlierThreshIre = parser.value(dgOutlierOption).toDouble();
+    }
+    if (parser.isSet(emitMax24pOption)) {
+        cadenceConfig.emitMax24p = true;
+        if (!parser.isSet(export24pOption)) {
+            qWarning() << "--emit-max-24p has no effect without --export-24p";
+        }
+    }
+
+	if (parser.isSet(debugCadenceOption)) {
+        combConfig.debugCadence = true;
+    }
+    if (cadenceConfig.noPA && cadenceConfig.setCadence != 0) {
+    qCritical() << "--set-cadence is incompatible with --no-pa (pulldown processing disabled)";
+    return -1;
+	}
+    
+    QString v = parser.value(twoDVariantOption).toLower();
+    if (v == "line") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Line;
+    } else if (v == "field") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Field;
+    } else if (v == "fieldb") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldB;
+    } else if (v == "frame" || v == "frameb2") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Frame;
+    } else if (v == "fvf" || v == "fieldvframe") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldVsFrame;
+    } else {
+        qWarning() << "Unknown two-d-variant" << v << " defaulting to fvf";
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldVsFrame;
+    }
 
     if (parser.isSet(startFrameOption)) {
         startFrame = parser.value(startFrameOption).toInt();
-
         if (startFrame < 1) {
-            // Quit with error
             qCritical("Specified startFrame must be at least 1");
             return -1;
         }
@@ -341,9 +451,7 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(lengthOption)) {
         length = parser.value(lengthOption).toInt();
-
         if (length < 1) {
-            // Quit with error
             qCritical("Specified length must be greater than zero frames");
             return -1;
         }
@@ -351,9 +459,7 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(threadsOption)) {
         maxThreads = parser.value(threadsOption).toInt();
-
         if (maxThreads < 1) {
-            // Quit with error
             qCritical("Specified number of threads must be greater than zero");
             return -1;
         }
@@ -363,9 +469,7 @@ int main(int argc, char *argv[])
         const double value = parser.value(chromaGainOption).toDouble();
         palConfig.chromaGain = value;
         combConfig.chromaGain = value;
-
         if (value < 0.0) {
-            // Quit with error
             qCritical("Chroma gain must not be less than 0");
             return -1;
         }
@@ -389,21 +493,18 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(chromaNROption)) {
         combConfig.cNRLevel = parser.value(chromaNROption).toDouble();
-
         if (combConfig.cNRLevel < 0.0) {
-            // Quit with error
             qCritical("Chroma noise reduction cannot be negative");
             return -1;
         }
     }
 
     if (parser.isSet(lumaNROption)) {
-        combConfig.yNRLevel = parser.value(lumaNROption).toDouble();
-        palConfig.yNRLevel = parser.value(lumaNROption).toDouble();
-        monoConfig.yNRLevel = parser.value(lumaNROption).toDouble();
-
+        double yNR = parser.value(lumaNROption).toDouble();
+        combConfig.yNRLevel = yNR;
+        palConfig.yNRLevel = yNR;
+        monoConfig.yNRLevel = yNR;
         if (combConfig.yNRLevel < 0.0) {
-            // Quit with error
             qCritical("Luma noise reduction cannot be negative");
             return -1;
         }
@@ -413,94 +514,104 @@ int main(int argc, char *argv[])
         combConfig.phaseCompensation = true;
     }
 
-    if (parser.isSet(adaptThresholdOption)) {
-        combConfig.adaptThreshold = parser.value(adaptThresholdOption).toDouble();
+    if (parser.isSet(vdisOption)) {
+        combConfig.tunables.VDIS_ENABLE = true;
+    }
 
-        if (combConfig.adaptThreshold <= 0.0) {
+	// Residual video: enabled by default when phase compensation is active
+    if (parser.isSet(noResidualVideoOption)) {
+        combConfig.tunables.VET_ENABLE_RESIDUAL_Y = false;
+        combConfig.residualColor = false;
+    } else {
+        combConfig.tunables.VET_ENABLE_RESIDUAL_Y = combConfig.phaseCompensation ? true : combConfig.tunables.VET_ENABLE_RESIDUAL_Y;
+        combConfig.residualColor = combConfig.phaseCompensation ? true : false;
+    }
+
+    if (parser.isSet(noResidualColorOption)) {
+        combConfig.residualColor = false;
+    }
+
+    if (parser.isSet(adaptThresholdOption)) {
+        const double v = parser.value(adaptThresholdOption).toDouble();
+        if (v <= 0.0) {
             qCritical("Adapt threshold must be greater than 0");
+            return -1;
+        }
+        combConfig.adaptThreshold = v;
+    }
+
+    if (parser.isSet(chromaWeightOption)) {
+        const double v = parser.value(chromaWeightOption).toDouble();
+        if (v < 0.0) {
+            qCritical("Chroma weight must be greater than or equal to 0");
+            return -1;
+        }
+        combConfig.chromaWeight = v;
+    }
+
+    if (parser.isSet(transformThresholdOption)) {
+        palConfig.transformThreshold = parser.value(transformThresholdOption).toDouble();
+        if (palConfig.transformThreshold < 0.0 || palConfig.transformThreshold > 1.0) {
+            qCritical("Transform threshold must be between 0 and 1");
             return -1;
         }
     }
 
-    if (parser.isSet(chromaWeightOption)) {
-        combConfig.chromaWeight = parser.value(chromaWeightOption).toDouble();
-
-        if (combConfig.chromaWeight < 0.0) {
-            qCritical("Chroma weight must be greater than or equal to 0");
-            return -1;
-        }
+    if (parser.isSet(showFFTsOption)) {
+        palConfig.showFFTs = true;
     }
 
     if (parser.isSet(simplePALOption)) {
         palConfig.simplePAL = true;
     }
 
-    if (parser.isSet(transformThresholdOption)) {
-        palConfig.transformThreshold = parser.value(transformThresholdOption).toDouble();
-
-        if (palConfig.transformThreshold < 0.0 || palConfig.transformThreshold > 1.0) {
-            // Quit with error
-            qCritical("Transform threshold must be between 0 and 1");
-            return -1;
-        }
-    }
-
+    // Optional overrides for line parameters
     LdDecodeMetaData::LineParameters lineParameters;
     if (parser.isSet(firstFieldLineOption)) {
         lineParameters.firstActiveFieldLine = parser.value(firstFieldLineOption).toInt();
     }
-    
     if (parser.isSet(lastFieldLineOption)) {
         lineParameters.lastActiveFieldLine = parser.value(lastFieldLineOption).toInt();
     }
-    
     if (parser.isSet(firstFrameLineOption)) {
         lineParameters.firstActiveFrameLine = parser.value(firstFrameLineOption).toInt();
     }
-    
     if (parser.isSet(lastFrameLineOption)) {
         lineParameters.lastActiveFrameLine = parser.value(lastFrameLineOption).toInt();
     }
 
     // Work out the metadata filename
-    QString inputMetadataFileName = inputFileName + ".db";
-    if (parser.isSet(inputMetadataOption)) {
-        inputMetadataFileName = parser.value(inputMetadataOption);
+    QString inputJsonFileName = inputFileName + ".tbc.db";
+    if (parser.isSet(inputJsonOption)) {
+        inputJsonFileName = parser.value(inputJsonOption);
     }
 
     // Load the source video metadata
     LdDecodeMetaData metaData;
-    if (!metaData.read(inputMetadataFileName)) {
-        qCritical() << "Unable to open ld-decode metadata file:" << inputMetadataFileName;
+    if (!metaData.read(inputJsonFileName)) {
+        qCritical() << "Unable to open ld-decode metadata file:" << inputJsonFileName;
         return -1;
     }
-    
+
     metaData.processLineParameters(lineParameters);
-    
+
     // Reverse field order if required
     if (parser.isSet(setReverseOption)) {
         qInfo() << "Expected field order is reversed to second field/first field";
         metaData.setIsFirstFieldFirst(false);
+        cadenceConfig.reverseFieldOrder = true;
     }
 
-    // Work out which decoder to use
+    // Select decoder
     QString decoderName;
     if (parser.isSet(decoderOption)) {
         decoderName = parser.value(decoderOption);
+    } else if (metaData.getVideoParameters().system == NTSC) {
+        decoderName = "ntsc2d";
     } else {
-        // Check if video parameters are valid before accessing them
-        try {
-            if (metaData.getVideoParameters().system == NTSC) {
-                decoderName = "ntsc2d";
-            } else {
-                decoderName = "pal2d";
-            }
-        } catch (const std::exception& e) {
-            qCritical() << "Failed to access video parameters from metadata file:" << e.what();
-            return -1;
-        }
+        decoderName = "pal2d";
     }
-
+    
     // Require ntsc3d if the map overlay is selected
     if (combConfig.showMap && decoderName != "ntsc3d") {
         qCritical() << "Can only show adaptive filter map with the ntsc3d decoder";
@@ -513,21 +624,17 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // Select the decoder
+    // Create decoder
     std::unique_ptr<Decoder> decoder;
     if (decoderName == "pal2d") {
         decoder = std::make_unique<PalDecoder>(palConfig);
     } else if (decoderName == "transform2d") {
         palConfig.chromaFilter = PalColour::transform2DFilter;
-        if (!loadTransformThresholds(parser, transformThresholdsOption, palConfig)) {
-            return -1;
-        }
+        if (!loadTransformThresholds(parser, transformThresholdsOption, palConfig)) return -1;
         decoder = std::make_unique<PalDecoder>(palConfig);
     } else if (decoderName == "transform3d") {
         palConfig.chromaFilter = PalColour::transform3DFilter;
-        if (!loadTransformThresholds(parser, transformThresholdsOption, palConfig)) {
-            return -1;
-        }
+        if (!loadTransformThresholds(parser, transformThresholdsOption, palConfig)) return -1;
         decoder = std::make_unique<PalDecoder>(palConfig);
     } else if (decoderName == "ntsc1d") {
         combConfig.dimensions = 1;
@@ -549,29 +656,40 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // Select the output format
+	if (parser.isSet(residualVideo3DOption)) {
+        combConfig.residualVideo3D = true;
+    }
+    
+    // Select output format
     QString outputFormatName;
     if (parser.isSet(outputFormatOption)) {
         outputFormatName = parser.value(outputFormatOption);
     } else {
         outputFormatName = "rgb";
     }
-    if (outputFormatName == "yuv" || outputFormatName == "y4m") {
-        if (outputFormatName == "y4m") {
-            outputConfig.outputY4m = true;
-        }
+
+    // Accept explicit pixel format strings as well as legacy names.
+    QString fmt = outputFormatName.trimmed().toLower();
+    if (fmt == "y4m") {
+        outputConfig.outputY4m = true;
+        fmt = "yuv";
+    }
+
+    if (fmt == "yuv" || fmt == "yuv444p16") {
         if (bwMode || decoderName == "mono") {
             outputConfig.pixelFormat = OutputWriter::PixelFormat::GRAY16;
         } else {
             outputConfig.pixelFormat = OutputWriter::PixelFormat::YUV444P16;
         }
-    } else if (outputFormatName == "rgb") {
+    } else if (fmt == "rgb" || fmt == "rgb48") {
         outputConfig.pixelFormat = OutputWriter::PixelFormat::RGB48;
+    } else if (fmt == "gray16" || fmt == "grey16" || fmt == "gray") {
+        outputConfig.pixelFormat = OutputWriter::PixelFormat::GRAY16;
     } else {
         qCritical() << "Unknown output format" << outputFormatName;
         return -1;
     }
-
+    
     if (parser.isSet(outputPaddingOption)) {
         outputConfig.paddingAmount = parser.value(outputPaddingOption).toInt();
         if (outputConfig.paddingAmount < 1 || outputConfig.paddingAmount > 32) {
@@ -579,13 +697,26 @@ int main(int argc, char *argv[])
             outputConfig.paddingAmount = 8;
         }
     }
-    
+	// After other cadenceConfig parsing in main.cpp
+	if (parser.isSet(setCadenceOption)) {
+		int val = parser.value(setCadenceOption).toInt();
+		if (val < 1 || val > 5) {
+			qCritical() << "--set-cadence must be in the range 1..5";
+			return -1;
+		}
+		cadenceConfig.setCadence = val;
+		    // Send the notice to stderr so it doesnt corrupt piped stdout (y4m/raw)
+		    fprintf(stderr,
+		            "Info: Forcing global cadence start at index %d (AA=1, AB=2, BC=3, CC=4, DD=5).\n",
+		            val);
+			std::fflush(stderr);
+		}
     // Perform the processing
-    DecoderPool decoderPool(*decoder, inputFileName, metaData, outputConfig, outputFileName, startFrame, length, maxThreads);
+    // Updated Constructor call for DecoderPool with cadenceConfig
+    DecoderPool decoderPool(*decoder, inputFileName, metaData, outputConfig, cadenceConfig, outputFileName, startFrame, length, maxThreads);
     if (!decoderPool.process()) {
         return -1;
     }
 
-    // Quit with success
     return 0;
 }
