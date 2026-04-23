@@ -6,7 +6,9 @@ add_compile_definitions(_USE_MATH_DEFINES)
 add_library(lddecode-chroma STATIC
 	decoder.cpp
 	decoderpool.cpp
+	cadenceassembler.cpp
     comb.cpp
+    combcandidate.cpp
     componentframe.cpp
     framecanvas.cpp
     outputwriter.cpp
