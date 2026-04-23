@@ -43,36 +43,37 @@ DecoderThread::DecoderThread(QAtomicInt& _abort, DecoderPool& _decoderPool, QObj
 
 void DecoderThread::run()
 {
-    // Input and output data
     QVector<SourceField> inputFields;
     QVector<ComponentFrame> componentFrames;
     QVector<OutputFrame> outputFrames;
 
     while (!abort) {
-        // Get the next batch of fields to process
         qint32 startFrameNumber, startIndex, endIndex;
         if (!decoderPool.getInputFrames(startFrameNumber, inputFields, startIndex, endIndex)) {
-            // No more input frames -- exit
             break;
         }
 
-        // Adjust the temporary arrays to the right size
         const qint32 numFrames = (endIndex - startIndex) / 2;
         componentFrames.resize(numFrames);
         outputFrames.resize(numFrames);
 
-        // Decode the fields to component frames
         decodeFrames(inputFields, startIndex, endIndex, componentFrames);
 
-        // Convert the component frames to the output format
         for (qint32 i = 0; i < numFrames; i++) {
             outputWriter.convert(componentFrames[i], outputFrames[i]);
         }
 
-        // Write the frames to the output file
-        if (!decoderPool.putOutputFrames(startFrameNumber, outputFrames)) {
-            abort = true;
-            break;
+        if (!decoderPool.getCadenceConfig().noPA &&
+            !decoderPool.getCadenceConfig().export24p) {
+            if (!decoderPool.putOutputFrames(startFrameNumber, componentFrames, outputFrames)) {
+                abort = true;
+                break;
+            }
+        } else {
+            if (!decoderPool.putOutputFrames(startFrameNumber, outputFrames)) {
+                abort = true;
+                break;
+            }
         }
     }
 }
