@@ -29,6 +29,7 @@
 DecoderPool::DecoderPool(Decoder &_decoder, QString _inputFileName,
                          LdDecodeMetaData &_ldDecodeMetaData,
                          OutputWriter::Configuration &_outputConfig, QString _outputFileName,
+                         OutputWriter::Configuration &_outputConfig,
                          qint32 _startFrame, qint32 _length, qint32 _maxThreads)
     : decoder(_decoder), inputFileName(_inputFileName),
       outputConfig(_outputConfig), outputFileName(_outputFileName),

@@ -21,17 +21,21 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 ************************************************************************/
-
 #ifndef DECODERPOOL_H
 #define DECODERPOOL_H
 
 #include <QObject>
 #include <QAtomicInt>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QList>
 #include <QMap>
 #include <QMutex>
 #include <QThread>
-#include <QVector>
+#include <QString>
+#include <memory>
+#include <deque>
+#include <vector>
 
 #include "lddecodemetadata.h"
 #include "sourcevideo.h"
@@ -39,85 +43,155 @@
 #include "decoder.h"
 #include "outputwriter.h"
 #include "sourcefield.h"
+#include "cadenceassembler.h"
 
 class DecoderPool
 {
 public:
     explicit DecoderPool(Decoder &decoder, QString inputFileName,
                          LdDecodeMetaData &ldDecodeMetaData,
-                         OutputWriter::Configuration &outputConfig, QString outputFileName,
+                         OutputWriter::Configuration &outputConfig,
+                         CadenceAssembler::Configuration &cadenceConfig,
+                         QString outputFileName,
                          qint32 startFrame, qint32 length, qint32 maxThreads);
 
-    // Decode fields to frames as specified by the constructor args.
-    // Returns true on success; on failure, prints a message and returns false.
     bool process();
 
-    // For worker threads: get the configured OutputWriter
-    OutputWriter &getOutputWriter() {
-        return outputWriter;
-    }
-	
-	Decoder& getDecoder();
+    OutputWriter &getOutputWriter() { return outputWriter; }
+    Decoder& getDecoder();
 
-    // For worker threads: get the next batch of data from the input file.
-    //
-    // fields will be resized and filled with pairs of SourceFields; entries
-    // from startIndex to endIndex are those that should be processed into
-    // output frames, with startIndex corresponding to the first field of frame
-    // startFrameNumber.
-    //
-    // If the Decoder requested lookahead or lookbehind, an appropriate number
-    // of additional fields will be provided before startIndex and after
-    // endIndex. Dummy black frames (with metadata copied from a real frame)
-    // will be provided when going beyond the bounds of the input file.
-    //
-    // Returns true if a frame was returned, false if the end of the input has
-    // been reached.
-    bool getInputFrames(qint32 &startFrameNumber, QVector<SourceField> &fields, qint32 &startIndex, qint32 &endIndex);
+    bool getInputFrames(qint32 &startFrameNumber, QList<SourceField> &fields, qint32 &startIndex, qint32 &endIndex);
 
-    // For worker threads: return decoded frames to write to the output file.
-    //
-    // outputFrames should contain RGB48, YUV444P16, or GRAY16 output frames,
-    // with the first frame being startFrameNumber.
-    //
-    // Returns true on success, false on failure.
-    bool putOutputFrames(qint32 startFrameNumber, const QVector<OutputFrame> &outputFrames);
+	bool putOutputFrame(qint32 frameNumber,
+                                 const ComponentFrame *componentFrame,
+                                 const OutputFrame &outputFrame);
+                                 
+    bool putOutputFrames(qint32 startFrameNumber, const QList<OutputFrame> &outputFrames);
+    
+    bool putOutputFrames(qint32 startFrameNumber,
+                     const QList<ComponentFrame> &componentFrames,
+                     const QList<OutputFrame> &outputFrames);
+
+
+	const CadenceAssembler::Configuration& getCadenceConfig() const { return cadenceConfig; }
 
 private:
     bool putOutputFrame(qint32 frameNumber, const OutputFrame &outputFrame);
+    
+    SourceField createBlackField(bool isFirst, int seqNo) const;
 
-    // Default batch size, in frames
-    static constexpr qint32 DEFAULT_BATCH_SIZE = 16;
+	QSet<qint32> baselineFramesQueued; // TBC frame numbers already queued for baseline passthrough
+	
+	qint32 frameNumberForSeq(qint32 seqNo) const;
+	void enqueueBaselinePassthrough(qint32 seqNo);
+	QMap<qint32, OutputFrame> resolvedOutputFrames; // keyed by TBC frame number
+	QSet<qint32> upgradedTbcFrames;                 // cap: frames with upgrade already stored
+    static constexpr qint32 DEFAULT_BATCH_SIZE = 20;
 
-    // Parameters
+    qint32 nextOutputKey24p = 0;
+    qint32 writeCursor24p   = 0;
+    
+    struct FrameReconstructionInfo {
+        CadenceAssembler::WorkItem::Expansion expansion;
+        bool swapped;
+        bool invertedFieldOrder = false;
+        bool temporalFirstIsF1  = true;
+        enum class Role { Neutral, Def, Comp };
+        Role f1Role = Role::Neutral;
+        Role f2Role = Role::Neutral;
+        bool spareIsTopDef = true;
+
+        // Capture-time metadata for 30i reconstruction
+        int  origSeqFirst      = -1;
+        int  origSeqSecond     = -1;
+        bool origIsFirstFirst  = true;
+        bool origIsFirstSecond = false;
+    };
+    
+	QMap<qint32, FrameReconstructionInfo> frameReconstructionMap;
+	QMutex metaDataMutex; // Protects frameReconstructionMap
+
+	
+struct StoredFieldPayload
+{
+    QVector<quint16> data;
+    bool ready = false;
+};
+
+struct DecodeTicket
+{
+    enum class Kind {
+        BaselinePair,   // passthrough / no-pa style result for exactly these homes
+        UpgradePair     // telecine result that may improve these homes
+    };
+
+    Kind kind = Kind::BaselinePair;
+
+    qint32 homeSeq1 = -1;
+    qint32 homeSeq2 = -1;
+
+    // Optional twin writeback for merged A/C
+    bool duplicateTwin = false;
+    qint32 twinHomeSeq = -1;
+    int twinSource = 0; // 1 => use field 1 payload, 2 => use field 2 payload
+};
+    
+	void registerFieldUpgrade(qint32 fieldSequenceNumber,
+										   const QVector<quint16> &upgradedField);
+										   
+	void submitBaselineField(qint32 seqNo, const QVector<quint16>& data);
+	void submitUpgradedField(qint32 seqNo, const QVector<quint16>& data);
+	bool tryEmitNextOriginalPair();
+
+	void submitProcessedFieldPair(qint32 seq1, qint32 seq2, bool isUpgrade);
+	bool assembleResolvedPairToFrame(qint32 seq1, qint32 seq2, OutputFrame& frame) const;
+	// transitional worker bookkeeping; ownership remains seq-based
+	QMap<qint32, DecodeTicket> decodeTicketsByFrameNumber;
+
     Decoder &decoder;
     QString inputFileName;
     OutputWriter::Configuration outputConfig;
+    CadenceAssembler::Configuration cadenceConfig;
     QString outputFileName;
     qint32 startFrame;
     qint32 length;
     qint32 maxThreads;
 
-    // Atomic abort flag shared by worker threads; workers watch this, and shut
-    // down as soon as possible if it becomes true
     QAtomicInt abort;
 
-    // Input stream information (all guarded by inputMutex while threads are running)
     QMutex inputMutex;
-    qint32 decoderLookBehind;
-    qint32 decoderLookAhead;
-    qint32 inputFrameNumber;
-    qint32 lastFrameNumber;
+    qint32 decoderLookBehind = 0;
+    qint32 decoderLookAhead  = 0;
+    qint32 inputFrameNumber  = 1;
+    qint32 lastFrameNumber   = 1;
+    qint32 servedFrameNumber = 1;
+    
     LdDecodeMetaData &ldDecodeMetaData;
+    LdDecodeMetaData::VideoParameters effectiveVideoParameters;
+
     SourceVideo sourceVideo;
 
-    // Output stream information (all guarded by outputMutex while threads are running)
     QMutex outputMutex;
-    qint32 outputFrameNumber;
+    qint32 outputFrameNumber = 1;
     QMap<qint32, OutputFrame> pendingOutputFrames;
     OutputWriter outputWriter;
     QFile targetVideo;
     QElapsedTimer totalTimer;
+	QMap<qint32, StoredFieldPayload> baselineFieldsBySeq;
+	QMap<qint32, StoredFieldPayload> upgradedFieldsBySeq;
+    std::deque<CadenceAssembler::WorkItem> scheduled24p;
+    std::vector<CadenceAssembler::WorkItem> buildingSeg24p;
+
+    // --- Absolute Clock State ---
+    long long initialFieldSeq = -1;
+    long long framesScheduled24p = 0;
+    int lastCadenceIndex24p = -1; 
+
+	std::unique_ptr<CadenceAssembler> cadenceAssembler;
+
+    std::deque<CadenceAssembler::WorkItem> workItems;
+    
+    std::deque<SourceField> paddingHistory;
 };
 
 #endif // DECODERPOOL_H
