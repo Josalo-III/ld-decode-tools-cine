@@ -39,6 +39,20 @@ class ComponentFrame;
 // vector of 16-bit numbers.
 using OutputFrame = QVector<quint16>;
 
+struct ProcessedFieldPayload
+{
+    QVector<quint16> data;
+};
+
+struct ProcessedFieldPair
+{
+    qint32 seq1 = -1;
+    qint32 seq2 = -1;
+
+    ProcessedFieldPayload f1;
+    ProcessedFieldPayload f2;
+};
+
 class OutputWriter {
 public:
     // Output pixel formats
@@ -53,11 +67,14 @@ public:
         qint32 paddingAmount = 8;
         PixelFormat pixelFormat = RGB48;
         bool outputY4m = false;
+        bool export24p = false;
+        bool is24p = false;
     };
 
     // Set the output configuration, and adjust the VideoParameters to suit.
     // (If usePadding is disabled, this will not change the VideoParameters.)
-    void updateConfiguration(LdDecodeMetaData::VideoParameters &videoParameters, const Configuration &config);
+    void updateConfiguration(LdDecodeMetaData::VideoParameters &videoParameters,
+                             const Configuration &config);
 
     // Print a qInfo message about the output format
     void printOutputInfo() const;
@@ -71,8 +88,22 @@ public:
     // For worker threads: convert a component frame to the configured output format
     void convert(const ComponentFrame &componentFrame, OutputFrame &outputFrame) const;
 
+    // Extract processed fields directly from the component frame, before final frame serialization.
+    void extractFieldPair(const ComponentFrame &componentFrame,
+                          qint32 seq1,
+                          qint32 seq2,
+                          ProcessedFieldPair &out) const;
+
     PixelFormat getPixelFormat() const {
         return config.pixelFormat;
+    }
+
+    qint32 getOutputHeight() const {
+        return outputHeight;
+    }
+
+    qint32 getOutputWidth() const {
+        return activeWidth;
     }
 
 private:
@@ -81,13 +112,13 @@ private:
     LdDecodeMetaData::VideoParameters videoParameters;
 
     // Number of blank lines to add at the top and bottom of the output
-    qint32 topPadLines;
-    qint32 bottomPadLines;
+    qint32 topPadLines = 0;
+    qint32 bottomPadLines = 0;
 
     // Output size
-    qint32 activeWidth;
-    qint32 activeHeight;
-    qint32 outputHeight;
+    qint32 activeWidth = 0;
+    qint32 activeHeight = 0;
+    qint32 outputHeight = 0;
 
     // Get a string representing the pixel format
     const char *getPixelName() const;
@@ -96,7 +127,9 @@ private:
     void clearPadLines(qint32 firstLine, qint32 numLines, OutputFrame &outputFrame) const;
 
     // Convert one line
-    void convertLine(qint32 lineNumber, const ComponentFrame &componentFrame, OutputFrame &outputFrame) const;
+    void convertLine(qint32 lineNumber,
+                     const ComponentFrame &componentFrame,
+                     OutputFrame &outputFrame) const;
 };
 
 #endif // OUTPUTWRITER_H

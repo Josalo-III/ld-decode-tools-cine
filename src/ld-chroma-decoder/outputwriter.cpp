@@ -58,6 +58,11 @@ void OutputWriter::updateConfiguration(LdDecodeMetaData::VideoParameters &_video
     topPadLines = 0;
     bottomPadLines = 0;
 
+    // Sync is24p from export24p if needed
+    if (config.export24p) {
+        config.is24p = true;
+    }
+
     activeWidth = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
     activeHeight = videoParameters.lastActiveFrameLine - videoParameters.firstActiveFrameLine;
     outputHeight = activeHeight;
@@ -141,17 +146,22 @@ QByteArray OutputWriter::getStreamHeader() const
     str << " H" << outputHeight;
 
     // Frame rate
-    if (videoParameters.system == PAL) {
+    if (config.is24p) {
+        // NTSC Film rate (23.976)
+        str << " F24000:1001";
+    } else if (videoParameters.system == PAL) {
         str << " F25:1";
     } else {
         str << " F30000:1001";
     }
 
     // Field order
-    if (videoParameters.firstActiveFrameLine % 2 ^ topPadLines % 2) {
-        str << " Ib";
+    if (config.is24p) {
+        str << " Ip"; // Progressive 24p
+    } else if (videoParameters.firstActiveFrameLine % 2 ^ topPadLines % 2) {
+        str << " Ib"; // Bottom field first
     } else {
-        str << " It";
+        str << " It"; // Top field first
     }
 
     // Pixel aspect ratio
@@ -171,7 +181,7 @@ QByteArray OutputWriter::getStreamHeader() const
         }
     }
 
-    // Pixel format
+	// Pixel format and colour metadata
     switch (config.pixelFormat) {
     case YUV444P16:
         str << " C444p16 XCOLORRANGE=LIMITED";
@@ -198,6 +208,102 @@ QByteArray OutputWriter::getFrameHeader() const
     return QStringLiteral("FRAME\n").toUtf8();
 }
 
+void OutputWriter::extractFieldPair(const ComponentFrame &componentFrame,
+                                    qint32 seq1,
+                                    qint32 seq2,
+                                    ProcessedFieldPair &out) const
+{
+    out.seq1 = seq1;
+    out.seq2 = seq2;
+    out.f1.data.clear();
+    out.f2.data.clear();
+
+    const qint32 firstLine = videoParameters.firstActiveFrameLine;
+    const qint32 lastLine  = videoParameters.lastActiveFrameLine;
+    const qint32 left      = videoParameters.activeVideoStart;
+    const qint32 width     = activeWidth;
+
+    const double yOffset = videoParameters.black16bIre;
+    double yRange = videoParameters.white16bIre - videoParameters.black16bIre;
+    double uvRange = yRange;
+
+    if (yRange == 0.0) yRange = 1.0;
+    if (uvRange == 0.0) uvRange = 1.0;
+
+    const double yScale  = 65535.0 / yRange;
+    const double uvScale = 65535.0 / uvRange;
+
+    auto clamp16 = [](double v) -> quint16 {
+        if (v < 0.0) v = 0.0;
+        if (v > 65535.0) v = 65535.0;
+        return static_cast<quint16>(std::lrint(v));
+    };
+
+    const qint32 activeLines = lastLine - firstLine;
+    const qint32 fieldLines1 = (activeLines + 1) / 2;
+    const qint32 fieldLines2 = activeLines / 2;
+
+    qint32 samplesPerPixel = 1;
+    if (config.pixelFormat == RGB48 || config.pixelFormat == YUV444P16) {
+        samplesPerPixel = 3;
+    }
+
+    out.f1.data.reserve(fieldLines1 * width * samplesPerPixel);
+    out.f2.data.reserve(fieldLines2 * width * samplesPerPixel);
+
+    for (qint32 inputLine = firstLine; inputLine < lastLine; ++inputLine) {
+        const double *inY = componentFrame.y(inputLine) + left;
+        const double *inU = (config.pixelFormat != GRAY16)
+                          ? componentFrame.u(inputLine) + left : nullptr;
+        const double *inV = (config.pixelFormat != GRAY16)
+                          ? componentFrame.v(inputLine) + left : nullptr;
+
+        const bool toFirstField = ((inputLine - firstLine) & 1) == 0;
+        QVector<quint16> &dst = toFirstField ? out.f1.data : out.f2.data;
+
+        switch (config.pixelFormat) {
+        case GRAY16:
+            for (qint32 x = 0; x < width; ++x) {
+                const double yNorm = (inY[x] - yOffset) / yRange;
+                const double yOut  = Y_ZERO + yNorm * Y_SCALE;
+                dst.push_back(clamp16(yOut));
+            }
+            break;
+
+        case YUV444P16:
+            for (qint32 x = 0; x < width; ++x) {
+                const double yNorm = (inY[x] - yOffset) / yRange;
+                const double uNorm = inU[x] / uvRange;
+                const double vNorm = inV[x] / uvRange;
+
+                const double yOut = Y_ZERO + yNorm * Y_SCALE;
+                const double uOut = C_ZERO + uNorm * C_SCALE;
+                const double vOut = C_ZERO + vNorm * C_SCALE;
+
+                dst.push_back(clamp16(yOut));
+                dst.push_back(clamp16(uOut));
+                dst.push_back(clamp16(vOut));
+            }
+            break;
+
+        case RGB48:
+            for (qint32 x = 0; x < width; ++x) {
+                const double rY = qBound(0.0, (inY[x] - yOffset) * yScale, 65535.0);
+                const double rU = inU[x] * uvScale;
+                const double rV = inV[x] * uvScale;
+
+                const double r = qBound(0.0, rY + ( 1.139883 * rV), 65535.0);
+                const double g = qBound(0.0, rY + (-0.394642 * rU) + (-0.580622 * rV), 65535.0);
+                const double b = qBound(0.0, rY + ( 2.032062 * rU), 65535.0);
+
+                dst.push_back(static_cast<quint16>(r));
+                dst.push_back(static_cast<quint16>(g));
+                dst.push_back(static_cast<quint16>(b));
+            }
+            break;
+        }
+    }
+}
 void OutputWriter::convert(const ComponentFrame &componentFrame, OutputFrame &outputFrame) const
 {
     // Work out the number of output values, and resize the vector accordingly
@@ -280,37 +386,31 @@ void OutputWriter::convertLine(qint32 lineNumber, const ComponentFrame &componen
     const double uvRange = yRange;
 
     switch (config.pixelFormat) {
-        case RGB48: {
-            // Convert Y'UV to full-range R'G'B' [Poynton eq 28.6 p337]
-            quint16 *out = outputFrame.data() + (activeWidth * outputLine * 3);
-
-            const double yScale = 65535.0 / yRange;
-            const double uvScale = 65535.0 / uvRange;
-
-            for (qint32 x = 0; x < activeWidth; x++) {
-                // Scale Y'UV to 0-65535
-                const double rY = qBound(0.0, (inY[x] - yOffset) * yScale, 65535.0);
-                const double rU = inU[x] * uvScale;
-                const double rV = inV[x] * uvScale;
-
-                // Convert Y'UV to R'G'B'
-                const qint32 pos = x * 3;
-                out[pos]     = static_cast<quint16>(qBound(0.0, rY                    + (1.139883 * rV),  65535.0));
-                out[pos + 1] = static_cast<quint16>(qBound(0.0, rY + (-0.394642 * rU) + (-0.580622 * rV), 65535.0));
-                out[pos + 2] = static_cast<quint16>(qBound(0.0, rY + (2.032062 * rU),                     65535.0));
-            }
-
-            break;
-        }
+		case RGB48: {
+					// Convert Y'UV to full-range R'G'B' [Poynton eq 28.6 p337]
+					quint16 *out = outputFrame.data() + (activeWidth * outputLine * 3);
+					const double yScale  = 65535.0 / yRange;
+					const double uvScale = 65535.0 / uvRange;
+					for (qint32 x = 0; x < activeWidth; x++) {
+						const double rY = qBound(0.0, (inY[x] - yOffset) * yScale, 65535.0);
+						const double rU = inU[x] * uvScale;
+						const double rV = inV[x] * uvScale;
+						const qint32 pos = x * 3;
+						out[pos]     = static_cast<quint16>(qBound(0.0, rY                    + (1.139883 * rV),  65535.0));
+						out[pos + 1] = static_cast<quint16>(qBound(0.0, rY + (-0.394642 * rU) + (-0.580622 * rV), 65535.0));
+						out[pos + 2] = static_cast<quint16>(qBound(0.0, rY + (2.032062 * rU),                    65535.0));
+					}
+					break;
+				}
         case YUV444P16: {
             // Convert Y'UV to Y'CbCr [Poynton eq 25.5 p307]
             quint16 *outY  = outputFrame.data() + (activeWidth * outputLine);
-            quint16 *outCB = outY + (activeWidth * outputHeight);
+            quint16 *outCB = outY  + (activeWidth * outputHeight);
             quint16 *outCR = outCB + (activeWidth * outputHeight);
 
-            const double yScale = Y_SCALE / yRange;
-            const double cbScale = (C_SCALE / (ONE_MINUS_Kb * kB)) / uvRange;
-            const double crScale = (C_SCALE / (ONE_MINUS_Kr * kR)) / uvRange;
+            const double yScale  = Y_SCALE / yRange;
+            const double cbScale = C_SCALE / (ONE_MINUS_Kb * kB * uvRange);
+            const double crScale = C_SCALE / (ONE_MINUS_Kr * kR * uvRange);
 
             for (qint32 x = 0; x < activeWidth; x++) {
                 outY[x]  = static_cast<quint16>(qBound(Y_MIN, ((inY[x] - yOffset) * yScale)  + Y_ZERO, Y_MAX));
@@ -320,7 +420,7 @@ void OutputWriter::convertLine(qint32 lineNumber, const ComponentFrame &componen
 
             break;
         }
-        case GRAY16: {
+		case GRAY16: {
             // Throw away UV and just convert Y' to the same scale as Y'CbCr
             quint16 *out = outputFrame.data() + (activeWidth * outputLine);
 
@@ -334,3 +434,4 @@ void OutputWriter::convertLine(qint32 lineNumber, const ComponentFrame &componen
         }
     }
 }
+
