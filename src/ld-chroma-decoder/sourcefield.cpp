@@ -33,49 +33,39 @@ void SourceField::loadFields(SourceVideo &sourceVideo, LdDecodeMetaData &ldDecod
 {
     const LdDecodeMetaData::VideoParameters &videoParameters = ldDecodeMetaData.getVideoParameters();
 
-    // Work out indexes.
-    // fields will contain {lookbehind fields... [startIndex] real fields... [endIndex] lookahead fields...}.
     startIndex = 2 * lookBehindFrames;
     endIndex = startIndex + (2 * numFrames);
     fields.resize(endIndex + (2 * lookAheadFrames));
 
-    // Populate fields
     const qint32 numInputFrames = ldDecodeMetaData.getNumberOfFrames();
     qint32 frameNumber = firstFrameNumber - lookBehindFrames;
     for (qint32 i = 0; i < fields.size(); i += 2) {
 
-        // Is this frame outside the bounds of the input file?
-        // If so, use real metadata (from frame 1) and black fields.
         const bool useBlankFrame = frameNumber < 1 || frameNumber > numInputFrames;
 
-        // Get the first frame from the file (using frame 1 if outside bounds)
-        qint32 firstFieldNumber = ldDecodeMetaData.getFirstFieldNumber(useBlankFrame ? 1 : frameNumber);
+        qint32 firstFieldNumber  = ldDecodeMetaData.getFirstFieldNumber(useBlankFrame ? 1 : frameNumber);
         qint32 secondFieldNumber = ldDecodeMetaData.getSecondFieldNumber(useBlankFrame ? 1 : frameNumber);
 
-        // Fetch the input metadata
-        fields[i].field = ldDecodeMetaData.getField(firstFieldNumber);
+        fields[i].field     = ldDecodeMetaData.getField(firstFieldNumber);
         fields[i + 1].field = ldDecodeMetaData.getField(secondFieldNumber);
+
+        // Store original TBC capture partner seqNo on each field.
+        // This is the ground truth for reconstruction — derived once here
+        // from the metadata frame map, carried forward from this point.
+        fields[i].capturePartnerSeqNo     = useBlankFrame ? -1 : secondFieldNumber;
+        fields[i + 1].capturePartnerSeqNo = useBlankFrame ? -1 : firstFieldNumber;
 
         const quint16 black = videoParameters.black16bIre;
 
         if (useBlankFrame) {
-            // Fill both fields with black
             fields[i].data.fill(black, sourceVideo.getFieldLength());
             fields[i + 1].data.fill(black, sourceVideo.getFieldLength());
         } else {
-            // Fetch the input fields
-            fields[i].data = sourceVideo.getVideoField(firstFieldNumber);
+            fields[i].data     = sourceVideo.getVideoField(firstFieldNumber);
             fields[i + 1].data = sourceVideo.getVideoField(secondFieldNumber);
 
-            if ((videoParameters.system == PAL || videoParameters.system == PAL_M) && videoParameters.isSubcarrierLocked) {
-                // With subcarrier-locked 4fSC PAL sampling, we have four
-                // "extra" samples over the course of the frame, so the two
-                // fields will be horizontally misaligned by two samples. Shift
-                // the second field to the left to compensate.
-                //
-                // XXX This should be done elsewhere, as it affects other tools
-                // too.
-
+            if ((videoParameters.system == PAL || videoParameters.system == PAL_M) &&
+                videoParameters.isSubcarrierLocked) {
                 fields[i + 1].data.remove(0, 2);
                 for (int j = 0; j < 2; j++) {
                     fields[i + 1].data.append(black);

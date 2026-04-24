@@ -77,7 +77,14 @@ public:
 
 private:
     bool putOutputFrame(qint32 frameNumber, const OutputFrame &outputFrame);
-    
+
+	OutputFrame interleaveFieldPayloads(const QVector<quint16>& field1,
+										const QVector<quint16>& field2) const;
+										
+	void splitOutputFrameToFields(const OutputFrame& frame,
+                                            QVector<quint16>& field1,
+                                            QVector<quint16>& field2) const;
+	
     SourceField createBlackField(bool isFirst, int seqNo) const;
 
 	QSet<qint32> baselineFramesQueued; // TBC frame numbers already queued for baseline passthrough

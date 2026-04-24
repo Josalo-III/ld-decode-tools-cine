@@ -581,7 +581,7 @@ int main(int argc, char *argv[])
     }
 
     // Work out the metadata filename
-    QString inputJsonFileName = inputFileName + ".tbc.db";
+    QString inputJsonFileName = inputFileName + ".db";
     if (parser.isSet(inputJsonOption)) {
         inputJsonFileName = parser.value(inputJsonOption);
     }

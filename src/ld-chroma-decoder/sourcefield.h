@@ -32,24 +32,17 @@
 struct SourceField {
     LdDecodeMetaData::Field field;
     SourceVideo::Data data;
+    qint32 capturePartnerSeqNo = -1;  // seqNo of the other field in the original TBC frame
 
-    // Load a sequence of frames from the input files.
-    //
-    // fields will contain {lookbehind fields... [startIndex] real fields... [endIndex] lookahead fields...}.
-    // Fields requested outside the bounds of the file will have dummy metadata and black data.
     static void loadFields(SourceVideo &sourceVideo, LdDecodeMetaData &ldDecodeMetaData,
                            qint32 firstFrameNumber, qint32 numFrames,
                            qint32 lookBehindFrames, qint32 lookAheadFrames,
                            QVector<SourceField> &fields, qint32 &startIndex, qint32 &endIndex);
 
-    // Return the vertical offset of this field within the interlaced frame
-    // (i.e. 0 for the top field, 1 for the bottom field).
     qint32 getOffset() const {
         return field.isFirstField ? 0 : 1;
     }
 
-    // Return the first/last active line numbers within this field's data,
-    // given the video parameters.
     qint32 getFirstActiveLine(const LdDecodeMetaData::VideoParameters &videoParameters) const {
         return (videoParameters.firstActiveFrameLine + 1 - getOffset()) / 2;
     }

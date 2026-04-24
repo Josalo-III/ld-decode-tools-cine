@@ -235,6 +235,108 @@ void DecoderPool::registerFieldUpgrade(qint32 fieldSequenceNumber,
     upgradedFieldsBySeq[fieldSequenceNumber] = { upgradedField, true };
 }
 
+// Split a fully converted OutputFrame into two field payloads (even/odd lines)
+void DecoderPool::splitOutputFrameToFields(const OutputFrame& frame,
+                                            QVector<quint16>& field1,
+                                            QVector<quint16>& field2) const
+{
+    const qint32 width = outputWriter.getOutputWidth();
+    const qint32 height = outputWriter.getOutputHeight();
+    const qint32 pixelFormat = outputWriter.getPixelFormat();
+
+    const qint32 field1Lines = (height + 1) / 2;
+    const qint32 field2Lines = height / 2;
+
+    if (pixelFormat == OutputWriter::YUV444P16) {
+        // Planar: three separate planes of width * height each
+        const qint32 planeSize = width * height;
+        const qint32 f1PlaneSize = width * field1Lines;
+        const qint32 f2PlaneSize = width * field2Lines;
+
+        field1.resize(f1PlaneSize * 3);
+        field2.resize(f2PlaneSize * 3);
+
+        for (int plane = 0; plane < 3; ++plane) {
+            const quint16* src = frame.constData() + plane * planeSize;
+            quint16* dst1 = field1.data() + plane * f1PlaneSize;
+            quint16* dst2 = field2.data() + plane * f2PlaneSize;
+
+            for (qint32 line = 0; line < height; ++line) {
+                if ((line & 1) == 0)
+                    memcpy(dst1 + (line / 2) * width, src + line * width, width * sizeof(quint16));
+                else
+                    memcpy(dst2 + (line / 2) * width, src + line * width, width * sizeof(quint16));
+            }
+        }
+    } else {
+        // Packed (RGB48 or GRAY16)
+        qint32 samplesPerPixel = (pixelFormat == OutputWriter::RGB48) ? 3 : 1;
+        const qint32 lineStride = width * samplesPerPixel;
+
+        field1.resize(field1Lines * lineStride);
+        field2.resize(field2Lines * lineStride);
+
+        for (qint32 line = 0; line < height; ++line) {
+            const quint16* src = frame.constData() + line * lineStride;
+            if ((line & 1) == 0)
+                memcpy(field1.data() + (line / 2) * lineStride, src, lineStride * sizeof(quint16));
+            else
+                memcpy(field2.data() + (line / 2) * lineStride, src, lineStride * sizeof(quint16));
+        }
+    }
+}
+
+OutputFrame DecoderPool::interleaveFieldPayloads(const QVector<quint16>& field1,
+                                                  const QVector<quint16>& field2) const
+{
+    const qint32 width = outputWriter.getOutputWidth();
+    const qint32 height = outputWriter.getOutputHeight();
+    const qint32 pixelFormat = outputWriter.getPixelFormat();
+
+    const qint32 field1Lines = (height + 1) / 2;
+    const qint32 field2Lines = height / 2;
+
+    if (pixelFormat == OutputWriter::YUV444P16) {
+        const qint32 planeSize = width * height;
+        const qint32 f1PlaneSize = width * field1Lines;
+        const qint32 f2PlaneSize = width * field2Lines;
+
+        OutputFrame frame;
+        frame.resize(planeSize * 3);
+
+        for (int plane = 0; plane < 3; ++plane) {
+            quint16* dst = frame.data() + plane * planeSize;
+            const quint16* src1 = field1.constData() + plane * f1PlaneSize;
+            const quint16* src2 = field2.constData() + plane * f2PlaneSize;
+
+            for (qint32 line = 0; line < height; ++line) {
+                if ((line & 1) == 0)
+                    memcpy(dst + line * width, src1 + (line / 2) * width, width * sizeof(quint16));
+                else
+                    memcpy(dst + line * width, src2 + (line / 2) * width, width * sizeof(quint16));
+            }
+        }
+
+        return frame;
+    } else {
+        qint32 samplesPerPixel = (pixelFormat == OutputWriter::RGB48) ? 3 : 1;
+        const qint32 lineStride = width * samplesPerPixel;
+
+        OutputFrame frame;
+        frame.resize(height * lineStride);
+
+        for (qint32 line = 0; line < height; ++line) {
+            quint16* dst = frame.data() + line * lineStride;
+            if ((line & 1) == 0)
+                memcpy(dst, field1.constData() + (line / 2) * lineStride, lineStride * sizeof(quint16));
+            else
+                memcpy(dst, field2.constData() + (line / 2) * lineStride, lineStride * sizeof(quint16));
+        }
+
+        return frame;
+    }
+}
+
 void DecoderPool::submitBaselineField(qint32 seqNo, const QVector<quint16>& data)
 {
     if (seqNo < 0 || data.isEmpty()) return;
@@ -382,18 +484,11 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         return !clean;
     };
 
-    auto looksUnclean24p = [](const CadenceAssembler::WorkItem& wi) -> bool {
-        if (wi.filmLabel == 'B') return true;
-        if (wi.f1.field.cinemap.cadenceId < 0 || wi.f2.field.cinemap.cadenceId < 0) return true;
-        return false;
-    };
-
     auto dropScore24p = [&](const CadenceAssembler::WorkItem& wi) -> int {
         int s = 0;
         if (wi.f1.field.cinemap.cadenceId == -2 || wi.f2.field.cinemap.cadenceId == -2) s += 100;
         if (wi.f1.field.cinemap.cadenceId < 0 || wi.f2.field.cinemap.cadenceId < 0) s += 4;
         if (wi.f1.field.cinemap.isEditBoundary || wi.f2.field.cinemap.isEditBoundary) s += 50;
-        if (looksUnclean24p(wi)) s += 2;
         return s;
     };
 
@@ -418,7 +513,27 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
                                 fetchStart, fetchFrames,
                                 0, 0,
                                 rawVec, dummyStart, dummyEnd);
-
+                                
+        // Trim batch to end on a cadence cycle boundary (cadenceId 9 = D2)
+		const int rawSize = static_cast<int>(rawVec.size());
+		int trimEnd = rawSize;
+		for (int i = rawSize - 1; i >= std::max(0, rawSize - 10); --i) {
+			const int cid = rawVec[i].field.cinemap.cadenceId;
+			if (cid == 9 || (cid >= 0 && cid % 10 == 9)) {
+				trimEnd = i + 1;
+				break;
+			}
+			if (rawVec[i].field.cinemap.isEditBoundary) {
+				trimEnd = i;
+				break;
+			}
+		}
+		
+		if (trimEnd < rawSize) {
+			const int fieldsReturned = rawSize - trimEnd;
+			inputFrameNumber -= fieldsReturned / 2;
+			rawVec.resize(trimEnd);
+		}
         if (cadenceAssembler) {
             cadenceAssembler->push(rawVec);
             const auto produced = cadenceAssembler->popWork();
@@ -650,35 +765,24 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
     return true;
 }
 
-void DecoderPool::submitProcessedFieldPair(qint32 seq1, qint32 seq2, bool isUpgrade)
-{
-    if (isUpgrade) {
-        upgradedFieldsBySeq[seq1] = { {}, true };
-        upgradedFieldsBySeq[seq2] = { {}, true };
-    } else {
-        if (!upgradedFieldsBySeq.contains(seq1))
-            baselineFieldsBySeq[seq1] = { {}, true };
-        if (!upgradedFieldsBySeq.contains(seq2))
-            baselineFieldsBySeq[seq2] = { {}, true };
-    }
-}
-
 bool DecoderPool::assembleResolvedPairToFrame(qint32 seq1, qint32 seq2, OutputFrame& frame) const
 {
-    // Check seqNo completion — registry unchanged.
-    auto seqReady = [&](qint32 seq) -> bool {
-        if (upgradedFieldsBySeq.contains(seq)) return true;
-        if (baselineFieldsBySeq.contains(seq)) return true;
-        return false;
+    auto getFieldData = [&](qint32 seq) -> const QVector<quint16>* {
+        auto upIt = upgradedFieldsBySeq.constFind(seq);
+        if (upIt != upgradedFieldsBySeq.constEnd() && !upIt->data.isEmpty())
+            return &upIt->data;
+        auto baseIt = baselineFieldsBySeq.constFind(seq);
+        if (baseIt != baselineFieldsBySeq.constEnd() && !baseIt->data.isEmpty())
+            return &baseIt->data;
+        return nullptr;
     };
-    if (!seqReady(seq1) || !seqReady(seq2)) return false;
 
-    // Pull the full OutputFrame stored at decode time.
-    const qint32 tbcFrame = frameNumberForSeq(seq1);
-    auto it = resolvedOutputFrames.constFind(tbcFrame);
-    if (it == resolvedOutputFrames.constEnd() || it->isEmpty()) return false;
+    const QVector<quint16>* f1data = getFieldData(seq1);
+    const QVector<quint16>* f2data = getFieldData(seq2);
 
-    frame = *it;
+    if (!f1data || !f2data) return false;
+
+    frame = interleaveFieldPayloads(*f1data, *f2data);
     return true;
 }
 
@@ -768,51 +872,44 @@ bool DecoderPool::putOutputFrame(qint32 frameNumber,
     }
 
     auto ticketIt = decodeTicketsByFrameNumber.find(frameNumber);
-    if (ticketIt == decodeTicketsByFrameNumber.end()) {
+        if (ticketIt == decodeTicketsByFrameNumber.end()) {
+            return true;
+        }
+    
+        const DecodeTicket ticket = ticketIt.value();
+        decodeTicketsByFrameNumber.erase(ticketIt);
+    
+        const bool isUpgrade = (ticket.kind == DecodeTicket::Kind::UpgradePair);
+    
+        if (!componentFrame) {
+            qWarning() << "putOutputFrame: 29.97 path called without ComponentFrame"
+                       << "for frameNumber" << frameNumber
+                       << "homeSeq1" << ticket.homeSeq1
+                       << "homeSeq2" << ticket.homeSeq2;
+            return false;
+        }
+    
+		QVector<quint16> f1data, f2data;
+		splitOutputFrameToFields(outputFrame, f1data, f2data);
+		
+		if (isUpgrade) {
+			submitUpgradedField(ticket.homeSeq1, f1data);
+			submitUpgradedField(ticket.homeSeq2, f2data);
+		} else {
+			if (!upgradedFieldsBySeq.contains(ticket.homeSeq1))
+				submitBaselineField(ticket.homeSeq1, f1data);
+			if (!upgradedFieldsBySeq.contains(ticket.homeSeq2))
+				submitBaselineField(ticket.homeSeq2, f2data);
+		}
+		
+		if (isUpgrade && ticket.duplicateTwin) {
+			const QVector<quint16>& twinFieldData =
+				(ticket.twinSource == 1) ? f1data : f2data;
+			submitUpgradedField(ticket.twinHomeSeq, twinFieldData);
+		}
+    
+        while (tryEmitNextOriginalPair()) {
+        }
+    
         return true;
-    }
-
-    const DecodeTicket ticket = ticketIt.value();
-    decodeTicketsByFrameNumber.erase(ticketIt);
-
-    const bool isUpgrade = (ticket.kind == DecodeTicket::Kind::UpgradePair);
-
-    if (!componentFrame) {
-        qWarning() << "putOutputFrame: 29.97 path called without ComponentFrame"
-                   << "for frameNumber" << frameNumber
-                   << "homeSeq1" << ticket.homeSeq1
-                   << "homeSeq2" << ticket.homeSeq2;
-        return false;
-    }
-
-    // Store the full OutputFrame — no half-frame split.
-    // Upgrade caps baseline: once an upgrade is stored the slot is closed.
-    const qint32 tbcFrame = frameNumberForSeq(ticket.homeSeq1);
-    if (tbcFrame >= 1) {
-        if (isUpgrade) {
-            resolvedOutputFrames[tbcFrame] = outputFrame;
-            upgradedTbcFrames.insert(tbcFrame);
-        } else if (!upgradedTbcFrames.contains(tbcFrame)) {
-            resolvedOutputFrames[tbcFrame] = outputFrame;
-        }
-    }
-
-    // Register seqNo completion for registry tracking — no data stored.
-    submitProcessedFieldPair(ticket.homeSeq1, ticket.homeSeq2, isUpgrade);
-
-    // Twin writeback: the spare TBC frame gets the same OutputFrame as the A/C frame.
-    if (isUpgrade && ticket.duplicateTwin) {
-        const qint32 twinTbcFrame = frameNumberForSeq(ticket.twinHomeSeq);
-        if (twinTbcFrame >= 1 && !upgradedTbcFrames.contains(twinTbcFrame)) {
-            resolvedOutputFrames[twinTbcFrame] = outputFrame;
-            upgradedTbcFrames.insert(twinTbcFrame);
-        }
-        // Register twin seqNo completion.
-        upgradedFieldsBySeq[ticket.twinHomeSeq] = { {}, true };
-    }
-
-    while (tryEmitNextOriginalPair()) {
-    }
-
-    return true;
 }
