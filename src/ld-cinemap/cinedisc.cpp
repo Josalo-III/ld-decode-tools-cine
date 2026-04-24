@@ -5,8 +5,50 @@
 
 #include <QDebug>
 #include <QFileInfo>
+#include <algorithm>
+#include <unordered_set>
 
 #include <memory>
+
+namespace {
+
+	// Parse seqNo keys from comma-separated string, optionally supporting ranges (e.g., "10-20")
+	static std::vector<qint32> parseSeqNoKeys(const QString& text, bool allowRanges)
+	{
+		std::vector<qint32> out;
+		if (text.trimmed().isEmpty()) return out;
+	
+		const QStringList items = text.split(',', Qt::SkipEmptyParts);
+		for (QString item : items) {
+			item = item.trimmed();
+			if (item.isEmpty()) continue;
+	
+			if (allowRanges && item.contains('-')) {
+				const QStringList parts = item.split('-', Qt::SkipEmptyParts);
+				if (parts.size() != 2) continue;
+	
+				bool okA = false, okB = false;
+				qint32 a = parts[0].trimmed().toInt(&okA);
+				qint32 b = parts[1].trimmed().toInt(&okB);
+				if (!okA || !okB) continue;
+				if (a <= 0 || b <= 0) continue;
+	
+				if (a > b) std::swap(a, b);
+				for (qint32 v = a; v <= b; ++v) out.push_back(v);
+			} else {
+				bool ok = false;
+				qint32 v = item.toInt(&ok);
+				if (!ok || v <= 0) continue;
+				out.push_back(v);
+			}
+		}
+	
+		std::sort(out.begin(), out.end());
+		out.erase(std::unique(out.begin(), out.end()), out.end());
+		return out;
+	}
+	
+} // namespace
 
 class CineDiscMeta : public CineDisc
 {
@@ -59,7 +101,7 @@ public:
     }
 
     // -------------------------------------------------------------------------
-    // CineDisc interface
+    // CineDisc interface implementation
     // -------------------------------------------------------------------------
 
     LdDecodeMetaData& getMetaData() override
@@ -136,10 +178,61 @@ public:
         return m_tbcPath;
     }
 
-    // refreshFrameCache() is a no-op for CineDiscMeta: we hold no derived
-    // frame-number cache of our own.  The base-class default handles this.
+    // -------------------------------------------------------------------------
+    // Edit Whitelist/Blacklist Implementation
+    // -------------------------------------------------------------------------
+
+    int applyEditWhitelistSeqNoKeys(const QString& csvSeqNoList) override
+    {
+        const auto keys = parseSeqNoKeys(csvSeqNoList, /*allowRanges=*/false);
+        return applyEditOverridesBySeqNoKeys(keys, /*value=*/true);
+    }
+
+    int applyEditBlacklistSeqNoKeys(const QString& csvSeqNoListWithRanges) override
+    {
+        const auto keys = parseSeqNoKeys(csvSeqNoListWithRanges, /*allowRanges=*/true);
+        return applyEditOverridesBySeqNoKeys(keys, /*value=*/false);
+    }
 
 private:
+    // -------------------------------------------------------------------------
+    // Private implementation
+    // -------------------------------------------------------------------------
+
+    // Apply edit overrides (whitelist=true for force-on, blacklist=false for force-off)
+    int applyEditOverridesBySeqNoKeys(const std::vector<qint32>& seqNoKeys, bool value)
+    {
+        if (seqNoKeys.empty()) return 0;
+
+        const qint32 totalFields = m_md->getNumberOfFields();
+        int changed = 0;
+
+        const std::unordered_set<qint32> wanted(seqNoKeys.begin(), seqNoKeys.end());
+
+        for (qint32 idx = 1; idx <= totalFields; ++idx) {
+            const auto field = m_md->getField(idx);
+
+            if (wanted.find(field.seqNo) == wanted.end()) continue;
+
+            // Skip pad fields (unusual to override but harmless)
+            if (field.pad) continue;
+
+            // Create a modified field with the override
+            auto modifiedField = field;
+			modifiedField.cinemap.isEditBoundary = value;
+			modifiedField.cinemap.isManualOverride = true;
+            // Use updateField to persist the override
+            m_md->updateField(modifiedField, idx);
+            changed++;
+        }
+
+        return changed;
+    }
+
+    // -------------------------------------------------------------------------
+    // Private member variables
+    // -------------------------------------------------------------------------
+
     QString                           m_tbcPath;
     bool                              m_reverseFieldOrder = false;
     std::unique_ptr<LdDecodeMetaData> m_md;
@@ -149,9 +242,9 @@ private:
     bool                              m_isDiscCav = false;
 };
 
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
 // Factory
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
 
 std::unique_ptr<CineDisc> loadCineDisc(const QString& tbcPath,
                                        bool reverseFieldOrder)

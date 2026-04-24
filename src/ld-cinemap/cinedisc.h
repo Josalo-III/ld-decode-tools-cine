@@ -1,5 +1,4 @@
-// tools/ld-cinemap/cinedisc.h
-#pragma once
+ #pragma once
 
 #include <QString>
 #include <memory>
@@ -36,7 +35,12 @@ public:
     virtual bool getReverseFieldOrder() const = 0;
 
     // Misc / compatibility
-     virtual QString getFilename() const = 0;
+    virtual QString getFilename() const = 0;
+
+    // Edit whitelist/blacklist - impose or remove edits
+    // comma delimited lists; blacklist accepts ranges
+    virtual int applyEditWhitelistSeqNoKeys(const QString& csvSeqNoList) = 0;
+    virtual int applyEditBlacklistSeqNoKeys(const QString& csvSeqNoListWithRanges) = 0;
 
     // No-op hook for implementations that maintain a derived frame cache.
     // CineDiscMeta has no such cache; this exists so CineMap can call it

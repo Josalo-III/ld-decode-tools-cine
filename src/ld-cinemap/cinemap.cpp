@@ -3151,9 +3151,10 @@ int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                 f.cinemap.cadenceIndexPresumed = false;
 
                 // Clear internal isEditBoundary; we want cadence monotone inside segment.
-                if (f.cinemap.isEditBoundary && s != segStartField && s != segEndField) {
+            /* Whitelist needs to have the last word, no after the fact removals    
+            if (f.cinemap.isEditBoundary && s != segStartField && s != segEndField) {
                     f.cinemap.isEditBoundary = false;
-                }
+                }*/
 
                 m_md->updateField(f, s);
                 fieldsFixed++;

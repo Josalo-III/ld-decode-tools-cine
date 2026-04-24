@@ -62,14 +62,14 @@ static bool runDetectEditsOnly(CineDisc& disc,
 
     // 3) Whitelist / blacklist overrides
     if (!editWhitelistArg.trimmed().isEmpty()) {
-        // TODO: port applyEditWhitelistSeqNoKeys
-        qInfo() << "Applying edit whitelist:" << editWhitelistArg;
+        const int n = disc.applyEditWhitelistSeqNoKeys(editWhitelistArg);
+        qInfo() << "Applied edit whitelist to" << n << "field(s) (seqNo keys).";
     }
     if (!editBlacklistArg.trimmed().isEmpty()) {
-        // TODO: port applyEditBlacklistSeqNoKeys
-        qInfo() << "Applying edit blacklist:" << editBlacklistArg;
+        const int n = disc.applyEditBlacklistSeqNoKeys(editBlacklistArg);
+        qInfo() << "Applied edit blacklist to" << n << "field(s) (seqNo keys).";
     }
-
+    
     // 4) Determine output metadata path
     const QString sourcePath = disc.getTbcPath() + ".db";
     const QString jsonOutPath =
@@ -148,14 +148,14 @@ static bool runFullPipeline(CineDisc& disc,
 
     // 3) Whitelist / blacklist overrides
     if (!editWhitelistArg.trimmed().isEmpty()) {
-        // TODO: port applyEditWhitelistSeqNoKeys
-        qInfo() << "Applying edit whitelist:" << editWhitelistArg;
+        const int n = disc.applyEditWhitelistSeqNoKeys(editWhitelistArg);
+        qInfo() << "Applied edit whitelist to" << n << "field(s) (seqNo keys).";
     }
     if (!editBlacklistArg.trimmed().isEmpty()) {
-        // TODO: port applyEditBlacklistSeqNoKeys
-        qInfo() << "Applying edit blacklist:" << editBlacklistArg;
+        const int n = disc.applyEditBlacklistSeqNoKeys(editBlacklistArg);
+        qInfo() << "Applied edit blacklist to" << n << "field(s) (seqNo keys).";
     }
-
+        
     // 4) Cadence / twin / mixedness solve
     CineMap solver(&disc, policy);
     const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
