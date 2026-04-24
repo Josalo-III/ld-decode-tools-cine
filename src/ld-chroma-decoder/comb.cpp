@@ -298,106 +298,96 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->overlayMap(*previous, *next);
 
         // --- Visual Debug Overlays: Cadence / Film vs Video ------------------------
-        if (configuration.debugCadence) {
-            FrameCanvas canvas(componentFrames[frameIndex], videoParameters);
-        
-            int cidTop    = -1;
-            int cidBottom = -1;
-            bool editTop  = false;
-            bool editBottom = false;
-        
-            if (fieldIndex < inputFields.size()) {
-                cidTop  = inputFields[fieldIndex].field.cinemap.cadenceId;
-                editTop = inputFields[fieldIndex].field.cinemap.isEditBoundary;
-            }
-            if (fieldIndex + 1 < inputFields.size()) {
-                cidBottom    = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
-                editBottom   = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
-            }
-        
-            const char labelTop    = cadenceFilmLetter(cidTop);
-            const char labelBottom = cadenceFilmLetter(cidBottom);
-        
-            // Position inside active picture
-            const int xBase = videoParameters.activeVideoStart + 32;
-            const int yBase = videoParameters.firstActiveFrameLine + 32;
-        
-            // Glyph metrics
-            const int scale = 4;
-            const int charW = 5 * scale;
-            const int charH = 7 * scale;
-            const int pad   = 4;
-            const int boxH  = charH + 2 * pad;
-        
-            // Widths must expand to hold optional '/'
-            int boxW1 = charW + 2 * pad;
-        
-            // Adjust widths if edit boundaries present
-            if (cidTop >= 0 && editTop) boxW1 += charW + pad;
-        
-            FrameCanvas::Colour fg = canvas.rgb(65535, 65535, 65535);
-            FrameCanvas::Colour bg = canvas.rgb(0, 0, 0);
-        
-            if (cidTop < 0 || cidBottom < 0) {
-                // Video Mode / Unlocked
-                int cycleIndex = (frameIndex % 5) + 1;
-                char labelNum  = static_cast<char>('0' + cycleIndex);
-                
-                // FIX: Calculate width based on editTop regardless of cadence ID
-                int currentW = charW + 2 * pad;
-                if (editTop) currentW += charW + pad;
-            
-                canvas.fillRectangle(xBase, yBase, currentW, boxH, bg);
-                drawChar(canvas, xBase + pad, yBase + pad, labelNum, fg, scale);
-                
-                // FIX: Actually draw the slash if an edit exists
-                if (editTop) {
-                    drawChar(canvas, xBase + pad + charW + pad, yBase + pad, '/', fg, scale);
-                }
-            } else {
-                if (labelTop == labelBottom) {
-                    // Pure frame
-                    int width = charW + 2 * pad;
-                    if (editTop) width += charW + pad;
-        
-                    canvas.fillRectangle(xBase, yBase, width, boxH, bg);
-                    drawChar(canvas, xBase + pad, yBase + pad, labelTop, fg, scale);
-                    if (editTop) {
-                        drawChar(canvas, xBase + pad + charW + pad, yBase + pad, '/', fg, scale);
-                    }
-                } else {
-                    // Mixed frame
-                    int xOff = xBase + pad;
-                    int totalW = pad;
-        
-                    // Top label
-                    totalW += charW + pad;
-                    if (editTop) totalW += charW + pad;
-        
-                    // Bottom label
-                    totalW += charW + pad;
-                    if (editBottom) totalW += charW + pad;
-        
-                    canvas.fillRectangle(xBase, yBase, totalW, boxH, bg);
-        
-                    // Draw Top
-                    drawChar(canvas, xOff, yBase + pad, labelTop, fg, scale);
-                    xOff += charW + pad;
-                    if (editTop) {
-                        drawChar(canvas, xOff, yBase + pad, '/', fg, scale);
-                        xOff += charW + pad;
-                    }
-        
-                    // Draw Bottom
-                    drawChar(canvas, xOff, yBase + pad, labelBottom, fg, scale);
-                    xOff += charW + pad;
-                    if (editBottom) {
-                        drawChar(canvas, xOff, yBase + pad, '/', fg, scale);
-                    }
-                }
-            }
-        }
-    }
+		if (configuration.debugCadence) {
+			FrameCanvas canvas(componentFrames[frameIndex], videoParameters);
+
+			int cidTop    = -1;
+			int cidBottom = -1;
+			bool editTop    = false;
+			bool editBottom = false;
+
+			if (fieldIndex < inputFields.size()) {
+				cidTop  = inputFields[fieldIndex].field.cinemap.cadenceId;
+				editTop = inputFields[fieldIndex].field.cinemap.isEditBoundary;
+			}
+			if (fieldIndex + 1 < inputFields.size()) {
+				cidBottom = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
+				editBottom = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
+			}
+
+			// Glyph metrics
+			const int scale = 4;
+			const int charW = 5 * scale;
+			const int charH = 7 * scale;
+			const int pad   = 4;
+			const int boxH  = charH + 2 * pad;
+
+			const int xBase = videoParameters.activeVideoStart + 32;
+			const int yBase = videoParameters.firstActiveFrameLine + 32;
+
+			FrameCanvas::Colour fg = canvas.rgb(65535, 65535, 65535);
+			FrameCanvas::Colour bg = canvas.rgb(0, 0, 0);
+
+			// Build the sequence of characters to display.
+			// Convention:
+			//   editTop    -> '/' leads  the frame:  /A  or /AB
+			//   editBottom -> '/' splits the frame:  A/B
+			//   -2 cadenceId -> "i2" (confirmed interlaced)
+			//   -3 cadenceId -> "p3" (confirmed progressive)
+			//   unknown    -> cycle-position digit
+
+			// Determine display label for each field position.
+			// Returns a 1-char label: film letter, digit, 'i', or 'p'.
+			auto fieldLabel = [&](int cid, int fallbackCyclePos) -> char {
+				if (cid == -2) return 'i';
+				if (cid == -3) return 'p';
+				if (cadenceKnown(cid)) return cadenceFilmLetter(cid);
+				return static_cast<char>('0' + ((fallbackCyclePos % 5) + 1));
+			};
+
+			const int cyclePos = frameIndex;
+			const char labelTop    = fieldLabel(cidTop,    cyclePos);
+			const char labelBottom = fieldLabel(cidBottom, cyclePos);
+
+			// Determine whether the two fields show the same label (pure frame)
+			// for the purpose of display — treat confirmed i/p as their own label.
+			const bool pureFrame = (labelTop == labelBottom)
+								&& (cidTop >= -3) && (cidBottom >= -3)
+								&& !editTop && !editBottom; 
+
+			// Count characters needed: labels + optional slashes
+			// Sequence:
+			//   editTop:              '/' labelTop [labelBottom if mixed]
+			//   editBottom&&!editTop: labelTop '/' labelBottom  (mixed only)
+			//   neither:              labelTop [labelBottom if mixed]
+			// For pure frames the bottom label is suppressed.
+
+			int numChars = 0;
+			if (editTop)                    numChars++; // leading '/'
+			numChars++;                                 // top label
+			if (!pureFrame) {
+				if (editBottom && !editTop) numChars++; // mid '/'
+				numChars++;                             // bottom label
+			}
+
+			const int totalW = pad + numChars * (charW + pad);
+			canvas.fillRectangle(xBase, yBase, totalW, boxH, bg);
+
+			int xOff = xBase + pad;
+
+			auto drawNext = [&](char c) {
+				drawChar(canvas, xOff, yBase + pad, c, fg, scale);
+				xOff += charW + pad;
+			};
+
+			if (editTop)    drawNext('/');
+			drawNext(labelTop);
+			if (!pureFrame) {
+				if (editBottom && !editTop) drawNext('/');
+				drawNext(labelBottom);
+			}
+		}
+	}
 }
 
 void Comb::FrameBuffer::copy2DTo3D()
