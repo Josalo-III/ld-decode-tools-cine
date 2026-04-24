@@ -189,7 +189,7 @@ public:
     // cadenceId = -1 and pulldownRole = QString() are the "not set" sentinels.
     struct Cinemap {
         bool inUse = false;
-
+		bool isManualOverride = false;
         bool isEditBoundary = false;
         qint32 cadenceId = -1;
         bool cadenceIndexPresumed = false;

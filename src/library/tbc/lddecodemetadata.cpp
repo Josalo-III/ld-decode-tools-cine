@@ -251,15 +251,13 @@ void LdDecodeMetaData::Field::write(SqliteWriter &writer, int captureId) const
     closedCaption.write(writer, captureId, fieldId);
     dropOuts.write(writer, captureId, fieldId);
 
-    // --- Josalo-III: cinemap ---
-    if (cinemap.inUse) {
-        cinemap.writeAuto(writer, captureId, fieldId);
-    }
-    // --- end Josalo-III ---
+	if (cinemap.inUse) {
+		if (cinemap.isManualOverride)
+			cinemap.writeManual(writer, captureId, fieldId);
+		else
+			cinemap.writeAuto(writer, captureId, fieldId);
+	}
 }
-
-// --- Josalo-III: Cinemap::write implementations ---
-
 // Delegates to writeFieldCinemapAuto. Called from Field::write via the inUse gate.
 // Never writes is_edit_boundary = 0; preserves any existing manual veto.
 void LdDecodeMetaData::Cinemap::writeAuto(SqliteWriter &writer, int captureId, int fieldId) const
@@ -282,8 +280,6 @@ void LdDecodeMetaData::Cinemap::writeManual(SqliteWriter &writer, int captureId,
                                    cadenceIndexPresumed,
                                    pulldownRole);
 }
-
-// --- end Josalo-III ---
 
 LdDecodeMetaData::LdDecodeMetaData()
 {
@@ -522,10 +518,8 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
     reader.readAllFieldClosedCaptions(captureId, ccQuery);
     reader.readAllFieldDropouts(captureId, dropoutsQuery);
 
-    // --- Josalo-III: cinemap ---
     QSqlQuery cinemapQuery;
     reader.readAllFieldCinemap(captureId, cinemapQuery);
-    // --- end Josalo-III ---
 
     // Create lookup maps for fast field data retrieval
     QMap<int, QPair<double, double>> vitsMap;
@@ -576,7 +570,6 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
         dropoutsMap.insert(fieldId, dropoutData);
     }
 
-    // --- Josalo-III: cinemap map ---
     // A row present in the cinemap table means inUse = true.
     // isEditBoundary reflects the column value directly: 1 = boundary asserted,
     // 0 = manual veto. NULL in the database means the auto-pass ran but made
@@ -600,7 +593,6 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
         row.pulldownRole = pr.isNull() ? QString() : pr.toString();
         cinemapMap[fieldId] = row;
     }
-    // --- end Josalo-III ---
 
     // Process main field records and apply cached data
     while (fieldsQuery.next()) {
@@ -667,7 +659,6 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
             }
         }
 
-        // --- Josalo-III: cinemap ---
         if (cinemapMap.contains(fieldId)) {
             const CinemapRow &row = cinemapMap[fieldId];
             field.cinemap.isEditBoundary       = row.isEditBoundary;
@@ -676,7 +667,6 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
             field.cinemap.pulldownRole         = row.pulldownRole;
             field.cinemap.inUse                = true;
         }
-        // --- end Josalo-III ---
 
         fields.push_back(field);
     }
