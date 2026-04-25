@@ -1,26 +1,16 @@
-/************************************************************************
-
-    main.cpp
-
-    ld-chroma-decoder - Colourisation filter for ld-decode
-    Copyright (C) 2018-2020 Simon Inns
-    Copyright (C) 2019-2022 Adam Sampson
-    Copyright (C) 2021 Chad Page
-    Copyright (C) 2021 Phillip Blucas
-    Copyright (C) 2025 Joseph Burns
-
-    This file is part of ld-decode-tools.
-
-    ld-chroma-decoder is free software: you can redistribute it and/or
-    modify it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
-    or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
-
-************************************************************************/
+/******************************************************************************
+ * main.cpp
+ * ld-chroma-decoder — Colourisation filter for ld-decode
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2018-2020 Simon Inns
+ * SPDX-FileCopyrightText: 2019-2022 Adam Sampson
+ * SPDX-FileCopyrightText: 2021 Chad Page
+ * SPDX-FileCopyrightText: 2021 Phillip Blucas
+ * SPDX-FileCopyrightText: 2025 Joseph Burns
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -41,7 +31,7 @@
 #include "palcolour.h"
 #include "paldecoder.h"
 #include "transformpal.h"
-#include "cadenceassembler.h" // Added
+#include "cadenceassembler.h"
 
 // Enable fast FP mode (flush denormals) on supported CPUs
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
@@ -236,10 +226,10 @@ int main(int argc, char *argv[])
 
     // -- NTSC decoder options --
     QCommandLineOption showMapOption(QStringList() << "o" << "oftest",
-											QCoreApplication::translate("main", "NTSC: Overlay the adaptive filter map (only used for testing)"));
+                                            QCoreApplication::translate("main", "NTSC: Overlay the adaptive filter map (only used for testing)"));
     parser.addOption(showMapOption);
 
-	QCommandLineOption chromaNROption(QStringList() << "chroma-nr",
+    QCommandLineOption chromaNROption(QStringList() << "chroma-nr",
                                       QCoreApplication::translate("main", "NTSC: Chroma noise reduction level in dB (default 0.0)"),
                                       QCoreApplication::translate("main", "number"));
     parser.addOption(chromaNROption);
@@ -254,22 +244,22 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
     
-	QCommandLineOption vdisOption(QStringList() << "vdis",
-											QCoreApplication::translate("main", "NTSC: Enable VDIS (Vertical Differential Isolation System) " 
-											"This restricts the 2d section very substantially - for use when regular output exhibits artifacts near horizontal color boundaries"));
-	parser.addOption(vdisOption);
+    QCommandLineOption vdisOption(QStringList() << "vdis",
+                                            QCoreApplication::translate("main", "NTSC: Enable VDIS (Vertical Differential Isolation System) " 
+                                            "This restricts the 2d section very substantially - for use when regular output exhibits artifacts near horizontal color boundaries"));
+    parser.addOption(vdisOption);
 
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
                                              QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
-	parser.addOption(noResidualVideoOption);
+    parser.addOption(noResidualVideoOption);
 
-	QCommandLineOption residualVideo3DOption(QStringList() << "residual-video-3d",
-										 QCoreApplication::translate("main", "Enable temporal enhancement for residual video"));
-	parser.addOption(residualVideo3DOption);
+    QCommandLineOption residualVideo3DOption(QStringList() << "residual-video-3d",
+                                         QCoreApplication::translate("main", "Enable temporal enhancement for residual video"));
+    parser.addOption(residualVideo3DOption);
 
-	QCommandLineOption noResidualColorOption(QStringList() << "no-residual-color",
-										 QCoreApplication::translate("main", "NTSC (locked mode): Keep residual Y but disable residual color refinement"));
-	parser.addOption(noResidualColorOption);
+    QCommandLineOption noResidualColorOption(QStringList() << "no-residual-color",
+                                         QCoreApplication::translate("main", "NTSC (locked mode): Keep residual Y but disable residual color refinement"));
+    parser.addOption(noResidualColorOption);
 
     QCommandLineOption adaptThresholdOption(QStringList() << "adapt-threshold",
         QCoreApplication::translate("main",
@@ -297,21 +287,21 @@ int main(int argc, char *argv[])
     parser.addOption(twoDVariantOption);
 
     // -- Cadence / PA options --
-	QCommandLineOption setCadenceOption(
-		QStringList() << "set-cadence",
-		QCoreApplication::translate("main",
-			"Impose a global pulldown interpretation, selecting video start frames for the 5 -frame cycle, overriding cadenceId metadata from CineMap -"
-			"Values are: "
-			"1=AA, 2=AB, 3=BC, 4=CC, 5=DD"),
-		QCoreApplication::translate("main", "number"));
-	parser.addOption(setCadenceOption);
+    QCommandLineOption setCadenceOption(
+        QStringList() << "set-cadence",
+        QCoreApplication::translate("main",
+            "Impose a global pulldown interpretation, selecting video start frames for the 5 -frame cycle, overriding cadenceId metadata from CineMap -"
+            "Values are: "
+            "1=AA, 2=AB, 3=BC, 4=CC, 5=DD"),
+        QCoreApplication::translate("main", "number"));
+    parser.addOption(setCadenceOption);
 
     QCommandLineOption export24pOption(QStringList() << "export-24p",
         QCoreApplication::translate("main", "Export 23.976 fps direct from consolidated telecine"
         "- this version re-syncs to the original timing, trimming as needed)"));
     parser.addOption(export24pOption);
 
-	// Max 24p option: emit every possible film frame (can be very long)
+    // Max 24p option: emit every possible film frame (can be very long)
     QCommandLineOption emitMax24pOption(QStringList() << "emit-max-24p",
         QCoreApplication::translate("main",
             "Use with --export-24p: outputs every film frame for which two opposite fields are available, "
@@ -320,7 +310,7 @@ int main(int argc, char *argv[])
 
     // Option to enable visual cadence debugging
     QCommandLineOption debugCadenceOption(QStringList() << "debug-cadence",
-									QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
+                                    QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
     parser.addOption(debugCadenceOption);
     
     QCommandLineOption noPAOption(QStringList() << "no-pa",
@@ -368,7 +358,7 @@ int main(int argc, char *argv[])
     processStandardDebugOptions(parser);
     emitDeprecatedToolWarning();
 
-	// Get the arguments from the parser
+    // Get the arguments from the parser
     QString inputFileName;
     QString outputFileName = "-";
     QStringList positionalArguments = parser.positionalArguments();
@@ -398,7 +388,7 @@ int main(int argc, char *argv[])
     Comb::Configuration combConfig;
     MonoDecoder::MonoConfiguration monoConfig;
     OutputWriter::Configuration outputConfig;
-    CadenceAssembler::Configuration cadenceConfig; // Added
+    CadenceAssembler::Configuration cadenceConfig;
 
     // Parse Cadence / PA options
     if (parser.isSet(export24pOption)) {
@@ -417,13 +407,13 @@ int main(int argc, char *argv[])
         }
     }
 
-	if (parser.isSet(debugCadenceOption)) {
+    if (parser.isSet(debugCadenceOption)) {
         combConfig.debugCadence = true;
     }
     if (cadenceConfig.noPA && cadenceConfig.setCadence != 0) {
     qCritical() << "--set-cadence is incompatible with --no-pa (pulldown processing disabled)";
     return -1;
-	}
+    }
     
     QString v = parser.value(twoDVariantOption).toLower();
     if (v == "line") {
@@ -518,7 +508,7 @@ int main(int argc, char *argv[])
         combConfig.tunables.VDIS_ENABLE = true;
     }
 
-	// Residual video: enabled by default when phase compensation is active
+    // Residual video: enabled by default when phase compensation is active
     if (parser.isSet(noResidualVideoOption)) {
         combConfig.tunables.VET_ENABLE_RESIDUAL_Y = false;
         combConfig.residualColor = false;
@@ -656,7 +646,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-	if (parser.isSet(residualVideo3DOption)) {
+    if (parser.isSet(residualVideo3DOption)) {
         combConfig.residualVideo3D = true;
     }
     
@@ -697,22 +687,21 @@ int main(int argc, char *argv[])
             outputConfig.paddingAmount = 8;
         }
     }
-	// After other cadenceConfig parsing in main.cpp
-	if (parser.isSet(setCadenceOption)) {
-		int val = parser.value(setCadenceOption).toInt();
-		if (val < 1 || val > 5) {
-			qCritical() << "--set-cadence must be in the range 1..5";
-			return -1;
-		}
-		cadenceConfig.setCadence = val;
-		    // Send the notice to stderr so it doesnt corrupt piped stdout (y4m/raw)
-		    fprintf(stderr,
-		            "Info: Forcing global cadence start at index %d (AA=1, AB=2, BC=3, CC=4, DD=5).\n",
-		            val);
-			std::fflush(stderr);
-		}
+    // After other cadenceConfig parsing in main.cpp
+    if (parser.isSet(setCadenceOption)) {
+        int val = parser.value(setCadenceOption).toInt();
+        if (val < 1 || val > 5) {
+            qCritical() << "--set-cadence must be in the range 1..5";
+            return -1;
+        }
+        cadenceConfig.setCadence = val;
+            // Send the notice to stderr so it doesnt corrupt piped stdout (y4m/raw)
+            fprintf(stderr,
+                    "Info: Forcing global cadence start at index %d (AA=1, AB=2, BC=3, CC=4, DD=5).\n",
+                    val);
+            std::fflush(stderr);
+        }
     // Perform the processing
-    // Updated Constructor call for DecoderPool with cadenceConfig
     DecoderPool decoderPool(*decoder, inputFileName, metaData, outputConfig, cadenceConfig, outputFileName, startFrame, length, maxThreads);
     if (!decoderPool.process()) {
         return -1;

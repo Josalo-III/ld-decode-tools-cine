@@ -1,26 +1,12 @@
-/************************************************************************
-
-    monodecoder.cpp
-
-    ld-chroma-decoder - Colourisation filter for ld-decode
-    Copyright (C) 2019-2021 Adam Sampson
-
-    This file is part of ld-decode-tools.
-
-    ld-chroma-decoder is free software: you can redistribute it and/or
-    modify it under the terms of the GNU General Public License as
-    published by the Free Software Foundation, either version 3 of the
-    License, or (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
-************************************************************************/
+/******************************************************************************
+ * monodecoder.cpp
+ * ld-chroma-decoder — Colourisation filter for ld-decode
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2019-2021 Adam Sampson
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 
 #include "monodecoder.h"
 
@@ -32,7 +18,7 @@
 #include "firfilter.h"
 
 MonoDecoder::MonoDecoder()
-{	
+{   
 }
 
 MonoDecoder::MonoDecoder(const MonoDecoder::MonoConfiguration &config)
@@ -42,7 +28,7 @@ MonoDecoder::MonoDecoder(const MonoDecoder::MonoConfiguration &config)
 
 bool MonoDecoder::updateConfiguration(const LdDecodeMetaData::VideoParameters &videoParameters, const MonoDecoder::MonoConfiguration &configuration) {
     // This decoder works for both PAL and NTSC.
-	monoConfig.yNRLevel = configuration.yNRLevel;
+    monoConfig.yNRLevel = configuration.yNRLevel;
     monoConfig.videoParameters = videoParameters;
 
     return true;
@@ -65,23 +51,23 @@ void MonoDecoder::decodeFrames(const QVector<SourceField>& inputFields,
                                qint32 endIndex,
                                QVector<ComponentFrame>& componentFrames)
 {
-	const LdDecodeMetaData::VideoParameters &videoParameters = monoConfig.videoParameters;
-	bool ignoreUV = false;
-	
-	
-	for (qint32 fieldIndex = startIndex, frameIndex = 0; fieldIndex < endIndex; fieldIndex += 2, frameIndex++) {
-		componentFrames[frameIndex].init(videoParameters, ignoreUV);
-		for (qint32 y = videoParameters.firstActiveFrameLine; y < videoParameters.lastActiveFrameLine; y++) {
-			const SourceVideo::Data &inputFieldData = (y % 2) == 0 ? inputFields[fieldIndex].data :inputFields[fieldIndex+1].data;
-			const quint16 *inputLine = inputFieldData.data() + ((y / 2) * videoParameters.fieldWidth);
+    const LdDecodeMetaData::VideoParameters &videoParameters = monoConfig.videoParameters;
+    bool ignoreUV = false;
+    
+    
+    for (qint32 fieldIndex = startIndex, frameIndex = 0; fieldIndex < endIndex; fieldIndex += 2, frameIndex++) {
+        componentFrames[frameIndex].init(videoParameters, ignoreUV);
+        for (qint32 y = videoParameters.firstActiveFrameLine; y < videoParameters.lastActiveFrameLine; y++) {
+            const SourceVideo::Data &inputFieldData = (y % 2) == 0 ? inputFields[fieldIndex].data :inputFields[fieldIndex+1].data;
+            const quint16 *inputLine = inputFieldData.data() + ((y / 2) * videoParameters.fieldWidth);
 
-			// Copy the whole composite signal to Y (leaving U and V blank)
-			double *outY = componentFrames[frameIndex].y(y);
-			for (qint32 x = videoParameters.activeVideoStart; x < videoParameters.activeVideoEnd; x++) {
-				outY[x] = inputLine[x];
-			}
-		}
-		doYNR(componentFrames[frameIndex]);
+            // Copy the whole composite signal to Y (leaving U and V blank)
+            double *outY = componentFrames[frameIndex].y(y);
+            for (qint32 x = videoParameters.activeVideoStart; x < videoParameters.activeVideoEnd; x++) {
+                outY[x] = inputLine[x];
+            }
+        }
+        doYNR(componentFrames[frameIndex]);
     }
 }
 

@@ -1,28 +1,15 @@
-/************************************************************************
-
-    outputwriter.cpp
-
-    ld-chroma-decoder - Colourisation filter for ld-decode
-    Copyright (C) 2018-2021 Chad Page
-    Copyright (C) 2020-2021 Adam Sampson
-    Copyright (C) 2021 Phillip Blucas
-
-    This file is part of ld-decode-tools.
-
-    ld-chroma-decoder is free software: you can redistribute it and/or
-    modify it under the terms of the GNU General Public License as
-    published by the Free Software Foundation, either version 3 of the
-    License, or (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
-************************************************************************/
+/******************************************************************************
+ * outputwriter.cpp
+ * ld-chroma-decoder — Colourisation filter for ld-decode
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2018-2021 Chad Page
+ * SPDX-FileCopyrightText: 2020-2021 Adam Sampson
+ * SPDX-FileCopyrightText: 2021 Phillip Blucas
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 
 #include "outputwriter.h"
 
@@ -181,7 +168,7 @@ QByteArray OutputWriter::getStreamHeader() const
         }
     }
 
-	// Pixel format and colour metadata
+    // Pixel format and colour metadata
     switch (config.pixelFormat) {
     case YUV444P16:
         str << " C444p16 XCOLORRANGE=LIMITED";
@@ -386,22 +373,22 @@ void OutputWriter::convertLine(qint32 lineNumber, const ComponentFrame &componen
     const double uvRange = yRange;
 
     switch (config.pixelFormat) {
-		case RGB48: {
-					// Convert Y'UV to full-range R'G'B' [Poynton eq 28.6 p337]
-					quint16 *out = outputFrame.data() + (activeWidth * outputLine * 3);
-					const double yScale  = 65535.0 / yRange;
-					const double uvScale = 65535.0 / uvRange;
-					for (qint32 x = 0; x < activeWidth; x++) {
-						const double rY = qBound(0.0, (inY[x] - yOffset) * yScale, 65535.0);
-						const double rU = inU[x] * uvScale;
-						const double rV = inV[x] * uvScale;
-						const qint32 pos = x * 3;
-						out[pos]     = static_cast<quint16>(qBound(0.0, rY                    + (1.139883 * rV),  65535.0));
-						out[pos + 1] = static_cast<quint16>(qBound(0.0, rY + (-0.394642 * rU) + (-0.580622 * rV), 65535.0));
-						out[pos + 2] = static_cast<quint16>(qBound(0.0, rY + (2.032062 * rU),                    65535.0));
-					}
-					break;
-				}
+        case RGB48: {
+                    // Convert Y'UV to full-range R'G'B' [Poynton eq 28.6 p337]
+                    quint16 *out = outputFrame.data() + (activeWidth * outputLine * 3);
+                    const double yScale  = 65535.0 / yRange;
+                    const double uvScale = 65535.0 / uvRange;
+                    for (qint32 x = 0; x < activeWidth; x++) {
+                        const double rY = qBound(0.0, (inY[x] - yOffset) * yScale, 65535.0);
+                        const double rU = inU[x] * uvScale;
+                        const double rV = inV[x] * uvScale;
+                        const qint32 pos = x * 3;
+                        out[pos]     = static_cast<quint16>(qBound(0.0, rY                    + (1.139883 * rV),  65535.0));
+                        out[pos + 1] = static_cast<quint16>(qBound(0.0, rY + (-0.394642 * rU) + (-0.580622 * rV), 65535.0));
+                        out[pos + 2] = static_cast<quint16>(qBound(0.0, rY + (2.032062 * rU),                    65535.0));
+                    }
+                    break;
+                }
         case YUV444P16: {
             // Convert Y'UV to Y'CbCr [Poynton eq 25.5 p307]
             quint16 *outY  = outputFrame.data() + (activeWidth * outputLine);
@@ -420,7 +407,7 @@ void OutputWriter::convertLine(qint32 lineNumber, const ComponentFrame &componen
 
             break;
         }
-		case GRAY16: {
+        case GRAY16: {
             // Throw away UV and just convert Y' to the same scale as Y'CbCr
             quint16 *out = outputFrame.data() + (activeWidth * outputLine);
 

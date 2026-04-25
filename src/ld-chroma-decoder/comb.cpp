@@ -1,8 +1,16 @@
-/************************************************************************
-
-  comb.cpp  (perf-aligned: preallocation + contiguous demod + FTZ-friendly)
-
-************************************************************************/
+/******************************************************************************
+ * comb.cpp
+ * ld-chroma-decoder — Colourisation filter for ld-decode
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2018 Chad Page
+ * SPDX-FileCopyrightText: 2018-2019 Simon Inns
+ * SPDX-FileCopyrightText: 2020-2021 Adam Sampson
+ * SPDX-FileCopyrightText: 2021 Phillip Blucas
+ * SPDX-FileCopyrightText: 2025-2026 Joseph Burns
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 
 #include "cadencedefs.h"
 #include "comb.h"
@@ -32,27 +40,28 @@ namespace {
 }
 
 namespace {
-    // Fractional 4fsc sample offset  (in samples). Keep small; start at 0.0.
-    // Adjust in 0.050.15 if vectorscope lines bow.
+    // Fractional 4fsc sample offset (in samples). Keep small; start at 0.0.
+    // Adjust in range 0.05..0.15 if vectorscope lines bow.
     constexpr double CAL_EPS_SAMPLES = -0.07;
 
-    // Tiny global LO trim  (degrees). Negative  usually counteracts a slight green bias.
+    // Tiny global LO trim (degrees). Negative usually counteracts a slight green bias.
     constexpr double CAL_LO_ROT_DEG  = 0.0;
 
-    // Compute  basis mix once per function call (shared by splitIQlocked and produceY)
+    // Compute basis mix once per function call (shared by splitIQlocked and produceY)
     inline void basisCoeffs(double& Ce, double& Se) {
-        const double K = 0.5 * M_PI; // 4fsc per-sample step = /2
+        const double K = 0.5 * M_PI; // 4fsc per-sample step = π/2
         Ce = std::cos(K * CAL_EPS_SAMPLES);
         Se = std::sin(K * CAL_EPS_SAMPLES);
     }
 
-    // Basis projection for a given sample h with basis shift 
+    // Basis projection for sample h shifted by ε (CAL_EPS_SAMPLES).
+    // sp = sin((h + ε) · π/2),  cp = cos((h + ε) · π/2)
     static inline void shiftedBasis(int h, double Ce, double Se, double& sp, double& cp) {
         const int idx = (h & 3);
         const double s4 = sin4fsc(idx);
         const double c4 = cos4fsc(idx);
-        sp = Ce * s4 + Se * c4;  // sin((h+)/2)
-        cp = Ce * c4 - Se * s4;  // cos((h+)/2)
+        sp = Ce * s4 + Se * c4;
+        cp = Ce * c4 - Se * s4;
     }
 }
 
@@ -80,6 +89,11 @@ static constexpr quint32 CANDIDATE_SHADES[] = {
     0x8080FF, // CAND_PREV_FRAME - blue
     0xFF80FF, // CAND_NEXT_FRAME - purple
 };
+// Polar-decompose a 2x2 affine matrix A = R·U into a rotation R and symmetric U,
+// then clamp R to a maximum phase rotation, clamp U's shear metric, and optionally
+// clamp the gain (mean singular value). The clamped gain is folded into R so callers
+// can apply a single matrix. Used throughout the locked path to keep per-line and
+// per-window affine corrections from diverging on noisy or saturated content.
 static inline void clamp_rotation_gain_shear(double R[2][2], double U[2][2],
                                              double phaseMaxRad, bool allowGain,
                                              double gMin, double gMax, double shearMax) {
@@ -117,7 +131,9 @@ static inline void clamp_rotation_gain_shear(double R[2][2], double U[2][2],
     R[0][0] *= g; R[0][1] *= g; R[1][0] *= g; R[1][1] *= g;
 }
 
-// ... helper for drawing characters (A-Z) ...
+// Render a single character from a minimal 5×7 bitmap font into a FrameCanvas.
+// Supports A–E (pulldown film letters), '?' (unknown), and '/' (boundary marker).
+// scale controls pixel block size for visibility at different output resolutions.
 static void drawChar(FrameCanvas &canvas, int x, int y, char ch, FrameCanvas::Colour col, int scale) {
     // Simple 5x7 font map for A-E, ?, and /
     static const unsigned char font[][7] = {
@@ -151,6 +167,9 @@ static void drawChar(FrameCanvas &canvas, int x, int y, char ch, FrameCanvas::Co
     }
 }
 
+// Demodulate a single composite sample v at horizontal position h into I and Q
+// using the locked basis LUTs (spLUT, cpLUT) and the per-line burst phasor
+// (bcos, bsin). Writes the result into outI[xi] and outQ[xi].
 inline void demodSample(double v, int h, int xi,
                         double bcos, double bsin,
                         const double* spLUT, const double* cpLUT,
@@ -195,7 +214,11 @@ void Comb::updateConfiguration(const LdDecodeMetaData::VideoParameters &_videoPa
     configurationSet = true;
 }
 
-// decodeFrames
+// Orchestrates per-frame decoding across all requested frames. Maintains a
+// rolling triple-buffer (previous / current / next) so that 3D temporal candidates
+// always have access to both neighbours. For each output frame, runs the full
+// chroma-decode pipeline — either the phase-locked (coherent) path or the bucket
+// path — then optionally overlays diagnostic visuals.
 void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                         qint32 startIndex, qint32 endIndex,
                         QVector<ComponentFrame> &componentFrames)
@@ -219,16 +242,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             next     = std::move(recycle);
         }
 
-        // Preload "next" framebuffer from inputFields
-        // NOTE: We only try to load if indices are valid. 
-        // If preStart is negative (e.g. -4), we might be accessing negative indices if not careful.
-        // However, the caller usually pads inputFields or manages startIndex.
-        // If we are at the very start of the stream, we might encounter "before-start" conditions.
-        
+        // Preload "next" framebuffer. Guard against out-of-range indices; the caller
+        // is responsible for padding inputFields with blank frames at the boundaries.
         bool canLoadNext = (fieldIndex + 3 < inputFields.size());
-        
-        // Safety: If fieldIndex + 2 < 0, we are accessing negative indices.
-        // We only load if index >= 0.
+
         if (canLoadNext && (fieldIndex + 2 >= 0)) {
             next->loadFields(inputFields[fieldIndex + 2], inputFields[fieldIndex + 3]);
 
@@ -259,13 +276,13 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         // Wire up temporal context for Residual Y if enabled
         if (configuration.residualVideo3D) {
         if (!isStartUp) {
-			current->prevFrameForVet = previous.get();
-			current->nextFrameForVet = next.get();
-		} else {
+            current->prevFrameForVet = previous.get();
+            current->nextFrameForVet = next.get();
+        } else {
                 current->prevFrameForVet = nullptr;
                 current->nextFrameForVet = nullptr;
-				}
-		}
+                }
+        }
         const qint32 frameIndex = (fieldIndex - startIndex) / 2;
         componentFrames[frameIndex].init(videoParameters);
         current->setComponentFrame(componentFrames[frameIndex]);
@@ -274,12 +291,16 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         if (configuration.phaseCompensation) {
             current->demodMode = FrameBuffer::DemodMode::Locked;
 
-            // 1) Demod + LS/affine in locked space (fills demodTI_flat/TQ_flat, TRI/TRQ)
+            // 1) Sinusoidal-fit pre-clean and affine solve (fills clpbuffer[0], lineAffineLocked)
+            // 2) Phase-corrected 1D demod -> demodTI_flat/TQ_flat (via buildPhaseCorrected1D inside split2D)
+            // 3) Full 2D scoring (Field A, Field B / Frame via scoreFieldVsFrame) -> clpbuffer[1]
+            // 4) Demod raw composite -> TRI/TRQ; build preI/preQ and yI/yQ for residual Y
             current->splitIQlocked();
-            // 3) Chroma NR, then coherent Y rebuild and Y NR
+            // 5) Chroma NR on I/Q
             current->doCNR();
+            // 6) Coherent Y rebuild from affine-corrected demod
             current->produceY();
-            // 2) Apply chroma FIRs in locked space (uses demodTI/TQ to produce I/Q)
+            // 7) Chroma FIR bandwidth limiting in locked space
             current->filterIQLocked();
             current->doYNR();
             current->transformIQ(configuration.chromaGain, configuration.chromaPhase);
@@ -298,98 +319,101 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->overlayMap(*previous, *next);
 
         // --- Visual Debug Overlays: Cadence / Film vs Video ------------------------
-		if (configuration.debugCadence) {
-			FrameCanvas canvas(componentFrames[frameIndex], videoParameters);
+        if (configuration.debugCadence) {
+            FrameCanvas canvas(componentFrames[frameIndex], videoParameters);
 
-			int cidTop    = -1;
-			int cidBottom = -1;
-			bool editTop    = false;
-			bool editBottom = false;
+            int cidTop    = -1;
+            int cidBottom = -1;
+            bool editTop    = false;
+            bool editBottom = false;
 
-			if (fieldIndex < inputFields.size()) {
-				cidTop  = inputFields[fieldIndex].field.cinemap.cadenceId;
-				editTop = inputFields[fieldIndex].field.cinemap.isEditBoundary;
-			}
-			if (fieldIndex + 1 < inputFields.size()) {
-				cidBottom = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
-				editBottom = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
-			}
+            if (fieldIndex < inputFields.size()) {
+                cidTop  = inputFields[fieldIndex].field.cinemap.cadenceId;
+                editTop = inputFields[fieldIndex].field.cinemap.isEditBoundary;
+            }
+            if (fieldIndex + 1 < inputFields.size()) {
+                cidBottom = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
+                editBottom = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
+            }
 
-			// Glyph metrics
-			const int scale = 4;
-			const int charW = 5 * scale;
-			const int charH = 7 * scale;
-			const int pad   = 4;
-			const int boxH  = charH + 2 * pad;
+            // Glyph metrics
+            const int scale = 4;
+            const int charW = 5 * scale;
+            const int charH = 7 * scale;
+            const int pad   = 4;
+            const int boxH  = charH + 2 * pad;
 
-			const int xBase = videoParameters.activeVideoStart + 32;
-			const int yBase = videoParameters.firstActiveFrameLine + 32;
+            const int xBase = videoParameters.activeVideoStart + 32;
+            const int yBase = videoParameters.firstActiveFrameLine + 32;
 
-			FrameCanvas::Colour fg = canvas.rgb(65535, 65535, 65535);
-			FrameCanvas::Colour bg = canvas.rgb(0, 0, 0);
+            FrameCanvas::Colour fg = canvas.rgb(65535, 65535, 65535);
+            FrameCanvas::Colour bg = canvas.rgb(0, 0, 0);
 
-			// Build the sequence of characters to display.
-			// Convention:
-			//   editTop    -> '/' leads  the frame:  /A  or /AB
-			//   editBottom -> '/' splits the frame:  A/B
-			//   -2 cadenceId -> "i2" (confirmed interlaced)
-			//   -3 cadenceId -> "p3" (confirmed progressive)
-			//   unknown    -> cycle-position digit
+            // Build the sequence of characters to display.
+            // Convention:
+            //   editTop    -> '/' leads  the frame:  /A  or /AB
+            //   editBottom -> '/' splits the frame:  A/B
+            //   -2 cadenceId -> "i2" (confirmed interlaced)
+            //   -3 cadenceId -> "p3" (confirmed progressive)
+            //   unknown    -> cycle-position digit
 
-			// Determine display label for each field position.
-			// Returns a 1-char label: film letter, digit, 'i', or 'p'.
-			auto fieldLabel = [&](int cid, int fallbackCyclePos) -> char {
-				if (cid == -2) return 'i';
-				if (cid == -3) return 'p';
-				if (cadenceKnown(cid)) return cadenceFilmLetter(cid);
-				return static_cast<char>('0' + ((fallbackCyclePos % 5) + 1));
-			};
+            // Determine display label for each field position.
+            // Returns a 1-char label: film letter, digit, 'i', or 'p'.
+            auto fieldLabel = [&](int cid, int fallbackCyclePos) -> char {
+                if (cid == -2) return 'i';
+                if (cid == -3) return 'p';
+                if (cadenceKnown(cid)) return cadenceFilmLetter(cid);
+                return static_cast<char>('0' + ((fallbackCyclePos % 5) + 1));
+            };
 
-			const int cyclePos = frameIndex;
-			const char labelTop    = fieldLabel(cidTop,    cyclePos);
-			const char labelBottom = fieldLabel(cidBottom, cyclePos);
+            const int cyclePos = frameIndex;
+            const char labelTop    = fieldLabel(cidTop,    cyclePos);
+            const char labelBottom = fieldLabel(cidBottom, cyclePos);
 
-			// Determine whether the two fields show the same label (pure frame)
-			// for the purpose of display — treat confirmed i/p as their own label.
-			const bool pureFrame = (labelTop == labelBottom)
-								&& (cidTop >= -3) && (cidBottom >= -3)
-								&& !editTop && !editBottom; 
+            // Determine whether the two fields show the same label (pure frame)
+            // for the purpose of display — treat confirmed i/p as their own label.
+            const bool pureFrame = (labelTop == labelBottom)
+                                && (cidTop >= -3) && (cidBottom >= -3)
+                                && !editTop && !editBottom; 
 
-			// Count characters needed: labels + optional slashes
-			// Sequence:
-			//   editTop:              '/' labelTop [labelBottom if mixed]
-			//   editBottom&&!editTop: labelTop '/' labelBottom  (mixed only)
-			//   neither:              labelTop [labelBottom if mixed]
-			// For pure frames the bottom label is suppressed.
+            // Count characters needed: labels + optional slashes
+            // Sequence:
+            //   editTop:              '/' labelTop [labelBottom if mixed]
+            //   editBottom&&!editTop: labelTop '/' labelBottom  (mixed only)
+            //   neither:              labelTop [labelBottom if mixed]
+            // For pure frames the bottom label is suppressed.
 
-			int numChars = 0;
-			if (editTop)                    numChars++; // leading '/'
-			numChars++;                                 // top label
-			if (!pureFrame) {
-				if (editBottom && !editTop) numChars++; // mid '/'
-				numChars++;                             // bottom label
-			}
+            int numChars = 0;
+            if (editTop)                    numChars++; // leading '/'
+            numChars++;                                 // top label
+            if (!pureFrame) {
+                if (editBottom && !editTop) numChars++; // mid '/'
+                numChars++;                             // bottom label
+            }
 
-			const int totalW = pad + numChars * (charW + pad);
-			canvas.fillRectangle(xBase, yBase, totalW, boxH, bg);
+            const int totalW = pad + numChars * (charW + pad);
+            canvas.fillRectangle(xBase, yBase, totalW, boxH, bg);
 
-			int xOff = xBase + pad;
+            int xOff = xBase + pad;
 
-			auto drawNext = [&](char c) {
-				drawChar(canvas, xOff, yBase + pad, c, fg, scale);
-				xOff += charW + pad;
-			};
+            auto drawNext = [&](char c) {
+                drawChar(canvas, xOff, yBase + pad, c, fg, scale);
+                xOff += charW + pad;
+            };
 
-			if (editTop)    drawNext('/');
-			drawNext(labelTop);
-			if (!pureFrame) {
-				if (editBottom && !editTop) drawNext('/');
-				drawNext(labelBottom);
-			}
-		}
-	}
+            if (editTop)    drawNext('/');
+            drawNext(labelTop);
+            if (!pureFrame) {
+                if (editBottom && !editTop) drawNext('/');
+                drawNext(labelBottom);
+            }
+        }
+    }
 }
 
+// Seed clpbuffer[2] (the 3D working plane) from the completed 2D result in
+// clpbuffer[1]. Called before split3D so that pixels where no temporal candidate
+// improves on 2D are left with the 2D value rather than uninitialised data.
 void Comb::FrameBuffer::copy2DTo3D()
 {
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -420,7 +444,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
     if (lines > 0 && width > 0) {
         // 2D score blending visualization (only written when showMap is true)
         w2d_frame_weight.assign(lines, std::vector<float>(width, 0.0f));
-		w2d_fieldA_gate.assign(lines, std::vector<double>(width, 1.0f));
+        w2d_fieldA_gate.assign(lines, std::vector<double>(width, 1.0f));
         // Accumulators for raster synthesis
         scratch_fieldLine.assign(width, 0.0);
         scratch_fieldGate.assign(width, 1.0);
@@ -453,13 +477,19 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         scratch_comp_res.assign(width, 0.0);
-		scratch_frameBCenter.assign(width, 0.0);
+        scratch_frameBCenter.assign(width, 0.0);
         scratch_fieldBCenter.assign(width, 0.0);
         scratch_vdis_flag.assign(width, 0);    
     }
     vdisMask.assign(lines, std::vector<char>(width, 0));
 }
 
+// Interleave the two source fields into rawbuffer in frame-line order (even lines
+// from firstField, odd lines from secondField), record their phase IDs, and derive
+// a single cadenceId representative for this frame from the two fields' cinemap
+// metadata. Also initialises lineFlip (per-line subcarrier polarity) and clears
+// the VDIS mask. capturePartnerSeqNo records the original TBC frame pairing for
+// each field, carried forward for reconstruction.
 void Comb::FrameBuffer::loadFields(const SourceField &firstField,
                                    const SourceField &secondField)
 {
@@ -529,6 +559,9 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     }
 }
 
+// Returns true if the consolidated VDIS mask has flagged position (lineNumber, h)
+// as a vertical differential isolation region. The mask is populated by
+// computeVDISLine and consolidated by consolidateVDISRegions during split2D.
 bool Comb::FrameBuffer::hasVDIS(int lineNumber, int h) const
 {
     const int first = videoParameters.firstActiveFrameLine;
@@ -546,7 +579,11 @@ bool Comb::FrameBuffer::hasVDIS(int lineNumber, int h) const
     return row[rel] != 0;
 }
 
-// Burst detection (internal linkage)
+// Burst detection (internal linkage).
+// Measures the colour burst in the horizontal blanking interval to derive
+// a normalised phasor (bcos, bsin) representing the subcarrier reference
+// phase for this line. The optional floor clamp prevents burst collapse on
+// very noisy lines from producing a near-zero (and hence useless) phasor.
 namespace {
     struct BurstInfo { double bsin; double bcos; };
     BurstInfo detectBurst(const quint16 *lineData,
@@ -574,8 +611,10 @@ namespace {
     }
 }
 
-// 1D band-pass (legacy 5-tap) + optional shaped 2nd-stage, blended by mix.
-// mix = 0 -> legacy only, mix = 1 -> full shaped 2nd stage
+// 1D horizontal bandpass: isolates subcarrier energy by subtracting the average
+// of the samples two positions either side (a 2-tap comb at 2fsc), scaled by 0.5.
+// This is the simplest possible chroma separator and serves as the baseline
+// reference for 2D and 3D candidates. Result written to clpbuffer[0].
 void Comb::FrameBuffer::split1D()
 {
     const int left      = videoParameters.activeVideoStart;
@@ -599,11 +638,11 @@ void Comb::FrameBuffer::split1D()
     }
 }
 
-// phaseLocked - We acquire a fine degree of phase correction 
-// phaseLocked - burst detection, affine solve from sinusoidal fit, and
-// subcarrier subtraction into clpbuffer[0]. Runs before split1D so that
-// split1D operates on phase-aligned composite. buildPhaseCorrected1D
-// applies the stored affine to demodTI/TQ after split1D has run.
+// Locked-path pre-processing: burst detection, raw composite demodulation into
+// TRI/TRQ, and sinusoidal-fit subcarrier subtraction into clpbuffer[0], with a
+// per-line affine solve stored in lineAffineLocked. Runs before split1D so that
+// subsequent stages operate on phase-aligned composite. buildPhaseCorrected1D
+// then applies the stored affine to demodTI/TQ after split1D has run.
 void Comb::FrameBuffer::phaseLocked()
 {
     if (!configuration.phaseCompensation)
@@ -804,19 +843,11 @@ void Comb::FrameBuffer::phaseLocked()
     }
 }
 
-// 2D helpers
-
-
-// "Line" - Phase-corrected 1D bandpass into clpbuffer[1]:
-// - demod clpbuffer[0] with per-line burst LO
-// - (optional) tiny smoothing in I/Q
-// - remod to real 4fsc
-// Replace the local allocation in buildPhaseCorrected1D with reuse of scratch_iq.
-
-// Demod clpbuffer[0] -> demodTI/TQ using locked basis, remod -> clpbuffer[1].
-// Populates demodTI/TQ for downstream consumers (computeFrameIQLine, filterIQLocked,
-// splitIQlocked) and writes phase-normalised chroma to clpbuffer[1] for split2D's
-// src1d reference.
+// Demodulates clpbuffer[0] into demodTI_flat/demodTQ_flat using the locked basis,
+// then remods back to phase-normalised composite in clpbuffer[1]. Populates
+// demodTI/TQ for downstream consumers (computeFrameIQLine, filterIQLocked,
+// scoreFieldVsFrame) and writes the phase-normalised chroma to clpbuffer[1]
+// as the reference used by split2D's Field/Frame scoring.
 void Comb::FrameBuffer::buildPhaseCorrected1D()
 {
     const int first  = videoParameters.firstActiveFrameLine;
@@ -883,7 +914,8 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
 
     static constexpr double blackLine[Comb::MAX_WIDTH] = {0};
 
-    // Source buffer: match FieldB pattern (phaseCompensation selects preclean/locked buffer)
+    // In locked mode, use clpbuffer[1] (phase-normalised composite); in bucket
+    // mode, use clpbuffer[0] (raw 1D bandpass).
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
 
     auto clampLinePtr = [&](int ln)->const double* {
@@ -1196,12 +1228,10 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     }
 
     
-    // In locked (phase-compensated) mode, leave FieldB un-damped.
-    // The π-damper is intended only for the phase-blind (bucket) path.
-    //if (configuration.phaseCompensation) {
-        std::copy(tcLine.begin(), tcLine.end(), outFieldLine);
-        return;
-   // }
+    // In locked (phase-compensated) mode, the π-damper is not applied —
+    // it is intended only for the phase-blind (bucket) path.
+    std::copy(tcLine.begin(), tcLine.end(), outFieldLine);
+    return;
 
     // --- PASS 2: π-damper (horizontal 3-tap pull to neighbor average) ---
     // Stronger in high chroma, reduced (but not eliminated) on hard horizontal edges.
@@ -1251,7 +1281,10 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     }
 }
 
-// We use Field B as a pre-clean for our demod space "Frame"
+// Demodulates the Field B scalar raster (simpleField2D[line]) into the locked
+// demodTI/TQ buffers for use by computeFrameIQLine. Field B provides a ±2 intra-field
+// comb estimate that serves as a cleaner input to the frame-comb demodulation than
+// the raw composite, reducing subcarrier leakage into the frame IQ estimate.
 void Comb::FrameBuffer::demodSimpleField2DLine(int line)
 {
     const int first = videoParameters.firstActiveFrameLine;
@@ -1490,14 +1523,11 @@ static void consolidateVDISRegions(
 }
 
 
-// Frame - sample the lines above and below (+1/-1) with ntsc 180 degree phase flips
-// Demod-space frame comb using ±1 lines with horizontal skew acceptance.
-// VDIS- we optionally detect vertical IQ disagreements for potential exclusion.
-
-// Frame - sample the lines above and below (+1/-1) with ntsc 180 degree phase flips
-// Demod-space frame comb using ±1 lines with horizontal skew acceptance.
-// VDIS- we optionally detect vertical IQ disagreements for potential exclusion.
-
+// Frame comb in IQ space: averages the ±1 neighbouring lines (adjacent in the
+// interlaced frame, therefore from the opposite field) to produce a frame-comb
+// estimate. Operates in demodulated IQ rather than raw composite to allow
+// phase-aware alignment and Nyquist/zipper repair. VDIS gating suppresses the
+// frame estimate where vertical chroma phase disagreement is detected.
 void Comb::FrameBuffer::computeFrameIQLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ)
@@ -2788,7 +2818,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     };
 
     applyIslandFilter();
-    // applyIslandFilter(); // optional 2nd pass
 
     if (!useFrameModel && fieldCountTotal > frameCountTotal * 2 && fieldCountTotal > 0) {
         for (int b = 0; b < width; b += FIELD_BLOCK_SIZE) {
@@ -3039,8 +3068,8 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     c[CAND_DOWN] = getCandidate(lineNumber, h, *this, lineNumber + 2, h, LINE_BONUS);
     src[CAND_DOWN] = this;
 
-    // FIX 2: Decoupled Temporal Candidates
-    // We check phase/validity individually for Prev and Next.
+    // Previous and next field candidates are evaluated independently so a valid
+    // prev does not force a symmetric next evaluation.
     
     // --- Previous Field ---
     bool prevValid = false;
@@ -3107,7 +3136,10 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
 
             double dIRE = std::fabs(c[i].sample - ref2d) / irescale;
             double delta = 0.0;
-            // ... (shaping logic same as before) ...
+            // Agreement shaping: reward temporal candidates that agree with the 2D
+            // estimate (parabolic bonus within AGREEMENT_REWARD_RADIUS_IRE), apply no
+            // adjustment in the neutral zone, and heavily penalise deviations beyond
+            // deviationThreshold to veto temporally incoherent candidates.
              if (dIRE <= T.AGREEMENT_REWARD_RADIUS_IRE) {
                 double x = dIRE / T.AGREEMENT_REWARD_RADIUS_IRE;
                 delta = - (T.AGREEMENT_REWARD_MAX * configuration.adaptThreshold) * (1.0 - x * x);
@@ -3137,11 +3169,13 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     bestSample = c[bestIndex].sample;
 }
 
-// splitIQ - Demod (no phase lock)  I/Q buckets ==> adjustY()
-// Transferring an analog NTSC line to 760 digital pixels affords a sample rate 
-// 4x the frequency of the subcarrier, which not only is the rate that  
-// theoretically "gets everything" in an analog video capture - 
-// it also allows for certain efficiencies when we need to interact with chroma phase.
+// Bucket-path demodulation: separates I and Q from the comb-filtered composite
+// using the 4fsc sampling structure directly. At 4× subcarrier, samples fall on
+// fixed phase positions (0°, 90°, 180°, 270°), so I and Q can be extracted by
+// routing each sample into the appropriate accumulator via a switch on (h & 3).
+// Y is initialised to the raw composite here; adjustY() subtracts the chroma
+// estimate afterwards. This path does not perform burst detection or phase
+// correction — it relies on the 4fsc sampling assumption holding exactly.
 void Comb::FrameBuffer::splitIQ()
 {
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -3154,10 +3188,7 @@ void Comb::FrameBuffer::splitIQ()
         double *I = componentFrame->u(lineNumber);
         double *Q = componentFrame->v(lineNumber);
 
-        // OLD:
-        // bool linePhase = getLinePhase(lineNumber);
-
-        // NEW: unified flip
+        // Apply per-line subcarrier polarity flip from lineFlip (populated in loadFields).
         int f = 1;
         if (!lineFlip.empty() &&
             lineNumber >= firstLine && lineNumber < (int)lineFlip.size()) {
@@ -3189,12 +3220,12 @@ void Comb::FrameBuffer::splitIQ()
 }
 
 
-// splitIQlocked - Demod (burst-locked)  Raw I/Q ===> produceY().
-// We separate I and Q without the efficiency of buckets, providing per-line
-// phase correction from the color burst (math moved to phaseLocked).
-// We transfer a coherent demod into a buffer for isolated use in obtaining Y.
-
-// splitIQlocked - Demod (burst-locked) Raw I/Q ===> produceY().
+// Locked-path demodulation: separates I and Q using the per-line burst phasor
+// (demodBurstCos/Sin) computed by phaseLocked, rather than relying on the 4fsc
+// sampling assumption. Also demodulates the raw composite into TRI/TRQ for
+// the residual Y path, and builds the HP-Y leakage buffers (yI, yQ) needed
+// by produceY. The affine stored in lineAffineLocked is applied to yI/yQ here
+// to align the residual Y demod with the locked chroma reference.
 void Comb::FrameBuffer::splitIQlocked()
 {
     // Safety check: ensure rawbuffer has enough lines to cover active video
@@ -3370,7 +3401,7 @@ void Comb::FrameBuffer::filterIQLocked()
     if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
 
-for (int line = firstLine; line < lastLine; ++line) {
+    for (int line = firstLine; line < lastLine; ++line) {
         double* Irow = componentFrame->u(line);
         double* Qrow = componentFrame->v(line);
         float*  tiRow = demodTI_line(line);
@@ -3384,30 +3415,30 @@ for (int line = firstLine; line < lastLine; ++line) {
         // If residualColor is active, derive chroma by subtracting the final Y from composite,
         // then demodulate that residual into the locked basis — this gives chroma that is
         // exactly consistent with the Y we produced, regardless of what filtering follows.
-		if (configuration.residualColor) {
-			double dc = (double)rawLine[left] - Yrow[left];
-			constexpr double DC_ALPHA = 1.0 / 64.0;
-			for (int i = 0; i < width; ++i) {
-				const int h = left + i;
-				const double chromaRaw = (double)rawLine[h] - Yrow[h];
-				dc += DC_ALPHA * (chromaRaw - dc);
-				const double chroma = chromaRaw - dc;
-				const int idx = (h & 3);
-				const double sp = spLUT_locked[idx];
-				const double cp = cpLUT_locked[idx];
-				const double lsin = chroma * sp * 2.0;
-				const double lcos = chroma * cp * 2.0;
-				scratch_preI[i] = (lsin * bcos - lcos * bsin) * effGI;
-				scratch_preQ[i] = (lsin * bsin + lcos * bcos) * effGQ;
-			}
-		} else {
-			for (int i = 0; i < width; ++i) {
-				const double ti = tiRow ? (double)tiRow[i] : 0.0;
-				const double tq = tqRow ? (double)tqRow[i] : 0.0;
-				scratch_preI[i] = ti * effGI;
-				scratch_preQ[i] = tq * effGQ;
-			}
-		}
+        if (configuration.residualColor) {
+            double dc = (double)rawLine[left] - Yrow[left];
+            constexpr double DC_ALPHA = 1.0 / 64.0;
+            for (int i = 0; i < width; ++i) {
+                const int h = left + i;
+                const double chromaRaw = (double)rawLine[h] - Yrow[h];
+                dc += DC_ALPHA * (chromaRaw - dc);
+                const double chroma = chromaRaw - dc;
+                const int idx = (h & 3);
+                const double sp = spLUT_locked[idx];
+                const double cp = cpLUT_locked[idx];
+                const double lsin = chroma * sp * 2.0;
+                const double lcos = chroma * cp * 2.0;
+                scratch_preI[i] = (lsin * bcos - lcos * bsin) * effGI;
+                scratch_preQ[i] = (lsin * bsin + lcos * bcos) * effGQ;
+            }
+        } else {
+            for (int i = 0; i < width; ++i) {
+                const double ti = tiRow ? (double)tiRow[i] : 0.0;
+                const double tq = tqRow ? (double)tqRow[i] : 0.0;
+                scratch_preI[i] = ti * effGI;
+                scratch_preQ[i] = tq * effGQ;
+            }
+        }
         // Apply FIRs to preI/preQ and write to I/Q
         for (int i = 0; i < width; ++i) {
             double accI = 0.0, accQ = 0.0;
@@ -3475,14 +3506,14 @@ void Comb::FrameBuffer::produceY()
         }
 
         // Pre-FIR demod arrays
-		const float* tiRow  = demodTI_line(line);
-		const float* tqRow  = demodTQ_line(line);
-		const float* triRow = demodTRI_line(line);
-		const float* trqRow = demodTRQ_line(line);
-		float* tiRowW = demodTI_line(line);
-		float* tqRowW = demodTQ_line(line);
+        const float* tiRow  = demodTI_line(line);
+        const float* tqRow  = demodTQ_line(line);
+        const float* triRow = demodTRI_line(line);
+        const float* trqRow = demodTRQ_line(line);
+        float* tiRowW = demodTI_line(line);
+        float* tqRowW = demodTQ_line(line);
 
-		// If any required demod rows are missing, fall back to non-residual
+        // If any required demod rows are missing, fall back to non-residual
         if (!tiRow || !tqRow || !triRow || !trqRow) {
             for (int h = left; h < right; ++h) Y[h] = (double)rawLine[h] - clpLine[h];
             if (configuration.showMap) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
@@ -3589,17 +3620,22 @@ void Comb::FrameBuffer::produceY()
             if (configuration.showMap) w2d_frame_weight[line][x] = (float)vet.confidence;
 
             if (vet.accept) {
-				Y[h] = (double)rawLine[h] - cval_hat;
-				tiRowW[x] = (float)ti_adj;
-				tqRowW[x] = (float)tq_adj;
-			} else {
-				Y[h] = (double)rawLine[h] - clpLine[h];
-			}
-		}
+                Y[h] = (double)rawLine[h] - cval_hat;
+                tiRowW[x] = (float)ti_adj;
+                tqRowW[x] = (float)tq_adj;
+            } else {
+                Y[h] = (double)rawLine[h] - clpLine[h];
+            }
+        }
     }
 }
 
-// Y reconstruction (adaptY - "Bucket mode" - ONLY when phaseCompensation == false)
+// Bucket-path Y reconstruction: subtracts the chroma estimate (reconstructed
+// from the I and Q buckets) from the raw composite to yield luma. The chroma
+// remodulation reverses the bucket demod — routing each sample through the
+// same switch on (h & 3) with sign inversion — and applies the per-line
+// subcarrier polarity from getLinePhase. Only called in bucket mode
+// (phaseCompensation == false); the locked path uses produceY() instead.
 void Comb::FrameBuffer::adjustY()
 {
     if (configuration.phaseCompensation) return;
@@ -3629,7 +3665,10 @@ void Comb::FrameBuffer::adjustY()
     }
 }
 
-// Chroma LP filter
+// Bucket-path chroma low-pass filter: applies a symmetric FIR to the I and Q
+// planes to remove high-frequency luma leakage left after the bucket demod.
+// Not used in the locked path, which applies bandwidth-tailored FIRs in
+// filterIQLocked instead.
 void Comb::FrameBuffer::filterIQ()
 {
     auto iqFilter = makeFIRFilter(c_colorlp_b);
@@ -3653,7 +3692,10 @@ void Comb::FrameBuffer::filterIQ()
     }
 }
 
-// Chroma NR (coring)
+// Chroma noise reduction (coring): high-pass filters I and Q with a narrow FIR,
+// then hard-clamps the result to ±cNRLevel IRE, and subtracts the clamped
+// high-frequency component. Suppresses chroma noise without affecting the
+// broad chroma spectrum. Operates on the I/Q planes in place.
 void Comb::FrameBuffer::doCNR()
 {
     if (configuration.cNRLevel == 0.0) return;
@@ -3702,7 +3744,9 @@ void Comb::FrameBuffer::doCNR()
     }
 }
 
-// Luma NR (coring)
+// Luma noise reduction (coring): same coring approach as doCNR but applied to
+// the Y plane. High-pass filters Y and subtracts any component within ±yNRLevel
+// IRE, attenuating fine-grain luma noise while preserving picture detail.
 void Comb::FrameBuffer::doYNR()
 {
     if (configuration.yNRLevel == 0.0) return;
@@ -3738,7 +3782,13 @@ void Comb::FrameBuffer::doYNR()
     }
 }
 
-// Final chroma rotation + gain
+// Final chroma rotation and gain: rotates the I/Q plane by chromaPhase degrees
+// and scales by chromaGain, converting from the internal demod basis to the
+// standard Y'UV colour axes. The two paths use different base rotation angles
+// because they produce I/Q in different reference frames: the locked path
+// (splitIQlocked / filterIQLocked) produces chroma aligned to the burst-locked
+// LO (base 70°), while the bucket path (splitIQ / filterIQ) produces chroma
+// aligned to the 4fsc sampling grid (base 33°).
 void Comb::FrameBuffer::transformIQ(double chromaGain, double chromaPhase)
 {
     if (demodMode == DemodMode::Locked) {
@@ -3794,7 +3844,10 @@ void Comb::FrameBuffer::transformIQ(double chromaGain, double chromaPhase)
     }
 }
 
-// Overlay 3D map (debug)
+// Debug overlay: paints each pixel of the U/V planes with a colour indicating
+// which candidate won the 3D election at that position (red = 1D/lateral,
+// yellow = 2D vertical, green = field, blue/purple = previous/next frame).
+// Useful for diagnosing candidate selection behaviour on problem content.
 void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
                                    const FrameBuffer &nextFrame)
 {

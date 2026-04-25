@@ -1,12 +1,12 @@
-/****************************************************************
- cadence_assembler.cpp
-
- implementation of pulldown consolidation for telecine
- Copyright 2026 - Joseph Burns
-
- a part of ld-chroma-decoder
-
- ****************************************************************/
+/******************************************************************************
+ * cadenceassembler.cpp
+ * ld-chroma-decoder — Colourisation filter for ld-decode
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 #include "cadenceassembler.h"
 #include "cadencedefs.h"
 #include "combmath.h"
@@ -18,203 +18,242 @@
 
 namespace {
 
-	struct BurstInfo { double bsin; double bcos; };
-	
-	static inline BurstInfo detectBurstForDgMerge(const quint16 *lineData,
-												  const LdDecodeMetaData::VideoParameters &vp)
-	{
-		double bsin = 0.0, bcos = 0.0;
-		for (int i = vp.colourBurstStart; i < vp.colourBurstEnd; ++i) {
-			const double s = lineData[i];
-			bsin += s * sin4fsc(i);
-			bcos += s * cos4fsc(i);
-		}
-		const int len = vp.colourBurstEnd - vp.colourBurstStart;
-		if (len > 0) {
-			const double invLen = 1.0 / len;
-			bsin *= invLen;
-			bcos *= invLen;
-		}
-		double mag = std::sqrt(bsin * bsin + bcos * bcos);
-		if (mag > 1e-9) {
-			const double invMag = 1.0 / mag;
-			bsin *= invMag;
-			bcos *= invMag;
-		} else {
-			bsin = 0.0;
-			bcos = 1.0;
-		}
-		return {bsin, bcos};
-	}
-	
-	static inline BurstInfo combineDefWeightedBasis(const BurstInfo& defB,
-												   const BurstInfo& spareB)
-	{
-		double bsin = 2.0 * defB.bsin + spareB.bsin;
-		double bcos = 2.0 * defB.bcos + spareB.bcos;
-		const double mag = std::sqrt(bsin*bsin + bcos*bcos);
-		if (mag > 1e-12) { bsin /= mag; bcos /= mag; }
-		else { bsin = 0.0; bcos = 1.0; }
-		return {bsin, bcos};
-	}
-	
-	static inline void demodIQ(double v, int h, double bcos, double bsin,
-							   double& outI, double& outQ)
-	{
-		const double lsin = v * sin4fsc(h) * 2.0;
-		const double lcos = v * cos4fsc(h) * 2.0;
-		outI = (lsin * bcos - lcos * bsin);
-		outQ = (lsin * bsin + lcos * bcos);
-	}
-	
-	static inline double hypot2(double a, double b) { return std::sqrt(a*a + b*b); }
-	
-	static inline quint16 clampU16(double v)
-	{
-		if (!(v == v)) return 0;
-		if (v < 0.0) return 0;
-		if (v > 65535.0) return 65535;
-		return static_cast<quint16>(std::llround(v));
-	}
-	
-	// Merge core
-	static bool mergeDgPairWithSanity(const LdDecodeMetaData::VideoParameters& vp,
-									 const CadenceAssembler::Configuration& cfg,
-									 SourceField& def,
-									 SourceField& spare,
-									 SourceField& comp)
-	{
-		const int width = vp.fieldWidth;
-		if (width <= 0) return false;
-	
-		// Treat SourceField::data as a raw byte buffer of 16-bit samples.
-		constexpr int bytesPerSample = int(sizeof(quint16));
-	
-		if (def.data.size() != spare.data.size()) return false;
-		if (def.data.size() != comp.data.size()) return false;
-		if (def.data.size() <= 0) return false;
-		if ((def.data.size() % bytesPerSample) != 0) return false;
-	
-		const int samples = def.data.size() / bytesPerSample;
-		if ((samples % width) != 0) return false;
-	
-		const int height = samples / width;
-		if (height <= 0) return false;
-	
-		int activeLeft  = vp.activeVideoStart;
-		int activeRight = vp.activeVideoEnd;
-	
-		// Clamp active window to buffer width.
-		activeLeft  = std::clamp(activeLeft,  0, width);
-		activeRight = std::clamp(activeRight, 0, width);
-		if (activeLeft >= activeRight) return false;
-	
-		const int y0     = std::clamp(def.getFirstActiveLine(vp),   0, height);
-		const int y1     = std::clamp(def.getLastActiveLine(vp),    0, height);
-		const int compY0 = std::clamp(comp.getFirstActiveLine(vp),  0, height);
-		const int compY1 = std::clamp(comp.getLastActiveLine(vp),   0, height);
-		if (y0 >= y1 || compY0 >= compY1) return false;
-	
-		const double ireScale = (vp.white16bIre - vp.black16bIre) / 100.0;
-		if (!(ireScale > 0.0)) return false;
-	
-		// Threshold expressed in sample/code units (same space as input pixels).
-		const double outlierThreshCode = cfg.dgOutlierThreshIre * ireScale;
-		const double maxOutlierFrac    = std::clamp(cfg.dgMaxOutlierFrac, 0.0, 1.0);
-		if (!(outlierThreshCode >= 0.0)) return false;
-	
-		// In this pipeline's demodIQ (as used by dg merge), IQ distance is 2x code distance:
-		// lsin/lcos have factor 2.0 and sin/cos are unit magnitude -> |dIQ| = 2*|dv|.
-		const double outlierThreshIQ = 2.0 * outlierThreshCode;
-	
-		const quint16* defp   = reinterpret_cast<const quint16*>(def.data.constData());
-		const quint16* sparep = reinterpret_cast<const quint16*>(spare.data.constData());
-		const quint16* compp  = reinterpret_cast<const quint16*>(comp.data.constData());
-	
-		std::int64_t total    = 0;
-		std::int64_t outliers = 0;
-	
-		// Pass 1: Analyze (cheap twin sanity in the same "code-derived" space via outlierThreshIQ)
-		for (int lf = y0; lf < y1; ++lf) {
-			const quint16* defLine   = defp   + lf * width;
-			const quint16* spareLine = sparep + lf * width;
-	
-			const BurstInfo bDef   = detectBurstForDgMerge(defLine, vp);
-			const BurstInfo bSpare = detectBurstForDgMerge(spareLine, vp);
-			const BurstInfo b      = combineDefWeightedBasis(bDef, bSpare);
-	
-			for (int h = activeLeft; h < activeRight; ++h) {
-				double ID, QD, IS, QS;
-				demodIQ((double)defLine[h],   h, b.bcos, b.bsin, ID, QD);
-				demodIQ((double)spareLine[h], h, b.bcos, b.bsin, IS, QS);
-	
-				// IQ-distance threshold (equivalent to code-distance threshold)
-				if (hypot2(ID - IS, QD - QS) > outlierThreshIQ) outliers++;
-				total++;
-			}
-		}
-	
-		if (total <= 0) return false;
-		const double outlierFrac = double(outliers) / double(total);
-		if (outlierFrac > maxOutlierFrac) return false;
-	
-		// Pass 2: Merge
-		quint16* defw   = reinterpret_cast<quint16*>(def.data.data());
-		quint16* sparew = reinterpret_cast<quint16*>(spare.data.data());
-		const bool defIsFirst = def.field.isFirstField;
-	
-		for (int lf = y0; lf < y1; ++lf) {
-			quint16* defLine   = defw   + lf * width;
-			quint16* spareLine = sparew + lf * width;
-	
-			const BurstInfo bDef   = detectBurstForDgMerge(defLine, vp);
-			const BurstInfo bSpare = detectBurstForDgMerge(spareLine, vp);
-			const BurstInfo b      = combineDefWeightedBasis(bDef, bSpare);
-	
-			int compLfUp = defIsFirst ? (lf - 1) : lf;
-			int compLfDn = defIsFirst ? lf       : (lf + 1);
-			compLfUp = std::clamp(compLfUp, compY0, compY1 - 1);
-			compLfDn = std::clamp(compLfDn, compY0, compY1 - 1);
-	
-			const quint16* compUpLine = compp + compLfUp * width;
-			const quint16* compDnLine = compp + compLfDn * width;
-	
-			for (int h = activeLeft; h < activeRight; ++h) {
-				double ID, QD, IS, QS;
-				demodIQ((double)defLine[h],   h, b.bcos, b.bsin, ID, QD);
-				demodIQ((double)spareLine[h], h, b.bcos, b.bsin, IS, QS);
-	
-				const double dDS_IQ = hypot2(ID - IS, QD - QS);
-	
-				quint16 outv = 0;
-				if (dDS_IQ <= outlierThreshIQ) {
-					outv = clampU16(0.5 * ((double)defLine[h] + (double)spareLine[h]));
-				} else {
-					double IU, QU, IDn, QDn;
-					demodIQ((double)compUpLine[h], h, b.bcos, b.bsin, IU,  QU);
-					demodIQ((double)compDnLine[h], h, b.bcos, b.bsin, IDn, QDn);
-	
-					if ((IU * IDn + QU * QDn) < 0.0) { IDn = -IDn; QDn = -QDn; }
-	
-					const double IR = 0.5 * (IU + IDn);
-					const double QR = 0.5 * (QU + QDn);
-	
-					const double dDef = hypot2(ID - IR, QD - QR);
-					const double dSp  = hypot2(IS - IR, QS - QR);
-	
-					outv = (dDef <= dSp) ? defLine[h] : spareLine[h];
-				}
-	
-				defLine[h]   = outv;
-				spareLine[h] = outv;
-			}
-		}
-	
-		return true;
-	}
+    struct BurstInfo { double bsin; double bcos; };
+    
+    static inline BurstInfo detectBurstForDgMerge(const quint16 *lineData,
+                                                  const LdDecodeMetaData::VideoParameters &vp)
+    {
+        double bsin = 0.0, bcos = 0.0;
+        for (int i = vp.colourBurstStart; i < vp.colourBurstEnd; ++i) {
+            const double s = lineData[i];
+            bsin += s * sin4fsc(i);
+            bcos += s * cos4fsc(i);
+        }
+        const int len = vp.colourBurstEnd - vp.colourBurstStart;
+        if (len > 0) {
+            const double invLen = 1.0 / len;
+            bsin *= invLen;
+            bcos *= invLen;
+        }
+        double mag = std::sqrt(bsin * bsin + bcos * bcos);
+        if (mag > 1e-9) {
+            const double invMag = 1.0 / mag;
+            bsin *= invMag;
+            bcos *= invMag;
+        } else {
+            bsin = 0.0;
+            bcos = 1.0;
+        }
+        return {bsin, bcos};
+    }
+    
+    static inline BurstInfo combineDefWeightedBasis(const BurstInfo& defB,
+                                                   const BurstInfo& spareB)
+    {
+        double bsin = 2.0 * defB.bsin + spareB.bsin;
+        double bcos = 2.0 * defB.bcos + spareB.bcos;
+        const double mag = std::sqrt(bsin*bsin + bcos*bcos);
+        if (mag > 1e-12) { bsin /= mag; bcos /= mag; }
+        else { bsin = 0.0; bcos = 1.0; }
+        return {bsin, bcos};
+    }
+    
+    static inline void demodIQ(double v, int h, double bcos, double bsin,
+                               double& outI, double& outQ)
+    {
+        const double lsin = v * sin4fsc(h) * 2.0;
+        const double lcos = v * cos4fsc(h) * 2.0;
+        outI = (lsin * bcos - lcos * bsin);
+        outQ = (lsin * bsin + lcos * bcos);
+    }
+    
+    static inline double hypot2(double a, double b) { return std::sqrt(a*a + b*b); }
+    
+    static inline quint16 clampU16(double v)
+    {
+        if (!(v == v)) return 0;
+        if (v < 0.0) return 0;
+        if (v > 65535.0) return 65535;
+        return static_cast<quint16>(std::llround(v));
+    }
+    
+    // Merge a doplGang A/C spare field into its definitional partner.
+    //
+    // The merge is performed in IQ (demodulated chroma) space rather than
+    // raw pixel space because the spare field carries a 180°-shifted subcarrier
+    // relative to the definitional field. A direct pixel average would cancel
+    // chroma; demodulating to IQ first allows the two fields' chroma to be
+    // compared and averaged coherently.
+    //
+    // Pass 1 counts how many samples differ by more than the outlier threshold
+    // in IQ distance. If the outlier fraction exceeds cfg.dgMaxOutlierFrac the
+    // pair is rejected (the fields are not genuine twins) and no merge occurs.
+    //
+    // Pass 2 performs the actual merge: where the def and spare agree within
+    // threshold, their raw pixels are averaged directly. Where they disagree,
+    // the complement field lines immediately above and below are demodulated
+    // and the def/spare sample closer to that reference is kept, discarding
+    // the other.
+    static bool mergeDgPairWithSanity(const LdDecodeMetaData::VideoParameters& vp,
+                                     const CadenceAssembler::Configuration& cfg,
+                                     SourceField& def,
+                                     SourceField& spare,
+                                     SourceField& comp)
+    {
+        const int width = vp.fieldWidth;
+        if (width <= 0) return false;
+    
+        // Treat SourceField::data as a raw byte buffer of 16-bit samples.
+        constexpr int bytesPerSample = int(sizeof(quint16));
+    
+        if (def.data.size() != spare.data.size()) return false;
+        if (def.data.size() != comp.data.size()) return false;
+        if (def.data.size() <= 0) return false;
+        if ((def.data.size() % bytesPerSample) != 0) return false;
+    
+        const int samples = def.data.size() / bytesPerSample;
+        if ((samples % width) != 0) return false;
+    
+        const int height = samples / width;
+        if (height <= 0) return false;
+    
+        int activeLeft  = vp.activeVideoStart;
+        int activeRight = vp.activeVideoEnd;
+    
+        // Clamp active window to buffer width.
+        activeLeft  = std::clamp(activeLeft,  0, width);
+        activeRight = std::clamp(activeRight, 0, width);
+        if (activeLeft >= activeRight) return false;
+    
+        const int y0     = std::clamp(def.getFirstActiveLine(vp),   0, height);
+        const int y1     = std::clamp(def.getLastActiveLine(vp),    0, height);
+        const int compY0 = std::clamp(comp.getFirstActiveLine(vp),  0, height);
+        const int compY1 = std::clamp(comp.getLastActiveLine(vp),   0, height);
+        if (y0 >= y1 || compY0 >= compY1) return false;
+    
+        const double ireScale = (vp.white16bIre - vp.black16bIre) / 100.0;
+        if (!(ireScale > 0.0)) return false;
+    
+        // Threshold expressed in sample/code units (same space as input pixels).
+        const double outlierThreshCode = cfg.dgOutlierThreshIre * ireScale;
+        const double maxOutlierFrac    = std::clamp(cfg.dgMaxOutlierFrac, 0.0, 1.0);
+        if (!(outlierThreshCode >= 0.0)) return false;
+    
+        // In this pipeline's demodIQ (as used by dg merge), IQ distance is 2x code distance:
+        // lsin/lcos have factor 2.0 and sin/cos are unit magnitude -> |dIQ| = 2*|dv|.
+        const double outlierThreshIQ = 2.0 * outlierThreshCode;
+    
+        const quint16* defp   = reinterpret_cast<const quint16*>(def.data.constData());
+        const quint16* sparep = reinterpret_cast<const quint16*>(spare.data.constData());
+        const quint16* compp  = reinterpret_cast<const quint16*>(comp.data.constData());
+    
+        std::int64_t total    = 0;
+        std::int64_t outliers = 0;
+    
+        // Pass 1: Analyze (cheap twin sanity in the same "code-derived" space via outlierThreshIQ)
+        for (int lf = y0; lf < y1; ++lf) {
+            const quint16* defLine   = defp   + lf * width;
+            const quint16* spareLine = sparep + lf * width;
+    
+            const BurstInfo bDef   = detectBurstForDgMerge(defLine, vp);
+            const BurstInfo bSpare = detectBurstForDgMerge(spareLine, vp);
+            const BurstInfo b      = combineDefWeightedBasis(bDef, bSpare);
+    
+            for (int h = activeLeft; h < activeRight; ++h) {
+                double ID, QD, IS, QS;
+                demodIQ((double)defLine[h],   h, b.bcos, b.bsin, ID, QD);
+                demodIQ((double)spareLine[h], h, b.bcos, b.bsin, IS, QS);
+    
+                // IQ-distance threshold (equivalent to code-distance threshold)
+                if (hypot2(ID - IS, QD - QS) > outlierThreshIQ) outliers++;
+                total++;
+            }
+        }
+    
+        if (total <= 0) return false;
+        const double outlierFrac = double(outliers) / double(total);
+        if (outlierFrac > maxOutlierFrac) return false;
+    
+        // Pass 2: Merge
+        quint16* defw   = reinterpret_cast<quint16*>(def.data.data());
+        quint16* sparew = reinterpret_cast<quint16*>(spare.data.data());
+        const bool defIsFirst = def.field.isFirstField;
+    
+        for (int lf = y0; lf < y1; ++lf) {
+            quint16* defLine   = defw   + lf * width;
+            quint16* spareLine = sparew + lf * width;
+    
+            const BurstInfo bDef   = detectBurstForDgMerge(defLine, vp);
+            const BurstInfo bSpare = detectBurstForDgMerge(spareLine, vp);
+            const BurstInfo b      = combineDefWeightedBasis(bDef, bSpare);
+    
+            int compLfUp = defIsFirst ? (lf - 1) : lf;
+            int compLfDn = defIsFirst ? lf       : (lf + 1);
+            compLfUp = std::clamp(compLfUp, compY0, compY1 - 1);
+            compLfDn = std::clamp(compLfDn, compY0, compY1 - 1);
+    
+            const quint16* compUpLine = compp + compLfUp * width;
+            const quint16* compDnLine = compp + compLfDn * width;
+    
+            for (int h = activeLeft; h < activeRight; ++h) {
+                double ID, QD, IS, QS;
+                demodIQ((double)defLine[h],   h, b.bcos, b.bsin, ID, QD);
+                demodIQ((double)spareLine[h], h, b.bcos, b.bsin, IS, QS);
+    
+                const double dDS_IQ = hypot2(ID - IS, QD - QS);
+    
+                quint16 outv = 0;
+                if (dDS_IQ <= outlierThreshIQ) {
+                    outv = clampU16(0.5 * ((double)defLine[h] + (double)spareLine[h]));
+                } else {
+                    double IU, QU, IDn, QDn;
+                    demodIQ((double)compUpLine[h], h, b.bcos, b.bsin, IU,  QU);
+                    demodIQ((double)compDnLine[h], h, b.bcos, b.bsin, IDn, QDn);
+    
+                    if ((IU * IDn + QU * QDn) < 0.0) { IDn = -IDn; QDn = -QDn; }
+    
+                    const double IR = 0.5 * (IU + IDn);
+                    const double QR = 0.5 * (QU + QDn);
+    
+                    const double dDef = hypot2(ID - IR, QD - QR);
+                    const double dSp  = hypot2(IS - IR, QS - QR);
+    
+                    outv = (dDef <= dSp) ? defLine[h] : spareLine[h];
+                }
+    
+                defLine[h]   = outv;
+                spareLine[h] = outv;
+            }
+        }
+    
+        return true;
+    }
 
 } // namespace
 
+// CadenceAssembler — telecine pulldown consolidation for ld-chroma-decoder.
+//
+// CadenceAssembler accepts a stream of SourceFields tagged with cadence
+// metadata from ld-cinemap and assembles them into WorkItems for the comb
+// decoder. Three operating modes are supported:
+//
+// Autosolve (default): uses cadenceId assignments written by ld-cinemap to
+//   identify and pair definitional, complement, and spare fields into film
+//   frames. Spare fields (A-trailing, C-leading) are merged into the
+//   definitional field via dG pixel averaging where the sanity check passes,
+//   or released to baseline passthrough if not.
+//
+// Forced cadence (--set-cadence): bypasses ld-cinemap's solve entirely and
+//   imposes a naive A-B-C-D pattern on the incoming field stream. Useful when
+//   cadence metadata is absent or unreliable.
+//
+// Output path: in normal telecine mode, WorkItems carry TelecineFrame or
+//   PassthroughFrame kind and are delivered to DecoderPool for comb decoding.
+//   With --export-24p, film frames are emitted as FilmFrame kind (one per
+//   unique film frame, no spare expansion). Fields that cannot be placed into
+//   a film frame are released to baseline so DecoderPool can emit them as
+//   plain video without gaps in the output stream.
+//
 // CadenceAssembler Implementation
 CadenceAssembler::CadenceAssembler(const LdDecodeMetaData::VideoParameters& vp,
                                    const Configuration& cfg,
@@ -336,7 +375,11 @@ int CadenceAssembler::forcedStartIndex() const
         default: base = 0; break;
     }
 
-    // -r gives the additional 5 offsets
+    // -r (reverseFieldOrder) shifts the starting slot by half a cycle (5 slots).
+    // In normal field order the upper (first-stored) field carries the A-definitional
+    // sample; reversing field order makes the lower field the first-stored, which
+    // flips which fields within each pulldown frame are the spares versus which are
+    // the B-frame fields — the core distinction in pulldown consolidation.
     if (config.reverseFieldOrder) base = (base + 5) % CADENCE_NTSC_CYCLE;
     return base;
 }
@@ -383,8 +426,12 @@ int CadenceAssembler::findComplementPos(int i0) const {
     return pos;
 }
 
-// Forced cadence (jam) mode:
-// - The user can bypass the solve and impose a naive pattern on the run
+// Forced cadence (jam) mode: the user insists on a specific cadence pattern
+// regardless of what ld-cinemap detected. Fields are consumed in strict
+// A-B-C-D sequence driven by setCadence (which sets the starting slot) with
+// no cadenceId validation — every incoming field is assigned its position by
+// counting, not by metadata. This is useful when cadence metadata is absent
+// or when the user knows the disc has a simple, unbroken pulldown cadence.
 void CadenceAssembler::processWindowForced(bool flushMode)
 {
     if (config.noPA) return;
@@ -443,9 +490,9 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                 SourceField spare = pop1();
                 if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
                     ex = WorkItem::Expansion::Trailing;
-				} else {
-					releaseToBaseline(std::move(spare));
-				}
+                } else {
+                    releaseToBaseline(std::move(spare));
+                }
             }
 
             emitTelecine2('A', std::move(def), std::move(comp), ex);
@@ -533,7 +580,7 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                     } else {
                         releaseToBaseline(std::move(spare));
                     }
-				}
+                }
                 emitTelecine2('A', std::move(def), std::move(comp), ex);
                 continue;
             }
@@ -577,7 +624,7 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                 emitTelecine2('D', std::move(f8), std::move(f9), WorkItem::Expansion::None);
                 continue;
             }
-			while (!window.empty()) releaseToBaseline(pop1());
+            while (!window.empty()) releaseToBaseline(pop1());
             window.clear();
             break;
         }
@@ -645,17 +692,19 @@ void CadenceAssembler::processHistory(bool flushMode)
         }
 
         // Mark any residual single tail as consumed.
-		while (cursor < (int)history.size()) {
-			if (!history[cursor].consumed) {
-				releaseToBaseline(std::move(history[cursor].field));
-			}
+        while (cursor < (int)history.size()) {
+            if (!history[cursor].consumed) {
+                releaseToBaseline(std::move(history[cursor].field));
+            }
             markHistoryConsumed(cursor);
             ++cursor;
         }
     }
 }
 
-// Autosolve path - we accept the CadenceId generated by CineMap and operate on that basis
+// Autosolve path: uses cadenceId metadata written by ld-cinemap to guide
+// film frame reconstruction. Fields are paired by their definitional/
+// complement relationship; spare fields are merged where available.
 bool CadenceAssembler::tryExtractFilmFrameAtCursor()
 {
     if (config.noPA) return false;
@@ -868,21 +917,21 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
         }
         releaseToBaseline(std::move(spare));
     };
-	
-	// Normalize baseSeq to the definitional anchor for spare lookup:
-	// A: always relative to Adef (idx 0); if we have Acomp (idx 1), step back 1.
-	// C: always relative to Cdef (idx 7); if we have Ccomp (idx 6), step forward 1.
-	const int baseSeq = (idx0 == 1) ? head.field.seqNo - 1  // Acomp -> Adef
-					  : (idx0 == 6) ? head.field.seqNo + 1  // Ccomp -> Cdef
-					  : head.field.seqNo;                    // Adef or Cdef already
+    
+    // Normalize baseSeq to the definitional anchor for spare lookup:
+    // A: always relative to Adef (idx 0); if we have Acomp (idx 1), step back 1.
+    // C: always relative to Cdef (idx 7); if we have Ccomp (idx 6), step forward 1.
+    const int baseSeq = (idx0 == 1) ? head.field.seqNo - 1  // Acomp -> Adef
+                      : (idx0 == 6) ? head.field.seqNo + 1  // Ccomp -> Cdef
+                      : head.field.seqNo;                    // Adef or Cdef already
 
-	if (letter == 'A') {
-		auto it = seqNoToHistoryIndex.find(baseSeq + 2);
-		if (it != seqNoToHistoryIndex.end()) tryConsumeSpare(it.value());
-	} else if (letter == 'C') {
-		auto it = seqNoToHistoryIndex.find(baseSeq - 2);
-		if (it != seqNoToHistoryIndex.end()) tryConsumeSpare(it.value());
-	}
+    if (letter == 'A') {
+        auto it = seqNoToHistoryIndex.find(baseSeq + 2);
+        if (it != seqNoToHistoryIndex.end()) tryConsumeSpare(it.value());
+    } else if (letter == 'C') {
+        auto it = seqNoToHistoryIndex.find(baseSeq - 2);
+        if (it != seqNoToHistoryIndex.end()) tryConsumeSpare(it.value());
+    }
     // Emit
     bool swapped = orderPairForComb(fA, fB);
     WorkItem wi;
@@ -905,7 +954,8 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
     return true;
 }
 
-/// Fallback when film process can't succeed - we need to produce a video frame, either from the fields
+// Fallback for when the film process doesn't succeed. Video frames must be
+// delivered in any event, as plain video if not film.
 bool CadenceAssembler::tryEmitPassthroughAtCursor(bool flushMode, bool force)
 {
     (void)flushMode;

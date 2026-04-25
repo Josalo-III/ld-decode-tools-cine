@@ -1,29 +1,15 @@
-/************************************************************************
-
-    decoderpool.cpp
-
-    ld-chroma-decoder - Colourisation filter for ld-decode
-    Copyright (C) 2018-2019 Simon Inns
-    Copyright (C) 2021 Phillip Blucas
-    Copyright (C) 2021 Adam Sampson
-    Copyright (C) 2025-2026 Joseph Burns
-    
-    This file is part of ld-decode-tools.
-
-    ld-chroma-decoder is free software: you can redistribute it and/or
-    modify it under the terms of the GNU General Public License as
-    published by the Free Software Foundation, either version 3 of the
-    License, or (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
-************************************************************************/
+/******************************************************************************
+ * decoderpool.cpp
+ * ld-chroma-decoder — Colourisation filter for ld-decode
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2018-2019 Simon Inns
+ * SPDX-FileCopyrightText: 2021 Adam Sampson
+ * SPDX-FileCopyrightText: 2021 Phillip Blucas
+ * SPDX-FileCopyrightText: 2025-2026 Joseph Burns
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 
 #include "decoderpool.h"
 
@@ -61,16 +47,16 @@ SourceField DecoderPool::createBlackField(bool isFirst, int seqNo) const
 
 namespace {
 
-	static inline int cadenceRoleIndex(int cid)
-	{
-		if (!cadenceKnown(cid)) return -1;
-		const int idx = cadenceIndex(cid);
-		if (idx == 0 || idx == 7) return 0;           // Def
-		if (idx == 1 || idx == 6 || idx == 8) return 1; // Comp
-		if (idx == 2 || idx == 5) return 2;           // Spare
-		return -1;
-	}
-	
+    static inline int cadenceRoleIndex(int cid)
+    {
+        if (!cadenceKnown(cid)) return -1;
+        const int idx = cadenceIndex(cid);
+        if (idx == 0 || idx == 7) return 0;           // Def
+        if (idx == 1 || idx == 6 || idx == 8) return 1; // Comp
+        if (idx == 2 || idx == 5) return 2;           // Spare
+        return -1;
+    }
+    
 } // namespace
 
 bool DecoderPool::process()
@@ -89,17 +75,17 @@ bool DecoderPool::process()
         return false;
     }
 
-	cadenceAssembler = std::make_unique<CadenceAssembler>(
-	    videoParameters,
-	    cadenceConfig,
-	    [this](qint32 seqNo) {
-	        // Called under inputMutex (from pumpAssembler inside getInputFrames).
-	        if (!cadenceConfig.export24p && !cadenceConfig.noPA)
-	            enqueueBaselinePassthrough(seqNo);
-	    }
-	);
-	
-	decoderLookBehind = decoder.getLookBehind();
+    cadenceAssembler = std::make_unique<CadenceAssembler>(
+        videoParameters,
+        cadenceConfig,
+        [this](qint32 seqNo) {
+            // Called under inputMutex (from pumpAssembler inside getInputFrames).
+            if (!cadenceConfig.export24p && !cadenceConfig.noPA)
+                enqueueBaselinePassthrough(seqNo);
+        }
+    );
+    
+    decoderLookBehind = decoder.getLookBehind();
     decoderLookAhead  = decoder.getLookAhead();
 
     if (!sourceVideo.open(inputFileName, videoParameters.fieldWidth * videoParameters.fieldHeight)) {
@@ -124,14 +110,14 @@ bool DecoderPool::process()
         }
     }
 
-	if (outputFileName == "-") {
-		if (!targetVideo.open(STDOUT_FILENO, QIODevice::WriteOnly)) {
-			qCritical() << "Could not open stdout for output";
-			sourceVideo.close();
-			return false;
-		}
-		qInfo() << "Writing output to stdout";
-	} else {
+    if (outputFileName == "-") {
+        if (!targetVideo.open(STDOUT_FILENO, QIODevice::WriteOnly)) {
+            qCritical() << "Could not open stdout for output";
+            sourceVideo.close();
+            return false;
+        }
+        qInfo() << "Writing output to stdout";
+    } else {
         targetVideo.setFileName(outputFileName);
         if (!targetVideo.open(QIODevice::WriteOnly)) {
             qCritical() << "Could not open" << outputFileName << "for output";
@@ -219,7 +205,7 @@ bool DecoderPool::process()
         }
     }
 
-	double totalSecs = (static_cast<double>(totalTimer.elapsed()) / 1000.0);
+    double totalSecs = (static_cast<double>(totalTimer.elapsed()) / 1000.0);
     qInfo() << "Processing complete -" << length << "frames in" << totalSecs << "seconds (" <<
                length / totalSecs << "FPS )";
 
@@ -515,25 +501,25 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
                                 rawVec, dummyStart, dummyEnd);
                                 
         // Trim batch to end on a cadence cycle boundary (cadenceId 9 = D2)
-		const int rawSize = static_cast<int>(rawVec.size());
-		int trimEnd = rawSize;
-		for (int i = rawSize - 1; i >= std::max(0, rawSize - 10); --i) {
-			const int cid = rawVec[i].field.cinemap.cadenceId;
-			if (cid == 9 || (cid >= 0 && cid % 10 == 9)) {
-				trimEnd = i + 1;
-				break;
-			}
-			if (rawVec[i].field.cinemap.isEditBoundary) {
-				trimEnd = i;
-				break;
-			}
-		}
-		
-		if (trimEnd < rawSize) {
-			const int fieldsReturned = rawSize - trimEnd;
-			inputFrameNumber -= fieldsReturned / 2;
-			rawVec.resize(trimEnd);
-		}
+        const int rawSize = static_cast<int>(rawVec.size());
+        int trimEnd = rawSize;
+        for (int i = rawSize - 1; i >= std::max(0, rawSize - 10); --i) {
+            const int cid = rawVec[i].field.cinemap.cadenceId;
+            if (cid == 9 || (cid >= 0 && cid % 10 == 9)) {
+                trimEnd = i + 1;
+                break;
+            }
+            if (rawVec[i].field.cinemap.isEditBoundary) {
+                trimEnd = i;
+                break;
+            }
+        }
+        
+        if (trimEnd < rawSize) {
+            const int fieldsReturned = rawSize - trimEnd;
+            inputFrameNumber -= fieldsReturned / 2;
+            rawVec.resize(trimEnd);
+        }
         if (cadenceAssembler) {
             cadenceAssembler->push(rawVec);
             const auto produced = cadenceAssembler->popWork();
@@ -737,7 +723,7 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
             decodeTicketsByFrameNumber[startFrameNumber] = ticket;
         }
         
-	}
+    }
 
     fields.clear();
 
@@ -889,24 +875,24 @@ bool DecoderPool::putOutputFrame(qint32 frameNumber,
             return false;
         }
     
-		QVector<quint16> f1data, f2data;
-		splitOutputFrameToFields(outputFrame, f1data, f2data);
-		
-		if (isUpgrade) {
-			submitUpgradedField(ticket.homeSeq1, f1data);
-			submitUpgradedField(ticket.homeSeq2, f2data);
-		} else {
-			if (!upgradedFieldsBySeq.contains(ticket.homeSeq1))
-				submitBaselineField(ticket.homeSeq1, f1data);
-			if (!upgradedFieldsBySeq.contains(ticket.homeSeq2))
-				submitBaselineField(ticket.homeSeq2, f2data);
-		}
-		
-		if (isUpgrade && ticket.duplicateTwin) {
-			const QVector<quint16>& twinFieldData =
-				(ticket.twinSource == 1) ? f1data : f2data;
-			submitUpgradedField(ticket.twinHomeSeq, twinFieldData);
-		}
+        QVector<quint16> f1data, f2data;
+        splitOutputFrameToFields(outputFrame, f1data, f2data);
+        
+        if (isUpgrade) {
+            submitUpgradedField(ticket.homeSeq1, f1data);
+            submitUpgradedField(ticket.homeSeq2, f2data);
+        } else {
+            if (!upgradedFieldsBySeq.contains(ticket.homeSeq1))
+                submitBaselineField(ticket.homeSeq1, f1data);
+            if (!upgradedFieldsBySeq.contains(ticket.homeSeq2))
+                submitBaselineField(ticket.homeSeq2, f2data);
+        }
+        
+        if (isUpgrade && ticket.duplicateTwin) {
+            const QVector<quint16>& twinFieldData =
+                (ticket.twinSource == 1) ? f1data : f2data;
+            submitUpgradedField(ticket.twinHomeSeq, twinFieldData);
+        }
     
         while (tryEmitNextOriginalPair()) {
         }
