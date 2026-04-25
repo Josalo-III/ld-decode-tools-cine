@@ -47,6 +47,8 @@ public:
                  bool _deleteUnmappable, bool _noAudio);
 
 private:
+    // These members hold the arguments passed to process() for use by the
+    // private mapping stage methods called from it.
     QFileInfo inputFileInfo;
     QFileInfo inputMetadataFileInfo;
     QFileInfo outputFileInfo;

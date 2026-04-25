@@ -52,6 +52,7 @@ DiscMap::DiscMap(const QFileInfo &metadataFileInfo, const bool reverseFieldOrder
     }
 
     if (m_numberOfFrames > 108000) {
+        // 108000 frames = 60 minutes at 30fps (NTSC) — beyond any real LaserDisc side
         tbcDebugStream() << "Metadata contains" << m_numberOfFrames << "frames - too big";
         m_tbcValid = false;
         return;
@@ -88,9 +89,11 @@ DiscMap::DiscMap(const QFileInfo &metadataFileInfo, const bool reverseFieldOrder
     }
 
     if (m_isDiscPal) {
+        // PAL: 44100 Hz / 50 fields/s = 882 samples/field; 882 * 4 bytes (16-bit stereo) = 3528
         m_audioFieldByteLength   = 3528;
         m_audioFieldSampleLength = 882;
     } else {
+        // NTSC: 44100 Hz / 60 fields/s = 735 samples/field; 736 * 4 bytes = 2944 (rounded up for alignment)
         m_audioFieldByteLength   = 2944;
         m_audioFieldSampleLength = 736;
     }
@@ -137,6 +140,10 @@ DiscMap::DiscMap(const QFileInfo &metadataFileInfo, const bool reverseFieldOrder
             m_frames[frameNumber].vbiFrameNumber(ldDecodeMetaData->convertClvTimecodeToFrameNumber(clvTimecode));
 
             if (!m_isDiscPal) {
+                // NTSC CLV discs using the IEC Amendment 2 encoding insert an extra
+                // frame number at specific positions in the timecode sequence. Track
+                // how many such offsets have been seen so that frame numbers can be
+                // corrected back to a contiguous sequence.
                 if (isNtscAmendment2ClvFrameNumber(m_frames[frameNumber].vbiFrameNumber() - iecOffset)) {
                     m_frames[frameNumber].isClvOffset(true);
                     iecOffset++;
@@ -256,6 +263,9 @@ DiscMap::DiscMap(const QFileInfo &metadataFileInfo, const bool reverseFieldOrder
         qint32 syncConfPercent = (ldDecodeMetaData->getField(ldDecodeMetaData->getFirstFieldNumber(frameNumber + 1)).syncConf +
                                   ldDecodeMetaData->getField(ldDecodeMetaData->getSecondFieldNumber(frameNumber + 1)).syncConf) / 2;
 
+        // Composite quality score weighted heavily towards dropout coverage (x1000),
+        // with secondary contributions from bSNR, sequence continuity penalty, and
+        // sync confidence. Normalised to a 0–100 range.
         m_frames[frameNumber].frameQuality((bsnrPercent + penaltyPercent + static_cast<double>(syncConfPercent) + (frameDoPercent * 1000.0)) / 1004.0);
     }
 
@@ -425,6 +435,8 @@ bool DiscMap::isPhaseRepeating(qint32 frameNumber) const
             (m_frames[frameNumber].secondFieldPhase() == m_frames[frameNumber - 1].secondFieldPhase()))
             return true;
     } else {
+        // Frame 0 has no predecessor; treat as non-repeating so it is never
+        // filtered out on the basis of phase alone.
         return true;
     }
 
@@ -459,6 +471,10 @@ void DiscMap::debugFrameDetails(qint32 frameNumber)
 
 bool DiscMap::isNtscAmendment2ClvFrameNumber(qint32 frameNumber)
 {
+    // The IEC Amendment 2 NTSC CLV timecode scheme inserts an extra frame number
+    // at positions n = 8991*l + 899*m for l in [0,13] and m in [1,9].
+    // These correspond to the rollover points where the CLV picture-number field
+    // wraps within each second group.
     for (qint32 l = 0; l < 14; l++) {
         for (qint32 m = 1; m <= 9; m++) {
             qint32 n = 8991 * l + 899 * m;
@@ -593,6 +609,9 @@ bool DiscMap::saveTargetMetadata(QFileInfo outputFileInfo)
                         secondSourceMetadata.vbi.vbiData[0], secondSourceMetadata.vbi.vbiData[1], secondSourceMetadata.vbi.vbiData[2]);
 
                 if (vbi.picNo != m_frames[frameNumber].vbiFrameNumber()) {
+                    // The corrected frame number has been overwritten by conflicting
+                    // data already present in VBI line 0. Clear line 0 so the picture
+                    // number written to lines 1 and 2 decodes cleanly.
                     qInfo() << "Warning: Updated VBI frame number for frame" << m_frames[frameNumber].vbiFrameNumber()
                             << "has been corrupted by existing VBI data - overwriting all VBI for frame";
                     firstSourceMetadata.vbi.vbiData[0] = 0;
@@ -657,6 +676,8 @@ bool DiscMap::saveTargetMetadata(QFileInfo outputFileInfo)
 
 qint32 DiscMap::convertFrameToVbi(qint32 frameNumber)
 {
+    // CAV picture numbers are BCD-encoded in VBI with the prefix 0x00F.
+    // Example: frame 12345 → "00F12345" interpreted as hex → 0x00F12345.
     QString number = "00F" + QString("%1").arg(frameNumber, 5, 10, QChar('0'));
     bool ok;
     qint32 returnValue = number.toInt(&ok, 16);
@@ -668,11 +689,13 @@ qint32 DiscMap::convertFrameToClvPicNo(qint32 frameNumber)
 {
     LdDecodeMetaData::ClvTimecode timecode = ldDecodeMetaData->convertFrameNumberToClvTimecode(frameNumber);
 
-    qint32 secondsX1;
-    if (timecode.seconds % 10 == 0) secondsX1 = timecode.seconds;
-    else secondsX1 = (timecode.seconds - (timecode.seconds % 10));
-    qint32 secondsX3 = timecode.seconds - secondsX1;
-    secondsX1 = ((secondsX1 + 10) / 10) + 9;
+    // The CLV picture-number VBI word (prefix 0x008) encodes the seconds field
+    // split across two nibbles: secondsX1 carries the tens digit (offset +10, +9
+    // as a hex digit) and secondsX3 carries the units digit, followed by the
+    // two-digit picture number within the second.
+    qint32 secondsX1 = (timecode.seconds / 10) * 10; // tens boundary
+    qint32 secondsX3 = timecode.seconds - secondsX1;  // units digit
+    secondsX1 = ((secondsX1 + 10) / 10) + 9;         // encode tens as offset hex digit
 
     QString number = "008" + QString("%1").arg(secondsX1, 1, 16, QChar('0')) + "E" +
             QString("%1").arg(secondsX3, 1, 10, QChar('0')) +
@@ -687,6 +710,9 @@ qint32 DiscMap::convertFrameToClvTimeCode(qint32 frameNumber)
 {
     LdDecodeMetaData::ClvTimecode timecode = ldDecodeMetaData->convertFrameNumberToClvTimecode(frameNumber);
 
+    // The CLV timecode VBI word (prefix 0x00F) encodes hours and minutes in BCD:
+    // one digit for hours followed by two digits for minutes, with 0xDD as a
+    // fixed separator between them.
     QString number = "00F" + QString("%1").arg(timecode.hours, 1, 10, QChar('0')) + "DD" +
             QString("%1").arg(timecode.minutes, 2, 10, QChar('0'));
     bool ok;

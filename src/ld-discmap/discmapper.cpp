@@ -82,9 +82,8 @@ bool DiscMapper::process(QFileInfo _inputFileInfo, QFileInfo _inputMetadataFileI
 
     if (!verifyFrameNumberPresence(discMap)) {
         if (mapOnly) {
-            // In map-only mode no TBC video file is written, so a metadata file with
-            // unmappable frames cannot accidentally be paired with a real video file.
-            // Ask the user whether to continue for analysis purposes or abort.
+            // In map-only mode no TBC video file is written, so unmappable frames
+            // cannot be deleted from the output. Offer to continue for analysis only.
             qInfo() << "";
             qInfo() << "Unmappable frames detected; deletion requires a TBC video file.";
             qInfo() << "Either cancel and re-run with -u (--delete-unmappable-frames),";
@@ -438,7 +437,8 @@ void DiscMapper::padDiscMap(DiscMap &discMap)
     for (qint32 frameNumber = 0; frameNumber < discMap.numberOfFrames() - 1; frameNumber++) {
         if (discMap.vbiFrameNumber(frameNumber) + 1 != discMap.vbiFrameNumber(frameNumber + 1)) {
             if (discMap.isPulldown(frameNumber)) {
-                // Can't check anything for this condition, just skip it
+                // Pulldown frames share a VBI number with the preceding frame;
+                // the gap check does not apply across them.
             } else {
                 if (discMap.isPulldown(frameNumber + 1)) {
                     if (discMap.vbiFrameNumber(frameNumber) + 1 != discMap.vbiFrameNumber(frameNumber + 2)) {
@@ -454,9 +454,8 @@ void DiscMapper::padDiscMap(DiscMap &discMap)
                             paddingLength.append(missingFrames);
                         } else {
                             if ((discMap.vbiFrameNumber(frameNumber + 2) - discMap.vbiFrameNumber(frameNumber)) == 0) {
-                               qInfo() << "Analysis got a gap of 0 - this is a edge case reported in issue 539.  If you are";
-                               qInfo() << "seeing this then you have a useful TBC that can be diagnosed... Please take the";
-                               qInfo() << "to make your TBC file available to the developers so we can cure this bug.";
+                               qInfo() << "Warning: zero-length gap detected across a pulldown boundary - this frame";
+                               qInfo() << "will be skipped. If this causes problems, re-run with --debug for more detail.";
                             }
                         }
                     }
