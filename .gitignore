@@ -103,3 +103,4 @@ compile.bat
 
 # Nix artefacts
 result
+src/ld-disc-stacker/stacker_main.cpp
