@@ -16,7 +16,7 @@ namespace segmenter {
 
     // Clears all solver-owned flags from disc metadata:
     //   - isEditBoundary
-    //   - cadenceId / cadenceConfidence / cadenceIndexPresumed
+    //   - cadenceId / cadenceIndexPresumed
     //   - pulldownRole
     // This is the backing implementation for --clear-all-flags.
     // Never called implicitly by any detection pass.

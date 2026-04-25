@@ -1,12 +1,13 @@
 // tools/ld-cinemap/cinemap.cpp
-/************************************************************************
-    cinemap. cpp
-
-    ld-cinemap - telecine solving and edit detection
-    Copyright (C) 2026 Joseph Burns
-
-    This file is part of ld-decode-tools.
-************************************************************************/
+/******************************************************************************
+ * cinemap.cpp
+ * ld-cinemap — telecine cadence solver and edit detection
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
+ *
+ * This file is part of ld-decode-tools.
+ ******************************************************************************/
 #include "cinemap.h"
 #include "cinedisc.h"
 
@@ -24,15 +25,11 @@
 #include <unordered_map>
 
 
-// Small helpers
-
 static inline int normalizePhase(long long val, int mod) {
     int res = val % mod;
     return (res < 0) ? res + mod : res;
 }
 
-
-// CineMap
 
 CineMap::CineMap(CineDisc* disc, Policy policy)
     : m_disc(disc)
@@ -41,14 +38,12 @@ CineMap::CineMap(CineDisc* disc, Policy policy)
 {
 }
 
-// main entry point
-
 int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
 {
     Q_UNUSED(threshold);
 
     if (!m_disc || !m_md || m_disc->isDiscPal()) {
-        qInfo() << "PA: Skipping cadence detection (PAL or invalid)";
+        qInfo() << "Skipping cadence detection (PAL or invalid)";
         return 0;
     }
 
@@ -70,22 +65,18 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
     m_doplGang.assign(totalFields + 1, std::nullopt);
     m_cadenceConfidence.assign(totalFields + 1, 0.0);
 
-	// -------------------------------
     // CAV fast-path
-    // -------------------------------
     if (m_disc->isDiscCav()) {
-        qInfo() << "PA: Running CAV cadence solver (picNo + dG based)";
+        qInfo() << "Running CAV cadence solver (picNo + dG based)";
         int cavLocked = solveCavDisc();
         if (cavLocked > 0) return cavLocked;
-        qInfo() << "PA: CAV fast-path found 0 groups/locks; falling back to CLV solver.";
+        qInfo() << "CAV fast-path found 0 groups/locks; falling back to CLV solver.";
     }
 
-    // -------------------------------
     // CLV path
-    // -------------------------------
     SourceVideo sv;
     if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) {
-        qWarning() << "PA: Failed to open TBC file";
+        qWarning() << "Failed to open TBC file";
         return 0;
     }
 
@@ -93,7 +84,7 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
 
     // 1. Initial segmentation by edit boundaries
     auto segments = identifySegments(hardMaxField);
-    qInfo() << "PA: Initially identified" << segments.size() << "segments";
+    qInfo() << "Initially identified" << segments.size() << "segments";
 
     // 2. Build frame/field capture cache
     auto cache = buildCaptureCache(hardMaxField);
@@ -111,7 +102,7 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
                 ? (100.0 * double(segIdx + 1) / double(segCount))
                 : 100.0;
             qInfo().noquote()
-                << QString("PA: Solving segment %1/%2 (%3%) fields [%4..%5]")
+                << QString("Solving segment %1/%2 (%3%) fields [%4..%5]")
                        .arg(segIdx + 1)
                        .arg(segCount)
                        .arg(pct, 0, 'f', 1)
@@ -153,9 +144,9 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
     }
 
     // 4. Continuity & intra-segment healing pass
-    qInfo() << "PA: Running Continuity Healer...";
+    qInfo() << "Running Continuity Healer...";
     int healedCount = healContinuity(solvedSegments, cache);
-    qInfo() << "PA: Healer refined" << healedCount << "segments/spans.";
+    qInfo() << "Healer refined" << healedCount << "segments/spans.";
 
     // 5. Final paint using healed results
     int totalFieldsLocked = 0;
@@ -177,13 +168,12 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
     detectAndEncodeInvertedCadenceRuns();
     assignPulldownRoles();
 
-    // Do NOT do DiscMap frame-flag writeback in ld-cinemap.
-    // applyCadenceToFrameFlags();
+    // ld-cinemap does not write back to DiscMap frame flags; that is DiscMap's domain.
 
     // 7. Reconcile doplGang with final cadence geometry
     reconcileDoplGangWithCadence();
 
-    qInfo() << "PA: Solver locked" << totalFieldsLocked << "fields.";
+    qInfo() << "Solver locked" << totalFieldsLocked << "fields.";
     return totalFieldsLocked;
 }
 
@@ -371,7 +361,7 @@ bool CineMap::verifyPhaseWithNotch(SourceVideo& sv,
         std::sort(scores.begin(), scores.end());
         const size_t n = scores.size();
         if ((scores[n * 3 / 4] - scores[n / 4]) < 1e-6) {
-            qInfo() << "PA: verifyPhaseWithNotch: mixedness has no dynamic range"
+            qInfo() << "verifyPhaseWithNotch: mixedness has no dynamic range"
                     << "— cannot verify, falling back to CLV policy";
             return false;
         }
@@ -414,7 +404,7 @@ bool CineMap::verifyPhaseWithNotch(SourceVideo& sv,
     const int gap = std::abs(notchPos0 - notchPos1);
     const bool adjacent = (gap == 1 || gap == 4); // gap==4 wraps 4→0
     if (!adjacent) {
-        qInfo() << "PA: verifyPhaseWithNotch: Notch top-2 positions"
+        qInfo() << "verifyPhaseWithNotch: Notch top-2 positions"
                 << notchPos0 << "and" << notchPos1
                 << "are not adjacent — signal too noisy, falling back";
         return false;
@@ -431,7 +421,7 @@ bool CineMap::verifyPhaseWithNotch(SourceVideo& sv,
 
     const bool verified = (notchPhase == picNoPhase);
 
-    qInfo() << "PA: verifyPhaseWithNotch: Notch top-2 positions"
+    qInfo() << "verifyPhaseWithNotch: Notch top-2 positions"
             << notchPos0 << notchPos1
             << "→ Notch phase" << notchPhase
             << "| picNo phase" << picNoPhase
@@ -727,7 +717,7 @@ void CineMap::detectCavCadenceBreaks(std::vector<Cav5Group>& groups,
         if (!fld.cinemap.isEditBoundary) {
             fld.cinemap.isEditBoundary = true;
             m_md->updateField(fld, tFirst);
-            qInfo() << "PA: CAV: inserted cadence break at field" << tFirst
+            qInfo() << "CAV: inserted cadence break at field" << tFirst
                     << "(frame" << frameIdx << ")";
         }
     };
@@ -735,7 +725,7 @@ void CineMap::detectCavCadenceBreaks(std::vector<Cav5Group>& groups,
     // VBI picture number for a frame index, or -1 if unavailable.
     auto pic = [&](int frameIdx) -> qint32 {
         if (frameIdx < 0 || frameIdx >= nFrames) return -1;
-	return m_vbi.picNo(frameIdx);
+    return m_vbi.picNo(frameIdx);
     };
 
     for (size_t i = 1; i < groups.size(); ++i) {
@@ -844,25 +834,25 @@ int CineMap::solveCavDisc()
                            (bestVotes >= MIN_SAMPLES) &&
                            (bestVotes > windowsScored / 2);
 
-    qInfo() << "PA: CAV picNo hits" << picNoHits << "/ frames" << nFrames
+    qInfo() << "CAV picNo hits" << picNoHits << "/ frames" << nFrames
             << "| best phase" << bestPhase << "with" << bestVotes
             << "votes of" << windowsScored << "| confident:" << confident;
 
     SourceVideo sv;
     if (!sv.open(m_disc->getTbcPath(), m_disc->getVideoFieldLength())) {
-        qWarning() << "PA: CAV solver: failed to open TBC file";
+        qWarning() << "CAV solver: failed to open TBC file";
         return 0;
     }
 
     if (!hasPicNo) {
-        qInfo() << "PA: CAV: no picNo found — applying CLV-policy fallback";
+        qInfo() << "CAV: no picNo found — applying CLV-policy fallback";
         solveCavFallback(sv);
         sv.close();
         return 0;
     }
 
     if (!confident) {
-        qInfo() << "PA: CAV: picNo present but phase not confident"
+        qInfo() << "CAV: picNo present but phase not confident"
                 << "(only" << bestVotes << "agreeing windows)"
                 << "— applying CLV-policy fallback";
         solveCavFallback(sv);
@@ -876,7 +866,7 @@ int CineMap::solveCavDisc()
     constexpr int VERIFY_FRAMES = 300;
 
     if (!verifyPhaseWithNotch(sv, bestPhase, VERIFY_FRAMES)) {
-        qInfo() << "PA: CAV: Notch pattern disagrees with picNo phase"
+        qInfo() << "CAV: Notch pattern disagrees with picNo phase"
                 << "— applying CLV-policy fallback";
         solveCavFallback(sv);
         sv.close();
@@ -886,7 +876,7 @@ int CineMap::solveCavDisc()
     // ------------------------------------------------------------------
     // 3. Verified: harvest dG twins, paint, run inversion test.
     // ------------------------------------------------------------------
-    qInfo() << "PA: CAV: picNo phase" << bestPhase
+    qInfo() << "CAV: picNo phase" << bestPhase
             << "verified by Notch — harvesting twins by pattern";
 
     const int hardMax = computeHardMaxField();
@@ -941,7 +931,7 @@ int CineMap::solveCavDisc()
         assignFrame(g.f3, v.cid[3]);
         assignFrame(g.f4, v.cid[4]);
     }
-    qInfo() << "PA: CAV: validated windows painted" << validated;
+    qInfo() << "CAV: validated windows painted" << validated;
 
     sv.close();
 
@@ -950,7 +940,7 @@ int CineMap::solveCavDisc()
     for (int i = 1; i <= totalFields; ++i)
         if (cadenceKnown(m_md->getField(i).cinemap.cadenceId)) totalLocked++;
 
-    qInfo() << "PA: CAV solver completed, total cadenced fields:" << totalLocked;
+    qInfo() << "CAV solver completed, total cadenced fields:" << totalLocked;
     return totalLocked;
 }
 
@@ -984,7 +974,7 @@ std::vector<CineMap::Cav5Group> CineMap::identifyCav5Groups()
         }
     }
 
-    qInfo() << "PA: CAV identifyCav5Groups: windows checked"
+    qInfo() << "CAV identifyCav5Groups: windows checked"
             << (n >= 5 ? n - 4 : 0)
             << "paddedSkip" << paddedSkip
             << "patternMismatch" << patternMismatch
@@ -995,7 +985,7 @@ std::vector<CineMap::Cav5Group> CineMap::identifyCav5Groups()
 
 void CineMap::solveCavFallback(SourceVideo& sv)
 {
-    qInfo() << "PA: CAV: running CLV-policy fallback (Tv policy)";
+    qInfo() << "CAV: running CLV-policy fallback (Tv policy)";
 
     const int hardMax = computeHardMaxField();
     const SegmentCaptureCache cache = buildCaptureCache(hardMax);
@@ -1049,7 +1039,7 @@ double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width, 
 
     auto d1 = sv.getVideoField(f1);
     auto d2 = sv.getVideoField(f2);
-    // Relaxed size check  allow some headroom for short buffers
+    // Relaxed size check: allow some headroom for short buffers
     if (d1.size() < (width * height * 2) / 2 || d2.size() < (width * height * 2) / 2) return 0.0;
 
     const uint16_t* p1 = reinterpret_cast<const uint16_t*>(d1.constData());
@@ -1060,7 +1050,7 @@ double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width, 
     const double white = (vp.white16bIre > black) ? vp.white16bIre : 65535.0;
     const double scaleToIre = (white > black) ? (100.0 / (white - black)) : (100.0 / 65535.0);
 
-    // --- Adaptive Noise Floor (PSNRbased, as before) ---
+    // Adaptive noise floor derived from field bPSNR.
     double psnr1 = m_md->getFieldVitsMetrics(f1).bPSNR;
     double psnr2 = m_md->getFieldVitsMetrics(f2).bPSNR;
     if (psnr1 <= 0.1) psnr1 = 38.0;
@@ -1234,7 +1224,7 @@ CineMap::computeFrameMixedness(SourceVideo& sv, int segStart, int segEnd)
     int endFrame   = frameIndexForField(segEnd);
     if (startFrame < 0 || endFrame < 0) return results;
 
-    tbcDebugStream() << "PA:   Computing mixedness (Notch && Lips) for frames"
+    tbcDebugStream() << "  Computing mixedness (Notch && Lips) for frames"
              << startFrame << "-" << endFrame;
 
     // Tunables for combining Notch and Lips
@@ -1291,7 +1281,7 @@ std::vector<CineMap::TwinEdge> CineMap::harvestTwinEdges(SourceVideo& sv, int se
     if (!m_md || !m_disc) return edges;
     const auto& vp = m_md->getVideoParameters();
 
-    tbcDebugStream() << "PA:   Harvesting twin edges (Dip-Based), maxDist =" << maxDist << "Range:" << segStart << "-" << segEnd;
+    tbcDebugStream() << "  Harvesting twin edges (Dip-Based), maxDist =" << maxDist << "Range:" << segStart << "-" << segEnd;
 
     for (int a = segStart; a <= segEnd; ++a) {
         if (!isValidEvidenceField(a)) continue;
@@ -1321,7 +1311,7 @@ std::vector<CineMap::TwinEdge> CineMap::harvestTwinEdges(SourceVideo& sv, int se
         }
     }
 
-    tbcDebugStream() << "PA:   Found" << edges.size() << "twin edges in brute force pass.";
+    tbcDebugStream() << "  Found" << edges.size() << "twin edges in brute force pass.";
 
     // Merge-write doplGang with conflict resolution vs existing JSON
     writeTwinEdgesToMetadata(sv, edges);
@@ -1672,8 +1662,8 @@ double CineMap::getAdaptiveTwinThreshold(int f1, int f2)
     // Clamp: Don't let threshold go below 1.2 (too strict) or above 5.0 (too loose)
     noiseScale = std::clamp(noiseScale, 0.6, 2.5);
 
-	double thr = BASE_THRESHOLD_IRE * noiseScale;
-	// Apply global twin/dG sensitivity: >1.0  more sensitive (lower threshold)
+    double thr = BASE_THRESHOLD_IRE * noiseScale;
+    // Apply global twin/dG sensitivity: >1.0  more sensitive (lower threshold)
     if (m_twinSensitivity > 0.0) {
         thr /= m_twinSensitivity;
     }
@@ -1794,7 +1784,7 @@ bool CineMap::tryCommitReciprocalGang(SourceVideo& sv,
         TwinACInfo ac = classifyTwinAC_strict(a, b, cache);
         if (ac.role == TwinACRole::Unknown) return false;
 
-        // --- NEW: boosted sanity gate for A/C twins ---
+        // Boosted sanity gate for A/C twins:
         const auto& vp = m_md->getVideoParameters();
         double dSanity = calculateBoostedDemodDiff(sv, a, b, vp.fieldWidth, vp.fieldHeight);
         double thr     = getAdaptiveTwinThreshold(a, b);
@@ -2231,8 +2221,6 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv,
     
     return true;
 }
-
-// Solving and Implementation
 
 CineMap::PhaseRun
 CineMap::scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
@@ -2840,15 +2828,13 @@ void CineMap::detectAndEncodeInvertedCadenceRuns()
     if (runStart >= 0) processRun(runStart, hardMax);
 
     if (runsFlipped > 0) {
-        qInfo() << "PA: detectAndEncodeInvertedCadenceRuns: flipped"
+        qInfo() << "detectAndEncodeInvertedCadenceRuns: flipped"
                 << fieldsFlipped << "field(s) across"
                 << runsFlipped << "run(s) to inverted domain.";
     } else {
-        qInfo() << "PA: detectAndEncodeInvertedCadenceRuns: all runs normal dominance.";
+        qInfo() << "detectAndEncodeInvertedCadenceRuns: all runs normal dominance.";
     }
 }
-
-// post cleanup - healing - reconciliation
 
 int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                             const SegmentCaptureCache& cache)
@@ -2926,7 +2912,7 @@ int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                                        cache);
 
                 if (fitScore > 0.15) {
-                    qInfo() << "PA: Healer: Back-projected phase"
+                    qInfo() << "Healer: Back-projected phase"
                             << projectedPhase
                             << "into segment" << (i + 1)
                             << "(Conf:" << fitScore << ")";
@@ -2964,7 +2950,7 @@ int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                                        cache);
 
                 if (fitScore > 0.15) {
-                    qInfo() << "PA: Healer: Forward-projected phase"
+                    qInfo() << "Healer: Forward-projected phase"
                             << projectedPhase
                             << "into segment" << (i + 2)
                             << "(Conf:" << fitScore << ")";
@@ -3006,7 +2992,7 @@ int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                         (curr.run.phaseOffset + (startB - startA)) % 5;
                     if (bridgePhase < 0) bridgePhase += 5;
                     
-                    qInfo() << "PA: Healer: Bridged gap segment"
+                    qInfo() << "Healer: Bridged gap segment"
                             << (i + 2) << "between locked neighbors.";
 
                     demoteSegmentRange(next, 0.4);

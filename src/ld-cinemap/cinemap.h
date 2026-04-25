@@ -1,17 +1,16 @@
 // tools/ld-cinemap/cinemap.h
 #pragma once
 
-#include <QString>
-#include <QVector>
+#include "sourcevideo.h"
+#include "vbiprobe.h"
 
 #include <array>
 #include <optional>
+#include <QString>
+#include <QVector>
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#include "sourcevideo.h"
-#include "vbiprobe.h"
 
 class CineDisc;
 class LdDecodeMetaData;
@@ -29,7 +28,7 @@ public:
 
     int detectCadence(const QString& tbcFilePath, double threshold);
     void setVbi(vbiProbe::ProbeResult vbi) { m_vbi = std::move(vbi); }
-    // Private methods
+
 private:
     // Internal structs
     struct SegmentCapture {
@@ -174,7 +173,7 @@ private:
         }
     };
 
-	bool             verifyPhaseWithNotch(SourceVideo& sv,
+    bool             verifyPhaseWithNotch(SourceVideo& sv,
                                          int picNoPhase,
                                          int verifyFrames);
 
@@ -263,12 +262,12 @@ private:
                                 std::vector<double>& lumaOut,
                                 int width) const;
 
-	double getAdaptiveTwinThreshold(int f1, int f2);
-	double twinConfidence(SourceVideo& sv, int seqA, int seqB);
-	int  fieldForFrame(int frameIdx) const;
-	void detectCavCadenceBreaks(std::vector<Cav5Group>& groups, SourceVideo& sv);
-	void solveCavFallback(SourceVideo& sv);
-	int  enforceSteadyCadenceAcrossBoundaries(int maxSpanFields);
+    double getAdaptiveTwinThreshold(int f1, int f2);
+    double twinConfidence(SourceVideo& sv, int seqA, int seqB);
+    int  fieldForFrame(int frameIdx) const;
+    void detectCavCadenceBreaks(std::vector<Cav5Group>& groups, SourceVideo& sv);
+    void solveCavFallback(SourceVideo& sv);
+    int  enforceSteadyCadenceAcrossBoundaries(int maxSpanFields);
     // Attempts to commit a reciprocal doplGang link between fields a and b.
     // cacheOrNull: if provided, enforces strict A/C geometry before committing.
     bool tryCommitReciprocalGang(SourceVideo& sv,
@@ -382,9 +381,10 @@ private:
     double m_notchSensitivity = 1.0;
     double m_twinSensitivity  = 1.0;
     vbiProbe::ProbeResult m_vbi;   // decoded VBI for every frame; set by setVbi()
-	// We store detected duplicate fields to aid in creation of cadenceId
-	std::vector<std::optional<int>> m_doplGang;        // indexed by 1-based field seq; size = totalFields + 1
-    std::vector<double>             m_cadenceConfidence; // indexed by 1-based field seq; size = totalFields + 1; internal only, not persisted
+    // Detected duplicate field links used to derive cadenceId assignments.
+    std::vector<std::optional<int>> m_doplGang;        // indexed by 1-based field seq; size = totalFields + 1
+    // Internal confidence scores for cadence assignments; not persisted to metadata.
+    std::vector<double>             m_cadenceConfidence; // indexed by 1-based field seq; size = totalFields + 1
     // Second order memoisation caches — cleared at the start of each detectCadence() call.
     std::unordered_map<DiffCacheKey,      double, DiffCacheKeyHash>      m_diffCache;
     std::unordered_map<TwinDemodCacheKey, double, TwinDemodCacheKeyHash> m_twinDemodCache;

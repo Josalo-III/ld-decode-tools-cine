@@ -2,52 +2,52 @@
 #include "cinedisc.h"
 
 #include "lddecodemetadata.h"
+#include "tbc/logging.h"
 
-#include <QDebug>
-#include <QFileInfo>
 #include <algorithm>
+#include <memory>
+#include <QFileInfo>
 #include <unordered_set>
 
-#include <memory>
 
 namespace {
 
-	// Parse seqNo keys from comma-separated string, optionally supporting ranges (e.g., "10-20")
-	static std::vector<qint32> parseSeqNoKeys(const QString& text, bool allowRanges)
-	{
-		std::vector<qint32> out;
-		if (text.trimmed().isEmpty()) return out;
-	
-		const QStringList items = text.split(',', Qt::SkipEmptyParts);
-		for (QString item : items) {
-			item = item.trimmed();
-			if (item.isEmpty()) continue;
-	
-			if (allowRanges && item.contains('-')) {
-				const QStringList parts = item.split('-', Qt::SkipEmptyParts);
-				if (parts.size() != 2) continue;
-	
-				bool okA = false, okB = false;
-				qint32 a = parts[0].trimmed().toInt(&okA);
-				qint32 b = parts[1].trimmed().toInt(&okB);
-				if (!okA || !okB) continue;
-				if (a <= 0 || b <= 0) continue;
-	
-				if (a > b) std::swap(a, b);
-				for (qint32 v = a; v <= b; ++v) out.push_back(v);
-			} else {
-				bool ok = false;
-				qint32 v = item.toInt(&ok);
-				if (!ok || v <= 0) continue;
-				out.push_back(v);
-			}
-		}
-	
-		std::sort(out.begin(), out.end());
-		out.erase(std::unique(out.begin(), out.end()), out.end());
-		return out;
-	}
-	
+    // Parse seqNo keys from comma-separated string, optionally supporting ranges (e.g., "10-20")
+    static std::vector<qint32> parseSeqNoKeys(const QString& text, bool allowRanges)
+    {
+        std::vector<qint32> out;
+        if (text.trimmed().isEmpty()) return out;
+    
+        const QStringList items = text.split(',', Qt::SkipEmptyParts);
+        for (QString item : items) {
+            item = item.trimmed();
+            if (item.isEmpty()) continue;
+    
+            if (allowRanges && item.contains('-')) {
+                const QStringList parts = item.split('-', Qt::SkipEmptyParts);
+                if (parts.size() != 2) continue;
+    
+                bool okA = false, okB = false;
+                qint32 a = parts[0].trimmed().toInt(&okA);
+                qint32 b = parts[1].trimmed().toInt(&okB);
+                if (!okA || !okB) continue;
+                if (a <= 0 || b <= 0) continue;
+    
+                if (a > b) std::swap(a, b);
+                for (qint32 v = a; v <= b; ++v) out.push_back(v);
+            } else {
+                bool ok = false;
+                qint32 v = item.toInt(&ok);
+                if (!ok || v <= 0) continue;
+                out.push_back(v);
+            }
+        }
+    
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+    
 } // namespace
 
 class CineDiscMeta : public CineDisc
@@ -63,17 +63,17 @@ public:
     static std::unique_ptr<CineDiscMeta> load(const QString& tbcPath,
                                               bool reverseFieldOrder)
     {
-        const QString jsonPath = tbcPath + ".db";
-        if (!QFileInfo::exists(jsonPath)) {
-            qCritical() << "CineDiscMeta: metadata file not found:" << jsonPath;
+        const QString dbPath = tbcPath + ".db";
+        if (!QFileInfo::exists(dbPath)) {
+            qCritical() << "CineDiscMeta: metadata file not found:" << dbPath;
             return nullptr;
         }
 
         auto disc = std::unique_ptr<CineDiscMeta>(
             new CineDiscMeta(tbcPath, reverseFieldOrder));
 
-        if (!disc->m_md->read(jsonPath)) {
-            qCritical() << "CineDiscMeta: failed to read metadata from" << jsonPath;
+        if (!disc->m_md->read(dbPath)) {
+            qCritical() << "CineDiscMeta: failed to read metadata from" << dbPath;
             return nullptr;
         }
 
@@ -195,11 +195,7 @@ public:
     }
 
 private:
-    // -------------------------------------------------------------------------
-    // Private implementation
-    // -------------------------------------------------------------------------
-
-    // Apply edit overrides (whitelist=true for force-on, blacklist=false for force-off)
+    // Sets isEditBoundary and isManualOverride on all fields matching seqNoKeys.
     int applyEditOverridesBySeqNoKeys(const std::vector<qint32>& seqNoKeys, bool value)
     {
         if (seqNoKeys.empty()) return 0;
@@ -217,11 +213,9 @@ private:
             // Skip pad fields (unusual to override but harmless)
             if (field.pad) continue;
 
-            // Create a modified field with the override
             auto modifiedField = field;
-			modifiedField.cinemap.isEditBoundary = value;
-			modifiedField.cinemap.isManualOverride = true;
-            // Use updateField to persist the override
+            modifiedField.cinemap.isEditBoundary = value;
+            modifiedField.cinemap.isManualOverride = true;
             m_md->updateField(modifiedField, idx);
             changed++;
         }

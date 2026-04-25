@@ -29,7 +29,6 @@ int segmentDisc(CineDisc& disc)
 
         if (!curValid) {
             // Invalid or padded field: reset phase tracking and clear solver flags.
-            // These are the only fields segmentDisc writes to directly.
             prevPhase            = -1;
             prevValid            = false;
             field.cinemap.isEditBoundary = false;

@@ -54,7 +54,7 @@ static bool runDetectEditsOnly(CineDisc& disc,
     qInfo() << "Segmenter identified" << segCount << "segment(s).";
 
     // 2) Visual edit detection
-    const int editCount = visualEdits::analyzeVisualEdits(disc,
+    const int editCount = visualEdits::analyseVisualEdits(disc,
                                                           editSensitivity,
                                                           editStrong,
                                                           editPeak);
@@ -72,19 +72,19 @@ static bool runDetectEditsOnly(CineDisc& disc,
     
     // 4) Determine output metadata path
     const QString sourcePath = disc.getTbcPath() + ".db";
-    const QString jsonOutPath =
+    const QString dbOutPath =
         (!outputFileInfo.filePath().isEmpty()
          && outputFileInfo.filePath() != "-"
          && outputFileInfo.filePath() != sourcePath)
         ? outputFileInfo.filePath() + ".db"
         : sourcePath;
 
-    if (!disc.getMetaData().write(jsonOutPath)) {
+    if (!disc.getMetaData().write(dbOutPath)) {
         qWarning() << "Failed to save metadata with edit annotations.";
         return false;
     }
 
-    qInfo() << "Edit annotations written to" << jsonOutPath;
+    qInfo() << "Edit annotations written to" << dbOutPath;
     return true;
 }
 
@@ -140,7 +140,7 @@ static bool runFullPipeline(CineDisc& disc,
     qInfo() << "Segmenter identified" << segCount << "segment(s).";
 
     // 2) Visual edit detection
-    const int editCount = visualEdits::analyzeVisualEdits(disc,
+    const int editCount = visualEdits::analyseVisualEdits(disc,
                                                           editSensitivity,
                                                           editStrong,
                                                           editPeak);
@@ -168,19 +168,19 @@ static bool runFullPipeline(CineDisc& disc,
 
     // 6) Write metadata
     const QString sourcePath = disc.getTbcPath() + ".db";
-    const QString jsonOutPath =
+    const QString dbOutPath =
         (!outputFileInfo.filePath().isEmpty()
          && outputFileInfo.filePath() != "-"
          && outputFileInfo.filePath() != sourcePath)
         ? outputFileInfo.filePath() + ".db"
         : sourcePath;
 
-    if (!disc.getMetaData().write(jsonOutPath)) {
+    if (!disc.getMetaData().write(dbOutPath)) {
         qWarning() << "Failed to save cadence metadata.";
         return false;
     }
 
-    qInfo() << "Output metadata written to" << jsonOutPath;
+    qInfo() << "Output metadata written to" << dbOutPath;
     return true;
 }
 
@@ -329,9 +329,9 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-	const auto vbi = vbiProbe::probe(*disc);
-	//   probe() calls disc->setIsDiscCav() internally.
-	qInfo() << "Disc type:" << (vbi.isDiscCav ? "CAV" : "CLV");
+    const auto vbi = vbiProbe::probe(*disc);
+    // probe() calls disc->setIsDiscCav() internally.
+    qInfo() << "Disc type:" << (vbi.isDiscCav ? "CAV" : "CLV");
 
     // -------------------------------------------------------------------------
     // --clear-all-flags

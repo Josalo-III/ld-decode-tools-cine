@@ -2,13 +2,9 @@
 **Telecine Cadence Solver and Edit Detection**
 
 ## Overview
-ld-cinemap detects film-originated content within LaserDisc TBC streams and solves the underlying telecine cadence pattern. It identifies edit boundaries (both structural phase discontinuities and visual cuts), detects 3:2 pulldown cadence patterns or interlaced/ progressive video, and records the relationship between film frames and interlaced video fields.
-
-The tool is designed for restoration workflows where accurate cadence information enables high-quality film reconstruction, increasing SNR, improving error correction, allowing more informed comb in chroma decoder, and optionally 24p output.
+ld-cinemap detects film-originated content within LaserDisc TBC streams and solves the underlying telecine cadence pattern. It identifies edit boundaries (structural phase discontinuities and visual cuts), classifies content as 3:2 pulldown, interlaced, or progressive, and records the relationship between film frames and interlaced video fields — enabling high-quality film reconstruction, improved comb filtering, and optional 24p output.
 
 ## Usage
-
-### Basic Syntax
 
 ```bash
 ld-cinemap [OPTIONS] <input.tbc> [output]
@@ -16,151 +12,102 @@ ld-cinemap [OPTIONS] <input.tbc> [output]
 
 ## Modes
 
-ld-cinemap supports three operational modes, selected by flags. If no mode flag is given, the **full pipeline** runs (default).
+If no mode flag is given, the **full pipeline** runs.
 
 ### Full Pipeline (default)
-Runs segmentation (phase changes, usually per Act/Reel) → visual edit detection → cadence solving in sequence, writing all metadata in one pass.
+Segmentation → visual edit detection → cadence solving, written in one pass.
 
 ```bash
 ld-cinemap <input.tbc> [output]
 ```
 
 ### Edit Detection Only (`--detect-edits-only`)
-Segments the disc by phase structure and runs visual edit detection, but does not solve cadence. Useful for vetting edit detection or for applying manual whitelist/blacklist overrides before solving.
+Segments by phase structure and runs visual edit detection; does not solve cadence. Use to vet edit detection or apply whitelist/blacklist overrides before solving.
 
 ```bash
 ld-cinemap --detect-edits-only <input.tbc> [output]
 ```
 
-Output: metadata with `isEditBoundary` flags set; cadence fields remain unset.
+Output: metadata with `isEditBoundary` flags set; cadence fields unset.
 
 ### Cadence Solve Only (`--skip-edits`)
-Skips all edit detection and accepts any existing edit boundaries already present in the input metadata. Solves cadence using pre-annotated boundaries. Useful for re-solving after refining edit detection.
+Skips edit detection and solves cadence using existing edit boundaries. Use to re-solve after refining detection without re-running the full pipeline.
 
 ```bash
 ld-cinemap --skip-edits --cine <input.tbc> [output]
 ```
 
-Requires: input metadata must have `isEditBoundary` flags already set (by a prior run or manual annotation).
+Requires `isEditBoundary` flags already present in input metadata.
 
 ## Options
 
 ### Cadence Policy
-Exactly one policy must be selected to control how cadence is resolved:
 
-- **`--cine`**: Implement film-edited telecine reconstruction policy.  
-  Optimised for discs where film was edited before telecine, producing cadence breaks only at reel changes. Produces 3:2 pulldown locks for material with occasional resets.
-
-- **`--tv`** (default): Implement video-edited telecine policy.  
-  Optimised for discs where raw footage was telecined and then edited in video. Assumes per-shot cadence breaks and solves each shot seperately.
+- **`--cine`**: Film-edited policy. Optimised for discs where film was edited before telecine; produces 3:2 pulldown locks with cadence breaks only at reel changes.
+- **`--tv`** (default): Video-edited policy. Optimised for footage telecined then edited in video; solves each shot separately.
 
 ### Visual Edit Detection
-These options control the sensitivity and behaviour of visual edit detection (ignored with `--skip-edits`):
+Ignored with `--skip-edits`.
 
-- **`--sensitivity <value>`** (default: 8.0)  
-  Overall visual edit sensitivity. Lower values flag more potential edits; higher values are more conservative. Typical range: 4.0–12.0.
-
-- **`--strong <value>`** (default: 1.5)  
-  Multiplier for strong visual discontinuities. Used to weight obvious cuts more heavily in the detection pipeline.
-
-- **`--peak <value>`** (default: 1.6)  
-  Multiplier for peak visual discontinuities. Applied to the most extreme luminance differences.
-
-- **`--edit-whitelist <keys>`**  
-  Comma-separated or space-separated list of field keys to force-mark as edit boundaries, overriding sensitivity settings.  
-
-- **`--edit-blacklist <keys>`**  
-  Comma-separated or space-separated list of sequential frame keys to force-exclude from edit boundaries, overriding detection results.  Accepts ranges.
+- **`--sensitivity <value>`** (default: 8.0) — Overall sensitivity. Lower flags more edits; higher is more conservative. Typical range: 4.0–12.0.
+- **`--strong <value>`** (default: 1.5) — Multiplier for strong discontinuities.
+- **`--peak <value>`** (default: 1.6) — Multiplier for peak luminance differences.
+- **`--edit-whitelist <keys>`** — Comma-separated field seqNo keys to force-mark as edit boundaries.
+- **`--edit-blacklist <keys>`** — Comma-separated field seqNo keys (ranges accepted) to force-exclude from edit boundaries.
 
 ### Input/Output
 
-- **`<input.tbc>`**: Path to input TBC file. Metadata expected at `<input.tbc>.tbc.db`.
-
-- **`[output]`** (optional): Base path for output metadata. If omitted, output overwrites input metadata at `<input.tbc>.tbc.db`. If provided, output is written to `<output>.tbc.db`.  
-  Special values: `-` means stdout (metadata only; TBC not duplicated).
+- **`<input.tbc>`** — Input TBC file. Metadata read from `<input.tbc>.tbc.db`.
+- **`[output]`** (optional) — Output base path; metadata written to `<output>.tbc.db`. If omitted, input metadata is overwritten.
 
 ### Metadata Management
 
-- **`--clear-all-flags`**  
-  Clears all solver-owned flags from the input metadata before running the selected mode:
-  - `isEditBoundary`
-  - `cadenceId`, `cadenceIndexPresumed`
-  - `pulldownRole`
-
-  Useful for starting fresh after a prior run, or for resetting between experimental parameter sweeps. The flag is applied first, before any other processing.
-
-- **`-r, --reverse`**  
-  Reverse field order (swap first and second fields) during processing. Used if the capture TBC has fields in the opposite order from the metadata.
-
-### Prompts and Automation
-
-- **`-y, --yes`**  
-  Assume 'yes' for all interactive prompts. Useful for automated batch processing.  
-  Currently used by: `--clear-all-flags` confirmation.
-
-### Help and Version
-
-- **`-h, --help`**: Display help on command-line options.
-- **`-v, --version`**: Display version information (branch and commit).
+- **`--clear-all-flags`** — Clears all solver-owned flags (`isEditBoundary`, `cadenceId`, `cadenceIndexPresumed`, `pulldownRole`) before running. Applied before any other processing.
+- **`-r, --reverse`** — Swap first and second fields during processing.
+- **`-y, --yes`** — Assume yes for all prompts (used by `--clear-all-flags` confirmation).
+- **`-h, --help`** / **`-v, --version`**
 
 ## Examples
 
-### Basic full pipeline on NTSC CAV disc
 ```bash
+# Full pipeline, film-edited policy
 ld-cinemap --cine source.tbc output.tbc
-```
-Segments, detects visual edits, solves cadence using the film-edited policy, and writes metadata to `output.tbc.db`.
 
-### Quick edit detection preview
-```bash
+# Preview edit detection with tighter sensitivity
 ld-cinemap --detect-edits-only --sensitivity 6.0 source.tbc
-```
-Runs segmentation and visual edit detection with tighter sensitivity (more conservative), overwrites source metadata.
 
-### Re-solve with different policy
-```bash
+# Re-solve with different policy, keeping existing boundaries
 ld-cinemap --skip-edits --tv source.tbc refined.tbc
-```
-Assumes edit boundaries are already in `source.tbc.tbc.db`, solves cadence using the video-edited policy, writes to `refined.tbc.db`.
 
-### Start fresh, aggressive edit detection
-```bash
+# Start fresh, aggressive detection, auto-confirm
 ld-cinemap --clear-all-flags --sensitivity 4.0 --cine --yes source.tbc
-```
-Clears prior results (auto-confirm), runs full pipeline with aggressive edit detection and film-edited policy, overwrites source metadata.
 
-### Export to separate file
-```bash
+# Write output to a separate file
 ld-cinemap --cine source.tbc /archive/restored
 ```
-Writes output metadata to `/archive/restored.tbc.db` (source TBC unmodified; metadata is separate).
 
 ## Output
 
 ### Metadata Fields
-ld-cinemap writes the following fields to the SQLite metadata at frame/field level:
 
-#### Edit Detection (all modes except `--skip-edits`)
-- **`isEditBoundary`**: Boolean flag; true if a phase discontinuity or visual cut is detected at this field.
+Written to the SQLite `.tbc.db` at field level:
 
-#### Cadence Solving (all modes except `--detect-edits-only`)
-- **`cadenceId`**: Integer ≥ 0 identifying which film frame this field belongs to (within its cadence group). −1 if not locked.
-- **`cadenceIndexPresumed`**: Boolean; true if the cadence assignment was interpolated rather than directly measured.
-- **`pulldownRole`**: String identifier for the field's role within the 3:2 pulldown pattern (e.g. `"A"`, `"B"`, `"C"`), or empty if not in a pulldown pattern.
+**Edit detection** (all modes except `--skip-edits`):
+- `isEditBoundary` — true at phase discontinuities and visual cuts.
 
-#### Global Metadata
-- **`isCinemapped`**: Boolean flag set to true in the video parameters after any solve run, indicating that cadence data is present.
+**Cadence solving** (all modes except `--detect-edits-only`):
+- `cadenceId` — film frame identity within the cadence group; −1 if unsolved.
+- `cadenceIndexPresumed` — true if the assignment was interpolated.
+- `pulldownRole` — field's role in the 3:2 pattern (`"definitional"`, `"spare"`, or empty).
+
+**Global**:
+- `isCinemapped` — set in video parameters after any solve run.
+
+Input and output metadata are SQLite 3 databases conforming to the ld-decode schema. See ld-decode documentation for full schema details.
 
 ### Logging
 
-ld-cinemap logs progress to stderr via Qt's logging framework:
-- VBI scanning results (CAV vs CLV detection)
-- Segmentation summary (boundaries found)
-- Visual edit detection summary (edits committed)
-- Cadence solver summary (fields locked)
-- Output file paths
-
-Example:
+Progress is logged to stderr:
 ```
 vbiProbe::probe: scanned 54000 frame(s) | CAV hits = 54000 | CLV hits = 0
 segmenter::segmentDisc: marked 12 boundary(s).
@@ -171,79 +118,53 @@ Output metadata written to output.tbc.db
 
 ## Workflow Integration
 
-### Typical Restoration Pipeline
-1. **Capture and TBC generation**: Digitise LaserDisc with ld-decode, producing `.tbc` and `.tbc.db`.
-2. **VBI processing**: Run ld-process-vbi to decode timecodes and picture numbers into metadata.
-3. **Disc mapping**: Run ld-discmap to establish frame sequence and handle multi-sided or multi-disc sources.
-4. **VITS processing**: Run ld-process-vits to measure per-field SNR and signal quality. While not strictly required, the stacking and SNR data written by this step is useful to ld-cinemap's cadence detection and solving — fields from a multi-source stack carry better signal quality metrics that can inform phase confidence.
-5. **Cinemap analysis**: Run ld-cinemap to detect edits and solve cadence.
+1. **Capture** — Digitise with ld-decode, producing `.tbc` and `.tbc.db`.
+2. **VBI** — Run ld-process-vbi to decode timecodes and picture numbers.
+3. **Disc mapping** — Run ld-discmap to establish frame sequence.
+4. **VITS** (recommended) — Run ld-process-vits for per-field SNR data; improves cadence confidence on stacked sources.
+5. **Cinemap** — Run ld-cinemap to detect edits and solve cadence.
    ```bash
    ld-cinemap --cine source.tbc source.tbc
    ```
-6. **Decompose** (optional): Use ld-tbc-trim to split at edit boundaries:
+6. **Decompose** (optional) — Split at edit boundaries with ld-tbc-trim:
    ```bash
    ld-tbc-trim --decompose-edits source.tbc /segments/disc
    ```
-7. **Frame reconstruction**: Run ld-chroma-decoder using cadence data to extract film frames at full quality.
+7. **Reconstruction** — Run ld-chroma-decoder using cadence data for film frame extraction.
 
-### Running on Any TBC
-ld-cinemap requires only a TBC file and its associated `.tbc.db` metadata. Steps 3 and 4 above improve results but are not mandatory — ld-cinemap will operate on any valid TBC/metadata pair produced by ld-decode and ld-process-vbi.
-
-### Manual Oversight
-- Inspect `isEditBoundary` flags with a metadata viewer or custom tooling.
-- Use `--edit-whitelist` / `--edit-blacklist` (when available) to correct false positives/negatives.
-- Re-run with different `--sensitivity` values to tune detection threshold.
-- Use `--skip-edits` to keep boundary corrections and re-solve cadence with alternative policies.
+Steps 3 and 4 improve results but are not mandatory; ld-cinemap will operate on any valid TBC/metadata pair from ld-decode and ld-process-vbi.
 
 ## Disc Support
 
-- **NTSC (525-line)**: Full support. Phase structure validation for 4-phase NTSC pulldown.
-- **PAL (625-line)**: Edit segmentation only (VBI probe sets `isDiscPal`). Cadence solving deferred; 8-phase PAL structure not yet implemented.
-- **CAV (Constant Angular Velocity)**: Full support. Uses VBI picture numbers for cadence lock.
-- **CLV (Constant Linear Velocity)**: Full support. Uses VBI timecodes for alignment; picture numbers absent.
+- **NTSC (525-line)**: Full support.
+- **PAL (625-line)**: Edit segmentation only; cadence solving not yet implemented.
+- **CAV**: Full support; uses VBI picture numbers for cadence lock.
+- **CLV**: Full support; uses VBI timecodes for alignment.
 
-## Performance Notes
+## Performance
 
-- **VBI scanning**: One pass over all frames; negligible cost.
-- **Visual edit detection**: Frame-level luminance analysis; typically 1–5 minutes for a full disc on modern hardware.
-- **Cadence solving**: Field-pair correlation and twin demodulation; typically 5–30 minutes depending on disc length and complexity.
-- **Full pipeline**: Sequential; total time is sum of components plus metadata I/O.
+- **VBI scanning**: Negligible.
+- **Visual edit detection**: 1–5 minutes per disc on modern hardware.
+- **Cadence solving**: 5–30 minutes depending on disc length and complexity.
 
-For very large discs (>100K frames) or when re-solving frequently, use `--detect-edits-only` first, then `--skip-edits` for rapid iteration on cadence parameters.
-
-## Metadata Format
-
-Input and output metadata are SQLite 3 databases named `<tbcPath>.tbc.db`, conforming to the ld-decode metadata schema. The schema includes fields for:
-- VBI data (picture numbers, timecodes, lead-in/out flags)
-- Field phase ID and padding status
-- Solver-owned columns: `isEditBoundary`, `cadenceId`, `cadenceIndexPresumed`, `pulldownRole`
-
-See the ld-decode documentation for full schema details.
+For large discs (>100K frames) or frequent re-solves, use `--detect-edits-only` then `--skip-edits` to iterate on cadence parameters without re-running detection.
 
 ## Troubleshooting
 
-### "no CAV or CLV VBI detected"
-**Cause**: Input metadata lacks valid VBI decoding.  
-**Solution**: Ensure ld-process-vbi was run on the source. Check that the TBC is a valid LaserDisc capture.
+**"no CAV or CLV VBI detected"** — Run ld-process-vbi on the source first.
 
-### No cadence locks found
-**Cause**: Disc content is heavily interlaced, shot-on-video, or has extreme noise.  
-**Solution**: Try `--tv` policy first (more permissive). Inspect visual edit detection results; edit boundaries may be misaligned.
+**No cadence locks found** — Content may be shot-on-video or heavily noisy. Try `--tv` policy; check that edit boundaries are correctly placed.
 
-### Spurious edit boundaries
-**Cause**: Visual edit sensitivity too aggressive for noisy content.  
-**Solution**: Increase `--sensitivity` value (try 10.0–12.0). Review detected boundaries with `--detect-edits-only` first. Use `--edit-blacklist` to suppress false positives (when available).
+**Spurious edit boundaries** — Increase `--sensitivity` (try 10.0–12.0); use `--detect-edits-only` to review, then `--edit-blacklist` to suppress false positives.
 
-### Metadata not written
-**Cause**: Output path is invalid or read-only.  
-**Solution**: Check that the output directory exists and has write permissions. Ensure the output base path does not conflict with the input.
+**Metadata not written** — Check output directory exists and is writable.
 
 ## See Also
-- **ld-decode**: LaserDisc digitisation and TBC generation
-- **ld-process-vbi**: VBI timecode and picture number decoding
-- **ld-tbc-trim**: TBC trimming and decomposition at cadence boundaries
-- **ld-chroma-decoder**: Chroma reconstruction using cadence data for film frame extraction
-- **VideoForge**: Real-time film frame compositor with integrated cadence solver UI
+- **ld-decode** — LaserDisc digitisation and TBC generation
+- **ld-process-vbi** — VBI timecode and picture number decoding
+- **ld-tbc-trim** — TBC trimming and decomposition at cadence boundaries
+- **ld-chroma-decoder** — Chroma reconstruction using cadence data
+- **VideoForge** — Film frame compositor with integrated cadence solver UI
 
 ## References
 - NTSC 3:2 pulldown and field phase: *SMPTE RP 202* and related standards

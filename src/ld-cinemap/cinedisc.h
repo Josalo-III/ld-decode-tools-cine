@@ -48,6 +48,6 @@ public:
     virtual void refreshFrameCache() {}
 };
 
-// Factory: load metadata from tbcPath + ".json" and construct a CineDisc.
+// Factory: load metadata from tbcPath + ".db" and construct a CineDisc.
 std::unique_ptr<CineDisc> loadCineDisc(const QString& tbcPath,
                                        bool reverseFieldOrder);
