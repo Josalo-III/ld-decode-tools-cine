@@ -179,20 +179,20 @@ int main(int argc, char *argv[])
         qInfo() << "GPLv3 Open-Source - github: https://github.com/happycube/ld-decode";
         qInfo() << "For more info on stacking mode, use --help-mode\n";
         qInfo() << "Mode:\n";
-        qInfo() << "(-1) auto            : select mode depending on the number off frame available (2f: mean, 3~4f: smart mean, 5+f: smart-neighbor)\n";
-        qInfo() << " (0) mean            : average all samples not marked as dropouts using mean\n";
-        qInfo() << " (1) median          : find the median from samples not marked as dropout\n";
-        qInfo() << " (2) smart mean      : find the median from samples not marked as dropout then average all value within (median + smartThreshold) or (median - smart Threshold) using mean\n";
-        qInfo() << " (3) smart neighbor  : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
-        qInfo() << "                      then take the closest value to the median of the current sample from the different closest value found";
-        qInfo() << "                      then average all value within (selectedSample + smartThreshold) or (selectedSample - smart threshold) using mean";
-        qInfo() << "                      when only 2 sources are available, it take the closest sample to the neighbor\n";
-        qInfo() << "(4) neighbor        : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
-        qInfo() << "                      then take the closest value to the median of the current sample from the different closest value found then average the selected sample with the median";
-        qInfo() << "                      when only 2 sources are available, it take the closest sample to the neighbor";
-        qInfo() << "(5) smart local neighbor : derive a medoid from the sample set, use it to identify and exclude outliers, then apply the smart neighbor process on the inlier set";
-        qInfo() << "(6) medoid with local neighbor : derive a medoid to exclude outliers, then apply the neighbor process on the inlier set";
-        qInfo() << "(7) medoid          : return the sample with the shortest total distance to all other samples (falls back to median/mean for small sets)";
+        qInfo() << "(-1) auto                : select mode depending on the number off frame available (2f: mean, 3~4f: smart mean, 5+f: smart-neighbor)\n";
+        qInfo() << " (0) mean                : average all samples not marked as dropouts using mean\n";
+        qInfo() << " (1) median              : find the median from samples not marked as dropout\n";
+        qInfo() << " (2) smart mean          : find the median from samples not marked as dropout then average all value within (median + smartThreshold) or (median - smart Threshold) using mean\n";
+        qInfo() << " (3) smart neighbor      : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
+        qInfo() << "                           then take the closest value to the median of the current sample from the different closest value found";
+        qInfo() << "                           then average all value within (selectedSample + smartThreshold) or (selectedSample - smart threshold) using mean";
+        qInfo() << "                           when only 2 sources are available, it take the closest sample to the neighbor\n";
+        qInfo() << "(4) neighbor             : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
+        qInfo() << "                           then take the closest value to the median of the current sample from the different closest value found then average the selected sample with the median";
+        qInfo() << "                           when only 2 sources are available, it take the closest sample to the neighbor";
+        qInfo() << "(5) local neighbor       : derive a medoid from the sample set, use it to identify and exclude outliers, then apply the neighbor process (as in mode 4) on the inlier set";
+        qInfo() << "(6) smart local neighbor : derive a medoid to exclude outliers, then apply the smart neighbor process (from mode 3) on the inlier set";
+        qInfo() << "(7) medoid               : return the sample with the shortest total distance to all other samples (falls back to median/mean for small sets)";
         return 0; // Exit after showing detailed help
     }
 
