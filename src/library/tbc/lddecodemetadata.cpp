@@ -251,12 +251,12 @@ void LdDecodeMetaData::Field::write(SqliteWriter &writer, int captureId) const
     closedCaption.write(writer, captureId, fieldId);
     dropOuts.write(writer, captureId, fieldId);
 
-	if (cinemap.inUse) {
-		if (cinemap.isManualOverride)
-			cinemap.writeManual(writer, captureId, fieldId);
-		else
-			cinemap.writeAuto(writer, captureId, fieldId);
-	}
+    if (cinemap.inUse) {
+        if (cinemap.isManualOverride)
+            cinemap.writeManual(writer, captureId, fieldId);
+        else
+            cinemap.writeAuto(writer, captureId, fieldId);
+    }
 }
 // Delegates to writeFieldCinemapAuto. Called from Field::write via the inUse gate.
 // Never writes is_edit_boundary = 0; preserves any existing manual veto.

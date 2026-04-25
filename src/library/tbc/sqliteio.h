@@ -79,8 +79,7 @@ public:
     bool readAllFieldClosedCaptions(int captureId, QSqlQuery &ccQuery);
     bool readAllFieldDropouts(int captureId, QSqlQuery &dropoutsQuery);
 
-    // --- Josalo-III: cinemap ---
-    // Single-field read (used by tools that query on demand)
+    // Single-field cinemap read (used by tools that query on demand)
     // isEditBoundaryPresent distinguishes NULL (no information) from 0 (manual veto).
     bool readFieldCinemap(int captureId, int fieldId,
                           bool &isEditBoundaryPresent, bool &isEditBoundary,
@@ -89,7 +88,6 @@ public:
 
     // Bulk read for all fields in a capture (used by LdDecodeMetaData::readFields)
     bool readAllFieldCinemap(int captureId, QSqlQuery &cinemapQuery);
-    // --- end Josalo-III ---
 
 private:
     QSqlDatabase db;
@@ -163,8 +161,7 @@ public:
     bool commitTransaction();
     bool rollbackTransaction();
 
-    // --- Josalo-III: cinemap ---
-    // Two named entry points enforce the write invariant:
+    // Two named cinemap write entry points enforce the write invariant:
     // writeFieldCinemapAuto  — automated detection; never writes 0 to is_edit_boundary,
     //                          and preserves any existing 0 (manual veto).
     // writeFieldCinemapManual — the ONLY entry point permitted to write 0 to
@@ -181,7 +178,6 @@ public:
                                  int cadenceId,
                                  bool cadenceIndexPresumed,
                                  const QString &pulldownRole);
-    // --- end Josalo-III ---
 
 private:
     QSqlDatabase db;

@@ -111,6 +111,9 @@ inline double median3(double a, double b, double c)
     else       { if (a > c) return a; else if (b > c) return c; else return b; }
 }
 
+// Demodulation result for a single line: separated Y, I, Q arrays and the
+// per-line burst phasor (bsin, bcos). Used by helper functions that return
+// a fully separated line without writing into a FrameBuffer.
 struct DemodResult {
     std::vector<double> Y;
     std::vector<double> I;

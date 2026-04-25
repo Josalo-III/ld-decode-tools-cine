@@ -3,7 +3,7 @@
  * ld-decode-tools TBC library
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
- * SPDX-FileCopyrightText: 2026 Joseph Burns
+ * SPDX-FileCopyrightText: 2025-2026 Joseph Burns
  *
  * This file is part of ld-decode-tools.
  *

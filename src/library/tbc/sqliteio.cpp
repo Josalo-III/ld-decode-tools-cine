@@ -183,7 +183,7 @@ CREATE TABLE IF NOT EXISTS closed_caption (
     PRIMARY KEY (capture_id, field_id)
 );
 
--- Josalo-III: cinemap side table.
+-- cinemap side table (ld-cinemap cadence and edit-boundary data).
 -- Keyed on (capture_id, field_id); invisible to upstream consumers.
 -- is_edit_boundary is nullable: NULL = no cinemap pass run or field not
 -- touched; 1 = boundary asserted (auto or manual); 0 = manual user veto.
@@ -486,7 +486,7 @@ bool SqliteReader::readAllFieldDropouts(int captureId, QSqlQuery &dropoutsQuery)
     return dropoutsQuery.exec();
 }
 
-// --- Josalo-III: cinemap readers ---
+// Cinemap readers
 
 bool SqliteReader::readFieldCinemap(int captureId, int fieldId,
                                     bool &isEditBoundaryPresent, bool &isEditBoundary,
@@ -532,7 +532,7 @@ bool SqliteReader::readAllFieldCinemap(int captureId, QSqlQuery &cinemapQuery)
     return cinemapQuery.exec();
 }
 
-// --- end Josalo-III cinemap readers ---
+
 
 SqliteWriter::SqliteWriter(const QString &fileName)
 {
@@ -884,7 +884,7 @@ bool SqliteWriter::rollbackTransaction()
     return db.rollback();
 }
 
-// --- Josalo-III: cinemap writers ---
+// Cinemap writers
 
 // Auto-detection writer.
 //
@@ -972,4 +972,4 @@ bool SqliteWriter::writeFieldCinemapManual(int captureId, int fieldId,
     return true;
 }
 
-// --- end Josalo-III cinemap writers ---
+
