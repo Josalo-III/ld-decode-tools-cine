@@ -175,7 +175,6 @@ public:
         void write(SqliteWriter &writer, int captureId) const;
     };
 
-    // --- Josalo-III: cinemap ---
     // Per-field cadence and edit-boundary metadata written by ld-cinemap.
     // Stored in the cinemap side table; invisible to upstream consumers.
     //
@@ -189,7 +188,7 @@ public:
     // cadenceId = -1 and pulldownRole = QString() are the "not set" sentinels.
     struct Cinemap {
         bool inUse = false;
-		bool isManualOverride = false;
+        bool isManualOverride = false;
         bool isEditBoundary = false;
         qint32 cadenceId = -1;
         bool cadenceIndexPresumed = false;
@@ -202,7 +201,6 @@ public:
         void writeAuto(SqliteWriter &writer, int captureId, int fieldId) const;
         void writeManual(SqliteWriter &writer, int captureId, int fieldId) const;
     };
-    // --- end Josalo-III ---
 
     // Field metadata definition
     struct Field {
@@ -221,9 +219,7 @@ public:
         DropOuts dropOuts;
         bool pad = false;
 
-        // --- Josalo-III: cinemap ---
         Cinemap cinemap;
-        // --- end Josalo-III ---
 
         double diskLoc = -1;
         qint64 fileLoc = -1;
