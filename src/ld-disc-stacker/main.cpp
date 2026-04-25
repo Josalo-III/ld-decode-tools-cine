@@ -58,7 +58,6 @@ int main(int argc, char *argv[])
                 "ld-disc-stacker - Disc stacking for ld-decode\n"
                 "\n"
                 "(c)2020-2025 Simon Inns\n"
-                //"2024 updated by Vrunk11\n" - If you want to claim copyright, use a name and (c) format - Simon
                 "GPLv3 Open-Source - github: https://github.com/happycube/ld-decode"
                 "\n"
                 "For more info on stacking mode, use --help-mode");
@@ -129,7 +128,7 @@ int main(int argc, char *argv[])
                                          "main", "Do not use differential dropout detection on low source pixels"));
     parser.addOption(noDiffDodOption);
 
-    // Option to disable differential dropout detection
+    // Option to disable the mapping requirement
     QCommandLineOption noMapOption(QStringList() << "no-map",
                                         QCoreApplication::translate(
                                          "main", "Disable mapping requirement"));
@@ -175,7 +174,6 @@ int main(int argc, char *argv[])
     if (parser.isSet(helpModeOption)) {
         qInfo() << "ld-disc-stacker - Disc stacking for ld-decode\n";
         qInfo() << "(c)2020-2022 Simon Inns";
-        //qInfo() << "2024 updated by Vrunk11"; - If you want to claim copyright, use a name and (c) format - Simon
         qInfo() << "GPLv3 Open-Source - github: https://github.com/happycube/ld-decode";
         qInfo() << "For more info on stacking mode, use --help-mode\n";
         qInfo() << "Mode:\n";
@@ -228,13 +226,13 @@ int main(int argc, char *argv[])
     if (parser.isSet(modeOption)) {
         mode = parser.value(modeOption).toInt();
 
-        if (mode > 7 || mode < 0) {
-            qInfo() << "Specified mode (" << mode << ") is unknown using auto mode instead";
+        if (mode > 7 || mode < -1) {
+            qInfo() << "Specified mode (" << mode << ") is unknown, using auto mode instead";
             mode = -1;
         }
     }
 
-    // Get the arguments from the parser
+    // Parse smart threshold
     qint32 smartThreshold = (15*256);
     if (parser.isSet(smartThresholdOption)) {
         smartThreshold = parser.value(smartThresholdOption).toInt();
@@ -249,7 +247,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Get the arguments from the parser
+    // Parse thread count
     qint32 maxThreads = QThread::idealThreadCount();
     if (parser.isSet(threadsOption)) {
         maxThreads = parser.value(threadsOption).toInt();

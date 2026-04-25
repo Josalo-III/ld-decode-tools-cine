@@ -158,7 +158,8 @@ void Stacker::stackField(const qint32 frameNumber,
                                        inputValues, valuesN, valuesS, valuesE, valuesW,
                                        isAllDropout, noDiffDod, verbose);
 
-                    // Mirror SNR weights in availableSourcesForFrame order
+                    // Assign SNR weights positionally from availableSourcesForFrame
+                    // to match the order in which inputValues were populated.
                     inputSnrWeights.resize(inputValues.size());
                     qint32 wi = 0;
                     for (qint32 i = 0; i < availableSourcesForFrame.size() && wi < inputValues.size(); i++)
@@ -805,6 +806,9 @@ void Stacker::getProcessedSample(const qint32 x, const qint32 y,
     }
 }
 
+// Legacy per-pixel dropout check. The hot path in stackField uses the inlined
+// fastIsDropout lambda over a pre-built interval map instead. These functions
+// are retained for any future callers outside that loop.
 inline bool Stacker::isDropout(const DropOuts& dropOuts, const qint32 fieldX, const qint32 fieldY)
 {
     for (qint32 i = 0; i < dropOuts.size(); i++) {
