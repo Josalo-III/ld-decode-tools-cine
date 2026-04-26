@@ -28,6 +28,7 @@
         packages.default = pkgs.stdenv.mkDerivation {
           pname = "ld-decode-tools-cine";
           version = packageVersion;
+          __noChroot = true;    # allows /usr/bin/codesign from host
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
@@ -41,9 +42,11 @@
             cmake
             ninja
             pkg-config
-            qt6.wrapQtAppsHook
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             qt6.qttools
+            darwin.cctools
+          ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+            qt6.wrapQtAppsHook    # Linux only — on Darwin macdeployqt handles Qt bundling
           ];
 
           buildInputs = with pkgs; [
@@ -58,10 +61,12 @@
           ];
 
           postInstall = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
-            macdeployqt $out/bin/ld-analyse.app -verbose=0
-            codesign --force --deep --sign - \
+            macdeployqt $out/bin/ld-analyse.app -verbose=0 -no-strip
+            /usr/bin/codesign --force --deep --sign - \
               --entitlements ${./ld-analyse.entitlements} \
               $out/bin/ld-analyse.app
+            echo "Verifying entitlements:"
+            /usr/bin/codesign -d --entitlements :- $out/bin/ld-analyse.app
           '';
 
           cmakeBuildType = "Release";
