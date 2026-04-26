@@ -17,7 +17,7 @@
         ezpwdSrc = ezpwd;
       in
       let
-        packageVersion = "7.2.0c";
+        packageVersion = "7.2.0c1";
         rev = if self ? rev then self.rev else "";
         shortRev = if self ? shortRev then self.shortRev else (if rev != "" then builtins.substring 0 7 rev else "unknown");
         dirtySuffix = if self ? dirtyRev then "-dirty" else "";
