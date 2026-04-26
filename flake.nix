@@ -17,7 +17,7 @@
         ezpwdSrc = ezpwd;
       in
       let
-        packageVersion = "7.2.0c1";
+        packageVersion = "7.2.0c2";
         rev = if self ? rev then self.rev else "";
         shortRev = if self ? shortRev then self.shortRev else (if rev != "" then builtins.substring 0 7 rev else "unknown");
         dirtySuffix = if self ? dirtyRev then "-dirty" else "";
@@ -42,12 +42,15 @@
             cmake
             ninja
             pkg-config
+            qt6.wrapQtAppsHook
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             qt6.qttools
             darwin.cctools
-          ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
-            qt6.wrapQtAppsHook    # Linux only — on Darwin macdeployqt handles Qt bundling
           ];
+
+          # On Darwin, macdeployqt bundles Qt into the .app — wrapQtAppsHook
+          # must not wrap the binaries as it would invalidate the codesign.
+          dontWrapQtApps = if pkgs.stdenv.isDarwin then true else false;
 
           buildInputs = with pkgs; [
             qt6.qtbase
