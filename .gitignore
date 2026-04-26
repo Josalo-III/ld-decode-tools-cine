@@ -104,3 +104,13 @@ compile.bat
 # Nix artefacts
 result
 src/ld-disc-stacker/stacker_main.cpp
+src/ld-cinemap/.DS_Store
+src/ld-disc-stacker/.DS_Store
+src/library/.DS_Store
+src/library/tbc/.DS_Store
+test-data/.DS_Store
+src/ld-analyse/.DS_Store
+src/.DS_Store
+prototypes/.DS_Store
+docs/.DS_Store
+.DS_Store
