@@ -24,23 +24,50 @@ set(ld-analyse_SOURCES
 qt_add_resources(ld-analyse_SOURCES ld-analyse-resources.qrc)
 
 if(WIN32)
-set(APP_ICON_RESOURCE_WINDOWS "${CMAKE_CURRENT_SOURCE_DIR}/appicon.rc")
-
-add_executable(ld-analyse MACOSX_BUNDLE
-    ${ld-analyse_SOURCES}
-	${APP_ICON_RESOURCE_WINDOWS})
+    set(APP_ICON_RESOURCE_WINDOWS "${CMAKE_CURRENT_SOURCE_DIR}/appicon.rc")
+    add_executable(ld-analyse MACOSX_BUNDLE
+        ${ld-analyse_SOURCES}
+        ${APP_ICON_RESOURCE_WINDOWS})
 elseif(UNIX)
-	add_executable(ld-analyse MACOSX_BUNDLE
-    ${ld-analyse_SOURCES})
+    add_executable(ld-analyse MACOSX_BUNDLE
+        ${ld-analyse_SOURCES})
 endif()
 
+set_target_properties(ld-analyse PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER "org.ld-decode-tools.ld-analyse"
+    MACOSX_BUNDLE_BUNDLE_NAME "ld-analyse"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${APP_COMMIT}"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${APP_COMMIT}"
+)
+
+# On macOS, copy the SVG icon engine plugin into the app bundle at build time.
+# macdeployqt does not detect runtime-loaded plugins automatically, and without
+# this plugin toolbar buttons render as blank rectangles when launched from Finder.
+if(APPLE)
+    get_filename_component(_qt_svg_cmake_dir "${Qt6Svg_DIR}" DIRECTORY)
+    get_filename_component(_qt_lib_dir "${_qt_svg_cmake_dir}" DIRECTORY)
+    set(_qt_svg_icon_plugin "${_qt_lib_dir}/qt-6/plugins/iconengines/libqsvgicon.dylib")
+    message(STATUS "Looking for SVG icon plugin at: ${_qt_svg_icon_plugin}")
+    if(EXISTS "${_qt_svg_icon_plugin}")
+        add_custom_command(TARGET ld-analyse POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                $<TARGET_BUNDLE_CONTENT_DIR:ld-analyse>/PlugIns/iconengines
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "${_qt_svg_icon_plugin}"
+                $<TARGET_BUNDLE_CONTENT_DIR:ld-analyse>/PlugIns/iconengines/
+            COMMENT "Copying SVG icon engine plugin into app bundle"
+        )
+    else()
+        message(WARNING "SVG icon engine plugin not found at ${_qt_svg_icon_plugin} - toolbar buttons may render blank in Finder-launched ld-analyse")
+    endif()
+endif()
 
 target_include_directories(ld-analyse PRIVATE
     ${FFTW_INCLUDE_DIR}
 )
 
 target_link_libraries(ld-analyse PRIVATE
-    Qt::Core Qt::Gui Qt::Widgets Qt::Svg
+    Qt::Core Qt::Gui Qt::Widgets Qt::Svg Qt::SvgWidgets
     lddecode-library lddecode-chroma
 )
 
@@ -53,50 +80,50 @@ if(WIN32)
 endif()
 
 if(UNIX)
-	install(TARGETS ld-analyse BUNDLE DESTINATION bin)
-	
-	# Install desktop integration files directly to XDG standard locations
-	# This avoids hanging issues with xdg-* commands run via sudo
-	
-	# Install .tbc mime type definition
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/install/application-video-tbc.xml
-		DESTINATION share/mime/packages)
-	
-	# Install application icons at various sizes
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/16-analyse.png
-		DESTINATION share/icons/hicolor/16x16/apps
-		RENAME ld-analyse.png)
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/32-analyse.png
-		DESTINATION share/icons/hicolor/32x32/apps
-		RENAME ld-analyse.png)
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/64-analyse.png
-		DESTINATION share/icons/hicolor/64x64/apps
-		RENAME ld-analyse.png)
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/128-analyse.png
-		DESTINATION share/icons/hicolor/128x128/apps
-		RENAME ld-analyse.png)
-	
-	# Install desktop menu entry
-	install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/install/ld-analyse.desktop
-		DESTINATION share/applications)
-	
-	# Post-install: update caches (only if update-* commands are available)
-	# These are safe to fail and won't hang
-	install(CODE "execute_process(COMMAND which update-mime-database OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _have_update_mime)")
-	install(CODE "if(NOT _have_update_mime)
-		execute_process(COMMAND update-mime-database \${CMAKE_INSTALL_PREFIX}/share/mime OUTPUT_QUIET ERROR_QUIET)
-	endif()")
-	install(CODE "execute_process(COMMAND which update-desktop-database OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _have_update_desktop)")
-	install(CODE "if(NOT _have_update_desktop)
-		execute_process(COMMAND update-desktop-database \${CMAKE_INSTALL_PREFIX}/share/applications OUTPUT_QUIET ERROR_QUIET)
-	endif()")
-	install(CODE "execute_process(COMMAND which gtk-update-icon-cache OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _have_gtk_icon)")
-	install(CODE "if(NOT _have_gtk_icon)
-		execute_process(COMMAND gtk-update-icon-cache -f -t \${CMAKE_INSTALL_PREFIX}/share/icons/hicolor OUTPUT_QUIET ERROR_QUIET)
-	endif()")
+    install(TARGETS ld-analyse BUNDLE DESTINATION bin)
+
+    # Install desktop integration files directly to XDG standard locations
+    # This avoids hanging issues with xdg-* commands run via sudo
+
+    # Install .tbc mime type definition
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/install/application-video-tbc.xml
+        DESTINATION share/mime/packages)
+
+    # Install application icons at various sizes
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/16-analyse.png
+        DESTINATION share/icons/hicolor/16x16/apps
+        RENAME ld-analyse.png)
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/32-analyse.png
+        DESTINATION share/icons/hicolor/32x32/apps
+        RENAME ld-analyse.png)
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/64-analyse.png
+        DESTINATION share/icons/hicolor/64x64/apps
+        RENAME ld-analyse.png)
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/128-analyse.png
+        DESTINATION share/icons/hicolor/128x128/apps
+        RENAME ld-analyse.png)
+
+    # Install desktop menu entry
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/install/ld-analyse.desktop
+        DESTINATION share/applications)
+
+    # Post-install: update caches (only if update-* commands are available)
+    # These are safe to fail and won't hang
+    install(CODE "execute_process(COMMAND which update-mime-database OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _have_update_mime)")
+    install(CODE "if(NOT _have_update_mime)
+        execute_process(COMMAND update-mime-database \${CMAKE_INSTALL_PREFIX}/share/mime OUTPUT_QUIET ERROR_QUIET)
+    endif()")
+    install(CODE "execute_process(COMMAND which update-desktop-database OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _have_update_desktop)")
+    install(CODE "if(NOT _have_update_desktop)
+        execute_process(COMMAND update-desktop-database \${CMAKE_INSTALL_PREFIX}/share/applications OUTPUT_QUIET ERROR_QUIET)
+    endif()")
+    install(CODE "execute_process(COMMAND which gtk-update-icon-cache OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _have_gtk_icon)")
+    install(CODE "if(NOT _have_gtk_icon)
+        execute_process(COMMAND gtk-update-icon-cache -f -t \${CMAKE_INSTALL_PREFIX}/share/icons/hicolor OUTPUT_QUIET ERROR_QUIET)
+    endif()")
 else()
-	install(
-			TARGETS ld-analyse
-			BUNDLE DESTINATION bin
-	)
+    install(
+        TARGETS ld-analyse
+        BUNDLE DESTINATION bin
+    )
 endif()
