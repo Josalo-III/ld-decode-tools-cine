@@ -519,7 +519,7 @@ CineMap::validateCavWindowWithDG(SourceVideo& sv,
 }
 
 CineMap::CavGroupSignature
-CineMap::analyzeCavGroup(Cav5Group& g, SourceVideo& sv)
+CineMap::analyseCavGroup(Cav5Group& g, SourceVideo& sv)
 {
     CavGroupSignature sig;
     if (!m_disc || !m_md) return sig;
@@ -692,7 +692,7 @@ void CineMap::detectCavCadenceBreaks(std::vector<Cav5Group>& groups,
     std::vector<CavGroupSignature> sigs;
     sigs.reserve(groups.size());
     for (auto& g : groups)
-        sigs.push_back(analyzeCavGroup(g, sv));
+        sigs.push_back(analyseCavGroup(g, sv));
 
     FieldOrderPolicy fo;
     fo.reverse = m_disc->getReverseFieldOrder();

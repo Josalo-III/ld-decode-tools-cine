@@ -4,7 +4,7 @@
 class CineDisc;
 
 namespace visualEdits {
-    int analyzeVisualEdits(CineDisc& disc,
+    int analyseVisualEdits(CineDisc& disc,
                            double threshold,
                            double strongFactor,
                            double peakFactor);

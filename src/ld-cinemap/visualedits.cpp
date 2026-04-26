@@ -448,7 +448,7 @@ namespace visualEdits {
                 if (blackNow) lastBlackField = i;
     
                 if (consecNotBlack >= BLACK_CONFIRM) {
-                    // Run ended. Analyze extent.
+                    // Run ended. Analyse extent.
                     const int runLengthFields = lastBlackField - firstBlackField + 1;
                     DeltaStats z;
     
@@ -760,7 +760,7 @@ namespace visualEdits {
                 continue;
             }
     
-            // Commit (field-aligned; ld-analyze cuts don't split fields)
+            // Commit (field-aligned; ld-analyse cuts don't split fields)
             const int targetField = i;
             if (targetField - lastEditFrame < 3) continue; // strict echo
     

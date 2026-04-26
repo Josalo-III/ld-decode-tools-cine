@@ -121,7 +121,7 @@ private:
         double confidence = 0.0;
     };
 
-    // Result of analyzeCavGroup().
+    // Result of analyseCavGroup().
     struct CavGroupSignature {
         bool valid             = false;
         bool invertedDomain    = false;
@@ -333,7 +333,7 @@ private:
                                               int f3,
                                               int f4);
 
-    CavGroupSignature analyzeCavGroup(Cav5Group& g, SourceVideo& sv);
+    CavGroupSignature analyseCavGroup(Cav5Group& g, SourceVideo& sv);
 
     void solveSegmentCine(SourceVideo& sv,
                           int segStart,
