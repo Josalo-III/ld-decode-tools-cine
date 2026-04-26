@@ -6,7 +6,7 @@ This is the complete suite of tools for processing LaserDisc captures and TBC (T
 
 This repo is the home of some experimental variations on the ld-decode tools, the chief of which is the addition of internal pulldown detection and consolidation. 
 
-Also of note: the world's first TBC trimmer, and a stacker able to use such trims (or other samples lacking the usual alignment) and still properly incorporate them, no matter the start point or duration. We also have 3 new stacking modes, which are a revelation themselves, particularly mode 6 : smart local neighbor. 
+Also of note: the world's first TBC trimmer, and a stacker able to use such trims (or other samples lacking the usual alignment) and still properly incorporate them, no matter the start point or duration. The timemaster now obeys VBI frame numbers, so a short timemaster can be used to target a patch in the middle of a set of full-length samples. We also have 3 new stacking modes, which are a revelation themselves, mode 5: local neighbor (SNR through the roof), mode 6 : smart local neighbor (superior detail over mode 3), and medoid, a close analog to a mode average, that picks the sample with the shortest total distance to all other samples - this is the "local" constraint on modes 5 and 6, removing local outliers from the neighbor process.
 
 We detect edits and pulldown in a new tool, ld-cinemap, best run after updating vits on a stack output. This tool can work in Cine mode, where we expect just a few cadence breaks, or in TV mode, where we expect it per shot. Since telecine detection in TV mode is dependent on successful edit detection, overrides are available via whitelist/blacklist commands. 
 
