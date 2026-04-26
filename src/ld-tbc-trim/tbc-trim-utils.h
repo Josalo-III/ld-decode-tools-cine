@@ -26,10 +26,11 @@
 #ifndef TBC_TRIM_UTILS_H
 #define TBC_TRIM_UTILS_H
 
-#include <QString>
-#include <QVector>
 #include "lddecodemetadata.h"
 #include "tbcwriter.h"
+
+#include <QString>
+#include <QVector>
 
 namespace TbcTrimUtils {
 
