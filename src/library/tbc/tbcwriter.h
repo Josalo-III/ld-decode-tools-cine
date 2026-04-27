@@ -8,10 +8,6 @@
  * This file is part of ld-decode-tools.
  *
  * Shared TBC stream writer for standalone ld-decode tools.
- *
- * Note: This class exists to give the standalone tools a write path.
- * When DiscOrc is in use, the orchestrator owns stream writing and this
- * class is bypassed entirely.
  ******************************************************************************/
 
 #ifndef TBCWRITER_H
