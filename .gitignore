@@ -114,3 +114,4 @@ src/.DS_Store
 prototypes/.DS_Store
 docs/.DS_Store
 .DS_Store
+oldflake.nix

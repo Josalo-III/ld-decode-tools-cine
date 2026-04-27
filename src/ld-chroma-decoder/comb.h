@@ -101,14 +101,6 @@ public:
         qint32 getLookBehind() const;
         qint32 getLookAhead()  const;
 
-		// Merged / pruned Tunables block preserving your additions and values.
-		// - Keeps your HYBRID_* VDIS knobs for compatibility, and aliases VDIS_* noted below.
-		// - Preserves ONE_D_NEAR_THRESH_IRE and the ANTI_COMPOSITE_* controls.
-		// - Uses your boosted FVF thresholds (3.0 / 7.0) as requested.
-		// - Adds VDIS_USE_PLUS1 and VDIS_1D_DIFF_THRESH_IRE with sensible defaults.
-		//
-		// Replace the Tunables block in comb.h with this merged version.
-		// If you want the old block saved in-repo, use the backup file above.
 		struct Tunables {
 			// =========================================================================
 			// 1D / Lateral baseline
