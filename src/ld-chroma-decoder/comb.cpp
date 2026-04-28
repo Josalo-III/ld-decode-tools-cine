@@ -63,6 +63,22 @@ namespace {
         sp = Ce * s4 + Se * c4;
         cp = Ce * c4 - Se * s4;
     }
+
+    // Fuse burst rotation into the 4-phase locked basis:
+    //   ti = c * 2 * (sp*bcos - cp*bsin)
+    //   tq = c * 2 * (sp*bsin + cp*bcos)
+    // (where (bcos,bsin) is the per-line burst phasor).
+    static inline void fusedDemodLUT(double bcos, double bsin,
+                                     const double spLUT[4], const double cpLUT[4],
+                                     double outTi[4], double outTq[4])
+    {
+        for (int i = 0; i < 4; ++i) {
+            const double sp = spLUT[i];
+            const double cp = cpLUT[i];
+            outTi[i] = 2.0 * (sp * bcos - cp * bsin);
+            outTq[i] = 2.0 * (sp * bsin + cp * bcos);
+        }
+    }
 }
 
 // 3D candidate palette
@@ -248,14 +264,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
         if (canLoadNext && (fieldIndex + 2 >= 0)) {
             next->loadFields(inputFields[fieldIndex + 2], inputFields[fieldIndex + 3]);
-
+            next->split1D();
             if (configuration.phaseCompensation) {
                 // Heavy locked pre-processing between 1D and 2D
                 next->phaseLocked();
             }
-            // 1D/2D always run; in locked mode they will see locked LO/basis state.
 
-            next->split1D();
             next->split2D();
         }
 
@@ -639,10 +653,11 @@ void Comb::FrameBuffer::split1D()
 }
 
 // Locked-path pre-processing: burst detection, raw composite demodulation into
-// TRI/TRQ, and sinusoidal-fit subcarrier subtraction into clpbuffer[0], with a
-// per-line affine solve stored in lineAffineLocked. Runs before split1D so that
-// subsequent stages operate on phase-aligned composite. buildPhaseCorrected1D
-// then applies the stored affine to demodTI/TQ after split1D has run.
+// TRI/TRQ, and a per-line affine solve stored in lineAffineLocked.
+//
+// Note: We intentionally do not overwrite clpbuffer[0] here; split1D populates
+// clpbuffer[0] (1D bandpass), and buildPhaseCorrected1D demodulates that using
+// the locked basis and applies the stored affine afterwards.
 void Comb::FrameBuffer::phaseLocked()
 {
     if (!configuration.phaseCompensation)
@@ -711,6 +726,8 @@ void Comb::FrameBuffer::phaseLocked()
             const double bsin      = (double)demodBurstSin[line];
             float *triRow          = demodTRI_line(line);
             float *trqRow          = demodTRQ_line(line);
+            double lutTi[4], lutTq[4];
+            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
 
             double dc = (double)rawLine[left];
             constexpr double DC_ALPHA = 1.0 / 64.0;
@@ -719,22 +736,18 @@ void Comb::FrameBuffer::phaseLocked()
                 const int h      = left + xi;
                 dc += DC_ALPHA * ((double)rawLine[h] - dc);
                 const double vraw = (double)rawLine[h] - dc;
-                const double sp   = spLUT_locked[h & 3];
-                const double cp   = cpLUT_locked[h & 3];
-                const double lsin = vraw * sp * 2.0;
-                const double lcos = vraw * cp * 2.0;
-                triRow[xi] = (float)(lsin * bcos - lcos * bsin);
-                trqRow[xi] = (float)(lsin * bsin + lcos * bcos);
+                const int ph = (h & 3);
+                triRow[xi] = (float)(vraw * lutTi[ph]);
+                trqRow[xi] = (float)(vraw * lutTq[ph]);
             }
         }
     }
 
-    // --- Pass 3: sinusoidal fit + affine solve -> clpbuffer[0], lineAffineLocked ---
+    // --- Pass 3: sinusoidal fit + affine solve -> lineAffineLocked ---
     // Reads TRI/TRQ from Pass 2. For each sample, estimates local chroma amplitude
     // from a windowed mean of TRI/TRQ magnitudes, computes fitted IQ, vets by windowed
-    // residual ratio, and writes corrected composite to clpbuffer[0] where accepted.
-    // The fitted IQ also serves as the reference for the per-line affine solve, which
-    // is stored in lineAffineLocked for buildPhaseCorrected1D to apply after split1D.
+    // residual ratio. The fitted IQ serves as the reference for the per-line affine
+    // solve, which is stored in lineAffineLocked for buildPhaseCorrected1D to apply.
     {
         const int WIN  = std::max(4, (T.SINFIT_WIN_SAMPLES / 4) * 4);
         const int HALF = WIN / 2;
@@ -746,19 +759,12 @@ void Comb::FrameBuffer::phaseLocked()
             const double bsin      = (double)demodBurstSin[line];
             const float *triRow    = demodTRI_line(line);
             const float *trqRow    = demodTRQ_line(line);
-            double *clp            = clpbuffer[0].pixel[line];
-
-            // Write luma estimate into scratch_comp_res for produceY.
-            for (int xi = 0; xi < width; ++xi)
-                scratch_comp_res[xi] = (double)rawLine[left + xi] - clp[left + xi];
 
             double STT[2][2] = {{0,0},{0,0}};
             double SRT[2][2] = {{0,0},{0,0}};
 
             for (int xi = 0; xi < width; ++xi) {
                 const int h  = left + xi;
-                const double sp = spLUT_locked[h & 3];
-                const double cp = cpLUT_locked[h & 3];
                 const double ri = (double)triRow[xi];
                 const double rq = (double)trqRow[xi];
 
@@ -799,22 +805,15 @@ void Comb::FrameBuffer::phaseLocked()
                     fQ = rq * (ampEst / mag0);
                 }
 
-                // Accumulate affine matrices using fitted IQ as reference
-                if (doAffine) {
+                const double ratio = (ampEst > 1e-9) ? (resAmp / ampEst) : 1.0;
+
+                // Accumulate affine matrices using vetted fitted IQ as reference
+                if (doAffine && ratio <= T.SINFIT_VET_THRESHOLD_IRE) {
                     STT[0][0] += fI*fI; STT[0][1] += fI*fQ;
                     STT[1][0] += fI*fQ; STT[1][1] += fQ*fQ;
                     SRT[0][0] += ri*fI; SRT[0][1] += ri*fQ;
                     SRT[1][0] += rq*fI; SRT[1][1] += rq*fQ;
                 }
-
-                // Remod and vet
-                const double lsin   =  fI * bcos + fQ * bsin;
-                const double lcos   = -fI * bsin + fQ * bcos;
-                const double fitted = 0.5 * (lsin * sp + lcos * cp);
-
-                const double ratio = (ampEst > 1e-9) ? (resAmp / ampEst) : 1.0;
-                if (ratio <= T.SINFIT_VET_THRESHOLD_IRE)
-                    clp[h] = (double)rawLine[h] - fitted;
             }
 
             // Affine solve — stored for buildPhaseCorrected1D to apply after split1D
@@ -864,25 +863,26 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
         const double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
         const double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+        double lutTi[4], lutTq[4];
+        fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
 
         float *tiRow = demodTI_line(line);
         float *tqRow = demodTQ_line(line);
 
         for (int xi = 0; xi < width; ++xi) {
             const int h    = left + xi;
-            const double sp = spLUT_locked[h & 3];
-            const double cp = cpLUT_locked[h & 3];
             const double c  = src[h];
 
-            const double lsin = c * sp * 2.0;
-            const double lcos = c * cp * 2.0;
-            const double ti   =  lsin * bcos - lcos * bsin;
-            const double tq   =  lsin * bsin + lcos * bcos;
+            const int ph = (h & 3);
+            const double ti = c * lutTi[ph];
+            const double tq = c * lutTq[ph];
 
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
 
             // Remod to phase-normalised composite for clpbuffer[1]
+            const double sp = spLUT_locked[ph];
+            const double cp = cpLUT_locked[ph];
             const double rsin =  ti * bcos + tq * bsin;
             const double rcos = -ti * bsin + tq * bcos;
             dst[h] = 0.5 * (rsin * sp + rcos * cp);
