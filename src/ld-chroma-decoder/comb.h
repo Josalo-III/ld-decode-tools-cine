@@ -49,9 +49,19 @@ public:
         bool   adaptive    = true; // If true, the 3D adaptive candidate selection is used.
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
-		// Demod plus Y selection: phase locked vs bucket
+        // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
+
+        // Locked mode: remod clpbuffer[1] onto exact 4fsc sample phases (h&3)
+        // instead of burst-referenced remod. This can improve assumptions made
+        // by later comb stages at the cost of moving burst phase variation into
+        // the demodulated I/Q domain.
+        bool lockedRemodTo4fsc = false;
+
+        // If true, keep clpbuffer[1] burst-referenced, but feed the 2D comb stage
+        // from a 4fsc-grid remodulated copy (reduces 2D Nyquist/zipper artifacts).
+        bool locked2DSourceTo4fsc = true;
 
         // Per-axis product gains: multipliers applied to I and Q before filtering.
         double gi_product = 1.0;
@@ -175,6 +185,7 @@ public:
 			double ONE_D_NEAR_THRESH_IRE          = 1.5;  
             // Neighbor Shaping for FVF (New)
             double FVF_SHAPE_STRENGTH             = 0.5;
+            // (reserved)
             // Neighbor-based cross-domain estimate shaping (FVF)
 			double NEIGHBOR_EST_WEIGHT        = 0.125;  // penalty weight (in IRE units); keep small
 			double NEIGHBOR_EST_SAT_MAX_IRE   = 12.0; // disable in strong saturation
@@ -391,6 +402,7 @@ private:
         std::vector<double> scratch_hpY;
 		std::vector<char> scratch_vdis_flag;
 		std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
+        std::vector<std::vector<double>> locked1DSource; // [line][rel], locked-mode stable source for 2D
 
         // Small helpers declared here; definitions provided after the class (in this header).
         inline qint32 getFieldID(qint32 lineNumber) const;
@@ -399,7 +411,7 @@ private:
 		double spLUT_locked[4] = {1.0, 0.0, -1.0, 0.0};
 		double cpLUT_locked[4] = {0.0, 1.0,  0.0, -1.0};
 		bool   basisLockedInit = false;
-		bool hasVDIS(int lineNumber, int h) const;		
+        bool hasVDIS(int lineNumber, int h) const;		
 
 		// Hybrid 2D helpers
 		void computeField2DLine(int lineNumber,

@@ -105,7 +105,7 @@ static constexpr quint32 CANDIDATE_SHADES[] = {
     0x8080FF, // CAND_PREV_FRAME - blue
     0xFF80FF, // CAND_NEXT_FRAME - purple
 };
-// Polar-decompose a 2x2 affine matrix A = R·U into a rotation R and symmetric U,
+// Polar-decompose a 2x2 affine matrix A = RU into a rotation R and symmetric U,
 // then clamp R to a maximum phase rotation, clamp U's shear metric, and optionally
 // clamp the gain (mean singular value). The clamped gain is folded into R so callers
 // can apply a single matrix. Used throughout the locked path to keep per-line and
@@ -147,17 +147,16 @@ static inline void clamp_rotation_gain_shear(double R[2][2], double U[2][2],
     R[0][0] *= g; R[0][1] *= g; R[1][0] *= g; R[1][1] *= g;
 }
 
-// Render a single character from a minimal 5×7 bitmap font into a FrameCanvas.
-// Supports A–E (pulldown film letters), '?' (unknown), and '/' (boundary marker).
+// Render a single character from a minimal 57 bitmap font into a FrameCanvas.
+// Supports pulldown film letters, '?' (unknown), and '/' (boundary marker).
 // scale controls pixel block size for visibility at different output resolutions.
 static void drawChar(FrameCanvas &canvas, int x, int y, char ch, FrameCanvas::Colour col, int scale) {
-    // Simple 5x7 font map for A-E, ?, and /
+    // Simple 5x7 font map for A-D, ?, and /
     static const unsigned char font[][7] = {
         {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}, // A (0)
         {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // B (1)
         {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, // C (2)
         {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, // D (3)
-        {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, // E (4)
         {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}, // ? (5)
         {0x01,0x02,0x02,0x04,0x04,0x08,0x10}  // / (6)
     };
@@ -166,10 +165,6 @@ static void drawChar(FrameCanvas &canvas, int x, int y, char ch, FrameCanvas::Co
     if (ch >= 'A' && ch <= 'E') idx = ch - 'A';
     else if (ch == '/') idx = 6;
     else if (ch >= '0' && ch <= '9') {
-        // Map numbers if needed, for now map '1'-'5' to something or keep '?'
-        // Actually the caller passes '1'..'5' for video cycle sometimes. 
-        // We only have glyphs for A-E defined above. 
-        // If we want numbers we need bitmaps. Assuming just A-E/ ? / slash for now.
     }
     
     for (int r = 0; r < 7; ++r) {
@@ -496,6 +491,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_vdis_flag.assign(width, 0);    
     }
     vdisMask.assign(lines, std::vector<char>(width, 0));
+    locked1DSource.assign(lines, std::vector<double>(width, 0.0));
 }
 
 // Interleave the two source fields into rawbuffer in frame-line order (even lines
@@ -519,29 +515,26 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 
     firstFieldPhaseID  = firstField.field.fieldPhaseID;
     secondFieldPhaseID = secondField.field.fieldPhaseID;
-
-    // Cadence IDs are per-field. Any per-pair gating must be symmetric and
-    // independent of field ordering (no "first field decides the regime").
+    
+    const bool editSplit = secondField.field.cinemap.isEditBoundary;
+    
     const qint32 cidA = firstField.field.cinemap.cadenceId;
     const qint32 cidB = secondField.field.cinemap.cadenceId;
-
-    auto mergeCadenceForComb = [](qint32 a, qint32 b) -> qint32 {
-        // Film-capable wins (>= 0). If both are film-capable, choose a stable representative.
+    
+    auto mergeCadenceForComb = [&](qint32 a, qint32 b) -> qint32 {
+        // If the edit split happens between these two fields, force Video mode.
+        if (editSplit) return -2;
+    
         const bool aFilm = (a >= 0);
         const bool bFilm = (b >= 0);
         if (aFilm && bFilm) return (a < b) ? a : b;
         if (aFilm) return a;
         if (bFilm) return b;
-
-        // Progressive hint (-3) next.
         if (a == -3 || b == -3) return -3;
-
-        // Otherwise treat as video/unknown (-2).
         return -2;
     };
-
+    
     cadenceId = mergeCadenceForComb(cidA, cidB);
-
     // Clear working planes only in active region for safety
     for (int buf = 0; buf < 3; ++buf) {
         for (int y = videoParameters.firstActiveFrameLine;
@@ -881,11 +874,22 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             tqRow[xi] = (float)tq;
 
             // Remod to phase-normalised composite for clpbuffer[1]
-            const double sp = spLUT_locked[ph];
-            const double cp = cpLUT_locked[ph];
-            const double rsin =  ti * bcos + tq * bsin;
-            const double rcos = -ti * bsin + tq * bcos;
-            dst[h] = 0.5 * (rsin * sp + rcos * cp);
+            if (configuration.lockedRemodTo4fsc) {
+                // Remodulate onto the exact 4fsc sample grid (h&3). This deliberately
+                // drops the fractional-basis shift (CAL_EPS_SAMPLES) for the remod only,
+                // to preserve perfect 4-sample periodicity for downstream comb stages.
+                const double sp4 = sin4fsc(ph);
+                const double cp4 = cos4fsc(ph);
+                const double rsin =  ti * bcos + tq * bsin;
+                const double rcos = -ti * bsin + tq * bcos;
+                dst[h] = 0.5 * (rsin * sp4 + rcos * cp4);
+            } else {
+                const double sp = spLUT_locked[ph];
+                const double cp = cpLUT_locked[ph];
+                const double rsin =  ti * bcos + tq * bsin;
+                const double rcos = -ti * bsin + tq * bcos;
+                dst[h] = 0.5 * (rsin * sp + rcos * cp);
+            }
         }
     }
 }
@@ -912,31 +916,39 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
 
     if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
-    static constexpr double blackLine[Comb::MAX_WIDTH] = {0};
-
-    // In locked mode, use clpbuffer[1] (phase-normalised composite); in bucket
-    // mode, use clpbuffer[0] (raw 1D bandpass).
-    const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
-
-    auto clampLinePtr = [&](int ln)->const double* {
-        if (ln < first || ln >= last) return blackLine;
-        return clpbuffer[srcBufIndex].pixel[ln];
+    auto clampSameFieldLine = [&](int ln)->int {
+        // For intrafield sampling we must stay on the same field parity as lineNumber.
+        // Plain clamping can jump to the opposite field at the top/bottom edges.
+        const int parity = (lineNumber & 1);
+        ln = std::clamp(ln, first, last - 1);
+        if ((ln & 1) != parity) {
+            // Prefer stepping inward rather than outward.
+            if (ln + 1 < last && ((ln + 1) & 1) == parity) ln = ln + 1;
+            else if (ln - 1 >= first && ((ln - 1) & 1) == parity) ln = ln - 1;
+        }
+        return ln;
     };
 
-    const double *cur = clampLinePtr(lineNumber);
-
-    // Near ±2 (classic)
-    const double *up2 = clampLinePtr(lineNumber - 2);
-    const double *dn2 = clampLinePtr(lineNumber + 2);
-
-    // Far ±4 (Field A extra reach)
-    const double *up4 = clampLinePtr(lineNumber - 4);
-    const double *dn4 = clampLinePtr(lineNumber + 4);
-
-    auto sample = [&](const double *ln, int h)->double {
+    auto sampleLocked1D = [&](int ln, int h)->double {
         if (h < left)   h = left;
         if (h >= right) h = right - 1;
-        return ln[h];
+        ln = clampSameFieldLine(ln);
+        const int rel = h - left;
+        if (rel < 0 || rel >= width) return 0.0;
+        if (ln < 0 || ln >= (int)locked1DSource.size()) return 0.0;
+        const auto &row = locked1DSource[ln];
+        if ((int)row.size() < width) return 0.0;
+        return row[rel];
+    };
+
+    auto sample = [&](int ln, int h)->double {
+        if (h < left)   h = left;
+        if (h >= right) h = right - 1;
+        ln = clampSameFieldLine(ln);
+        if (configuration.phaseCompensation) {
+            return sampleLocked1D(ln, h);
+        }
+        return clpbuffer[0].pixel[ln][h];
     };
 
     const auto  &T    = configuration.tunables;
@@ -953,7 +965,7 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
     auto edgeGateAt = [&](int h)->double {
         const int hm1 = (h > left) ? h - 1 : left;
         const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
-        const double eIRE = std::fabs(sample(cur, hp1) - sample(cur, hm1)) * invI;
+        const double eIRE = std::fabs(sample(lineNumber, hp1) - sample(lineNumber, hm1)) * invI;
 
         if (eIRE <= EDGE_SOFT_IRE) return 1.0;
         if (eIRE >= EDGE_HARD_IRE) return 0.0;
@@ -969,28 +981,28 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
 
         // Center and symmetric lateral context (reduces column bias)
-        const double C    = sample(cur, h);
-        const double C_m1 = sample(cur, hm1);
-        const double C_p1 = sample(cur, hp1);
+        const double C    = sample(lineNumber, h);
+        const double C_m1 = sample(lineNumber, hm1);
+        const double C_p1 = sample(lineNumber, hp1);
         const double symCur = 0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
 
-        // --- Near samples (±2) ---
-        const double U2    = sample(up2, h);
-        const double D2    = sample(dn2, h);
-        const double U2_m1 = sample(up2, hm1);
-        const double U2_p1 = sample(up2, hp1);
-        const double D2_m1 = sample(dn2, hm1);
-        const double D2_p1 = sample(dn2, hp1);
+        // --- Near samples (2) ---
+        const double U2    = sample(lineNumber - 2, h);
+        const double D2    = sample(lineNumber + 2, h);
+        const double U2_m1 = sample(lineNumber - 2, hm1);
+        const double U2_p1 = sample(lineNumber - 2, hp1);
+        const double D2_m1 = sample(lineNumber + 2, hm1);
+        const double D2_p1 = sample(lineNumber + 2, hp1);
         const double symU2 = 0.5 * (std::fabs(U2_m1) + std::fabs(U2_p1));
         const double symD2 = 0.5 * (std::fabs(D2_m1) + std::fabs(D2_p1));
 
-        // --- Far samples (±4) ---
-        const double U4    = sample(up4, h);
-        const double D4    = sample(dn4, h);
-        const double U4_m1 = sample(up4, hm1);
-        const double U4_p1 = sample(up4, hp1);
-        const double D4_m1 = sample(dn4, hm1);
-        const double D4_p1 = sample(dn4, hp1);
+        // --- Far samples (4) ---
+        const double U4    = sample(lineNumber - 4, h);
+        const double D4    = sample(lineNumber + 4, h);
+        const double U4_m1 = sample(lineNumber - 4, hm1);
+        const double U4_p1 = sample(lineNumber - 4, hp1);
+        const double D4_m1 = sample(lineNumber + 4, hm1);
+        const double D4_p1 = sample(lineNumber + 4, hp1);
         const double symU4 = 0.5 * (std::fabs(U4_m1) + std::fabs(U4_p1));
         const double symD4 = 0.5 * (std::fabs(D4_m1) + std::fabs(D4_p1));
 
@@ -1002,7 +1014,7 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
             double k = 0.0;
             k  = std::fabs(std::fabs(C0) - std::fabs(Cn));
             k += std::fabs(sym0 - symn);
-            // small bonus for strong signal (helps avoid “weak = noisy” toggles)
+            // small bonus for strong signal (helps avoid weak = noisy toggles)
             k -= (std::fabs(C0) + std::fabs(Cn)) * 0.10;
             if (k < 0.0) k = 0.0;
             return k;
@@ -1041,8 +1053,8 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         }
 
         // ------------------------------------------------------------
-        // Far weights (±4), but *ramped* by near confidence and edge gate
-        // This avoids “far popping” that creates patterned alternation.
+        // Far weights (4), but *ramped* by near confidence and edge gate
+        // This avoids far popping that creates patterned alternation.
         // ------------------------------------------------------------
         double kp4 = phaseDiffMetric(C, symCur, U4, symU4);
         double kn4 = phaseDiffMetric(C, symCur, D4, symD4);
@@ -1063,12 +1075,12 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         wDn4 *= nearConfDn * eGate;
 
         // Prefer near unless far is clearly better; keep far subtle
-        const double FAR_SCALE = 0.65; // far contributes less “authority” by default
+        const double FAR_SCALE = 0.65; // far contributes less authority by default
         wUp4 *= FAR_SCALE;
         wDn4 *= FAR_SCALE;
 
         // ------------------------------------------------------------
-        // Combine near and far contributions (still a ± comb)
+        // Combine near and far contributions (still a  comb)
         // ------------------------------------------------------------
         double tc = 0.0;
 
@@ -1096,8 +1108,8 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
 
         outFieldLine[rel] = tc;
 
-        // Gate for scorer: “how confident is A here?”
-        // Use near confidence primarily, with far only if it’s present.
+        // Gate for scorer: how confident is A here?
+        // Use near confidence primarily, with far only if its present.
         double gateA = std::max(wUp2, wDn2);
         gateA = std::max(gateA, 0.5 * std::max(wUp4, wDn4)); // far contributes but less
         gateA = std::clamp(gateA, 0.0, 1.0);
@@ -1125,23 +1137,36 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     }
     if (!outFieldLine) return;
 
-    static constexpr double blackLine[Comb::MAX_WIDTH] = {0};
-
-    const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
-
-    auto clampLinePtr = [&](int ln)->const double* {
-        if (ln < first || ln >= last) return blackLine;
-        return clpbuffer[srcBufIndex].pixel[ln];
+    auto clampSameFieldLine = [&](int ln)->int {
+        const int parity = (lineNumber & 1);
+        ln = std::clamp(ln, first, last - 1);
+        if ((ln & 1) != parity) {
+            if (ln + 1 < last && ((ln + 1) & 1) == parity) ln = ln + 1;
+            else if (ln - 1 >= first && ((ln - 1) & 1) == parity) ln = ln - 1;
+        }
+        return ln;
     };
 
-    const double *cur = clampLinePtr(lineNumber);
-    const double *up2 = clampLinePtr(lineNumber - 2);
-    const double *dn2 = clampLinePtr(lineNumber + 2);
-
-    auto sample = [&](const double *ln, int h)->double {
+    auto sampleLocked1D = [&](int ln, int h)->double {
         if (h < left)   h = left;
         if (h >= right) h = right - 1;
-        return ln[h];
+        ln = clampSameFieldLine(ln);
+        const int rel = h - left;
+        if (rel < 0 || rel >= width) return 0.0;
+        if (ln < 0 || ln >= (int)locked1DSource.size()) return 0.0;
+        const auto &row = locked1DSource[ln];
+        if ((int)row.size() < width) return 0.0;
+        return row[rel];
+    };
+
+    auto sample = [&](int ln, int h)->double {
+        if (h < left)   h = left;
+        if (h >= right) h = right - 1;
+        ln = clampSameFieldLine(ln);
+        if (configuration.phaseCompensation) {
+            return sampleLocked1D(ln, h);
+        }
+        return clpbuffer[0].pixel[ln][h];
     };
 
     const auto &T = configuration.tunables;
@@ -1156,16 +1181,16 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         const int hm1 = (h > left) ? h - 1 : left;
         const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
 
-        const double C    = sample(cur, h);
-        const double Cup  = sample(up2, h);
-        const double Cdn  = sample(dn2, h);
+        const double C    = sample(lineNumber, h);
+        const double Cup  = sample(lineNumber - 2, h);
+        const double Cdn  = sample(lineNumber + 2, h);
 
-        const double C_m1   = sample(cur, hm1);
-        const double C_p1   = sample(cur, hp1);
-        const double Cup_m1 = sample(up2, hm1);
-        const double Cup_p1 = sample(up2, hp1);
-        const double Cdn_m1 = sample(dn2, hm1);
-        const double Cdn_p1 = sample(dn2, hp1);
+        const double C_m1   = sample(lineNumber, hm1);
+        const double C_p1   = sample(lineNumber, hp1);
+        const double Cup_m1 = sample(lineNumber - 2, hm1);
+        const double Cup_p1 = sample(lineNumber - 2, hp1);
+        const double Cdn_m1 = sample(lineNumber + 2, hm1);
+        const double Cdn_p1 = sample(lineNumber + 2, hp1);
 
         // Symmetric lateral magnitude context (removes column bias)
         const double symCur = 0.5 * (std::fabs(C_m1)   + std::fabs(C_p1));
@@ -1228,12 +1253,12 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     }
 
     
-    // In locked (phase-compensated) mode, the π-damper is not applied —
+    // In locked (phase-compensated) mode, the -damper is not applied 
     // it is intended only for the phase-blind (bucket) path.
     std::copy(tcLine.begin(), tcLine.end(), outFieldLine);
     return;
 
-    // --- PASS 2: π-damper (horizontal 3-tap pull to neighbor average) ---
+    // --- PASS 2: -damper (horizontal 3-tap pull to neighbor average) ---
     // Stronger in high chroma, reduced (but not eliminated) on hard horizontal edges.
     const double invI = this->invIreScale;
 
@@ -1264,7 +1289,7 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         }
 
         // Horizontal edge in IRE from raw composite (phase-blind)
-        const double hEdgeIRE = std::fabs(sample(cur, hp1) - sample(cur, hm1)) * invI;
+        const double hEdgeIRE = std::fabs(sample(lineNumber, hp1) - sample(lineNumber, hm1)) * invI;
 
         // Reduce damping on strong edges, but never to zero.
         double edgeReduce = 1.0;
@@ -1282,7 +1307,7 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
 }
 
 // Demodulates the Field B scalar raster (simpleField2D[line]) into the locked
-// demodTI/TQ buffers for use by computeFrameIQLine. Field B provides a ±2 intra-field
+// demodTI/TQ buffers for use by computeFrameIQLine. Field B provides a 2 intra-field
 // comb estimate that serves as a cleaner input to the frame-comb demodulation than
 // the raw composite, reducing subcarrier leakage into the frame IQ estimate.
 void Comb::FrameBuffer::demodSimpleField2DLine(int line)
@@ -1523,7 +1548,7 @@ static void consolidateVDISRegions(
 }
 
 
-// Frame comb in IQ space: averages the ±1 neighbouring lines (adjacent in the
+// Frame comb in IQ space: averages the 1 neighbouring lines (adjacent in the
 // interlaced frame, therefore from the opposite field) to produce a frame-comb
 // estimate. Operates in demodulated IQ rather than raw composite to allow
 // phase-aware alignment and Nyquist/zipper repair. VDIS gating suppresses the
@@ -1682,7 +1707,7 @@ void Comb::FrameBuffer::computeFrameIQLine(
     const double VDIS_RAMP_RANGE_IRE = 4.0;
 
     // ------------------------------------------------------------
-    // Build IQ vectors for center and ±1 neighbors
+    // Build IQ vectors for center and 1 neighbors
     // ------------------------------------------------------------
     const bool usePreclean = havePrecleanLine(line);
 
@@ -1882,7 +1907,7 @@ void Comb::FrameBuffer::computeFrameIQLine(
     }
 
     // ------------------------------------------------------------
-    // Nyquist/zipper repair (local ±1 search only when alternation is detected)
+    // Nyquist/zipper repair (local 1 search only when alternation is detected)
     // ------------------------------------------------------------
     auto sgnCorr = [&](const std::complex<double> &a, const std::complex<double> &b)->int {
         const double ma = cmag(a);
@@ -1981,7 +2006,7 @@ void Comb::FrameBuffer::computeFrameIQLine(
         std::complex<double> ZUpRaw = upIQ[x];
         std::complex<double> ZDnRaw = dnIQ[x];
 
-        // Local alternation repair: tiny ±1 search as a replacement sample (local only).
+        // Local alternation repair: tiny 1 search as a replacement sample (local only).
         if (isNyq5(sgnUp, x) || isNyqRun(sgnUp, x)) {
             std::complex<double> bestZ;
             double bestC = 0.0;
@@ -2218,11 +2243,11 @@ static inline bool fvf_is_tri_safe(double candVal,
 static inline double getNotchLumaEven2(const double* arr, int rel, int width) {
     if (!arr || width <= 0) return 0.0;
 
-    // Need rel±2
+    // Need rel2
     if (rel < 2) rel = 2;
     if (rel > width - 3) rel = width - 3;
 
-    // True 2-tap comb notch at 4fsc: average of ±2
+    // True 2-tap comb notch at 4fsc: average of 2
     return 0.5 * (arr[rel - 2] + arr[rel + 2]);
 }
 
@@ -2359,18 +2384,16 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double SAT_FALLBACK_FULL  = 20.0;
     double prev_interfield_luma_ire = 0.0;
 
+    // Core Logic of Field Vs Frame
+	// when the footage is progressive we prefer interfield comb
     bool useFrameModel = (cadenceId >= 0 || cadenceId == -3);
+	bool localUseFrameModel = useFrameModel;
 
     for (int rel = 0; rel < width; ++rel) {
         double FA = fieldA[rel];
         double FB = fieldB[rel];
         double FR = frameB2[rel];
         double L1 = sample1D(rel);
-
-        // Field/Frame model:
-        //  - progressive: Frame is model
-        //  - interlace:   Field A is model (swapped from B)
-        double targetModel = useFrameModel ? FR : FA;
 
         double satFR_demod = 0.0;
         if (frameIQ && rel < (int)frameIQ->size()) {
@@ -2407,9 +2430,23 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double diff_candA_ire = std::fabs(lumFR - lumFA) * invI;
         double diff_candB_ire = std::fabs(lumFR - lumFB) * invI;
         double diff_cand_ire  = std::min(diff_candA_ire, diff_candB_ire);
+        
+        double dFR_ire = std::fabs(lumFB - lumFR) * invI;
+        bool frameInsane = (dFR_ire > FRAME_MAX_DIST_IRE);
+    
+        double interfield_luma_ire = std::fabs(
+            0.5 * (notchScalar(line - 1, rel) + notchScalar(line + 1, rel))
+            - notchScalar(line, rel)) * invI;
+        
+        double smoothed_interfield = (rel > 0)
+            ? 0.5 * (interfield_luma_ire + prev_interfield_luma_ire)
+            : interfield_luma_ire;
+        prev_interfield_luma_ire = interfield_luma_ire;
+    
+        bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
+        double targetModel = localUseFrameModel ? FR : FA;
 
-        // diffFVF uses the geometric interfield stack divergence only —
-        // not A/B comb difference, which is an intraframe quantity.
+        // diffFVF uses the geometric interfield stack divergence only
         double diff_fvf_ire = diff_stack_ire;
         diffFVF[rel] = diff_fvf_ire;
 
@@ -2463,7 +2500,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             if (T.FVF_SHAPE_STRENGTH > 0.0) {
                 double m_c = targetModel;
                 auto getM = [&](int r) {
-                    if (useFrameModel)
+                    if (localUseFrameModel)
                         return frameB2[std::clamp(r, 0, width - 1)];
                     else
                         return fieldA[std::clamp(r, 0, width - 1)];
@@ -2532,7 +2569,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // ------------------------------------------------------------
             // Scale bias: only in Frame-model regime (progressive).
             // ------------------------------------------------------------
-            if (useFrameModel && frameIQ && rel < (int)frameIQ->size()) {
+            if (localUseFrameModel && frameIQ && rel < (int)frameIQ->size()) {
                 auto iqMag = [&](int r)->double {
                     r = std::clamp(r, 0, width - 1);
                     const auto &z = (*frameIQ)[r];
@@ -2574,10 +2611,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
 
             const double MODEL_BIAS = 0.9;
-            if (useFrameModel) scoreR *= MODEL_BIAS;
+            if (localUseFrameModel) scoreR *= MODEL_BIAS;
             else               scoreB *= MODEL_BIAS;
 
-            // --- cross-domain neighbor estimate using ±2 plus a small ±1 term ---
+            // --- cross-domain neighbor estimate using 2 plus a small 1 term ---
             if (!vdisHard &&
                 hIRE < T.NEIGHBOR_EST_EDGE_MAX_IRE &&
                 diff_stack_ire < T.NEIGHBOR_EST_FVF_MAX_IRE &&
@@ -2634,9 +2671,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
 
             // A/B comb divergence: penalise both intrafield combs equally.
-            // Frame score is untouched — it gains by default if A and B can't agree.
+            // Frame score is untouched  it gains by default if A and B can't agree.
             // Only applies in interlace mode; progressive assumes no field separation.
-            if (!useFrameModel) {
+            if (!localUseFrameModel) {
                 double ab_div_ire = std::fabs(lumFA - lumFB) * invI;
                 if (ab_div_ire > FIELD_DISAGREE_IRE) {
                     double pen = (ab_div_ire - FIELD_DISAGREE_IRE) * 0.15;
@@ -2644,24 +2681,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     scoreB += pen;
                 }
             }
-
-            // Interfield divergence probe: compare frame comb geometry (±1 line average)
-            // against current line. High divergence means the two NTSC fields differ in
-            // time — Frame combing across them would mix distinct time samples.
-            double dFR_ire = std::fabs(lumFB - lumFR) * invI;
-            bool frameInsane = (dFR_ire > FRAME_MAX_DIST_IRE);
-
-            double interfield_luma_ire = std::fabs(
-                0.5 * (notchScalar(line - 1, rel) + notchScalar(line + 1, rel))
-                - notchScalar(line, rel)) * invI;
-            double smoothed_interfield = (rel > 0)
-                ? 0.5 * (interfield_luma_ire + prev_interfield_luma_ire)
-                : interfield_luma_ire;
-            prev_interfield_luma_ire = interfield_luma_ire;
-
-            // b2VertCoherent: true when the two NTSC fields at this pixel are
-            // coherent enough to permit interfield (Frame) combing.
-            bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
 
             auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
                 if (vdisSoft) {
@@ -2762,19 +2781,21 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
         }
-
+        // In highly saturated areas the election risks alternating per pixel, so we lock to the model
+        // We gate this on vertical coherence to avoid bad interfield combs between unrelated fields
         if (chromaMagIRE > SAT_FALLBACK_START) {
-            if (useFrameModel) {
-                idx   = 2;
-                val   = FR;
-                shade = 0.8f;
+            if (localUseFrameModel) {
+                if (b2VertCoherent) {     // <-- Only allow FrameIQ if fields are coherent
+                    idx   = 2;
+                    val   = FR;
+                    shade = 0.8f;
+                } // else, do NOT award FrameIQ!
             } else {
                 idx   = 1;
-                val   = FB;
+                val   = FA;
                 shade = 0.35f;
             }
         }
-
         winner[rel]   = idx;
         outVal[rel]   = val;
         outShade[rel] = shade;
@@ -2819,7 +2840,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
     applyIslandFilter();
 
-    if (!useFrameModel && fieldCountTotal > frameCountTotal * 2 && fieldCountTotal > 0) {
+    if (!localUseFrameModel && fieldCountTotal > frameCountTotal * 2 && fieldCountTotal > 0) {
         for (int b = 0; b < width; b += FIELD_BLOCK_SIZE) {
             int e = std::min(width, b + FIELD_BLOCK_SIZE);
 
@@ -2868,15 +2889,35 @@ void Comb::FrameBuffer::split2D()
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
 
+    if ((int)simpleField2D.size() < lastLine) simpleField2D.resize(lastLine);
+
     if (width <= 0 || firstLine >= lastLine) return;
 
-    if (configuration.phaseCompensation) buildPhaseCorrected1D();
+    if (configuration.phaseCompensation) {
+        buildPhaseCorrected1D();
+        // Preserve the per-line locked 1D source before clpbuffer[1] is overwritten
+        // in-place with the 2D output as we iterate down the frame.
+        if ((int)locked1DSource.size() < lastLine) locked1DSource.resize(lastLine);
+        for (int line = firstLine; line < lastLine; ++line) {
+            auto &row = locked1DSource[line];
+            if ((int)row.size() < width) row.assign(width, 0.0);
+            const double *src = clpbuffer[1].pixel[line];
+            for (int rel = 0; rel < width; ++rel) row[rel] = src[left + rel];
+        }
+    }
 
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
         for (int line = firstLine; line < lastLine; ++line) {
             double *dst = clpbuffer[1].pixel[line];
-            const double *src1d = clpbuffer[1].pixel[line]; 
-            for (int rel = 0; rel < width; ++rel) dst[left + rel] = src1d[left + rel];
+            if (configuration.phaseCompensation &&
+                line >= 0 && line < (int)locked1DSource.size() &&
+                (int)locked1DSource[line].size() >= width)
+            {
+                for (int rel = 0; rel < width; ++rel) dst[left + rel] = locked1DSource[line][rel];
+            } else {
+                const double *src1d = clpbuffer[1].pixel[line];
+                for (int rel = 0; rel < width; ++rel) dst[left + rel] = src1d[left + rel];
+            }
             if (writeWeights && line < (int)w2d_frame_weight.size())
                 std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
         }
@@ -2909,6 +2950,12 @@ void Comb::FrameBuffer::split2D()
     std::vector<std::complex<double>> frameIQ; 
 
     for (int line = firstLine; line < lastLine; ++line) {
+        // PREP: Precompute next neighbor (line+1) if in range and not already done
+        if (line + 1 < lastLine) {
+            computeSimpleField2DLine(line + 1, simpleField2D[line + 1].data());
+            if (configuration.phaseCompensation)
+                demodSimpleField2DLine(line + 1);
+        }
         if (line >= demodLines) continue;
 
         computeSimpleField2DLine(line, scratch_fieldBLine.data());
@@ -2916,11 +2963,20 @@ void Comb::FrameBuffer::split2D()
 
         {
             const double *src1d = configuration.phaseCompensation
-                                  ? clpbuffer[1].pixel[line]
+                                  ? nullptr
                                   : clpbuffer[0].pixel[line];
             scratch_lateralLine.assign(width, 0.0);
-            for (int rel = 0; rel < width; ++rel)
-                scratch_lateralLine[rel] = src1d[left + rel];
+            if (configuration.phaseCompensation) {
+                if (line >= 0 && line < (int)locked1DSource.size() &&
+                    (int)locked1DSource[line].size() >= width)
+                {
+                    for (int rel = 0; rel < width; ++rel)
+                        scratch_lateralLine[rel] = locked1DSource[line][rel];
+                }
+            } else {
+                for (int rel = 0; rel < width; ++rel)
+                    scratch_lateralLine[rel] = src1d[left + rel];
+            }
         }
 
         simpleField2D[line].assign(width, 0.0);
@@ -2929,7 +2985,6 @@ void Comb::FrameBuffer::split2D()
 
         if (configuration.phaseCompensation) {
             demodSimpleField2DLine(line);
-            
             computeFrameIQLine(line, frameIQ); 
             
             scratch_fieldBCenter.assign(width, 0.0);
@@ -3170,12 +3225,12 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
 }
 
 // Bucket-path demodulation: separates I and Q from the comb-filtered composite
-// using the 4fsc sampling structure directly. At 4× subcarrier, samples fall on
-// fixed phase positions (0°, 90°, 180°, 270°), so I and Q can be extracted by
+// using the 4fsc sampling structure directly. At 4 subcarrier, samples fall on
+// fixed phase positions (0, 90, 180, 270), so I and Q can be extracted by
 // routing each sample into the appropriate accumulator via a switch on (h & 3).
 // Y is initialised to the raw composite here; adjustY() subtracts the chroma
 // estimate afterwards. This path does not perform burst detection or phase
-// correction — it relies on the 4fsc sampling assumption holding exactly.
+// correction  it relies on the 4fsc sampling assumption holding exactly.
 void Comb::FrameBuffer::splitIQ()
 {
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -3238,7 +3293,7 @@ void Comb::FrameBuffer::splitIQlocked()
     const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
     const int width  = right - left;
 
-    // Ensure TRI/TRQ buffers sized — TI/TQ already guaranteed from phaseLocked
+    // Ensure TRI/TRQ buffers sized  TI/TQ already guaranteed from phaseLocked
     const int requiredLines = lastLine + 1;
     const size_t need = static_cast<size_t>(requiredLines) * static_cast<size_t>(width);
     if (demodTRI_flat.size() < need) {
@@ -3413,7 +3468,7 @@ void Comb::FrameBuffer::filterIQLocked()
         const double   bsin    = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
 
         // If residualColor is active, derive chroma by subtracting the final Y from composite,
-        // then demodulate that residual into the locked basis — this gives chroma that is
+        // then demodulate that residual into the locked basis  this gives chroma that is
         // exactly consistent with the Y we produced, regardless of what filtering follows.
         if (configuration.residualColor) {
             double dc = (double)rawLine[left] - Yrow[left];
@@ -3632,8 +3687,8 @@ void Comb::FrameBuffer::produceY()
 
 // Bucket-path Y reconstruction: subtracts the chroma estimate (reconstructed
 // from the I and Q buckets) from the raw composite to yield luma. The chroma
-// remodulation reverses the bucket demod — routing each sample through the
-// same switch on (h & 3) with sign inversion — and applies the per-line
+// remodulation reverses the bucket demod  routing each sample through the
+// same switch on (h & 3) with sign inversion  and applies the per-line
 // subcarrier polarity from getLinePhase. Only called in bucket mode
 // (phaseCompensation == false); the locked path uses produceY() instead.
 void Comb::FrameBuffer::adjustY()
@@ -3693,7 +3748,7 @@ void Comb::FrameBuffer::filterIQ()
 }
 
 // Chroma noise reduction (coring): high-pass filters I and Q with a narrow FIR,
-// then hard-clamps the result to ±cNRLevel IRE, and subtracts the clamped
+// then hard-clamps the result to cNRLevel IRE, and subtracts the clamped
 // high-frequency component. Suppresses chroma noise without affecting the
 // broad chroma spectrum. Operates on the I/Q planes in place.
 void Comb::FrameBuffer::doCNR()
@@ -3745,7 +3800,7 @@ void Comb::FrameBuffer::doCNR()
 }
 
 // Luma noise reduction (coring): same coring approach as doCNR but applied to
-// the Y plane. High-pass filters Y and subtracts any component within ±yNRLevel
+// the Y plane. High-pass filters Y and subtracts any component within yNRLevel
 // IRE, attenuating fine-grain luma noise while preserving picture detail.
 void Comb::FrameBuffer::doYNR()
 {
@@ -3787,8 +3842,8 @@ void Comb::FrameBuffer::doYNR()
 // standard Y'UV colour axes. The two paths use different base rotation angles
 // because they produce I/Q in different reference frames: the locked path
 // (splitIQlocked / filterIQLocked) produces chroma aligned to the burst-locked
-// LO (base 70°), while the bucket path (splitIQ / filterIQ) produces chroma
-// aligned to the 4fsc sampling grid (base 33°).
+// LO (base 70), while the bucket path (splitIQ / filterIQ) produces chroma
+// aligned to the 4fsc sampling grid (base 33).
 void Comb::FrameBuffer::transformIQ(double chromaGain, double chromaPhase)
 {
     if (demodMode == DemodMode::Locked) {
