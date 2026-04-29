@@ -17,6 +17,7 @@
 #define COMB_H
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
 #include <cstddef>
@@ -299,6 +300,34 @@ private:
     public:
         enum class DemodMode { Bucket, Locked };
 
+        // FVF model/context metrics (not candidate-specific).
+        // Stored per pixel so downstream consumers can understand why a line
+        // segment was treated as frame-model vs field-model, edge-risk, etc.
+        struct FvfModelMetrics {
+            double chromaMagIRE = 0.0;
+            double verticalBoundaryIRE = 0.0;   // horizontal gradient: scanline crosses a vertical edge
+            double horizontalBoundaryIRE = 0.0; // vertical gradient: scanline runs along/grazes an edge
+            double fieldFrameDivergenceIRE = 0.0;
+            double interfieldDistinctIRE = 0.0;
+            double frameToFieldModelIRE = 0.0;  // interlace regime: |Frame - FieldA(model)|
+            double frameToBestFieldIRE = 0.0;   // progressive regime: |Frame - min(FieldA,FieldB)|
+
+            double iqFineFrac = 0.0;
+            double iqMidFrac = 0.0;
+            double iqCoarseFrac = 0.0;
+            double chromaBandEnergyIRE = 0.0;
+            double lumaIncursionRiskIRE = 0.0;
+            double iqCoherence = 0.0;
+            double residualFitErrorIRE = 0.0;
+
+            bool frameModel = false;
+            bool managementVeto = false;
+            bool frameVertCoherent = false;
+            bool vdisSoft = false;
+            bool vdisHard = false;
+            int winner = 1;
+        };
+
         FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
                     const Configuration &configuration_);
 
@@ -328,6 +357,8 @@ private:
         void transformIQ(double chromaGain, double chromaPhase);
         void overlayMap(const FrameBuffer &previousFrame,
                         const FrameBuffer &nextFrame);
+
+        const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
 
         // Optional temporal context pointers used by vetComposite1D (set by decodeFrames)
         // Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
@@ -390,6 +421,7 @@ private:
 		std::vector<double> scratch_lateralLine;
         std::vector<std::vector<float>> w2d_frame_weight;
         std::vector<std::vector<double>> w2d_fieldA_gate;
+        std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
 		std::vector<LineAffine> lineAffineLocked;
 		std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)        
 		std::vector<double> scratch_fieldLine;

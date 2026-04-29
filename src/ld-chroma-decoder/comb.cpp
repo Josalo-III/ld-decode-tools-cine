@@ -451,6 +451,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         // 2D score blending visualization (only written when showMap is true)
         w2d_frame_weight.assign(lines, std::vector<float>(width, 0.0f));
         w2d_fieldA_gate.assign(lines, std::vector<double>(width, 1.0f));
+        fvfMetrics.assign(lines, std::vector<FvfModelMetrics>(width));
         // Accumulators for raster synthesis
         scratch_fieldLine.assign(width, 0.0);
         scratch_fieldGate.assign(width, 1.0);
@@ -2235,6 +2236,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int width = right - left;
     if (width <= 0) return;
     if (!fieldA || !fieldB || (int)frameB2.size() < width || !outMixed) return;
+    if (line >= 0 && line < (int)fvfMetrics.size() &&
+        (int)fvfMetrics[line].size() < width)
+    {
+        fvfMetrics[line].assign(width, FvfModelMetrics());
+    }
 
     const auto &T   = configuration.tunables;
     const double invI = this->invIreScale;
@@ -2282,6 +2288,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     auto sampleRawVert = [&](int ln, int rel)->double {
         if (ln < firstLine) ln = firstLine;
         if (ln >= lastLine) ln = lastLine - 1;
+        rel = std::clamp(rel, 0, width - 1);
         int h = left + rel;
         return clpbuffer[srcBufIndex].pixel[ln][h];
     };
@@ -2426,9 +2433,27 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         bool safeB = fvf_is_tri_safe(FB, L1, invI, TRI_SAFE_IRE);
         bool safeR = fvf_is_tri_safe(FR, L1, invI, TRI_SAFE_IRE);
 
+        FvfModelMetrics metrics;
+        metrics.chromaMagIRE = chromaMagIRE;
+        metrics.chromaBandEnergyIRE = chromaMagIRE;
+        metrics.verticalBoundaryIRE = hIRE;
+        metrics.horizontalBoundaryIRE = vIRE;
+        metrics.fieldFrameDivergenceIRE = diff_fvf_ire;
+        metrics.interfieldDistinctIRE = smoothed_interfield;
+        metrics.frameToFieldModelIRE = std::fabs(lumFR - lumFA) * invI;
+        metrics.frameToBestFieldIRE = std::min(std::fabs(lumFR - lumFA), std::fabs(lumFR - lumFB)) * invI;
+        metrics.frameModel = localUseFrameModel;
+        metrics.managementVeto = managementVeto;
+        metrics.frameVertCoherent = b2VertCoherent;
+        metrics.vdisSoft = vdisSoft;
+        metrics.vdisHard = vdisHard;
+
         int    idx   = 1;
         double val   = FB;
         float  shade = 0.35f;
+        double scoreA = std::numeric_limits<double>::quiet_NaN();
+        double scoreB = std::numeric_limits<double>::quiet_NaN();
+        double scoreR = std::numeric_limits<double>::quiet_NaN();
 
         // --- NEW: Force fallback BEFORE the complex scoring happens ---
         if (chromaMagIRE > SAT_FALLBACK_START) {
@@ -2507,9 +2532,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             double errB_notch = std::fabs(lumFB);
             double errR_notch = std::fabs(lumFR);
 
-            double scoreA = (1.0 - satScale) * devA + satScale * errA_notch;
-            double scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
-            double scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
+            scoreA = (1.0 - satScale) * devA + satScale * errA_notch;
+            scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
+            scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
 
             // ------------------------------------------------------------
             // A cleanup + conditional "B keeps them honest"
@@ -2562,6 +2587,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const double fineFrac   = fine   / denom;
                 const double midFrac    = mid    / denom;
                 const double coarseFrac = coarse / denom;
+                metrics.iqFineFrac = fineFrac;
+                metrics.iqMidFrac = midFrac;
+                metrics.iqCoarseFrac = coarseFrac;
+                metrics.iqCoherence = 1.0 - std::clamp(coarseFrac, 0.0, 1.0);
 
                 const double FRAME_BONUS_STRENGTH   = 0.15;
                 const double FRAME_COARSE_CLAMP     = 0.60;
@@ -2761,6 +2790,12 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         winner[rel]   = idx;
         outVal[rel]   = val;
         outShade[rel] = shade;
+        metrics.winner = idx;
+        if (line >= 0 && line < (int)fvfMetrics.size() &&
+            rel < (int)fvfMetrics[line].size())
+        {
+            fvfMetrics[line][rel] = metrics;
+        }
     }
     
     int fieldCountTotal = 0, frameCountTotal = 0;
@@ -2831,6 +2866,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     }
     for (int rel = 0; rel < width; ++rel) {
         outMixed[rel] = outVal[rel];
+        if (line >= 0 && line < (int)fvfMetrics.size() &&
+            rel < (int)fvfMetrics[line].size())
+        {
+            fvfMetrics[line][rel].winner = winner[rel];
+        }
         if (writeWeights && line < (int)w2d_frame_weight.size()) {
             float w = outShade[rel];
             if (!std::isfinite(w)) w = 0.0f;
