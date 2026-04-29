@@ -1334,6 +1334,8 @@ void Comb::FrameBuffer::demodSimpleField2DLine(int line)
 
     const double bcos = (double)demodBurstCos[line];
     const double bsin = (double)demodBurstSin[line];
+    double lutTi[4], lutTq[4];
+    fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
 
     // Ensure locked basis LUT is ready (same lazy-init as splitIQlocked)
     if (!basisLockedInit) {
@@ -1351,18 +1353,9 @@ void Comb::FrameBuffer::demodSimpleField2DLine(int line)
     for (int rel = 0; rel < width; ++rel) {
         const int h = left + rel;
         const double c = fieldLine[rel];
-
-        demodSample(
-            c,
-            h,
-            rel,
-            bcos,
-            bsin,
-            spLUT_locked,
-            cpLUT_locked,
-            ti,
-            tq
-        );
+        const int ph = (h & 3);
+        ti[rel] = (float)(c * lutTi[ph]);
+        tq[rel] = (float)(c * lutTq[ph]);
     }
 }
 
@@ -2127,8 +2120,6 @@ void Comb::FrameBuffer::computeFrameIQLine(
         // --------------------------------------------------------
         // Adaptive comb strength: 0.5 .. COMB_STRENGTH
         // Use strong comb only when coherence is high AND vertical neighbors agree.
-        // This is the "2D is on us" fix: suppress alternation-generating zones
-        // without globally softening the line.
         // --------------------------------------------------------
         const double COMB_STRENGTH_HI = COMB_STRENGTH;  // your existing max (e.g. 2.0)
         const double COMB_STRENGTH_LO = 0.75;            // new floor per your tests
@@ -2438,13 +2429,18 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             : interfield_luma_ire;
         prev_interfield_luma_ire = interfield_luma_ire;
     
-        // --- Veto Logic ---
-        bool managementVeto = (cadenceId == -2);
-        bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
-        
-        if (managementVeto) {
-            b2VertCoherent = false; 
-        }
+	        // --- Veto Logic ---
+	        bool managementVeto = (cadenceId == -2);
+	        bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
+	        double targetModel = localUseFrameModel ? FR : FA;
+
+	        // diffFVF uses the geometric interfield stack divergence only
+	        double diff_fvf_ire = diff_stack_ire;
+	        diffFVF[rel] = diff_fvf_ire;
+	        
+	        if (managementVeto) {
+	            b2VertCoherent = false; 
+	        }
 
         double chromaMagIRE = (frameIQ)
             ? (satFR_demod * invI)
@@ -2476,7 +2472,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
             // By doing this here, we skip the potential for downstream overrides.
         } else if (vdisHard) {
-            // ... (rest of vdisHard logic)
+            // Hard regime: keep original "closest to L1" winner logic (no hysteresis here).
             double bestVal = L1;
             int    bestIdx = 1;
             float  bestSh  = 0.0f;
@@ -2503,9 +2499,292 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             shade = bestSh;
         }
         else {
-            // ... (Insert the rest of your scoring logic here, vIRE, hIRE, pickCandidate, etc.)
-            // Note: If you already processed SAT_FALLBACK above, the original code's 
-            // version at the bottom of the loop should be removed to avoid duplication.
+            double devA = 0.0, devB = 0.0, devR = 0.0;
+
+            if (T.FVF_SHAPE_STRENGTH > 0.0) {
+                double m_c = targetModel;
+                auto getM = [&](int r) {
+                    if (localUseFrameModel)
+                        return frameB2[std::clamp(r, 0, width - 1)];
+                    else
+                        return fieldA[std::clamp(r, 0, width - 1)];
+                };
+                double m_l = getM(rel - 1);
+                double m_r = getM(rel + 1);
+                double shapeModel = m_c - 0.5 * (m_l + m_r);
+
+                auto getShapeScore = [&](double v, double v_l, double v_r) {
+                    double shapeVal = v - 0.5 * (v_l + v_r);
+                    return std::fabs(shapeVal - shapeModel);
+                };
+
+                double FA_l = fieldA[std::clamp(rel - 1, 0, width - 1)];
+                double FA_r = fieldA[std::clamp(rel + 1, 0, width - 1)];
+                double FB_l = fieldB[std::clamp(rel - 1, 0, width - 1)];
+                double FB_r = fieldB[std::clamp(rel + 1, 0, width - 1)];
+                double FR_l = frameB2[std::clamp(rel - 1, 0, width - 1)];
+                double FR_r = frameB2[std::clamp(rel + 1, 0, width - 1)];
+
+                devA += getShapeScore(FA, FA_l, FA_r) * T.FVF_SHAPE_STRENGTH;
+                devB += getShapeScore(FB, FB_l, FB_r) * T.FVF_SHAPE_STRENGTH;
+                devR += getShapeScore(FR, FR_l, FR_r) * T.FVF_SHAPE_STRENGTH;
+            }
+
+            double satScale = std::clamp((chromaMagIRE - 2.0) / 8.0, 0.0, 1.0);
+
+            double errA_notch = std::fabs(lumFA);
+            double errB_notch = std::fabs(lumFB);
+            double errR_notch = std::fabs(lumFR);
+
+            double scoreA = (1.0 - satScale) * devA + satScale * errA_notch;
+            double scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
+            double scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
+
+            // ------------------------------------------------------------
+            // A cleanup + conditional "B keeps them honest"
+            // ------------------------------------------------------------
+            double gA = 1.0;
+            if (line >= 0 && line < (int)w2d_fieldA_gate.size())
+                gA = w2d_fieldA_gate[line][std::clamp(rel, 0, width - 1)];
+            gA = std::clamp(gA, 0.0, 1.0);
+
+            double gAm = gA, gAp = gA;
+            if (line >= 0 && line < (int)w2d_fieldA_gate.size()) {
+                gAm = w2d_fieldA_gate[line][std::clamp(rel - 1, 0, width - 1)];
+                gAp = w2d_fieldA_gate[line][std::clamp(rel + 1, 0, width - 1)];
+                gAm = std::clamp(gAm, 0.0, 1.0);
+                gAp = std::clamp(gAp, 0.0, 1.0);
+            }
+
+            const double gateAltA = std::fabs(gA - 0.5 * (gAm + gAp));
+
+            const double W_A_GATE     = 0.20;
+            const double W_A_GATE_ALT = 0.30;
+
+            scoreA += W_A_GATE * (1.0 - gA);
+            scoreA += W_A_GATE_ALT * gateAltA;
+
+            double wantB = (1.0 - gA) + 1.5 * gateAltA;
+            wantB = std::clamp(wantB, 0.0, 1.0);
+
+            const double W_B_HELP = 0.18;
+            scoreB *= (1.0 - W_B_HELP * wantB);
+
+            // ------------------------------------------------------------
+            // Scale bias: only in Frame-model regime (progressive).
+            // ------------------------------------------------------------
+            if (localUseFrameModel && frameIQ && rel < (int)frameIQ->size()) {
+                auto iqMag = [&](int r)->double {
+                    r = std::clamp(r, 0, width - 1);
+                    const auto &z = (*frameIQ)[r];
+                    return std::hypot(z.real(), z.imag());
+                };
+
+                const double fine = std::fabs(iqMag(rel) -
+                                              0.5 * (iqMag(rel - 1) + iqMag(rel + 1)));
+                const double mid  = std::fabs(iqMag(rel) -
+                                              0.5 * (iqMag(rel - 2) + iqMag(rel + 2)));
+                const double coarse = std::fabs(iqMag(rel) -
+                                                0.5 * (iqMag(rel - 4) + iqMag(rel + 4)));
+
+                const double denom = fine + mid + coarse + 1e-9;
+                const double fineFrac   = fine   / denom;
+                const double midFrac    = mid    / denom;
+                const double coarseFrac = coarse / denom;
+
+                const double FRAME_BONUS_STRENGTH   = 0.15;
+                const double FRAME_COARSE_CLAMP     = 0.60;
+                const double FIELD_A_FINE_PENALTY   = 0.10;
+                const double FIELD_B_FINE_PENALTY   = 0.05;
+                const double FIELD_SWITCH_STRENGTH  = 0.10;
+
+                const bool fineDominant = (fineFrac > (midFrac + coarseFrac) + 0.10);
+
+                double frameBonus = FRAME_BONUS_STRENGTH * fineFrac;
+                frameBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
+                scoreR *= (1.0 - frameBonus);
+
+                if (fineDominant) {
+                    scoreA *= (1.0 + FIELD_A_FINE_PENALTY * fineFrac);
+                    scoreB *= (1.0 + FIELD_B_FINE_PENALTY * fineFrac);
+                } else {
+                    const double bias = std::clamp(coarseFrac - midFrac, -1.0, 1.0);
+                    scoreA *= (1.0 - FIELD_SWITCH_STRENGTH * bias);
+                    scoreB *= (1.0 + FIELD_SWITCH_STRENGTH * bias);
+                }
+            }
+
+            const double MODEL_BIAS = 0.9;
+            if (localUseFrameModel) scoreR *= MODEL_BIAS;
+            else               scoreB *= MODEL_BIAS;
+
+            // --- cross-domain neighbor estimate using 2 plus a small 1 term ---
+            if (!vdisHard &&
+                hIRE < T.NEIGHBOR_EST_EDGE_MAX_IRE &&
+                diff_stack_ire < T.NEIGHBOR_EST_FVF_MAX_IRE &&
+                chromaMagIRE < T.NEIGHBOR_EST_SAT_MAX_IRE)
+            {
+                auto median3 = [&](double a, double b, double c)->double {
+                    double e0 = a, e1 = b, e2 = c;
+                    if (e0 > e1) std::swap(e0, e1);
+                    if (e1 > e2) std::swap(e1, e2);
+                    if (e0 > e1) std::swap(e0, e1);
+                    return e1;
+                };
+
+                int r_m2 = std::max(0,         rel - 2);
+                int r_p2 = std::min(width - 1, rel + 2);
+
+                double estA2 = 0.5 * (fieldA[r_m2]  + fieldA[r_p2]);
+                double estB2 = 0.5 * (fieldB[r_m2]  + fieldB[r_p2]);
+                double estF2 = 0.5 * (frameB2[r_m2] + frameB2[r_p2]);
+
+                double E2 = median3(estA2, estB2, estF2);
+
+                bool allowPm1 = true;
+                {
+                    int r_m1 = std::max(0,         rel - 1);
+                    int r_p1 = std::min(width - 1, rel + 1);
+                    double altF = std::fabs(frameB2[r_m1] - frameB2[r_p1]) * invI;
+                    if (altF > 6.0) allowPm1 = false;
+                }
+
+                double E = E2;
+                if (allowPm1) {
+                    int r_m1 = std::max(0,         rel - 1);
+                    int r_p1 = std::min(width - 1, rel + 1);
+
+                    double estA1 = 0.5 * (fieldA[r_m1]  + fieldA[r_p1]);
+                    double estB1 = 0.5 * (fieldB[r_m1]  + fieldB[r_p1]);
+                    double estF1 = 0.5 * (frameB2[r_m1] + frameB2[r_p1]);
+
+                    double E1 = median3(estA1, estB1, estF1);
+
+                    const double K_PM1 = 0.5;
+                    E = (E2 + K_PM1 * E1) / (1.0 + K_PM1);
+                }
+
+                double dA = std::fabs(FA - E) * invI;
+                double dB = std::fabs(FB - E) * invI;
+                double dR = std::fabs(FR - E) * invI;
+
+                const double W_NEIGH = T.NEIGHBOR_EST_WEIGHT;
+                scoreA += W_NEIGH * dA;
+                scoreB += W_NEIGH * dB;
+                scoreR += W_NEIGH * dR;
+            }
+
+            // A/B comb divergence: penalise both intrafield combs equally.
+            // Frame score is untouched  it gains by default if A and B can't agree.
+            // Only applies in interlace mode; progressive assumes no field separation.
+            if (!localUseFrameModel) {
+                double ab_div_ire = std::fabs(lumFA - lumFB) * invI;
+                if (ab_div_ire > FIELD_DISAGREE_IRE) {
+                    double pen = (ab_div_ire - FIELD_DISAGREE_IRE) * 0.15;
+                    scoreA += pen;
+                    scoreB += pen;
+                }
+            }
+
+            auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
+                if (vdisSoft) {
+                    if (candIdx == 0 && !safeA) return;
+                    if (candIdx == 1 && !safeB) return;
+                    if (candIdx == 2 && !safeR) return;
+                }
+                idx   = candIdx;
+                val   = candVal;
+                shade = candShade;
+            };
+
+            if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
+                double dF1 = std::fabs(lumFR - L1) * invI;
+                if (dF1 <= 3.5 && diff_cand_ire <= 5.0 && !frameInsane)
+                    pickCandidate(2, FR, 0.75f);
+                else {
+                    if (scoreA < scoreB) pickCandidate(0, FA, 0.25f);
+                    else                 pickCandidate(1, FB, 0.35f);
+                }
+            } else if (chromaMagIRE > CHROMA_STRONG_IRE && vIRE > VERT_THRESH_IRE) {
+                // Strong chroma with vertical contrast indicates per-line alternation
+                // that Frame is well-suited to suppress. Bypass interfield gate here.
+                if (!frameInsane)
+                    pickCandidate(2, FR, 0.8f);
+                else {
+                    if (scoreA <= scoreB) pickCandidate(0, FA, 0.25f);
+                    else                  pickCandidate(1, FB, 0.35f);
+                }
+            } else {
+                if (b2VertCoherent)
+                    pickCandidate(2, FR, 0.8f);
+                else if (scoreR + 1e-12 < scoreA * 0.85 &&
+                         scoreR + 1e-12 < scoreB * 0.85)
+                    pickCandidate(2, FR, 0.8f);
+                else if (scoreA < scoreB * 0.8)
+                    pickCandidate(0, FA, 0.25f);
+                else {
+                    double dFL = std::fabs(lumFB - L1) * invI;
+                    double dRL = std::fabs(lumFR - L1) * invI;
+                    if (!frameInsane && dRL + 1.0 < dFL)
+                        pickCandidate(2, FR, 0.75f);
+                    else
+                        pickCandidate(1, FB, 0.35f);
+                }
+            }
+
+
+            if (diff_fvf_ire < FVF_SMALL_DIFF_IRE) {
+                if ((!vdisSoft || safeR) && (idx == 0 || idx == 1))
+                    pickCandidate(2, FR, 0.8f);
+            }
+
+            // Subtle hysteresis (switch veto) in soft regions
+            if (rel > 0) {
+                const int prevIdx = winner[rel - 1];
+
+                if (prevIdx >= 0 && prevIdx <= 2 && idx != prevIdx) {
+
+                    const bool hystOk =
+                        !vdisHard &&
+                        (chromaMagIRE <= SAT_FALLBACK_START) &&
+                        !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) &&
+                        !((chromaMagIRE > CHROMA_STRONG_IRE) && (vIRE > VERT_THRESH_IRE));
+
+                    if (hystOk) {
+                        auto candScore = [&](int c)->double {
+                            switch (c) {
+                                case 0: return scoreA;
+                                case 1: return scoreB;
+                                case 2: return scoreR;
+                                default: return 1e30;
+                            }
+                        };
+
+                        const bool prevSafe =
+                            !vdisSoft ||
+                            (prevIdx == 0 ? safeA : (prevIdx == 1 ? safeB : safeR));
+
+                        if (prevSafe) {
+                            const double newS  = candScore(idx);
+                            const double prevS = candScore(prevIdx);
+
+                            const double HYST_ABS_GATE = 0.03;
+                            const double HYST_REL_GATE = 0.04;
+
+                            const bool convincinglyBetter =
+                                (newS + HYST_ABS_GATE < prevS) &&
+                                (newS < prevS * (1.0 - HYST_REL_GATE));
+
+                            if (!convincinglyBetter) {
+                                idx = prevIdx;
+                                if      (idx == 0) { val = FA; shade = 0.25f; }
+                                else if (idx == 1) { val = FB; shade = 0.35f; }
+                                else               { val = FR; shade = 0.8f;  }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         winner[rel]   = idx;
@@ -3044,6 +3323,8 @@ void Comb::FrameBuffer::splitIQlocked()
             bcos = (double)demodBurstCos[line];
             bsin = (double)demodBurstSin[line];
         }
+        double lutTi[4], lutTq[4];
+        fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
 
         double       *Y     = componentFrame->y(line);
         float        *tiRow = demodTI_line(line);
@@ -3064,17 +3345,12 @@ void Comb::FrameBuffer::splitIQlocked()
             const int h = left + xi;
             dc += DC_ALPHA * ((double)rawLine[h] - dc);
             const double vraw = (double)rawLine[h] - dc;
-
-            const double sp = spLUT_locked[h & 3];
-            const double cp = cpLUT_locked[h & 3];
+            const int ph = (h & 3);
 
             const double ti = tiRow ? (double)tiRow[xi] : 0.0;
             const double tq = tqRow ? (double)tqRow[xi] : 0.0;
-
-            const double lsin_r = vraw * sp * 2.0;
-            const double lcos_r = vraw * cp * 2.0;
-            const double ri     = lsin_r * bcos - lcos_r * bsin;
-            const double rq     = lsin_r * bsin + lcos_r * bcos;
+            const double ri = vraw * lutTi[ph];
+            const double rq = vraw * lutTq[ph];
 
             triRow[xi] = (float)ri;
             trqRow[xi] = (float)rq;
@@ -3086,10 +3362,8 @@ void Comb::FrameBuffer::splitIQlocked()
             const int hp = (h < right - 1) ? h + 1 : h;
             const double yh = Y[h] - 0.5 * (Y[hm] + Y[hp]);
             yhp[xi] = yh;
-            const double lsin_y = yh * sp * 2.0;
-            const double lcos_y = yh * cp * 2.0;
-            yI[xi] = lsin_y * bcos - lcos_y * bsin;
-            yQ[xi] = lsin_y * bsin + lcos_y * bcos;
+            yI[xi] = yh * lutTi[ph];
+            yQ[xi] = yh * lutTq[ph];
         }
 
         // Apply pre-computed affine from phaseLocked to yI/yQ only.
@@ -3178,6 +3452,8 @@ void Comb::FrameBuffer::filterIQLocked()
         const double*  Yrow    = componentFrame->y(line);
         const double   bcos    = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
         const double   bsin    = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+        double lutTi[4], lutTq[4];
+        fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
 
         // If residualColor is active, derive chroma by subtracting the final Y from composite,
         // then demodulate that residual into the locked basis  this gives chroma that is
@@ -3190,13 +3466,9 @@ void Comb::FrameBuffer::filterIQLocked()
                 const double chromaRaw = (double)rawLine[h] - Yrow[h];
                 dc += DC_ALPHA * (chromaRaw - dc);
                 const double chroma = chromaRaw - dc;
-                const int idx = (h & 3);
-                const double sp = spLUT_locked[idx];
-                const double cp = cpLUT_locked[idx];
-                const double lsin = chroma * sp * 2.0;
-                const double lcos = chroma * cp * 2.0;
-                scratch_preI[i] = (lsin * bcos - lcos * bsin) * effGI;
-                scratch_preQ[i] = (lsin * bsin + lcos * bcos) * effGQ;
+                const int ph = (h & 3);
+                scratch_preI[i] = (chroma * lutTi[ph]) * effGI;
+                scratch_preQ[i] = (chroma * lutTq[ph]) * effGQ;
             }
         } else {
             for (int i = 0; i < width; ++i) {
