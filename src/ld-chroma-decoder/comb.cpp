@@ -924,27 +924,43 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         return ln;
     };
 
-    auto sampleLocked1D = [&](int ln, int h)->double {
-        if (h < left)   h = left;
-        if (h >= right) h = right - 1;
-        ln = clampSameFieldLine(ln);
-        const int rel = h - left;
-        if (rel < 0 || rel >= width) return 0.0;
-        if (ln < 0 || ln >= (int)locked1DSource.size()) return 0.0;
-        const auto &row = locked1DSource[ln];
-        if ((int)row.size() < width) return 0.0;
-        return row[rel];
-    };
+    const int ln0   = clampSameFieldLine(lineNumber);
+    const int lnUp2 = clampSameFieldLine(lineNumber - 2);
+    const int lnDn2 = clampSameFieldLine(lineNumber + 2);
+    const int lnUp4 = clampSameFieldLine(lineNumber - 4);
+    const int lnDn4 = clampSameFieldLine(lineNumber + 4);
 
-    auto sample = [&](int ln, int h)->double {
-        if (h < left)   h = left;
-        if (h >= right) h = right - 1;
-        ln = clampSameFieldLine(ln);
-        if (configuration.phaseCompensation) {
-            return sampleLocked1D(ln, h);
-        }
-        return clpbuffer[0].pixel[ln][h];
-    };
+    const double *row0   = nullptr;
+    const double *rowUp2 = nullptr;
+    const double *rowDn2 = nullptr;
+    const double *rowUp4 = nullptr;
+    const double *rowDn4 = nullptr;
+
+    if (configuration.phaseCompensation) {
+        auto getRow = [&](int ln)->const double* {
+            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
+            const auto &row = locked1DSource[ln];
+            if ((int)row.size() < width) return nullptr;
+            return row.data();
+        };
+        row0   = getRow(ln0);
+        rowUp2 = getRow(lnUp2);
+        rowDn2 = getRow(lnDn2);
+        rowUp4 = getRow(lnUp4);
+        rowDn4 = getRow(lnDn4);
+    } else {
+        row0   = clpbuffer[0].pixel[ln0]   + left;
+        rowUp2 = clpbuffer[0].pixel[lnUp2] + left;
+        rowDn2 = clpbuffer[0].pixel[lnDn2] + left;
+        rowUp4 = clpbuffer[0].pixel[lnUp4] + left;
+        rowDn4 = clpbuffer[0].pixel[lnDn4] + left;
+    }
+
+    if (!row0 || !rowUp2 || !rowDn2 || !rowUp4 || !rowDn4) {
+        std::fill(outFieldLine, outFieldLine + width, 0.0);
+        if (outGate) std::fill(outGate, outGate + width, 1.0f);
+        return;
+    }
 
     const auto  &T    = configuration.tunables;
     const double invI = this->invIreScale;
@@ -957,10 +973,10 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
     const double EDGE_SOFT_IRE = 6.0;
     const double EDGE_HARD_IRE = 14.0;
 
-    auto edgeGateAt = [&](int h)->double {
-        const int hm1 = (h > left) ? h - 1 : left;
-        const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
-        const double eIRE = std::fabs(sample(lineNumber, hp1) - sample(lineNumber, hm1)) * invI;
+    auto edgeGateAt = [&](int rel)->double {
+        const int rm1 = (rel > 0) ? (rel - 1) : 0;
+        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
+        const double eIRE = std::fabs(row0[rp1] - row0[rm1]) * invI;
 
         if (eIRE <= EDGE_SOFT_IRE) return 1.0;
         if (eIRE >= EDGE_HARD_IRE) return 0.0;
@@ -972,32 +988,32 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
     for (int h = left; h < right; ++h) {
         const int rel = h - left;
 
-        const int hm1 = (h > left) ? h - 1 : left;
-        const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
+        const int rm1 = (rel > 0) ? (rel - 1) : 0;
+        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
 
         // Center and symmetric lateral context (reduces column bias)
-        const double C    = sample(lineNumber, h);
-        const double C_m1 = sample(lineNumber, hm1);
-        const double C_p1 = sample(lineNumber, hp1);
+        const double C    = row0[rel];
+        const double C_m1 = row0[rm1];
+        const double C_p1 = row0[rp1];
         const double symCur = 0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
 
         // --- Near samples (2) ---
-        const double U2    = sample(lineNumber - 2, h);
-        const double D2    = sample(lineNumber + 2, h);
-        const double U2_m1 = sample(lineNumber - 2, hm1);
-        const double U2_p1 = sample(lineNumber - 2, hp1);
-        const double D2_m1 = sample(lineNumber + 2, hm1);
-        const double D2_p1 = sample(lineNumber + 2, hp1);
+        const double U2    = rowUp2[rel];
+        const double D2    = rowDn2[rel];
+        const double U2_m1 = rowUp2[rm1];
+        const double U2_p1 = rowUp2[rp1];
+        const double D2_m1 = rowDn2[rm1];
+        const double D2_p1 = rowDn2[rp1];
         const double symU2 = 0.5 * (std::fabs(U2_m1) + std::fabs(U2_p1));
         const double symD2 = 0.5 * (std::fabs(D2_m1) + std::fabs(D2_p1));
 
         // --- Far samples (4) ---
-        const double U4    = sample(lineNumber - 4, h);
-        const double D4    = sample(lineNumber + 4, h);
-        const double U4_m1 = sample(lineNumber - 4, hm1);
-        const double U4_p1 = sample(lineNumber - 4, hp1);
-        const double D4_m1 = sample(lineNumber + 4, hm1);
-        const double D4_p1 = sample(lineNumber + 4, hp1);
+        const double U4    = rowUp4[rel];
+        const double D4    = rowDn4[rel];
+        const double U4_m1 = rowUp4[rm1];
+        const double U4_p1 = rowUp4[rp1];
+        const double D4_m1 = rowDn4[rm1];
+        const double D4_p1 = rowDn4[rp1];
         const double symU4 = 0.5 * (std::fabs(U4_m1) + std::fabs(U4_p1));
         const double symD4 = 0.5 * (std::fabs(D4_m1) + std::fabs(D4_p1));
 
@@ -1064,7 +1080,7 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         const double nearConfDn = wDn2;
 
         // Additional suppression on strong horizontal edges
-        const double eGate = edgeGateAt(h);
+        const double eGate = edgeGateAt(rel);
 
         wUp4 *= nearConfUp * eGate;
         wDn4 *= nearConfDn * eGate;
@@ -1142,50 +1158,54 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         return ln;
     };
 
-    auto sampleLocked1D = [&](int ln, int h)->double {
-        if (h < left)   h = left;
-        if (h >= right) h = right - 1;
-        ln = clampSameFieldLine(ln);
-        const int rel = h - left;
-        if (rel < 0 || rel >= width) return 0.0;
-        if (ln < 0 || ln >= (int)locked1DSource.size()) return 0.0;
-        const auto &row = locked1DSource[ln];
-        if ((int)row.size() < width) return 0.0;
-        return row[rel];
-    };
+    const int ln0   = clampSameFieldLine(lineNumber);
+    const int lnUp2 = clampSameFieldLine(lineNumber - 2);
+    const int lnDn2 = clampSameFieldLine(lineNumber + 2);
 
-    auto sample = [&](int ln, int h)->double {
-        if (h < left)   h = left;
-        if (h >= right) h = right - 1;
-        ln = clampSameFieldLine(ln);
-        if (configuration.phaseCompensation) {
-            return sampleLocked1D(ln, h);
-        }
-        return clpbuffer[0].pixel[ln][h];
-    };
+    const double *row0   = nullptr;
+    const double *rowUp2 = nullptr;
+    const double *rowDn2 = nullptr;
+
+    if (configuration.phaseCompensation) {
+        auto getRow = [&](int ln)->const double* {
+            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
+            const auto &row = locked1DSource[ln];
+            if ((int)row.size() < width) return nullptr;
+            return row.data();
+        };
+        row0   = getRow(ln0);
+        rowUp2 = getRow(lnUp2);
+        rowDn2 = getRow(lnDn2);
+    } else {
+        row0   = clpbuffer[0].pixel[ln0]   + left;
+        rowUp2 = clpbuffer[0].pixel[lnUp2] + left;
+        rowDn2 = clpbuffer[0].pixel[lnDn2] + left;
+    }
+
+    if (!row0 || !rowUp2 || !rowDn2) {
+        std::fill(outFieldLine, outFieldLine + width, 0.0);
+        return;
+    }
 
     const auto &T = configuration.tunables;
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
 
-    // --- PASS 1: existing vertical 2-comb ---
-    std::vector<double> tcLine(width, 0.0);
-
     for (int h = left; h < right; ++h) {
         const int rel = h - left;
-        const int hm1 = (h > left) ? h - 1 : left;
-        const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
+        const int rm1 = (rel > 0) ? (rel - 1) : 0;
+        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
 
-        const double C    = sample(lineNumber, h);
-        const double Cup  = sample(lineNumber - 2, h);
-        const double Cdn  = sample(lineNumber + 2, h);
+        const double C    = row0[rel];
+        const double Cup  = rowUp2[rel];
+        const double Cdn  = rowDn2[rel];
 
-        const double C_m1   = sample(lineNumber, hm1);
-        const double C_p1   = sample(lineNumber, hp1);
-        const double Cup_m1 = sample(lineNumber - 2, hm1);
-        const double Cup_p1 = sample(lineNumber - 2, hp1);
-        const double Cdn_m1 = sample(lineNumber + 2, hm1);
-        const double Cdn_p1 = sample(lineNumber + 2, hp1);
+        const double C_m1   = row0[rm1];
+        const double C_p1   = row0[rp1];
+        const double Cup_m1 = rowUp2[rm1];
+        const double Cup_p1 = rowUp2[rp1];
+        const double Cdn_m1 = rowDn2[rm1];
+        const double Cdn_p1 = rowDn2[rp1];
 
         // Symmetric lateral magnitude context (removes column bias)
         const double symCur = 0.5 * (std::fabs(C_m1)   + std::fabs(C_p1));
@@ -1244,61 +1264,12 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
             tc = 0.0;
         }
 
-        tcLine[rel] = tc;
+        outFieldLine[rel] = tc;
     }
 
-    
-    // In locked (phase-compensated) mode, the -damper is not applied 
+    // In locked (phase-compensated) mode, the -damper is not applied;
     // it is intended only for the phase-blind (bucket) path.
-    std::copy(tcLine.begin(), tcLine.end(), outFieldLine);
     return;
-
-    // --- PASS 2: -damper (horizontal 3-tap pull to neighbor average) ---
-    // Stronger in high chroma, reduced (but not eliminated) on hard horizontal edges.
-    const double invI = this->invIreScale;
-
-    // Tunables (start here)
-    const double K_BASE = 0.10;          // damping in low-chroma areas
-    const double K_SAT  = 0.22;          // additional damping in high-chroma
-    const double SAT_START_IRE = 6.0;    // where it becomes visible
-    const double SAT_FULL_IRE  = 20.0;
-
-    // Edge reduction: keep some damping even on transitions
-    const double EDGE_SOFT_IRE = 6.0;    // start reducing around here
-    const double EDGE_HARD_IRE = 14.0;   // max reduction by here
-
-    outFieldLine[0] = tcLine[0];
-    if (width > 1) outFieldLine[width - 1] = tcLine[width - 1];
-
-    for (int rel = 1; rel < width - 1; ++rel) {
-        const int h = left + rel;
-        const int hm1 = (h > left) ? h - 1 : left;
-        const int hp1 = (h + 1 < right) ? h + 1 : right - 1;
-
-        // Saturation proxy in IRE using tc magnitude (phase-blind)
-        const double tcIRE = std::fabs(tcLine[rel]) * invI;
-        double sat = 0.0;
-        if (SAT_FULL_IRE > SAT_START_IRE) {
-            sat = (tcIRE - SAT_START_IRE) / (SAT_FULL_IRE - SAT_START_IRE);
-            sat = std::clamp(sat, 0.0, 1.0);
-        }
-
-        // Horizontal edge in IRE from raw composite (phase-blind)
-        const double hEdgeIRE = std::fabs(sample(lineNumber, hp1) - sample(lineNumber, hm1)) * invI;
-
-        // Reduce damping on strong edges, but never to zero.
-        double edgeReduce = 1.0;
-        if (hEdgeIRE > EDGE_SOFT_IRE) {
-            double t = (hEdgeIRE - EDGE_SOFT_IRE) / (EDGE_HARD_IRE - EDGE_SOFT_IRE + 1e-9);
-            t = std::clamp(t, 0.0, 1.0);
-            edgeReduce = 1.0 - 0.6 * t;  // keep at least 40% damping at hardest edges
-        }
-
-        const double k = (K_BASE + K_SAT * sat) * edgeReduce;
-
-        const double n = 0.5 * (tcLine[rel - 1] + tcLine[rel + 1]);
-        outFieldLine[rel] = tcLine[rel] + k * (n - tcLine[rel]);
-    }
 }
 
 // Demodulates the Field B scalar raster (simpleField2D[line]) into the locked
