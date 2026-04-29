@@ -227,9 +227,7 @@ void Comb::updateConfiguration(const LdDecodeMetaData::VideoParameters &_videoPa
 
 // Orchestrates per-frame decoding across all requested frames. Maintains a
 // rolling triple-buffer (previous / current / next) so that 3D temporal candidates
-// always have access to both neighbours. For each output frame, runs the full
-// chroma-decode pipeline — either the phase-locked (coherent) path or the bucket
-// path — then optionally overlays diagnostic visuals.
+// always have access to both neighbours.
 void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                         qint32 startIndex, qint32 endIndex,
                         QVector<ComponentFrame> &componentFrames)
@@ -380,7 +378,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             const char labelBottom = fieldLabel(cidBottom, cyclePos);
 
             // Determine whether the two fields show the same label (pure frame)
-            // for the purpose of display — treat confirmed i/p as their own label.
             const bool pureFrame = (labelTop == labelBottom)
                                 && (cidTop >= -3) && (cidBottom >= -3)
                                 && !editTop && !editBottom; 
@@ -671,7 +668,6 @@ void Comb::FrameBuffer::phaseLocked()
         demodBurstCos.assign(requiredLines, 1.0f);
         demodBurstSin.assign(requiredLines, 0.0f);
     }
-
     // Basis coefficients — computed once, used by all passes
     double Ce = 1.0, Se = 0.0;
     basisCoeffs(Ce, Se);
@@ -808,7 +804,6 @@ void Comb::FrameBuffer::phaseLocked()
                     SRT[1][0] += rq*fI; SRT[1][1] += rq*fQ;
                 }
             }
-
             // Affine solve — stored for buildPhaseCorrected1D to apply after split1D
             if (doAffine) {
                 LineAffine &la = lineAffineLocked[line];
