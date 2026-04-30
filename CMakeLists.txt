@@ -122,11 +122,68 @@ set(CMAKE_AUTOUIC ON)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Sql Svg SvgWidgets)
 message(STATUS "Qt Version: ${QT_VERSION}")
 
-find_package(PkgConfig REQUIRED)
+find_package(PkgConfig)
 
-pkg_check_modules(FFTW REQUIRED IMPORTED_TARGET fftw3)
-set(FFTW_INCLUDE_DIR ${FFTW_INCLUDE_DIRS})
-set(FFTW_LIBRARY PkgConfig::FFTW)
+# FFTW3 (required)
+#
+# Prefer pkg-config (Nix, many Linux distros), but keep a manual fallback for
+# environments where pkg-config is missing or PKG_CONFIG_PATH isn't populated.
+set(FFTW_FOUND FALSE)
+
+if(PkgConfig_FOUND)
+    pkg_check_modules(FFTW QUIET IMPORTED_TARGET fftw3)
+    if(FFTW_FOUND)
+        set(FFTW_INCLUDE_DIR ${FFTW_INCLUDE_DIRS})
+        set(FFTW_LIBRARY PkgConfig::FFTW)
+    endif()
+endif()
+
+if(NOT FFTW_FOUND)
+    # Manual finder (legacy)
+    set(FFTW_LIBRARY_NAMES
+        fftw3 libfftw3 fftw3-3 libfftw3-3
+        fftw3l libfftw3l fftw3l-3 libfftw3l-3
+        fftw3q libfftw3q fftw3q-3 libfftw3q-3
+    )
+
+    find_library(FFTW_LIBRARY
+        NAMES ${FFTW_LIBRARY_NAMES}
+        PATHS
+            /usr/lib
+            /usr/lib/fftw
+            /usr/lib/fftw3
+            /usr/local/lib
+            /usr/local/lib/fftw
+            /usr/local/lib/fftw3
+            "$ENV{LIB_DIR}/lib"
+            "$ENV{LIB}"
+            "${FFTW_ROOT}/lib"
+    )
+
+    find_path(FFTW_INCLUDE_DIR
+        NAMES fftw3.h
+        PATHS
+            /usr/include
+            /usr/include/fftw
+            /usr/include/fftw3
+            /usr/local/include
+            /usr/local/include/fftw
+            /usr/local/include/fftw3
+            "$ENV{LIB_DIR}/include"
+            "$ENV{INCLUDE}"
+            "${FFTW_ROOT}/include"
+        PATH_SUFFIXES fftw3 fftw
+    )
+
+    if(FFTW_INCLUDE_DIR AND FFTW_LIBRARY)
+        set(FFTW_FOUND TRUE)
+        message(STATUS "Found fftw3: ${FFTW_LIBRARY}")
+    endif()
+endif()
+
+if(NOT FFTW_FOUND)
+    message(FATAL_ERROR "Could not find fftw3 (set FFTW_ROOT, install fftw3, or ensure pkg-config can find it)")
+endif()
 
 # Build metadata (set by Nix or other build systems)
 set(APP_BRANCH "nix" CACHE STRING "Build source identifier")
