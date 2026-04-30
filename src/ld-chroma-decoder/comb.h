@@ -55,12 +55,6 @@ public:
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
 
-        // Locked mode: remod clpbuffer[1] onto exact 4fsc sample phases (h&3)
-        // instead of burst-referenced remod. This can improve assumptions made
-        // by later comb stages at the cost of moving burst phase variation into
-        // the demodulated I/Q domain.
-        bool lockedRemodTo4fsc = false;
-
         // If true, keep clpbuffer[1] burst-referenced, but feed the 2D comb stage
         // from a 4fsc-grid remodulated copy (reduces 2D Nyquist/zipper artifacts).
         bool locked2DSourceTo4fsc = true;

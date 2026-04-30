@@ -922,23 +922,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
 
-            // Remod to phase-normalised composite for clpbuffer[1]
-            if (configuration.lockedRemodTo4fsc) {
-                // Remodulate onto the exact 4fsc sample grid (h&3). This deliberately
-                // drops the fractional-basis shift (CAL_EPS_SAMPLES) for the remod only,
-                // to preserve perfect 4-sample periodicity for downstream comb stages.
-                const double sp4 = sin4fsc(ph);
-                const double cp4 = cos4fsc(ph);
-                const double rsin =  ti * bcos + tq * bsin;
-                const double rcos = -ti * bsin + tq * bcos;
-                dst[h] = 0.5 * (rsin * sp4 + rcos * cp4);
-            } else {
-                const double sp = spLUT_locked[ph];
-                const double cp = cpLUT_locked[ph];
-                const double rsin =  ti * bcos + tq * bsin;
-                const double rcos = -ti * bsin + tq * bcos;
-                dst[h] = 0.5 * (rsin * sp + rcos * cp);
-            }
+            // Remodulate onto the exact 4fsc sample grid (h&3). This deliberately
+            // drops the fractional-basis shift (CAL_EPS_SAMPLES) for the remod only,
+            // to preserve perfect 4-sample periodicity for downstream comb stages.
+            const double sp4 = sin4fsc(ph);
+            const double cp4 = cos4fsc(ph);
+            const double rsin =  ti * bcos + tq * bsin;
+            const double rcos = -ti * bsin + tq * bcos;
+            dst[h] = 0.5 * (rsin * sp4 + rcos * cp4);
         }
     }
 }
@@ -1093,6 +1084,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double SAT_FALLBACK_START = 6.0;
     const double SAT_FALLBACK_FULL  = 20.0;
     double prev_interfield_luma_ire = 0.0;
+    double prev_sat_t = 0.0;
 
     // Core Logic of Field Vs Frame
     // when the footage is progressive we prefer interfield comb
@@ -1223,6 +1215,18 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             ? (satFR_demod * invI)
             : std::max({ std::fabs(FA), std::fabs(FB), std::fabs(FR) }) * invI;
         satMap[rel] = chromaMagIRE;
+        // Saturation ramp used for soft biasing (avoid hard switches).
+        double sat_t = 0.0;
+        if (SAT_FALLBACK_FULL > SAT_FALLBACK_START) {
+            sat_t = std::clamp((chromaMagIRE - SAT_FALLBACK_START) /
+                                   (SAT_FALLBACK_FULL - SAT_FALLBACK_START),
+                               0.0, 1.0);
+        } else {
+            sat_t = (chromaMagIRE > SAT_FALLBACK_START) ? 1.0 : 0.0;
+        }
+        // Light smoothing to avoid per-pixel toggling in highly saturated regions.
+        sat_t = (rel > 0) ? (0.5 * (sat_t + prev_sat_t)) : sat_t;
+        prev_sat_t = sat_t;
 
         double vIRE = vertContrastIRE(rel);
         double hIRE = horizEdgeIRE(rel);
@@ -1259,19 +1263,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double scoreB = std::numeric_limits<double>::quiet_NaN();
         double scoreR = std::numeric_limits<double>::quiet_NaN();
 
-        // --- NEW: Force fallback BEFORE the complex scoring happens ---
-        if (chromaMagIRE > SAT_FALLBACK_START) {
-            if (localUseFrameModel && !managementVeto && b2VertCoherent) {
-                idx   = 2;
-                val   = FR;
-                shade = 0.8f;
-            } else {
-                idx   = 0; 
-                val   = FA;
-                shade = 0.25f;
-            }
-            // By doing this here, we skip the potential for downstream overrides.
-        } else if (vdisHard) {
+        if (vdisHard) {
             // Hard regime: keep original "closest to L1" winner logic (no hysteresis here).
             double bestVal = L1;
             int    bestIdx = 1;
@@ -1420,8 +1412,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     ? T.FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE
                     : T.FRAME_SCALE_BIAS_STRENGTH_INTERLACE;
                 const double FRAME_COARSE_CLAMP     = 0.60;
-                const double FIELD_A_FINE_PENALTY   = 0.10;
-                const double FIELD_B_FINE_PENALTY   = 0.05;
                 const double FIELD_SWITCH_STRENGTH  = 0.10;
 
                 const bool fineDominant = (fineFrac > (midFrac + coarseFrac) + 0.10);
@@ -1430,14 +1420,111 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 frameBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
                 scoreR *= (1.0 - frameBonus);
 
-                if (fineDominant) {
-                    scoreA *= (1.0 + FIELD_A_FINE_PENALTY * fineFrac);
-                    scoreB *= (1.0 + FIELD_B_FINE_PENALTY * fineFrac);
-                } else {
+                if (!fineDominant) {
                     const double bias = std::clamp(coarseFrac - midFrac, -1.0, 1.0);
                     scoreA *= (1.0 - FIELD_SWITCH_STRENGTH * bias);
                     scoreB *= (1.0 + FIELD_SWITCH_STRENGTH * bias);
                 }
+            }
+
+            // ------------------------------------------------------------
+            // Saturation regime: in highly saturated regions, Frame is often
+            // the least visually toxic when coherent, but Field B tends to
+            // introduce zipper/alternation more readily than Field A.
+            // Apply a soft bias rather than a hard override.
+            // ------------------------------------------------------------
+            if (sat_t > 0.0) {
+                // Penalize Field B more than Field A as saturation rises.
+                const double SAT_FIELD_A_PEN = 0.06;
+                const double SAT_FIELD_B_PEN = 0.14;
+                scoreA *= (1.0 + SAT_FIELD_A_PEN * sat_t);
+                scoreB *= (1.0 + SAT_FIELD_B_PEN * sat_t);
+
+                // Reward Frame when it is allowed/coherent (both regimes),
+                // but never punch through management veto or insane frame.
+                if (!managementVeto && b2VertCoherent && !frameInsane) {
+                    const double SAT_FRAME_BONUS = 0.18;
+                    scoreR *= (1.0 - SAT_FRAME_BONUS * sat_t);
+                }
+            }
+
+            // ------------------------------------------------------------
+            // Transition sharpness reward:
+            // Detect stable region transitions along the scanline and reward
+            // candidates that make a fast (sharp) step and settle on both sides.
+            // This acts as a proxy for "sharpness" without applying a filter.
+            // ------------------------------------------------------------
+            {
+                constexpr int EDGE_GAP = 2;   // pixels excluded around the transition
+                // Use same-phase notch probes on the source line to detect a stable step.
+                // This reuses our existing notch architecture and avoids per-pixel window scans.
+                constexpr int EDGE_PROBE_NEAR = 2;
+                constexpr int EDGE_PROBE_FAR  = 6;
+                const bool canEval =
+                    (hIRE >= 0.75 * HEDGE_THRESH_IRE) &&
+                    (rel >= (EDGE_GAP + EDGE_PROBE_FAR)) &&
+                    (rel + (EDGE_GAP + EDGE_PROBE_FAR) < width) &&
+                    (line >= firstLine && line < lastLine);
+
+                if (canEval) {
+                    const double *srcLine = clpbuffer[srcBufIndex].pixel[line] + left;
+                    auto srcNotch = [&](int r)->double {
+                        r = std::clamp(r, 0, width - 1);
+                        return getNotchLumaEven2(srcLine, r, width);
+                    };
+
+                    const double lNear = srcNotch(rel - (EDGE_GAP + EDGE_PROBE_NEAR));
+                    const double lFar  = srcNotch(rel - (EDGE_GAP + EDGE_PROBE_FAR));
+                    const double rNear = srcNotch(rel + (EDGE_GAP + EDGE_PROBE_NEAR));
+                    const double rFar  = srcNotch(rel + (EDGE_GAP + EDGE_PROBE_FAR));
+
+                    const double stepIRE = std::fabs(rNear - lNear) * invI;
+                    const double lJitterIRE = std::fabs(lNear - lFar) * invI;
+                    const double rJitterIRE = std::fabs(rNear - rFar) * invI;
+
+                    // Require a meaningful step with stable plateaus (discount small fluctuations).
+                    const double EDGE_STEP_THRESH_IRE = std::max(2.0, 0.9 * HEDGE_THRESH_IRE);
+                    const double EDGE_PLATEAU_JITTER_MAX_IRE = 1.2;
+                    const bool stableStep =
+                        (stepIRE >= EDGE_STEP_THRESH_IRE) &&
+                        (lJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE) &&
+                        (rJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE);
+
+                    if (!stableStep) goto no_sharp_reward;
+
+                    // Candidate step measured using notch luma (reduces composite phase chatter).
+                    const int rm2 = std::max(0, rel - 2);
+                    const int rp2 = std::min(width - 1, rel + 2);
+                    const double lmeanIRE = lNear * invI;
+                    const double rmeanIRE = rNear * invI;
+
+                    auto applySharpReward = [&](double &score,
+                                                const double *arr,
+                                                const std::vector<double> *vec)
+                    {
+                        const double m2 = arr ? getNotchLuma(arr, rm2) : getNotchLumaVec(*vec, rm2);
+                        const double p2 = arr ? getNotchLuma(arr, rp2) : getNotchLumaVec(*vec, rp2);
+                        const double candStepIRE = std::fabs(p2 - m2) * invI;
+
+                        // Reward only if candidate has plausibly settled to the two plateaus.
+                        const double settleL = std::fabs(m2 * invI - lmeanIRE);
+                        const double settleR = std::fabs(p2 * invI - rmeanIRE);
+                        const double SETTLE_MAX_IRE = 0.35 * stepIRE + 1.0;
+                        if (settleL > SETTLE_MAX_IRE || settleR > SETTLE_MAX_IRE) return;
+
+                        // Normalize: prefer candidates that reach most of the step quickly.
+                        const double ratio = candStepIRE / std::max(1e-9, stepIRE);
+                        const double sharp = std::clamp((ratio - 0.70) / 0.30, 0.0, 1.0);
+                        const double stepStrength = std::clamp((stepIRE - EDGE_STEP_THRESH_IRE) / 6.0, 0.0, 1.0);
+                        const double W_EDGE_SHARP = 0.10;
+                        score *= (1.0 - W_EDGE_SHARP * sharp * stepStrength);
+                    };
+
+                    applySharpReward(scoreA, fieldA, nullptr);
+                    applySharpReward(scoreB, fieldB, nullptr);
+                    applySharpReward(scoreR, nullptr, &frameB2);
+                }
+                no_sharp_reward: ;
             }
 
             // --- cross-domain neighbor estimate using 2 plus a small 1 term ---

@@ -244,12 +244,6 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
-    QCommandLineOption lockedRemod4fscOption(QStringList() << "locked-remod-4fsc",
-                                           QCoreApplication::translate("main",
-                                           "NTSC (locked mode): Remodulate phase-normalised composite onto exact 4fsc sample phases (h&3) "
-                                           "instead of burst-referenced remod (experimental)"));
-    parser.addOption(lockedRemod4fscOption);
-    
     QCommandLineOption vdisOption(QStringList() << "vdis",
                                             QCoreApplication::translate("main", "NTSC: Enable VDIS (Vertical Differential Isolation System) " 
                                             "This restricts the 2d section very substantially - for use when regular output exhibits artifacts near horizontal color boundaries"));
@@ -508,10 +502,6 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(ntscPhaseCompOption)) {
         combConfig.phaseCompensation = true;
-    }
-
-    if (parser.isSet(lockedRemod4fscOption)) {
-        combConfig.lockedRemodTo4fsc = true;
     }
 
     if (parser.isSet(vdisOption)) {
