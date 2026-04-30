@@ -429,6 +429,13 @@ private:
         std::vector<double> scratch_fieldGate;
         std::vector<double> scratch_frameALine;
         std::vector<double> scratch_fieldBLine;
+        // FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
+        std::vector<int>    scratch_fvf_winner;
+        std::vector<int>    scratch_fvf_winner2;
+        std::vector<double> scratch_fvf_outVal;
+        std::vector<float>  scratch_fvf_outShade;
+        std::vector<double> scratch_fvf_diffFVF;
+        std::vector<double> scratch_fvf_satMap;
         std::vector<double> scratch_filter_temp;
         std::vector<double> scratch_hpI;
         std::vector<double> scratch_hpQ;
@@ -461,6 +468,8 @@ private:
 		// Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
 		// into scratch_vdis_flag for a given line. Does not modify FieldA/FrameB2.
 		void computeVDISLine(int lineNumber);
+        static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
+                                           const LdDecodeMetaData::VideoParameters &vp);
 		
 		// Minimal Field-vs-Frame scorer: uses normalized FieldB and Frame plus
 		// phase-corrected 1D as fallback reference only.
@@ -473,6 +482,29 @@ private:
             bool writeWeights,
             const double *lateral1D,
             const std::vector<std::complex<double>> *frameIQ = nullptr);
+
+        static inline bool fvf_is_tri_safe(double candVal,
+                                           double L1,
+                                           double invIreScale,
+                                           double triSafeIre)
+        {
+            const double dCand1D_ire = std::fabs(candVal - L1) * invIreScale;
+            return (dCand1D_ire <= triSafeIre);
+        }
+
+        static inline double getNotchLumaEven2(const double* arr, int rel, int width)
+        {
+            if (!arr || width <= 0) return 0.0;
+            if (rel < 2) rel = 2;
+            if (rel > width - 3) rel = width - 3;
+            return 0.5 * (arr[rel - 2] + arr[rel + 2]);
+        }
+
+        static inline double getNotchLumaEven2Vec(const std::vector<double>& vec, int rel)
+        {
+            const int width = (int)vec.size();
+            return (width > 0) ? getNotchLumaEven2(vec.data(), rel, width) : 0.0;
+        }
             
             		    		    
         void getBestCandidate(qint32 lineNumber, qint32 h,
