@@ -370,22 +370,56 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
     const int lines = videoParameters.lastActiveFrameLine;
     const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
     if (lines > 0 && width > 0) {
+        const bool wantMap  = configuration.showMap;
+        const bool wantLocked = configuration.phaseCompensation;
+        // Note: we intentionally allow Frame/FVF selection even without locked mode
+        // (a "half-locked" backdoor some users rely on). Storage is gated on the
+        // variant selection, while the locked-only computations remain gated on
+        // phaseCompensation inside split2D/scoreFieldVsFrame.
+        const bool wantFvf  =
+            (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
+        const bool wantVdis = configuration.tunables.VDIS_ENABLE;
+        const bool needFrameIQ =
+            (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Frame || wantFvf);
+
         // 2D score blending visualization (only written when showMap is true)
-        w2d_frame_weight.assign(lines, std::vector<float>(width, 0.0f));
-        w2d_fieldA_gate.assign(lines, std::vector<double>(width, 1.0f));
-        fvfMetrics.assign(lines, std::vector<FvfModelMetrics>(width));
+        if (wantMap) {
+            w2d_frame_weight.assign(lines, std::vector<float>(width, 0.0f));
+        }
+        // FVF-only data and scratch.
+        if (wantFvf) {
+            w2d_fieldA_gate.assign(lines, std::vector<double>(width, 1.0f));
+            fvfMetrics.assign(lines, std::vector<FvfModelMetrics>(width));
+            scratch_fvf_winner.assign(width, 1);
+            scratch_fvf_winner2.assign(width, 1);
+            scratch_fvf_outVal.assign(width, 0.0);
+            scratch_fvf_outShade.assign(width, 0.35f);
+            scratch_fvf_diffFVF.assign(width, 0.0);
+            scratch_fvf_satMap.assign(width, 0.0);
+        }
+        // VDIS is opt-in.
+        if (wantVdis) {
+            vdisMask.assign(lines, std::vector<char>(width, 0));
+            scratch_vdis_flag.assign(width, 0);
+        }
+        // Locked-path-only stable 1D source.
+        if (wantLocked) {
+            locked1DSource.assign(lines, std::vector<double>(width, 0.0));
+        }
+        // FieldB preclean raster is only needed for Frame/FVF in locked mode.
+        if (needFrameIQ) {
+            for (int s = 0; s < 3; ++s) {
+                simpleField2DRing[s].assign(width, 0.0);
+                simpleField2DRingLine[s] = -1;
+            }
+        }
+
         // Accumulators for raster synthesis
         scratch_fieldLine.assign(width, 0.0);
         scratch_fieldGate.assign(width, 1.0);
         scratch_fieldBLine.assign(width, 0.0);
         scratch_outMixed.assign(width, 0.0);
         scratch_lateralLine.assign(width, 0.0);
-        scratch_fvf_winner.assign(width, 1);
-        scratch_fvf_winner2.assign(width, 1);
-        scratch_fvf_outVal.assign(width, 0.0);
-        scratch_fvf_outShade.assign(width, 0.35f);
-        scratch_fvf_diffFVF.assign(width, 0.0);
-        scratch_fvf_satMap.assign(width, 0.0);
 
         // Filtering/NR temporaries
         scratch_filter_temp.assign(width, 0.0);
@@ -414,10 +448,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_comp_res.assign(width, 0.0);
         scratch_frameBCenter.assign(width, 0.0);
         scratch_fieldBCenter.assign(width, 0.0);
-        scratch_vdis_flag.assign(width, 0);    
     }
-    vdisMask.assign(lines, std::vector<char>(width, 0));
-    locked1DSource.assign(lines, std::vector<double>(width, 0.0));
 }
 
 // Interleave the two source fields into rawbuffer in frame-line order (even lines
@@ -483,12 +514,14 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     }
 
     // Clear VDIS mask for this frame
-    if ((int)vdisMask.size() < last) vdisMask.resize(last);
-    const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
-    for (int line = first; line < last; ++line) {
-        auto &row = vdisMask[line];
-        if ((int)row.size() < width) row.assign(width, 0);
-        else std::fill(row.begin(), row.end(), 0);
+    if (!vdisMask.empty()) {
+        if ((int)vdisMask.size() < last) vdisMask.resize(last);
+        const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
+        for (int line = first; line < last; ++line) {
+            auto &row = vdisMask[line];
+            if ((int)row.size() < width) row.assign(width, 0);
+            else std::fill(row.begin(), row.end(), 0);
+        }
     }
 }
 
@@ -1799,14 +1832,16 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 void Comb::FrameBuffer::split2D()
 {
     const bool writeWeights = configuration.showMap;
+    const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
+    const bool needFrameIQStorage =
+        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Frame || wantFvf);
+    const bool needFrameIQCompute = configuration.phaseCompensation && needFrameIQStorage;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
-
-    if ((int)simpleField2D.size() < lastLine) simpleField2D.resize(lastLine);
 
     if (width <= 0 || firstLine >= lastLine) return;
 
@@ -1841,10 +1876,14 @@ void Comb::FrameBuffer::split2D()
         return;
     }
 
-    if ((int)simpleField2D.size() < lastLine) simpleField2D.resize(lastLine);
+    if (!needFrameIQStorage) {
+        // Not needed for this run; invalidate ring tags to avoid accidental use.
+        simpleField2DRingLine = { -1, -1, -1 };
+    }
 
     const bool vdisEnabled = configuration.tunables.VDIS_ENABLE;
     if (vdisEnabled) {
+        if ((int)vdisMask.size() < lastLine) vdisMask.resize(lastLine);
         for (int line = firstLine; line < lastLine; ++line) {
             if (line >= demodLines) continue;
             computeVDISLine(line);
@@ -1856,22 +1895,17 @@ void Comb::FrameBuffer::split2D()
         }
         consolidateVDISRegions(vdisMask, videoParameters);
     } else {
-        if ((int)vdisMask.size() < lastLine) vdisMask.resize(lastLine);
-        for (int line = firstLine; line < lastLine; ++line) {
-            auto &row = vdisMask[line];
-            if ((int)row.size() < width) row.assign(width, 0);
-            else std::fill(row.begin(), row.end(), 0);
-        }
+        vdisMask.clear();
     }
 
     std::vector<std::complex<double>> frameIQ; 
 
     for (int line = firstLine; line < lastLine; ++line) {
         // PREP: Precompute next neighbor (line+1) if in range and not already done
-        if (line + 1 < lastLine) {
-            computeSimpleField2DLine(line + 1, simpleField2D[line + 1].data());
-            if (configuration.phaseCompensation)
-                demodSimpleField2DLine(line + 1);
+        if (needFrameIQCompute && line + 1 < lastLine) {
+            double *dst = simpleField2DLinePtrMutable(line + 1, width);
+            computeSimpleField2DLine(line + 1, dst);
+            demodSimpleField2DLine(line + 1);
         }
         if (line >= demodLines) continue;
 
@@ -1896,11 +1930,9 @@ void Comb::FrameBuffer::split2D()
             }
         }
 
-        simpleField2D[line].assign(width, 0.0);
-        for (int rel = 0; rel < width; ++rel)
-            simpleField2D[line][rel] = scratch_fieldBLine[rel];
-
-        if (configuration.phaseCompensation) {
+        if (needFrameIQCompute) {
+            double *dst = simpleField2DLinePtrMutable(line, width);
+            std::copy(scratch_fieldBLine.begin(), scratch_fieldBLine.begin() + width, dst);
             demodSimpleField2DLine(line);
             computeFrameIQLine(line, frameIQ); 
             
@@ -2468,10 +2500,18 @@ void Comb::FrameBuffer::produceY()
     const int width     = right - left;
     if (width <= 0) return;
 
-    double Ce = 1.0, Se = 0.0;
-    basisCoeffs(Ce, Se);
-    double spLUT[4], cpLUT[4];
-    for (int i = 0; i < 4; ++i) shiftedBasis(i, Ce, Se, spLUT[i], cpLUT[i]);
+    // basisLockedInit guaranteed by phaseLocked in locked mode; guard retained for safety.
+    if (!basisLockedInit) {
+        double Ce = 1.0, Se = 0.0;
+        basisCoeffs(Ce, Se);
+        for (int i = 0; i < 4; ++i) {
+            double sp, cp;
+            shiftedBasis(i, Ce, Se, sp, cp);
+            spLUT_locked[i] = sp;
+            cpLUT_locked[i] = cp;
+        }
+        basisLockedInit = true;
+    }
 
     const auto &T = configuration.tunables;
     const bool enableResidualY = T.VET_ENABLE_RESIDUAL_Y;
@@ -2492,6 +2532,16 @@ void Comb::FrameBuffer::produceY()
         const quint16* rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
         const double bcos = demodBurstCos[line];
         const double bsin = demodBurstSin[line];
+        // Remod coefficients for cval_hat:
+        //   c = 0.5 * ((ti*bcos + tq*bsin)*sp + (-ti*bsin + tq*bcos)*cp)
+        //     = ti * 0.5*(bcos*sp - bsin*cp) + tq * 0.5*(bsin*sp + bcos*cp)
+        double remodI[4], remodQ[4];
+        for (int ph = 0; ph < 4; ++ph) {
+            const double sp = spLUT_locked[ph];
+            const double cp = cpLUT_locked[ph];
+            remodI[ph] = 0.5 * (bcos * sp - bsin * cp);
+            remodQ[ph] = 0.5 * (bsin * sp + bcos * cp);
+        }
 
         double* Y = componentFrame->y(line);
         const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
@@ -2525,6 +2575,68 @@ void Comb::FrameBuffer::produceY()
             scratch_comp_res[xi] = ((double)rawLine[h] - clpLine[h]);
         }
 
+        // ------------------------------------------------------------
+        // Precompute per-sample window contributions once per line.
+        // Reuse existing scratch buffers (width-sized) to avoid new allocations.
+        // ------------------------------------------------------------
+        // Ensure scratch buffers are large enough for width-sized repurposing.
+        if ((int)scratch_preI_ext.size() < width) scratch_preI_ext.resize(width, 0.0);
+        if ((int)scratch_preQ_ext.size() < width) scratch_preQ_ext.resize(width, 0.0);
+        double *cSTT00 = scratch_yhp.data();
+        double *cSTT01 = scratch_yI.data();
+        double *cSTT11 = scratch_yQ.data();
+        double *cSRT00 = scratch_preI.data();
+        double *cSRT01 = scratch_preQ.data();
+        double *cSRT10 = scratch_preI_ext.data();
+        double *cSRT11 = scratch_preQ_ext.data();
+        double *cN     = scratch_filter_temp.data();
+        if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
+
+        for (int xi = 0; xi < width; ++xi) {
+            const double ti = (double)tiRow[xi];
+            const double tq = (double)tqRow[xi];
+            const double ri = (double)triRow[xi];
+            const double rq = (double)trqRow[xi];
+
+            const double magT_ire = std::hypot(ti, tq) * invI;
+            const double magR_ire = std::hypot(ri, rq) * invI;
+
+            if (magT_ire < MIN_FIT_IRE || magR_ire < MIN_FIT_IRE) {
+                cSTT00[xi] = cSTT01[xi] = cSTT11[xi] = 0.0;
+                cSRT00[xi] = cSRT01[xi] = cSRT10[xi] = cSRT11[xi] = 0.0;
+                cN[xi] = 0.0;
+                continue;
+            }
+
+            double w = 1.0;
+            if (magT_ire > MAX_FIT_IRE) {
+                const double t = (magT_ire - MAX_FIT_IRE) / (MAX_FIT_IRE + 1e-9);
+                w = 1.0 / (1.0 + 4.0 * t * t);
+            }
+
+            cSTT00[xi] = w * ti * ti;
+            cSTT01[xi] = w * ti * tq;
+            cSTT11[xi] = w * tq * tq;
+            cSRT00[xi] = w * ri * ti;
+            cSRT01[xi] = w * ri * tq;
+            cSRT10[xi] = w * rq * ti;
+            cSRT11[xi] = w * rq * tq;
+            cN[xi] = 1.0;
+        }
+
+        // Sliding window sums (window shifts to stay in-bounds, not shrink).
+        const int winN = (width <= WIN) ? width : WIN;
+        int a = 0;
+        int b = winN - 1;
+        double sSTT00 = 0.0, sSTT01 = 0.0, sSTT11 = 0.0;
+        double sSRT00 = 0.0, sSRT01 = 0.0, sSRT10 = 0.0, sSRT11 = 0.0;
+        double sN = 0.0;
+        for (int xi = a; xi <= b; ++xi) {
+            sSTT00 += cSTT00[xi]; sSTT01 += cSTT01[xi]; sSTT11 += cSTT11[xi];
+            sSRT00 += cSRT00[xi]; sSRT01 += cSRT01[xi]; sSRT10 += cSRT10[xi]; sSRT11 += cSRT11[xi];
+            sN += cN[xi];
+        }
+
         // Process pixels
         for (int x = 0; x < width; ++x) {
             const int h = left + x;
@@ -2538,56 +2650,107 @@ void Comb::FrameBuffer::produceY()
                 continue;
             }
 
-            // Window [a,b] in demod domain
-            int a = x - HALF, b = x + HALF - 1;
-            if (a < 0) { b += -a; a = 0; }
-            if (b >= width) { int over = b - (width - 1); b -= over; a -= over; if (a < 0) a = 0; }
+            if (width > WIN) {
+                int aWant = x - HALF;
+                int bWant = x + HALF - 1;
+                if (aWant < 0) { bWant += -aWant; aWant = 0; }
+                if (bWant >= width) {
+                    int over = bWant - (width - 1);
+                    bWant -= over;
+                    aWant -= over;
+                    if (aWant < 0) aWant = 0;
+                }
+                while (a < aWant) {
+                    sSTT00 -= cSTT00[a]; sSTT01 -= cSTT01[a]; sSTT11 -= cSTT11[a];
+                    sSRT00 -= cSRT00[a]; sSRT01 -= cSRT01[a]; sSRT10 -= cSRT10[a]; sSRT11 -= cSRT11[a];
+                    sN -= cN[a];
+                    ++a;
+                }
+                while (a > aWant) {
+                    --a;
+                    sSTT00 += cSTT00[a]; sSTT01 += cSTT01[a]; sSTT11 += cSTT11[a];
+                    sSRT00 += cSRT00[a]; sSRT01 += cSRT01[a]; sSRT10 += cSRT10[a]; sSRT11 += cSRT11[a];
+                    sN += cN[a];
+                }
+                while (b < bWant) {
+                    ++b;
+                    sSTT00 += cSTT00[b]; sSTT01 += cSTT01[b]; sSTT11 += cSTT11[b];
+                    sSRT00 += cSRT00[b]; sSRT01 += cSRT01[b]; sSRT10 += cSRT10[b]; sSRT11 += cSRT11[b];
+                    sN += cN[b];
+                }
+                while (b > bWant) {
+                    sSTT00 -= cSTT00[b]; sSTT01 -= cSTT01[b]; sSTT11 -= cSTT11[b];
+                    sSRT00 -= cSRT00[b]; sSRT01 -= cSRT01[b]; sSRT10 -= cSRT10[b]; sSRT11 -= cSRT11[b];
+                    sN -= cN[b];
+                    --b;
+                }
+            }
 
-            // Accumulate  T T^T and  R T^T in window, with gating/rolloff
-            double STT[2][2] = {{0,0},{0,0}};
-            double SRT[2][2] = {{0,0},{0,0}};
-            int n = 0;
+            double STT[2][2] = {{sSTT00, sSTT01}, {sSTT01, sSTT11}};
+            double SRT[2][2] = {{sSRT00, sSRT01}, {sSRT10, sSRT11}};
+            const int n = (int)(sN + 0.5);
 
-            for (int xi = a; xi <= b; ++xi) {
-                const double ti = (double)tiRow[xi];
-                const double tq = (double)tqRow[xi];
-                const double ri = (double)triRow[xi];
-                const double rq = (double)trqRow[xi];
+            // ------------------------------------------------------------
+            // Vet: local LS alignment (phase + correlation + shear)
+            //
+            // IMPORTANT: Don't call vetComposite1D() here. That function
+            // re-scans the WIN window per pixel to rebuild STT/SRT, but we
+            // already have STT/SRT from the sliding sums above.
+            // ------------------------------------------------------------
+            Vet1DResult vet;
+            vet.accept = true;
+            vet.confidence = 1.0;
+            vet.composite_bandpass = scratch_comp_res[x];
 
-                const double magT_ire = std::hypot(ti, tq) * invI;
-                const double magR_ire = std::hypot(ri, rq) * invI;
+            double STTinv[2][2];
+            const bool invOk = mat2_inv(STT, STTinv);
 
-                // Ignore very small vectors (ill-conditioned)
-                if (magT_ire < MIN_FIT_IRE) continue;
-                if (magR_ire < MIN_FIT_IRE) continue;
+            // Vet metrics are computed from A_vet = SRT * inv(STT) when possible.
+            double RmVet[2][2] = {{1,0},{0,1}};
+            double UVet[2][2]  = {{1,0},{0,1}};
+            if (invOk) {
+                double Avet[2][2];
+                mat2_mul(SRT, STTinv, Avet);
+                polar_decompose_2x2(Avet, RmVet, UVet);
 
-                // Soft rolloff on very large vectors (often where saturation/nonlinearity lives)
-                double w = 1.0;
-                if (magT_ire > MAX_FIT_IRE) {
-                    const double t = (magT_ire - MAX_FIT_IRE) / (MAX_FIT_IRE + 1e-9);
-                    w = 1.0 / (1.0 + 4.0 * t * t);
+                const double phase = std::atan2(RmVet[1][0], RmVet[0][0]); // radians
+                double l1, l2, V_[2][2];
+                eig2_sym(UVet, l1, l2, V_);
+                const double s1 = std::max(0.0, l1), s2 = std::max(0.0, l2);
+                const double g  = 0.5 * (s1 + s2);
+                const double shear = (g > 1e-12) ? std::fabs(s1 - s2) / g : 0.0;
+
+                const double srt00 = SRT[0][0], srt01 = SRT[0][1], srt10 = SRT[1][0], srt11 = SRT[1][1];
+                const double numRho = std::sqrt(srt00*srt00 + srt01*srt01 + srt10*srt10 + srt11*srt11);
+                const double denRho = std::max(1e-9, STT[0][0] + STT[1][1]);
+                const double rho = numRho / denRho;
+
+                const double pMaxVet = T.VET_ALIGN_PHASE_MAX_DEG * M_PI / 180.0;
+                if (std::fabs(phase) > pMaxVet || rho < T.VET_ALIGN_MIN_RHO || shear > T.VET_ALIGN_MAX_SHEAR) {
+                    vet.accept = false;
                 }
 
-                STT[0][0] += w * ti*ti; STT[0][1] += w * ti*tq;
-                STT[1][0] += w * ti*tq; STT[1][1] += w * tq*tq;
-                SRT[0][0] += w * ri*ti; SRT[0][1] += w * ri*tq;
-                SRT[1][0] += w * rq*ti; SRT[1][1] += w * rq*tq;
-                ++n;
+                double c_phase = 1.0 - std::min(1.0, std::fabs(phase) / (pMaxVet + 1e-12));
+                double c_shear = 1.0 - std::min(1.0, shear / (T.VET_ALIGN_MAX_SHEAR + 1e-12));
+                double c = 0.5 * std::max(0.0, std::min(1.0, rho)) + 0.25 * c_phase + 0.25 * c_shear;
+                if (c < 0.0) c = 0.0; else if (c > 1.0) c = 1.0;
+                vet.confidence = c;
             }
 
-            // Solve A = SRT * inv(STT)
-            double A[2][2] = {{1,0},{0,1}};
-            double STTinv[2][2];
-            if (T.Y_LOCAL_AFFINE_ENABLE && n >= 16 && mat2_inv(STT, STTinv)) {
-                double tmp[2][2];
-                mat2_mul(SRT, STTinv, tmp);
-                A[0][0] = tmp[0][0]; A[0][1] = tmp[0][1];
-                A[1][0] = tmp[1][0]; A[1][1] = tmp[1][1];
-            }
+            if (configuration.showMap) w2d_frame_weight[line][x] = (float)vet.confidence;
 
-            // Polar decompose and clamp
-            double Rm[2][2], U[2][2];
-            polar_decompose_2x2(A, Rm, U);
+            // ------------------------------------------------------------
+            // Solve local affine (optional): reuse the same polar decomposition
+            // computed for the vet when we actually apply the affine.
+            // ------------------------------------------------------------
+            double Rm[2][2] = {{1,0},{0,1}};
+            double U[2][2]  = {{1,0},{0,1}};
+            if (T.Y_LOCAL_AFFINE_ENABLE && n >= 16 && invOk) {
+                Rm[0][0] = RmVet[0][0]; Rm[0][1] = RmVet[0][1];
+                Rm[1][0] = RmVet[1][0]; Rm[1][1] = RmVet[1][1];
+                U[0][0]  = UVet[0][0];  U[0][1]  = UVet[0][1];
+                U[1][0]  = UVet[1][0];  U[1][1]  = UVet[1][1];
+            }
 
             const double pMax = T.Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0;
 
@@ -2603,20 +2766,14 @@ void Comb::FrameBuffer::produceY()
                                       satTrouble ? 0.0 : T.Y_LOCAL_MAX_SHEAR);
 
             const int idx = (h & 3);
-            const double sp = spLUT[idx], cp = cpLUT[idx];
+            const double sp = spLUT_locked[idx], cp = cpLUT_locked[idx];
 
             // Apply clamped transform to (ti0,tq0) for estimate only
             // NOTE: we apply only Rm here 
             const double ti_adj = Rm[0][0]*ti0 + Rm[0][1]*tq0;
             const double tq_adj = Rm[1][0]*ti0 + Rm[1][1]*tq0;
 
-            const double lsin =  ti_adj * bcos + tq_adj * bsin;
-            const double lcos = -ti_adj * bsin + tq_adj * bcos;
-            const double cval_hat = 0.5 * (lsin * sp + lcos * cp);
-
-            // Vet: local LS alignment (phase + correlation + shear) veto only if poor
-            Vet1DResult vet = vetComposite1D(line, h, /*requireVerticalConfirm=*/false);
-            if (configuration.showMap) w2d_frame_weight[line][x] = (float)vet.confidence;
+            const double cval_hat = ti_adj * remodI[idx] + tq_adj * remodQ[idx];
 
             if (vet.accept) {
                 Y[h] = (double)rawLine[h] - cval_hat;

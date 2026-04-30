@@ -450,10 +450,9 @@ void Comb::FrameBuffer::demodSimpleField2DLine(int line)
         return;
     }
 
-    // FieldB scalar raster must already be in simpleField2D[line]
-    if ((int)simpleField2D.size() <= line) return;
-    const auto &fieldLine = simpleField2D[line];
-    if ((int)fieldLine.size() < width) return;
+    // FieldB scalar raster must already be present in the ring for this line.
+    const double *fieldLine = simpleField2DLinePtr(line, width);
+    if (!fieldLine) return;
 
     float *ti = demodTI_line(line);
     float *tq = demodTQ_line(line);
@@ -766,8 +765,7 @@ void Comb::FrameBuffer::computeFrameIQLine(
     // ------------------------------------------------------------
     auto havePrecleanLine = [&](int ln)->bool {
         if (ln < first || ln >= last) return false;
-        if (ln < 0 || ln >= (int)simpleField2D.size()) return false;
-        if ((int)simpleField2D[ln].size() < width) return false;
+        if (!simpleField2DLinePtr(ln, width)) return false;
         if (ln < 0 || ln >= (int)demodBurstCos.size() || ln >= (int)demodBurstSin.size()) return false;
         return true;
     };
@@ -798,7 +796,9 @@ void Comb::FrameBuffer::computeFrameIQLine(
         const double sp = spLUT_locked[idx];
         const double cp = cpLUT_locked[idx];
 
-        const double c = simpleField2D[ln][x];
+        const double *row = simpleField2DLinePtr(ln, width);
+        if (!row) return false;
+        const double c = row[x];
 
         const double lsin = c * sp * 2.0;
         const double lcos = c * cp * 2.0;

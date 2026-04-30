@@ -28,7 +28,6 @@
 #include <QFile>
 #include <QtMath>
 #include <vector>
-#include <array>
 
 #include "lddecodemetadata.h"
 #include "componentframe.h"
@@ -399,11 +398,12 @@ private:
         std::vector<std::array<float,4>> demodLUTTq_locked;
 
         // Flat/contiguous buffers (lines x width)
-        std::vector<std::array<float,4>> lineRm_locked; // per line: [r00 r01 r10 r11]
-        std::vector<float> demodBurstMagRaw;
         std::vector<float> demodTI_flat;
         std::vector<float> demodTQ_flat;
-		std::vector<std::vector<double>> simpleField2D;
+        // Ring buffer for the lightweight Field B comb raster used as a preclean
+        // input for locked Frame IQ demod. Only adjacent lines are needed.
+        std::array<std::vector<double>, 3> simpleField2DRing;
+        std::array<int, 3> simpleField2DRingLine = { -1, -1, -1 };
 		std::vector<double> scratch_frameBCenter;
 		std::vector<double> scratch_fieldBCenter;        // NEW: raw-composite demod storage (flat contiguous)
         std::vector<float> demodTRI_flat;
@@ -428,7 +428,6 @@ private:
 		std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)        
 		std::vector<double> scratch_fieldLine;
         std::vector<double> scratch_fieldGate;
-        std::vector<double> scratch_frameALine;
         std::vector<double> scratch_fieldBLine;
         // FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
         std::vector<int>    scratch_fvf_winner;
@@ -446,6 +445,35 @@ private:
 		std::vector<char> scratch_vdis_flag;
 		std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
         std::vector<std::vector<double>> locked1DSource; // [line][rel], locked-mode stable source for 2D
+
+        inline int simpleField2DRingSlot(int lineNumber) const
+        {
+            int s = lineNumber % 3;
+            if (s < 0) s += 3;
+            return s;
+        }
+
+        inline bool haveSimpleField2DLine(int lineNumber, int width) const
+        {
+            const int s = simpleField2DRingSlot(lineNumber);
+            if (simpleField2DRingLine[s] != lineNumber) return false;
+            return ((int)simpleField2DRing[s].size() >= width);
+        }
+
+        inline const double *simpleField2DLinePtr(int lineNumber, int width) const
+        {
+            if (!haveSimpleField2DLine(lineNumber, width)) return nullptr;
+            const int s = simpleField2DRingSlot(lineNumber);
+            return simpleField2DRing[s].data();
+        }
+
+        inline double *simpleField2DLinePtrMutable(int lineNumber, int width)
+        {
+            const int s = simpleField2DRingSlot(lineNumber);
+            if ((int)simpleField2DRing[s].size() < width) simpleField2DRing[s].assign(width, 0.0);
+            simpleField2DRingLine[s] = lineNumber;
+            return simpleField2DRing[s].data();
+        }
 
         // Small helpers declared here; definitions provided after the class (in this header).
         inline qint32 getFieldID(qint32 lineNumber) const;
