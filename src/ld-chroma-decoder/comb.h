@@ -28,6 +28,7 @@
 #include <QFile>
 #include <QtMath>
 #include <vector>
+#include <array>
 
 #include "lddecodemetadata.h"
 #include "componentframe.h"
@@ -398,6 +399,10 @@ private:
         ComponentFrame *componentFrame = nullptr;
         std::vector<float> demodBurstCos;
         std::vector<float> demodBurstSin;
+        // Per-line fused locked demod LUTs for the 4 phase buckets (h&3).
+        // Computed in phaseLocked() and reused by buildPhaseCorrected1D/splitIQlocked/filterIQLocked.
+        std::vector<std::array<float,4>> demodLUTTi_locked;
+        std::vector<std::array<float,4>> demodLUTTq_locked;
 
         // Flat/contiguous buffers (lines x width)
         std::vector<std::array<float,4>> lineRm_locked; // per line: [r00 r01 r10 r11]
@@ -411,6 +416,8 @@ private:
         std::vector<float> demodTRQ_flat;
         std::vector<double> scratch_preI;          // unscaled pre-FIR storage (per-line)
         std::vector<double> scratch_preQ;
+        std::vector<double> scratch_preI_ext;      // edge-extended for FIR (per-line)
+        std::vector<double> scratch_preQ_ext;
         std::vector<double> scratch_comp_res;     // composite residual = raw - clp - chroma_est
 		// Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
 		std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
@@ -440,6 +447,8 @@ private:
         std::vector<double> scratch_hpI;
         std::vector<double> scratch_hpQ;
         std::vector<double> scratch_hpY;
+        std::vector<double> scratch_sinfit_mag;    // per-line |TRI/TRQ|
+        std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
 		std::vector<char> scratch_vdis_flag;
 		std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
         std::vector<std::vector<double>> locked1DSource; // [line][rel], locked-mode stable source for 2D

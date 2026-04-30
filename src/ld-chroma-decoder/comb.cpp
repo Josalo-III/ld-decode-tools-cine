@@ -576,6 +576,10 @@ void Comb::FrameBuffer::phaseLocked()
         demodBurstCos.assign(requiredLines, 1.0f);
         demodBurstSin.assign(requiredLines, 0.0f);
     }
+    if ((int)demodLUTTi_locked.size() < requiredLines) {
+        demodLUTTi_locked.assign(requiredLines, std::array<float,4>{});
+        demodLUTTq_locked.assign(requiredLines, std::array<float,4>{});
+    }
     // Basis coefficients — computed once, used by all passes
     double Ce = 1.0, Se = 0.0;
     basisCoeffs(Ce, Se);
@@ -605,6 +609,13 @@ void Comb::FrameBuffer::phaseLocked()
         const double bs2 = bcos * sRb + bsin * cRb;
         demodBurstCos[line] = static_cast<float>(bc2);
         demodBurstSin[line] = static_cast<float>(bs2);
+
+        double lutTi[4], lutTq[4];
+        fusedDemodLUT(bc2, bs2, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        for (int i = 0; i < 4; ++i) {
+            demodLUTTi_locked[line][i] = (float)lutTi[i];
+            demodLUTTq_locked[line][i] = (float)lutTq[i];
+        }
     }
 
     // --- Pass 2: raw composite demod -> TRI/TRQ ---
@@ -619,12 +630,10 @@ void Comb::FrameBuffer::phaseLocked()
 
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
-            const double bcos      = (double)demodBurstCos[line];
-            const double bsin      = (double)demodBurstSin[line];
             float *triRow          = demodTRI_line(line);
             float *trqRow          = demodTRQ_line(line);
-            double lutTi[4], lutTq[4];
-            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+            const float *lutTi = demodLUTTi_locked[line].data();
+            const float *lutTq = demodLUTTq_locked[line].data();
 
             double dc = (double)rawLine[left];
             constexpr double DC_ALPHA = 1.0 / 64.0;
@@ -634,8 +643,8 @@ void Comb::FrameBuffer::phaseLocked()
                 dc += DC_ALPHA * ((double)rawLine[h] - dc);
                 const double vraw = (double)rawLine[h] - dc;
                 const int ph = (h & 3);
-                triRow[xi] = (float)(vraw * lutTi[ph]);
-                trqRow[xi] = (float)(vraw * lutTq[ph]);
+                triRow[xi] = (float)(vraw * (double)lutTi[ph]);
+                trqRow[xi] = (float)(vraw * (double)lutTq[ph]);
             }
         }
     }
@@ -660,39 +669,68 @@ void Comb::FrameBuffer::phaseLocked()
             double STT[2][2] = {{0,0},{0,0}};
             double SRT[2][2] = {{0,0},{0,0}};
 
+            if ((int)scratch_sinfit_mag.size() < width) scratch_sinfit_mag.resize(width, 0.0);
+            if ((int)scratch_sinfit_resmag.size() < width) scratch_sinfit_resmag.resize(width, 0.0);
+            double *magRow = scratch_sinfit_mag.data();
+            double *resRow = scratch_sinfit_resmag.data();
+
+            // Precompute per-sample magnitudes and residual magnitudes.
+            for (int k = 0; k < width; ++k) {
+                const int hk = left + k;
+                const double spk = spLUT_locked[hk & 3];
+                const double cpk = cpLUT_locked[hk & 3];
+                const double rik = (double)triRow[k];
+                const double rqk = (double)trqRow[k];
+                const double mag_k = std::hypot(rik, rqk);
+                magRow[k] = mag_k;
+                if (mag_k > 1e-9) {
+                    const double fitted_k = 0.5 * ((rik * bcos + rqk * bsin) * spk
+                                                  + (-rik * bsin + rqk * bcos) * cpk);
+                    const double corr_k   = (double)rawLine[hk] - fitted_k;
+                    const double rsk      = corr_k * spk * 2.0;
+                    const double rck      = corr_k * cpk * 2.0;
+                    resRow[k] = std::hypot(rsk * bcos - rck * bsin,
+                                           rsk * bsin + rck * bcos);
+                } else {
+                    resRow[k] = 0.0;
+                }
+            }
+
+            // Sliding window sums for amp/res. The window shifts to stay inside bounds.
+            const int winN = (width <= WIN) ? width : WIN;
+            int a = 0;
+            int b = winN - 1;
+            double sumAmp = 0.0, sumRes = 0.0;
+            for (int k = a; k <= b; ++k) { sumAmp += magRow[k]; sumRes += resRow[k]; }
+
             for (int xi = 0; xi < width; ++xi) {
                 const int h  = left + xi;
                 const double ri = (double)triRow[xi];
                 const double rq = (double)trqRow[xi];
 
-                // Windowed amplitude and residual from TRI/TRQ neighbours
-                int a = xi - HALF, b = xi + HALF - 1;
-                if (a < 0)      { b += -a;              a = 0; }
-                if (b >= width) { int ov = b-(width-1); b -= ov; a -= ov; if (a < 0) a = 0; }
-                const int n = b - a + 1;
-
-                double ampEst = 0.0, resAmp = 0.0;
-                for (int k = a; k <= b; ++k) {
-                    const int hk     = left + k;
-                    const double spk = spLUT_locked[hk & 3];
-                    const double cpk = cpLUT_locked[hk & 3];
-                    const double rik = (double)triRow[k];
-                    const double rqk = (double)trqRow[k];
-                    const double mag_k = std::hypot(rik, rqk);
-                    ampEst += mag_k;
-
-                    if (mag_k > 1e-9) {
-                        const double fitted_k = 0.5 * ((rik * bcos + rqk * bsin) * spk
-                                                      + (-rik * bsin + rqk * bcos) * cpk);
-                        const double corr_k   = (double)rawLine[hk] - fitted_k;
-                        const double rsk      = corr_k * spk * 2.0;
-                        const double rck      = corr_k * cpk * 2.0;
-                        resAmp += std::hypot(rsk * bcos - rck * bsin,
-                                             rsk * bsin + rck * bcos);
+                // Windowed amplitude and residual from TRI/TRQ neighbours.
+                // Window shifts (not shrinks) near edges to keep a stable support.
+                if (width > WIN) {
+                    int aWant = xi - HALF;
+                    int bWant = xi + HALF - 1;
+                    if (aWant < 0) {
+                        bWant += -aWant;
+                        aWant = 0;
                     }
+                    if (bWant >= width) {
+                        int ov = bWant - (width - 1);
+                        bWant -= ov;
+                        aWant -= ov;
+                        if (aWant < 0) aWant = 0;
+                    }
+                    // Update sliding sums to new [aWant, bWant].
+                    while (a < aWant) { sumAmp -= magRow[a]; sumRes -= resRow[a]; ++a; }
+                    while (a > aWant) { --a; sumAmp += magRow[a]; sumRes += resRow[a]; }
+                    while (b < bWant) { ++b; sumAmp += magRow[b]; sumRes += resRow[b]; }
+                    while (b > bWant) { sumAmp -= magRow[b]; sumRes -= resRow[b]; --b; }
                 }
-                ampEst /= n;
-                resAmp /= n;
+                const double ampEst = sumAmp / (double)winN;
+                const double resAmp = sumRes / (double)winN;
 
                 // Fitted IQ at xi: raw demod direction scaled to windowed amplitude
                 const double mag0 = std::hypot(ri, rq);
@@ -760,7 +798,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         const double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
         const double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
         double lutTi[4], lutTq[4];
-        fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        if (line < (int)demodLUTTi_locked.size()) {
+            for (int i = 0; i < 4; ++i) {
+                lutTi[i] = (double)demodLUTTi_locked[line][i];
+                lutTq[i] = (double)demodLUTTq_locked[line][i];
+            }
+        } else {
+            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        }
 
         float *tiRow = demodTI_line(line);
         float *tqRow = demodTQ_line(line);
@@ -793,12 +838,20 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             if (line >= 0 && line < (int)fvfMetrics.size() &&
                 xi < (int)fvfMetrics[line].size())
             {
-                const double fine = std::fabs(sampleSrc(xi) -
-                                              0.5 * (sampleSrc(xi - 1) + sampleSrc(xi + 1))) * invIreScale;
-                const double mid = std::fabs(sampleSrc(xi) -
-                                             0.5 * (sampleSrc(xi - 2) + sampleSrc(xi + 2))) * invIreScale;
-                const double coarse = std::fabs(sampleSrc(xi) -
-                                                0.5 * (sampleSrc(xi - 4) + sampleSrc(xi + 4))) * invIreScale;
+                double fine = 0.0, mid = 0.0, coarse = 0.0;
+                if (xi >= 4 && xi < width - 4) {
+                    const double c0 = src[left + xi];
+                    fine = std::fabs(c0 - 0.5 * (src[left + xi - 1] + src[left + xi + 1])) * invIreScale;
+                    mid = std::fabs(c0 - 0.5 * (src[left + xi - 2] + src[left + xi + 2])) * invIreScale;
+                    coarse = std::fabs(c0 - 0.5 * (src[left + xi - 4] + src[left + xi + 4])) * invIreScale;
+                } else {
+                    fine = std::fabs(sampleSrc(xi) -
+                                     0.5 * (sampleSrc(xi - 1) + sampleSrc(xi + 1))) * invIreScale;
+                    mid = std::fabs(sampleSrc(xi) -
+                                    0.5 * (sampleSrc(xi - 2) + sampleSrc(xi + 2))) * invIreScale;
+                    coarse = std::fabs(sampleSrc(xi) -
+                                       0.5 * (sampleSrc(xi - 4) + sampleSrc(xi + 4))) * invIreScale;
+                }
                 const double denom = fine + mid + coarse + 1e-9;
                 const double fineFrac = fine / denom;
                 const double nonFineFrac = std::max(mid, coarse) / denom;
@@ -807,10 +860,41 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
                 double tiLm1 = 0.0, tqLm1 = 0.0, tiLp1 = 0.0, tqLp1 = 0.0;
                 double tiLm2 = 0.0, tqLm2 = 0.0, tiLp2 = 0.0, tqLp2 = 0.0;
-                sampleIQ(xi - 1, tiLm1, tqLm1);
-                sampleIQ(xi + 1, tiLp1, tqLp1);
-                sampleIQ(xi - 2, tiLm2, tqLm2);
-                sampleIQ(xi + 2, tiLp2, tqLp2);
+                if (xi >= 2 && xi < width - 2) {
+                    {
+                        const int hh = left + xi - 1;
+                        const double cc = src[hh];
+                        const int hhPh = (hh & 3);
+                        tiLm1 = cc * lutTi[hhPh];
+                        tqLm1 = cc * lutTq[hhPh];
+                    }
+                    {
+                        const int hh = left + xi + 1;
+                        const double cc = src[hh];
+                        const int hhPh = (hh & 3);
+                        tiLp1 = cc * lutTi[hhPh];
+                        tqLp1 = cc * lutTq[hhPh];
+                    }
+                    {
+                        const int hh = left + xi - 2;
+                        const double cc = src[hh];
+                        const int hhPh = (hh & 3);
+                        tiLm2 = cc * lutTi[hhPh];
+                        tqLm2 = cc * lutTq[hhPh];
+                    }
+                    {
+                        const int hh = left + xi + 2;
+                        const double cc = src[hh];
+                        const int hhPh = (hh & 3);
+                        tiLp2 = cc * lutTi[hhPh];
+                        tqLp2 = cc * lutTq[hhPh];
+                    }
+                } else {
+                    sampleIQ(xi - 1, tiLm1, tqLm1);
+                    sampleIQ(xi + 1, tiLp1, tqLp1);
+                    sampleIQ(xi - 2, tiLm2, tqLm2);
+                    sampleIQ(xi + 2, tiLp2, tqLp2);
+                }
 
                 const double avg1I = 0.5 * (tiLm1 + tiLp1);
                 const double avg1Q = 0.5 * (tqLm1 + tqLp1);
@@ -2076,7 +2160,14 @@ void Comb::FrameBuffer::splitIQlocked()
             bsin = (double)demodBurstSin[line];
         }
         double lutTi[4], lutTq[4];
-        fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        if (line < (int)demodLUTTi_locked.size()) {
+            for (int i = 0; i < 4; ++i) {
+                lutTi[i] = (double)demodLUTTi_locked[line][i];
+                lutTq[i] = (double)demodLUTTq_locked[line][i];
+            }
+        } else {
+            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        }
 
         double       *Y     = componentFrame->y(line);
         float        *tiRow = demodTI_line(line);
@@ -2187,12 +2278,16 @@ void Comb::FrameBuffer::filterIQLocked()
     const int MQ = (NQ - 1) / 2;
     const double* tapsI = hI.data();
     const double* tapsQ = hQ.data();
+    const int pad = std::max(MI, MQ);
 
     const double effGI = GI_PRODUCT * configuration.gi_product;
     const double effGQ = GQ_PRODUCT * configuration.gq_product;
 
     if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
+    const int extWidth = width + 2 * pad;
+    if ((int)scratch_preI_ext.size() < extWidth) scratch_preI_ext.resize(extWidth, 0.0);
+    if ((int)scratch_preQ_ext.size() < extWidth) scratch_preQ_ext.resize(extWidth, 0.0);
 
     for (int line = firstLine; line < lastLine; ++line) {
         double* Irow = componentFrame->u(line);
@@ -2205,7 +2300,14 @@ void Comb::FrameBuffer::filterIQLocked()
         const double   bcos    = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
         const double   bsin    = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
         double lutTi[4], lutTq[4];
-        fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        if (line < (int)demodLUTTi_locked.size()) {
+            for (int i = 0; i < 4; ++i) {
+                lutTi[i] = (double)demodLUTTi_locked[line][i];
+                lutTq[i] = (double)demodLUTTq_locked[line][i];
+            }
+        } else {
+            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        }
 
         // If residualColor is active, derive chroma by subtracting the final Y from composite,
         // then demodulate that residual into the locked basis  this gives chroma that is
@@ -2230,16 +2332,32 @@ void Comb::FrameBuffer::filterIQLocked()
                 scratch_preQ[i] = tq * effGQ;
             }
         }
+
+        // Edge-extend once, then FIR with straight indexing (no per-tap clamps).
+        double *preIext = scratch_preI_ext.data();
+        double *preQext = scratch_preQ_ext.data();
+        const double leftI = (width > 0) ? scratch_preI[0] : 0.0;
+        const double leftQ = (width > 0) ? scratch_preQ[0] : 0.0;
+        const double rightI = (width > 0) ? scratch_preI[width - 1] : 0.0;
+        const double rightQ = (width > 0) ? scratch_preQ[width - 1] : 0.0;
+        for (int i = 0; i < pad; ++i) { preIext[i] = leftI; preQext[i] = leftQ; }
+        std::copy(scratch_preI.data(), scratch_preI.data() + width, preIext + pad);
+        std::copy(scratch_preQ.data(), scratch_preQ.data() + width, preQext + pad);
+        for (int i = 0; i < pad; ++i) {
+            preIext[pad + width + i] = rightI;
+            preQext[pad + width + i] = rightQ;
+        }
+
         // Apply FIRs to preI/preQ and write to I/Q
         for (int i = 0; i < width; ++i) {
             double accI = 0.0, accQ = 0.0;
+            const double *cI = preIext + pad + i;
+            const double *cQ = preQext + pad + i;
             for (int k = -MI; k <= MI; ++k) {
-                int idx = std::clamp(i + k, 0, width - 1);
-                accI += scratch_preI[idx] * tapsI[k + MI];
+                accI += cI[k] * tapsI[k + MI];
             }
             for (int k = -MQ; k <= MQ; ++k) {
-                int idx = std::clamp(i + k, 0, width - 1);
-                accQ += scratch_preQ[idx] * tapsQ[k + MQ];
+                accQ += cQ[k] * tapsQ[k + MQ];
             }
             const int h = left + i;
             Irow[h] = accI;
