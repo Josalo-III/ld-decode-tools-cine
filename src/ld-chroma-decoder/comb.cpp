@@ -2575,6 +2575,17 @@ void Comb::FrameBuffer::produceY()
             scratch_comp_res[xi] = ((double)rawLine[h] - clpLine[h]);
         }
 
+        // Per-pixel outputs for the second-pass election:
+        // - cHat: remodulated chroma estimate to subtract
+        // - tiAdj/tqAdj: adjusted demod vectors (only written back if chosen)
+        // - vetConf: vet confidence (0..1)
+        if ((int)scratch_fieldGate.size() < width) scratch_fieldGate.resize(width, 1.0);
+        if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
+        double *cHat    = scratch_fieldGate.data();
+        double *tiAdjLn = scratch_fieldLine.data();
+        double *tqAdjLn = scratch_fieldBLine.data();
+        double *vetConf = scratch_lateralLine.data();
+
         // ------------------------------------------------------------
         // Precompute per-sample window contributions once per line.
         // Reuse existing scratch buffers (width-sized) to avoid new allocations.
@@ -2684,9 +2695,8 @@ void Comb::FrameBuffer::produceY()
             // ------------------------------------------------------------
             // Vet: local LS alignment (phase + correlation + shear)
             //
-            // IMPORTANT: Don't call vetComposite1D() here. That function
-            // re-scans the WIN window per pixel to rebuild STT/SRT, but we
-            // already have STT/SRT from the sliding sums above.
+            // IMPORTANT: Don't re-scan the WIN window here per pixel to rebuild
+            // STT/SRT; we already have STT/SRT from the sliding sums above.
             // ------------------------------------------------------------
             Vet1DResult vet;
             vet.accept = true;
@@ -2699,7 +2709,10 @@ void Comb::FrameBuffer::produceY()
             // Vet metrics are computed from A_vet = SRT * inv(STT) when possible.
             double RmVet[2][2] = {{1,0},{0,1}};
             double UVet[2][2]  = {{1,0},{0,1}};
-            if (invOk) {
+            if (!invOk || n < 8) {
+                vet.accept = false;
+                vet.confidence = 0.0;
+            } else {
                 double Avet[2][2];
                 mat2_mul(SRT, STTinv, Avet);
                 polar_decompose_2x2(Avet, RmVet, UVet);
@@ -2727,8 +2740,6 @@ void Comb::FrameBuffer::produceY()
                 if (c < 0.0) c = 0.0; else if (c > 1.0) c = 1.0;
                 vet.confidence = c;
             }
-
-            if (configuration.showMap) w2d_frame_weight[line][x] = (float)vet.confidence;
 
             // ------------------------------------------------------------
             // Solve local affine (optional): reuse the same polar decomposition
@@ -2766,25 +2777,87 @@ void Comb::FrameBuffer::produceY()
 
             const double cval_hat = ti_adj * remodI[idx] + tq_adj * remodQ[idx];
 
-            // Coherent-Y candidate (protected by the vet gate); fall back to 2D clp-Y.
-            const double yCoherent = vet.accept
-                ? ((double)rawLine[h] - cval_hat)
-                : ((double)rawLine[h] - clpLine[h]);
+            // Store for the second-pass decision (protect luma against chroma).
+            cHat[x] = cval_hat;
+            tiAdjLn[x] = ti_adj;
+            tqAdjLn[x] = tq_adj;
+            vetConf[x] = vet.confidence;
+        }
 
-            // --- If residualVideo3D is enabled and valid, select between coherent-Y and residual-Y ---
-            if (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet) {
-                Y[h] = getBestY(line, h, yCoherent, *prevFrameForVet, *nextFrameForVet);
-                // preserve prior behaviour: residual3D owns Y; don't rewrite TI/TQ rows here.
-                if (configuration.showMap) w2d_frame_weight[line][x] = 0.0f;
-                continue;
+        // ------------------------------------------------------------
+        // Second pass: produce residual Y by controlling the subtraction itself.
+        //
+        // The residual path is the incumbent: alpha=1 subtracts the remodulated
+        // chroma estimate as-is. In uncertain cases, use the chroma profile of
+        // cHat and the luma profile of the resulting Y to make a bounded alpha
+        // correction that minimizes 4fSC-like residue in Y. This keeps the
+        // decision at the waveform separation point instead of treating residual
+        // Y as an optional replacement candidate.
+        // ------------------------------------------------------------
+        const bool do3D = (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
+
+        const double MIN_ALPHA = 0.75;
+        const double MAX_ALPHA = 1.25;
+        const double MIN_SUB_CHROMA_IRE = 2.0;
+
+        if (width < 4) {
+            // Degenerate: no 4-sample group; use full residual subtraction.
+            for (int x = 0; x < width; ++x) {
+                const int h = left + x;
+                const double yOut = (double)rawLine[h] - cHat[x];
+                Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
+                if (configuration.showMap) w2d_frame_weight[line][x] = (float)vetConf[x];
+                tiRowW[x] = (float)tiAdjLn[x];
+                tqRowW[x] = (float)tqAdjLn[x];
+            }
+            continue;
+        }
+
+        for (int gp = 0; gp < width; gp += 4) {
+            int p = gp;
+            if (p > width - 4) p = width - 4;
+
+            const double r0 = (double)rawLine[left + p + 0];
+            const double r1 = (double)rawLine[left + p + 1];
+            const double r2 = (double)rawLine[left + p + 2];
+            const double r3 = (double)rawLine[left + p + 3];
+
+            const double c0 = cHat[p + 0];
+            const double c1 = cHat[p + 1];
+            const double c2 = cHat[p + 2];
+            const double c3 = cHat[p + 3];
+
+            // Phase-agnostic 4fSC vectors: I ~= s1-s3, Q ~= s2-s0.
+            const double rawI = r1 - r3;
+            const double rawQ = r2 - r0;
+            const double subI = c1 - c3;
+            const double subQ = c2 - c0;
+            const double subEnergy = subI * subI + subQ * subQ;
+            const double subMagIRE = std::sqrt(subEnergy) * invI;
+
+            double alpha = 1.0;
+            if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0 && subMagIRE >= MIN_SUB_CHROMA_IRE) {
+                // Least-squares alpha that minimizes 4fSC energy in raw - alpha*cHat.
+                const double alphaFit = std::clamp((rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
+                                                   MIN_ALPHA, MAX_ALPHA);
+                const double conf = std::clamp(0.25 * (vetConf[p + 0] + vetConf[p + 1] +
+                                                       vetConf[p + 2] + vetConf[p + 3]),
+                                               0.0, 1.0);
+                const double profileWeight = T.VET_Y_CHROMA_LIKE_WEIGHT * (1.0 - conf);
+                alpha = 1.0 + profileWeight * (alphaFit - 1.0);
             }
 
-            if (vet.accept) {
-                Y[h] = yCoherent;
-                tiRowW[x] = (float)ti_adj;
-                tqRowW[x] = (float)tq_adj;
-            } else {
-                Y[h] = (double)rawLine[h] - clpLine[h];
+            for (int i = 0; i < 4; ++i) {
+                const int x = p + i;
+                if (x < 0 || x >= width) continue;
+                const int h = left + x;
+
+                const double yOut = (double)rawLine[h] - alpha * cHat[x];
+                Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
+
+                if (configuration.showMap) w2d_frame_weight[line][x] = (float)alpha;
+                tiRowW[x] = (float)(alpha * tiAdjLn[x]);
+                tqRowW[x] = (float)(alpha * tqAdjLn[x]);
             }
         }
     }

@@ -155,6 +155,8 @@ if(NOT FFTW_FOUND)
             /usr/local/lib
             /usr/local/lib/fftw
             /usr/local/lib/fftw3
+            /opt/homebrew/lib
+            /opt/homebrew/opt/fftw/lib
             "$ENV{LIB_DIR}/lib"
             "$ENV{LIB}"
             "${FFTW_ROOT}/lib"
@@ -169,6 +171,8 @@ if(NOT FFTW_FOUND)
             /usr/local/include
             /usr/local/include/fftw
             /usr/local/include/fftw3
+            /opt/homebrew/include
+            /opt/homebrew/opt/fftw/include
             "$ENV{LIB_DIR}/include"
             "$ENV{INCLUDE}"
             "${FFTW_ROOT}/include"

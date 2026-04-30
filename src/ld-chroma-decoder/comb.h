@@ -86,8 +86,8 @@ public:
 		};
 		TwoDVariant twoDVariant = FieldVsFrame;
 	
-		// Opt-in for 3D temporal checks in Residual Y (vetComposite1D)
-		bool residualVideo3D = false;
+			// Opt-in for 3D temporal checks in Residual Y (getBestY)
+			bool residualVideo3D = false;
 		bool residualVideo = false;
 		bool residualColor = false;		        
 
@@ -261,9 +261,9 @@ public:
 			double VET_ADJ_NEIGH_WEIGHT_CONF      = 0.27;
 			double VET_ADJ_NEIGH_WEIGHT_SCORE     = 0.30;
 			double VET_Y_NEIGHBOR_WEIGHT          = 0.25;
-            // Residual-Y election: demote candidates that look "chroma-like" (4fSC energy),
-            // to protect luma from chroma contamination after we already protected chroma
-            // pre-demod. This is a cheap local bucket-demod proxy on Y.
+            // Residual-Y subtraction: in uncertain cases, use 4fSC chroma/luma
+            // profile agreement to make a bounded correction to the chroma
+            // subtraction amount.
             double VET_Y_CHROMA_LIKE_WEIGHT       = 0.12;
 			double VET_Y_ADAPTIVE_SCALE           = 0.0;
 			double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
@@ -359,7 +359,7 @@ private:
 
         const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
 
-        // Optional temporal context pointers used by vetComposite1D (set by decodeFrames)
+        // Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
         // Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
         const FrameBuffer *prevFrameForVet = nullptr;
         const FrameBuffer *nextFrameForVet = nullptr;
@@ -587,12 +587,7 @@ private:
             return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
         }
 
-        // Lightweight 1D vet for a composite sample.
-        // Uses only local horizontal neighbours (and optional vertical confirmation)
-        // to provide a background-check style acceptance metric for applying a
-        // composite-derived change to Y. This deliberately avoids running the full
-        // 2D/3D candidate election (getBestCandidate) and is cheap enough to call
-        // per-sample if needed.
+        // Vet result container (used by locked-path coherent Y rebuild).
         struct Vet1DResult {
             double composite_bandpass = 0.0;        // raw - 2D clp (IRE units)
             double leftScore         = std::numeric_limits<double>::infinity();  // smaller is better
@@ -606,9 +601,6 @@ private:
             int    adjNeighborCount  = 0;          // number of valid immediate neighbors (0..2)
             double adjNeighborSupport= 0.0;        // average agreement of h±1 with residual (0..1)
         };
-
-        // Evaluate local 1D vet for composite at (line, h).
-        Vet1DResult vetComposite1D(qint32 line, qint32 h, bool requireVerticalConfirm = false) const;
 
     };
 

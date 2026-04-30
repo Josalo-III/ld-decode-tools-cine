@@ -12,8 +12,8 @@
  *
  * This file is part of ld-decode-tools.
  *
- * Implements Comb::FrameBuffer::getCandidate() and vetComposite1D(),
- * separated from comb.cpp so that candidate selection and vet logic
+ * Implements Comb::FrameBuffer::getCandidate(),
+ * separated from comb.cpp so that candidate selection and 2D helpers
  * live in a single translation unit.
  ******************************************************************************/
 
@@ -1449,157 +1449,6 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     result.penalty = penalty;
     return result;
 }
-// -------------------------------------------------------------------------
-// Accept by default; veto only when local 2x2 LS alignment is poor.
-// Criteria: large phase, low normalized correlation (rho), or excessive shear.
-// No anti-column heuristics.
-// -------------------------------------------------------------------------
-Comb::FrameBuffer::Vet1DResult Comb::FrameBuffer::vetComposite1D(qint32 line, qint32 h, bool requireVerticalConfirm) const
-{
-    Vet1DResult R;
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int width     = right - left;
-
-    if (line < firstLine || line >= lastLine || h < left || h >= right) return R;
-
-    const int xi = h - left;
-    const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
-    const double *clpLine = clpbuffer[srcBuf].pixel[line];
-    const quint16 *rawRow = rawbuffer.data() + line * videoParameters.fieldWidth;
-
-    if (xi >= 0 && xi < demodWidth && !scratch_comp_res.empty())
-        R.composite_bandpass = scratch_comp_res[xi];
-    else
-        R.composite_bandpass = (double)rawRow[h] - clpLine[h];
-
-    // Default: accept unless alignment test fails
-    R.accept = true;
-    R.confidence = 1.0;
-
-    if (line >= demodLines || demodWidth <= 0) return R;
-
-    const float* tiRow  = demodTI_line(line);
-    const float* tqRow  = demodTQ_line(line);
-    const float* triRow = demodTRI_line(line);
-    const float* trqRow = demodTRQ_line(line);
-    if (!tiRow || !tqRow || !triRow || !trqRow) return R;
-
-    const auto &T = configuration.tunables;
-    const int WIN  = std::max(4, (T.VET_ALIGN_WIN_SAMPLES / 4) * 4);
-    const int HALF = WIN / 2;
-
-    int a = xi - HALF, b = xi + HALF - 1;
-    if (a < 0) { b += -a; a = 0; }
-    if (b >= demodWidth) { int over = b - (demodWidth - 1); b -= over; a -= over; if (a < 0) a = 0; }
-
-    // Accumulate Σ T T^T and Σ R T^T
-    double STT[2][2] = {{0,0},{0,0}};
-    double SRT[2][2] = {{0,0},{0,0}};
-    for (int x = a; x <= b; ++x) {
-        const double ti = (double)tiRow[x];
-        const double tq = (double)tqRow[x];
-        const double ri = (double)triRow[x];
-        const double rq = (double)trqRow[x];
-        STT[0][0] += ti*ti; STT[0][1] += ti*tq;
-        STT[1][0] += ti*tq; STT[1][1] += tq*tq;
-        SRT[0][0] += ri*ti; SRT[0][1] += ri*tq;
-        SRT[1][0] += rq*ti; SRT[1][1] += rq*tq;
-    }
-
-    // Invertibility guard
-    double STTinv[2][2];
-    if (!mat2_inv(STT, STTinv)) return R;
-
-    // A = SRT * inv(STT); polar decomposition
-    double tmp[2][2], A[2][2], Rm[2][2], U[2][2];
-    mat2_mul(SRT, STTinv, tmp);
-    A[0][0] = tmp[0][0]; A[0][1] = tmp[0][1];
-    A[1][0] = tmp[1][0]; A[1][1] = tmp[1][1];
-    polar_decompose_2x2(A, Rm, U);
-
-    // Extract metrics
-    const double phase = std::atan2(Rm[1][0], Rm[0][0]); // radians
-    double l1,l2,V_[2][2]; eig2_sym(U,l1,l2,V_);
-    const double s1 = std::max(0.0, l1), s2 = std::max(0.0, l2);
-    const double g  = 0.5*(s1+s2);
-    const double shear = (g>1e-12)? std::fabs(s1-s2)/g : 0.0;
-
-    // Normalized correlation rho (scalar proxy): ||Σ conj(T)·R|| / (Σ|T|^2)
-    // Equivalent to Frobenius alignment proxy: trace(SRT SRT^T)^{1/2} / trace(STT) (rough proxy)
-    const double srt00 = SRT[0][0], srt01 = SRT[0][1], srt10 = SRT[1][0], srt11 = SRT[1][1];
-    const double num = std::sqrt(srt00*srt00 + srt01*srt01 + srt10*srt10 + srt11*srt11);
-    const double den = std::max(1e-9, STT[0][0] + STT[1][1]);
-    const double rho = num / den;
-
-    // Gate
-    const double pMax = T.VET_ALIGN_PHASE_MAX_DEG * M_PI / 180.0;
-    if (std::fabs(phase) > pMax || rho < T.VET_ALIGN_MIN_RHO || shear > T.VET_ALIGN_MAX_SHEAR) {
-        R.accept = false;
-    }
-
-    // Confidence combines rho, phase tightness, and shear tightness
-    double c_phase = 1.0 - std::min(1.0, std::fabs(phase)/ (pMax + 1e-12));
-    double c_shear = 1.0 - std::min(1.0, shear / (T.VET_ALIGN_MAX_SHEAR + 1e-12));
-    double c = 0.5*std::max(0.0, std::min(1.0, rho)) + 0.25*c_phase + 0.25*c_shear;
-    if (c < 0.0) c = 0.0; else if (c > 1.0) c = 1.0;
-    R.confidence = c;
-
-    // Optional vertical confirmation
-    if (requireVerticalConfirm && R.accept) {
-        int agrees = 0;
-        auto checkLine = [&](int ln){
-            if (ln < firstLine || ln >= lastLine) return;
-            const float* ti2 = demodTI_line(ln);
-            const float* tq2 = demodTQ_line(ln);
-            const float* ri2 = demodTRI_line(ln);
-            const float* rq2 = demodTRQ_line(ln);
-            if (!ti2 || !tq2 || !ri2 || !rq2) return;
-            double STT2[2][2]={{0,0},{0,0}}, SRT2[2][2]={{0,0},{0,0}};
-            for (int x = a; x <= b; ++x) {
-                const double ti = (double)ti2[x], tq = (double)tq2[x];
-                const double rI = (double)ri2[x], rQ = (double)rq2[x];
-                STT2[0][0]+=ti*ti; STT2[0][1]+=ti*tq; STT2[1][0]+=ti*tq; STT2[1][1]+=tq*tq;
-                SRT2[0][0]+=rI*ti; SRT2[0][1]+=rI*tq; SRT2[1][0]+=rQ*ti; SRT2[1][1]+=rQ*tq;
-            }
-            double inv2[2][2];
-            if (!mat2_inv(STT2, inv2)) return;
-            double tmp2[2][2], A2[2][2], R2[2][2], U2[2][2];
-            mat2_mul(SRT2, inv2, tmp2);
-            A2[0][0]=tmp2[0][0]; A2[0][1]=tmp2[0][1];
-            A2[1][0]=tmp2[1][0]; A2[1][1]=tmp2[1][1];
-            polar_decompose_2x2(A2, R2, U2);
-            double ph = std::atan2(R2[1][0], R2[0][0]);
-            double l1_,l2_,Vt[2][2]; eig2_sym(U2,l1_,l2_,Vt);
-            double s1_ = std::max(0.0, l1_), s2_ = std::max(0.0, l2_);
-            double g_ = 0.5*(s1_+s2_);
-            double sh = (g_>1e-12)? std::fabs(s1_-s2_)/g_ : 0.0;
-            const double num2 = std::sqrt(SRT2[0][0]*SRT2[0][0] + SRT2[0][1]*SRT2[0][1] +
-                                          SRT2[1][0]*SRT2[1][0] + SRT2[1][1]*SRT2[1][1]);
-            const double den2 = std::max(1e-9, STT2[0][0] + STT2[1][1]);
-            double rho2 = num2 / den2;
-            if (std::fabs(ph) <= pMax && rho2 >= T.VET_ALIGN_MIN_RHO && sh <= T.VET_ALIGN_MAX_SHEAR) ++agrees;
-        };
-        checkLine(line - 2);
-        checkLine(line + 2);
-        R.verticalAgree = agrees;
-        if (agrees == 0) { R.accept = false; R.confidence *= 0.5; }
-    }
-
-    // Legacy diagnostic fields (no L/R election now)
-    R.leftScore  = std::numeric_limits<double>::infinity();
-    R.rightScore = std::numeric_limits<double>::infinity();
-    R.bestIndex  = -1;
-    R.bestScore  = R.accept ? 0.0 : 1.0;
-    R.adjNeighborCount   = 0;
-    R.adjNeighborSupport = 0.0;
-
-    return R;
-}
-
 // ---------------------------------------------------------------------
 // getBestY - Dedicated 3D Residual Y Election/Blend
 // ---------------------------------------------------------------------
@@ -1608,9 +1457,6 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
 {
     const auto &T = configuration.tunables;
     const int fw  = videoParameters.fieldWidth;
-    const int left = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const double invI = this->invIreScale;
 
     // Helper to extract Y from a framebuffer
     auto getY = [&](const FrameBuffer& fb, int ln, int x) -> double {
@@ -1618,25 +1464,6 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
         double raw = (double)fb.rawbuffer.data()[ln * fw + x];
         double clp = fb.clpbuffer[1].pixel[ln][x];
         return raw - clp;
-    };
-
-    // Cheap "chroma-likeness" metric on Y: local 4fSC energy proxy.
-    // Align to a 4-sample group and compute I/Q-like magnitude:
-    //   I ~= y1 - y3, Q ~= y2 - y0 (bucket-demod equivalent; magnitude is phase-agnostic).
-    auto chromaLikeMagIRE = [&](const FrameBuffer& fb, int ln, int x) -> double {
-        if (ln < videoParameters.firstActiveFrameLine || ln >= videoParameters.lastActiveFrameLine) return 0.0;
-        if (x < left || x >= right) return 0.0;
-        int p = x - ((x - left) & 3);
-        if (p < left) p = left;
-        if (p > right - 4) p = right - 4;
-        if (p < left) return 0.0;
-        const double y0 = getY(fb, ln, p + 0);
-        const double y1 = getY(fb, ln, p + 1);
-        const double y2 = getY(fb, ln, p + 2);
-        const double y3 = getY(fb, ln, p + 3);
-        const double i = (y1 - y3);
-        const double q = (y2 - y0);
-        return std::hypot(i, q) * invI;
     };
 
     double yCurr = currentY2D;
@@ -1663,16 +1490,6 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
     double shapeStr = T.NEIGHBOR_SHAPE_STRENGTH;
     double penPrev  = std::fabs(yPrev - spatialTarget) * shapeStr;
     double penNext  = std::fabs(yNext - spatialTarget) * shapeStr;
-
-    // Pivot: protect luma against chroma contamination by demoting candidates
-    // whose Y contains strong 4fSC-like structure.
-    if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0) {
-        const double cPrev = chromaLikeMagIRE(prev, line, h);
-        const double cNext = chromaLikeMagIRE(next, line, h);
-        // Scale to sample space so it composes with the existing penalties.
-        penPrev += (cPrev * irescale) * T.VET_Y_CHROMA_LIKE_WEIGHT;
-        penNext += (cNext * irescale) * T.VET_Y_CHROMA_LIKE_WEIGHT;
-    }
 
     // --- Agreement Scores ---
     double baseRadius = T.AGREEMENT_REWARD_RADIUS_IRE * irescale;
