@@ -70,21 +70,24 @@ static constexpr quint32 CANDIDATE_SHADES[] = {
 // Supports pulldown film letters, '?' (unknown), and '/' (boundary marker).
 // scale controls pixel block size for visibility at different output resolutions.
 static void drawChar(FrameCanvas &canvas, int x, int y, char ch, FrameCanvas::Colour col, int scale) {
-    // Simple 5x7 font map for A-D, ?, and /
+    // Simple 5x7 font map for A-D, ?, /, i, p
     static const unsigned char font[][7] = {
         {0x04,0x0A,0x11,0x11,0x1F,0x11,0x11}, // A (0)
         {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // B (1)
         {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, // C (2)
         {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, // D (3)
-        {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}, // ? (5)
-        {0x01,0x02,0x02,0x04,0x04,0x08,0x10}  // / (6)
+        {0x0E,0x11,0x01,0x02,0x04,0x00,0x04}, // ? (4)
+        {0x01,0x02,0x02,0x04,0x04,0x08,0x10}, // / (5)
+        {0x04,0x00,0x04,0x04,0x04,0x04,0x0E}, // i (6)
+        {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}  // p (7) - rendered as P
     };
     
-    int idx = 5; // default to ?
-    if (ch >= 'A' && ch <= 'E') idx = ch - 'A';
-    else if (ch == '/') idx = 6;
-    else if (ch >= '0' && ch <= '9') {
-    }
+    int idx = 4; // default to '?'
+    if (ch >= 'A' && ch <= 'D') idx = ch - 'A';
+    else if (ch == '?' ) idx = 4;
+    else if (ch == '/') idx = 5;
+    else if (ch == 'i' || ch == 'I') idx = 6;
+    else if (ch == 'p' || ch == 'P') idx = 7;
     
     for (int r = 0; r < 7; ++r) {
         unsigned char row = font[idx][r];
@@ -279,8 +282,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             // Convention:
             //   editTop    -> '/' leads  the frame:  /A  or /AB
             //   editBottom -> '/' splits the frame:  A/B
-            //   -2 cadenceId -> "i2" (confirmed interlaced)
-            //   -3 cadenceId -> "p3" (confirmed progressive)
+            //   -2 cadenceId -> "i" (confirmed interlaced)
+            //   -3 cadenceId -> "p" (confirmed progressive)
             //   unknown    -> cycle-position digit
 
             // Determine display label for each field position.
@@ -1105,10 +1108,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         Cond1D c;
         c.raw = arr[rel];
         // Bucketed (h&3) conditioning: compare against same-phase neighbors (±4),
-        // not adjacent/±2 samples, to avoid smoothing across composite alternation.
+        // not adjacent/±2 samples, to avoid disrupting composite alternation.
         const int rm4 = std::clamp(rel - 4, 0, width - 1);
         const int rp4 = std::clamp(rel + 4, 0, width - 1);
-        const double est = 0.5 * (arr[rm4] + arr[rp4]);
+        const double est = 0.5 * (arr[rm4] + arr[rp4]); // adjust this multiplier (+/-) to trim conditioning
         c.outlierIRE = std::fabs(c.raw - est) * invI;
 
         // Horizontal-only outlier conditioning for scoring: if the pixel strongly
@@ -1338,7 +1341,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
 
             // ------------------------------------------------------------
-            // A cleanup + conditional "B keeps them honest"
+            // A cleanup + conditional
             // ------------------------------------------------------------
             double gA = 1.0;
             if (line >= 0 && line < (int)w2d_fieldA_gate.size())
