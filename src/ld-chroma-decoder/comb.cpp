@@ -2412,6 +2412,49 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     bool useFrameModel = (cadenceId >= 0 || cadenceId == -3);
     bool localUseFrameModel = useFrameModel;
 
+    struct Cond1D {
+        double raw = 0.0;
+        double score = 0.0;
+        double outlierIRE = 0.0;
+    };
+    auto condSamePhase = [&](const double *arr, int rel) -> Cond1D {
+        Cond1D c;
+        c.raw = arr[rel];
+        // Bucketed (h&3) conditioning: compare against same-phase neighbors (±4),
+        // not adjacent/±2 samples, to avoid smoothing across composite alternation.
+        const int rm4 = std::clamp(rel - 4, 0, width - 1);
+        const int rp4 = std::clamp(rel + 4, 0, width - 1);
+        const double est = 0.5 * (arr[rm4] + arr[rp4]);
+        c.outlierIRE = std::fabs(c.raw - est) * invI;
+
+        // Horizontal-only outlier conditioning for scoring: if the pixel strongly
+        // deviates from same-phase bucket neighbors (±4), blend toward the estimate.
+        const double OUTLIER_WARN_IRE = 3.0;
+        const double OUTLIER_FULL_IRE = 10.0;
+        double t = (c.outlierIRE - OUTLIER_WARN_IRE) / (OUTLIER_FULL_IRE - OUTLIER_WARN_IRE);
+        t = std::clamp(t, 0.0, 1.0);
+        // Dial back: even a full outlier only corrects halfway toward est.
+        t *= 0.5;
+        c.score = c.raw + (est - c.raw) * t;
+        return c;
+    };
+    auto condSamePhaseVec = [&](const std::vector<double> &vec, int rel) -> Cond1D {
+        Cond1D c;
+        c.raw = vec[rel];
+        const int rm4 = std::clamp(rel - 4, 0, width - 1);
+        const int rp4 = std::clamp(rel + 4, 0, width - 1);
+        const double est = 0.5 * (vec[rm4] + vec[rp4]);
+        c.outlierIRE = std::fabs(c.raw - est) * invI;
+
+        const double OUTLIER_WARN_IRE = 3.0;
+        const double OUTLIER_FULL_IRE = 10.0;
+        double t = (c.outlierIRE - OUTLIER_WARN_IRE) / (OUTLIER_FULL_IRE - OUTLIER_WARN_IRE);
+        t = std::clamp(t, 0.0, 1.0);
+        t *= 0.5;
+        c.score = c.raw + (est - c.raw) * t;
+        return c;
+    };
+
     for (int rel = 0; rel < width; ++rel) {
         double FA = fieldA[rel];
         double FB = fieldB[rel];
@@ -2426,9 +2469,20 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             satFR_demod = std::fabs(FR);
         }
 
-        double lumFA = getNotchLuma(fieldA, rel);
-        double lumFB = getNotchLuma(fieldB, rel);
-        double lumFR = getNotchLumaVec(frameB2, rel);
+        const Cond1D FA_c = condSamePhase(fieldA, rel);
+        const Cond1D FB_c = condSamePhase(fieldB, rel);
+        const Cond1D FR_c = condSamePhaseVec(frameB2, rel);
+
+        // Use conditioned candidates for scoring only; output still uses raw winners.
+        const double FA_s = FA_c.score;
+        const double FB_s = FB_c.score;
+        const double FR_s = FR_c.score;
+
+        // Luma proxies: prefer the pure even-offset notch (±2 average), which is
+        // less sensitive to single-pixel spikes than a [1,2,1] that includes center.
+        double lumFA = getNotchLumaEven2(fieldA, rel, width);
+        double lumFB = getNotchLumaEven2(fieldB, rel, width);
+        double lumFR = getNotchLumaEven2Vec(frameB2, rel);
 
         int maskVal = 0;
         if (line >= firstLine && line < lastLine &&
@@ -2468,7 +2522,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 	        // --- Veto Logic ---
 	        bool managementVeto = (cadenceId == -2);
 	        bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
-	        double targetModel = localUseFrameModel ? FR : FA;
+	        double targetModel = localUseFrameModel ? FR_s : FA_s;
 
 	        // diffFVF uses the geometric interfield stack divergence only
 	        double diff_fvf_ire = diff_stack_ire;
@@ -2487,9 +2541,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double hIRE = horizEdgeIRE(rel);
 
         const double TRI_SAFE_IRE = 3.0;
-        bool safeA = fvf_is_tri_safe(FA, L1, invI, TRI_SAFE_IRE);
-        bool safeB = fvf_is_tri_safe(FB, L1, invI, TRI_SAFE_IRE);
-        bool safeR = fvf_is_tri_safe(FR, L1, invI, TRI_SAFE_IRE);
+        bool safeA = fvf_is_tri_safe(FA_s, L1, invI, TRI_SAFE_IRE);
+        bool safeB = fvf_is_tri_safe(FB_s, L1, invI, TRI_SAFE_IRE);
+        bool safeR = fvf_is_tri_safe(FR_s, L1, invI, TRI_SAFE_IRE);
 
         FvfModelMetrics metrics;
         if (line >= 0 && line < (int)fvfMetrics.size() &&
@@ -2584,9 +2638,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 double FR_l = frameB2[std::clamp(rel - 1, 0, width - 1)];
                 double FR_r = frameB2[std::clamp(rel + 1, 0, width - 1)];
 
-                devA += getShapeScore(FA, FA_l, FA_r) * T.FVF_SHAPE_STRENGTH;
-                devB += getShapeScore(FB, FB_l, FB_r) * T.FVF_SHAPE_STRENGTH;
-                devR += getShapeScore(FR, FR_l, FR_r) * T.FVF_SHAPE_STRENGTH;
+                devA += getShapeScore(FA_s, FA_l, FA_r) * T.FVF_SHAPE_STRENGTH;
+                devB += getShapeScore(FB_s, FB_l, FB_r) * T.FVF_SHAPE_STRENGTH;
+                devR += getShapeScore(FR_s, FR_l, FR_r) * T.FVF_SHAPE_STRENGTH;
             }
 
             double satScale = std::clamp((chromaMagIRE - 2.0) / 8.0, 0.0, 1.0);
@@ -2745,9 +2799,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     E = (E2 + K_PM1 * E1) / (1.0 + K_PM1);
                 }
 
-                double dA = std::fabs(FA - E) * invI;
-                double dB = std::fabs(FB - E) * invI;
-                double dR = std::fabs(FR - E) * invI;
+                double dA = std::fabs(FA_s - E) * invI;
+                double dB = std::fabs(FB_s - E) * invI;
+                double dR = std::fabs(FR_s - E) * invI;
 
                 const double W_NEIGH = T.NEIGHBOR_EST_WEIGHT;
                 scoreA += W_NEIGH * dA;
