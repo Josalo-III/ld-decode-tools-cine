@@ -2641,15 +2641,6 @@ void Comb::FrameBuffer::produceY()
         for (int x = 0; x < width; ++x) {
             const int h = left + x;
 
-            // --- If residualVideo3D is enabled and valid, it owns the output ---
-            if (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet) {
-                Y[h] = getBestY(line, h,
-                               (double)rawLine[h] - clpLine[h],
-                               *prevFrameForVet, *nextFrameForVet);
-                if (configuration.showMap) w2d_frame_weight[line][x] = 0.0f;
-                continue;
-            }
-
             if (width > WIN) {
                 int aWant = x - HALF;
                 int bWant = x + HALF - 1;
@@ -2775,8 +2766,21 @@ void Comb::FrameBuffer::produceY()
 
             const double cval_hat = ti_adj * remodI[idx] + tq_adj * remodQ[idx];
 
+            // Coherent-Y candidate (protected by the vet gate); fall back to 2D clp-Y.
+            const double yCoherent = vet.accept
+                ? ((double)rawLine[h] - cval_hat)
+                : ((double)rawLine[h] - clpLine[h]);
+
+            // --- If residualVideo3D is enabled and valid, select between coherent-Y and residual-Y ---
+            if (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet) {
+                Y[h] = getBestY(line, h, yCoherent, *prevFrameForVet, *nextFrameForVet);
+                // preserve prior behaviour: residual3D owns Y; don't rewrite TI/TQ rows here.
+                if (configuration.showMap) w2d_frame_weight[line][x] = 0.0f;
+                continue;
+            }
+
             if (vet.accept) {
-                Y[h] = (double)rawLine[h] - cval_hat;
+                Y[h] = yCoherent;
                 tiRowW[x] = (float)ti_adj;
                 tqRowW[x] = (float)tq_adj;
             } else {

@@ -1608,6 +1608,9 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
 {
     const auto &T = configuration.tunables;
     const int fw  = videoParameters.fieldWidth;
+    const int left = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const double invI = this->invIreScale;
 
     // Helper to extract Y from a framebuffer
     auto getY = [&](const FrameBuffer& fb, int ln, int x) -> double {
@@ -1615,6 +1618,25 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
         double raw = (double)fb.rawbuffer.data()[ln * fw + x];
         double clp = fb.clpbuffer[1].pixel[ln][x];
         return raw - clp;
+    };
+
+    // Cheap "chroma-likeness" metric on Y: local 4fSC energy proxy.
+    // Align to a 4-sample group and compute I/Q-like magnitude:
+    //   I ~= y1 - y3, Q ~= y2 - y0 (bucket-demod equivalent; magnitude is phase-agnostic).
+    auto chromaLikeMagIRE = [&](const FrameBuffer& fb, int ln, int x) -> double {
+        if (ln < videoParameters.firstActiveFrameLine || ln >= videoParameters.lastActiveFrameLine) return 0.0;
+        if (x < left || x >= right) return 0.0;
+        int p = x - ((x - left) & 3);
+        if (p < left) p = left;
+        if (p > right - 4) p = right - 4;
+        if (p < left) return 0.0;
+        const double y0 = getY(fb, ln, p + 0);
+        const double y1 = getY(fb, ln, p + 1);
+        const double y2 = getY(fb, ln, p + 2);
+        const double y3 = getY(fb, ln, p + 3);
+        const double i = (y1 - y3);
+        const double q = (y2 - y0);
+        return std::hypot(i, q) * invI;
     };
 
     double yCurr = currentY2D;
@@ -1641,6 +1663,16 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
     double shapeStr = T.NEIGHBOR_SHAPE_STRENGTH;
     double penPrev  = std::fabs(yPrev - spatialTarget) * shapeStr;
     double penNext  = std::fabs(yNext - spatialTarget) * shapeStr;
+
+    // Pivot: protect luma against chroma contamination by demoting candidates
+    // whose Y contains strong 4fSC-like structure.
+    if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0) {
+        const double cPrev = chromaLikeMagIRE(prev, line, h);
+        const double cNext = chromaLikeMagIRE(next, line, h);
+        // Scale to sample space so it composes with the existing penalties.
+        penPrev += (cPrev * irescale) * T.VET_Y_CHROMA_LIKE_WEIGHT;
+        penNext += (cNext * irescale) * T.VET_Y_CHROMA_LIKE_WEIGHT;
+    }
 
     // --- Agreement Scores ---
     double baseRadius = T.AGREEMENT_REWARD_RADIUS_IRE * irescale;

@@ -261,6 +261,10 @@ public:
 			double VET_ADJ_NEIGH_WEIGHT_CONF      = 0.27;
 			double VET_ADJ_NEIGH_WEIGHT_SCORE     = 0.30;
 			double VET_Y_NEIGHBOR_WEIGHT          = 0.25;
+            // Residual-Y election: demote candidates that look "chroma-like" (4fSC energy),
+            // to protect luma from chroma contamination after we already protected chroma
+            // pre-demod. This is a cheap local bucket-demod proxy on Y.
+            double VET_Y_CHROMA_LIKE_WEIGHT       = 0.12;
 			double VET_Y_ADAPTIVE_SCALE           = 0.0;
 			double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
 			bool   VET_RESIDUAL_FIR_ENABLE        = false;
