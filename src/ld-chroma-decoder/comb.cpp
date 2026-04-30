@@ -858,13 +858,72 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         float *tiRow = demodTI_line(line);
         float *tqRow = demodTQ_line(line);
 
+        auto sampleSrc = [&](int rel)->double {
+            rel = std::clamp(rel, 0, width - 1);
+            return src[left + rel];
+        };
+        auto sampleIQ = [&](int rel, double &outI, double &outQ) {
+            rel = std::clamp(rel, 0, width - 1);
+            const int hh = left + rel;
+            const int hhPh = (hh & 3);
+            const double cc = src[hh];
+            outI = cc * lutTi[hhPh];
+            outQ = cc * lutTq[hhPh];
+        };
+
         for (int xi = 0; xi < width; ++xi) {
             const int h    = left + xi;
             const double c  = src[h];
 
             const int ph = (h & 3);
-            const double ti = c * lutTi[ph];
-            const double tq = c * lutTq[ph];
+            double ti = c * lutTi[ph];
+            double tq = c * lutTq[ph];
+
+            double intakeNyquistRiskIRE = 0.0;
+            double lumaIncursionRiskIRE = 0.0;
+            double residualFitErrorIRE = 0.0;
+
+            if (line >= 0 && line < (int)fvfMetrics.size() &&
+                xi < (int)fvfMetrics[line].size())
+            {
+                const double fine = std::fabs(sampleSrc(xi) -
+                                              0.5 * (sampleSrc(xi - 1) + sampleSrc(xi + 1))) * invIreScale;
+                const double mid = std::fabs(sampleSrc(xi) -
+                                             0.5 * (sampleSrc(xi - 2) + sampleSrc(xi + 2))) * invIreScale;
+                const double coarse = std::fabs(sampleSrc(xi) -
+                                                0.5 * (sampleSrc(xi - 4) + sampleSrc(xi + 4))) * invIreScale;
+                const double denom = fine + mid + coarse + 1e-9;
+                const double fineFrac = fine / denom;
+                const double nonFineFrac = std::max(mid, coarse) / denom;
+                const double dominance = std::clamp((fineFrac - nonFineFrac - 0.15) / 0.35, 0.0, 1.0);
+                intakeNyquistRiskIRE = fine * dominance;
+
+                double tiLm1 = 0.0, tqLm1 = 0.0, tiLp1 = 0.0, tqLp1 = 0.0;
+                double tiLm2 = 0.0, tqLm2 = 0.0, tiLp2 = 0.0, tqLp2 = 0.0;
+                sampleIQ(xi - 1, tiLm1, tqLm1);
+                sampleIQ(xi + 1, tiLp1, tqLp1);
+                sampleIQ(xi - 2, tiLm2, tqLm2);
+                sampleIQ(xi + 2, tiLp2, tqLp2);
+
+                const double avg1I = 0.5 * (tiLm1 + tiLp1);
+                const double avg1Q = 0.5 * (tqLm1 + tqLp1);
+                const double avg2I = 0.5 * (tiLm2 + tiLp2);
+                const double avg2Q = 0.5 * (tqLm2 + tqLp2);
+
+                const double err1IRE = std::hypot(ti - avg1I, tq - avg1Q) * invIreScale;
+                const double err2IRE = std::hypot(ti - avg2I, tq - avg2Q) * invIreScale;
+                const double iqMagIRE = std::hypot(ti, tq) * invIreScale;
+                residualFitErrorIRE = 0.65 * err1IRE + 0.35 * err2IRE;
+
+                const double incoherence = std::clamp(
+                    (residualFitErrorIRE - std::max(1.0, 0.25 * iqMagIRE)) / 4.0,
+                    0.0, 1.0);
+                lumaIncursionRiskIRE = intakeNyquistRiskIRE * incoherence;
+
+                fvfMetrics[line][xi].intakeNyquistRiskIRE = intakeNyquistRiskIRE;
+                fvfMetrics[line][xi].lumaIncursionRiskIRE = lumaIncursionRiskIRE;
+                fvfMetrics[line][xi].residualFitErrorIRE = residualFitErrorIRE;
+            }
 
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
@@ -2262,7 +2321,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // Chroma magnitude above which the pixel is considered saturated enough to influence election (IRE)
     const double CHROMA_STRONG_IRE  = 6.0;
 
-    // Maximum distance in luma IRE frame may deviate from field when field is the model before being considered unreliable
+    // Maximum distance in luma IRE frame may deviate from the active model before being considered unreliable
     const double FRAME_MAX_DIST_IRE = 4.0;
 
     // Maximum interfield luma divergence (IRE) below which Frame combing is permitted.
@@ -2393,10 +2452,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         double diff_candA_ire = std::fabs(lumFR - lumFA) * invI;
         double diff_candB_ire = std::fabs(lumFR - lumFB) * invI;
-        double diff_cand_ire   = std::min(diff_candA_ire, diff_candB_ire);
-        
-        double dFR_ire = std::fabs(lumFB - lumFR) * invI;
-        bool frameInsane = (dFR_ire > FRAME_MAX_DIST_IRE);
+        double diff_cand_ire  = std::min(diff_candA_ire, diff_candB_ire);
+        double frameModelDistIRE = localUseFrameModel ? diff_cand_ire : diff_candA_ire;
+        bool frameInsane = (frameModelDistIRE > FRAME_MAX_DIST_IRE);
     
         double interfield_luma_ire = std::fabs(
             0.5 * (notchScalar(line - 1, rel) + notchScalar(line + 1, rel))
@@ -2434,14 +2492,19 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         bool safeR = fvf_is_tri_safe(FR, L1, invI, TRI_SAFE_IRE);
 
         FvfModelMetrics metrics;
+        if (line >= 0 && line < (int)fvfMetrics.size() &&
+            rel < (int)fvfMetrics[line].size())
+        {
+            metrics = fvfMetrics[line][rel];
+        }
         metrics.chromaMagIRE = chromaMagIRE;
         metrics.chromaBandEnergyIRE = chromaMagIRE;
         metrics.verticalBoundaryIRE = hIRE;
         metrics.horizontalBoundaryIRE = vIRE;
         metrics.fieldFrameDivergenceIRE = diff_fvf_ire;
         metrics.interfieldDistinctIRE = smoothed_interfield;
-        metrics.frameToFieldModelIRE = std::fabs(lumFR - lumFA) * invI;
-        metrics.frameToBestFieldIRE = std::min(std::fabs(lumFR - lumFA), std::fabs(lumFR - lumFB)) * invI;
+        metrics.frameToFieldModelIRE = diff_candA_ire;
+        metrics.frameToBestFieldIRE = diff_cand_ire;
         metrics.frameModel = localUseFrameModel;
         metrics.managementVeto = managementVeto;
         metrics.frameVertCoherent = b2VertCoherent;
@@ -2567,9 +2630,29 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             scoreB *= (1.0 - W_B_HELP * wantB);
 
             // ------------------------------------------------------------
-            // Scale bias: only in Frame-model regime (progressive).
+            // Model-aware regime scoring.
+            // Progressive protects Frame and scores fields by their deviation
+            // from the frame model. Interlace treats Field A as the model,
+            // lets A/B compete, and only gives Frame a small bonus when it is
+            // very close to the field model.
             // ------------------------------------------------------------
-            if (localUseFrameModel && frameIQ && rel < (int)frameIQ->size()) {
+            if (localUseFrameModel) {
+                scoreA += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
+                scoreB += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
+                if (!managementVeto && b2VertCoherent) {
+                    scoreR *= T.FRAME_MODEL_BIAS;
+                }
+            } else {
+                const double closeFrameBonus = std::clamp(
+                    1.0 - (diff_candA_ire / std::max(1e-9, T.FVF_SMALL_DIFF_IRE)),
+                    0.0, 1.0);
+                scoreA *= T.FIELD_MODEL_BIAS;
+                scoreR += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
+                scoreR *= T.FRAME_IN_INTERLACE_PENALTY;
+                scoreR *= (1.0 - 0.08 * closeFrameBonus);
+            }
+
+            if (frameIQ && rel < (int)frameIQ->size()) {
                 auto iqMag = [&](int r)->double {
                     r = std::clamp(r, 0, width - 1);
                     const auto &z = (*frameIQ)[r];
@@ -2592,7 +2675,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 metrics.iqCoarseFrac = coarseFrac;
                 metrics.iqCoherence = 1.0 - std::clamp(coarseFrac, 0.0, 1.0);
 
-                const double FRAME_BONUS_STRENGTH   = 0.15;
+                const double frameScaleBiasStrength = localUseFrameModel
+                    ? T.FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE
+                    : T.FRAME_SCALE_BIAS_STRENGTH_INTERLACE;
                 const double FRAME_COARSE_CLAMP     = 0.60;
                 const double FIELD_A_FINE_PENALTY   = 0.10;
                 const double FIELD_B_FINE_PENALTY   = 0.05;
@@ -2600,7 +2685,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
                 const bool fineDominant = (fineFrac > (midFrac + coarseFrac) + 0.10);
 
-                double frameBonus = FRAME_BONUS_STRENGTH * fineFrac;
+                double frameBonus = frameScaleBiasStrength * fineFrac;
                 frameBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
                 scoreR *= (1.0 - frameBonus);
 
@@ -2613,10 +2698,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     scoreB *= (1.0 + FIELD_SWITCH_STRENGTH * bias);
                 }
             }
-
-            const double MODEL_BIAS = 0.9;
-            if (localUseFrameModel) scoreR *= MODEL_BIAS;
-            else               scoreB *= MODEL_BIAS;
 
             // --- cross-domain neighbor estimate using 2 plus a small 1 term ---
             if (!vdisHard &&
@@ -2674,15 +2755,22 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 scoreR += W_NEIGH * dR;
             }
 
-            // A/B comb divergence: penalise both intrafield combs equally.
-            // Frame score is untouched  it gains by default if A and B can't agree.
-            // Only applies in interlace mode; progressive assumes no field separation.
+            // When the fields disagree in interlace, use 1D as a soft reality
+            // check to favor the field that is less likely to be alternating.
             if (!localUseFrameModel) {
                 double ab_div_ire = std::fabs(lumFA - lumFB) * invI;
                 if (ab_div_ire > FIELD_DISAGREE_IRE) {
-                    double pen = (ab_div_ire - FIELD_DISAGREE_IRE) * 0.15;
-                    scoreA += pen;
-                    scoreB += pen;
+                    double dA1 = std::fabs(lumFA - L1) * invI;
+                    double dB1 = std::fabs(lumFB - L1) * invI;
+                    double realityBias = std::min(std::fabs(dA1 - dB1), 4.0);
+                    double biasScale = 0.08 * realityBias;
+                    if (dA1 + T.ONE_D_NEAR_THRESH_IRE < dB1) {
+                        scoreA *= (1.0 - biasScale);
+                        scoreB *= (1.0 + biasScale);
+                    } else if (dB1 + T.ONE_D_NEAR_THRESH_IRE < dA1) {
+                        scoreB *= (1.0 - biasScale);
+                        scoreA *= (1.0 + biasScale);
+                    }
                 }
             }
 

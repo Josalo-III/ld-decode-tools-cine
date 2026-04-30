@@ -304,6 +304,7 @@ private:
         // Stored per pixel so downstream consumers can understand why a line
         // segment was treated as frame-model vs field-model, edge-risk, etc.
         struct FvfModelMetrics {
+            double intakeNyquistRiskIRE = 0.0;
             double chromaMagIRE = 0.0;
             double verticalBoundaryIRE = 0.0;   // horizontal gradient: scanline crosses a vertical edge
             double horizontalBoundaryIRE = 0.0; // vertical gradient: scanline runs along/grazes an edge
