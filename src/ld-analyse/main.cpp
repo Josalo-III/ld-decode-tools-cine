@@ -114,9 +114,9 @@ int main(int argc, char *argv[])
     // This must match the installed .desktop file name (without .desktop extension)
     QGuiApplication::setDesktopFileName("ld-analyse");
     
-    // Set application icon (for window decorations and taskbar)
-    // QIcon::fromTheme will find the icon we installed to /usr/local/share/icons/hicolor/
-    a.setWindowIcon(QIcon::fromTheme("ld-analyse"));
+    // Set application icon (for window decorations and taskbar).
+    // Theme lookup covers Linux installs; the resource fallback covers macOS bundles.
+    a.setWindowIcon(QIcon::fromTheme("ld-analyse", QIcon(":/icons/Graphics/128-analyse.png")));
 
     // Set up the command line parser
     QCommandLineParser parser;

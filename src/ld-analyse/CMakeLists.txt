@@ -23,6 +23,13 @@ set(ld-analyse_SOURCES
 
 qt_add_resources(ld-analyse_SOURCES ld-analyse-resources.qrc)
 
+if(APPLE)
+    set(APP_ICON_MACOSX "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/ld-analyse.icns")
+    list(APPEND ld-analyse_SOURCES ${APP_ICON_MACOSX})
+    set_source_files_properties(${APP_ICON_MACOSX} PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources")
+endif()
+
 if(WIN32)
     set(APP_ICON_RESOURCE_WINDOWS "${CMAKE_CURRENT_SOURCE_DIR}/appicon.rc")
     add_executable(ld-analyse MACOSX_BUNDLE
@@ -37,6 +44,7 @@ set_target_properties(ld-analyse PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER "org.ld-decode-tools.ld-analyse"
     MACOSX_BUNDLE_BUNDLE_NAME "ld-analyse"
     MACOSX_BUNDLE_BUNDLE_VERSION "${APP_COMMIT}"
+    MACOSX_BUNDLE_ICON_FILE "ld-analyse.icns"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${APP_COMMIT}"
 )
 
