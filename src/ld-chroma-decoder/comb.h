@@ -213,17 +213,34 @@ public:
 			double FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE = 0.15;
 			double FRAME_SCALE_BIAS_STRENGTH_INTERLACE   = 0.0;
             						
-			// =========================================================================
-			// 3D candidate / vet / Y path
-			// =========================================================================
-			int    CANDIDATE_SYSTEM                 = 0;
-			// 2D Agreement Curve - prev/next get bonus for similarity to 2D
-			double AGREEMENT_REWARD_RADIUS_IRE    = 4.5;
-			double AGREEMENT_REWARD_MAX           = 2.5;
-			double AGREEMENT_VETO_BASE            = 12.0;
-			// At the other end, there is a severe deviation penalty
-			double deviationThreshold            = 10.0;
-			double deviationPenalty               = 3.0;
+				// =========================================================================
+				// 3D candidate / vet / Y path
+				// =========================================================================
+				int    CANDIDATE_SYSTEM                 = 0;
+				// 2D Similarity Curve for temporal candidates (getBestCandidate).
+				//
+				// We compare a temporal candidate sample to the local 2D estimate (clpbuffer[1]).
+				// Let d = |cand - ref2d| in IRE. We then add a delta to the candidate penalty:
+				//   if d <= AGREEMENT_REWARD_RADIUS_IRE:
+				//     delta = -AGREEMENT_REWARD_MAX * adaptThreshold * (1 - (d/r)^2)
+				//   else if d <= deviationThreshold:
+				//     delta = 0
+				//   else:
+				//     delta = AGREEMENT_VETO_BASE + deviationPenalty * (d - deviationThreshold)
+				//
+				// Notes:
+				// - AGREEMENT_REWARD_MAX is in the same penalty units as getCandidate() (roughly IRE).
+				// - adaptThreshold scales only the reward lobe (user-facing strength control).
+				// - deviationThreshold and deviationPenalty define the veto knee and slope.
+				// - deviationThreshold is shared with getBestY(): it is the
+				//   global "temporal mixing veto" control. When the material disagrees
+				//   beyond this point, both 3D candidate selection and residual-Y temporal
+				//   mixing are suppressed consistently.
+				double AGREEMENT_REWARD_RADIUS_IRE    = 4.5;  // reward region radius (IRE)
+				double AGREEMENT_REWARD_MAX           = 2.7;  // max reward at d=0 (penalty units, scaled by adaptThreshold)
+				double AGREEMENT_VETO_BASE            = 12.0; // base penalty once d exceeds deviationThreshold
+				double deviationThreshold            = 8.0; // start of veto region (IRE)
+				double deviationPenalty               = 3.0;  // penalty slope beyond deviationThreshold (per IRE)
 
             // We look for Y leakage in our chroma
 			double LEAKAGE_ALPHA_MAX              = 0.60;
