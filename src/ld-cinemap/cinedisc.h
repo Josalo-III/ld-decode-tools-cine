@@ -41,6 +41,7 @@ public:
     // comma delimited lists; blacklist accepts ranges
     virtual int applyEditWhitelistSeqNoKeys(const QString& csvSeqNoList) = 0;
     virtual int applyEditBlacklistSeqNoKeys(const QString& csvSeqNoListWithRanges) = 0;
+    virtual int applyCadenceOverrideFieldRange(const QString& rangeSpec) = 0;
 
     // No-op hook for implementations that maintain a derived frame cache.
     // CineDiscMeta has no such cache; this exists so CineMap can call it

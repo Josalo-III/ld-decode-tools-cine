@@ -1,6 +1,7 @@
 // tools/ld-cinemap/cinedisc.cpp
 #include "cinedisc.h"
 
+#include "cadencedefs.h"
 #include "lddecodemetadata.h"
 #include "tbc/logging.h"
 
@@ -47,7 +48,56 @@ namespace {
         out.erase(std::unique(out.begin(), out.end()), out.end());
         return out;
     }
-    
+
+    static QString pulldownRoleForCadenceId(int cid)
+    {
+        if (!cadenceKnown(cid)) return QString();
+        if (isDefinitionalRole(cid)) return QStringLiteral("definitional");
+        if (isSpareRole(cid)) return QStringLiteral("spare");
+        return QString();
+    }
+
+    static bool parseCadenceOverrideSpec(const QString& text, qint32& firstField, qint32& lastField, int& firstCid)
+    {
+        const QString spec = text.trimmed();
+        const int colon = spec.indexOf(':');
+        if (colon <= 0 || colon == spec.size() - 1) return false;
+
+        const QString rangeText = spec.left(colon).trimmed();
+        const QString cidText = spec.mid(colon + 1).trimmed();
+        const int dash = rangeText.indexOf('-');
+        if (dash <= 0 || dash == rangeText.size() - 1) return false;
+
+        bool okFirst = false, okLast = false, okCid = false;
+        firstField = rangeText.left(dash).trimmed().toInt(&okFirst);
+        lastField = rangeText.mid(dash + 1).trimmed().toInt(&okLast);
+        firstCid = cidText.toInt(&okCid);
+
+        if (!okFirst || !okLast || !okCid) return false;
+        if (firstField <= 0 || lastField <= 0) return false;
+        if (firstField > lastField) std::swap(firstField, lastField);
+
+        if (firstCid == CADENCE_UNKNOWN ||
+            firstCid == CADENCE_VIDEO ||
+            firstCid == CADENCE_PROGRESSIVE) {
+            return true;
+        }
+
+        return (firstCid >= 0 &&
+                firstCid < CADENCE_NTSC_INVERTED_OFFSET + CADENCE_NTSC_CYCLE);
+    }
+
+    static int cadenceIdAtOffset(int firstCid, int offset)
+    {
+        if (!cadenceKnown(firstCid)) return firstCid;
+
+        const int base = cadenceIsInverted(firstCid) ? CADENCE_NTSC_INVERTED_OFFSET : 0;
+        int idx = cadenceIndex(firstCid);
+        idx = (idx + offset) % CADENCE_NTSC_CYCLE;
+        if (idx < 0) idx += CADENCE_NTSC_CYCLE;
+        return base + idx;
+    }
+
 } // namespace
 
 class CineDiscMeta : public CineDisc
@@ -192,6 +242,38 @@ public:
     {
         const auto keys = parseSeqNoKeys(csvSeqNoListWithRanges, /*allowRanges=*/true);
         return applyEditOverridesBySeqNoKeys(keys, /*value=*/false);
+    }
+
+    int applyCadenceOverrideFieldRange(const QString& rangeSpec) override
+    {
+        qint32 firstField = 0, lastField = 0;
+        int firstCid = CADENCE_UNKNOWN;
+        if (!parseCadenceOverrideSpec(rangeSpec, firstField, lastField, firstCid)) {
+            qWarning() << "Invalid cadence override spec:" << rangeSpec
+                       << "(expected fieldStart-fieldEnd:cadenceId)";
+            return -1;
+        }
+
+        const qint32 totalFields = m_md->getNumberOfFields();
+        int changed = 0;
+        int cadenceOffset = 0;
+
+        for (qint32 idx = firstField; idx <= lastField && idx <= totalFields; ++idx) {
+            const auto field = m_md->getField(idx);
+            if (field.pad) continue;
+
+            const int cid = cadenceIdAtOffset(firstCid, cadenceOffset++);
+
+            auto modifiedField = field;
+            modifiedField.cinemap.cadenceId = cid;
+            modifiedField.cinemap.cadenceIndexPresumed = false;
+            modifiedField.cinemap.pulldownRole = pulldownRoleForCadenceId(cid);
+            modifiedField.cinemap.isManualOverride = true;
+            m_md->updateField(modifiedField, idx);
+            changed++;
+        }
+
+        return changed;
     }
 
 private:

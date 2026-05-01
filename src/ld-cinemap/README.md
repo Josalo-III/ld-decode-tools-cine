@@ -39,15 +39,23 @@ ld-cinemap --skip-edits --cine <input.tbc> [output]
 
 Requires `isEditBoundary` flags already present in input metadata.
 
+### Override Only (`--override-only`)
+Applies manual edit whitelist/blacklist and cadence overrides, then writes metadata. Does not run segmentation, visual edit detection, or cadence solving.
+
+```bash
+ld-cinemap --override-only --cadence-override 12340-12419:0 <input.tbc> [output]
+```
+
 ## Options
 
 ### Cadence Policy
 
 - **`--cine`**: Film-edited policy. Optimised for discs where film was edited before telecine; produces 3:2 pulldown locks with cadence breaks only at reel changes.
 - **`--tv`** (default): Video-edited policy. Optimised for footage telecined then edited in video; solves each shot separately.
+- **`--cadence-override <start-end:cid>`**: Manually write cadence IDs over a 1-based field-number range matching ld-analyse's field display. `cid` is the first field's `cadenceId`; known cadence IDs (`0..9`, `10..19`) advance through the NTSC sequence, while `-1`, `-2`, and `-3` fill the range flat. May be repeated.
 
 ### Visual Edit Detection
-Ignored with `--skip-edits`.
+Ignored with `--skip-edits` and `--override-only`.
 
 - **`--sensitivity <value>`** (default: 8.0) — Overall sensitivity. Lower flags more edits; higher is more conservative. Typical range: 4.0–12.0.
 - **`--strong <value>`** (default: 1.5) — Multiplier for strong discontinuities.
@@ -79,6 +87,12 @@ ld-cinemap --detect-edits-only --sensitivity 6.0 source.tbc
 # Re-solve with different policy, keeping existing boundaries
 ld-cinemap --skip-edits --tv source.tbc refined.tbc
 
+# Re-solve, then manually force a cadence sequence over a problem range
+ld-cinemap --skip-edits --cadence-override 12340-12419:0 source.tbc
+
+# Patch only the manual override metadata, leaving detection and solve output untouched
+ld-cinemap --override-only --cadence-override 12340-12419:0 source.tbc
+
 # Start fresh, aggressive detection, auto-confirm
 ld-cinemap --clear-all-flags --sensitivity 4.0 --cine --yes source.tbc
 
@@ -92,16 +106,20 @@ ld-cinemap --cine source.tbc /archive/restored
 
 Written to the SQLite `.tbc.db` at field level:
 
-**Edit detection** (all modes except `--skip-edits`):
+**Edit detection** (full pipeline and `--detect-edits-only`):
 - `isEditBoundary` — true at phase discontinuities and visual cuts.
 
-**Cadence solving** (all modes except `--detect-edits-only`):
+**Cadence solving** (full pipeline and `--skip-edits`):
 - `cadenceId` — film frame identity within the cadence group; −1 if unsolved.
 - `cadenceIndexPresumed` — true if the assignment was interpolated.
 - `pulldownRole` — field's role in the 3:2 pattern (`"definitional"`, `"spare"`, or empty).
 
+**Manual overrides** (`--override-only`, or after detection/solve in other modes):
+- `--edit-whitelist` / `--edit-blacklist` — force or remove `isEditBoundary`.
+- `--cadence-override` — writes `cadenceId`, clears `cadenceIndexPresumed`, and refreshes `pulldownRole`.
+
 **Global**:
-- `isCinemapped` — set in video parameters after any solve run.
+- `isCinemapped` — set in video parameters after any solve run, or after a cadence override writes at least one field.
 
 Input and output metadata are SQLite 3 databases conforming to the ld-decode schema. See ld-decode documentation for full schema details.
 
