@@ -2361,8 +2361,8 @@ void Comb::FrameBuffer::filterIQLocked()
     // FIR setup (same parameters as in splitIQlocked)
     constexpr bool   EXP_IQ_FIR_ENABLE = true;
     constexpr int    EXP_FIR_TAPS      = 21;
-    constexpr double EXP_I_CUTOFF_MHZ  = 1.40;
-    constexpr double EXP_Q_CUTOFF_MHZ  = 0.75; // We backed off from spec to avoid shaving the trace
+    constexpr double EXP_I_CUTOFF_MHZ  = 1.5;
+    constexpr double EXP_Q_CUTOFF_MHZ  = 0.67; // We backed off from spec to avoid shaving the trace
 
     if (!EXP_IQ_FIR_ENABLE) return;
 
