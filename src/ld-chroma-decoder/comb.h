@@ -50,6 +50,7 @@ public:
         bool   adaptive    = true; // If true, the 3D adaptive candidate selection is used.
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
+        bool   debugPhaseLegs = false; // Log per-(h&3) locked-demod residual stats.
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
@@ -81,7 +82,8 @@ public:
 			Line,           // 1D only
 			Field,          // Field A (Smart VDIS)
 			FieldB,         // Field B (Simple)
-			Frame,          // Frame (was FrameB2)
+			FramePreclean,  // Frame A: interfield frame from precleaned demod
+			FrameRaw,       // Frame B: interfield frame from locked 1D demod
 			FieldVsFrame    // FVF (Default)
 		};
 		TwoDVariant twoDVariant = FieldVsFrame;
@@ -344,6 +346,30 @@ private:
             int winner = 1;
         };
 
+        // Signal ownership evidence, collected before election. This is not a
+        // scoring model; it records why bandpassed energy looks luma-owned,
+        // chroma-owned, or contested so demod/admission can later act on it.
+        struct OwnershipEvidence {
+            double bandpassFineIRE = 0.0;
+            double bandpassMidIRE = 0.0;
+            double bandpassCoarseIRE = 0.0;
+            double lumaExcursionIRE = 0.0;
+            double residualFitErrorIRE = 0.0;
+            double lumaIncursionRiskIRE = 0.0;
+            double locked1DChromaIRE = 0.0;
+
+            double fieldAChromaIRE = 0.0;
+            double fieldBChromaIRE = 0.0;
+            double frameChromaIRE = 0.0;
+            double candidateSpreadIRE = 0.0;
+            double frameFieldAgreementIRE = 0.0;
+            double frameIQCoherence = 0.0;
+
+            double lumaClaim = 0.0;
+            double chromaClaim = 0.0;
+            double uncertainClaim = 1.0;
+        };
+
         FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
                     const Configuration &configuration_);
 
@@ -351,6 +377,7 @@ private:
 
         void split1D();
 		void buildPhaseCorrected1D();
+        void rebuildLockedDemodFromSelectedComb();
         void split2D();
         void copy2DTo3D(); 
         void split3D(const FrameBuffer &previousFrame,
@@ -375,6 +402,7 @@ private:
                         const FrameBuffer &nextFrame);
 
         const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
+        const std::vector<std::vector<OwnershipEvidence>> &getOwnershipEvidence() const { return ownershipEvidence; }
 
         // Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
         // Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
@@ -457,6 +485,10 @@ private:
         std::vector<float>  scratch_fvf_outShade;
         std::vector<double> scratch_fvf_diffFVF;
         std::vector<double> scratch_fvf_satMap;
+        // Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
+        // of framePreclean). Cached during the main scoring pass so the island
+        // filter and any post-processing can recover the Frame A output.
+        std::vector<double> scratch_fvf_frameAVal;
         std::vector<double> scratch_filter_temp;
         std::vector<double> scratch_hpI;
         std::vector<double> scratch_hpQ;
@@ -466,6 +498,7 @@ private:
 		std::vector<char> scratch_vdis_flag;
 		std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
         std::vector<std::vector<double>> locked1DSource; // [line][rel], locked-mode stable source for 2D
+        std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
 
         inline int simpleField2DRingSlot(int lineNumber) const
         {
@@ -512,13 +545,30 @@ private:
 
 		void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
 
-		void demodSimpleField2DLine(int line);
+        void demodSimpleField2DLine(int line);
 
-        // Frame B: demod/remod version, ±1, skew
-		void computeFrameIQLine(int line,
-								std::vector<std::complex<double>> &outFrameIQ);
+        void computeFrameIQPrecleanLine(int line,
+                                        std::vector<std::complex<double>> &outFrameIQ);
+        void computeFrameIQLocked1DLine(int line,
+                                        std::vector<std::complex<double>> &outFrameIQ,
+                                        const std::vector<float> *tiOverride = nullptr,
+                                        const std::vector<float> *tqOverride = nullptr);
+        void computeFrameIQFromPreparedVectors(int line,
+                                               const std::vector<std::complex<double>> &centerIQ,
+                                               std::vector<std::complex<double>> upIQ,
+                                               std::vector<std::complex<double>> dnIQ,
+                                               std::vector<std::complex<double>> &outFrameIQ,
+                                               const std::vector<float> *tiOverride,
+                                               const std::vector<float> *tqOverride,
+                                               bool enableLateralRefine);
+        void collectCombOwnershipEvidence(int line,
+                                           const double *fieldA,
+                                           const double *fieldB,
+                                           const std::vector<double> &frameScalar,
+                                           const std::vector<std::complex<double>> *frameIQ);
+        void reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const;
 		// Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
-		// into scratch_vdis_flag for a given line. Does not modify FieldA/FrameB2.
+		// into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.
 		void computeVDISLine(int lineNumber);
         static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
                                            const LdDecodeMetaData::VideoParameters &vp);
@@ -529,7 +579,8 @@ private:
             int line,
             const double *fieldA,
             const double *fieldB,
-            const std::vector<double> &frameB2,
+            const std::vector<double> &framePreclean,
+            const std::vector<double> *frameRaw,
             double *outMixed,
             bool writeWeights,
             const double *lateral1D,

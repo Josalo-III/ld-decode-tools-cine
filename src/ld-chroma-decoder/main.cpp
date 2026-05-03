@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
     QCommandLineOption twoDVariantOption(
         QStringList() << QCoreApplication::translate("main", "two-d-variant"),
         QCoreApplication::translate("main",
-            "2D comb variant: line | field | fieldb | frame | fvf (default) Select between 2D comb filters: Frame is an interfield comb; Field and Field B are intrafield combs, B is simpler; Line is 1D - FVF (Field Vs Frame) intelligently selects per pixel from Frame and Field A/B "),
+            "2D comb variant: line | field | fieldb | frame-preclean | frame-raw | fvf (default)"),
         QCoreApplication::translate("main", "variant"),
         QCoreApplication::translate("main", "fvf"));
     parser.addOption(twoDVariantOption);
@@ -312,7 +312,11 @@ int main(int argc, char *argv[])
     QCommandLineOption debugCadenceOption(QStringList() << "debug-cadence",
                                     QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
     parser.addOption(debugCadenceOption);
-    
+
+    QCommandLineOption debugPhaseLegsOption(QStringList() << "debug-phase-legs",
+                                    QCoreApplication::translate("main", "NTSC locked mode: log per-(h&3) phase-leg demod residual statistics for diagnosing ordered column artifacts"));
+    parser.addOption(debugPhaseLegsOption);
+
     QCommandLineOption noPAOption(QStringList() << "no-pa",
         QCoreApplication::translate("main", "Disable pulldown awareness - reverts to original 29.97 video process"));
     parser.addOption(noPAOption);
@@ -410,6 +414,10 @@ int main(int argc, char *argv[])
     if (parser.isSet(debugCadenceOption)) {
         combConfig.debugCadence = true;
     }
+    if (parser.isSet(debugPhaseLegsOption)) {
+        combConfig.debugPhaseLegs = true;
+    }
+
     if (cadenceConfig.noPA && cadenceConfig.setCadence != 0) {
     qCritical() << "--set-cadence is incompatible with --no-pa (pulldown processing disabled)";
     return -1;
@@ -418,12 +426,19 @@ int main(int argc, char *argv[])
     QString v = parser.value(twoDVariantOption).toLower();
     if (v == "line") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Line;
-    } else if (v == "field") {
+    } else if (v == "field" || v == "fielda") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Field;
     } else if (v == "fieldb") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldB;
-    } else if (v == "frame" || v == "frameb2") {
-        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Frame;
+    } else if (v == "frame-preclean" || v == "preclean-frame" || v == "framea") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FramePreclean;
+    } else if (v == "frame-raw" || v == "raw-frame" || v == "frameb") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameRaw;
+    } else if (v == "frame") {
+        // Backward-compat: historically "frame" was ambiguous / repurposed in experiments.
+        // Default it to the precleaned interfield Frame to preserve legacy expectations.
+        qWarning() << "two-d-variant=frame is deprecated; use frame-preclean or frame-raw";
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FramePreclean;
     } else if (v == "fvf" || v == "fieldvframe") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldVsFrame;
     } else {

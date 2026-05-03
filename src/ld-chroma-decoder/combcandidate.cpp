@@ -44,8 +44,7 @@ bool Comb::FrameBuffer::hasVDIS(int lineNumber, int h) const
     return row[rel] != 0;
 }
 
-
-// Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically
+// Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically 
 // influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
 void Comb::FrameBuffer::computeField2DLine(int lineNumber,
                                           double *outFieldLine,
@@ -121,75 +120,70 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
     const auto  &T    = configuration.tunables;
     const double invI = this->invIreScale;
 
+    auto reflectRel = [&](int r)->int {
+        if (r < 0) return -r;
+        if (r >= width) return (width - 1) - (r - (width - 1));
+        return r;
+    };
+
+    // Debug-only: measure whether Field A is actually producing a vertical estimate
+    // or collapsing into near-zero output (which reads as "1D remains").
+    qint64 dbgN = 0;
+    qint64 dbgCollapsedN = 0;
+    double dbgSumGate = 0.0;
+    double dbgSumAbsTc = 0.0;
+    double dbgSumAbsC = 0.0;
+
     // Phase relationship range (like FieldB; in IRE)
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
 
     // Luma-edge exclusion for far reach (prevents reaching across disparate vertical regions)
-    const double EDGE_SOFT_IRE = 6.0;
-    const double EDGE_HARD_IRE = 14.0;
-
-    auto edgeGateAt = [&](int rel)->double {
-        const int rm1 = (rel > 0) ? (rel - 1) : 0;
-        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
-        const double eIRE = std::fabs(row0[rp1] - row0[rm1]) * invI;
-
-        if (eIRE <= EDGE_SOFT_IRE) return 1.0;
-        if (eIRE >= EDGE_HARD_IRE) return 0.0;
-        double t = (eIRE - EDGE_SOFT_IRE) / (EDGE_HARD_IRE - EDGE_SOFT_IRE);
-        t = std::clamp(t, 0.0, 1.0);
-        return 1.0 - t;
-    };
-
     for (int h = left; h < right; ++h) {
         const int rel = h - left;
 
-        const int rm1 = (rel > 0) ? (rel - 1) : 0;
-        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
+        const int rm1 = reflectRel(rel - 1);
+        const int rp1 = reflectRel(rel + 1);
 
-        // Center and symmetric lateral context (reduces column bias)
+        // Conservative reform: Field A should look like Field B, with an
+        // additional cautious ±4 reach. Avoid extra heuristics that create
+        // phase-leg / column artifacts.
+
         const double C    = row0[rel];
-        const double C_m1 = row0[rm1];
-        const double C_p1 = row0[rp1];
-        const double symCur = 0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
+        const double Cup2 = rowUp2[rel];
+        const double Cdn2 = rowDn2[rel];
+        const double Cup4 = rowUp4[rel];
+        const double Cdn4 = rowDn4[rel];
 
-        // --- Near samples (2) ---
-        const double U2    = rowUp2[rel];
-        const double D2    = rowDn2[rel];
-        const double U2_m1 = rowUp2[rm1];
-        const double U2_p1 = rowUp2[rp1];
-        const double D2_m1 = rowDn2[rm1];
-        const double D2_p1 = rowDn2[rp1];
-        const double symU2 = 0.5 * (std::fabs(U2_m1) + std::fabs(U2_p1));
-        const double symD2 = 0.5 * (std::fabs(D2_m1) + std::fabs(D2_p1));
+        const double C_m1    = row0[rm1];
+        const double C_p1    = row0[rp1];
+        const double Cup2_m1 = rowUp2[rm1];
+        const double Cup2_p1 = rowUp2[rp1];
+        const double Cdn2_m1 = rowDn2[rm1];
+        const double Cdn2_p1 = rowDn2[rp1];
+        const double Cup4_m1 = rowUp4[rm1];
+        const double Cup4_p1 = rowUp4[rp1];
+        const double Cdn4_m1 = rowDn4[rm1];
+        const double Cdn4_p1 = rowDn4[rp1];
 
-        // --- Far samples (4) ---
-        const double U4    = rowUp4[rel];
-        const double D4    = rowDn4[rel];
-        const double U4_m1 = rowUp4[rm1];
-        const double U4_p1 = rowUp4[rp1];
-        const double D4_m1 = rowDn4[rm1];
-        const double D4_p1 = rowDn4[rp1];
-        const double symU4 = 0.5 * (std::fabs(U4_m1) + std::fabs(U4_p1));
-        const double symD4 = 0.5 * (std::fabs(D4_m1) + std::fabs(D4_p1));
+        const double symCur  = 0.5 * (std::fabs(C_m1)    + std::fabs(C_p1));
+        const double symUp2  = 0.5 * (std::fabs(Cup2_m1) + std::fabs(Cup2_p1));
+        const double symDn2  = 0.5 * (std::fabs(Cdn2_m1) + std::fabs(Cdn2_p1));
+        const double symUp4  = 0.5 * (std::fabs(Cup4_m1) + std::fabs(Cup4_p1));
+        const double symDn4  = 0.5 * (std::fabs(Cdn4_m1) + std::fabs(Cdn4_p1));
 
-        // ------------------------------------------------------------
-        // PASS: compute near weights wUp2/wDn2 based on magnitude-phase agreement
-        // Similar to FieldB logic, but symmetric and tuned for A.
-        // ------------------------------------------------------------
-        auto phaseDiffMetric = [&](double C0, double sym0, double Cn, double symn)->double {
+        auto kMetric = [&](double cc, double symC, double cn, double symN)->double {
             double k = 0.0;
-            k  = std::fabs(std::fabs(C0) - std::fabs(Cn));
-            k += std::fabs(sym0 - symn);
-            // small bonus for strong signal (helps avoid weak = noisy toggles)
-            k -= (std::fabs(C0) + std::fabs(Cn)) * 0.10;
+            k  = std::fabs(std::fabs(cc) - std::fabs(cn));
+            k += std::fabs(symC - symN);
+            k -= (std::fabs(cc) + std::fabs(cn)) * 0.10;
             if (k < 0.0) k = 0.0;
             return k;
         };
 
-        double kp2 = phaseDiffMetric(C, symCur, U2, symU2);
-        double kn2 = phaseDiffMetric(C, symCur, D2, symD2);
-
+        // Near weights (same as Field B)
+        double kp2 = kMetric(C, symCur, Cup2, symUp2);
+        double kn2 = kMetric(C, symCur, Cdn2, symDn2);
         double wUp2 = (kRange > 1e-9) ? (1.0 - kp2 * invK) : 1.0;
         double wDn2 = (kRange > 1e-9) ? (1.0 - kn2 * invK) : 1.0;
         wUp2 = std::clamp(wUp2, 0.0, 1.0);
@@ -208,9 +202,8 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
                 wUp2 = wDn2 = 0.0;
             }
         } else {
-            // If up/down are similar to each other, allow both (classic fallback)
-            double dMag  = std::fabs(std::fabs(U2) - std::fabs(D2));
-            double sumUD = std::fabs(U2 + D2);
+            double dMag  = std::fabs(std::fabs(Cup2) - std::fabs(Cdn2));
+            double sumUD = std::fabs(Cup2 + Cdn2);
             if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
                 wUp2 = wDn2 = 1.0;
                 sc2 = 1.0;
@@ -219,72 +212,101 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
             }
         }
 
-        // ------------------------------------------------------------
-        // Far weights (4), but *ramped* by near confidence and edge gate
-        // This avoids far popping that creates patterned alternation.
-        // ------------------------------------------------------------
-        double kp4 = phaseDiffMetric(C, symCur, U4, symU4);
-        double kn4 = phaseDiffMetric(C, symCur, D4, symD4);
+        // 5-tap contour check:
+        // Use the full set { -4, -2, 0, +2, +4 } to decide whether far reach is
+        // on-contour. Far does not contribute directly; it only refines the ±2 tap.
+        const double FAR_INFLUENCE_BASE = 0.55;
 
-        double wUp4 = (kRange > 1e-9) ? (1.0 - kp4 * invK) : 1.0;
-        double wDn4 = (kRange > 1e-9) ? (1.0 - kn4 * invK) : 1.0;
-        wUp4 = std::clamp(wUp4, 0.0, 1.0);
-        wDn4 = std::clamp(wDn4, 0.0, 1.0);
+        auto smoothGate = [&](double xIRE, double softIRE, double hardIRE)->double {
+            if (xIRE <= softIRE) return 1.0;
+            if (xIRE >= hardIRE) return 0.0;
+            double t = (xIRE - softIRE) / (hardIRE - softIRE);
+            t = std::clamp(t, 0.0, 1.0);
+            return 1.0 - t;
+        };
 
-        // Ramp FAR by NEAR (no hard on/off)
-        const double nearConfUp = wUp2;
-        const double nearConfDn = wDn2;
+        const double aC   = std::fabs(C);
+        const double aU2  = std::fabs(Cup2);
+        const double aD2  = std::fabs(Cdn2);
+        const double aU4  = std::fabs(Cup4);
+        const double aD4  = std::fabs(Cdn4);
 
-        // Additional suppression on strong horizontal edges
-        const double eGate = edgeGateAt(rel);
+        // Detect "hard corner" / boundary crossing at the center using a discrete curvature.
+        const double curvMidIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invI;
+        const double midOk = smoothGate(curvMidIRE, 4.0, 10.0);
 
-        wUp4 *= nearConfUp * eGate;
-        wDn4 *= nearConfDn * eGate;
+        // Side-specific far consistency: far should lie near the line extrapolated from {0,±2}.
+        const double u4Pred = 2.0 * aU2 - aC;
+        const double d4Pred = 2.0 * aD2 - aC;
+        const double uResIRE = std::fabs(aU4 - u4Pred) * invI;
+        const double dResIRE = std::fabs(aD4 - d4Pred) * invI;
+        const double upSideOk = smoothGate(uResIRE, 4.0, 10.0);
+        const double dnSideOk = smoothGate(dResIRE, 4.0, 10.0);
 
-        // Prefer near unless far is clearly better; keep far subtle
-        const double FAR_SCALE = 0.65; // far contributes less authority by default
-        wUp4 *= FAR_SCALE;
-        wDn4 *= FAR_SCALE;
+        // Similarity check in the existing k-metric space (near vs far).
+        auto farSim = [&](double nearS, double nearSym, double farS, double farSym)->double {
+            const double k = kMetric(nearS, nearSym, farS, farSym);
+            const double w = (kRange > 1e-9) ? (1.0 - k * invK) : 1.0;
+            return std::clamp(w, 0.0, 1.0);
+        };
+        const double upSim = (wUp2 > 0.0) ? farSim(Cup2, symUp2, Cup4, symUp4) : 0.0;
+        const double dnSim = (wDn2 > 0.0) ? farSim(Cdn2, symDn2, Cdn4, symDn4) : 0.0;
 
-        // ------------------------------------------------------------
-        // Combine near and far contributions (still a  comb)
-        // ------------------------------------------------------------
+        // Convert similarity into a 0..1 factor (soft start at 0.55).
+        auto simFactor = [&](double sim)->double {
+            const double start = 0.55;
+            const double full  = 0.85;
+            if (sim <= start) return 0.0;
+            if (sim >= full) return 1.0;
+            double t = (sim - start) / (full - start);
+            return std::clamp(t, 0.0, 1.0);
+        };
+
+        const double upInfluence = FAR_INFLUENCE_BASE * midOk * upSideOk * simFactor(upSim);
+        const double dnInfluence = FAR_INFLUENCE_BASE * midOk * dnSideOk * simFactor(dnSim);
+
+        const double Cup2Adj = (upInfluence > 0.0)
+            ? ((Cup2 + upInfluence * Cup4) / (1.0 + upInfluence))
+            : Cup2;
+        const double Cdn2Adj = (dnInfluence > 0.0)
+            ? ((Cdn2 + dnInfluence * Cdn4) / (1.0 + dnInfluence))
+            : Cdn2;
+
         double tc = 0.0;
-
-        // Near comb component
         if (wUp2 > 0.0 || wDn2 > 0.0) {
-            double t2  = ((C - U2) * wUp2 * sc2);
-            t2        += ((C - D2) * wDn2 * sc2);
-            t2        *= 0.25;
-            tc        += t2;
-        }
-
-        // Far comb component (no separate sc; weights already ramped)
-        if (wUp4 > 0.0 || wDn4 > 0.0) {
-            const double denom = wUp4 + wDn4;
-            double sc4 = 1.0;
-            if (denom > 1e-9) {
-                sc4 = 2.0 / denom;
-                if (sc4 < 1.0) sc4 = 1.0;
-            }
-            double t4  = ((C - U4) * wUp4 * sc4);
-            t4        += ((C - D4) * wDn4 * sc4);
-            t4        *= 0.25;
-            tc        += t4;
+            double t2  = ((C - Cup2Adj) * wUp2 * sc2);
+            t2        += ((C - Cdn2Adj) * wDn2 * sc2);
+            tc        += 0.25 * t2;
         }
 
         outFieldLine[rel] = tc;
 
-        // Gate for scorer: how confident is A here?
-        // Use near confidence primarily, with far only if its present.
         double gateA = std::max(wUp2, wDn2);
-        gateA = std::max(gateA, 0.5 * std::max(wUp4, wDn4)); // far contributes but less
+        // Gate reflects near evidence; far only refines the near tap.
         gateA = std::clamp(gateA, 0.0, 1.0);
-
         if (outGate) outGate[rel] = (float)gateA;
+
+        // Collect debug stats over active region only.
+        if (configuration.debugPhaseLegs) {
+            ++dbgN;
+            dbgSumGate += gateA;
+            dbgSumAbsTc += std::fabs(tc) * invI;
+            dbgSumAbsC += std::fabs(C) * invI;
+            if ((wUp2 + wDn2) < 0.10) ++dbgCollapsedN;
+        }
+    }
+
+    if (configuration.debugPhaseLegs && dbgN > 0) {
+        const double invN = 1.0 / (double)dbgN;
+        qInfo().noquote() << QString("FieldAStats line=%1 n=%2 collapsed=%3 gate=%4 absTcIRE=%5 absCIRE=%6")
+            .arg(lineNumber)
+            .arg(dbgN)
+            .arg(dbgCollapsedN)
+            .arg(dbgSumGate * invN, 0, 'f', 3)
+            .arg(dbgSumAbsTc * invN, 0, 'f', 3)
+            .arg(dbgSumAbsC * invN, 0, 'f', 3);
     }
 }
-
 
 // Field B
 // Simplified Field comb as a FrameBuffer member:
@@ -347,10 +369,16 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
 
+    auto reflectRel = [&](int r)->int {
+        if (r < 0) return -r;
+        if (r >= width) return (width - 1) - (r - (width - 1));
+        return r;
+    };
+
     for (int h = left; h < right; ++h) {
         const int rel = h - left;
-        const int rm1 = (rel > 0) ? (rel - 1) : 0;
-        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
+        const int rm1 = reflectRel(rel - 1);
+        const int rp1 = reflectRel(rel + 1);
 
         const double C    = row0[rel];
         const double Cup  = rowUp2[rel];
@@ -662,15 +690,18 @@ void Comb::FrameBuffer::consolidateVDISRegions(
     vdisMask.swap(outMask);
 }
 
+static inline double cmag(const std::complex<double> &z) { return std::hypot(z.real(), z.imag()); }
+static inline double dotIQ(const std::complex<double> &a, const std::complex<double> &b) { return a.real()*b.real() + a.imag()*b.imag(); }
 
-// Frame comb in IQ space: averages the 1 neighbouring lines (adjacent in the
-// interlaced frame, therefore from the opposite field) to produce a frame-comb
-// estimate. Operates in demodulated IQ rather than raw composite to allow
-// phase-aware alignment and Nyquist/zipper repair. VDIS gating suppresses the
-// frame estimate where vertical chroma phase disagreement is detected.
-void Comb::FrameBuffer::computeFrameIQLine(
+void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     int line,
-    std::vector<std::complex<double>> &outFrameIQ)
+    const std::vector<std::complex<double>> &centerIQ,
+    std::vector<std::complex<double>> upIQ,
+    std::vector<std::complex<double>> dnIQ,
+    std::vector<std::complex<double>> &outFrameIQ,
+    const std::vector<float> *tiOverride,
+    const std::vector<float> *tqOverride,
+    bool enableLateralRefine)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
@@ -681,25 +712,26 @@ void Comb::FrameBuffer::computeFrameIQLine(
     outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
 
     if (width <= 0 || line < first || line >= last) return;
-    if (line >= demodLines || demodWidth <= 0)      return;
+    if (line >= demodLines || demodWidth <= 0) return;
 
     const auto  &T    = configuration.tunables;
-    const double invI = this->invIreScale;
+    const double invI = invIreScale;
 
-    const float *ti0_raw  = demodTI_line(line);
-    const float *tq0_raw  = demodTQ_line(line);
-    const float *tiUp_raw = (line - 1 >= first) ? demodTI_line(line - 1) : nullptr;
-    const float *tqUp_raw = (line - 1 >= first) ? demodTQ_line(line - 1) : nullptr;
-    const float *tiDn_raw = (line + 1 <  last)  ? demodTI_line(line + 1) : nullptr;
-    const float *tqDn_raw = (line + 1 <  last)  ? demodTQ_line(line + 1) : nullptr;
-
-    if (!ti0_raw || !tq0_raw) return;
-
-    auto cmag = [](const std::complex<double> &z)->double {
-        return std::hypot(z.real(), z.imag());
+    auto tiLine = [&](int ln)->const float* {
+        if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
+            return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
+        return demodTI_line(ln);
     };
-    auto dotIQ = [](const std::complex<double> &a, const std::complex<double> &b)->double {
-        return a.real()*b.real() + a.imag()*b.imag();
+    auto tqLine = [&](int ln)->const float* {
+        if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
+            return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
+        return demodTQ_line(ln);
+    };
+
+    auto reflectIndex = [&](int x)->int {
+        if (x < 0) return -x;
+        if (x >= width) return (width - 1) - (x - (width - 1));
+        return x;
     };
 
     // Signed correlation in [-1..1]
@@ -825,37 +857,10 @@ void Comb::FrameBuffer::computeFrameIQLine(
     // ------------------------------------------------------------
     // Build IQ vectors for center and 1 neighbors
     // ------------------------------------------------------------
-    const bool usePreclean = havePrecleanLine(line);
+    if ((int)centerIQ.size() < width || (int)upIQ.size() < width || (int)dnIQ.size() < width) return;
 
-    std::vector<std::complex<double>> centerIQ(width);
-    std::vector<std::complex<double>> upIQ(width);
-    std::vector<std::complex<double>> dnIQ(width);
-
-    for (int x = 0; x < width; ++x) {
-        if (usePreclean) {
-            std::complex<double> z;
-            if (demodPrecleanAt(line, x, z)) centerIQ[x] = z;
-            else centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
-
-            if (!demodPrecleanAt(line - 1, x, z)) {
-                if (tiUp_raw && tqUp_raw) z = std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x]);
-                else z = std::complex<double>(0.0, 0.0);
-            }
-            upIQ[x] = z;
-
-            if (!demodPrecleanAt(line + 1, x, z)) {
-                if (tiDn_raw && tqDn_raw) z = std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x]);
-                else z = std::complex<double>(0.0, 0.0);
-            }
-            dnIQ[x] = z;
-        } else {
-            centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
-            upIQ[x]     = (tiUp_raw && tqUp_raw) ? std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x])
-                                                 : std::complex<double>(0.0, 0.0);
-            dnIQ[x]     = (tiDn_raw && tqDn_raw) ? std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x])
-                                                 : std::complex<double>(0.0, 0.0);
-        }
-    }
+    // We treat the center line as mutable below (trim rotation), so take a copy.
+    std::vector<std::complex<double>> center = centerIQ;
 
     // ------------------------------------------------------------
     // 4fsc-referenced per-line trim (rotation only)
@@ -867,8 +872,8 @@ void Comb::FrameBuffer::computeFrameIQLine(
         const int actualHeight = (int)(rawbuffer.size() / (size_t)videoParameters.fieldWidth);
         if (ln < first || ln >= last || ln < 0 || ln >= actualHeight) return;
 
-        const float *tiRow = demodTI_line(ln);
-        const float *tqRow = demodTQ_line(ln);
+        const float *tiRow = tiLine(ln);
+        const float *tqRow = tqLine(ln);
         if (!tiRow || !tqRow) return;
 
         if (ln >= (int)demodBurstCos.size() || ln >= (int)demodBurstSin.size()) return;
@@ -905,8 +910,8 @@ void Comb::FrameBuffer::computeFrameIQLine(
             const double vraw = vraw_s - dc;
 
             const int idx = (h & 3);
-            const double sp = spLUT_locked[idx];
-            const double cp = cpLUT_locked[idx];
+                const double sp = spLUT_locked[idx];
+                const double cp = cpLUT_locked[idx];
 
             const double lsin_r = vraw * sp * 2.0;
             const double lcos_r = vraw * cp * 2.0;
@@ -952,7 +957,7 @@ void Comb::FrameBuffer::computeFrameIQLine(
         }
     };
 
-    applyLineTrimRm(line,   centerIQ);
+    applyLineTrimRm(line,   center);
     applyLineTrimRm(line-1, upIQ);
     applyLineTrimRm(line+1, dnIQ);
 
@@ -972,7 +977,7 @@ void Comb::FrameBuffer::computeFrameIQLine(
         const double MIN_FIT_IRE = std::max(2.0, 0.5 * MIN_CHROMA_IRE);
 
         for (int x = 0; x < width; ++x) {
-            const std::complex<double> Z0 = centerIQ[x];
+            const std::complex<double> Z0 = center[x];
             const std::complex<double> Zn = nbr[x];
             const double a0 = cmag(Z0);
             const double an = cmag(Zn);
@@ -1023,94 +1028,10 @@ void Comb::FrameBuffer::computeFrameIQLine(
     }
 
     // ------------------------------------------------------------
-    // Nyquist/zipper repair (local 1 search only when alternation is detected)
-    // ------------------------------------------------------------
-    auto sgnCorr = [&](const std::complex<double> &a, const std::complex<double> &b)->int {
-        const double ma = cmag(a);
-        const double mb = cmag(b);
-        if (ma <= 1e-12 || mb <= 1e-12) return 0;
-        const double d = dotIQ(a,b);
-        return (d >= 0.0) ? 1 : -1;
-    };
-
-    std::vector<int> sgnUp(width, 0), sgnDn(width, 0);
-    for (int x = 0; x < width; ++x) {
-        if (cmag(centerIQ[x]) * invI > MIN_CHROMA_IRE) {
-            sgnUp[x] = sgnCorr(centerIQ[x], upIQ[x]);
-            sgnDn[x] = sgnCorr(centerIQ[x], dnIQ[x]);
-        }
-    }
-
-    auto isNyq5 = [&](const std::vector<int> &sgn, int x)->bool {
-        if (x < 2 || x >= width - 2) return false;
-        const int s0 = sgn[x];
-        if (s0 == 0) return false;
-        return (sgn[x-1] == -s0) && (sgn[x-2] == s0) && (sgn[x+1] == -s0) && (sgn[x+2] == s0);
-    };
-
-    const int NYQ_RUN_MIN = 3;
-
-    auto isNyqRun = [&](const std::vector<int> &sgn, int x)->bool {
-        const int half = NYQ_RUN_MIN / 2;
-        if (x < half || x >= width - half) return false;
-        if (sgn[x] == 0) return false;
-
-        int leftRun = 0;
-        for (int i = x - 1; i >= 0; --i) {
-            if (sgn[i] == 0) break;
-            if (sgn[i] != -sgn[i + 1]) break;
-            ++leftRun;
-        }
-
-        int rightRun = 0;
-        for (int i = x + 1; i < width; ++i) {
-            if (sgn[i] == 0) break;
-            if (sgn[i] != -sgn[i - 1]) break;
-            ++rightRun;
-        }
-
-        const int runLen = 1 + leftRun + rightRun;
-        return (runLen >= NYQ_RUN_MIN) && (leftRun >= half) && (rightRun >= half);
-    };
-
-    const double NYQ_CONF_GOOD     = 0.67;
-    const double NYQ_SHIFT_PENALTY = 0.25;
-    const double NYQ_MAX_DELTA_IRE = 6.0;
-
-    auto pickBestFrom3 = [&](const std::vector<std::complex<double>> &nbr, int x,
-                             std::complex<double> &bestZ, double &bestCorrAbs)->bool
-    {
-        bestCorrAbs = 0.0;
-        double bestScore = -1e9;
-        bool any = false;
-        const std::complex<double> &Z0 = centerIQ[x];
-        const double a0 = cmag(Z0);
-        if (a0 <= 1e-12) return false;
-
-        for (int dx = -1; dx <= 1; ++dx) {
-            const int xx = x + dx;
-            if (xx < 0 || xx >= width) continue;
-            const std::complex<double> Zn = nbr[xx];
-            const double an = cmag(Zn);
-            if (an <= 1e-12) continue;
-
-            const double cabs = std::fabs(dotIQ(Z0, Zn)) / (a0*an + 1e-12);
-            const double score = cabs - NYQ_SHIFT_PENALTY * (double)std::abs(dx);
-            if (!any || score > bestScore) {
-                any = true;
-                bestScore = score;
-                bestCorrAbs = cabs;
-                bestZ = Zn;
-            }
-        }
-        return any;
-    };
-
-    // ------------------------------------------------------------
     // Combine (soft signed contributions + boundary-aware asymmetry)
     // ------------------------------------------------------------
     for (int x = 0; x < width; ++x) {
-        const std::complex<double> Z0 = centerIQ[x];
+        const std::complex<double> Z0 = center[x];
         const double a0 = cmag(Z0);
         const double a0_ire = a0 * invI;
 
@@ -1122,28 +1043,35 @@ void Comb::FrameBuffer::computeFrameIQLine(
         std::complex<double> ZUpRaw = upIQ[x];
         std::complex<double> ZDnRaw = dnIQ[x];
 
-        // Local alternation repair: tiny 1 search as a replacement sample (local only).
-        if (isNyq5(sgnUp, x) || isNyqRun(sgnUp, x)) {
-            std::complex<double> bestZ;
-            double bestC = 0.0;
-            if (pickBestFrom3(upIQ, x, bestZ, bestC) && bestC >= NYQ_CONF_GOOD) {
-                const double dCenterIRE = cmag(bestZ - Z0) * invI;
-                const double dOrigIRE   = cmag(bestZ - upIQ[x]) * invI;
-                if (dCenterIRE <= NYQ_MAX_DELTA_IRE && dOrigIRE <= NYQ_MAX_DELTA_IRE) {
-                    ZUpRaw = bestZ;
-                }
-            }
-        }
-        if (isNyq5(sgnDn, x) || isNyqRun(sgnDn, x)) {
-            std::complex<double> bestZ;
-            double bestC = 0.0;
-            if (pickBestFrom3(dnIQ, x, bestZ, bestC) && bestC >= NYQ_CONF_GOOD) {
-                const double dCenterIRE = cmag(bestZ - Z0) * invI;
-                const double dOrigIRE   = cmag(bestZ - dnIQ[x]) * invI;
-                if (dCenterIRE <= NYQ_MAX_DELTA_IRE && dOrigIRE <= NYQ_MAX_DELTA_IRE) {
-                    ZDnRaw = bestZ;
-                }
-            }
+        if (enableLateralRefine) {
+            // Frame A only: lateral pre-clean for the samples we comb with (Up/Dn only).
+            auto refineNeighbor = [&](const std::vector<std::complex<double>> &nbr,
+                                      const std::complex<double> &Z,
+                                      int xi)->std::complex<double>
+            {
+                const int xm1 = reflectIndex(xi - 1);
+                const int xp1 = reflectIndex(xi + 1);
+                const std::complex<double> Zm = nbr[xm1];
+                const std::complex<double> Zp = nbr[xp1];
+
+                const double c0 = std::fabs(corrSigned(Z, Zm));
+                const double c1 = std::fabs(corrSigned(Z, Zp));
+                const double cmin = std::min(c0, c1);
+
+                const double T0 = 0.55;
+                const double T1 = 0.85;
+                double t = (cmin - T0) / (T1 - T0);
+                t = std::clamp(t, 0.0, 1.0);
+
+                const double alpha = 0.40 * t;
+                if (alpha <= 0.0) return Z;
+
+                const std::complex<double> Zlr = 0.5 * (Zm + Zp);
+                return (Z + alpha * Zlr) / (1.0 + alpha);
+            };
+
+            ZUpRaw = refineNeighbor(upIQ, ZUpRaw, x);
+            ZDnRaw = refineNeighbor(dnIQ, ZDnRaw, x);
         }
 
         const double aUp = cmag(ZUpRaw);
@@ -1249,8 +1177,8 @@ void Comb::FrameBuffer::computeFrameIQLine(
         // Adaptive comb strength: 0.5 .. COMB_STRENGTH
         // Use strong comb only when coherence is high AND vertical neighbors agree.
         // --------------------------------------------------------
-        const double COMB_STRENGTH_HI = COMB_STRENGTH;  // your existing max (e.g. 2.0)
-        const double COMB_STRENGTH_LO = 0.75;            // new floor per your tests
+        const double COMB_STRENGTH_HI = COMB_STRENGTH;
+        const double COMB_STRENGTH_LO = 0.8;
 
         // Coherence vs center (signed corr magnitude) for allowed neighbors
         double coh = 0.0;
@@ -1337,9 +1265,148 @@ void Comb::FrameBuffer::computeFrameIQLine(
     }
 }
 
+void Comb::FrameBuffer::computeFrameIQPrecleanLine(
+    int line,
+    std::vector<std::complex<double>> &outFrameIQ)
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
 
+    outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
+    if (width <= 0 || line < first || line >= last) return;
+    if (line >= demodLines || demodWidth <= 0) return;
 
-// Note: fvf_is_tri_safe and getNotchLumaEven2* live in comb.h as inline helpers.
+    const std::vector<float> *tiOverride = nullptr;
+    const std::vector<float> *tqOverride = nullptr;
+    auto tiLine = [&](int ln)->const float* { return demodTI_line(ln); };
+    auto tqLine = [&](int ln)->const float* { return demodTQ_line(ln); };
+
+    const float *ti0_raw  = tiLine(line);
+    const float *tq0_raw  = tqLine(line);
+    const float *tiUp_raw = (line - 1 >= first) ? tiLine(line - 1) : nullptr;
+    const float *tqUp_raw = (line - 1 >= first) ? tqLine(line - 1) : nullptr;
+    const float *tiDn_raw = (line + 1 <  last)  ? tiLine(line + 1) : nullptr;
+    const float *tqDn_raw = (line + 1 <  last)  ? tqLine(line + 1) : nullptr;
+    if (!ti0_raw || !tq0_raw) return;
+
+    // Preclean demod helper: demod simpleField2D[ln][x] -> IQ using burst + locked basis.
+    auto havePrecleanLine = [&](int ln)->bool {
+        if (ln < first || ln >= last) return false;
+        if (!simpleField2DLinePtr(ln, width)) return false;
+        if (ln < 0 || ln >= (int)demodBurstCos.size() || ln >= (int)demodBurstSin.size()) return false;
+        return true;
+    };
+
+    auto ensureLockedBasis = [&](){
+        if (basisLockedInit) return;
+        double Ce = 1.0, Se = 0.0;
+        basisCoeffs(Ce, Se);
+        for (int i = 0; i < 4; ++i) {
+            double sp, cp;
+            shiftedBasis(i, Ce, Se, sp, cp);
+            spLUT_locked[i] = sp;
+            cpLUT_locked[i] = cp;
+        }
+        basisLockedInit = true;
+    };
+
+    auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
+        if (!havePrecleanLine(ln)) return false;
+
+        ensureLockedBasis();
+
+        const double bcos = (double)demodBurstCos[ln];
+        const double bsin = (double)demodBurstSin[ln];
+
+        const int h   = left + x;
+        const int idx = (h & 3);
+        const double sp = spLUT_locked[idx];
+        const double cp = cpLUT_locked[idx];
+
+        const double *row = simpleField2DLinePtr(ln, width);
+        if (!row) return false;
+        const double c = row[x];
+
+        const double lsin = c * sp * 2.0;
+        const double lcos = c * cp * 2.0;
+        const double Ii   = (lsin * bcos - lcos * bsin);
+        const double Qi   = (lsin * bsin + lcos * bcos);
+
+        Z = std::complex<double>(Ii, Qi);
+        return true;
+    };
+
+    std::vector<std::complex<double>> centerIQ(width), upIQ(width), dnIQ(width);
+    for (int x = 0; x < width; ++x) {
+        std::complex<double> z;
+        if (demodPrecleanAt(line, x, z)) centerIQ[x] = z;
+        else centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+
+        if (!demodPrecleanAt(line - 1, x, z)) {
+            if (tiUp_raw && tqUp_raw) z = std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x]);
+            else z = std::complex<double>(0.0, 0.0);
+        }
+        upIQ[x] = z;
+
+        if (!demodPrecleanAt(line + 1, x, z)) {
+            if (tiDn_raw && tqDn_raw) z = std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x]);
+            else z = std::complex<double>(0.0, 0.0);
+        }
+        dnIQ[x] = z;
+    }
+
+    computeFrameIQFromPreparedVectors(line, centerIQ, upIQ, dnIQ, outFrameIQ, tiOverride, tqOverride, true);
+}
+
+void Comb::FrameBuffer::computeFrameIQLocked1DLine(
+    int line,
+    std::vector<std::complex<double>> &outFrameIQ,
+    const std::vector<float> *tiOverride,
+    const std::vector<float> *tqOverride)
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+
+    outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
+    if (width <= 0 || line < first || line >= last) return;
+    if (line >= demodLines || demodWidth <= 0) return;
+
+    auto tiLine = [&](int ln)->const float* {
+        if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
+            return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
+        return demodTI_line(ln);
+    };
+    auto tqLine = [&](int ln)->const float* {
+        if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
+            return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
+        return demodTQ_line(ln);
+    };
+
+    const float *ti0_raw  = tiLine(line);
+    const float *tq0_raw  = tqLine(line);
+    const float *tiUp_raw = (line - 1 >= first) ? tiLine(line - 1) : nullptr;
+    const float *tqUp_raw = (line - 1 >= first) ? tqLine(line - 1) : nullptr;
+    const float *tiDn_raw = (line + 1 <  last)  ? tiLine(line + 1) : nullptr;
+    const float *tqDn_raw = (line + 1 <  last)  ? tqLine(line + 1) : nullptr;
+    if (!ti0_raw || !tq0_raw) return;
+
+    std::vector<std::complex<double>> centerIQ(width), upIQ(width), dnIQ(width);
+    for (int x = 0; x < width; ++x) {
+        centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+        upIQ[x]     = (tiUp_raw && tqUp_raw) ? std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x])
+                                             : std::complex<double>(0.0, 0.0);
+        dnIQ[x]     = (tiDn_raw && tqDn_raw) ? std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x])
+                                             : std::complex<double>(0.0, 0.0);
+    }
+
+    computeFrameIQFromPreparedVectors(line, centerIQ, upIQ, dnIQ, outFrameIQ, tiOverride, tqOverride, false);
+}
 
 Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     qint32 refLineNumber, qint32 refH,
