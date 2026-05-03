@@ -2509,7 +2509,6 @@ void Comb::FrameBuffer::split2D()
         if (needFrameIQCompute && line + 1 < lastLine) {
             double *dst = simpleField2DLinePtrMutable(line + 1, width);
             computeSimpleField2DLine(line + 1, dst);
-            demodSimpleField2DLine(line + 1);
         }
         if (line >= demodLines) continue;
 
@@ -2558,13 +2557,9 @@ void Comb::FrameBuffer::split2D()
 
             double *dst = simpleField2DLinePtrMutable(line, width);
             std::copy(scratch_fieldBLine.begin(), scratch_fieldBLine.begin() + width, dst);
-            demodSimpleField2DLine(line);
             computeFrameIQPrecleanLine(line, frameIQ);
             
             scratch_fieldBCenter.assign(width, 0.0);
-
-            double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
-            double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
 
             for (int rel = 0; rel < width; ++rel) {
                 int h = left + rel;
@@ -2574,9 +2569,8 @@ void Comb::FrameBuffer::split2D()
                     const double Qi = Z.imag();
                     const double s4 = sin4fsc(h);
                     const double c4 = cos4fsc(h);
-                    const double lsin =  Ii * bcos + Qi * bsin;
-                    const double lcos = -Ii * bsin + Qi * bcos;
-                    const double cOut = 0.5 * (lsin * s4 + lcos * c4);
+                    // Frame A IQ is in canonical 4fsc bucket axes; remod directly.
+                    const double cOut = 0.5 * (Ii * s4 + Qi * c4);
                     scratch_fieldBCenter[rel] = cOut;
                 } else {
                     scratch_fieldBCenter[rel] = 0.0;

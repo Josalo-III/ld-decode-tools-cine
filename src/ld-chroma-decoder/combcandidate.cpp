@@ -378,11 +378,35 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     const auto &T = configuration.tunables;
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
+    const double invI   = this->invIreScale;
 
     auto reflectRel = [&](int r)->int {
         if (r < 0) return -r;
         if (r >= width) return (width - 1) - (r - (width - 1));
         return r;
+    };
+
+    // Phase-coherence gate for vertical reaches (locked mode only).
+    // Uses the existing phase-corrected 1D IQ produced upstream by buildPhaseCorrected1D
+    // (demodTI/demodTQ). This avoids any additional demod and keys directly off the
+    // same locked phase model that the rest of the pipeline uses.
+    const float *ti0 = configuration.phaseCompensation ? demodTI_line(ln0)   : nullptr;
+    const float *tq0 = configuration.phaseCompensation ? demodTQ_line(ln0)   : nullptr;
+    const float *tiU = configuration.phaseCompensation ? demodTI_line(lnUp2) : nullptr;
+    const float *tqU = configuration.phaseCompensation ? demodTQ_line(lnUp2) : nullptr;
+    const float *tiD = configuration.phaseCompensation ? demodTI_line(lnDn2) : nullptr;
+    const float *tqD = configuration.phaseCompensation ? demodTQ_line(lnDn2) : nullptr;
+
+    auto phaseCoherenceIQ = [&](double I0, double Q0, double In, double Qn)->double {
+        const double m0 = std::hypot(I0, Q0);
+        const double mn = std::hypot(In, Qn);
+        if (m0 * invI < 2.5 || mn * invI < 2.5) return 1.0; // too weak to trust phase
+        const double corr = (I0 * In + Q0 * Qn) / (m0 * mn + 1e-12); // [-1..1]
+        if (corr <= 0.0) return 0.0;
+        const double t0 = 0.55;
+        const double t1 = 0.85;
+        double w = (corr - t0) / (t1 - t0);
+        return std::clamp(w, 0.0, 1.0);
     };
 
     for (int h = left; h < right; ++h) {
@@ -425,6 +449,17 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         wUp = std::clamp(wUp, 0.0, 1.0);
         wDn = std::clamp(wDn, 0.0, 1.0);
 
+        if (configuration.phaseCompensation && ti0 && tq0 && tiU && tqU && tiD && tqD) {
+            const double I0 = (double)ti0[rel];
+            const double Q0 = (double)tq0[rel];
+            const double IU = (double)tiU[rel];
+            const double QU = (double)tqU[rel];
+            const double ID = (double)tiD[rel];
+            const double QD = (double)tqD[rel];
+            wUp *= phaseCoherenceIQ(I0, Q0, IU, QU);
+            wDn *= phaseCoherenceIQ(I0, Q0, ID, QD);
+        }
+
         double sc = 1.0;
 
         if ((wUp > 0.0) || (wDn > 0.0)) {
@@ -466,52 +501,9 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     return;
 }
 
-// Demodulates the Field B scalar raster (simpleField2D[line]) into demodTI/TQ for
-// use by FrameIQ preclean.
-//
-// Important domain note:
-// The Field-B scalar preclean is sourced from the phase-normalised chroma composite
-// (remodulated onto the exact 4fsc bucket grid). Therefore the correct demod here is
-// the bucket basis (sin4fsc/cos4fsc) rather than the locked per-line burst LUT.
-// Using fusedDemodLUT(bcos/bsin, ...) here would effectively "re-lock" a signal that
-// was intentionally de-locked by the remod step, and can create structured
-// alternation artifacts.
-void Comb::FrameBuffer::demodSimpleField2DLine(int line)
-{
-    const int first = videoParameters.firstActiveFrameLine;
-    const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-
-    if (line < first || line >= last) return;
-    if (width <= 0) return;
-    if (line >= demodLines || demodWidth <= 0) return;
-
-    if ((int)demodBurstCos.size() <= line ||
-        (int)demodBurstSin.size() <= line) {
-        // No LO for this line
-        return;
-    }
-
-    // FieldB scalar raster must already be present in the ring for this line.
-    const double *fieldLine = simpleField2DLinePtr(line, width);
-    if (!fieldLine) return;
-
-    float *ti = demodTI_line(line);
-    float *tq = demodTQ_line(line);
-    if (!ti || !tq) return;
-
-    for (int rel = 0; rel < width; ++rel) {
-        const int h = left + rel;
-        const double c = fieldLine[rel];
-        const int ph = (h & 3);
-        // demodSample() equivalent with (bcos=1, bsin=0) and the ideal 4fsc basis:
-        // ri = v * sin(phase) * 2, rq = v * cos(phase) * 2.
-        ti[rel] = (float)(c * sin4fsc(ph) * 2.0);
-        tq[rel] = (float)(c * cos4fsc(ph) * 2.0);
-    }
-}
+// NOTE: demodSimpleField2DLine was removed. FrameIQ preclean demods directly from
+// the simpleField2D ring using the canonical 4fsc basis to avoid shared-buffer
+// side effects and to guarantee a single demod contract for the preclean path.
 
 // VDIS - Vertical Differential Isolation System.
 // Reduces artifacts at horizontal boundaries between different regions.
@@ -790,56 +782,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         return w;
     };
 
-    // ------------------------------------------------------------
-    // Preclean demod helper: demod simpleField2D[ln][x] -> IQ using burst + locked basis.
-    // Falls back to canonical demodTI/TQ if preclean isn't available.
-    // ------------------------------------------------------------
-    auto havePrecleanLine = [&](int ln)->bool {
-        if (ln < first || ln >= last) return false;
-        if (!simpleField2DLinePtr(ln, width)) return false;
-        if (ln < 0 || ln >= (int)demodBurstCos.size() || ln >= (int)demodBurstSin.size()) return false;
-        return true;
-    };
-
-    auto ensureLockedBasis = [&](){
-        if (basisLockedInit) return;
-        double Ce = 1.0, Se = 0.0;
-        basisCoeffs(Ce, Se);
-        for (int i = 0; i < 4; ++i) {
-            double sp, cp;
-            shiftedBasis(i, Ce, Se, sp, cp);
-            spLUT_locked[i] = sp;
-            cpLUT_locked[i] = cp;
-        }
-        basisLockedInit = true;
-    };
-
-    auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
-        if (!havePrecleanLine(ln)) return false;
-
-        ensureLockedBasis();
-
-        const double bcos = (double)demodBurstCos[ln];
-        const double bsin = (double)demodBurstSin[ln];
-
-        const int h   = left + x;
-        const int idx = (h & 3);
-        const double sp = spLUT_locked[idx];
-        const double cp = cpLUT_locked[idx];
-
-        const double *row = simpleField2DLinePtr(ln, width);
-        if (!row) return false;
-        const double c = row[x];
-
-        const double lsin = c * sp * 2.0;
-        const double lcos = c * cp * 2.0;
-        const double Ii   = (lsin * bcos - lcos * bsin);
-        const double Qi   = (lsin * bsin + lcos * bcos);
-
-        Z = std::complex<double>(Ii, Qi);
-        return true;
-    };
-
     auto applyMat = [](const std::complex<double> &z, const double M[2][2])->std::complex<double> {
         const double I = z.real(), Q = z.imag();
         return std::complex<double>(M[0][0]*I + M[0][1]*Q,
@@ -862,98 +804,23 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     std::vector<std::complex<double>> center = centerIQ;
 
     // ------------------------------------------------------------
-    // 4fsc-referenced per-line trim (rotation only)
+    // Per-line trim (rotation only)
+    //
+    // IMPORTANT: FrameIQ operates in canonical 4fsc bucket IQ (rsin/rcos) space.
+    // The original trim solve compared against a locked/burst demod of the raw
+    // composite, which is a different coordinate frame. That mismatch can produce
+    // structured grid artifacts when inputs are canonical.
+    //
+    // For now, keep this trim disabled in canonical mode; if we need an
+    // equivalent correction later, it must be derived entirely within the
+    // canonical frame (e.g. by comparing candidates, not by re-demodding raw).
     // ------------------------------------------------------------
     auto applyLineTrimRm = [&](int ln, std::vector<std::complex<double>> &v)
     {
-        if (!T.Y_LINE_AFFINE_TRIM_ENABLE) return;
+        (void)ln;
+        (void)v;
+        return;
 
-        const int actualHeight = (int)(rawbuffer.size() / (size_t)videoParameters.fieldWidth);
-        if (ln < first || ln >= last || ln < 0 || ln >= actualHeight) return;
-
-        const float *tiRow = tiLine(ln);
-        const float *tqRow = tqLine(ln);
-        if (!tiRow || !tqRow) return;
-
-        if (ln >= (int)demodBurstCos.size() || ln >= (int)demodBurstSin.size()) return;
-
-        if (!basisLockedInit) {
-            double Ce = 1.0, Se = 0.0;
-            basisCoeffs(Ce, Se);
-            for (int i = 0; i < 4; ++i) {
-                double sp, cp;
-                shiftedBasis(i, Ce, Se, sp, cp);
-                spLUT_locked[i] = sp;
-                cpLUT_locked[i] = cp;
-            }
-            basisLockedInit = true;
-        }
-
-        const quint16 *rawLine = rawbuffer.data() + (size_t)ln * (size_t)videoParameters.fieldWidth;
-
-        const double bcos = (double)demodBurstCos[ln];
-        const double bsin = (double)demodBurstSin[ln];
-
-        double STT[2][2] = {{0,0},{0,0}};
-        double SRT[2][2] = {{0,0},{0,0}};
-
-        double dc = (double)rawLine[left];
-        constexpr double DC_ALPHA = 1.0 / 64.0;
-
-        const double MIN_FIT_IRE = std::max(2.0, 0.5 * T.FRAME_CHROMA_MIN_IRE);
-
-        int n = 0;
-        for (int x = 0, h = left; h < right; ++h, ++x) {
-            const double vraw_s = (double)rawLine[h];
-            dc += DC_ALPHA * (vraw_s - dc);
-            const double vraw = vraw_s - dc;
-
-            const int idx = (h & 3);
-                const double sp = spLUT_locked[idx];
-                const double cp = cpLUT_locked[idx];
-
-            const double lsin_r = vraw * sp * 2.0;
-            const double lcos_r = vraw * cp * 2.0;
-            const double ri     = (lsin_r * bcos - lcos_r * bsin);
-            const double rq     = (lsin_r * bsin + lcos_r * bcos);
-
-            const double ti = (double)tiRow[x];
-            const double tq = (double)tqRow[x];
-
-            if (std::hypot(ti, tq) * invI < MIN_FIT_IRE) continue;
-
-            STT[0][0] += ti*ti; STT[0][1] += ti*tq;
-            STT[1][0] += ti*tq; STT[1][1] += tq*tq;
-
-            SRT[0][0] += ri*ti; SRT[0][1] += ri*tq;
-            SRT[1][0] += rq*ti; SRT[1][1] += rq*tq;
-
-            ++n;
-        }
-
-        if (n < 64) return;
-
-        double STTinv[2][2];
-        if (!mat2_inv(STT, STTinv)) return;
-
-        double A[2][2];
-        mat2_mul(SRT, STTinv, A);
-
-        double Rm[2][2] = {{1,0},{0,1}}, U[2][2];
-        polar_decompose_2x2(A, Rm, U);
-
-        const double pMax = T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
-        clamp_rotation_gain_shear(Rm, U, pMax,
-                                  T.Y_LINE_ALLOW_GAIN_ON_IQ,
-                                  T.Y_LINE_GAIN_MIN, T.Y_LINE_GAIN_MAX,
-                                  T.Y_LINE_MAX_SHEAR);
-
-        for (int x = 0; x < width; ++x) {
-            const double I = v[x].real();
-            const double Q = v[x].imag();
-            v[x] = std::complex<double>(Rm[0][0]*I + Rm[0][1]*Q,
-                                        Rm[1][0]*I + Rm[1][1]*Q);
-        }
     };
 
     applyLineTrimRm(line,   center);
@@ -1291,50 +1158,17 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
     const float *tqDn_raw = (line + 1 <  last)  ? tqLine(line + 1) : nullptr;
     if (!ti0_raw || !tq0_raw) return;
 
-    // Preclean demod helper: demod simpleField2D[ln][x] -> IQ using burst + locked basis.
-    auto havePrecleanLine = [&](int ln)->bool {
-        if (ln < first || ln >= last) return false;
-        if (!simpleField2DLinePtr(ln, width)) return false;
-        if (ln < 0 || ln >= (int)demodBurstCos.size() || ln >= (int)demodBurstSin.size()) return false;
-        return true;
-    };
-
-    auto ensureLockedBasis = [&](){
-        if (basisLockedInit) return;
-        double Ce = 1.0, Se = 0.0;
-        basisCoeffs(Ce, Se);
-        for (int i = 0; i < 4; ++i) {
-            double sp, cp;
-            shiftedBasis(i, Ce, Se, sp, cp);
-            spLUT_locked[i] = sp;
-            cpLUT_locked[i] = cp;
-        }
-        basisLockedInit = true;
-    };
-
+    // Preclean demod helper: demod simpleField2D[ln][x] -> canonical 4fsc bucket IQ.
+    // This is the *only* demod used for the preclean path (no shared demod buffers).
     auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
-        if (!havePrecleanLine(ln)) return false;
-
-        ensureLockedBasis();
-
-        const double bcos = (double)demodBurstCos[ln];
-        const double bsin = (double)demodBurstSin[ln];
-
-        const int h   = left + x;
-        const int idx = (h & 3);
-        const double sp = spLUT_locked[idx];
-        const double cp = cpLUT_locked[idx];
-
+        if (ln < first || ln >= last) return false;
         const double *row = simpleField2DLinePtr(ln, width);
         if (!row) return false;
+        const int h = left + x;
+        const int ph = (h & 3);
         const double c = row[x];
-
-        const double lsin = c * sp * 2.0;
-        const double lcos = c * cp * 2.0;
-        const double Ii   = (lsin * bcos - lcos * bsin);
-        const double Qi   = (lsin * bsin + lcos * bcos);
-
-        Z = std::complex<double>(Ii, Qi);
+        Z = std::complex<double>(c * sin4fsc(ph) * 2.0,
+                                 c * cos4fsc(ph) * 2.0);
         return true;
     };
 

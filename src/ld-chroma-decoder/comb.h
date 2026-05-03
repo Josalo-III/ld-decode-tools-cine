@@ -545,8 +545,6 @@ private:
 
 		void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
 
-        void demodSimpleField2DLine(int line);
-
         void computeFrameIQPrecleanLine(int line,
                                         std::vector<std::complex<double>> &outFrameIQ);
         void computeFrameIQLocked1DLine(int line,
