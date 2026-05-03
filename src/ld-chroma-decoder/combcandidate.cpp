@@ -265,12 +265,22 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         const double upInfluence = FAR_INFLUENCE_BASE * midOk * upSideOk * simFactor(upSim);
         const double dnInfluence = FAR_INFLUENCE_BASE * midOk * dnSideOk * simFactor(dnSim);
 
-        const double Cup2Adj = (upInfluence > 0.0)
-            ? ((Cup2 + upInfluence * Cup4) / (1.0 + upInfluence))
-            : Cup2;
-        const double Cdn2Adj = (dnInfluence > 0.0)
-            ? ((Cdn2 + dnInfluence * Cdn4) / (1.0 + dnInfluence))
-            : Cdn2;
+        // Far reach is evaluated in magnitude space, so apply it in a sign-safe way:
+        // refine the magnitude of the ±2 tap, but keep the near tap's sign. If the
+        // far tap disagrees in sign (phase), ignore far refinement to avoid
+        // injecting checkerboard/alternation into the intrafield estimate.
+        auto refineNearWithFar = [&](double nearS, double farS, double influence)->double {
+            if (influence <= 0.0) return nearS;
+            if (nearS == 0.0) return nearS;
+            if ((nearS > 0.0) != (farS > 0.0)) return nearS;
+            const double nearMag = std::fabs(nearS);
+            const double farMag  = std::fabs(farS);
+            const double mag = (nearMag + influence * farMag) / (1.0 + influence);
+            return std::copysign(mag, nearS);
+        };
+
+        const double Cup2Adj = refineNearWithFar(Cup2, Cup4, upInfluence);
+        const double Cdn2Adj = refineNearWithFar(Cdn2, Cdn4, dnInfluence);
 
         double tc = 0.0;
         if (wUp2 > 0.0 || wDn2 > 0.0) {
