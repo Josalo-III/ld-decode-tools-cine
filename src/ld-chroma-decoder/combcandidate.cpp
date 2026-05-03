@@ -466,10 +466,16 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     return;
 }
 
-// Demodulates the Field B scalar raster (simpleField2D[line]) into the locked
-// demodTI/TQ buffers for use by computeFrameIQLine. Field B provides a 2 intra-field
-// comb estimate that serves as a cleaner input to the frame-comb demodulation than
-// the raw composite, reducing subcarrier leakage into the frame IQ estimate.
+// Demodulates the Field B scalar raster (simpleField2D[line]) into demodTI/TQ for
+// use by FrameIQ preclean.
+//
+// Important domain note:
+// The Field-B scalar preclean is sourced from the phase-normalised chroma composite
+// (remodulated onto the exact 4fsc bucket grid). Therefore the correct demod here is
+// the bucket basis (sin4fsc/cos4fsc) rather than the locked per-line burst LUT.
+// Using fusedDemodLUT(bcos/bsin, ...) here would effectively "re-lock" a signal that
+// was intentionally de-locked by the remod step, and can create structured
+// alternation artifacts.
 void Comb::FrameBuffer::demodSimpleField2DLine(int line)
 {
     const int first = videoParameters.firstActiveFrameLine;
@@ -496,31 +502,14 @@ void Comb::FrameBuffer::demodSimpleField2DLine(int line)
     float *tq = demodTQ_line(line);
     if (!ti || !tq) return;
 
-    const double bcos = (double)demodBurstCos[line];
-    const double bsin = (double)demodBurstSin[line];
-    double lutTi[4], lutTq[4];
-    fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
-
-    // Ensure locked basis LUT is ready (same lazy-init as splitIQlocked)
-    if (!basisLockedInit) {
-        double Ce = 1.0, Se = 0.0;
-        basisCoeffs(Ce, Se);
-        for (int i = 0; i < 4; ++i) {
-            double sp, cp;
-            shiftedBasis(i, Ce, Se, sp, cp);
-            spLUT_locked[i] = sp;
-            cpLUT_locked[i] = cp;
-        }
-        basisLockedInit = true;
-    }
-
-    int fieldCountTotal = 0, frameCountTotal = 0;
     for (int rel = 0; rel < width; ++rel) {
         const int h = left + rel;
         const double c = fieldLine[rel];
         const int ph = (h & 3);
-        ti[rel] = (float)(c * lutTi[ph]);
-        tq[rel] = (float)(c * lutTq[ph]);
+        // demodSample() equivalent with (bcos=1, bsin=0) and the ideal 4fsc basis:
+        // ri = v * sin(phase) * 2, rq = v * cos(phase) * 2.
+        ti[rel] = (float)(c * sin4fsc(ph) * 2.0);
+        tq[rel] = (float)(c * cos4fsc(ph) * 2.0);
     }
 }
 
