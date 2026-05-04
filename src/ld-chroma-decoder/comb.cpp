@@ -1856,7 +1856,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const double FRAME_A_1D_BONUS = 0.12;
                 scoreR_A *= (1.0 - FRAME_A_1D_BONUS * frameA_1D_t);
             }
-/*
+
             // Frame B (raw) — favored around horizontal boundaries.
             {
                 const double HEDGE_NORM      = std::max(HEDGE_THRESH_IRE, 1.0);
@@ -1871,7 +1871,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const double FIELD_A_HEDGE_BONUS = 0.18;
                 scoreR_B *= (1.0 - FIELD_A_HEDGE_BONUS * fieldA_hedge_t);
             }
-*/
+
             auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
                 if (vdisSoft) {
                     if (candIdx == 0 && !safeA) return;

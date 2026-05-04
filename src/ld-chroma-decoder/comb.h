@@ -476,7 +476,10 @@ private:
         std::vector<std::vector<double>> w2d_fieldA_gate;
         std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
         std::vector<LineAffine> lineAffineLocked;
-        std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)        
+        std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)
+        std::vector<std::complex<double>> scratch_centerIQ; // reused per-line preclean/locked frame IQ prep
+        std::vector<std::complex<double>> scratch_upIQ;
+        std::vector<std::complex<double>> scratch_dnIQ;
         std::vector<double> scratch_fieldLine;
         std::vector<double> scratch_fieldGate;
         std::vector<double> scratch_fieldBLine;
@@ -570,8 +573,8 @@ private:
                                         const std::vector<float> *tqOverride = nullptr);
         void computeFrameIQFromPreparedVectors(int line,
                                                const std::vector<std::complex<double>> &centerIQ,
-                                               std::vector<std::complex<double>> upIQ,
-                                               std::vector<std::complex<double>> dnIQ,
+                                               std::vector<std::complex<double>> &upIQ,
+                                               std::vector<std::complex<double>> &dnIQ,
                                                std::vector<std::complex<double>> &outFrameIQ,
                                                const std::vector<float> *tiOverride,
                                                const std::vector<float> *tqOverride,

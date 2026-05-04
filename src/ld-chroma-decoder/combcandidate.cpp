@@ -691,8 +691,8 @@ static inline double dotIQ(const std::complex<double> &a, const std::complex<dou
 void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
-    std::vector<std::complex<double>> upIQ,
-    std::vector<std::complex<double>> dnIQ,
+    std::vector<std::complex<double>> &upIQ,
+    std::vector<std::complex<double>> &dnIQ,
     std::vector<std::complex<double>> &outFrameIQ,
     const std::vector<float> *tiOverride,
     const std::vector<float> *tqOverride,
@@ -1178,26 +1178,28 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
         return true;
     };
 
-    std::vector<std::complex<double>> centerIQ(width), upIQ(width), dnIQ(width);
+    scratch_centerIQ.resize(width);
+    scratch_upIQ.resize(width);
+    scratch_dnIQ.resize(width);
     for (int x = 0; x < width; ++x) {
         std::complex<double> z;
-        if (demodPrecleanAt(line, x, z)) centerIQ[x] = z;
-        else centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+        if (demodPrecleanAt(line, x, z)) scratch_centerIQ[x] = z;
+        else scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
 
         if (!demodPrecleanAt(line - 1, x, z)) {
             if (tiUp_raw && tqUp_raw) z = std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x]);
             else z = std::complex<double>(0.0, 0.0);
         }
-        upIQ[x] = z;
+        scratch_upIQ[x] = z;
 
         if (!demodPrecleanAt(line + 1, x, z)) {
             if (tiDn_raw && tqDn_raw) z = std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x]);
             else z = std::complex<double>(0.0, 0.0);
         }
-        dnIQ[x] = z;
+        scratch_dnIQ[x] = z;
     }
 
-    computeFrameIQFromPreparedVectors(line, centerIQ, upIQ, dnIQ, outFrameIQ, tiOverride, tqOverride, true);
+    computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, true);
 }
 
 void Comb::FrameBuffer::computeFrameIQLocked1DLine(
@@ -1235,16 +1237,18 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     const float *tqDn_raw = (line + 1 <  last)  ? tqLine(line + 1) : nullptr;
     if (!ti0_raw || !tq0_raw) return;
 
-    std::vector<std::complex<double>> centerIQ(width), upIQ(width), dnIQ(width);
+    scratch_centerIQ.resize(width);
+    scratch_upIQ.resize(width);
+    scratch_dnIQ.resize(width);
     for (int x = 0; x < width; ++x) {
-        centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
-        upIQ[x]     = (tiUp_raw && tqUp_raw) ? std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x])
-                                             : std::complex<double>(0.0, 0.0);
-        dnIQ[x]     = (tiDn_raw && tqDn_raw) ? std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x])
-                                             : std::complex<double>(0.0, 0.0);
+        scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+        scratch_upIQ[x]     = (tiUp_raw && tqUp_raw) ? std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x])
+                                                     : std::complex<double>(0.0, 0.0);
+        scratch_dnIQ[x]     = (tiDn_raw && tqDn_raw) ? std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x])
+                                                     : std::complex<double>(0.0, 0.0);
     }
 
-    computeFrameIQFromPreparedVectors(line, centerIQ, upIQ, dnIQ, outFrameIQ, tiOverride, tqOverride, false);
+    computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, false);
 }
 
 Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
