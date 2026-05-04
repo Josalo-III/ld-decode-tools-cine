@@ -145,10 +145,6 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         const int rm1 = reflectRel(rel - 1);
         const int rp1 = reflectRel(rel + 1);
 
-        // Conservative reform: Field A should look like Field B, with an
-        // additional cautious ±4 reach. Avoid extra heuristics that create
-        // phase-leg / column artifacts.
-
         const double C    = row0[rel];
         const double Cup2 = rowUp2[rel];
         const double Cdn2 = rowDn2[rel];
@@ -397,57 +393,52 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     const float *tiD = configuration.phaseCompensation ? demodTI_line(lnDn2) : nullptr;
     const float *tqD = configuration.phaseCompensation ? demodTQ_line(lnDn2) : nullptr;
 
-    auto phaseCoherenceIQ = [&](double I0, double Q0, double In, double Qn)->double {
+    auto checkPhaseAngle = [&](double I0, double Q0, double In, double Qn)->double {
         const double m0 = std::hypot(I0, Q0);
         const double mn = std::hypot(In, Qn);
-        if (m0 * invI < 2.5 || mn * invI < 2.5) return 1.0; // too weak to trust phase
-        const double corr = (I0 * In + Q0 * Qn) / (m0 * mn + 1e-12); // [-1..1]
-        if (corr <= 0.0) return 0.0;
-        const double t0 = 0.55;
-        const double t1 = 0.85;
-        double w = (corr - t0) / (t1 - t0);
-        return std::clamp(w, 0.0, 1.0);
+        if (m0 * invI < 3.0 || mn * invI < 3.0) return 0.0;
+
+        const double cosTheta = (I0 * In + Q0 * Qn) / (m0 * mn + 1e-12);
+        constexpr double angularCutoff = 0.94;
+
+        return (cosTheta > angularCutoff) ? 1.0 : 0.0;
     };
 
     for (int h = left; h < right; ++h) {
         const int rel = h - left;
-        const int rm1 = reflectRel(rel - 1);
-        const int rp1 = reflectRel(rel + 1);
 
         const double C    = row0[rel];
         const double Cup  = rowUp2[rel];
         const double Cdn  = rowDn2[rel];
 
-        const double C_m1   = row0[rm1];
-        const double C_p1   = row0[rp1];
-        const double Cup_m1 = rowUp2[rm1];
-        const double Cup_p1 = rowUp2[rp1];
-        const double Cdn_m1 = rowDn2[rm1];
-        const double Cdn_p1 = rowDn2[rp1];
-
-        // Symmetric lateral magnitude context (removes column bias)
-        const double symCur = 0.5 * (std::fabs(C_m1)   + std::fabs(C_p1));
-        const double symUp  = 0.5 * (std::fabs(Cup_m1) + std::fabs(Cup_p1));
-        const double symDn  = 0.5 * (std::fabs(Cdn_m1) + std::fabs(Cdn_p1));
-
-        double kp = 0.0;
-        double kn = 0.0;
-
-        kp  = std::fabs(std::fabs(C) - std::fabs(Cup));
-        kp += std::fabs(symCur - symUp);
-        kp -= (std::fabs(C) + std::fabs(Cup)) * 0.10;
-
-        kn  = std::fabs(std::fabs(C) - std::fabs(Cdn));
-        kn += std::fabs(symCur - symDn);
-        kn -= (std::fabs(C) + std::fabs(Cdn)) * 0.10;
-
+        // --- Disentangled Vertical-Only Logic ---
+        
+        // 1. Calculate the raw vertical penalty (Luma-based)
+        // We remove the symCur, symUp, and symDn terms entirely.
+        // Instead of fabs(fabs(C) - fabs(Cup)), we look at the raw difference in IRE.
+        double kp = std::fabs(C - Cup) * invI; 
+        double kn = std::fabs(C - Cdn) * invI;
+        
+        // 2. Apply the 'Floor' (The old 10% bias removal)
+        // This keeps the logic from being too twitchy on low-level noise.
+        kp -= (std::fabs(C) * invI) * 0.10;
+        kn -= (std::fabs(C) * invI) * 0.10;
+        
         if (kp < 0.0) kp = 0.0;
         if (kn < 0.0) kn = 0.0;
-
-        double wUp = (kRange > 1e-9) ? (1.0 - kp * invK) : 1.0;
-        double wDn = (kRange > 1e-9) ? (1.0 - kn * invK) : 1.0;
+        
+        // 3. Convert to Weights
+        // Using your existing kRange / invK logic
+        double wUp = (kRange > 1e-9) ? (1.0 - (kp / kRange)) : 1.0;
+        double wDn = (kRange > 1e-9) ? (1.0 - (kn / kRange)) : 1.0;
+        
         wUp = std::clamp(wUp, 0.0, 1.0);
         wDn = std::clamp(wDn, 0.0, 1.0);
+        
+        // 4. Factor in the Vector Coherence
+        double angleUp = 1.0;
+        double angleDn = 1.0;
+        double angleUpDn = 1.0;
 
         if (configuration.phaseCompensation && ti0 && tq0 && tiU && tqU && tiD && tqD) {
             const double I0 = (double)ti0[rel];
@@ -456,10 +447,16 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
             const double QU = (double)tqU[rel];
             const double ID = (double)tiD[rel];
             const double QD = (double)tqD[rel];
-            wUp *= phaseCoherenceIQ(I0, Q0, IU, QU);
-            wDn *= phaseCoherenceIQ(I0, Q0, ID, QD);
-        }
 
+            angleUp = checkPhaseAngle(I0, Q0, IU, QU);
+            angleDn = checkPhaseAngle(I0, Q0, ID, QD);
+            if (angleUp > 0.0 && angleDn > 0.0) {
+                angleUpDn = checkPhaseAngle(IU, QU, ID, QD);
+            }
+
+            wUp *= angleUp;
+            wDn *= angleDn;
+        }
         double sc = 1.0;
 
         if ((wUp > 0.0) || (wDn > 0.0)) {
@@ -486,9 +483,20 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
 
         double tc = 0.0;
         if (wUp > 0.0 || wDn > 0.0) {
-            tc  = ((C - Cup) * wUp * sc);
-            tc += ((C - Cdn) * wDn * sc);
-            tc *= 0.25;
+            const double tcUp = (wUp > 0.0) ? ((C - Cup) * 0.5) : 0.0;
+            const double tcDn = (wDn > 0.0) ? ((C - Cdn) * 0.5) : 0.0;
+            const double tc3 =
+                ((((C - Cup) * wUp * sc) + ((C - Cdn) * wDn * sc)) * 0.25);
+
+            if (wUp > 0.0 && wDn > 0.0 && angleUp > 0.0 && angleDn > 0.0 && angleUpDn > 0.0) {
+                tc = tc3;
+            } else if (wUp > 0.0 && wDn > 0.0) {
+                tc = (kp <= kn) ? tcUp : tcDn;
+            } else if (wUp > 0.0) {
+                tc = tcUp;
+            } else {
+                tc = tcDn;
+            }
         } else {
             tc = 0.0;
         }
@@ -500,10 +508,6 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
     // it is intended only for the phase-blind (bucket) path.
     return;
 }
-
-// NOTE: demodSimpleField2DLine was removed. FrameIQ preclean demods directly from
-// the simpleField2D ring using the canonical 4fsc basis to avoid shared-buffer
-// side effects and to guarantee a single demod contract for the preclean path.
 
 // VDIS - Vertical Differential Isolation System.
 // Reduces artifacts at horizontal boundaries between different regions.
@@ -788,7 +792,9 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
                                     M[1][0]*I + M[1][1]*Q);
     };
 
-    const double COMB_STRENGTH  = std::max(1.0, T.FRAME_COMB_STRENGTH);
+    const double COMB_STRENGTH  = std::max(1.0, enableLateralRefine
+                                                  ? T.FRAME_COMB_STRENGTH
+                                                  : T.FRAME_B_COMB_STRENGTH);
     const double MAX_DELTA_IRE  = T.FRAME_IQ_RAW_MAX_DELTA_IRE;
     const double MIN_CHROMA_IRE = T.FRAME_CHROMA_MIN_IRE;
 
@@ -1158,11 +1164,11 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
     const float *tqDn_raw = (line + 1 <  last)  ? tqLine(line + 1) : nullptr;
     if (!ti0_raw || !tq0_raw) return;
 
-    // Preclean demod helper: demod simpleField2D[ln][x] -> canonical 4fsc bucket IQ.
+    // Preclean demod helper: demod precleanRing[ln][x] -> canonical 4fsc bucket IQ.
     // This is the *only* demod used for the preclean path (no shared demod buffers).
     auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
         if (ln < first || ln >= last) return false;
-        const double *row = simpleField2DLinePtr(ln, width);
+        const double *row = precleanLinePtr(ln, width);
         if (!row) return false;
         const int h = left + x;
         const int ph = (h & 3);

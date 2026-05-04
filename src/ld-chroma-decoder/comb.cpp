@@ -37,6 +37,22 @@ namespace {
     // chroma amplitude normalization
     constexpr double BUCKET_CHROMA_SCALE = 1.4;
     constexpr double PRODUCT_CHROMA_SCALE = 1.33;
+
+    inline double median4_average_middle(double a, double b, double c, double d)
+    {
+        if (a > b) std::swap(a, b);
+        if (c > d) std::swap(c, d);
+        if (a > c) std::swap(a, c);
+        if (b > d) std::swap(b, d);
+        if (b > c) std::swap(b, c);
+        return 0.5 * (b + c);
+    }
+
+    // Hard-coded, bucket-preserving (h&3) smooth applied to the locked,
+    // remodulated scalar 4fsc line in buildPhaseCorrected1D(). This keeps
+    // same-phase identity while reducing bucket-local texture injection
+    // that can otherwise show up as multi-line variation in Field combs.
+    constexpr double FIELD_BUCKET_SMOOTH_STRENGTH = 0.50;
 }
 
 // Tiny global LO trim (degrees). Negative usually counteracts a slight green bias.
@@ -416,11 +432,12 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             locked1DSource.assign(lines, std::vector<double>(width, 0.0));
             ownershipEvidence.assign(lines, std::vector<OwnershipEvidence>(width));
         }
-        // FieldB preclean raster is only needed for Frame/FVF in locked mode.
+        // Preclean ring is only needed for Frame/FVF in locked mode.
         if (needFrameIQ) {
             for (int s = 0; s < 3; ++s) {
-                simpleField2DRing[s].assign(width, 0.0);
-                simpleField2DRingLine[s] = -1;
+                precleanRing[s].assign(width, 0.0);
+                precleanGateRing[s].assign(width, 1.0);
+                precleanRingLine[s] = -1;
             }
         }
 
@@ -1014,6 +1031,29 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double rcos = -ti * bsin + tq * bcos;
             dst[h] = 0.5 * (rsin * sp4 + rcos * cp4);
         }
+
+        // After remodulating onto the integer 4fsc grid, apply a bucket-preserving
+        // same-phase smooth (±4) once per line. This avoids recomputing the same
+        // operation in multiple Field comb paths during FVF, and does not touch
+        // the demodTI/TQ arrays used by Frame B IQ.
+        if (FIELD_BUCKET_SMOOTH_STRENGTH > 0.0) {
+            if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.assign(width, 0.0);
+
+            auto reflectXi = [&](int x)->int {
+                if (x < 0) return -x;
+                if (x >= width) return (width - 1) - (x - (width - 1));
+                return x;
+            };
+
+            for (int xi = 0; xi < width; ++xi) {
+                const int xm4 = reflectXi(xi - 4);
+                const int xp4 = reflectXi(xi + 4);
+                const double raw = dst[left + xi];
+                const double est = 0.5 * (dst[left + xm4] + dst[left + xp4]);
+                scratch_filter_temp[xi] = raw + (est - raw) * FIELD_BUCKET_SMOOTH_STRENGTH;
+            }
+            for (int xi = 0; xi < width; ++xi) dst[left + xi] = scratch_filter_temp[xi];
+        }
     }
 }
 
@@ -1077,7 +1117,7 @@ void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
 // Paradigm: sample @ ±1 (interfield) = Frame. Sample @ ±2 (intra) = Field.
 //
 // Candidates:
-//   idx 0 : Field A — same-line ±2 (intra-field, primary phase)
+//   idx 0 : Field A — same-line ±2 influenced by ±4 (intra-field, primary phase)
 //   idx 1 : Field B — same-line ±2 (intra-field, alt phase)
 //   idx 2 : Frame A — precleaned interfield Frame (1D-conditioned same-phase
 //                     blend of framePreclean; cancels 1D chroma variations)
@@ -1243,6 +1283,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double SAT_FALLBACK_FULL  = 20.0;
     double prev_interfield_luma_ire = 0.0;
     double prev_sat_t = 0.0;
+    const double *frameRawData =
+        (frameRaw && (int)frameRaw->size() >= width) ? frameRaw->data() : nullptr;
 
     // Core Logic of Field Vs Frame
     // when the footage is progressive we prefer interfield comb
@@ -1586,14 +1628,17 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const double FRAME_COARSE_CLAMP     = 0.60;
                 const double FIELD_SWITCH_STRENGTH  = 0.10;
 
-                const bool fineDominant = (fineFrac > (midFrac + coarseFrac) + 0.10);
+                const bool frameScaleDominant = ((fineFrac + midFrac) > coarseFrac + 0.10);
 
-                double frameBonus = frameScaleBiasStrength * fineFrac;
-                frameBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
-                scoreR_A *= (1.0 - frameBonus);
-                scoreR_B *= (1.0 - frameBonus);
+                double frameABonus = frameScaleBiasStrength * midFrac;
+                frameABonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
+                scoreR_A *= (1.0 - frameABonus);
 
-                if (!fineDominant) {
+                double frameBBonus = frameScaleBiasStrength * fineFrac;
+                frameBBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
+                scoreR_B *= (1.0 - frameBBonus);
+
+                if (!frameScaleDominant) {
                     const double bias = std::clamp(coarseFrac - midFrac, -1.0, 1.0);
                     scoreA *= (1.0 - FIELD_SWITCH_STRENGTH * bias);
                     scoreB *= (1.0 + FIELD_SWITCH_STRENGTH * bias);
@@ -1636,7 +1681,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             if (sat_t > 0.0) {
                 // Penalize Field B more than Field A as saturation rises.
                 const double SAT_FIELD_A_PEN = 0.06;
-                const double SAT_FIELD_B_PEN = 0.14;
+                const double SAT_FIELD_B_PEN = 0.24;
                 scoreA *= (1.0 + SAT_FIELD_A_PEN * sat_t);
                 scoreB *= (1.0 + SAT_FIELD_B_PEN * sat_t);
 
@@ -1644,7 +1689,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 // but never punch through management veto or insane frame.
                 if (!managementVeto && b2VertCoherent && !frameInsane) {
                     const double SAT_FRAME_BONUS = 0.18;
-                    scoreR_A *= (1.0 - SAT_FRAME_BONUS * sat_t);
+                  //  scoreR_A *= (1.0 - SAT_FRAME_BONUS * sat_t); --removed due to boundary issues
                     scoreR_B *= (1.0 - SAT_FRAME_BONUS * sat_t);
                 }
             }
@@ -1729,28 +1774,23 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 no_sharp_reward: ;
             }
 
-            // --- cross-domain neighbor estimate using 2 plus a small 1 term ---
+            // VDIS
             if (!vdisHard &&
                 hIRE < T.NEIGHBOR_EST_EDGE_MAX_IRE &&
                 diff_stack_ire < T.NEIGHBOR_EST_FVF_MAX_IRE &&
                 chromaMagIRE < T.NEIGHBOR_EST_SAT_MAX_IRE)
             {
-                auto median3 = [&](double a, double b, double c)->double {
-                    double e0 = a, e1 = b, e2 = c;
-                    if (e0 > e1) std::swap(e0, e1);
-                    if (e1 > e2) std::swap(e1, e2);
-                    if (e0 > e1) std::swap(e0, e1);
-                    return e1;
-                };
-
                 int r_m2 = std::max(0,         rel - 2);
                 int r_p2 = std::min(width - 1, rel + 2);
 
                 double estA2 = 0.5 * (fieldA[r_m2]  + fieldA[r_p2]);
                 double estB2 = 0.5 * (fieldB[r_m2]  + fieldB[r_p2]);
                 double estF2 = 0.5 * (framePreclean[r_m2] + framePreclean[r_p2]);
+                double estRB2 = frameRawData
+                    ? 0.5 * (frameRawData[r_m2] + frameRawData[r_p2])
+                    : estF2;
 
-                double E2 = median3(estA2, estB2, estF2);
+                double E2 = median4_average_middle(estA2, estB2, estF2, estRB2);
 
                 bool allowPm1 = true;
                 {
@@ -1768,8 +1808,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     double estA1 = 0.5 * (fieldA[r_m1]  + fieldA[r_p1]);
                     double estB1 = 0.5 * (fieldB[r_m1]  + fieldB[r_p1]);
                     double estF1 = 0.5 * (framePreclean[r_m1] + framePreclean[r_p1]);
+                    double estRB1 = frameRawData
+                        ? 0.5 * (frameRawData[r_m1] + frameRawData[r_p1])
+                        : estF1;
 
-                    double E1 = median3(estA1, estB1, estF1);
+                    double E1 = median4_average_middle(estA1, estB1, estF1, estRB1);
 
                     const double K_PM1 = 0.5;
                     E = (E2 + K_PM1 * E1) / (1.0 + K_PM1);
@@ -1813,7 +1856,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const double FRAME_A_1D_BONUS = 0.12;
                 scoreR_A *= (1.0 - FRAME_A_1D_BONUS * frameA_1D_t);
             }
-
+/*
             // Frame B (raw) — favored around horizontal boundaries.
             {
                 const double HEDGE_NORM      = std::max(HEDGE_THRESH_IRE, 1.0);
@@ -1822,6 +1865,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 scoreR_B *= (1.0 - FRAME_B_HEDGE_BONUS * frameB_hedge_t);
             }
 
+            {
+                const double HEDGE_NORM2      = std::max(HEDGE_THRESH_IRE, 1.0);
+                const double fieldA_hedge_t  = std::clamp(hIRE / HEDGE_NORM2, 0.0, 1.0);
+                const double FIELD_A_HEDGE_BONUS = 0.18;
+                scoreR_B *= (1.0 - FIELD_A_HEDGE_BONUS * fieldA_hedge_t);
+            }
+*/
             auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
                 if (vdisSoft) {
                     if (candIdx == 0 && !safeA) return;
@@ -1840,10 +1890,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             };
 
             if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
-                // Strong horizontal luma edge regime — Frame B (raw) preserves
-                // edge detail; the precleaning would blunt the transition.
+                // Strong horizontal luma edge regime 
                 double dF1 = std::fabs(lumFRRaw - L1) * invI;
-                const std::vector<double> &rawFrameVec = frameRaw ? *frameRaw : framePreclean;
                 if (dF1 <= 3.5 && diff_cand_ire <= 5.0 && !frameInsane &&
                     (scoreR_B <= scoreR_A))
                     pickCandidate(3, FR_raw, 0.85f);   // Frame B
@@ -2480,7 +2528,7 @@ void Comb::FrameBuffer::split2D()
 
     if (!needFrameIQStorage) {
         // Not needed for this run; invalidate ring tags to avoid accidental use.
-        simpleField2DRingLine = { -1, -1, -1 };
+        precleanRingLine = { -1, -1, -1 };
     }
 
     const bool vdisEnabled = configuration.tunables.VDIS_ENABLE;
@@ -2505,15 +2553,27 @@ void Comb::FrameBuffer::split2D()
     std::vector<double> frameRawCenter;
 
     for (int line = firstLine; line < lastLine; ++line) {
-        // PREP: Precompute next neighbor (line+1) if in range and not already done
+        // PREP: Precompute next neighbor (line+1) into the preclean ring so the
+        // current line can read its result from the ring on the next iteration.
         if (needFrameIQCompute && line + 1 < lastLine) {
-            double *dst = simpleField2DLinePtrMutable(line + 1, width);
-            computeSimpleField2DLine(line + 1, dst);
+            computeField2DLine(line + 1,
+                               precleanLinePtrMutable(line + 1, width),
+                               precleanGateLinePtrMutable(line + 1, width));
         }
         if (line >= demodLines) continue;
 
         computeSimpleField2DLine(line, scratch_fieldBLine.data());
-        computeField2DLine(line, scratch_fieldLine.data(), scratch_fieldGate.data());
+        // Read Field A from the preclean ring when available (populated by the previous
+        // iteration's prefetch), otherwise fall back to computing it fresh.
+        if (needFrameIQCompute && havePrecleanLine(line, width)) {
+            const double *cSrc = precleanLinePtr(line, width);
+            std::copy(cSrc, cSrc + width, scratch_fieldLine.data());
+            const double *gSrc = precleanGateLinePtr(line, width);
+            if (gSrc) std::copy(gSrc, gSrc + width, scratch_fieldGate.data());
+            else       std::fill(scratch_fieldGate.data(), scratch_fieldGate.data() + width, 1.0);
+        } else {
+            computeField2DLine(line, scratch_fieldLine.data(), scratch_fieldGate.data());
+        }
 
         {
             const double *src1d = configuration.phaseCompensation
@@ -2555,8 +2615,6 @@ void Comb::FrameBuffer::split2D()
                 }
             }
 
-            double *dst = simpleField2DLinePtrMutable(line, width);
-            std::copy(scratch_fieldBLine.begin(), scratch_fieldBLine.begin() + width, dst);
             computeFrameIQPrecleanLine(line, frameIQ);
             
             scratch_fieldBCenter.assign(width, 0.0);
