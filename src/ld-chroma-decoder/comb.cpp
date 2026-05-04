@@ -3477,14 +3477,20 @@ void Comb::FrameBuffer::produceY()
         }
 
         // ------------------------------------------------------------
-        // Second pass: produce residual Y by controlling the subtraction itself.
+        // Second pass: three-candidate vet for residual Y.
         //
-        // The residual path is the incumbent: alpha=1 subtracts the remodulated
-        // chroma estimate as-is. In uncertain cases, use the chroma profile of
-        // cHat and the luma profile of the resulting Y to make a bounded alpha
-        // correction that minimizes 4fSC-like residue in Y. This keeps the
-        // decision at the waveform separation point instead of treating residual
-        // Y as an optional replacement candidate.
+        // Each candidate represents a different subtraction strength (alpha)
+        // applied to cHat — they differ in how much chroma to remove from Y.
+        //
+        //   1. Coherent (alpha=1): trust the comb's demodulated IQ entirely.
+        //   2. Residual (alpha=alphaFit): LS fit minimising 4fSC energy in
+        //      raw - alpha*cHat; captures HF luma the comb missed.
+        //   3. Reassigned (alpha=chromaFrac): ownership evidence says some of
+        //      what the comb attributed to chroma is actually luma; return it.
+        //
+        // The effective alpha is the weighted average of the three subtraction
+        // strengths. alphaFit is computed per 4-sample group (needs the 4fSC
+        // phase structure). The ownership correction is applied per-pixel.
         // ------------------------------------------------------------
         const bool do3D = (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
 
@@ -3492,15 +3498,31 @@ void Comb::FrameBuffer::produceY()
         const double MAX_ALPHA = 1.25;
         const double MIN_SUB_CHROMA_IRE = 2.0;
 
+        // Ownership evidence for this line (may be absent)
+        const bool ownershipEnabled = T.VET_OWNERSHIP_ENABLE
+            && line >= 0 && line < (int)ownershipEvidence.size()
+            && (int)ownershipEvidence[line].size() >= width;
+        const OwnershipEvidence *ownRow = ownershipEnabled
+            ? ownershipEvidence[line].data() : nullptr;
+        const double ownershipWeight = T.VET_OWNERSHIP_LUMA_WEIGHT;
+
         if (width < 4) {
-            // Degenerate: no 4-sample group; use full residual subtraction.
+            // Degenerate: no 4-sample group; use full residual subtraction
+            // with per-pixel ownership correction only.
             for (int x = 0; x < width; ++x) {
                 const int h = left + x;
-                const double yOut = (double)rawLine[h] - cHat[x];
+                double alphaEff = 1.0;
+                if (ownRow) {
+                    const double lc = ownRow[x].lumaClaim;
+                    const double chromaFrac = std::clamp(1.0 - lc, 0.0, 1.0);
+                    alphaEff = 1.0 * (1.0 - ownershipWeight * lc)
+                             + chromaFrac * (ownershipWeight * lc);
+                }
+                const double yOut = (double)rawLine[h] - alphaEff * cHat[x];
                 Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
-                if (configuration.showMap) w2d_frame_weight[line][x] = (float)vetConf[x];
-                tiRowW[x] = (float)tiAdjLn[x];
-                tqRowW[x] = (float)tqAdjLn[x];
+                if (configuration.showMap) w2d_frame_weight[line][x] = (float)alphaEff;
+                tiRowW[x] = (float)(alphaEff * tiAdjLn[x]);
+                tqRowW[x] = (float)(alphaEff * tqAdjLn[x]);
             }
             continue;
         }
@@ -3527,29 +3549,45 @@ void Comb::FrameBuffer::produceY()
             const double subEnergy = subI * subI + subQ * subQ;
             const double subMagIRE = std::sqrt(subEnergy) * invI;
 
-            double alpha = 1.0;
+            // Candidate 1 vs 2: existing vet blend (coherent ↔ residual).
+            // This produces the alpha that would be used without ownership.
+            double alphaVet = 1.0;
             if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0 && subMagIRE >= MIN_SUB_CHROMA_IRE) {
-                // Least-squares alpha that minimizes 4fSC energy in raw - alpha*cHat.
                 const double alphaFit = std::clamp((rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
                                                    MIN_ALPHA, MAX_ALPHA);
                 const double conf = std::clamp(0.25 * (vetConf[p + 0] + vetConf[p + 1] +
                                                        vetConf[p + 2] + vetConf[p + 3]),
                                                0.0, 1.0);
                 const double profileWeight = T.VET_Y_CHROMA_LIKE_WEIGHT * (1.0 - conf);
-                alpha = 1.0 + profileWeight * (alphaFit - 1.0);
+                alphaVet = 1.0 + profileWeight * (alphaFit - 1.0);
             }
 
+            // Candidate 3: per-pixel ownership reassignment blended in.
             for (int i = 0; i < 4; ++i) {
                 const int x = p + i;
                 if (x < 0 || x >= width) continue;
                 const int h = left + x;
 
-                const double yOut = (double)rawLine[h] - alpha * cHat[x];
+                double alphaEff = alphaVet;
+
+                if (ownRow) {
+                    const double lc = ownRow[x].lumaClaim;
+                    // chromaFrac: the fraction of cHat that ownership says is
+                    // genuinely chroma. When lumaClaim is high, chromaFrac is
+                    // low → subtract less → HF luma stays in Y.
+                    const double chromaFrac = std::clamp(1.0 - lc, 0.0, 1.0);
+                    const double blend = ownershipWeight * lc;
+                    alphaEff = alphaVet * (1.0 - blend) + chromaFrac * blend;
+                }
+
+                alphaEff = std::clamp(alphaEff, MIN_ALPHA, MAX_ALPHA);
+
+                const double yOut = (double)rawLine[h] - alphaEff * cHat[x];
                 Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
 
-                if (configuration.showMap) w2d_frame_weight[line][x] = (float)alpha;
-                tiRowW[x] = (float)(alpha * tiAdjLn[x]);
-                tqRowW[x] = (float)(alpha * tqAdjLn[x]);
+                if (configuration.showMap) w2d_frame_weight[line][x] = (float)alphaEff;
+                tiRowW[x] = (float)(alphaEff * tiAdjLn[x]);
+                tqRowW[x] = (float)(alphaEff * tqAdjLn[x]);
             }
         }
     }

@@ -285,6 +285,11 @@ public:
             // profile agreement to make a bounded correction to the chroma
             // subtraction amount.
             double VET_Y_CHROMA_LIKE_WEIGHT       = 0.12;
+            // Ownership-informed Y reassignment: when ownership evidence says
+            // bandpassed energy is luma-owned, return it to Y instead of
+            // subtracting it as chroma.
+            bool   VET_OWNERSHIP_ENABLE            = true;
+            double VET_OWNERSHIP_LUMA_WEIGHT       = 0.5;  // blend strength for lumaClaim reassignment (0=off, 1=full)
             double VET_Y_ADAPTIVE_SCALE           = 0.0;
             double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
             bool   VET_RESIDUAL_FIR_ENABLE        = false;
