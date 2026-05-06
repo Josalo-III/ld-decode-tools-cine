@@ -52,7 +52,7 @@ namespace {
     // remodulated scalar 4fsc line in buildPhaseCorrected1D(). This keeps
     // same-phase identity while reducing bucket-local texture injection
     // that can otherwise show up as multi-line variation in Field combs.
-    constexpr double FIELD_BUCKET_SMOOTH_STRENGTH = 0.50;
+    constexpr double FIELD_BUCKET_SMOOTH_STRENGTH = 0.00;
 }
 
 // Tiny global LO trim (degrees). Negative usually counteracts a slight green bias.
@@ -1349,10 +1349,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             satFR_demod = std::fabs(FR);
         }
 
-        const Cond1D FA_c = condSamePhase(fieldA, rel);
-        const Cond1D FB_c = condSamePhase(fieldB, rel);
-        const Cond1D FR_c = condSamePhaseVec(framePreclean, rel);
-
+		Cond1D FA_c; FA_c.raw = FA; FA_c.score = FA; FA_c.outlierIRE = 0.0;
+		Cond1D FB_c; FB_c.raw = FB; FB_c.score = FB; FB_c.outlierIRE = 0.0;
+		Cond1D FR_c; FR_c.raw = FR; FR_c.score = FR; FR_c.outlierIRE = 0.0;
         // Cache the precleaned Frame A value (the 1D-conditioned blend);
         // the island filter and post-processing read from this scratch.
         scratch_fvf_frameAVal[rel] = FR_c.score;
@@ -2086,7 +2085,7 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
         e.uncertainClaim = std::clamp(1.0 - std::max(e.lumaClaim, e.chromaClaim), 0.0, 1.0);
     }
 }
-
+//diagnostic tool for comb development
 void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const
 {
     if (!configuration.debugPhaseLegs || !configuration.phaseCompensation)
@@ -2556,9 +2555,8 @@ void Comb::FrameBuffer::split2D()
         // PREP: Precompute next neighbor (line+1) into the preclean ring so the
         // current line can read its result from the ring on the next iteration.
         if (needFrameIQCompute && line + 1 < lastLine) {
-            computeField2DLine(line + 1,
-                               precleanLinePtrMutable(line + 1, width),
-                               precleanGateLinePtrMutable(line + 1, width));
+            computeSimpleField2DLine(line + 1,
+                               precleanLinePtrMutable(line + 1, width));
         }
         if (line >= demodLines) continue;
 
@@ -2614,26 +2612,9 @@ void Comb::FrameBuffer::split2D()
                     frameRawCenter[rel] = 0.0;
                 }
             }
-
-            computeFrameIQPrecleanLine(line, frameIQ);
             
-            scratch_fieldBCenter.assign(width, 0.0);
-
-            for (int rel = 0; rel < width; ++rel) {
-                int h = left + rel;
-                if (rel < (int)frameIQ.size()) {
-                    const auto &Z = frameIQ[rel];
-                    const double Ii = Z.real();
-                    const double Qi = Z.imag();
-                    const double s4 = sin4fsc(h);
-                    const double c4 = cos4fsc(h);
-                    // Frame A IQ is in canonical 4fsc bucket axes; remod directly.
-                    const double cOut = 0.5 * (Ii * s4 + Qi * c4);
-                    scratch_fieldBCenter[rel] = cOut;
-                } else {
-                    scratch_fieldBCenter[rel] = 0.0;
-                }
-            }
+			scratch_fieldBCenter.assign(width, 0.0);
+			computeFrameScalarLine(line, scratch_fieldBCenter.data());
             
         }
 
@@ -3192,19 +3173,6 @@ void Comb::FrameBuffer::produceY()
     const int width     = right - left;
     if (width <= 0) return;
 
-    // basisLockedInit guaranteed by phaseLocked in locked mode; guard retained for safety.
-    if (!basisLockedInit) {
-        double Ce = 1.0, Se = 0.0;
-        basisCoeffs(Ce, Se);
-        for (int i = 0; i < 4; ++i) {
-            double sp, cp;
-            shiftedBasis(i, Ce, Se, sp, cp);
-            spLUT_locked[i] = sp;
-            cpLUT_locked[i] = cp;
-        }
-        basisLockedInit = true;
-    }
-
     const auto &T = configuration.tunables;
     const bool enableResidualY = T.VET_ENABLE_RESIDUAL_Y;
     const double invI = this->invIreScale;
@@ -3224,15 +3192,13 @@ void Comb::FrameBuffer::produceY()
         const quint16* rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
         const double bcos = demodBurstCos[line];
         const double bsin = demodBurstSin[line];
-        // Remod coefficients for cval_hat:
-        //   c = 0.5 * ((ti*bcos + tq*bsin)*sp + (-ti*bsin + tq*bcos)*cp)
-        //     = ti * 0.5*(bcos*sp - bsin*cp) + tq * 0.5*(bsin*sp + bcos*cp)
+        // Exact 4fsc remod coefficients for cval_hat.
+        // We rotate the incoming locked IQ onto the canonical sample-phase grid at
+        // intake, then stay on that single 4fsc clock for the residual-Y solve.
         double remodI[4], remodQ[4];
         for (int ph = 0; ph < 4; ++ph) {
-            const double sp = spLUT_locked[ph];
-            const double cp = cpLUT_locked[ph];
-            remodI[ph] = 0.5 * (bcos * sp - bsin * cp);
-            remodQ[ph] = 0.5 * (bsin * sp + bcos * cp);
+            remodI[ph] = 0.5 * sin4fsc(ph);
+            remodQ[ph] = 0.5 * cos4fsc(ph);
         }
 
         double* Y = componentFrame->y(line);
@@ -3296,10 +3262,20 @@ void Comb::FrameBuffer::produceY()
         if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
 
         for (int xi = 0; xi < width; ++xi) {
-            const double ti = (double)tiRow[xi];
-            const double tq = (double)tqRow[xi];
-            const double ri = (double)triRow[xi];
-            const double rq = (double)trqRow[xi];
+            const double tiLocked = (double)tiRow[xi];
+            const double tqLocked = (double)tqRow[xi];
+            const double riLocked = (double)triRow[xi];
+            const double rqLocked = (double)trqRow[xi];
+
+            // Receive upstream's locked-basis demod here, then rotate once into
+            // canonical 4fsc bucket IQ for the local residual-Y solve.
+            const double ti = tiLocked * bcos + tqLocked * bsin;
+            const double tq = -tiLocked * bsin + tqLocked * bcos;
+            const double ri = riLocked * bcos + rqLocked * bsin;
+            const double rq = -riLocked * bsin + rqLocked * bcos;
+
+            tiAdjLn[xi] = ti;
+            tqAdjLn[xi] = tq;
 
             const double magT_ire = std::hypot(ti, tq) * invI;
             const double magR_ire = std::hypot(ri, rq) * invI;
@@ -3449,8 +3425,8 @@ void Comb::FrameBuffer::produceY()
             const double pMax = T.Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0;
 
             // Saturated trouble regions: keep transform conservative (rotation-only / no shear).
-            const double ti0 = (double)tiRow[x];
-            const double tq0 = (double)tqRow[x];
+            const double ti0 = tiAdjLn[x];
+            const double tq0 = tqAdjLn[x];
             const double magX_ire = std::hypot(ti0, tq0) * invI;
             const bool satTrouble = (magX_ire > SAT_TROUBLE_IRE);
 
@@ -3459,14 +3435,12 @@ void Comb::FrameBuffer::produceY()
                                       T.Y_LOCAL_GAIN_MIN, T.Y_LOCAL_GAIN_MAX,
                                       satTrouble ? 0.0 : T.Y_LOCAL_MAX_SHEAR);
 
-            const int idx = (h & 3);
-            const double sp = spLUT_locked[idx], cp = cpLUT_locked[idx];
-
             // Apply clamped transform to (ti0,tq0) for estimate only
             // NOTE: we apply only Rm here 
             const double ti_adj = Rm[0][0]*ti0 + Rm[0][1]*tq0;
             const double tq_adj = Rm[1][0]*ti0 + Rm[1][1]*tq0;
 
+            const int idx = (h & 3);
             const double cval_hat = ti_adj * remodI[idx] + tq_adj * remodQ[idx];
 
             // Store for the second-pass decision (protect luma against chroma).
@@ -3521,8 +3495,10 @@ void Comb::FrameBuffer::produceY()
                 const double yOut = (double)rawLine[h] - alphaEff * cHat[x];
                 Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
                 if (configuration.showMap) w2d_frame_weight[line][x] = (float)alphaEff;
-                tiRowW[x] = (float)(alphaEff * tiAdjLn[x]);
-                tqRowW[x] = (float)(alphaEff * tqAdjLn[x]);
+                const double tiLocked = tiAdjLn[x] * bcos - tqAdjLn[x] * bsin;
+                const double tqLocked = tiAdjLn[x] * bsin + tqAdjLn[x] * bcos;
+                tiRowW[x] = (float)(alphaEff * tiLocked);
+                tqRowW[x] = (float)(alphaEff * tqLocked);
             }
             continue;
         }
@@ -3586,8 +3562,10 @@ void Comb::FrameBuffer::produceY()
                 Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
 
                 if (configuration.showMap) w2d_frame_weight[line][x] = (float)alphaEff;
-                tiRowW[x] = (float)(alphaEff * tiAdjLn[x]);
-                tqRowW[x] = (float)(alphaEff * tqAdjLn[x]);
+                const double tiLocked = tiAdjLn[x] * bcos - tqAdjLn[x] * bsin;
+                const double tqLocked = tiAdjLn[x] * bsin + tqAdjLn[x] * bcos;
+                tiRowW[x] = (float)(alphaEff * tiLocked);
+                tqRowW[x] = (float)(alphaEff * tqLocked);
             }
         }
     }

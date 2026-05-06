@@ -290,6 +290,13 @@ public:
             // subtracting it as chroma.
             bool   VET_OWNERSHIP_ENABLE            = true;
             double VET_OWNERSHIP_LUMA_WEIGHT       = 0.5;  // blend strength for lumaClaim reassignment (0=off, 1=full)
+            double VET_OWNERSHIP_CHROMA_WEIGHT = 0.12;
+            double VET_OWNERSHIP_CONFLICT_SUPPRESS = 0.65;
+            double VET_Y_COHERENCE_ROLLBACK_WEIGHT = 0.75;
+            double VET_Y_COHERENCE_BADNESS_IRE = 1.5;
+			double FVF_OWNERSHIP_LUMA_WEIGHT     = 0.14; // lumaClaim favors less chroma-removal / safer field-side witnesses
+			double FVF_OWNERSHIP_CHROMA_WEIGHT   = 0.18; // chromaClaim favors coherent chroma witnesses
+			double LOCKED1D_OWNERSHIP_DAMP_WEIGHT = 0.25; // early positive fork: damp 1D chroma when luma-owned
             double VET_Y_ADAPTIVE_SCALE           = 0.0;
             double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
             bool   VET_RESIDUAL_FIR_ENABLE        = false;
@@ -569,6 +576,9 @@ private:
                               double  *outGate);
 
         void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
+        
+        void computeFrameScalarLine(int lineNumber, double *outFrameLine);
+
 
         void computeFrameIQPrecleanLine(int line,
                                         std::vector<std::complex<double>> &outFrameIQ);
@@ -632,7 +642,6 @@ private:
             return (width > 0) ? getNotchLumaEven2(vec.data(), rel, width) : 0.0;
         }
             
-                                    
         void getBestCandidate(qint32 lineNumber, qint32 h,
                               const FrameBuffer &previousFrame,
                               const FrameBuffer &nextFrame,
@@ -692,9 +701,7 @@ private:
             int    adjNeighborCount  = 0;          // number of valid immediate neighbors (0..2)
             double adjNeighborSupport= 0.0;        // average agreement of h±1 with residual (0..1)
         };
-
     };
-
     // Inline definitions for FrameBuffer (out-of-class)
 };
 

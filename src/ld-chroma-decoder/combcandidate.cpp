@@ -24,6 +24,110 @@
 #include <algorithm>
 #include <limits>
 
+// VDIS - Vertical Differential Isolation System.
+// Reduces artifacts at horizontal boundaries between different regions.
+// We detect for strong vertical differentials in both chroma phase (IQ space)
+// and scalar magnitude between upper and lower samples in the field.
+// If checks fail, 1D only in FVF and 3D. Fields excluded from FVF if 2 fails.
+// This is the heavy-handed lathe when nothing else works and 1D is tempting
+void Comb::FrameBuffer::computeVDISLine(int lineNumber)
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    if (width <= 0) return;
+
+    const auto &T = configuration.tunables;
+
+    // Ensure flag buffer is sized and cleared
+    if ((int)scratch_vdis_flag.size() < width) scratch_vdis_flag.resize(width, 0);
+    else std::fill(scratch_vdis_flag.begin(), scratch_vdis_flag.end(), 0);
+
+    // ----------------------------------------------------------------
+    // Scalar (2) leg: amplitude-based disagreement
+    // ----------------------------------------------------------------
+    const int up2 = lineNumber - 2;
+    const int dn2 = lineNumber + 2;
+    const bool haveUp2 = (up2 >= first && up2 < last);
+    const bool haveDn2 = (dn2 >= first && dn2 < last);
+
+    if (haveUp2 && haveDn2) {
+        const double th1d_ire = T.VDIS_1D_DIFF_THRESH_IRE;
+        const double th1d_s   = (th1d_ire > 0.0) ? th1d_ire * irescale : 0.0;
+
+        if (th1d_s > 0.0) {
+            for (int rel = 0; rel < width; ++rel) {
+                int h = left + rel;
+                double c = clpbuffer[0].pixel[lineNumber][h];
+                double u = clpbuffer[0].pixel[up2][h];
+                double d = clpbuffer[0].pixel[dn2][h];
+                double maxDiff = std::max(std::fabs(c - u), std::fabs(c - d));
+                if (maxDiff > th1d_s) {
+                    scratch_vdis_flag[rel] = 1;
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // IQ (1) leg: chroma phase disagreement (VDIS_USE_PLUS1)
+    // ----------------------------------------------------------------
+    if (T.VDIS_USE_PLUS1 &&
+        lineNumber >= first && lineNumber < last &&
+        lineNumber < demodLines && demodWidth > 0)
+    {
+        const int up1 = lineNumber - 1;
+        const int dn1 = lineNumber + 1;
+        const bool haveUp1 = (up1 >= 0 && up1 < demodLines);
+        const bool haveDn1 = (dn1 >= 0 && dn1 < demodLines);
+
+        if (haveUp1 || haveDn1) {
+            const float *ti0 = demodTI_line(lineNumber);
+            const float *tq0 = demodTQ_line(lineNumber);
+            const float *tiU = haveUp1 ? demodTI_line(up1) : nullptr;
+            const float *tqU = haveUp1 ? demodTQ_line(up1) : nullptr;
+            const float *tiD = haveDn1 ? demodTI_line(dn1) : nullptr;
+            const float *tqD = haveDn1 ? demodTQ_line(dn1) : nullptr;
+
+            const double minChroma = T.VDIS_MIN_CHROMA_IRE * irescale;
+            const double cosThresh = std::cos(T.VDIS_PHASE_THRESH_DEG * M_PI / 180.0);
+
+            const int W = std::min(width, demodWidth);
+            for (int rel = 0; rel < W; ++rel) {
+                double I0 = ti0[rel];
+                double Q0 = tq0[rel];
+                double m0 = std::hypot(I0, Q0);
+                if (m0 < minChroma) continue;
+
+                bool fire = false;
+
+                if (haveUp1) {
+                    double IU = tiU[rel], QU = tqU[rel];
+                    double mU = std::hypot(IU, QU);
+                    if (mU >= minChroma) {
+                        double dot = I0 * IU + Q0 * QU;
+                        double cosv = dot / (m0 * mU + 1e-12);
+                        if (cosv < cosThresh) fire = true;
+                    }
+                }
+                if (!fire && haveDn1) {
+                    double ID = tiD[rel], QD = tqD[rel];
+                    double mD = std::hypot(ID, QD);
+                    if (mD >= minChroma) {
+                        double dot = I0 * ID + Q0 * QD;
+                        double cosv = dot / (m0 * mD + 1e-12);
+                        if (cosv < cosThresh) fire = true;
+                    }
+                }
+
+                if (fire) scratch_vdis_flag[rel] = 1;
+            }
+        }
+    }
+}
+// -------------------------------------------------------------------------
 // Returns true if the consolidated VDIS mask has flagged position (lineNumber, h)
 // as a vertical differential isolation region. The mask is populated by
 // computeVDISLine and consolidated by consolidateVDISRegions during split2D.
@@ -43,6 +147,81 @@ bool Comb::FrameBuffer::hasVDIS(int lineNumber, int h) const
     if (rel < 0 || rel >= (int)row.size()) return false;
     return row[rel] != 0;
 }
+
+// VDIS region consolidation
+//
+// Input:  vdisMask[line][rel] == 0/1 from computeVDISLine per-line flags.
+// Output: vdisMask is rewritten to:
+//   0 = no VDIS
+//   1 = soft VDIS region
+//   2 = hard VDIS region
+//
+// We use a small 3x3 neighbourhood count:
+//   vcount >= HARD_MIN  => strong cluster => hard VDIS (2)
+//   SOFT_MIN <=vcount< HARD_MIN => soft VDIS belt (1)
+//   vcount <= NOISE_MAX => isolated speck => cleared to 0
+//   else => keep original value.
+void Comb::FrameBuffer::consolidateVDISRegions(
+    std::vector<std::vector<char>> &vdisMask,
+    const LdDecodeMetaData::VideoParameters &vp)
+{
+    const int firstLine = vp.firstActiveFrameLine;
+    const int lastLine  = vp.lastActiveFrameLine;
+    const int left      = vp.activeVideoStart;
+    const int right     = vp.activeVideoEnd;
+    const int width     = right - left;
+
+    if (width <= 0) return;
+    if ((int)vdisMask.size() < lastLine) return;
+
+    // Thresholds; adjust as needed.
+    const int HARD_MIN  = 5;  // strong 3x3 cluster -> hard VDIS
+    const int SOFT_MIN  = 2;  // 2-4 neighbors   -> soft VDIS
+    const int NOISE_MAX = 1;  // <= 1 neighbor   -> noise
+
+    std::vector<std::vector<char>> outMask = vdisMask;
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        if ((int)vdisMask[line].size() < width) continue;
+
+        for (int rel = 0; rel < width; ++rel) {
+            int vcount = 0;
+
+            // Count VDIS flags in 3x3 neighbourhood
+            for (int dy = -1; dy <= +1; ++dy) {
+                int ln = line + dy;
+                if (ln < firstLine || ln >= lastLine) continue;
+                if ((int)vdisMask[ln].size() < width) continue;
+                const auto &row = vdisMask[ln];
+
+                for (int dx = -1; dx <= +1; ++dx) {
+                    int rr = rel + dx;
+                    if (rr < 0 || rr >= width) continue;
+                    if (row[rr]) ++vcount;
+                }
+            }
+
+            char newVal = 0;
+
+            if (vcount >= HARD_MIN) {
+                newVal = 2; // hard region
+            } else if (vcount >= SOFT_MIN) {
+                newVal = 1; // soft belt
+            } else if (vcount <= NOISE_MAX) {
+                newVal = 0; // speck -> clear
+            } else {
+                // mid case: keep original (usually 1)
+                newVal = vdisMask[line][rel];
+            }
+
+            outMask[line][rel] = newVal;
+        }
+    }
+
+    vdisMask.swap(outMask);
+}
+
+// 2D section
 
 // Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically 
 // influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
@@ -319,20 +498,11 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
 // - uses only 2 vertical neighbours
 void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFieldLine)
 {
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
 
-    if (width <= 0 || lineNumber < first || lineNumber >= last) {
-        if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
-        return;
-    }
-    if (!outFieldLine) return;
-
-    auto clampSameFieldLine = [&](int ln)->int {
+    // --- HELPER DECLARATION ---
+    auto clampSameFieldLine = [&](int ln) -> int {
         const int parity = (lineNumber & 1);
         ln = std::clamp(ln, first, last - 1);
         if ((ln & 1) != parity) {
@@ -342,352 +512,276 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         return ln;
     };
 
-    const int ln0   = clampSameFieldLine(lineNumber);
-    const int lnUp2 = clampSameFieldLine(lineNumber - 2);
-    const int lnDn2 = clampSameFieldLine(lineNumber + 2);
+    // Pre-calculate the indices once
+    const int ln0  = clampSameFieldLine(lineNumber);
+    const int lnU2 = clampSameFieldLine(lineNumber - 2);
+    const int lnD2 = clampSameFieldLine(lineNumber + 2);
+    // --------------------------
 
-    const double *row0   = nullptr;
-    const double *rowUp2 = nullptr;
-    const double *rowDn2 = nullptr;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
 
-    if (configuration.phaseCompensation) {
-        auto getRow = [&](int ln)->const double* {
-            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
-            const auto &row = locked1DSource[ln];
-            if ((int)row.size() < width) return nullptr;
-            return row.data();
-        };
-        row0   = getRow(ln0);
-        rowUp2 = getRow(lnUp2);
-        rowDn2 = getRow(lnDn2);
-    } else {
-        row0   = clpbuffer[0].pixel[ln0]   + left;
-        rowUp2 = clpbuffer[0].pixel[lnUp2] + left;
-        rowDn2 = clpbuffer[0].pixel[lnDn2] + left;
+    if (width <= 0 || lineNumber < first || lineNumber >= last || !outFieldLine) {
+        if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
+        return;
     }
+
+    auto getRow = [&](int ln) -> const double* {
+        if (ln < 0) return nullptr;
+        if (configuration.phaseCompensation) {
+             if (ln >= (int)locked1DSource.size()) return nullptr;
+             return locked1DSource[ln].data();
+        }
+        return clpbuffer[0].pixel[ln] + left;
+    };
+
+    const double *row0   = getRow(ln0);
+    const double *rowUp2 = getRow(lnU2);
+    const double *rowDn2 = getRow(lnD2);
 
     if (!row0 || !rowUp2 || !rowDn2) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
         return;
     }
 
-    const auto &T = configuration.tunables;
-    const double kRange = T.FIELD_K_RANGE_IRE * irescale;
-    const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
-    const double invI   = this->invIreScale;
+    const double invI = this->invIreScale;
 
-    auto reflectRel = [&](int r)->int {
-        if (r < 0) return -r;
-        if (r >= width) return (width - 1) - (r - (width - 1));
-        return r;
+    auto getCoherence = [&](const float* ti, const float* tq, const float* tiN, const float* tqN, int x) -> double {
+        if (!ti || !tq || !tiN || !tqN) return 1.0;
+        const double m0 = std::hypot(ti[x], tq[x]);
+        const double mn = std::hypot(tiN[x], tqN[x]);
+        if (m0 * invI < 2.5 || mn * invI < 2.5) return 1.0; 
+        const double corr = (ti[x] * tiN[x] + tq[x] * tqN[x]) / (m0 * mn + 1e-12);
+        return std::clamp((corr - 0.55) / (0.85 - 0.55), 0.0, 1.0);
     };
 
-    // Phase-coherence gate for vertical reaches (locked mode only).
-    // Uses the existing phase-corrected 1D IQ produced upstream by buildPhaseCorrected1D
-    // (demodTI/demodTQ). This avoids any additional demod and keys directly off the
-    // same locked phase model that the rest of the pipeline uses.
-    const float *ti0 = configuration.phaseCompensation ? demodTI_line(ln0)   : nullptr;
-    const float *tq0 = configuration.phaseCompensation ? demodTQ_line(ln0)   : nullptr;
-    const float *tiU = configuration.phaseCompensation ? demodTI_line(lnUp2) : nullptr;
-    const float *tqU = configuration.phaseCompensation ? demodTQ_line(lnUp2) : nullptr;
-    const float *tiD = configuration.phaseCompensation ? demodTI_line(lnDn2) : nullptr;
-    const float *tqD = configuration.phaseCompensation ? demodTQ_line(lnDn2) : nullptr;
+    for (int h = 0; h < width; ++h) {
+        const double C   = row0[h];
+        const double Cup = rowUp2[h];
+        const double Cdn = rowDn2[h];
 
-    auto checkPhaseAngle = [&](double I0, double Q0, double In, double Qn)->double {
-        const double m0 = std::hypot(I0, Q0);
-        const double mn = std::hypot(In, Qn);
-        if (m0 * invI < 3.0 || mn * invI < 3.0) return 0.0;
-
-        const double cosTheta = (I0 * In + Q0 * Qn) / (m0 * mn + 1e-12);
-        constexpr double angularCutoff = 0.94;
-
-        return (cosTheta > angularCutoff) ? 1.0 : 0.0;
-    };
-
-    for (int h = left; h < right; ++h) {
-        const int rel = h - left;
-
-        const double C    = row0[rel];
-        const double Cup  = rowUp2[rel];
-        const double Cdn  = rowDn2[rel];
-
-        // --- Disentangled Vertical-Only Logic ---
-        
-        // 1. Calculate the raw vertical penalty (Luma-based)
-        // We remove the symCur, symUp, and symDn terms entirely.
-        // Instead of fabs(fabs(C) - fabs(Cup)), we look at the raw difference in IRE.
-        double kp = std::fabs(C - Cup) * invI; 
-        double kn = std::fabs(C - Cdn) * invI;
-        
-        // 2. Apply the 'Floor' (The old 10% bias removal)
-        // This keeps the logic from being too twitchy on low-level noise.
-        kp -= (std::fabs(C) * invI) * 0.10;
-        kn -= (std::fabs(C) * invI) * 0.10;
-        
-        if (kp < 0.0) kp = 0.0;
-        if (kn < 0.0) kn = 0.0;
-        
-        // 3. Convert to Weights
-        // Using your existing kRange / invK logic
-        double wUp = (kRange > 1e-9) ? (1.0 - (kp / kRange)) : 1.0;
-        double wDn = (kRange > 1e-9) ? (1.0 - (kn / kRange)) : 1.0;
-        
-        wUp = std::clamp(wUp, 0.0, 1.0);
-        wDn = std::clamp(wDn, 0.0, 1.0);
-        
-        // 4. Factor in the Vector Coherence
-        double angleUp = 1.0;
-        double angleDn = 1.0;
-        double angleUpDn = 1.0;
-
-        if (configuration.phaseCompensation && ti0 && tq0 && tiU && tqU && tiD && tqD) {
-            const double I0 = (double)ti0[rel];
-            const double Q0 = (double)tq0[rel];
-            const double IU = (double)tiU[rel];
-            const double QU = (double)tqU[rel];
-            const double ID = (double)tiD[rel];
-            const double QD = (double)tqD[rel];
-
-            angleUp = checkPhaseAngle(I0, Q0, IU, QU);
-            angleDn = checkPhaseAngle(I0, Q0, ID, QD);
-            if (angleUp > 0.0 && angleDn > 0.0) {
-                angleUpDn = checkPhaseAngle(IU, QU, ID, QD);
-            }
-
-            wUp *= angleUp;
-            wDn *= angleDn;
+        double hLumaDelta = 0.0;
+        if (h > 0 && h < width - 1) {
+            hLumaDelta = std::fabs(row0[h+1] - row0[h-1]) * invI;
         }
-        double sc = 1.0;
+        double dynamicVThreshold = (hLumaDelta > 12.0) ? 6.0 : 10.0;
 
-        if ((wUp > 0.0) || (wDn > 0.0)) {
-            if (wDn > 3.0 * wUp)      wUp = 0.0;
-            else if (wUp > 3.0 * wDn) wDn = 0.0;
+        double cohUp = 1.0;
+        double cohDn = 1.0;
+        
+        if (configuration.phaseCompensation) {
+            auto checkStrict = [&](int lA, int lB) -> double {
+                const float *tiA = demodTI_line(lA), *tqA = demodTQ_line(lA);
+                const float *tiB = demodTI_line(lB), *tqB = demodTQ_line(lB);
+                if (!tiA || !tiB) return 1.0;
 
-            const double denom = wUp + wDn;
-            if (denom > 1e-9) {
-                sc = 2.0 / denom;
-                if (sc < 1.0) sc = 1.0;
-            } else {
-                wUp = wDn = 0.0;
-            }
-        } else {
-            double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
-            double sumUD = std::fabs(Cup + Cdn);
-            if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
-                wUp = wDn = 1.0;
-                sc = 1.0;
-            } else {
-                wUp = wDn = 0.0;
+                double cMid = getCoherence(tiA, tqA, tiB, tqB, h);
+                if (h > 0 && h < width - 1) {
+                    double cL = getCoherence(tiA, tqA, tiB, tqB, h - 1);
+                    double cR = getCoherence(tiA, tqA, tiB, tqB, h + 1);
+                    return std::min({cL, cMid, cR}); 
+                }
+                return cMid;
+            };
+            cohUp = checkStrict(ln0, lnU2);
+            cohDn = checkStrict(ln0, lnD2);
+        }
+
+        double diffUpIRE = std::fabs(C - Cup) * invI;
+        double diffDnIRE = std::fabs(C - Cdn) * invI;
+        
+        if (configuration.phaseCompensation) {
+            const float *ti0 = demodTI_line(ln0), *tq0 = demodTQ_line(ln0);
+            const float *tiU = demodTI_line(lnU2), *tqU = demodTQ_line(lnU2);
+            const float *tiD = demodTI_line(lnD2), *tqD = demodTQ_line(lnD2);
+            
+            if (ti0 && tiU && tiD) {
+                diffUpIRE = std::hypot(ti0[h] - tiU[h], tq0[h] - tqU[h]) * invI;
+                diffDnIRE = std::hypot(ti0[h] - tiD[h], tq0[h] - tqD[h]) * invI;
             }
         }
 
-        double tc = 0.0;
-        if (wUp > 0.0 || wDn > 0.0) {
-            const double tcUp = (wUp > 0.0) ? ((C - Cup) * 0.5) : 0.0;
-            const double tcDn = (wDn > 0.0) ? ((C - Cdn) * 0.5) : 0.0;
-            const double tc3 =
-                ((((C - Cup) * wUp * sc) + ((C - Cdn) * wDn * sc)) * 0.25);
+        double tc = C;
+        const bool okUp = (cohUp >= 0.5 && diffUpIRE < dynamicVThreshold);
+        const bool okDn = (cohDn >= 0.5 && diffDnIRE < dynamicVThreshold);
 
-            if (wUp > 0.0 && wDn > 0.0 && angleUp > 0.0 && angleDn > 0.0 && angleUpDn > 0.0) {
-                tc = tc3;
-            } else if (wUp > 0.0 && wDn > 0.0) {
-                tc = (kp <= kn) ? tcUp : tcDn;
-            } else if (wUp > 0.0) {
-                tc = tcUp;
-            } else {
-                tc = tcDn;
-            }
-        } else {
-            tc = 0.0;
+        if (okUp && okDn) {
+            tc = (2.0 * C - Cup - Cdn) * 0.25;
+        } else if (okUp && (diffUpIRE < diffDnIRE || !okDn)) {
+            tc = (C - Cup) * 0.5;
+        } else if (okDn) {
+            tc = (C - Cdn) * 0.5;
         }
 
-        outFieldLine[rel] = tc;
+        double maxPhysDelta = std::max(std::fabs(C - Cup), std::fabs(C - Cdn)) * 0.65;
+        outFieldLine[h] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
     }
-
-    // In locked (phase-compensated) mode, the -damper is not applied;
-    // it is intended only for the phase-blind (bucket) path.
-    return;
 }
 
-// VDIS - Vertical Differential Isolation System.
-// Reduces artifacts at horizontal boundaries between different regions.
-// We detect for strong vertical differentials in both chroma phase (IQ space)
-// and scalar magnitude between upper and lower samples in the field.
-// If 1 checks fail, 1D only in FVF and 3D. Fields excluded from FVF if 2 fails.
-void Comb::FrameBuffer::computeVDISLine(int lineNumber)
+static inline double cmag(const std::complex<double> &z) { return std::hypot(z.real(), z.imag()); }
+static inline double dotIQ(const std::complex<double> &a, const std::complex<double> &b) { return a.real()*b.real() + a.imag()*b.imag(); }
+
+// FrameScalar / Frame A composite cancellation candidate.
+// Interfield version of Field B:
+// - uses adjacent frame lines (±1), not same-field lines (±2)
+// - operates in composite space
+// - writes a composite residual candidate suitable for scratch_fieldBCenter
+void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameLine)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
-    if (width <= 0) return;
 
-    const auto &T = configuration.tunables;
-
-    // Ensure flag buffer is sized and cleared
-    if ((int)scratch_vdis_flag.size() < width) scratch_vdis_flag.resize(width, 0);
-    else std::fill(scratch_vdis_flag.begin(), scratch_vdis_flag.end(), 0);
-
-    // ----------------------------------------------------------------
-    // Scalar (2) leg: amplitude-based disagreement
-    // ----------------------------------------------------------------
-    const int up2 = lineNumber - 2;
-    const int dn2 = lineNumber + 2;
-    const bool haveUp2 = (up2 >= first && up2 < last);
-    const bool haveDn2 = (dn2 >= first && dn2 < last);
-
-    if (haveUp2 && haveDn2) {
-        const double th1d_ire = T.VDIS_1D_DIFF_THRESH_IRE;
-        const double th1d_s   = (th1d_ire > 0.0) ? th1d_ire * irescale : 0.0;
-
-        if (th1d_s > 0.0) {
-            for (int rel = 0; rel < width; ++rel) {
-                int h = left + rel;
-                double c = clpbuffer[0].pixel[lineNumber][h];
-                double u = clpbuffer[0].pixel[up2][h];
-                double d = clpbuffer[0].pixel[dn2][h];
-                double maxDiff = std::max(std::fabs(c - u), std::fabs(c - d));
-                if (maxDiff > th1d_s) {
-                    scratch_vdis_flag[rel] = 1;
-                }
-            }
-        }
+    if (width <= 0 || lineNumber < first || lineNumber >= last || !outFrameLine) {
+        if (outFrameLine) std::fill(outFrameLine, outFrameLine + std::max(width, 0), 0.0);
+        return;
     }
 
-    // ----------------------------------------------------------------
-    // IQ (1) leg: chroma phase disagreement (VDIS_USE_PLUS1)
-    // ----------------------------------------------------------------
-    if (T.VDIS_USE_PLUS1 &&
-        lineNumber >= first && lineNumber < last &&
-        lineNumber < demodLines && demodWidth > 0)
+    const int ln0 = lineNumber;
+    const int lnU = lineNumber - 1;
+    const int lnD = lineNumber + 1;
+
+    const bool haveUp = (lnU >= first && lnU < last);
+    const bool haveDn = (lnD >= first && lnD < last);
+
+    auto getRow = [&](int ln) -> const double* {
+        if (ln < first || ln >= last) return nullptr;
+
+        if (configuration.phaseCompensation) {
+            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
+            const auto &row = locked1DSource[ln];
+            if ((int)row.size() < width) return nullptr;
+            return row.data();
+        }
+
+        return clpbuffer[0].pixel[ln] + left;
+    };
+
+    const double *row0 = getRow(ln0);
+    const double *rowU = haveUp ? getRow(lnU) : nullptr;
+    const double *rowD = haveDn ? getRow(lnD) : nullptr;
+
+    if (!row0) {
+        std::fill(outFrameLine, outFrameLine + width, 0.0);
+        return;
+    }
+
+    const double invI = this->invIreScale;
+
+    auto getCoherence = [&](const float* tiA, const float* tqA,
+                            const float* tiB, const float* tqB,
+                            int x) -> double
     {
-        const int up1 = lineNumber - 1;
-        const int dn1 = lineNumber + 1;
-        const bool haveUp1 = (up1 >= 0 && up1 < demodLines);
-        const bool haveDn1 = (dn1 >= 0 && dn1 < demodLines);
+        if (!tiA || !tqA || !tiB || !tqB) return 1.0;
 
-        if (haveUp1 || haveDn1) {
-            const float *ti0 = demodTI_line(lineNumber);
-            const float *tq0 = demodTQ_line(lineNumber);
-            const float *tiU = haveUp1 ? demodTI_line(up1) : nullptr;
-            const float *tqU = haveUp1 ? demodTQ_line(up1) : nullptr;
-            const float *tiD = haveDn1 ? demodTI_line(dn1) : nullptr;
-            const float *tqD = haveDn1 ? demodTQ_line(dn1) : nullptr;
+        const double i0 = tiA[x];
+        const double q0 = tqA[x];
+        const double i1 = tiB[x];
+        const double q1 = tqB[x];
 
-            const double minChroma = T.VDIS_MIN_CHROMA_IRE * irescale;
-            const double cosThresh = std::cos(T.VDIS_PHASE_THRESH_DEG * M_PI / 180.0);
+        const double m0 = std::hypot(i0, q0);
+        const double m1 = std::hypot(i1, q1);
 
-            const int W = std::min(width, demodWidth);
-            for (int rel = 0; rel < W; ++rel) {
-                double I0 = ti0[rel];
-                double Q0 = tq0[rel];
-                double m0 = std::hypot(I0, Q0);
-                if (m0 < minChroma) continue;
+        if (m0 * invI < 2.5 || m1 * invI < 2.5) return 1.0;
 
-                bool fire = false;
+        const double corr = (i0 * i1 + q0 * q1) / (m0 * m1 + 1e-12);
+        return std::clamp((std::fabs(corr) - 0.55) / (0.85 - 0.55), 0.0, 1.0);
+    };
 
-                if (haveUp1) {
-                    double IU = tiU[rel], QU = tqU[rel];
-                    double mU = std::hypot(IU, QU);
-                    if (mU >= minChroma) {
-                        double dot = I0 * IU + Q0 * QU;
-                        double cosv = dot / (m0 * mU + 1e-12);
-                        if (cosv < cosThresh) fire = true;
-                    }
+    for (int rel = 0; rel < width; ++rel) {
+        const double C = row0[rel];
+
+        const double Cup = rowU ? rowU[rel] : C;
+        const double Cdn = rowD ? rowD[rel] : C;
+
+        double hLumaDelta = 0.0;
+        if (rel > 0 && rel < width - 1) {
+            hLumaDelta = std::fabs(row0[rel + 1] - row0[rel - 1]) * invI;
+        }
+
+        // More cautious at strong horizontal transitions.
+        const double dynamicVThreshold = (hLumaDelta > 12.0) ? 6.0 : 10.0;
+
+        double cohUp = haveUp ? 1.0 : 0.0;
+        double cohDn = haveDn ? 1.0 : 0.0;
+
+        if (configuration.phaseCompensation) {
+            auto checkStrict = [&](int lA, int lB) -> double {
+                const float *tiA = demodTI_line(lA);
+                const float *tqA = demodTQ_line(lA);
+                const float *tiB = demodTI_line(lB);
+                const float *tqB = demodTQ_line(lB);
+
+                if (!tiA || !tqA || !tiB || !tqB) return 1.0;
+
+                double cMid = getCoherence(tiA, tqA, tiB, tqB, rel);
+
+                if (rel > 0 && rel < width - 1) {
+                    double cL = getCoherence(tiA, tqA, tiB, tqB, rel - 1);
+                    double cR = getCoherence(tiA, tqA, tiB, tqB, rel + 1);
+                    return std::min({ cL, cMid, cR });
                 }
-                if (!fire && haveDn1) {
-                    double ID = tiD[rel], QD = tqD[rel];
-                    double mD = std::hypot(ID, QD);
-                    if (mD >= minChroma) {
-                        double dot = I0 * ID + Q0 * QD;
-                        double cosv = dot / (m0 * mD + 1e-12);
-                        if (cosv < cosThresh) fire = true;
-                    }
-                }
 
-                if (fire) scratch_vdis_flag[rel] = 1;
+                return cMid;
+            };
+
+            if (haveUp) cohUp = checkStrict(ln0, lnU);
+            if (haveDn) cohDn = checkStrict(ln0, lnD);
+        }
+
+        const double scalarDiffUpIRE = haveUp ? std::fabs(C - Cup) * invI
+                                               : std::numeric_limits<double>::infinity();
+        const double scalarDiffDnIRE = haveDn ? std::fabs(C - Cdn) * invI
+                                               : std::numeric_limits<double>::infinity();
+        double diffUpIRE = scalarDiffUpIRE;
+        double diffDnIRE = scalarDiffDnIRE;
+
+        if (configuration.phaseCompensation) {
+            const float *ti0 = demodTI_line(ln0);
+            const float *tq0 = demodTQ_line(ln0);
+            const float *tiU = haveUp ? demodTI_line(lnU) : nullptr;
+            const float *tqU = haveUp ? demodTQ_line(lnU) : nullptr;
+            const float *tiD = haveDn ? demodTI_line(lnD) : nullptr;
+            const float *tqD = haveDn ? demodTQ_line(lnD) : nullptr;
+
+            if (ti0 && tq0) {
+                if (tiU && tqU)
+                    diffUpIRE = std::hypot(ti0[rel] - tiU[rel],
+                                           tq0[rel] - tqU[rel]) * invI;
+                if (tiD && tqD)
+                    diffDnIRE = std::hypot(ti0[rel] - tiD[rel],
+                                           tq0[rel] - tqD[rel]) * invI;
             }
         }
-    }
-}
 
-// VDIS region consolidation
-//
-// Input:  vdisMask[line][rel] == 0/1 from computeVDISLine per-line flags.
-// Output: vdisMask is rewritten to:
-//   0 = no VDIS
-//   1 = soft VDIS region
-//   2 = hard VDIS region
-//
-// We use a small 3x3 neighbourhood count:
-//   vcount >= HARD_MIN  => strong cluster => hard VDIS (2)
-//   SOFT_MIN <=vcount< HARD_MIN => soft VDIS belt (1)
-//   vcount <= NOISE_MAX => isolated speck => cleared to 0
-//   else => keep original value.
-void Comb::FrameBuffer::consolidateVDISRegions(
-    std::vector<std::vector<char>> &vdisMask,
-    const LdDecodeMetaData::VideoParameters &vp)
-{
-    const int firstLine = vp.firstActiveFrameLine;
-    const int lastLine  = vp.lastActiveFrameLine;
-    const int left      = vp.activeVideoStart;
-    const int right     = vp.activeVideoEnd;
-    const int width     = right - left;
+        const bool okUp = haveUp && (cohUp >= 0.5) && (diffUpIRE < dynamicVThreshold);
+        const bool okDn = haveDn && (cohDn >= 0.5) && (diffDnIRE < dynamicVThreshold);
 
-    if (width <= 0) return;
-    if ((int)vdisMask.size() < lastLine) return;
+        double tc = C;
 
-    // Thresholds; adjust as needed.
-    const int HARD_MIN  = 5;  // strong 3x3 cluster -> hard VDIS
-    const int SOFT_MIN  = 2;  // 2-4 neighbors   -> soft VDIS
-    const int NOISE_MAX = 1;  // <= 1 neighbor   -> noise
-
-    std::vector<std::vector<char>> outMask = vdisMask;
-
-    for (int line = firstLine; line < lastLine; ++line) {
-        if ((int)vdisMask[line].size() < width) continue;
-
-        for (int rel = 0; rel < width; ++rel) {
-            int vcount = 0;
-
-            // Count VDIS flags in 3x3 neighbourhood
-            for (int dy = -1; dy <= +1; ++dy) {
-                int ln = line + dy;
-                if (ln < firstLine || ln >= lastLine) continue;
-                if ((int)vdisMask[ln].size() < width) continue;
-                const auto &row = vdisMask[ln];
-
-                for (int dx = -1; dx <= +1; ++dx) {
-                    int rr = rel + dx;
-                    if (rr < 0 || rr >= width) continue;
-                    if (row[rr]) ++vcount;
-                }
-            }
-
-            char newVal = 0;
-
-            if (vcount >= HARD_MIN) {
-                newVal = 2; // hard region
-            } else if (vcount >= SOFT_MIN) {
-                newVal = 1; // soft belt
-            } else if (vcount <= NOISE_MAX) {
-                newVal = 0; // speck -> clear
-            } else {
-                // mid case: keep original (usually 1)
-                newVal = vdisMask[line][rel];
-            }
-
-            outMask[line][rel] = newVal;
+        if (okUp && okDn) {
+            tc = (2.0 * C - Cup - Cdn) * 0.25;
+        } else if (okUp && (diffUpIRE <= diffDnIRE || !okDn)) {
+            tc = (C - Cup) * 0.5;
+        } else if (okDn) {
+            tc = (C - Cdn) * 0.5;
+        } else {
+            tc = C;
         }
+
+        double maxPhysDelta = 0.0;
+        if (haveUp) maxPhysDelta = std::max(maxPhysDelta, std::fabs(C - Cup));
+        if (haveDn) maxPhysDelta = std::max(maxPhysDelta, std::fabs(C - Cdn));
+
+        maxPhysDelta *= 0.65;
+
+        outFrameLine[rel] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
     }
-
-    vdisMask.swap(outMask);
 }
-
-static inline double cmag(const std::complex<double> &z) { return std::hypot(z.real(), z.imag()); }
-static inline double dotIQ(const std::complex<double> &a, const std::complex<double> &b) { return a.real()*b.real() + a.imag()*b.imag(); }
-
+// use buffers preprocessed by an intrafield comb to feed demod for IQ interfield comb
 void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
@@ -1136,7 +1230,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         outFrameIQ[x] = Zout;
     }
 }
-
+// process intrafield scalar comb as prep for interfield comb
 void Comb::FrameBuffer::computeFrameIQPrecleanLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ)
@@ -1201,7 +1295,7 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
 
     computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, true);
 }
-
+// skip preprocessing and take IQ directly from buildPhaseCorrected1D for interfield comb
 void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ,
@@ -1251,6 +1345,8 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, false);
 }
 
+// 3D Section
+// getCandidate - prescreen for 3D election
 Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     qint32 refLineNumber, qint32 refH,
     const FrameBuffer &frameBuffer, qint32 lineNumber, qint32 h,
@@ -1359,9 +1455,7 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     result.penalty = penalty;
     return result;
 }
-// ---------------------------------------------------------------------
 // getBestY - Dedicated 3D Residual Y Election/Blend
-// ---------------------------------------------------------------------
 double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
                                    const FrameBuffer &prev, const FrameBuffer &next) const
 {
