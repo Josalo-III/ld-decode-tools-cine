@@ -61,6 +61,62 @@ inline void fusedDemodLUT(double bcos, double bsin,
     }
 }
 
+// Rotate line-local locked IQ into the common 4fsc frame.
+inline void lockedTo4fsc(double iLocked, double qLocked,
+                         double bcos, double bsin,
+                         double &i4fsc, double &q4fsc)
+{
+    i4fsc = iLocked * bcos + qLocked * bsin;
+    q4fsc = -iLocked * bsin + qLocked * bcos;
+}
+
+// Rotate common 4fsc IQ back into the line-local locked frame.
+inline void fourfscToLocked(double i4fsc, double q4fsc,
+                            double bcos, double bsin,
+                            double &iLocked, double &qLocked)
+{
+    iLocked = i4fsc * bcos - q4fsc * bsin;
+    qLocked = i4fsc * bsin + q4fsc * bcos;
+}
+
+// Demodulate scalar composite already aligned to the common 4fsc grid.
+inline void demod4fscFromComposite(double v, int h, double &i4fsc, double &q4fsc)
+{
+    i4fsc = v * sin4fsc(h) * 2.0;
+    q4fsc = v * cos4fsc(h) * 2.0;
+}
+
+// Remodulate common 4fsc IQ back into composite sample space at position h.
+inline double remod4fscToComposite(double i4fsc, double q4fsc, int h,
+                                   double lineScale = 1.0)
+{
+    return lineScale * 0.5 * (i4fsc * sin4fsc(h) + q4fsc * cos4fsc(h));
+}
+
+// Remodulate common 4fsc IQ back into the shifted sample basis used by the
+// burst-locked demod path. This preserves the fractional basis choice while
+// staying explicit about the fact that the IQ itself is already canonical 4fsc.
+inline double remod4fscToShiftedComposite(double i4fsc, double q4fsc, int h,
+                                          const double spLUT[4], const double cpLUT[4],
+                                          double lineScale = 1.0)
+{
+    const int idx = (h & 3);
+    return lineScale * 0.5 * (i4fsc * spLUT[idx] + q4fsc * cpLUT[idx]);
+}
+
+// Remodulate line-local locked IQ back into composite sample space using the
+// shifted locked basis. The seam is explicit: locked IQ is rotated once into
+// common 4fsc, then remodulated on the chosen sample basis.
+inline double remodLockedToShiftedComposite(double iLocked, double qLocked, int h,
+                                            double bcos, double bsin,
+                                            const double spLUT[4], const double cpLUT[4],
+                                            double lineScale = 1.0)
+{
+    double i4fsc = 0.0, q4fsc = 0.0;
+    lockedTo4fsc(iLocked, qLocked, bcos, bsin, i4fsc, q4fsc);
+    return remod4fscToShiftedComposite(i4fsc, q4fsc, h, spLUT, cpLUT, lineScale);
+}
+
 inline void eig2_sym(const double S[2][2], double &l1, double &l2, double V[2][2]);
 
 // Polar-decompose a 2x2 affine matrix A = RU into a rotation R and symmetric U,

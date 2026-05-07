@@ -377,6 +377,9 @@ private:
             double candidateSpreadIRE = 0.0;
             double frameFieldAgreementIRE = 0.0;
             double frameIQCoherence = 0.0;
+            double lumaShapeContinuation = 0.0;
+            double carrierPlausibility = 0.0;
+            double ownershipConflict = 0.0;
 
             double lumaClaim = 0.0;
             double chromaClaim = 0.0;
@@ -460,8 +463,13 @@ private:
         std::vector<std::array<float,4>> demodLUTTq_locked;
 
         // Flat/contiguous buffers (lines x width)
+        // Line-local locked IQ after burst alignment and affine trim.
         std::vector<float> demodTI_flat;
         std::vector<float> demodTQ_flat;
+        // Common 4fsc IQ export derived from the locked IQ. This is the seam
+        // between the line-local locked domain and the cross-line 4fsc domain.
+        std::vector<float> demodTI4fsc_flat;
+        std::vector<float> demodTQ4fsc_flat;
         // 3-slot ring buffers caching the Field A comb output (chroma + gate) used
         // as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
         std::array<std::vector<double>, 3> precleanRing;
@@ -514,7 +522,7 @@ private:
         std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
         std::vector<char> scratch_vdis_flag;
         std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
-        std::vector<std::vector<double>> locked1DSource; // [line][rel], locked-mode stable source for 2D
+        std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
         std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
 
         inline int precleanRingSlot(int lineNumber) const
@@ -599,6 +607,9 @@ private:
                                            const double *fieldB,
                                            const std::vector<double> &frameScalar,
                                            const std::vector<std::complex<double>> *frameIQ);
+        void finalizeOwnershipClaims(OwnershipEvidence &e,
+                                     double neighborLumaMeanIRE = -1.0,
+                                     double neighborBaseMeanIRE = -1.0) const;
         void reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const;
         // Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
         // into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.
@@ -666,11 +677,23 @@ private:
         inline float* demodTQ_line(int line) {
             return demodTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
         }
+        inline float* demodTI4fsc_line(int line) {
+            return demodTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+        }
+        inline float* demodTQ4fsc_line(int line) {
+            return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+        }
         inline const float* demodTI_line(int line) const {
             return demodTI_flat.data() + static_cast<size_t>(line) * demodWidth;
         }
         inline const float* demodTQ_line(int line) const {
             return demodTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+        }
+        inline const float* demodTI4fsc_line(int line) const {
+            return demodTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+        }
+        inline const float* demodTQ4fsc_line(int line) const {
+            return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
         }
 
         // Raw-composite demod accessors

@@ -84,12 +84,12 @@ void Comb::FrameBuffer::computeVDISLine(int lineNumber)
         const bool haveDn1 = (dn1 >= 0 && dn1 < demodLines);
 
         if (haveUp1 || haveDn1) {
-            const float *ti0 = demodTI_line(lineNumber);
-            const float *tq0 = demodTQ_line(lineNumber);
-            const float *tiU = haveUp1 ? demodTI_line(up1) : nullptr;
-            const float *tqU = haveUp1 ? demodTQ_line(up1) : nullptr;
-            const float *tiD = haveDn1 ? demodTI_line(dn1) : nullptr;
-            const float *tqD = haveDn1 ? demodTQ_line(dn1) : nullptr;
+            const float *ti0 = demodTI4fsc_line(lineNumber);
+            const float *tq0 = demodTQ4fsc_line(lineNumber);
+            const float *tiU = haveUp1 ? demodTI4fsc_line(up1) : nullptr;
+            const float *tqU = haveUp1 ? demodTQ4fsc_line(up1) : nullptr;
+            const float *tiD = haveDn1 ? demodTI4fsc_line(dn1) : nullptr;
+            const float *tqD = haveDn1 ? demodTQ4fsc_line(dn1) : nullptr;
 
             const double minChroma = T.VDIS_MIN_CHROMA_IRE * irescale;
             const double cosThresh = std::cos(T.VDIS_PHASE_THRESH_DEG * M_PI / 180.0);
@@ -545,6 +545,7 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         return;
     }
 
+    const auto  &T    = configuration.tunables;
     const double invI = this->invIreScale;
 
     auto getCoherence = [&](const float* ti, const float* tq, const float* tiN, const float* tqN, int x) -> double {
@@ -562,7 +563,13 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         const double Cdn = rowDn2[h];
 
         double hLumaDelta = 0.0;
-        if (h > 0 && h < width - 1) {
+        if (configuration.phaseCompensation) {
+            if (width >= 5) {
+                const double lumL = getNotchLumaEven2(row0, h - 1, width);
+                const double lumR = getNotchLumaEven2(row0, h + 1, width);
+                hLumaDelta = std::fabs(lumR - lumL) * invI;
+            }
+        } else if (h > 0 && h < width - 1) {
             hLumaDelta = std::fabs(row0[h+1] - row0[h-1]) * invI;
         }
         double dynamicVThreshold = (hLumaDelta > 12.0) ? 6.0 : 10.0;
@@ -572,15 +579,17 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         
         if (configuration.phaseCompensation) {
             auto checkStrict = [&](int lA, int lB) -> double {
-                const float *tiA = demodTI_line(lA), *tqA = demodTQ_line(lA);
-                const float *tiB = demodTI_line(lB), *tqB = demodTQ_line(lB);
+                const float *tiA = demodTI4fsc_line(lA), *tqA = demodTQ4fsc_line(lA);
+                const float *tiB = demodTI4fsc_line(lB), *tqB = demodTQ4fsc_line(lB);
                 if (!tiA || !tiB) return 1.0;
 
                 double cMid = getCoherence(tiA, tqA, tiB, tqB, h);
-                if (h > 0 && h < width - 1) {
-                    double cL = getCoherence(tiA, tqA, tiB, tqB, h - 1);
-                    double cR = getCoherence(tiA, tqA, tiB, tqB, h + 1);
-                    return std::min({cL, cMid, cR}); 
+                if (width >= 9) {
+                    const int hL = std::clamp(h - 4, 0, width - 1);
+                    const int hR = std::clamp(h + 4, 0, width - 1);
+                    double cL = getCoherence(tiA, tqA, tiB, tqB, hL);
+                    double cR = getCoherence(tiA, tqA, tiB, tqB, hR);
+                    return std::min({cL, cMid, cR});
                 }
                 return cMid;
             };
@@ -592,9 +601,9 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         double diffDnIRE = std::fabs(C - Cdn) * invI;
         
         if (configuration.phaseCompensation) {
-            const float *ti0 = demodTI_line(ln0), *tq0 = demodTQ_line(ln0);
-            const float *tiU = demodTI_line(lnU2), *tqU = demodTQ_line(lnU2);
-            const float *tiD = demodTI_line(lnD2), *tqD = demodTQ_line(lnD2);
+            const float *ti0 = demodTI4fsc_line(ln0), *tq0 = demodTQ4fsc_line(ln0);
+            const float *tiU = demodTI4fsc_line(lnU2), *tqU = demodTQ4fsc_line(lnU2);
+            const float *tiD = demodTI4fsc_line(lnD2), *tqD = demodTQ4fsc_line(lnD2);
             
             if (ti0 && tiU && tiD) {
                 diffUpIRE = std::hypot(ti0[h] - tiU[h], tq0[h] - tqU[h]) * invI;
@@ -614,7 +623,30 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
             tc = (C - Cdn) * 0.5;
         }
 
-        double maxPhysDelta = std::max(std::fabs(C - Cup), std::fabs(C - Cdn)) * 0.65;
+        double maxPhysDelta = 0.0;
+        if (configuration.phaseCompensation) {
+            const float *ti0 = demodTI4fsc_line(ln0), *tq0 = demodTQ4fsc_line(ln0);
+            const float *tiU = demodTI4fsc_line(lnU2), *tqU = demodTQ4fsc_line(lnU2);
+            const float *tiD = demodTI4fsc_line(lnD2), *tqD = demodTQ4fsc_line(lnD2);
+
+            if (ti0 && tq0 && tiU && tqU && tiD && tqD) {
+                double envClamp = 0.5 * std::hypot(ti0[h], tq0[h]);
+                envClamp = std::max(envClamp, 0.5 * std::hypot(tiU[h], tqU[h]));
+                envClamp = std::max(envClamp, 0.5 * std::hypot(tiD[h], tqD[h]));
+
+                double iqDeltaClamp = 0.0;
+                if (std::isfinite(diffUpIRE))
+                    iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
+                if (std::isfinite(diffDnIRE))
+                    iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffDnIRE * irescale);
+
+                const double envFloor = 0.35 * envClamp;
+                maxPhysDelta = std::min(envClamp, std::max(envFloor, iqDeltaClamp));
+            }
+        }
+        if (maxPhysDelta <= 0.0) {
+            maxPhysDelta = std::max(std::fabs(C - Cup), std::fabs(C - Cdn)) * 0.65;
+        }
         outFieldLine[h] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
     }
 }
@@ -669,116 +701,351 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         return;
     }
 
+    const auto  &T    = configuration.tunables;
     const double invI = this->invIreScale;
 
-    auto getCoherence = [&](const float* tiA, const float* tqA,
-                            const float* tiB, const float* tqB,
-                            int x) -> double
-    {
-        if (!tiA || !tqA || !tiB || !tqB) return 1.0;
-
-        const double i0 = tiA[x];
-        const double q0 = tqA[x];
-        const double i1 = tiB[x];
-        const double q1 = tqB[x];
-
-        const double m0 = std::hypot(i0, q0);
-        const double m1 = std::hypot(i1, q1);
-
-        if (m0 * invI < 2.5 || m1 * invI < 2.5) return 1.0;
-
-        const double corr = (i0 * i1 + q0 * q1) / (m0 * m1 + 1e-12);
-        return std::clamp((std::fabs(corr) - 0.55) / (0.85 - 0.55), 0.0, 1.0);
+    auto applyMat = [](double I, double Q, const double M[2][2], double &outI, double &outQ) {
+        outI = M[0][0] * I + M[0][1] * Q;
+        outQ = M[1][0] * I + M[1][1] * Q;
     };
 
-    for (int rel = 0; rel < width; ++rel) {
-        const double C = row0[rel];
+    const float *ti0 = configuration.phaseCompensation ? demodTI4fsc_line(ln0) : nullptr;
+    const float *tq0 = configuration.phaseCompensation ? demodTQ4fsc_line(ln0) : nullptr;
+    const float *tiU = (configuration.phaseCompensation && haveUp) ? demodTI4fsc_line(lnU) : nullptr;
+    const float *tqU = (configuration.phaseCompensation && haveUp) ? demodTQ4fsc_line(lnU) : nullptr;
+    const float *tiD = (configuration.phaseCompensation && haveDn) ? demodTI4fsc_line(lnD) : nullptr;
+    const float *tqD = (configuration.phaseCompensation && haveDn) ? demodTQ4fsc_line(lnD) : nullptr;
+    const double sign0Line = (configuration.phaseCompensation && !lineFlip.empty() &&
+                              ln0 >= 0 && ln0 < (int)lineFlip.size())
+        ? (double)lineFlip[ln0] : 1.0;
+    const double signULine = (configuration.phaseCompensation && !lineFlip.empty() &&
+                              lnU >= 0 && lnU < (int)lineFlip.size())
+        ? (double)lineFlip[lnU] : 1.0;
+    const double signDLine = (configuration.phaseCompensation && !lineFlip.empty() &&
+                              lnD >= 0 && lnD < (int)lineFlip.size())
+        ? (double)lineFlip[lnD] : 1.0;
 
-        const double Cup = rowU ? rowU[rel] : C;
-        const double Cdn = rowD ? rowD[rel] : C;
+    auto solveFamilyRotation = [&](const float *tiNbr,
+                                   const float *tqNbr,
+                                   int bucketFamily,
+                                   double Rm[2][2]) -> bool {
+        Rm[0][0] = 1.0; Rm[0][1] = 0.0;
+        Rm[1][0] = 0.0; Rm[1][1] = 1.0;
 
-        double hLumaDelta = 0.0;
-        if (rel > 0 && rel < width - 1) {
-            hLumaDelta = std::fabs(row0[rel + 1] - row0[rel - 1]) * invI;
+        if (!configuration.phaseCompensation || !ti0 || !tq0 || !tiNbr || !tqNbr)
+            return false;
+
+        constexpr double MIN_FIT_IRE = 2.5;
+        const double pMax = T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
+
+        double STT[2][2] = {{0,0},{0,0}};
+        double SRT[2][2] = {{0,0},{0,0}};
+        int n = 0;
+
+        for (int x = 0; x < width; ++x) {
+            if (((left + x) & 1) != bucketFamily)
+                continue;
+
+            const double I0 = ti0[x];
+            const double Q0 = tq0[x];
+            const double In = tiNbr[x];
+            const double Qn = tqNbr[x];
+
+            const double a0 = std::hypot(I0, Q0) * invI;
+            const double an = std::hypot(In, Qn) * invI;
+
+            if (a0 < MIN_FIT_IRE || an < MIN_FIT_IRE)
+                continue;
+
+            STT[0][0] += In * In;
+            STT[0][1] += In * Qn;
+            STT[1][0] += Qn * In;
+            STT[1][1] += Qn * Qn;
+
+            SRT[0][0] += I0 * In;
+            SRT[0][1] += I0 * Qn;
+            SRT[1][0] += Q0 * In;
+            SRT[1][1] += Q0 * Qn;
+
+            ++n;
         }
 
-        // More cautious at strong horizontal transitions.
+        if (n < 32)
+            return false;
+
+        double STTinv[2][2];
+        if (!mat2_inv(STT, STTinv))
+            return false;
+
+        double A[2][2];
+        double U[2][2];
+        mat2_mul(SRT, STTinv, A);
+        polar_decompose_2x2(A, Rm, U);
+        clamp_rotation_gain_shear(Rm, U, pMax,
+                                  T.Y_LINE_ALLOW_GAIN_ON_IQ,
+                                  T.Y_LINE_GAIN_MIN,
+                                  T.Y_LINE_GAIN_MAX,
+                                  T.Y_LINE_MAX_SHEAR);
+        return true;
+    };
+
+    auto bucketErrorForNeighbor = [&](const float *tiNbr,
+                                      const float *tqNbr,
+                                      int bucketClass,
+                                      int lineSignNbr,
+                                      double bucketPol,
+                                      const double Rm[2][2]) -> std::pair<double, int> {
+        constexpr double MIN_FIT_IRE = 2.5;
+        double err = 0.0;
+        int errN = 0;
+
+        if (!ti0 || !tq0 || !tiNbr || !tqNbr)
+            return {err, errN};
+
+        for (int x = 0; x < width; ++x) {
+            if (((left + x) & 3) != bucketClass)
+                continue;
+
+            const double I0 = ti0[x];
+            const double Q0 = tq0[x];
+            const double a0 = std::hypot(I0, Q0) * invI;
+            if (a0 < MIN_FIT_IRE)
+                continue;
+
+            double In = 0.0;
+            double Qn = 0.0;
+            applyMat(tiNbr[x], tqNbr[x], Rm, In, Qn);
+            In *= bucketPol;
+            Qn *= bucketPol;
+            const double an = std::hypot(In, Qn) * invI;
+            if (an < MIN_FIT_IRE)
+                continue;
+
+            const int h = left + x;
+            const double C0 = remod4fscToComposite(sign0Line * I0, sign0Line * Q0, h);
+            const double Cn = remod4fscToComposite(lineSignNbr * In, lineSignNbr * Qn, h);
+            err += std::fabs(C0 + Cn);
+            ++errN;
+        }
+
+        return {err, errN};
+    };
+
+    double RmUp[2][2][2];
+    double RmDn[2][2][2];
+    double bucketPol[4] = {1.0, 1.0, 1.0, 1.0};
+
+    solveFamilyRotation(tiU, tqU, 0, RmUp[0]);
+    solveFamilyRotation(tiU, tqU, 1, RmUp[1]);
+    solveFamilyRotation(tiD, tqD, 0, RmDn[0]);
+    solveFamilyRotation(tiD, tqD, 1, RmDn[1]);
+
+    for (int bucketClass = 0; bucketClass < 4; ++bucketClass) {
+        double bestErr = std::numeric_limits<double>::infinity();
+        double bestPol = 1.0;
+        const int bucketFamily = bucketClass & 1;
+
+        for (double candPol : {1.0, -1.0}) {
+            const bool okUpSolve = tiU && tqU;
+            const bool okDnSolve = tiD && tqD;
+
+            double err = 0.0;
+            int errN = 0;
+            if (okUpSolve) {
+                auto [e, n] = bucketErrorForNeighbor(tiU, tqU, bucketClass, (int)signULine, candPol, RmUp[bucketFamily]);
+                err += e;
+                errN += n;
+            }
+            if (okDnSolve) {
+                auto [e, n] = bucketErrorForNeighbor(tiD, tqD, bucketClass, (int)signDLine, candPol, RmDn[bucketFamily]);
+                err += e;
+                errN += n;
+            }
+
+            if (errN >= 16 && err < bestErr) {
+                bestErr = err;
+                bestPol = candPol;
+            }
+        }
+
+        bucketPol[bucketClass] = bestPol;
+    }
+
+    for (int rel = 0; rel < width; ++rel) {
+        const int bucketClass = (left + rel) & 3;
+        const int bucketFamily = bucketClass & 1;
+        const double sign0 = sign0Line;
+        const double signU = signULine * bucketPol[bucketClass];
+        const double signD = signDLine * bucketPol[bucketClass];
+        const double (*RmUpUse)[2] = RmUp[bucketFamily];
+        const double (*RmDnUse)[2] = RmDn[bucketFamily];
+
+        double C = row0[rel];
+
+        double Cup = rowU ? rowU[rel] : C;
+        double Cdn = rowD ? rowD[rel] : C;
+        double I0c = 0.0, Q0c = 0.0;
+        double IUc = 0.0, QUc = 0.0;
+        double IDc = 0.0, QDc = 0.0;
+        const bool haveCenterIQ = configuration.phaseCompensation && ti0 && tq0;
+        const bool haveUpIQ = configuration.phaseCompensation && tiU && tqU;
+        const bool haveDnIQ = configuration.phaseCompensation && tiD && tqD;
+
+        if (configuration.phaseCompensation) {
+            const int h = left + rel;
+
+            if (ti0 && tq0) {
+                I0c = sign0 * ti0[rel];
+                Q0c = sign0 * tq0[rel];
+                C = remod4fscToComposite(I0c, Q0c, h);
+            }
+
+            if (tiU && tqU) {
+                double Iu = 0.0;
+                double Qu = 0.0;
+                applyMat(tiU[rel], tqU[rel], RmUpUse, Iu, Qu);
+                IUc = signU * Iu;
+                QUc = signU * Qu;
+                Cup = remod4fscToComposite(IUc, QUc, h);
+            }
+
+            if (tiD && tqD) {
+                double Id = 0.0;
+                double Qd = 0.0;
+                applyMat(tiD[rel], tqD[rel], RmDnUse, Id, Qd);
+                IDc = signD * Id;
+                QDc = signD * Qd;
+                Cdn = remod4fscToComposite(IDc, QDc, h);
+            }
+        }
+
+        double hLumaDelta = 0.0;
+        if (width >= 5) {
+            const double lumL = getNotchLumaEven2(row0, rel - 1, width);
+            const double lumR = getNotchLumaEven2(row0, rel + 1, width);
+            hLumaDelta = std::fabs(lumR - lumL) * invI;
+        }
+
         const double dynamicVThreshold = (hLumaDelta > 12.0) ? 6.0 : 10.0;
 
         double cohUp = haveUp ? 1.0 : 0.0;
         double cohDn = haveDn ? 1.0 : 0.0;
 
         if (configuration.phaseCompensation) {
-            auto checkStrict = [&](int lA, int lB) -> double {
-                const float *tiA = demodTI_line(lA);
-                const float *tqA = demodTQ_line(lA);
-                const float *tiB = demodTI_line(lB);
-                const float *tqB = demodTQ_line(lB);
+            auto checkStrict = [&](const float *tiNbr,
+                                   const float *tqNbr,
+                                   const double Rm[2][2],
+                                   double signNbr) -> double {
+                if (!ti0 || !tq0 || !tiNbr || !tqNbr)
+                    return 1.0;
 
-                if (!tiA || !tqA || !tiB || !tqB) return 1.0;
+                auto coherenceAt = [&](int x) -> double {
+                    double In = 0.0;
+                    double Qn = 0.0;
+                    applyMat(tiNbr[x], tqNbr[x], Rm, In, Qn);
+                    In *= signNbr;
+                    Qn *= signNbr;
 
-                double cMid = getCoherence(tiA, tqA, tiB, tqB, rel);
+                    const double I0x = sign0 * ti0[x];
+                    const double Q0x = sign0 * tq0[x];
+                    const double m0 = std::hypot(I0x, Q0x);
+                    const double m1 = std::hypot(In, Qn);
 
-                if (rel > 0 && rel < width - 1) {
-                    double cL = getCoherence(tiA, tqA, tiB, tqB, rel - 1);
-                    double cR = getCoherence(tiA, tqA, tiB, tqB, rel + 1);
+                    if (m0 * invI < 2.5 || m1 * invI < 2.5)
+                        return 1.0;
+
+                    const double corr = (I0x * In + Q0x * Qn) / (m0 * m1 + 1e-12);
+                    return std::clamp((corr - 0.55) / (0.85 - 0.55), 0.0, 1.0);
+                };
+
+                const double cMid = coherenceAt(rel);
+
+                if (width >= 9) {
+                    const int relL = std::clamp(rel - 4, 0, width - 1);
+                    const int relR = std::clamp(rel + 4, 0, width - 1);
+                    const double cL = coherenceAt(relL);
+                    const double cR = coherenceAt(relR);
                     return std::min({ cL, cMid, cR });
                 }
 
                 return cMid;
             };
 
-            if (haveUp) cohUp = checkStrict(ln0, lnU);
-            if (haveDn) cohDn = checkStrict(ln0, lnD);
+            if (haveUp) cohUp = checkStrict(tiU, tqU, RmUpUse, signU);
+            if (haveDn) cohDn = checkStrict(tiD, tqD, RmDnUse, signD);
         }
 
-        const double scalarDiffUpIRE = haveUp ? std::fabs(C - Cup) * invI
-                                               : std::numeric_limits<double>::infinity();
-        const double scalarDiffDnIRE = haveDn ? std::fabs(C - Cdn) * invI
-                                               : std::numeric_limits<double>::infinity();
+        const double scalarDiffUpIRE = haveUp
+            ? std::fabs(C - Cup) * invI
+            : std::numeric_limits<double>::infinity();
+
+        const double scalarDiffDnIRE = haveDn
+            ? std::fabs(C - Cdn) * invI
+            : std::numeric_limits<double>::infinity();
+
         double diffUpIRE = scalarDiffUpIRE;
         double diffDnIRE = scalarDiffDnIRE;
 
-        if (configuration.phaseCompensation) {
-            const float *ti0 = demodTI_line(ln0);
-            const float *tq0 = demodTQ_line(ln0);
-            const float *tiU = haveUp ? demodTI_line(lnU) : nullptr;
-            const float *tqU = haveUp ? demodTQ_line(lnU) : nullptr;
-            const float *tiD = haveDn ? demodTI_line(lnD) : nullptr;
-            const float *tqD = haveDn ? demodTQ_line(lnD) : nullptr;
-
-            if (ti0 && tq0) {
-                if (tiU && tqU)
-                    diffUpIRE = std::hypot(ti0[rel] - tiU[rel],
-                                           tq0[rel] - tqU[rel]) * invI;
-                if (tiD && tqD)
-                    diffDnIRE = std::hypot(ti0[rel] - tiD[rel],
-                                           tq0[rel] - tqD[rel]) * invI;
-            }
+        if (configuration.phaseCompensation && haveCenterIQ) {
+            if (haveUpIQ)
+                diffUpIRE = std::hypot(I0c - IUc, Q0c - QUc) * invI;
+            if (haveDnIQ)
+                diffDnIRE = std::hypot(I0c - IDc, Q0c - QDc) * invI;
         }
 
         const bool okUp = haveUp && (cohUp >= 0.5) && (diffUpIRE < dynamicVThreshold);
         const bool okDn = haveDn && (cohDn >= 0.5) && (diffDnIRE < dynamicVThreshold);
 
+        auto softWeight = [&](bool haveNbr, bool okNbr, double coh, double diffIRE) -> double {
+            if (!haveNbr || !okNbr)
+                return 0.0;
+            const double diffT = std::clamp(1.0 - (diffIRE / std::max(dynamicVThreshold, 1e-9)), 0.0, 1.0);
+            const double cohT  = std::clamp((coh - 0.5) / 0.5, 0.0, 1.0);
+            return cohT * diffT;
+        };
+
+        const double wUp = softWeight(haveUp, okUp, cohUp, diffUpIRE);
+        const double wDn = softWeight(haveDn, okDn, cohDn, diffDnIRE);
+
         double tc = C;
 
-        if (okUp && okDn) {
-            tc = (2.0 * C - Cup - Cdn) * 0.25;
-        } else if (okUp && (diffUpIRE <= diffDnIRE || !okDn)) {
-            tc = (C - Cup) * 0.5;
-        } else if (okDn) {
-            tc = (C - Cdn) * 0.5;
-        } else {
-            tc = C;
+        const double wSum = wUp + wDn;
+        if (wSum > 1e-9) {
+            const double nbrMix = (wUp * Cup + wDn * Cdn) / wSum;
+            tc = 0.5 * (C - nbrMix);
         }
 
         double maxPhysDelta = 0.0;
-        if (haveUp) maxPhysDelta = std::max(maxPhysDelta, std::fabs(C - Cup));
-        if (haveDn) maxPhysDelta = std::max(maxPhysDelta, std::fabs(C - Cdn));
 
-        maxPhysDelta *= 0.65;
+        if (configuration.phaseCompensation && ti0 && tq0) {
+            double envClamp = 0.5 * std::hypot(ti0[rel], tq0[rel]);
 
-        outFrameLine[rel] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
+            if (tiU && tqU)
+                envClamp = std::max(envClamp, 0.5 * std::hypot(tiU[rel], tqU[rel]));
+            if (tiD && tqD)
+                envClamp = std::max(envClamp, 0.5 * std::hypot(tiD[rel], tqD[rel]));
+
+            double iqDeltaClamp = 0.0;
+
+            if (haveUp && std::isfinite(diffUpIRE))
+                iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
+
+            if (haveDn && std::isfinite(diffDnIRE))
+                iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffDnIRE * irescale);
+
+            const double envFloor = 0.35 * envClamp;
+            maxPhysDelta = std::min(envClamp, std::max(envFloor, iqDeltaClamp));
+        } else {
+            if (haveUp) maxPhysDelta = std::max(maxPhysDelta, std::fabs(C - Cup));
+            if (haveDn) maxPhysDelta = std::max(maxPhysDelta, std::fabs(C - Cdn));
+            maxPhysDelta *= 0.65;
+        }
+
+        double outTc = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
+        if (configuration.phaseCompensation) {
+            outTc *= sign0;
+        }
+        outFrameLine[rel] = outTc;
     }
 }
 // use buffers preprocessed by an intrafield comb to feed demod for IQ interfield comb
@@ -809,12 +1076,12 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return demodTI_line(ln);
+        return demodTI4fsc_line(ln);
     };
     auto tqLine = [&](int ln)->const float* {
         if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
             return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return demodTQ_line(ln);
+        return demodTQ4fsc_line(ln);
     };
 
     auto reflectIndex = [&](int x)->int {
@@ -886,7 +1153,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
                                     M[1][0]*I + M[1][1]*Q);
     };
 
-    const double COMB_STRENGTH  = std::max(1.0, enableLateralRefine
+    const double COMB_STRENGTH  = std::max(0.0, enableLateralRefine
                                                   ? T.FRAME_COMB_STRENGTH
                                                   : T.FRAME_B_COMB_STRENGTH);
     const double MAX_DELTA_IRE  = T.FRAME_IQ_RAW_MAX_DELTA_IRE;
@@ -1144,7 +1411,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         // Use strong comb only when coherence is high AND vertical neighbors agree.
         // --------------------------------------------------------
         const double COMB_STRENGTH_HI = COMB_STRENGTH;
-        const double COMB_STRENGTH_LO = 0.8;
+        const double COMB_STRENGTH_LO = std::min(0.8, COMB_STRENGTH_HI);
 
         // Coherence vs center (signed corr magnitude) for allowed neighbors
         double coh = 0.0;
@@ -1247,8 +1514,8 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
 
     const std::vector<float> *tiOverride = nullptr;
     const std::vector<float> *tqOverride = nullptr;
-    auto tiLine = [&](int ln)->const float* { return demodTI_line(ln); };
-    auto tqLine = [&](int ln)->const float* { return demodTQ_line(ln); };
+    auto tiLine = [&](int ln)->const float* { return demodTI4fsc_line(ln); };
+    auto tqLine = [&](int ln)->const float* { return demodTQ4fsc_line(ln); };
 
     const float *ti0_raw  = tiLine(line);
     const float *tq0_raw  = tqLine(line);
@@ -1265,10 +1532,10 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
         const double *row = precleanLinePtr(ln, width);
         if (!row) return false;
         const int h = left + x;
-        const int ph = (h & 3);
         const double c = row[x];
-        Z = std::complex<double>(c * sin4fsc(ph) * 2.0,
-                                 c * cos4fsc(ph) * 2.0);
+        double i4fsc = 0.0, q4fsc = 0.0;
+        demod4fscFromComposite(c, h, i4fsc, q4fsc);
+        Z = std::complex<double>(i4fsc, q4fsc);
         return true;
     };
 
@@ -1315,12 +1582,12 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return demodTI_line(ln);
+        return demodTI4fsc_line(ln);
     };
     auto tqLine = [&](int ln)->const float* {
         if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
             return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return demodTQ_line(ln);
+        return demodTQ4fsc_line(ln);
     };
 
     const float *ti0_raw  = tiLine(line);
