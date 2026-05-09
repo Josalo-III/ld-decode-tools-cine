@@ -302,6 +302,11 @@ public:
 			double FVF_OWNERSHIP_LUMA_WEIGHT     = 0.14; // lumaClaim favors less chroma-removal / safer field-side witnesses
 			double FVF_OWNERSHIP_CHROMA_WEIGHT   = 0.18; // chromaClaim favors coherent chroma witnesses
 			double LOCKED1D_OWNERSHIP_DAMP_WEIGHT = 0.25; // early positive fork: damp 1D chroma when luma-owned
+            // Iceberg alien-Y cancellation in buildPhaseCorrected1D.
+            // Scales the bandpass-of-smooth-luma prediction at directional edges to
+            // compensate for the chroma-canceling smooth blunting the peak height.
+            // 1.0 = no recovery boost, 2.0–3.0 = moderate-to-strong boost.
+            double LUMA_ICEBERG_RECOVERY           = 2.0;
             double VET_Y_ADAPTIVE_SCALE           = 0.0;
             double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
             bool   VET_RESIDUAL_FIR_ENABLE        = false;
@@ -374,6 +379,7 @@ private:
             double lumaExcursionIRE = 0.0;
             double residualFitErrorIRE = 0.0;
             double lumaIncursionRiskIRE = 0.0;
+            double icebergAlienYFraction = 0.0;
             double locked1DChromaIRE = 0.0;
 
             double fieldAChromaIRE = 0.0;

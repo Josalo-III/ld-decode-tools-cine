@@ -912,9 +912,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
     if (width <= 0 || first >= last) return;
 
+    // Scratch for iceberg luma smooth; reused each line.
+    std::vector<double> lumaSmooth(width, 0.0);
+
     for (int line = first; line < last; ++line) {
         const double *src = clpbuffer[0].pixel[line];
         double       *dst = clpbuffer[1].pixel[line];
+
+        // lumaSmooth is filled below, after sampleSrc is defined.
 
         const double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
         const double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
@@ -951,6 +956,17 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             rel = std::clamp(rel, 0, width - 1);
             return src[left + rel];
         };
+
+        // Chroma-canceling smooth luma: [1,2,2,2,1]/8 applied to src.
+        // Same units as ti/tq so the iceberg bandpass correction is correctly scaled.
+        // Four-cycle averaging cancels the NTSC subcarrier exactly, leaving a smooth
+        // luma profile — the iceberg outline below the bandpass waterline.
+        // Also used for edge detection (chroma-immune slope signals on colored edges).
+        for (int xi = 0; xi < width; ++xi) {
+            lumaSmooth[xi] = (sampleSrc(xi-2) + 2.0*sampleSrc(xi-1) + 2.0*sampleSrc(xi)
+                              + 2.0*sampleSrc(xi+1) + sampleSrc(xi+2)) / 8.0;
+        }
+
         auto sampleIQ = [&](int rel, double &outI, double &outQ) {
             rel = std::clamp(rel, 0, width - 1);
             const int hh = left + rel;
@@ -976,6 +992,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             double fine = 0.0, mid = 0.0, coarse = 0.0;
             double directionalEdgeSupport = 0.0;
             double directionalEdgeAsymmetry = 0.0;
+            double bpLumaPredicted = 0.0;
+            double bpLumaModeled = 0.0;
+            double icebergAlienYFraction = 0.0;
 
             if (xi >= 4 && xi < width - 4) {
                 const double c0 = src[left + xi];
@@ -1054,11 +1073,13 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             lumaIncursionRiskIRE = intakeNyquistRiskIRE * incoherence;
 
             {
-                const double cLm2 = sampleSrc(xi - 2);
-                const double cLm1 = sampleSrc(xi - 1);
-                const double c0   = sampleSrc(xi);
-                const double cLp1 = sampleSrc(xi + 1);
-                const double cLp2 = sampleSrc(xi + 2);
+                // Use chroma-canceled smooth luma for slope detection — raw src has
+                // chroma oscillations that break monotonicity on colored text edges.
+                const double cLm2 = lumaSmooth[std::clamp(xi - 2, 0, width - 1)];
+                const double cLm1 = lumaSmooth[std::clamp(xi - 1, 0, width - 1)];
+                const double c0   = lumaSmooth[xi];
+                const double cLp1 = lumaSmooth[std::clamp(xi + 1, 0, width - 1)];
+                const double cLp2 = lumaSmooth[std::clamp(xi + 2, 0, width - 1)];
 
                 const double gLm = cLm1 - cLm2;
                 const double gL0 = c0 - cLm1;
@@ -1102,6 +1123,19 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     0.0, 1.0);
             }
 
+            if (T.LUMA_ICEBERG_RECOVERY > 0.0 && directionalEdgeSupport > 0.0
+                && xi >= 2 && xi < width - 2) {
+                bpLumaPredicted =
+                    (lumaSmooth[xi] - 0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
+                bpLumaModeled = bpLumaPredicted * T.LUMA_ICEBERG_RECOVERY
+                                * directionalEdgeSupport;
+
+                const double modeledAlienYIRE = std::fabs(bpLumaModeled) * invIreScale;
+                icebergAlienYFraction = std::clamp(
+                    modeledAlienYIRE / std::max(1.0, iqMagIRE),
+                    0.0, 1.0);
+            }
+
             if (line >= 0 && line < (int)fvfMetrics.size() &&
                 xi < (int)fvfMetrics[line].size())
             {
@@ -1119,15 +1153,31 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 e.lumaExcursionIRE = intakeNyquistRiskIRE;
                 e.residualFitErrorIRE = residualFitErrorIRE;
                 e.lumaIncursionRiskIRE = lumaIncursionRiskIRE;
+                e.icebergAlienYFraction = icebergAlienYFraction;
                 e.locked1DChromaIRE = std::hypot(ti, tq) * invIreScale;
                 
-                const double lumaT = std::clamp(lumaIncursionRiskIRE / 8.0, 0.0, 1.0);
+                const double lumaT = std::max(
+                    std::clamp(lumaIncursionRiskIRE / 8.0, 0.0, 1.0),
+                    icebergAlienYFraction);
                 const double chromaStrength = std::clamp((e.locked1DChromaIRE - 2.0) / 10.0, 0.0, 1.0);
                 const double chromaCoherence = std::clamp(1.0 - (residualFitErrorIRE / 12.0), 0.0, 1.0);
                 
                 e.lumaClaim = lumaT;
                 e.chromaClaim = chromaStrength * chromaCoherence * (1.0 - 0.5 * lumaT);
                 e.uncertainClaim = std::clamp(1.0 - std::max(e.lumaClaim, e.chromaClaim), 0.0, 1.0);            }
+
+            // Iceberg alien-Y cancellation.
+            // bpLumaPredicted: bandpass of chroma-canceled smooth luma (same scale as src).
+            // directionalEdgeSupport gates the entire correction — zero at flat regions,
+            // full strength at monotonic ramps where luma transients alias into chroma.
+            // Ownership evidence above is written from the original ti/tq for diagnostics.
+            if (bpLumaModeled != 0.0) {
+                double corrTi = bpLumaModeled * lutTi[ph];
+                double corrTq = bpLumaModeled * lutTq[ph];
+                applyLineAffine(corrTi, corrTq);
+                ti -= corrTi;
+                tq -= corrTq;
+            }
 
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
@@ -1244,7 +1294,9 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
                                           e.fieldBChromaIRE,
                                           e.frameChromaIRE});
 
-    const double lumaRisk = std::clamp(e.lumaIncursionRiskIRE / 8.0, 0.0, 1.0);
+    const double lumaRisk = std::max(
+        std::clamp(e.lumaIncursionRiskIRE / 8.0, 0.0, 1.0),
+        std::clamp(e.icebergAlienYFraction, 0.0, 1.0));
     const double lumaResidual = std::clamp(
         (e.residualFitErrorIRE - std::max(1.0, 0.2 * maxChromaIRE)) / 8.0,
         0.0, 1.0);
