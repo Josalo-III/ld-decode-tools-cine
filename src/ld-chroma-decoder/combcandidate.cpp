@@ -223,16 +223,345 @@ void Comb::FrameBuffer::consolidateVDISRegions(
 
 // 2D section
 
+static inline int reflectCombRel(int rel, int width)
+{
+    if (width <= 0) return 0;
+    if (rel < 0) return -rel;
+    if (rel >= width) return (width - 1) - (rel - (width - 1));
+    return rel;
+}
+
+static inline double combKMetric(double cc, double symC, double cn, double symN)
+{
+    double k = 0.0;
+    k  = std::fabs(std::fabs(cc) - std::fabs(cn));
+    k += std::fabs(symC - symN);
+    k -= (std::fabs(cc) + std::fabs(cn)) * 0.10;
+    return std::max(0.0, k);
+}
+
+static inline double combSmoothGate(double xIRE, double softIRE, double hardIRE)
+{
+    if (xIRE <= softIRE) return 1.0;
+    if (xIRE >= hardIRE) return 0.0;
+    double t = (xIRE - softIRE) / std::max(1e-9, hardIRE - softIRE);
+    return 1.0 - std::clamp(t, 0.0, 1.0);
+}
+
+static inline double combSimilarityFactor(double sim, double start, double full)
+{
+    if (sim <= start) return 0.0;
+    if (sim >= full) return 1.0;
+    double t = (sim - start) / std::max(1e-9, full - start);
+    return std::clamp(t, 0.0, 1.0);
+}
+
+void Comb::FrameBuffer::invalidateCombTapCache()
+{
+    tapLineCacheLine = { -1, -1, -1 };
+    for (auto &tapLine : tapLineCache) {
+        tapLine.cacheLine = -1;
+        tapLine.builtFlags = 0;
+    }
+}
+
+const Comb::FrameBuffer::CombTapLine &Comb::FrameBuffer::ensureCombTapLine(int lineNumber)
+{
+    const int slot = precleanRingSlot(lineNumber);
+    CombTapLine &tapLine = tapLineCache[slot];
+    if (tapLineCacheLine[slot] != lineNumber || tapLine.cacheLine != lineNumber) {
+        tapLineCacheLine[slot] = lineNumber;
+        tapLine.cacheLine = -1;
+        tapLine.builtFlags = 0;
+        buildCombTapLine(lineNumber, tapLine);
+    }
+    return tapLine;
+}
+
+void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+
+    tapLine.width = std::max(0, width);
+    if (width <= 0 || lineNumber < first || lineNumber >= last) return;
+
+    tapLine.cacheLine = lineNumber;
+    tapLine.width = width;
+
+    const unsigned flags = combTapBuildFlags_;
+    const bool wantFieldA = (flags & TapBuildFieldA) != 0;
+    const bool wantFieldB = (flags & TapBuildFieldB) != 0;
+    const bool wantFrame  = (flags & TapBuildFrame)  != 0;
+
+    auto clampSameFieldLine = [&](int ln)->int {
+        const int parity = (lineNumber & 1);
+        ln = std::clamp(ln, first, last - 1);
+        if ((ln & 1) != parity) {
+            if (ln + 1 < last && ((ln + 1) & 1) == parity) ln = ln + 1;
+            else if (ln - 1 >= first && ((ln - 1) & 1) == parity) ln = ln - 1;
+        }
+        return ln;
+    };
+
+    tapLine.ln0  = lineNumber;
+    tapLine.lnU1 = lineNumber - 1;
+    tapLine.lnD1 = lineNumber + 1;
+    tapLine.lnU2 = clampSameFieldLine(lineNumber - 2);
+    tapLine.lnD2 = clampSameFieldLine(lineNumber + 2);
+    tapLine.lnU4 = clampSameFieldLine(lineNumber - 4);
+    tapLine.lnD4 = clampSameFieldLine(lineNumber + 4);
+
+    tapLine.haveU1 = wantFrame  && (tapLine.lnU1 >= first && tapLine.lnU1 < last);
+    tapLine.haveD1 = wantFrame  && (tapLine.lnD1 >= first && tapLine.lnD1 < last);
+    tapLine.haveU2 = (wantFieldA || wantFieldB) && (tapLine.lnU2 >= first && tapLine.lnU2 < last);
+    tapLine.haveD2 = (wantFieldA || wantFieldB) && (tapLine.lnD2 >= first && tapLine.lnD2 < last);
+    tapLine.haveU4 = wantFieldA && (tapLine.lnU4 >= first && tapLine.lnU4 < last);
+    tapLine.haveD4 = wantFieldA && (tapLine.lnD4 >= first && tapLine.lnD4 < last);
+
+    auto sizeSamples = [&](std::vector<CombTapSample> &v) {
+        if ((int)v.size() != width) v.assign(width, CombTapSample());
+    };
+    sizeSamples(tapLine.tap0);
+    sizeSamples(tapLine.tapU1);
+    sizeSamples(tapLine.tapD1);
+    sizeSamples(tapLine.tapU2);
+    sizeSamples(tapLine.tapD2);
+    sizeSamples(tapLine.tapU4);
+    sizeSamples(tapLine.tapD4);
+    if ((int)tapLine.pairU1.size() != width) tapLine.pairU1.assign(width, CombTapPair());
+    if ((int)tapLine.pairD1.size() != width) tapLine.pairD1.assign(width, CombTapPair());
+    if ((int)tapLine.pairU2.size() != width) tapLine.pairU2.assign(width, CombTapPair());
+    if ((int)tapLine.pairD2.size() != width) tapLine.pairD2.assign(width, CombTapPair());
+    if ((int)tapLine.contour.size() != width) tapLine.contour.assign(width, CombTapContour());
+    if ((int)tapLine.hLumaDeltaIRE.size() != width) tapLine.hLumaDeltaIRE.assign(width, 0.0);
+
+    auto getCompRow = [&](int ln)->const double* {
+        if (ln < first || ln >= last) return nullptr;
+        if (configuration.phaseCompensation) {
+            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
+            const auto &row = locked1DSource[ln];
+            if ((int)row.size() < width) return nullptr;
+            return row.data();
+        }
+        return clpbuffer[0].pixel[ln] + left;
+    };
+    auto getTiRow = [&](int ln)->const float* {
+        if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
+        return demodTI4fsc_line(ln);
+    };
+    auto getTqRow = [&](int ln)->const float* {
+        if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
+        return demodTQ4fsc_line(ln);
+    };
+
+    struct RowRefs {
+        int ln = -1;
+        const double *comp = nullptr;
+        const float *ti = nullptr;
+        const float *tq = nullptr;
+        bool haveLine = false;
+    };
+    auto rowRefs = [&](int ln, bool haveLine, bool wantIQ)->RowRefs {
+        RowRefs r;
+        r.ln = ln;
+        r.haveLine = haveLine;
+        r.comp = haveLine ? getCompRow(ln) : nullptr;
+        r.ti = (haveLine && wantIQ) ? getTiRow(ln) : nullptr;
+        r.tq = (haveLine && wantIQ) ? getTqRow(ln) : nullptr;
+        return r;
+    };
+
+    const bool wantIQ = configuration.phaseCompensation;
+    RowRefs r0  = rowRefs(tapLine.ln0,  true,            wantIQ);
+    RowRefs rU1 = rowRefs(tapLine.lnU1, tapLine.haveU1,  wantIQ && wantFrame);
+    RowRefs rD1 = rowRefs(tapLine.lnD1, tapLine.haveD1,  wantIQ && wantFrame);
+    RowRefs rU2 = rowRefs(tapLine.lnU2, tapLine.haveU2,  wantIQ && (wantFieldA || wantFieldB));
+    RowRefs rD2 = rowRefs(tapLine.lnD2, tapLine.haveD2,  wantIQ && (wantFieldA || wantFieldB));
+    RowRefs rU4 = rowRefs(tapLine.lnU4, tapLine.haveU4,  wantIQ && wantFieldA);
+    RowRefs rD4 = rowRefs(tapLine.lnD4, tapLine.haveD4,  wantIQ && wantFieldA);
+
+    auto fillTap = [&](const RowRefs &r, std::vector<CombTapSample> &dst) {
+        for (int rel = 0; rel < width; ++rel) {
+            const int rm1 = reflectCombRel(rel - 1, width);
+            const int rp1 = reflectCombRel(rel + 1, width);
+            CombTapSample s;
+            s.haveComp = (r.comp != nullptr);
+            if (s.haveComp) {
+                s.comp = r.comp[rel];
+                s.symMag = 0.5 * (std::fabs(r.comp[rm1]) + std::fabs(r.comp[rp1]));
+            }
+            s.haveIQ = (r.ti && r.tq && rel < demodWidth);
+            if (s.haveIQ) {
+                s.ti = r.ti[rel];
+                s.tq = r.tq[rel];
+                s.iqMag = std::hypot((double)s.ti, (double)s.tq);
+            }
+            dst[rel] = s;
+        }
+    };
+
+    fillTap(r0, tapLine.tap0);
+    if (wantFrame) {
+        fillTap(rU1, tapLine.tapU1);
+        fillTap(rD1, tapLine.tapD1);
+    }
+    if (wantFieldA || wantFieldB) {
+        fillTap(rU2, tapLine.tapU2);
+        fillTap(rD2, tapLine.tapD2);
+    }
+    if (wantFieldA) {
+        fillTap(rU4, tapLine.tapU4);
+        fillTap(rD4, tapLine.tapD4);
+    }
+
+    const auto &T = configuration.tunables;
+    const double kRange = T.FIELD_K_RANGE_IRE * irescale;
+    const double invK = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
+    const double invI = invIreScale;
+
+    auto coherenceAt = [&](const std::vector<CombTapSample> &nbr, int rel)->double {
+        rel = std::clamp(rel, 0, width - 1);
+        const CombTapSample &c = tapLine.tap0[rel];
+        const CombTapSample &n = nbr[rel];
+        if (!c.haveIQ || !n.haveIQ) return 1.0;
+        if (c.iqMag * invI < 2.5 || n.iqMag * invI < 2.5) return 1.0;
+        const double corr = ((double)c.ti * (double)n.ti + (double)c.tq * (double)n.tq) /
+                            (c.iqMag * n.iqMag + 1e-12);
+        return std::clamp((corr - 0.55) / (0.85 - 0.55), 0.0, 1.0);
+    };
+
+    // Pair and contour fields are evidence, not decisions: candidates consume
+    // them differently so Field A/B and Frame A/B keep their distinct behavior.
+    auto fillPair = [&](const std::vector<CombTapSample> &nbr,
+                        bool haveNbr,
+                        std::vector<CombTapPair> &dst) {
+        for (int rel = 0; rel < width; ++rel) {
+            CombTapPair p;
+            const CombTapSample &c = tapLine.tap0[rel];
+            const CombTapSample &n = nbr[rel];
+            if (c.haveComp && n.haveComp && haveNbr) {
+                p.diffIRE = std::fabs(c.comp - n.comp) * invI;
+                p.kScore = combKMetric(c.comp, c.symMag, n.comp, n.symMag);
+                p.weight = (kRange > 1e-9) ? (1.0 - p.kScore * invK) : 1.0;
+                p.weight = std::clamp(p.weight, 0.0, 1.0);
+            }
+            if (c.haveIQ && n.haveIQ && haveNbr)
+                p.iqDiffIRE = std::hypot((double)c.ti - (double)n.ti,
+                                         (double)c.tq - (double)n.tq) * invI;
+            if (configuration.phaseCompensation && haveNbr) {
+                const int relL = std::clamp(rel - 4, 0, width - 1);
+                const int relR = std::clamp(rel + 4, 0, width - 1);
+                p.coherence = (width >= 9)
+                    ? std::min({coherenceAt(nbr, relL), coherenceAt(nbr, rel), coherenceAt(nbr, relR)})
+                    : coherenceAt(nbr, rel);
+            }
+            dst[rel] = p;
+        }
+    };
+
+    if (wantFrame) {
+        fillPair(tapLine.tapU1, tapLine.haveU1, tapLine.pairU1);
+        fillPair(tapLine.tapD1, tapLine.haveD1, tapLine.pairD1);
+    }
+    if (wantFieldA || wantFieldB) {
+        fillPair(tapLine.tapU2, tapLine.haveU2, tapLine.pairU2);
+        fillPair(tapLine.tapD2, tapLine.haveD2, tapLine.pairD2);
+    }
+
+    auto sampleTapComp = [&](const std::vector<CombTapSample> &tap, int rel)->double {
+        rel = std::clamp(rel, 0, width - 1);
+        return tap[rel].comp;
+    };
+    auto notchTap = [&](const std::vector<CombTapSample> &tap, int rel)->double {
+        if (rel < 2) rel = 2;
+        if (rel > width - 3) rel = width - 3;
+        return 0.5 * (sampleTapComp(tap, rel - 2) + sampleTapComp(tap, rel + 2));
+    };
+
+    if (wantFieldB || wantFrame) {
+        for (int rel = 0; rel < width; ++rel) {
+        if (configuration.phaseCompensation) {
+            if (width >= 5) {
+                const double lumL = notchTap(tapLine.tap0, rel - 1);
+                const double lumR = notchTap(tapLine.tap0, rel + 1);
+                tapLine.hLumaDeltaIRE[rel] = std::fabs(lumR - lumL) * invI;
+            } else {
+                tapLine.hLumaDeltaIRE[rel] = 0.0;
+            }
+        } else {
+            const int rm1 = std::clamp(rel - 1, 0, width - 1);
+            const int rp1 = std::clamp(rel + 1, 0, width - 1);
+            tapLine.hLumaDeltaIRE[rel] = std::fabs(tapLine.tap0[rp1].comp - tapLine.tap0[rm1].comp) * invI;
+        }
+        }
+    }
+
+    if (wantFieldA) {
+        for (int rel = 0; rel < width; ++rel) {
+        CombTapContour c;
+        const bool useIQCurve = configuration.phaseCompensation &&
+                                tapLine.tap0[rel].haveIQ &&
+                                tapLine.tapU2[rel].haveIQ &&
+                                tapLine.tapD2[rel].haveIQ &&
+                                tapLine.tapU4[rel].haveIQ &&
+                                tapLine.tapD4[rel].haveIQ;
+        auto curveMag = [&](const std::vector<CombTapSample> &tap)->double {
+            return useIQCurve ? tap[rel].iqMag : std::fabs(tap[rel].comp);
+        };
+        const double aC  = curveMag(tapLine.tap0);
+        const double aU2 = curveMag(tapLine.tapU2);
+        const double aD2 = curveMag(tapLine.tapD2);
+        const double aU4 = curveMag(tapLine.tapU4);
+        const double aD4 = curveMag(tapLine.tapD4);
+
+        c.curvMidIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invI;
+        c.midOk = combSmoothGate(c.curvMidIRE, T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
+
+        const double u4Pred = 2.0 * aU2 - aC;
+        const double d4Pred = 2.0 * aD2 - aC;
+        c.upResIRE = std::fabs(aU4 - u4Pred) * invI;
+        c.dnResIRE = std::fabs(aD4 - d4Pred) * invI;
+        c.upSideOk = combSmoothGate(c.upResIRE, T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
+        c.dnSideOk = combSmoothGate(c.dnResIRE, T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
+
+        const double upK = useIQCurve
+            ? std::fabs(aU2 - aU4)
+            : combKMetric(tapLine.tapU2[rel].comp, tapLine.tapU2[rel].symMag,
+                          tapLine.tapU4[rel].comp, tapLine.tapU4[rel].symMag);
+        const double dnK = useIQCurve
+            ? std::fabs(aD2 - aD4)
+            : combKMetric(tapLine.tapD2[rel].comp, tapLine.tapD2[rel].symMag,
+                          tapLine.tapD4[rel].comp, tapLine.tapD4[rel].symMag);
+        c.upSim = (tapLine.pairU2[rel].weight > 0.0)
+            ? std::clamp((kRange > 1e-9) ? (1.0 - upK * invK) : 1.0, 0.0, 1.0)
+            : 0.0;
+        c.dnSim = (tapLine.pairD2[rel].weight > 0.0)
+            ? std::clamp((kRange > 1e-9) ? (1.0 - dnK * invK) : 1.0, 0.0, 1.0)
+            : 0.0;
+        c.upTrust = c.midOk * c.upSideOk;
+        c.dnTrust = c.midOk * c.dnSideOk;
+        c.upInfluence = T.FIELD_CONTOUR_FAR_INFLUENCE * c.upTrust *
+                         combSimilarityFactor(c.upSim, T.FIELD_CONTOUR_SIM_START, T.FIELD_CONTOUR_SIM_FULL);
+        c.dnInfluence = T.FIELD_CONTOUR_FAR_INFLUENCE * c.dnTrust *
+                         combSimilarityFactor(c.dnSim, T.FIELD_CONTOUR_SIM_START, T.FIELD_CONTOUR_SIM_FULL);
+        tapLine.contour[rel] = c;
+        }
+    }
+
+    tapLine.builtFlags = flags;
+}
+
 // Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically 
 // influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
 void Comb::FrameBuffer::computeField2DLine(int lineNumber,
                                           double *outFieldLine,
                                           double  *outGate)
 {
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-
+    const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
 
@@ -245,124 +574,35 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
 
     if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
-    auto clampSameFieldLine = [&](int ln)->int {
-        // For intrafield sampling we must stay on the same field parity as lineNumber.
-        // Plain clamping can jump to the opposite field at the top/bottom edges.
-        const int parity = (lineNumber & 1);
-        ln = std::clamp(ln, first, last - 1);
-        if ((ln & 1) != parity) {
-            // Prefer stepping inward rather than outward.
-            if (ln + 1 < last && ((ln + 1) & 1) == parity) ln = ln + 1;
-            else if (ln - 1 >= first && ((ln - 1) & 1) == parity) ln = ln - 1;
-        }
-        return ln;
-    };
+    const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
+    computeField2DLine(tapLine, outFieldLine, outGate);
+}
 
-    const int ln0   = clampSameFieldLine(lineNumber);
-    const int lnUp2 = clampSameFieldLine(lineNumber - 2);
-    const int lnDn2 = clampSameFieldLine(lineNumber + 2);
-    const int lnUp4 = clampSameFieldLine(lineNumber - 4);
-    const int lnDn4 = clampSameFieldLine(lineNumber + 4);
+void Comb::FrameBuffer::computeField2DLine(const CombTapLine &tapLine,
+                                           double *outFieldLine,
+                                           double *outGate)
+{
+    const int width = tapLine.width;
+    if (width <= 0 || !outFieldLine || (int)tapLine.tap0.size() < width) return;
 
-    const double *row0   = nullptr;
-    const double *rowUp2 = nullptr;
-    const double *rowDn2 = nullptr;
-    const double *rowUp4 = nullptr;
-    const double *rowDn4 = nullptr;
+    if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
-    if (configuration.phaseCompensation) {
-        auto getRow = [&](int ln)->const double* {
-            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
-            const auto &row = locked1DSource[ln];
-            if ((int)row.size() < width) return nullptr;
-            return row.data();
-        };
-        row0   = getRow(ln0);
-        rowUp2 = getRow(lnUp2);
-        rowDn2 = getRow(lnDn2);
-        rowUp4 = getRow(lnUp4);
-        rowDn4 = getRow(lnDn4);
-    } else {
-        row0   = clpbuffer[0].pixel[ln0]   + left;
-        rowUp2 = clpbuffer[0].pixel[lnUp2] + left;
-        rowDn2 = clpbuffer[0].pixel[lnDn2] + left;
-        rowUp4 = clpbuffer[0].pixel[lnUp4] + left;
-        rowDn4 = clpbuffer[0].pixel[lnDn4] + left;
-    }
-
-    if (!row0 || !rowUp2 || !rowDn2 || !rowUp4 || !rowDn4) {
-        std::fill(outFieldLine, outFieldLine + width, 0.0);
-        if (outGate) std::fill(outGate, outGate + width, 1.0f);
-        return;
-    }
-
-    const auto  &T    = configuration.tunables;
-    const double invI = this->invIreScale;
-
-    auto reflectRel = [&](int r)->int {
-        if (r < 0) return -r;
-        if (r >= width) return (width - 1) - (r - (width - 1));
-        return r;
-    };
-
-    // Debug-only: measure whether Field A is actually producing a vertical estimate
-    // or collapsing into near-zero output (which reads as "1D remains").
     qint64 dbgN = 0;
     qint64 dbgCollapsedN = 0;
     double dbgSumGate = 0.0;
     double dbgSumAbsTc = 0.0;
     double dbgSumAbsC = 0.0;
 
-    // Phase relationship range (like FieldB; in IRE)
-    const double kRange = T.FIELD_K_RANGE_IRE * irescale;
-    const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
+    for (int rel = 0; rel < width; ++rel) {
+        const double C    = tapLine.tap0[rel].comp;
+        const double Cup2 = tapLine.tapU2[rel].comp;
+        const double Cdn2 = tapLine.tapD2[rel].comp;
+        const double Cup4 = tapLine.tapU4[rel].comp;
+        const double Cdn4 = tapLine.tapD4[rel].comp;
 
-    // Luma-edge exclusion for far reach (prevents reaching across disparate vertical regions)
-    for (int h = left; h < right; ++h) {
-        const int rel = h - left;
-
-        const int rm1 = reflectRel(rel - 1);
-        const int rp1 = reflectRel(rel + 1);
-
-        const double C    = row0[rel];
-        const double Cup2 = rowUp2[rel];
-        const double Cdn2 = rowDn2[rel];
-        const double Cup4 = rowUp4[rel];
-        const double Cdn4 = rowDn4[rel];
-
-        const double C_m1    = row0[rm1];
-        const double C_p1    = row0[rp1];
-        const double Cup2_m1 = rowUp2[rm1];
-        const double Cup2_p1 = rowUp2[rp1];
-        const double Cdn2_m1 = rowDn2[rm1];
-        const double Cdn2_p1 = rowDn2[rp1];
-        const double Cup4_m1 = rowUp4[rm1];
-        const double Cup4_p1 = rowUp4[rp1];
-        const double Cdn4_m1 = rowDn4[rm1];
-        const double Cdn4_p1 = rowDn4[rp1];
-
-        const double symCur  = 0.5 * (std::fabs(C_m1)    + std::fabs(C_p1));
-        const double symUp2  = 0.5 * (std::fabs(Cup2_m1) + std::fabs(Cup2_p1));
-        const double symDn2  = 0.5 * (std::fabs(Cdn2_m1) + std::fabs(Cdn2_p1));
-        const double symUp4  = 0.5 * (std::fabs(Cup4_m1) + std::fabs(Cup4_p1));
-        const double symDn4  = 0.5 * (std::fabs(Cdn4_m1) + std::fabs(Cdn4_p1));
-
-        auto kMetric = [&](double cc, double symC, double cn, double symN)->double {
-            double k = 0.0;
-            k  = std::fabs(std::fabs(cc) - std::fabs(cn));
-            k += std::fabs(symC - symN);
-            k -= (std::fabs(cc) + std::fabs(cn)) * 0.10;
-            if (k < 0.0) k = 0.0;
-            return k;
-        };
-
-        // Near weights (same as Field B)
-        double kp2 = kMetric(C, symCur, Cup2, symUp2);
-        double kn2 = kMetric(C, symCur, Cdn2, symDn2);
-        double wUp2 = (kRange > 1e-9) ? (1.0 - kp2 * invK) : 1.0;
-        double wDn2 = (kRange > 1e-9) ? (1.0 - kn2 * invK) : 1.0;
-        wUp2 = std::clamp(wUp2, 0.0, 1.0);
-        wDn2 = std::clamp(wDn2, 0.0, 1.0);
+        double wUp2 = tapLine.pairU2[rel].weight;
+        double wDn2 = tapLine.pairD2[rel].weight;
+        const CombTapContour &curve = tapLine.contour[rel];
 
         double sc2 = 1.0;
         if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
@@ -387,63 +627,6 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
             }
         }
 
-        // 5-tap contour check:
-        // Use the full set { -4, -2, 0, +2, +4 } to decide whether far reach is
-        // on-contour. Far does not contribute directly; it only refines the ±2 tap.
-        const double FAR_INFLUENCE_BASE = 0.55;
-
-        auto smoothGate = [&](double xIRE, double softIRE, double hardIRE)->double {
-            if (xIRE <= softIRE) return 1.0;
-            if (xIRE >= hardIRE) return 0.0;
-            double t = (xIRE - softIRE) / (hardIRE - softIRE);
-            t = std::clamp(t, 0.0, 1.0);
-            return 1.0 - t;
-        };
-
-        const double aC   = std::fabs(C);
-        const double aU2  = std::fabs(Cup2);
-        const double aD2  = std::fabs(Cdn2);
-        const double aU4  = std::fabs(Cup4);
-        const double aD4  = std::fabs(Cdn4);
-
-        // Detect "hard corner" / boundary crossing at the center using a discrete curvature.
-        const double curvMidIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invI;
-        const double midOk = smoothGate(curvMidIRE, 4.0, 10.0);
-
-        // Side-specific far consistency: far should lie near the line extrapolated from {0,±2}.
-        const double u4Pred = 2.0 * aU2 - aC;
-        const double d4Pred = 2.0 * aD2 - aC;
-        const double uResIRE = std::fabs(aU4 - u4Pred) * invI;
-        const double dResIRE = std::fabs(aD4 - d4Pred) * invI;
-        const double upSideOk = smoothGate(uResIRE, 4.0, 10.0);
-        const double dnSideOk = smoothGate(dResIRE, 4.0, 10.0);
-
-        // Similarity check in the existing k-metric space (near vs far).
-        auto farSim = [&](double nearS, double nearSym, double farS, double farSym)->double {
-            const double k = kMetric(nearS, nearSym, farS, farSym);
-            const double w = (kRange > 1e-9) ? (1.0 - k * invK) : 1.0;
-            return std::clamp(w, 0.0, 1.0);
-        };
-        const double upSim = (wUp2 > 0.0) ? farSim(Cup2, symUp2, Cup4, symUp4) : 0.0;
-        const double dnSim = (wDn2 > 0.0) ? farSim(Cdn2, symDn2, Cdn4, symDn4) : 0.0;
-
-        // Convert similarity into a 0..1 factor (soft start at 0.55).
-        auto simFactor = [&](double sim)->double {
-            const double start = 0.55;
-            const double full  = 0.85;
-            if (sim <= start) return 0.0;
-            if (sim >= full) return 1.0;
-            double t = (sim - start) / (full - start);
-            return std::clamp(t, 0.0, 1.0);
-        };
-
-        const double upInfluence = FAR_INFLUENCE_BASE * midOk * upSideOk * simFactor(upSim);
-        const double dnInfluence = FAR_INFLUENCE_BASE * midOk * dnSideOk * simFactor(dnSim);
-
-        // Far reach is evaluated in magnitude space, so apply it in a sign-safe way:
-        // refine the magnitude of the ±2 tap, but keep the near tap's sign. If the
-        // far tap disagrees in sign (phase), ignore far refinement to avoid
-        // injecting checkerboard/alternation into the intrafield estimate.
         auto refineNearWithFar = [&](double nearS, double farS, double influence)->double {
             if (influence <= 0.0) return nearS;
             if (nearS == 0.0) return nearS;
@@ -454,8 +637,8 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
             return std::copysign(mag, nearS);
         };
 
-        const double Cup2Adj = refineNearWithFar(Cup2, Cup4, upInfluence);
-        const double Cdn2Adj = refineNearWithFar(Cdn2, Cdn4, dnInfluence);
+        const double Cup2Adj = refineNearWithFar(Cup2, Cup4, curve.upInfluence);
+        const double Cdn2Adj = refineNearWithFar(Cdn2, Cdn4, curve.dnInfluence);
 
         double tc = 0.0;
         if (wUp2 > 0.0 || wDn2 > 0.0) {
@@ -467,16 +650,14 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
         outFieldLine[rel] = tc;
 
         double gateA = std::max(wUp2, wDn2);
-        // Gate reflects near evidence; far only refines the near tap.
         gateA = std::clamp(gateA, 0.0, 1.0);
-        if (outGate) outGate[rel] = (float)gateA;
+        if (outGate) outGate[rel] = gateA;
 
-        // Collect debug stats over active region only.
         if (configuration.debugPhaseLegs) {
             ++dbgN;
             dbgSumGate += gateA;
-            dbgSumAbsTc += std::fabs(tc) * invI;
-            dbgSumAbsC += std::fabs(C) * invI;
+            dbgSumAbsTc += std::fabs(tc) * invIreScale;
+            dbgSumAbsC += std::fabs(C) * invIreScale;
             if ((wUp2 + wDn2) < 0.10) ++dbgCollapsedN;
         }
     }
@@ -484,7 +665,7 @@ void Comb::FrameBuffer::computeField2DLine(int lineNumber,
     if (configuration.debugPhaseLegs && dbgN > 0) {
         const double invN = 1.0 / (double)dbgN;
         qInfo().noquote() << QString("FieldAStats line=%1 n=%2 collapsed=%3 gate=%4 absTcIRE=%5 absCIRE=%6")
-            .arg(lineNumber)
+            .arg(tapLine.ln0)
             .arg(dbgN)
             .arg(dbgCollapsedN)
             .arg(dbgSumGate * invN, 0, 'f', 3)
@@ -500,116 +681,40 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
-
-    // --- HELPER DECLARATION ---
-    auto clampSameFieldLine = [&](int ln) -> int {
-        const int parity = (lineNumber & 1);
-        ln = std::clamp(ln, first, last - 1);
-        if ((ln & 1) != parity) {
-            if (ln + 1 < last && ((ln + 1) & 1) == parity) ln = ln + 1;
-            else if (ln - 1 >= first && ((ln - 1) & 1) == parity) ln = ln - 1;
-        }
-        return ln;
-    };
-
-    // Pre-calculate the indices once
-    const int ln0  = clampSameFieldLine(lineNumber);
-    const int lnU2 = clampSameFieldLine(lineNumber - 2);
-    const int lnD2 = clampSameFieldLine(lineNumber + 2);
-    // --------------------------
-
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
+    const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
 
     if (width <= 0 || lineNumber < first || lineNumber >= last || !outFieldLine) {
         if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
         return;
     }
 
-    auto getRow = [&](int ln) -> const double* {
-        if (ln < 0) return nullptr;
-        if (configuration.phaseCompensation) {
-             if (ln >= (int)locked1DSource.size()) return nullptr;
-             return locked1DSource[ln].data();
-        }
-        return clpbuffer[0].pixel[ln] + left;
-    };
+    const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
+    computeSimpleField2DLine(tapLine, outFieldLine);
+}
 
-    const double *row0   = getRow(ln0);
-    const double *rowUp2 = getRow(lnU2);
-    const double *rowDn2 = getRow(lnD2);
-
-    if (!row0 || !rowUp2 || !rowDn2) {
-        std::fill(outFieldLine, outFieldLine + width, 0.0);
+void Comb::FrameBuffer::computeSimpleField2DLine(const CombTapLine &tapLine, double *outFieldLine)
+{
+    const int width = tapLine.width;
+    if (width <= 0 || !outFieldLine || (int)tapLine.tap0.size() < width) {
+        if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
         return;
     }
 
-    const auto  &T    = configuration.tunables;
-    const double invI = this->invIreScale;
+    for (int rel = 0; rel < width; ++rel) {
+        const double C   = tapLine.tap0[rel].comp;
+        const double Cup = tapLine.tapU2[rel].comp;
+        const double Cdn = tapLine.tapD2[rel].comp;
 
-    auto getCoherence = [&](const float* ti, const float* tq, const float* tiN, const float* tqN, int x) -> double {
-        if (!ti || !tq || !tiN || !tqN) return 1.0;
-        const double m0 = std::hypot(ti[x], tq[x]);
-        const double mn = std::hypot(tiN[x], tqN[x]);
-        if (m0 * invI < 2.5 || mn * invI < 2.5) return 1.0; 
-        const double corr = (ti[x] * tiN[x] + tq[x] * tqN[x]) / (m0 * mn + 1e-12);
-        return std::clamp((corr - 0.55) / (0.85 - 0.55), 0.0, 1.0);
-    };
+        const double dynamicVThreshold = (tapLine.hLumaDeltaIRE[rel] > 12.0) ? 6.0 : 10.0;
 
-    for (int h = 0; h < width; ++h) {
-        const double C   = row0[h];
-        const double Cup = rowUp2[h];
-        const double Cdn = rowDn2[h];
-
-        double hLumaDelta = 0.0;
-        if (configuration.phaseCompensation) {
-            if (width >= 5) {
-                const double lumL = getNotchLumaEven2(row0, h - 1, width);
-                const double lumR = getNotchLumaEven2(row0, h + 1, width);
-                hLumaDelta = std::fabs(lumR - lumL) * invI;
-            }
-        } else if (h > 0 && h < width - 1) {
-            hLumaDelta = std::fabs(row0[h+1] - row0[h-1]) * invI;
-        }
-        double dynamicVThreshold = (hLumaDelta > 12.0) ? 6.0 : 10.0;
-
-        double cohUp = 1.0;
-        double cohDn = 1.0;
-        
-        if (configuration.phaseCompensation) {
-            auto checkStrict = [&](int lA, int lB) -> double {
-                const float *tiA = demodTI4fsc_line(lA), *tqA = demodTQ4fsc_line(lA);
-                const float *tiB = demodTI4fsc_line(lB), *tqB = demodTQ4fsc_line(lB);
-                if (!tiA || !tiB) return 1.0;
-
-                double cMid = getCoherence(tiA, tqA, tiB, tqB, h);
-                if (width >= 9) {
-                    const int hL = std::clamp(h - 4, 0, width - 1);
-                    const int hR = std::clamp(h + 4, 0, width - 1);
-                    double cL = getCoherence(tiA, tqA, tiB, tqB, hL);
-                    double cR = getCoherence(tiA, tqA, tiB, tqB, hR);
-                    return std::min({cL, cMid, cR});
-                }
-                return cMid;
-            };
-            cohUp = checkStrict(ln0, lnU2);
-            cohDn = checkStrict(ln0, lnD2);
-        }
-
-        double diffUpIRE = std::fabs(C - Cup) * invI;
-        double diffDnIRE = std::fabs(C - Cdn) * invI;
-        
-        if (configuration.phaseCompensation) {
-            const float *ti0 = demodTI4fsc_line(ln0), *tq0 = demodTQ4fsc_line(ln0);
-            const float *tiU = demodTI4fsc_line(lnU2), *tqU = demodTQ4fsc_line(lnU2);
-            const float *tiD = demodTI4fsc_line(lnD2), *tqD = demodTQ4fsc_line(lnD2);
-            
-            if (ti0 && tiU && tiD) {
-                diffUpIRE = std::hypot(ti0[h] - tiU[h], tq0[h] - tqU[h]) * invI;
-                diffDnIRE = std::hypot(ti0[h] - tiD[h], tq0[h] - tqD[h]) * invI;
-            }
-        }
+        const double cohUp = configuration.phaseCompensation ? tapLine.pairU2[rel].coherence : 1.0;
+        const double cohDn = configuration.phaseCompensation ? tapLine.pairD2[rel].coherence : 1.0;
+        const double diffUpIRE = configuration.phaseCompensation
+            ? tapLine.pairU2[rel].iqDiffIRE
+            : tapLine.pairU2[rel].diffIRE;
+        const double diffDnIRE = configuration.phaseCompensation
+            ? tapLine.pairD2[rel].iqDiffIRE
+            : tapLine.pairD2[rel].diffIRE;
 
         double tc = C;
         const bool okUp = (cohUp >= 0.5 && diffUpIRE < dynamicVThreshold);
@@ -624,30 +729,26 @@ void Comb::FrameBuffer::computeSimpleField2DLine(int lineNumber, double *outFiel
         }
 
         double maxPhysDelta = 0.0;
-        if (configuration.phaseCompensation) {
-            const float *ti0 = demodTI4fsc_line(ln0), *tq0 = demodTQ4fsc_line(ln0);
-            const float *tiU = demodTI4fsc_line(lnU2), *tqU = demodTQ4fsc_line(lnU2);
-            const float *tiD = demodTI4fsc_line(lnD2), *tqD = demodTQ4fsc_line(lnD2);
+        if (configuration.phaseCompensation &&
+            tapLine.tap0[rel].haveIQ && tapLine.tapU2[rel].haveIQ && tapLine.tapD2[rel].haveIQ)
+        {
+            double envClamp = 0.5 * tapLine.tap0[rel].iqMag;
+            envClamp = std::max(envClamp, 0.5 * tapLine.tapU2[rel].iqMag);
+            envClamp = std::max(envClamp, 0.5 * tapLine.tapD2[rel].iqMag);
 
-            if (ti0 && tq0 && tiU && tqU && tiD && tqD) {
-                double envClamp = 0.5 * std::hypot(ti0[h], tq0[h]);
-                envClamp = std::max(envClamp, 0.5 * std::hypot(tiU[h], tqU[h]));
-                envClamp = std::max(envClamp, 0.5 * std::hypot(tiD[h], tqD[h]));
+            double iqDeltaClamp = 0.0;
+            if (std::isfinite(diffUpIRE))
+                iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
+            if (std::isfinite(diffDnIRE))
+                iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffDnIRE * irescale);
 
-                double iqDeltaClamp = 0.0;
-                if (std::isfinite(diffUpIRE))
-                    iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
-                if (std::isfinite(diffDnIRE))
-                    iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffDnIRE * irescale);
-
-                const double envFloor = 0.35 * envClamp;
-                maxPhysDelta = std::min(envClamp, std::max(envFloor, iqDeltaClamp));
-            }
+            const double envFloor = 0.35 * envClamp;
+            maxPhysDelta = std::min(envClamp, std::max(envFloor, iqDeltaClamp));
         }
         if (maxPhysDelta <= 0.0) {
             maxPhysDelta = std::max(std::fabs(C - Cup), std::fabs(C - Cdn)) * 0.65;
         }
-        outFieldLine[h] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
+        outFieldLine[rel] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
     }
 }
 
@@ -663,76 +764,55 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
+    const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
 
     if (width <= 0 || lineNumber < first || lineNumber >= last || !outFrameLine) {
         if (outFrameLine) std::fill(outFrameLine, outFrameLine + std::max(width, 0), 0.0);
         return;
     }
 
-    const int ln0 = lineNumber;
-    const int lnU = lineNumber - 1;
-    const int lnD = lineNumber + 1;
+    const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
+    computeFrameScalarLine(tapLine, outFrameLine);
+}
 
-    const bool haveUp = (lnU >= first && lnU < last);
-    const bool haveDn = (lnD >= first && lnD < last);
+void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, double *outFrameLine)
+{
+    const int left  = videoParameters.activeVideoStart;
+    const int width = tapLine.width;
 
-    auto getRow = [&](int ln) -> const double* {
-        if (ln < first || ln >= last) return nullptr;
-
-        if (configuration.phaseCompensation) {
-            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
-            const auto &row = locked1DSource[ln];
-            if ((int)row.size() < width) return nullptr;
-            return row.data();
-        }
-
-        return clpbuffer[0].pixel[ln] + left;
-    };
-
-    const double *row0 = getRow(ln0);
-    const double *rowU = haveUp ? getRow(lnU) : nullptr;
-    const double *rowD = haveDn ? getRow(lnD) : nullptr;
-
-    if (!row0) {
-        std::fill(outFrameLine, outFrameLine + width, 0.0);
+    if (width <= 0 || !outFrameLine || (int)tapLine.tap0.size() < width) {
+        if (outFrameLine) std::fill(outFrameLine, outFrameLine + std::max(width, 0), 0.0);
         return;
     }
 
     const auto  &T    = configuration.tunables;
-    const double invI = this->invIreScale;
+    const double invI = invIreScale;
+    const bool haveUp = tapLine.haveU1;
+    const bool haveDn = tapLine.haveD1;
 
     auto applyMat = [](double I, double Q, const double M[2][2], double &outI, double &outQ) {
         outI = M[0][0] * I + M[0][1] * Q;
         outQ = M[1][0] * I + M[1][1] * Q;
     };
 
-    const float *ti0 = configuration.phaseCompensation ? demodTI4fsc_line(ln0) : nullptr;
-    const float *tq0 = configuration.phaseCompensation ? demodTQ4fsc_line(ln0) : nullptr;
-    const float *tiU = (configuration.phaseCompensation && haveUp) ? demodTI4fsc_line(lnU) : nullptr;
-    const float *tqU = (configuration.phaseCompensation && haveUp) ? demodTQ4fsc_line(lnU) : nullptr;
-    const float *tiD = (configuration.phaseCompensation && haveDn) ? demodTI4fsc_line(lnD) : nullptr;
-    const float *tqD = (configuration.phaseCompensation && haveDn) ? demodTQ4fsc_line(lnD) : nullptr;
     const double sign0Line = (configuration.phaseCompensation && !lineFlip.empty() &&
-                              ln0 >= 0 && ln0 < (int)lineFlip.size())
-        ? (double)lineFlip[ln0] : 1.0;
+                              tapLine.ln0 >= 0 && tapLine.ln0 < (int)lineFlip.size())
+        ? (double)lineFlip[tapLine.ln0] : 1.0;
     const double signULine = (configuration.phaseCompensation && !lineFlip.empty() &&
-                              lnU >= 0 && lnU < (int)lineFlip.size())
-        ? (double)lineFlip[lnU] : 1.0;
+                              tapLine.lnU1 >= 0 && tapLine.lnU1 < (int)lineFlip.size())
+        ? (double)lineFlip[tapLine.lnU1] : 1.0;
     const double signDLine = (configuration.phaseCompensation && !lineFlip.empty() &&
-                              lnD >= 0 && lnD < (int)lineFlip.size())
-        ? (double)lineFlip[lnD] : 1.0;
+                              tapLine.lnD1 >= 0 && tapLine.lnD1 < (int)lineFlip.size())
+        ? (double)lineFlip[tapLine.lnD1] : 1.0;
 
-    auto solveFamilyRotation = [&](const float *tiNbr,
-                                   const float *tqNbr,
+    auto solveFamilyRotation = [&](const std::vector<CombTapSample> &nbr,
+                                   bool haveNbr,
                                    int bucketFamily,
                                    double Rm[2][2]) -> bool {
         Rm[0][0] = 1.0; Rm[0][1] = 0.0;
         Rm[1][0] = 0.0; Rm[1][1] = 1.0;
 
-        if (!configuration.phaseCompensation || !ti0 || !tq0 || !tiNbr || !tqNbr)
+        if (!configuration.phaseCompensation || !haveNbr)
             return false;
 
         constexpr double MIN_FIT_IRE = 2.5;
@@ -745,14 +825,18 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         for (int x = 0; x < width; ++x) {
             if (((left + x) & 1) != bucketFamily)
                 continue;
+            const CombTapSample &c = tapLine.tap0[x];
+            const CombTapSample &nb = nbr[x];
+            if (!c.haveIQ || !nb.haveIQ)
+                continue;
 
-            const double I0 = ti0[x];
-            const double Q0 = tq0[x];
-            const double In = tiNbr[x];
-            const double Qn = tqNbr[x];
+            const double I0 = c.ti;
+            const double Q0 = c.tq;
+            const double In = nb.ti;
+            const double Qn = nb.tq;
 
-            const double a0 = std::hypot(I0, Q0) * invI;
-            const double an = std::hypot(In, Qn) * invI;
+            const double a0 = c.iqMag * invI;
+            const double an = nb.iqMag * invI;
 
             if (a0 < MIN_FIT_IRE || an < MIN_FIT_IRE)
                 continue;
@@ -789,8 +873,8 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         return true;
     };
 
-    auto bucketErrorForNeighbor = [&](const float *tiNbr,
-                                      const float *tqNbr,
+    auto bucketErrorForNeighbor = [&](const std::vector<CombTapSample> &nbr,
+                                      bool haveNbr,
                                       int bucketClass,
                                       int lineSignNbr,
                                       double bucketPol,
@@ -799,22 +883,24 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         double err = 0.0;
         int errN = 0;
 
-        if (!ti0 || !tq0 || !tiNbr || !tqNbr)
+        if (!configuration.phaseCompensation || !haveNbr)
             return {err, errN};
 
         for (int x = 0; x < width; ++x) {
             if (((left + x) & 3) != bucketClass)
                 continue;
+            const CombTapSample &c = tapLine.tap0[x];
+            const CombTapSample &nb = nbr[x];
+            if (!c.haveIQ || !nb.haveIQ)
+                continue;
 
-            const double I0 = ti0[x];
-            const double Q0 = tq0[x];
-            const double a0 = std::hypot(I0, Q0) * invI;
+            const double a0 = c.iqMag * invI;
             if (a0 < MIN_FIT_IRE)
                 continue;
 
             double In = 0.0;
             double Qn = 0.0;
-            applyMat(tiNbr[x], tqNbr[x], Rm, In, Qn);
+            applyMat(nb.ti, nb.tq, Rm, In, Qn);
             In *= bucketPol;
             Qn *= bucketPol;
             const double an = std::hypot(In, Qn) * invI;
@@ -822,7 +908,7 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
                 continue;
 
             const int h = left + x;
-            const double C0 = remod4fscToComposite(sign0Line * I0, sign0Line * Q0, h);
+            const double C0 = remod4fscToComposite(sign0Line * c.ti, sign0Line * c.tq, h);
             const double Cn = remod4fscToComposite(lineSignNbr * In, lineSignNbr * Qn, h);
             err += std::fabs(C0 + Cn);
             ++errN;
@@ -835,10 +921,10 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
     double RmDn[2][2][2];
     double bucketPol[4] = {1.0, 1.0, 1.0, 1.0};
 
-    solveFamilyRotation(tiU, tqU, 0, RmUp[0]);
-    solveFamilyRotation(tiU, tqU, 1, RmUp[1]);
-    solveFamilyRotation(tiD, tqD, 0, RmDn[0]);
-    solveFamilyRotation(tiD, tqD, 1, RmDn[1]);
+    solveFamilyRotation(tapLine.tapU1, haveUp, 0, RmUp[0]);
+    solveFamilyRotation(tapLine.tapU1, haveUp, 1, RmUp[1]);
+    solveFamilyRotation(tapLine.tapD1, haveDn, 0, RmDn[0]);
+    solveFamilyRotation(tapLine.tapD1, haveDn, 1, RmDn[1]);
 
     for (int bucketClass = 0; bucketClass < 4; ++bucketClass) {
         double bestErr = std::numeric_limits<double>::infinity();
@@ -846,18 +932,17 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         const int bucketFamily = bucketClass & 1;
 
         for (double candPol : {1.0, -1.0}) {
-            const bool okUpSolve = tiU && tqU;
-            const bool okDnSolve = tiD && tqD;
-
             double err = 0.0;
             int errN = 0;
-            if (okUpSolve) {
-                auto [e, n] = bucketErrorForNeighbor(tiU, tqU, bucketClass, (int)signULine, candPol, RmUp[bucketFamily]);
+            if (haveUp) {
+                auto [e, n] = bucketErrorForNeighbor(tapLine.tapU1, haveUp, bucketClass,
+                                                     (int)signULine, candPol, RmUp[bucketFamily]);
                 err += e;
                 errN += n;
             }
-            if (okDnSolve) {
-                auto [e, n] = bucketErrorForNeighbor(tiD, tqD, bucketClass, (int)signDLine, candPol, RmDn[bucketFamily]);
+            if (haveDn) {
+                auto [e, n] = bucketErrorForNeighbor(tapLine.tapD1, haveDn, bucketClass,
+                                                     (int)signDLine, candPol, RmDn[bucketFamily]);
                 err += e;
                 errN += n;
             }
@@ -871,6 +956,16 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         bucketPol[bucketClass] = bestPol;
     }
 
+    // Ownership evidence for this line (populated by buildPhaseCorrected1D).
+    // lumaClaim identifies alien-Y pixels where the sign convention is wrong
+    // and the raw composite comb should be used instead.
+    const int ownerLine = tapLine.ln0;
+    const bool haveOwnership = configuration.phaseCompensation
+        && ownerLine >= 0 && ownerLine < (int)ownershipEvidence.size()
+        && (int)ownershipEvidence[ownerLine].size() >= width;
+    const OwnershipEvidence *ownRow = haveOwnership
+        ? ownershipEvidence[ownerLine].data() : nullptr;
+
     for (int rel = 0; rel < width; ++rel) {
         const int bucketClass = (left + rel) & 3;
         const int bucketFamily = bucketClass & 1;
@@ -880,105 +975,126 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         const double (*RmUpUse)[2] = RmUp[bucketFamily];
         const double (*RmDnUse)[2] = RmDn[bucketFamily];
 
-        double C = row0[rel];
+        // Save raw composite values before the sign convention overwrites them.
+        // In the common 4fsc domain, alien Y maps identically on both fields
+        // (it's a luma transient, not carrier-modulated), so the raw comb
+        // rawC - rawCup cancels alien Y while the signed comb amplifies it.
+        const double rawC   = tapLine.tap0[rel].comp;
+        const double rawCup = haveUp ? tapLine.tapU1[rel].comp : rawC;
+        const double rawCdn = haveDn ? tapLine.tapD1[rel].comp : rawC;
 
-        double Cup = rowU ? rowU[rel] : C;
-        double Cdn = rowD ? rowD[rel] : C;
+        double C = rawC;
+        double Cup = rawCup;
+        double Cdn = rawCdn;
         double I0c = 0.0, Q0c = 0.0;
         double IUc = 0.0, QUc = 0.0;
         double IDc = 0.0, QDc = 0.0;
-        const bool haveCenterIQ = configuration.phaseCompensation && ti0 && tq0;
-        const bool haveUpIQ = configuration.phaseCompensation && tiU && tqU;
-        const bool haveDnIQ = configuration.phaseCompensation && tiD && tqD;
+        const bool haveCenterIQ = configuration.phaseCompensation && tapLine.tap0[rel].haveIQ;
+        const bool haveUpIQ = configuration.phaseCompensation && haveUp && tapLine.tapU1[rel].haveIQ;
+        const bool haveDnIQ = configuration.phaseCompensation && haveDn && tapLine.tapD1[rel].haveIQ;
 
         if (configuration.phaseCompensation) {
             const int h = left + rel;
 
-            if (ti0 && tq0) {
-                I0c = sign0 * ti0[rel];
-                Q0c = sign0 * tq0[rel];
+            if (haveCenterIQ) {
+                I0c = sign0 * tapLine.tap0[rel].ti;
+                Q0c = sign0 * tapLine.tap0[rel].tq;
                 C = remod4fscToComposite(I0c, Q0c, h);
             }
 
-            if (tiU && tqU) {
+            if (haveUpIQ) {
                 double Iu = 0.0;
                 double Qu = 0.0;
-                applyMat(tiU[rel], tqU[rel], RmUpUse, Iu, Qu);
+                applyMat(tapLine.tapU1[rel].ti, tapLine.tapU1[rel].tq, RmUpUse, Iu, Qu);
                 IUc = signU * Iu;
                 QUc = signU * Qu;
                 Cup = remod4fscToComposite(IUc, QUc, h);
             }
 
-            if (tiD && tqD) {
+            if (haveDnIQ) {
                 double Id = 0.0;
                 double Qd = 0.0;
-                applyMat(tiD[rel], tqD[rel], RmDnUse, Id, Qd);
+                applyMat(tapLine.tapD1[rel].ti, tapLine.tapD1[rel].tq, RmDnUse, Id, Qd);
                 IDc = signD * Id;
                 QDc = signD * Qd;
                 Cdn = remod4fscToComposite(IDc, QDc, h);
             }
         }
 
-        double hLumaDelta = 0.0;
-        if (width >= 5) {
-            const double lumL = getNotchLumaEven2(row0, rel - 1, width);
-            const double lumR = getNotchLumaEven2(row0, rel + 1, width);
-            hLumaDelta = std::fabs(lumR - lumL) * invI;
-        }
+        // Ownership blend factor for this pixel. As lumaClaim → 1, all gate
+        // signals migrate from the signed domain to the raw composite domain,
+        // so the transition to the unsigned regime is integrated and continuous.
+        const double lcEff = ownRow ? ownRow[rel].lumaClaim : 0.0;
 
-        const double dynamicVThreshold = (hLumaDelta > 12.0) ? 6.0 : 10.0;
+        // dynamicVThreshold: at sharp luma edges it tightens to 6 IRE to reject
+        // motion/boundary noise, but alien-Y edges are exactly those pixels.
+        // As lcEff rises, relax it back toward 10 so alien-Y pixels can enter
+        // the softWeight path rather than forcing tc = C passthrough.
+        const double edgeSqueeze = (tapLine.hLumaDeltaIRE[rel] > 12.0) ? 1.0 : 0.0;
+        const double dynamicVThreshold = 10.0 - 4.0 * edgeSqueeze * (1.0 - lcEff);
 
         double cohUp = haveUp ? 1.0 : 0.0;
         double cohDn = haveDn ? 1.0 : 0.0;
 
         if (configuration.phaseCompensation) {
-            auto checkStrict = [&](const float *tiNbr,
-                                   const float *tqNbr,
+            auto checkStrict = [&](const std::vector<CombTapSample> &nbr,
                                    const double Rm[2][2],
                                    double signNbr) -> double {
-                if (!ti0 || !tq0 || !tiNbr || !tqNbr)
+                if (!haveCenterIQ)
                     return 1.0;
 
                 auto coherenceAt = [&](int x) -> double {
+                    x = std::clamp(x, 0, width - 1);
+                    if (!tapLine.tap0[x].haveIQ || !nbr[x].haveIQ)
+                        return 1.0;
                     double In = 0.0;
                     double Qn = 0.0;
-                    applyMat(tiNbr[x], tqNbr[x], Rm, In, Qn);
+                    applyMat(nbr[x].ti, nbr[x].tq, Rm, In, Qn);
                     In *= signNbr;
                     Qn *= signNbr;
 
-                    const double I0x = sign0 * ti0[x];
-                    const double Q0x = sign0 * tq0[x];
+                    const double I0x = sign0 * tapLine.tap0[x].ti;
+                    const double Q0x = sign0 * tapLine.tap0[x].tq;
                     const double m0 = std::hypot(I0x, Q0x);
                     const double m1 = std::hypot(In, Qn);
 
                     if (m0 * invI < 2.5 || m1 * invI < 2.5)
                         return 1.0;
 
-                    const double corr = (I0x * In + Q0x * Qn) / (m0 * m1 + 1e-12);
+                    const double rawCorr = (I0x * In + Q0x * Qn) / (m0 * m1 + 1e-12);
+                    // Accept anti-correlated neighbors only when the line-level bucketPol
+                    // election confirmed this bucket is systematically anti-phase (alien Y
+                    // at a luma edge outvoted normal chroma). Otherwise anti-correlation
+                    // signals boundary noise and should gate out — including screen edges
+                    // where bucketPol defaults to +1 due to insufficient pixel count.
+                    const double corr = (bucketPol[(left + x) & 3] < 0.0)
+                                        ? std::fabs(rawCorr) : rawCorr;
                     return std::clamp((corr - 0.55) / (0.85 - 0.55), 0.0, 1.0);
                 };
 
                 const double cMid = coherenceAt(rel);
-
                 if (width >= 9) {
                     const int relL = std::clamp(rel - 4, 0, width - 1);
                     const int relR = std::clamp(rel + 4, 0, width - 1);
-                    const double cL = coherenceAt(relL);
-                    const double cR = coherenceAt(relR);
-                    return std::min({ cL, cMid, cR });
+                    return std::min({ coherenceAt(relL), cMid, coherenceAt(relR) });
                 }
-
                 return cMid;
             };
 
-            if (haveUp) cohUp = checkStrict(tiU, tqU, RmUpUse, signU);
-            if (haveDn) cohDn = checkStrict(tiD, tqD, RmDnUse, signD);
+            if (haveUp) cohUp = checkStrict(tapLine.tapU1, RmUpUse, signU);
+            if (haveDn) cohDn = checkStrict(tapLine.tapD1, RmDnUse, signD);
+        }
+
+        // Blend coherence toward 1.0 as lcEff rises: in the raw domain alien-Y
+        // IQ is in-phase across fields, so the raw coherence is intrinsically high.
+        if (lcEff > 0.0) {
+            cohUp = cohUp * (1.0 - lcEff) + 1.0 * lcEff;
+            cohDn = cohDn * (1.0 - lcEff) + 1.0 * lcEff;
         }
 
         const double scalarDiffUpIRE = haveUp
             ? std::fabs(C - Cup) * invI
             : std::numeric_limits<double>::infinity();
-
         const double scalarDiffDnIRE = haveDn
             ? std::fabs(C - Cdn) * invI
             : std::numeric_limits<double>::infinity();
@@ -991,6 +1107,20 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
                 diffUpIRE = std::hypot(I0c - IUc, Q0c - QUc) * invI;
             if (haveDnIQ)
                 diffDnIRE = std::hypot(I0c - IDc, Q0c - QDc) * invI;
+        }
+
+        // Blend diff toward the raw composite diff as lcEff rises. In the raw
+        // domain, alien-Y has the same value on both fields (common 4fsc frame),
+        // so rawDiff ≈ 0 and easily passes the threshold.
+        if (lcEff > 0.0) {
+            const double rawDiffUpIRE = haveUp
+                ? std::fabs(rawC - rawCup) * invI
+                : std::numeric_limits<double>::infinity();
+            const double rawDiffDnIRE = haveDn
+                ? std::fabs(rawC - rawCdn) * invI
+                : std::numeric_limits<double>::infinity();
+            if (haveUp) diffUpIRE = diffUpIRE * (1.0 - lcEff) + rawDiffUpIRE * lcEff;
+            if (haveDn) diffDnIRE = diffDnIRE * (1.0 - lcEff) + rawDiffDnIRE * lcEff;
         }
 
         const bool okUp = haveUp && (cohUp >= 0.5) && (diffUpIRE < dynamicVThreshold);
@@ -1008,28 +1138,46 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         const double wDn = softWeight(haveDn, okDn, cohDn, diffDnIRE);
 
         double tc = C;
-
         const double wSum = wUp + wDn;
         if (wSum > 1e-9) {
             const double nbrMix = (wUp * Cup + wDn * Cdn) / wSum;
             tc = 0.5 * (C - nbrMix);
         }
 
+        // Ownership-guided alien-Y cancellation.
+        // When lumaClaim is high, the sign convention is wrong for these pixels
+        // (alien Y is a luma transient, not carrier-modulated, so the interfield
+        // sign flip that aligns chroma instead anti-aligns alien Y).
+        // Fall back to the raw composite comb which naturally cancels alien Y:
+        // in the common 4fsc domain, alien Y is identical on both fields, so
+        // rawC - rawCup ≈ 0 for alien Y while preserving partial chroma.
+        if (ownRow) {
+            const double lc = ownRow[rel].lumaClaim;
+            if (lc > 0.0 && (haveUp || haveDn)) {
+                double rawNbrMix;
+                if (haveUp && haveDn)
+                    rawNbrMix = 0.5 * (rawCup + rawCdn);
+                else if (haveUp)
+                    rawNbrMix = rawCup;
+                else
+                    rawNbrMix = rawCdn;
+                const double tcRaw = 0.5 * (rawC - rawNbrMix);
+                tc = tc * (1.0 - lc) + tcRaw * lc;
+            }
+        }
+
         double maxPhysDelta = 0.0;
 
-        if (configuration.phaseCompensation && ti0 && tq0) {
-            double envClamp = 0.5 * std::hypot(ti0[rel], tq0[rel]);
-
-            if (tiU && tqU)
-                envClamp = std::max(envClamp, 0.5 * std::hypot(tiU[rel], tqU[rel]));
-            if (tiD && tqD)
-                envClamp = std::max(envClamp, 0.5 * std::hypot(tiD[rel], tqD[rel]));
+        if (configuration.phaseCompensation && haveCenterIQ) {
+            double envClamp = 0.5 * tapLine.tap0[rel].iqMag;
+            if (haveUpIQ)
+                envClamp = std::max(envClamp, 0.5 * tapLine.tapU1[rel].iqMag);
+            if (haveDnIQ)
+                envClamp = std::max(envClamp, 0.5 * tapLine.tapD1[rel].iqMag);
 
             double iqDeltaClamp = 0.0;
-
             if (haveUp && std::isfinite(diffUpIRE))
                 iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
-
             if (haveDn && std::isfinite(diffDnIRE))
                 iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffDnIRE * irescale);
 
@@ -1048,6 +1196,7 @@ void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameL
         outFrameLine[rel] = outTc;
     }
 }
+
 // use buffers preprocessed by an intrafield comb to feed demod for IQ interfield comb
 void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     int line,
@@ -1500,7 +1649,8 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
 // process intrafield scalar comb as prep for interfield comb
 void Comb::FrameBuffer::computeFrameIQPrecleanLine(
     int line,
-    std::vector<std::complex<double>> &outFrameIQ)
+    std::vector<std::complex<double>> &outFrameIQ,
+    bool enableLateralRefine)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
@@ -1560,7 +1710,7 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
         scratch_dnIQ[x] = z;
     }
 
-    computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, true);
+    computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, enableLateralRefine);
 }
 // skip preprocessing and take IQ directly from buildPhaseCorrected1D for interfield comb
 void Comb::FrameBuffer::computeFrameIQLocked1DLine(

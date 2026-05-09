@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
     QCommandLineOption twoDVariantOption(
         QStringList() << QCoreApplication::translate("main", "two-d-variant"),
         QCoreApplication::translate("main",
-            "2D comb variant: line | field | fieldb | frame-preclean | frame-raw | fvf (default)"),
+            "2D comb variant: line | field | fieldb | frame-preclean | frameb | fvf (default)"),
         QCoreApplication::translate("main", "variant"),
         QCoreApplication::translate("main", "fvf"));
     parser.addOption(twoDVariantOption);
@@ -432,12 +432,13 @@ int main(int argc, char *argv[])
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldB;
     } else if (v == "frame-preclean" || v == "preclean-frame" || v == "framea") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FramePreclean;
-    } else if (v == "frame-raw" || v == "raw-frame" || v == "frameb") {
+    } else if (v == "frameb" || v == "frame-b" || v == "frame-b-preclean" ||
+               v == "frame-raw" || v == "raw-frame") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameRaw;
     } else if (v == "frame") {
         // Backward-compat: historically "frame" was ambiguous / repurposed in experiments.
         // Default it to the precleaned interfield Frame to preserve legacy expectations.
-        qWarning() << "two-d-variant=frame is deprecated; use frame-preclean or frame-raw";
+        qWarning() << "two-d-variant=frame is deprecated; use frame-preclean or frameb";
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FramePreclean;
     } else if (v == "fvf" || v == "fieldvframe") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldVsFrame;

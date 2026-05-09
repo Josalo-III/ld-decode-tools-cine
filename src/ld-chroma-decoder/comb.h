@@ -82,8 +82,8 @@ public:
             Line,           // 1D only
             Field,          // Field A (longer reach; more rules)
             FieldB,         // Field B (Simple)
-            FramePreclean,  // Frame A: interfield frame from precleaned demod
-            FrameRaw,       // Frame B: interfield frame from locked 1D demod
+            FramePreclean,  // Frame A: scalar interfield frame from locked 1D
+            FrameRaw,       // Frame B: interfield frame from Field B-precleaned IQ
             FieldVsFrame    // FVF (Default)
         };
         TwoDVariant twoDVariant = FieldVsFrame;
@@ -131,6 +131,11 @@ public:
             double FIELD_VERT_FAR_WEIGHT       = 0.45;
             double FIELD_VERT_FAR_BLEND        = 0.60;
             double FIELD_VERT_K_RANGE_SCALE    = 1.00;
+            double FIELD_CONTOUR_FAR_INFLUENCE = 0.55;
+            double FIELD_CONTOUR_SOFT_IRE      = 4.0;
+            double FIELD_CONTOUR_HARD_IRE      = 10.0;
+            double FIELD_CONTOUR_SIM_START     = 0.55;
+            double FIELD_CONTOUR_SIM_FULL      = 0.85;
         
             double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0;
             double FIELD_VERT_DISAGREE_SUPPRESS   = 1.00;
@@ -454,6 +459,80 @@ private:
             alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
         } clpbuffer[3]; // [0]=1D, [1]=2D, [2]=3D
 
+        struct CombTapSample {
+            double comp = 0.0;
+            double symMag = 0.0;
+            float ti = 0.0f;
+            float tq = 0.0f;
+            double iqMag = 0.0;
+            bool haveComp = false;
+            bool haveIQ = false;
+        };
+
+        struct CombTapPair {
+            double diffIRE = std::numeric_limits<double>::infinity();
+            double iqDiffIRE = std::numeric_limits<double>::infinity();
+            double coherence = 1.0;
+            double kScore = 0.0;
+            double weight = 1.0;
+        };
+
+        struct CombTapContour {
+            double curvMidIRE = 0.0;
+            double midOk = 1.0;
+            double upResIRE = 0.0;
+            double dnResIRE = 0.0;
+            double upSideOk = 1.0;
+            double dnSideOk = 1.0;
+            double upSim = 0.0;
+            double dnSim = 0.0;
+            double upTrust = 0.0;
+            double dnTrust = 0.0;
+            double upInfluence = 0.0;
+            double dnInfluence = 0.0;
+        };
+
+        // Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
+        // collection and reusable geometry facts only; each comb remains a
+        // distinct consumer that applies its own model to this evidence.
+        struct CombTapLine {
+            int cacheLine = -1;
+            int width = 0;
+            unsigned builtFlags = 0;
+            int ln0 = -1;
+            int lnU1 = -1;
+            int lnD1 = -1;
+            int lnU2 = -1;
+            int lnD2 = -1;
+            int lnU4 = -1;
+            int lnD4 = -1;
+            bool haveU1 = false;
+            bool haveD1 = false;
+            bool haveU2 = false;
+            bool haveD2 = false;
+            bool haveU4 = false;
+            bool haveD4 = false;
+            std::vector<CombTapSample> tap0;
+            std::vector<CombTapSample> tapU1;
+            std::vector<CombTapSample> tapD1;
+            std::vector<CombTapSample> tapU2;
+            std::vector<CombTapSample> tapD2;
+            std::vector<CombTapSample> tapU4;
+            std::vector<CombTapSample> tapD4;
+            std::vector<CombTapPair> pairU1;
+            std::vector<CombTapPair> pairD1;
+            std::vector<CombTapPair> pairU2;
+            std::vector<CombTapPair> pairD2;
+            std::vector<CombTapContour> contour;
+            std::vector<double> hLumaDeltaIRE;
+        };
+        enum CombTapBuild : unsigned {
+            TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta
+            TapBuildFieldA = 1u << 1, // center + +/-2/+/-4 scalar contour facts
+            TapBuildFrame  = 1u << 2, // center + +/-1 for scalar frame comb
+            TapBuildAll    = TapBuildFieldB | TapBuildFieldA | TapBuildFrame
+        };
+
         ComponentFrame *componentFrame = nullptr;
         std::vector<float> demodBurstCos;
         std::vector<float> demodBurstSin;
@@ -470,8 +549,8 @@ private:
         // between the line-local locked domain and the cross-line 4fsc domain.
         std::vector<float> demodTI4fsc_flat;
         std::vector<float> demodTQ4fsc_flat;
-        // 3-slot ring buffers caching the Field A comb output (chroma + gate) used
-        // as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
+        // 3-slot ring buffers caching an intrafield comb output (chroma + gate)
+        // used as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
         std::array<std::vector<double>, 3> precleanRing;
         std::array<std::vector<double>, 3> precleanGateRing;
         std::array<int, 3> precleanRingLine = { -1, -1, -1 };
@@ -524,6 +603,10 @@ private:
         std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
         std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
         std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
+        CombTapLine scratch_tapLine;
+        std::array<CombTapLine, 3> tapLineCache;
+        std::array<int, 3> tapLineCacheLine = { -1, -1, -1 };
+        unsigned combTapBuildFlags_ = TapBuildAll;
 
         inline int precleanRingSlot(int lineNumber) const
         {
@@ -579,17 +662,25 @@ private:
         bool hasVDIS(int lineNumber, int h) const;      
 
         // Hybrid 2D helpers
+        void invalidateCombTapCache();
+        const CombTapLine &ensureCombTapLine(int lineNumber);
+        void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
         void computeField2DLine(int lineNumber,
+                              double *outFieldLine,
+                              double  *outGate);
+        void computeField2DLine(const CombTapLine &tapLine,
                               double *outFieldLine,
                               double  *outGate);
 
         void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
+        void computeSimpleField2DLine(const CombTapLine &tapLine, double *outFieldLine);
         
         void computeFrameScalarLine(int lineNumber, double *outFrameLine);
-
+        void computeFrameScalarLine(const CombTapLine &tapLine, double *outFrameLine);
 
         void computeFrameIQPrecleanLine(int line,
-                                        std::vector<std::complex<double>> &outFrameIQ);
+                                        std::vector<std::complex<double>> &outFrameIQ,
+                                        bool enableLateralRefine = true);
         void computeFrameIQLocked1DLine(int line,
                                         std::vector<std::complex<double>> &outFrameIQ,
                                         const std::vector<float> *tiOverride = nullptr,
@@ -621,8 +712,10 @@ private:
         // phase-corrected 1D as fallback reference only.
         void scoreFieldVsFrame(
             int line,
+            const CombTapLine &tapLine,
             const double *fieldA,
             const double *fieldB,
+            const double *fieldAGate,
             const std::vector<double> &framePreclean,
             const std::vector<double> *frameRaw,
             double *outMixed,
