@@ -915,9 +915,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     // Scratch for iceberg luma smooth; reused each line.
     std::vector<double> lumaSmooth(width, 0.0);
 
+    if ((int)locked1DSource.size() < last) locked1DSource.resize(last);
     for (int line = first; line < last; ++line) {
         const double *src = clpbuffer[0].pixel[line];
-        double       *dst = clpbuffer[1].pixel[line];
+        auto &ldsRow = locked1DSource[line];
+        if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
 
         // lumaSmooth is filled below, after sampleSrc is defined.
 
@@ -1191,7 +1193,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             tq4Row[xi] = (float)tq4;
 
             // Remodulate the common 4fsc export back to scalar composite.
-            dst[h] = remod4fscToComposite(ti4, tq4, h);
+            ldsRow[xi] = remod4fscToComposite(ti4, tq4, h);
         }
 
         // After remodulating onto the integer 4fsc grid, apply a bucket-preserving
@@ -1210,11 +1212,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             for (int xi = 0; xi < width; ++xi) {
                 const int xm4 = reflectXi(xi - 4);
                 const int xp4 = reflectXi(xi + 4);
-                const double raw = dst[left + xi];
-                const double est = 0.5 * (dst[left + xm4] + dst[left + xp4]);
+                const double raw = ldsRow[xi];
+                const double est = 0.5 * (ldsRow[xm4] + ldsRow[xp4]);
                 scratch_filter_temp[xi] = raw + (est - raw) * FIELD_BUCKET_SMOOTH_STRENGTH;
             }
-            for (int xi = 0; xi < width; ++xi) dst[left + xi] = scratch_filter_temp[xi];
+            for (int xi = 0; xi < width; ++xi) ldsRow[xi] = scratch_filter_temp[xi];
         }
     }
 }
@@ -2738,16 +2740,7 @@ void Comb::FrameBuffer::split2D()
     if (width <= 0 || firstLine >= lastLine) return;
 
     if (configuration.phaseCompensation) {
-        buildPhaseCorrected1D();
-        // Preserve the per-line locked 1D source before clpbuffer[1] is overwritten
-        // in-place with the 2D output as we iterate down the frame.
-        if ((int)locked1DSource.size() < lastLine) locked1DSource.resize(lastLine);
-        for (int line = firstLine; line < lastLine; ++line) {
-            auto &row = locked1DSource[line];
-            if ((int)row.size() < width) row.assign(width, 0.0);
-            const double *src = clpbuffer[1].pixel[line];
-            for (int rel = 0; rel < width; ++rel) row[rel] = src[left + rel];
-        }
+        buildPhaseCorrected1D(); // writes locked-1D directly into locked1DSource
         reportPhaseLegStats("locked1d", 1, true);
     }
 
@@ -2771,7 +2764,7 @@ void Comb::FrameBuffer::split2D()
     }
 
     // The preclean ring is populated on demand below with Field B output, then
-    // used as the first stage for the Frame B IQ interfield comb.
+    // reused by Frame A as a second-stage scalar cancellation source.
     precleanRingLine = { -1, -1, -1 };
     invalidateCombTapCache();
 
@@ -2815,6 +2808,7 @@ void Comb::FrameBuffer::split2D()
     }
 
     std::vector<std::complex<double>> frameIQ;
+    std::vector<std::complex<double>> frameIQPreclean;
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
@@ -2872,7 +2866,19 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameIQCompute) {
-            computeFrameIQPrecleanLine(line, frameIQ, false);
+            computeFrameIQPrecleanLine(line, frameIQPreclean, false);
+            scratch_fieldBCenter.assign(width, 0.0);
+            for (int rel = 0; rel < width; ++rel) {
+                const int h = left + rel;
+                if (rel < (int)frameIQPreclean.size()) {
+                    const auto &Z = frameIQPreclean[rel];
+                    scratch_fieldBCenter[rel] = remod4fscToComposite(Z.real(), Z.imag(), h);
+                } else {
+                    scratch_fieldBCenter[rel] = 0.0;
+                }
+            }
+
+            computeFrameIQLocked1DLine(line, frameIQ);
             scratch_frameBCenter.assign(width, 0.0);
             for (int rel = 0; rel < width; ++rel) {
                 const int h = left + rel;
@@ -2883,10 +2889,6 @@ void Comb::FrameBuffer::split2D()
                     scratch_frameBCenter[rel] = 0.0;
                 }
             }
-
-            scratch_fieldBCenter.assign(width, 0.0);
-            if (combTapBuildFlags_ & TapBuildFrame)
-                computeFrameScalarLine(tapLine, scratch_fieldBCenter.data());
         }
 
         collectCombOwnershipEvidence(

@@ -705,27 +705,35 @@ void Comb::FrameBuffer::computeSimpleField2DLine(const CombTapLine &tapLine, dou
         const double Cup = tapLine.tapU2[rel].comp;
         const double Cdn = tapLine.tapD2[rel].comp;
 
-        const double dynamicVThreshold = (tapLine.hLumaDeltaIRE[rel] > 12.0) ? 6.0 : 10.0;
+        // Soft weights from pre-computed kRange magnitude agreement (same formula
+        // as Luma Wow). In locked mode the tap .comp values already come from
+        // locked1DSource (phase-aligned), so the weight already encodes phase
+        // quality. A separate coherence multiplier is redundant and creates sharp
+        // drops at color-region edges that feed splitIQ checkerboards.
+        double wUp = tapLine.pairU2[rel].weight;
+        double wDn = tapLine.pairD2[rel].weight;
 
-        const double cohUp = configuration.phaseCompensation ? tapLine.pairU2[rel].coherence : 1.0;
-        const double cohDn = configuration.phaseCompensation ? tapLine.pairD2[rel].coherence : 1.0;
-        const double diffUpIRE = configuration.phaseCompensation
-            ? tapLine.pairU2[rel].iqDiffIRE
-            : tapLine.pairU2[rel].diffIRE;
-        const double diffDnIRE = configuration.phaseCompensation
-            ? tapLine.pairD2[rel].iqDiffIRE
-            : tapLine.pairD2[rel].diffIRE;
+        double tc = 0.0;
+        if (wUp > 0.0 || wDn > 0.0) {
+            if (wDn > 3.0 * wUp)      wUp = 0.0;
+            else if (wUp > 3.0 * wDn) wDn = 0.0;
 
-        double tc = C;
-        const bool okUp = (cohUp >= 0.5 && diffUpIRE < dynamicVThreshold);
-        const bool okDn = (cohDn >= 0.5 && diffDnIRE < dynamicVThreshold);
-
-        if (okUp && okDn) {
-            tc = (2.0 * C - Cup - Cdn) * 0.25;
-        } else if (okUp && (diffUpIRE < diffDnIRE || !okDn)) {
-            tc = (C - Cup) * 0.5;
-        } else if (okDn) {
-            tc = (C - Cdn) * 0.5;
+            const double denom = wUp + wDn;
+            if (denom > 1e-9) {
+                double sc = 2.0 / denom;
+                if (sc < 1.0) sc = 1.0;
+                tc  = (C - Cup) * wUp * sc;
+                tc += (C - Cdn) * wDn * sc;
+                tc *= 0.25;
+            }
+        } else {
+            // Both neighbors dissimilar to center. If they agree with each other,
+            // their differences point the same direction — use their average.
+            const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
+            const double sumUD = std::fabs(Cup + Cdn);
+            if (dMag - std::fabs(sumUD * 0.2) <= 0.0)
+                tc = (2.0 * C - Cup - Cdn) * 0.25;
+            // else tc = 0.0 — luma pass-through fallback
         }
 
         double maxPhysDelta = 0.0;
@@ -736,6 +744,8 @@ void Comb::FrameBuffer::computeSimpleField2DLine(const CombTapLine &tapLine, dou
             envClamp = std::max(envClamp, 0.5 * tapLine.tapU2[rel].iqMag);
             envClamp = std::max(envClamp, 0.5 * tapLine.tapD2[rel].iqMag);
 
+            const double diffUpIRE = tapLine.pairU2[rel].iqDiffIRE;
+            const double diffDnIRE = tapLine.pairD2[rel].iqDiffIRE;
             double iqDeltaClamp = 0.0;
             if (std::isfinite(diffUpIRE))
                 iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
@@ -745,9 +755,8 @@ void Comb::FrameBuffer::computeSimpleField2DLine(const CombTapLine &tapLine, dou
             const double envFloor = 0.35 * envClamp;
             maxPhysDelta = std::min(envClamp, std::max(envFloor, iqDeltaClamp));
         }
-        if (maxPhysDelta <= 0.0) {
+        if (maxPhysDelta <= 0.0)
             maxPhysDelta = std::max(std::fabs(C - Cup), std::fabs(C - Cdn)) * 0.65;
-        }
         outFieldLine[rel] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
     }
 }
@@ -759,6 +768,8 @@ static inline double dotIQ(const std::complex<double> &a, const std::complex<dou
 // Interfield version of Field B:
 // - uses adjacent frame lines (±1), not same-field lines (±2)
 // - operates in composite space
+// - when available, uses Field B-precleaned rows as the composite source so the
+//   frame comb becomes a second-stage cancellation over Field B's cleanup
 // - writes a composite residual candidate suitable for scratch_fieldBCenter
 void Comb::FrameBuffer::computeFrameScalarLine(int lineNumber, double *outFrameLine)
 {
@@ -975,13 +986,17 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
         const double (*RmUpUse)[2] = RmUp[bucketFamily];
         const double (*RmDnUse)[2] = RmDn[bucketFamily];
 
+        const double *pre0 = precleanLinePtr(tapLine.ln0, width);
+        const double *preU = precleanLinePtr(tapLine.lnU1, width);
+        const double *preD = precleanLinePtr(tapLine.lnD1, width);
+
         // Save raw composite values before the sign convention overwrites them.
         // In the common 4fsc domain, alien Y maps identically on both fields
         // (it's a luma transient, not carrier-modulated), so the raw comb
         // rawC - rawCup cancels alien Y while the signed comb amplifies it.
-        const double rawC   = tapLine.tap0[rel].comp;
-        const double rawCup = haveUp ? tapLine.tapU1[rel].comp : rawC;
-        const double rawCdn = haveDn ? tapLine.tapD1[rel].comp : rawC;
+        const double rawC   = pre0 ? pre0[rel] : tapLine.tap0[rel].comp;
+        const double rawCup = haveUp ? (preU ? preU[rel] : tapLine.tapU1[rel].comp) : rawC;
+        const double rawCdn = haveDn ? (preD ? preD[rel] : tapLine.tapD1[rel].comp) : rawC;
 
         double C = rawC;
         double Cup = rawCup;
@@ -1123,26 +1138,62 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
             if (haveDn) diffDnIRE = diffDnIRE * (1.0 - lcEff) + rawDiffDnIRE * lcEff;
         }
 
-        const bool okUp = haveUp && (cohUp >= 0.5) && (diffUpIRE < dynamicVThreshold);
-        const bool okDn = haveDn && (cohDn >= 0.5) && (diffDnIRE < dynamicVThreshold);
-
-        auto softWeight = [&](bool haveNbr, bool okNbr, double coh, double diffIRE) -> double {
-            if (!haveNbr || !okNbr)
+        auto softWeight = [&](bool haveNbr, double coh, double diffIRE) -> double {
+            if (!haveNbr || !std::isfinite(diffIRE))
                 return 0.0;
-            const double diffT = std::clamp(1.0 - (diffIRE / std::max(dynamicVThreshold, 1e-9)), 0.0, 1.0);
-            const double cohT  = std::clamp((coh - 0.5) / 0.5, 0.0, 1.0);
+            // Frame A should degrade gracefully under 1D-style alternation rather
+            // than dropping straight to preservation. Let coherence and diff shape
+            // the weight continuously, with a soft shoulder beyond the nominal
+            // threshold instead of a hard veto.
+            const double diffNorm = diffIRE / std::max(dynamicVThreshold, 1e-9);
+            const double diffT = std::clamp(1.15 - diffNorm, 0.0, 1.0);
+            const double cohT  = std::clamp((coh - 0.20) / 0.80, 0.0, 1.0);
             return cohT * diffT;
         };
 
-        const double wUp = softWeight(haveUp, okUp, cohUp, diffUpIRE);
-        const double wDn = softWeight(haveDn, okDn, cohDn, diffDnIRE);
+        const double wUp = softWeight(haveUp, cohUp, diffUpIRE);
+        const double wDn = softWeight(haveDn, cohDn, diffDnIRE);
 
         double tc = C;
         const double wSum = wUp + wDn;
+        const double tcAlt = (2.0 * C - Cup - Cdn) * 0.25;
         if (wSum > 1e-9) {
             const double nbrMix = (wUp * Cup + wDn * Cdn) / wSum;
             tc = 0.5 * (C - nbrMix);
         }
+
+        if (haveUp && haveDn) {
+            // Frame A exception: detect the same geometry the comb itself uses.
+            // If Up and Down agree with each other in scalar composite space, and
+            // their average strongly opposes the current line, that's the
+            // alternating frame pattern we want to cancel rather than preserve.
+            const double nbrMean = 0.5 * (Cup + Cdn);
+            const double nbrAgreeIRE = std::fabs(Cup - Cdn) * invI;
+            const double centerOppIRE = std::fabs(C - nbrMean) * invI;
+            const double agreeT = std::clamp(
+                1.0 - (nbrAgreeIRE / std::max(0.85 * dynamicVThreshold, 1e-9)),
+                0.0, 1.0);
+            const double opposeT = std::clamp(
+                (centerOppIRE - 0.45 * dynamicVThreshold) /
+                std::max(0.70 * dynamicVThreshold, 1e-9),
+                0.0, 1.0);
+            const double weakAdmissionT = std::clamp(1.0 - (wSum / 0.35), 0.0, 1.0);
+            const double altT = agreeT * opposeT * weakAdmissionT;
+            if (altT > 0.0)
+                tc = tc * (1.0 - altT) + tcAlt * altT;
+        }
+
+        if (std::fabs(tc - C) < 1e-12 && haveCenterIQ && haveUpIQ && haveDnIQ) {
+            // All three composites are rotation-corrected (translation matrix applied).
+            // Safe to apply magnitude-agreement fallback, as on-disc carrier phase
+            // disruption from telecine assembly has been corrected for all three.
+            const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
+            const double sumUD = std::fabs(Cup + Cdn);
+            if (dMag - std::fabs(sumUD * 0.2) <= 0.0)
+                tc = tcAlt;
+            // else tc = C — magnitude fallback also failed; preserve signal
+        }
+        // else tc = C — raw on-disc composites without translation; preserve signal
 
         // Ownership-guided alien-Y cancellation.
         // When lumaClaim is high, the sign convention is wrong for these pixels

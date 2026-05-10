@@ -82,8 +82,8 @@ public:
             Line,           // 1D only
             Field,          // Field A (longer reach; more rules)
             FieldB,         // Field B (Simple)
-            FramePreclean,  // Frame A: scalar interfield frame from locked 1D
-            FrameRaw,       // Frame B: interfield frame from Field B-precleaned IQ
+            FramePreclean,  // Frame A: scalar interfield frame from Field B-precleaned scalar
+            FrameRaw,       // Frame B: simple interfield frame from locked 1D IQ
             FieldVsFrame    // FVF (Default)
         };
         TwoDVariant twoDVariant = FieldVsFrame;
