@@ -169,10 +169,9 @@ public:
             // Frame comb on phase-corrected 1D
             // =========================================================================
             double FRAME_COMB_STRENGTH            = 1.125; // Frame A
-            double FRAME_B_COMB_STRENGTH          = 0.75; // Frame B
+            double FRAME_B_COMB_STRENGTH          = 0.90; // Frame B
             double FRAME_PHASE_DOT_COS            = 0.0;
             double FRAME_CHROMA_MIN_IRE           = 2.5;
-        
             double FRAME_IQ_RAW_MAX_DELTA_IRE     = 8.0;
         
             // =========================================================================

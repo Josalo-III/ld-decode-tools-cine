@@ -1611,7 +1611,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         // Use strong comb only when coherence is high AND vertical neighbors agree.
         // --------------------------------------------------------
         const double COMB_STRENGTH_HI = COMB_STRENGTH;
-        const double COMB_STRENGTH_LO = std::min(0.8, COMB_STRENGTH_HI);
+        const double COMB_STRENGTH_LO = std::min(0.5, COMB_STRENGTH_HI);
 
         // Coherence vs center (signed corr magnitude) for allowed neighbors
         double coh = 0.0;
