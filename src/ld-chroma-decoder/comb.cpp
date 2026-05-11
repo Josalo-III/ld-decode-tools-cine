@@ -2339,7 +2339,75 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
         );
     }
 }
-//diagnostic tool for comb development
+
+void Comb::FrameBuffer::buildCompositeLumaBaseLine(const quint16 *rawLine,
+                                                   int left,
+                                                   int width,
+                                                   double *baseY,
+                                                   double *hiRaw) const
+{
+    if (!rawLine || !baseY || width <= 0)
+        return;
+
+    // A four-sample group spans one 4fSC cycle. Averaging the group cancels
+    // the chroma alternation and leaves a low-resolution luma floor.
+    //
+    // This is guaranteed-but-incomplete Y:
+    //
+    //   raw = baseY + hiRaw
+    //
+    // Callers may pass hiRaw == nullptr when only the base is needed.
+    if (width >= 4) {
+        int p = 0;
+
+        for (; p + 3 < width; p += 4) {
+            const double avg =
+                0.25 * ((double)rawLine[left + p + 0] +
+                        (double)rawLine[left + p + 1] +
+                        (double)rawLine[left + p + 2] +
+                        (double)rawLine[left + p + 3]);
+
+            baseY[p + 0] = avg;
+            baseY[p + 1] = avg;
+            baseY[p + 2] = avg;
+            baseY[p + 3] = avg;
+        }
+
+        // Non-overlapping tail fill. Reuse the last complete 4-sample phase
+        // window, but only write pixels that were not already covered above.
+        if (p < width) {
+            const int tailBase = std::max(0, width - 4);
+            const double avg =
+                0.25 * ((double)rawLine[left + tailBase + 0] +
+                        (double)rawLine[left + tailBase + 1] +
+                        (double)rawLine[left + tailBase + 2] +
+                        (double)rawLine[left + tailBase + 3]);
+
+            for (int x = p; x < width; ++x) {
+                baseY[x] = avg;
+            }
+        }
+    } else {
+        // Degenerate active widths should not happen in normal NTSC 4fSC use,
+        // but keep the helper total and safe.
+        double avg = 0.0;
+        for (int x = 0; x < width; ++x) {
+            avg += (double)rawLine[left + x];
+        }
+        avg /= (double)width;
+
+        for (int x = 0; x < width; ++x) {
+            baseY[x] = avg;
+        }
+    }
+
+    if (hiRaw) {
+        for (int x = 0; x < width; ++x) {
+            hiRaw[x] = (double)rawLine[left + x] - baseY[x];
+        }
+    }
+}
+//diagnostic tool for comb development 
 void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const
 {
     if (!configuration.debugPhaseLegs || !configuration.phaseCompensation)
@@ -2719,6 +2787,7 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
 
     qInfo().noquote() << msg;
 }
+
 
 // split2D dispatcher
 void Comb::FrameBuffer::split2D()
@@ -3514,66 +3583,26 @@ void Comb::FrameBuffer::produceY()
         //
         // Each four-sample group spans one 4fSC cycle. Its average is the
         // low-resolution luma floor: guaranteed Y, but incomplete. All later
-        // chroma/residual decisions operate on the high-frequency remainder
-        // above this base.
+        // chroma/residual decisions in produceY operate on the high-frequency
+        // remainder above this base.
         //
         //   raw = baseY + hiRaw
         //   Y   = baseY + hiRaw - alpha * cHat
         //
-        // In fully accepted regions this is algebraically equivalent to the old
-        // raw - alpha*cHat path, but the local fit is now targeted at hiRaw
-        // instead of full raw composite.
+        // This is a late-stage produceY decomposition. It does not feed earlier
+        // comb/election/ownership stages unless a separate earlier callsite is added.
         // --------------------------------------------------------------------
         if ((int)scratch_frameBCenter.size() < width) scratch_frameBCenter.resize(width, 0.0);
         if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
-
+        if ((int)scratch_comp_res.size() < width) scratch_comp_res.resize(width, 0.0);
+        
         double *baseY = scratch_frameBCenter.data();
         double *hiRaw = scratch_fieldBCenter.data();
-
-        if (width >= 4) {
-            for (int p = 0; p + 3 < width; p += 4) {
-                const double avg =
-                    0.25 * ((double)rawLine[left + p + 0] +
-                            (double)rawLine[left + p + 1] +
-                            (double)rawLine[left + p + 2] +
-                            (double)rawLine[left + p + 3]);
-
-                baseY[p + 0] = avg;
-                baseY[p + 1] = avg;
-                baseY[p + 2] = avg;
-                baseY[p + 3] = avg;
-            }
-
-            const int tailStart = (width / 4) * 4;
-            if (tailStart < width) {
-                const int p = std::max(0, width - 4);
-                const double avg =
-                    0.25 * ((double)rawLine[left + p + 0] +
-                            (double)rawLine[left + p + 1] +
-                            (double)rawLine[left + p + 2] +
-                            (double)rawLine[left + p + 3]);
-
-                for (int x = tailStart; x < width; ++x) {
-                    baseY[x] = avg;
-                }
-            }
-        } else {
-            double avg = 0.0;
-            for (int x = 0; x < width; ++x) {
-                avg += (double)rawLine[left + x];
-            }
-            avg /= (double)std::max(1, width);
-
-            for (int x = 0; x < width; ++x) {
-                baseY[x] = avg;
-            }
-        }
-
-        for (int x = 0; x < width; ++x) {
-            hiRaw[x] = (double)rawLine[left + x] - baseY[x];
-            scratch_comp_res[x] = hiRaw[x];
-        }
-
+        
+        buildCompositeLumaBaseLine(rawLine, left, width, baseY, hiRaw);
+        
+        std::copy(hiRaw, hiRaw + width, scratch_comp_res.begin());
+        
         // Per-pixel outputs for the second-pass election:
         // - cHat: remodulated chroma estimate to subtract from hiRaw
         // - tiAdj/tqAdj: adjusted selected chroma vectors in common 4fSC space

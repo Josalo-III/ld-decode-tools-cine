@@ -538,6 +538,12 @@ private:
             TapBuildAll    = TapBuildFieldB | TapBuildFieldA | TapBuildFrame
         };
 
+		void buildCompositeLumaBaseLine(const quint16 *rawLine,
+										int left,
+										int width,
+										double *baseY,
+										double *hiRaw) const;
+
         ComponentFrame *componentFrame = nullptr;
         std::vector<float> demodBurstCos;
         std::vector<float> demodBurstSin;
