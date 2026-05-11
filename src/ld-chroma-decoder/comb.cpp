@@ -3455,71 +3455,151 @@ void Comb::FrameBuffer::produceY()
     const bool enableResidualY = T.VET_ENABLE_RESIDUAL_Y;
     const double invI = this->invIreScale;
 
-    // Window size (must be multiple of 4)
+    // Window size (must be multiple of 4).
     const int WIN  = std::max(4, (T.VET_ALIGN_WIN_SAMPLES / 4) * 4);
     const int HALF = WIN / 2;
 
-    // Fit gating (these are deliberately conservative; tune if needed)
-    const double MIN_FIT_IRE = 2.0;   // ignore near-zero chroma (ill-conditioned STT)
-    const double MAX_FIT_IRE = 35.0;  // roll off very large vectors (often non-linear/clipped)
-    const double SAT_TROUBLE_IRE = 18.0; // where we clamp transform to rotation-only more aggressively
+    // Fit gating. These remain deliberately conservative; the local affine is
+    // useful, but failed vets must not steer the chroma estimate used for Y.
+    const double MIN_FIT_IRE      = 2.0;
+    const double MAX_FIT_IRE      = 35.0;
+    const double SAT_TROUBLE_IRE  = 18.0;
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
-        const quint16* rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
+        const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
         const double bcos = demodBurstCos[line];
         const double bsin = demodBurstSin[line];
-        double* Y = componentFrame->y(line);
+
+        double *Y = componentFrame->y(line);
+
         const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
         const double *clpLine = clpbuffer[srcBuf].pixel[line];
 
-        // Baseline when residual disabled
+        // Baseline when residual Y is disabled: preserve old behavior.
         if (!enableResidualY) {
-            for (int h = left; h < right; ++h) Y[h] = (double)rawLine[h] - clpLine[h];
-            if (configuration.showMap) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
+            for (int h = left; h < right; ++h) {
+                Y[h] = (double)rawLine[h] - clpLine[h];
+            }
+
+            if (configuration.showMap) {
+                std::fill(w2d_frame_weight[line].begin(),
+                          w2d_frame_weight[line].end(), 0.0f);
+            }
             continue;
         }
 
-        // Pre-FIR demod arrays
-        const float* tiRow  = demodTI_line(line);
-        const float* tqRow  = demodTQ_line(line);
-        const float* triRow = demodTRI_line(line);
-        const float* trqRow = demodTRQ_line(line);
-        float* tiRowW = demodTI_line(line);
-        float* tqRowW = demodTQ_line(line);
+        const float *tiRow = demodTI_line(line);
+        const float *tqRow = demodTQ_line(line);
+        float *tiRowW = demodTI_line(line);
+        float *tqRowW = demodTQ_line(line);
 
-        // If any required demod rows are missing, fall back to non-residual
-        if (!tiRow || !tqRow || !triRow || !trqRow) {
-            for (int h = left; h < right; ++h) Y[h] = (double)rawLine[h] - clpLine[h];
-            if (configuration.showMap) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
+        // If selected chroma demod rows are unavailable, fall back to the direct
+        // selected-comb subtraction path.
+        if (!tiRow || !tqRow || !tiRowW || !tqRowW) {
+            for (int h = left; h < right; ++h) {
+                Y[h] = (double)rawLine[h] - clpLine[h];
+            }
+
+            if (configuration.showMap) {
+                std::fill(w2d_frame_weight[line].begin(),
+                          w2d_frame_weight[line].end(), 0.0f);
+            }
             continue;
         }
 
-        // Residual for diagnostics/vet
-        for (int xi = 0; xi < width; ++xi) {
-            const int h = left + xi;
-            scratch_comp_res[xi] = ((double)rawLine[h] - clpLine[h]);
+        // --------------------------------------------------------------------
+        // Guaranteed low-resolution Y base.
+        //
+        // Each four-sample group spans one 4fSC cycle. Its average is the
+        // low-resolution luma floor: guaranteed Y, but incomplete. All later
+        // chroma/residual decisions operate on the high-frequency remainder
+        // above this base.
+        //
+        //   raw = baseY + hiRaw
+        //   Y   = baseY + hiRaw - alpha * cHat
+        //
+        // In fully accepted regions this is algebraically equivalent to the old
+        // raw - alpha*cHat path, but the local fit is now targeted at hiRaw
+        // instead of full raw composite.
+        // --------------------------------------------------------------------
+        if ((int)scratch_frameBCenter.size() < width) scratch_frameBCenter.resize(width, 0.0);
+        if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
+
+        double *baseY = scratch_frameBCenter.data();
+        double *hiRaw = scratch_fieldBCenter.data();
+
+        if (width >= 4) {
+            for (int p = 0; p + 3 < width; p += 4) {
+                const double avg =
+                    0.25 * ((double)rawLine[left + p + 0] +
+                            (double)rawLine[left + p + 1] +
+                            (double)rawLine[left + p + 2] +
+                            (double)rawLine[left + p + 3]);
+
+                baseY[p + 0] = avg;
+                baseY[p + 1] = avg;
+                baseY[p + 2] = avg;
+                baseY[p + 3] = avg;
+            }
+
+            const int tailStart = (width / 4) * 4;
+            if (tailStart < width) {
+                const int p = std::max(0, width - 4);
+                const double avg =
+                    0.25 * ((double)rawLine[left + p + 0] +
+                            (double)rawLine[left + p + 1] +
+                            (double)rawLine[left + p + 2] +
+                            (double)rawLine[left + p + 3]);
+
+                for (int x = tailStart; x < width; ++x) {
+                    baseY[x] = avg;
+                }
+            }
+        } else {
+            double avg = 0.0;
+            for (int x = 0; x < width; ++x) {
+                avg += (double)rawLine[left + x];
+            }
+            avg /= (double)std::max(1, width);
+
+            for (int x = 0; x < width; ++x) {
+                baseY[x] = avg;
+            }
+        }
+
+        for (int x = 0; x < width; ++x) {
+            hiRaw[x] = (double)rawLine[left + x] - baseY[x];
+            scratch_comp_res[x] = hiRaw[x];
         }
 
         // Per-pixel outputs for the second-pass election:
-        // - cHat: remodulated chroma estimate to subtract
-        // - tiAdj/tqAdj: adjusted demod vectors (only written back if chosen)
-        // - vetConf: vet confidence (0..1)
+        // - cHat: remodulated chroma estimate to subtract from hiRaw
+        // - tiAdj/tqAdj: adjusted selected chroma vectors in common 4fSC space
+        // - vetConf: local fit confidence
         if ((int)scratch_fieldGate.size() < width) scratch_fieldGate.resize(width, 1.0);
+        if ((int)scratch_fieldLine.size() < width) scratch_fieldLine.resize(width, 0.0);
+        if ((int)scratch_fieldBLine.size() < width) scratch_fieldBLine.resize(width, 0.0);
         if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
+
         double *cHat    = scratch_fieldGate.data();
         double *tiAdjLn = scratch_fieldLine.data();
         double *tqAdjLn = scratch_fieldBLine.data();
         double *vetConf = scratch_lateralLine.data();
 
-        // ------------------------------------------------------------
+        // --------------------------------------------------------------------
         // Precompute per-sample window contributions once per line.
-        // Reuse existing scratch buffers (width-sized) to avoid new allocations.
-        // ------------------------------------------------------------
-        // Ensure scratch buffers are large enough for width-sized repurposing.
+        // --------------------------------------------------------------------
+        if ((int)scratch_yhp.size() < width) scratch_yhp.resize(width, 0.0);
+        if ((int)scratch_yI.size() < width) scratch_yI.resize(width, 0.0);
+        if ((int)scratch_yQ.size() < width) scratch_yQ.resize(width, 0.0);
+        if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
+        if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
         if ((int)scratch_preI_ext.size() < width) scratch_preI_ext.resize(width, 0.0);
         if ((int)scratch_preQ_ext.size() < width) scratch_preQ_ext.resize(width, 0.0);
+        if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
+
         double *cSTT00 = scratch_yhp.data();
         double *cSTT01 = scratch_yI.data();
         double *cSTT11 = scratch_yQ.data();
@@ -3528,30 +3608,38 @@ void Comb::FrameBuffer::produceY()
         double *cSRT10 = scratch_preI_ext.data();
         double *cSRT11 = scratch_preQ_ext.data();
         double *cN     = scratch_filter_temp.data();
-        if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
 
-        for (int xi = 0; xi < width; ++xi) {
-            const double tiLocked = (double)tiRow[xi];
-            const double tqLocked = (double)tqRow[xi];
-            const double riLocked = (double)triRow[xi];
-            const double rqLocked = (double)trqRow[xi];
+        for (int x = 0; x < width; ++x) {
+            const int h = left + x;
 
-            // Receive upstream's locked-basis demod here, then rotate once into
-            // the common 4fsc frame for the local residual-Y solve.
-            double ti = 0.0, tq = 0.0, ri = 0.0, rq = 0.0;
+            const double tiLocked = (double)tiRow[x];
+            const double tqLocked = (double)tqRow[x];
+
+            // Selected chroma estimate: locked basis -> common 4fSC basis.
+            double ti = 0.0;
+            double tq = 0.0;
             lockedTo4fsc(tiLocked, tqLocked, bcos, bsin, ti, tq);
-            lockedTo4fsc(riLocked, rqLocked, bcos, bsin, ri, rq);
 
-            tiAdjLn[xi] = ti;
-            tqAdjLn[xi] = tq;
+            // Residual target: high-frequency composite above the 4-pixel Y base.
+            double ri = 0.0;
+            double rq = 0.0;
+            demod4fscFromComposite(hiRaw[x], h, ri, rq);
+
+            tiAdjLn[x] = ti;
+            tqAdjLn[x] = tq;
 
             const double magT_ire = std::hypot(ti, tq) * invI;
             const double magR_ire = std::hypot(ri, rq) * invI;
 
             if (magT_ire < MIN_FIT_IRE || magR_ire < MIN_FIT_IRE) {
-                cSTT00[xi] = cSTT01[xi] = cSTT11[xi] = 0.0;
-                cSRT00[xi] = cSRT01[xi] = cSRT10[xi] = cSRT11[xi] = 0.0;
-                cN[xi] = 0.0;
+                cSTT00[x] = 0.0;
+                cSTT01[x] = 0.0;
+                cSTT11[x] = 0.0;
+                cSRT00[x] = 0.0;
+                cSRT01[x] = 0.0;
+                cSRT10[x] = 0.0;
+                cSRT11[x] = 0.0;
+                cN[x] = 0.0;
                 continue;
             }
 
@@ -3561,79 +3649,138 @@ void Comb::FrameBuffer::produceY()
                 w = 1.0 / (1.0 + 4.0 * t * t);
             }
 
-            cSTT00[xi] = w * ti * ti;
-            cSTT01[xi] = w * ti * tq;
-            cSTT11[xi] = w * tq * tq;
-            cSRT00[xi] = w * ri * ti;
-            cSRT01[xi] = w * ri * tq;
-            cSRT10[xi] = w * rq * ti;
-            cSRT11[xi] = w * rq * tq;
-            cN[xi] = 1.0;
+            cSTT00[x] = w * ti * ti;
+            cSTT01[x] = w * ti * tq;
+            cSTT11[x] = w * tq * tq;
+
+            cSRT00[x] = w * ri * ti;
+            cSRT01[x] = w * ri * tq;
+            cSRT10[x] = w * rq * ti;
+            cSRT11[x] = w * rq * tq;
+
+            cN[x] = 1.0;
         }
 
-        // Sliding window sums (window shifts to stay in-bounds, not shrink).
+        // Sliding window sums. The window shifts to stay in-bounds, not shrink.
         const int winN = (width <= WIN) ? width : WIN;
         int a = 0;
         int b = winN - 1;
-        double sSTT00 = 0.0, sSTT01 = 0.0, sSTT11 = 0.0;
-        double sSRT00 = 0.0, sSRT01 = 0.0, sSRT10 = 0.0, sSRT11 = 0.0;
+
+        double sSTT00 = 0.0;
+        double sSTT01 = 0.0;
+        double sSTT11 = 0.0;
+        double sSRT00 = 0.0;
+        double sSRT01 = 0.0;
+        double sSRT10 = 0.0;
+        double sSRT11 = 0.0;
         double sN = 0.0;
-        for (int xi = a; xi <= b; ++xi) {
-            sSTT00 += cSTT00[xi]; sSTT01 += cSTT01[xi]; sSTT11 += cSTT11[xi];
-            sSRT00 += cSRT00[xi]; sSRT01 += cSRT01[xi]; sSRT10 += cSRT10[xi]; sSRT11 += cSRT11[xi];
-            sN += cN[xi];
+
+        for (int x = a; x <= b; ++x) {
+            sSTT00 += cSTT00[x];
+            sSTT01 += cSTT01[x];
+            sSTT11 += cSTT11[x];
+
+            sSRT00 += cSRT00[x];
+            sSRT01 += cSRT01[x];
+            sSRT10 += cSRT10[x];
+            sSRT11 += cSRT11[x];
+
+            sN += cN[x];
         }
 
-        // Process pixels
+        // --------------------------------------------------------------------
+        // First pass: local affine/vet and remodulated cHat.
+        // --------------------------------------------------------------------
         for (int x = 0; x < width; ++x) {
             const int h = left + x;
 
             if (width > WIN) {
                 int aWant = x - HALF;
                 int bWant = x + HALF - 1;
-                if (aWant < 0) { bWant += -aWant; aWant = 0; }
+
+                if (aWant < 0) {
+                    bWant += -aWant;
+                    aWant = 0;
+                }
+
                 if (bWant >= width) {
-                    int over = bWant - (width - 1);
+                    const int over = bWant - (width - 1);
                     bWant -= over;
                     aWant -= over;
                     if (aWant < 0) aWant = 0;
                 }
+
                 while (a < aWant) {
-                    sSTT00 -= cSTT00[a]; sSTT01 -= cSTT01[a]; sSTT11 -= cSTT11[a];
-                    sSRT00 -= cSRT00[a]; sSRT01 -= cSRT01[a]; sSRT10 -= cSRT10[a]; sSRT11 -= cSRT11[a];
+                    sSTT00 -= cSTT00[a];
+                    sSTT01 -= cSTT01[a];
+                    sSTT11 -= cSTT11[a];
+
+                    sSRT00 -= cSRT00[a];
+                    sSRT01 -= cSRT01[a];
+                    sSRT10 -= cSRT10[a];
+                    sSRT11 -= cSRT11[a];
+
                     sN -= cN[a];
                     ++a;
                 }
+
                 while (a > aWant) {
                     --a;
-                    sSTT00 += cSTT00[a]; sSTT01 += cSTT01[a]; sSTT11 += cSTT11[a];
-                    sSRT00 += cSRT00[a]; sSRT01 += cSRT01[a]; sSRT10 += cSRT10[a]; sSRT11 += cSRT11[a];
+
+                    sSTT00 += cSTT00[a];
+                    sSTT01 += cSTT01[a];
+                    sSTT11 += cSTT11[a];
+
+                    sSRT00 += cSRT00[a];
+                    sSRT01 += cSRT01[a];
+                    sSRT10 += cSRT10[a];
+                    sSRT11 += cSRT11[a];
+
                     sN += cN[a];
                 }
+
                 while (b < bWant) {
                     ++b;
-                    sSTT00 += cSTT00[b]; sSTT01 += cSTT01[b]; sSTT11 += cSTT11[b];
-                    sSRT00 += cSRT00[b]; sSRT01 += cSRT01[b]; sSRT10 += cSRT10[b]; sSRT11 += cSRT11[b];
+
+                    sSTT00 += cSTT00[b];
+                    sSTT01 += cSTT01[b];
+                    sSTT11 += cSTT11[b];
+
+                    sSRT00 += cSRT00[b];
+                    sSRT01 += cSRT01[b];
+                    sSRT10 += cSRT10[b];
+                    sSRT11 += cSRT11[b];
+
                     sN += cN[b];
                 }
+
                 while (b > bWant) {
-                    sSTT00 -= cSTT00[b]; sSTT01 -= cSTT01[b]; sSTT11 -= cSTT11[b];
-                    sSRT00 -= cSRT00[b]; sSRT01 -= cSRT01[b]; sSRT10 -= cSRT10[b]; sSRT11 -= cSRT11[b];
+                    sSTT00 -= cSTT00[b];
+                    sSTT01 -= cSTT01[b];
+                    sSTT11 -= cSTT11[b];
+
+                    sSRT00 -= cSRT00[b];
+                    sSRT01 -= cSRT01[b];
+                    sSRT10 -= cSRT10[b];
+                    sSRT11 -= cSRT11[b];
+
                     sN -= cN[b];
                     --b;
                 }
             }
 
-            double STT[2][2] = {{sSTT00, sSTT01}, {sSTT01, sSTT11}};
-            double SRT[2][2] = {{sSRT00, sSRT01}, {sSRT10, sSRT11}};
+            double STT[2][2] = {
+                {sSTT00, sSTT01},
+                {sSTT01, sSTT11}
+            };
+
+            double SRT[2][2] = {
+                {sSRT00, sSRT01},
+                {sSRT10, sSRT11}
+            };
+
             const int n = (int)(sN + 0.5);
 
-            // ------------------------------------------------------------
-            // Vet: local LS alignment (phase + correlation + shear)
-            //
-            // IMPORTANT: Don't re-scan the WIN window here per pixel to rebuild
-            // STT/SRT; we already have STT/SRT from the sliding sums above.
-            // ------------------------------------------------------------
             Vet1DResult vet;
             vet.accept = true;
             vet.confidence = 1.0;
@@ -3642,9 +3789,9 @@ void Comb::FrameBuffer::produceY()
             double STTinv[2][2];
             const bool invOk = mat2_inv(STT, STTinv);
 
-            // Vet metrics are computed from A_vet = SRT * inv(STT) when possible.
-            double RmVet[2][2] = {{1,0},{0,1}};
-            double UVet[2][2]  = {{1,0},{0,1}};
+            double RmVet[2][2] = {{1, 0}, {0, 1}};
+            double UVet[2][2]  = {{1, 0}, {0, 1}};
+
             if (!invOk || n < 8) {
                 vet.accept = false;
                 vet.confidence = 0.0;
@@ -3653,195 +3800,216 @@ void Comb::FrameBuffer::produceY()
                 mat2_mul(SRT, STTinv, Avet);
                 polar_decompose_2x2(Avet, RmVet, UVet);
 
-                const double phase = std::atan2(RmVet[1][0], RmVet[0][0]); // radians
-                double l1, l2, V_[2][2];
+                const double phase = std::atan2(RmVet[1][0], RmVet[0][0]);
+
+                double l1 = 1.0;
+                double l2 = 1.0;
+                double V_[2][2];
                 eig2_sym(UVet, l1, l2, V_);
-                const double s1 = std::max(0.0, l1), s2 = std::max(0.0, l2);
+
+                const double s1 = std::max(0.0, l1);
+                const double s2 = std::max(0.0, l2);
                 const double g  = 0.5 * (s1 + s2);
                 const double shear = (g > 1e-12) ? std::fabs(s1 - s2) / g : 0.0;
 
-                const double srt00 = SRT[0][0], srt01 = SRT[0][1], srt10 = SRT[1][0], srt11 = SRT[1][1];
-                const double numRho = std::sqrt(srt00*srt00 + srt01*srt01 + srt10*srt10 + srt11*srt11);
+                const double srt00 = SRT[0][0];
+                const double srt01 = SRT[0][1];
+                const double srt10 = SRT[1][0];
+                const double srt11 = SRT[1][1];
+
+                const double numRho = std::sqrt(
+                    srt00 * srt00 + srt01 * srt01 +
+                    srt10 * srt10 + srt11 * srt11);
+
                 const double denRho = std::max(1e-9, STT[0][0] + STT[1][1]);
                 const double rho = numRho / denRho;
 
                 const double pMaxVet = T.VET_ALIGN_PHASE_MAX_DEG * M_PI / 180.0;
-                if (std::fabs(phase) > pMaxVet || rho < T.VET_ALIGN_MIN_RHO || shear > T.VET_ALIGN_MAX_SHEAR) {
+
+                if (std::fabs(phase) > pMaxVet ||
+                    rho < T.VET_ALIGN_MIN_RHO ||
+                    shear > T.VET_ALIGN_MAX_SHEAR)
+                {
                     vet.accept = false;
                 }
 
-                double c_phase = 1.0 - std::min(1.0, std::fabs(phase) / (pMaxVet + 1e-12));
-                double c_shear = 1.0 - std::min(1.0, shear / (T.VET_ALIGN_MAX_SHEAR + 1e-12));
-                double c = 0.5 * std::max(0.0, std::min(1.0, rho)) + 0.25 * c_phase + 0.25 * c_shear;
-                if (c < 0.0) c = 0.0; else if (c > 1.0) c = 1.0;
-                vet.confidence = c;
+                const double c_phase =
+                    1.0 - std::min(1.0, std::fabs(phase) / (pMaxVet + 1e-12));
+                const double c_shear =
+                    1.0 - std::min(1.0, shear / (T.VET_ALIGN_MAX_SHEAR + 1e-12));
+
+                double c =
+                    0.5  * std::max(0.0, std::min(1.0, rho)) +
+                    0.25 * c_phase +
+                    0.25 * c_shear;
+
+                c = std::clamp(c, 0.0, 1.0);
+                vet.confidence = vet.accept ? c : 0.0;
             }
 
-            // ------------------------------------------------------------
-            // Solve local affine (optional): reuse the same polar decomposition
-            // computed for the vet when we actually apply the affine.
-            // ------------------------------------------------------------
-            double Rm[2][2] = {{1,0},{0,1}};
-            double U[2][2]  = {{1,0},{0,1}};
-            if (T.Y_LOCAL_AFFINE_ENABLE && n >= 16 && invOk) {
+            // Local affine is useful, but only an accepted local fit may steer it.
+            double Rm[2][2] = {{1, 0}, {0, 1}};
+            double U[2][2]  = {{1, 0}, {0, 1}};
+
+            if (T.Y_LOCAL_AFFINE_ENABLE && n >= 16 && invOk && vet.accept) {
                 Rm[0][0] = RmVet[0][0]; Rm[0][1] = RmVet[0][1];
                 Rm[1][0] = RmVet[1][0]; Rm[1][1] = RmVet[1][1];
-                U[0][0]  = UVet[0][0];  U[0][1]  = UVet[0][1];
-                U[1][0]  = UVet[1][0];  U[1][1]  = UVet[1][1];
+
+                U[0][0] = UVet[0][0]; U[0][1] = UVet[0][1];
+                U[1][0] = UVet[1][0]; U[1][1] = UVet[1][1];
             }
 
-            const double pMax = T.Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0;
-
-            // Saturated trouble regions: keep transform conservative (rotation-only / no shear).
             const double ti0 = tiAdjLn[x];
             const double tq0 = tqAdjLn[x];
+
             const double magX_ire = std::hypot(ti0, tq0) * invI;
             const bool satTrouble = (magX_ire > SAT_TROUBLE_IRE);
 
+            const double pMax = T.Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0;
             clamp_rotation_gain_shear(Rm, U, pMax,
                                       /*allowGain=*/!satTrouble,
-                                      T.Y_LOCAL_GAIN_MIN, T.Y_LOCAL_GAIN_MAX,
+                                      T.Y_LOCAL_GAIN_MIN,
+                                      T.Y_LOCAL_GAIN_MAX,
                                       satTrouble ? 0.0 : T.Y_LOCAL_MAX_SHEAR);
 
-            // Apply clamped transform to (ti0,tq0) for estimate only
-            // NOTE: we apply only Rm here 
-            const double ti_adj = Rm[0][0]*ti0 + Rm[0][1]*tq0;
-            const double tq_adj = Rm[1][0]*ti0 + Rm[1][1]*tq0;
+            // Keep the application rotation-only. The affine/polar solve is still
+            // valuable because it finds a better local phase relation, but letting
+            // local gain/shear reshape chroma here is more dangerous than useful.
+            const double ti_adj = Rm[0][0] * ti0 + Rm[0][1] * tq0;
+            const double tq_adj = Rm[1][0] * ti0 + Rm[1][1] * tq0;
 
-            const double cval_hat = remod4fscToComposite(ti_adj, tq_adj, h);
-
-            // Store for the second-pass decision (protect luma against chroma).
-            cHat[x] = cval_hat;
+            cHat[x] = remod4fscToComposite(ti_adj, tq_adj, h);
             tiAdjLn[x] = ti_adj;
             tqAdjLn[x] = tq_adj;
             vetConf[x] = vet.confidence;
         }
 
-        // ------------------------------------------------------------
-        // Second pass: three-candidate vet for residual Y.
-        //
-        // Each candidate represents a different subtraction strength (alpha)
-        // applied to cHat — they differ in how much chroma to remove from Y.
-        //
-        //   1. Coherent (alpha=1): trust the comb's demodulated IQ entirely.
-        //   2. Residual (alpha=alphaFit): LS fit minimising 4fSC energy in
-        //      raw - alpha*cHat; captures HF luma the comb missed.
-        //   3. Reassigned (alpha=chromaFrac): ownership evidence says some of
-        //      what the comb attributed to chroma is actually luma; return it.
-        //
-        // The effective alpha is the weighted average of the three subtraction
-        // strengths. alphaFit is computed per 4-sample group (needs the 4fSC
-        // phase structure). The ownership correction is applied per-pixel.
-        // ------------------------------------------------------------
-        const bool do3D = (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
+        // --------------------------------------------------------------------
+        // Second pass: residual-safe Y reconstruction.
+        // --------------------------------------------------------------------
+        const bool do3D =
+            (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
 
         const double MIN_ALPHA = 0.75;
         const double MAX_ALPHA = 1.25;
         const double MIN_SUB_CHROMA_IRE = 2.0;
 
-        // Ownership evidence for this line (may be absent)
-        const bool ownershipEnabled = T.VET_OWNERSHIP_ENABLE
-            && line >= 0 && line < (int)ownershipEvidence.size()
-            && (int)ownershipEvidence[line].size() >= width;
-        const OwnershipEvidence *ownRow = ownershipEnabled
-            ? ownershipEvidence[line].data() : nullptr;
+        const bool ownershipEnabled =
+            T.VET_OWNERSHIP_ENABLE &&
+            line >= 0 &&
+            line < (int)ownershipEvidence.size() &&
+            (int)ownershipEvidence[line].size() >= width;
+
+        const OwnershipEvidence *ownRow =
+            ownershipEnabled ? ownershipEvidence[line].data() : nullptr;
+
         const double ownershipWeight = T.VET_OWNERSHIP_LUMA_WEIGHT;
 
+        auto applyOwnership = [&](int x, double alphaVet) -> double {
+            if (!ownRow) return alphaVet;
+
+            const double lc = std::clamp(ownRow[x].lumaClaim, 0.0, 1.0);
+            const double cc = std::clamp(ownRow[x].chromaClaim, 0.0, 1.0);
+            const double uc = std::clamp(ownRow[x].uncertainClaim, 0.0, 1.0);
+
+            // Strong luma claim suppresses chroma subtraction, but chroma claim
+            // can earn back subtraction strength. Uncertainty damps the correction.
+            const double support =
+                lc * (1.0 - 0.5 * cc) * (1.0 - 0.5 * uc);
+
+            const double chromaFrac = std::clamp(
+                1.0 - lc + (T.VET_OWNERSHIP_CHROMA_WEIGHT * cc),
+                0.0, 1.0);
+
+            const double blend = std::clamp(ownershipWeight * support, 0.0, 1.0);
+            return alphaVet * (1.0 - blend) + chromaFrac * blend;
+        };
+
+        auto writePixel = [&](int x, double alphaEff) {
+            const int h = left + x;
+
+            const double yOut = baseY[x] + (hiRaw[x] - alphaEff * cHat[x]);
+            Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet)
+                         : yOut;
+
+            if (configuration.showMap) {
+                w2d_frame_weight[line][x] = (float)alphaEff;
+            }
+
+            double tiLocked = 0.0;
+            double tqLocked = 0.0;
+            fourfscToLocked(tiAdjLn[x], tqAdjLn[x], bcos, bsin, tiLocked, tqLocked);
+
+            tiRowW[x] = (float)(alphaEff * tiLocked);
+            tqRowW[x] = (float)(alphaEff * tqLocked);
+        };
+
         if (width < 4) {
-            // Degenerate: no 4-sample group; use full residual subtraction
-            // with per-pixel ownership correction only.
             for (int x = 0; x < width; ++x) {
-                const int h = left + x;
-                double alphaEff = 1.0;
-                
-                if (ownRow) {
-                    const double lc = ownRow[x].lumaClaim;
-                    const double chromaFrac = std::clamp(1.0 - lc, 0.0, 1.0);
-                
-                    alphaEff = 1.0 * (1.0 - ownershipWeight * lc)
-                             + chromaFrac * (ownershipWeight * lc);
-                }
-                
-                const double yOut = (double)rawLine[h] - alphaEff * cHat[x];
-                Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
-                
-                if (configuration.showMap)
-                    w2d_frame_weight[line][x] = (float)alphaEff;
-                
-                // Convert back to locked space for write-out
-                double tiLocked = 0.0, tqLocked = 0.0;
-                fourfscToLocked(tiAdjLn[x], tqAdjLn[x], bcos, bsin, tiLocked, tqLocked);
-                
-                tiRowW[x] = (float)(alphaEff * tiLocked);
-                tqRowW[x] = (float)(alphaEff * tqLocked);
-                }
+                const double alphaEff = applyOwnership(x, 1.0);
+                writePixel(x, alphaEff);
+            }
             continue;
         }
 
-        for (int gp = 0; gp < width; gp += 4) {
-            int p = gp;
-            if (p > width - 4) p = width - 4;
-
-            const double r0 = (double)rawLine[left + p + 0];
-            const double r1 = (double)rawLine[left + p + 1];
-            const double r2 = (double)rawLine[left + p + 2];
-            const double r3 = (double)rawLine[left + p + 3];
+        auto processGroup = [&](int p, int xBegin, int xEnd) {
+            const double r0 = hiRaw[p + 0];
+            const double r1 = hiRaw[p + 1];
+            const double r2 = hiRaw[p + 2];
+            const double r3 = hiRaw[p + 3];
 
             const double c0 = cHat[p + 0];
             const double c1 = cHat[p + 1];
             const double c2 = cHat[p + 2];
             const double c3 = cHat[p + 3];
 
-            // Phase-agnostic 4fSC vectors: I ~= s1-s3, Q ~= s2-s0.
+            // Phase-agnostic 4fSC group vectors: I ~= s1-s3, Q ~= s2-s0.
             const double rawI = r1 - r3;
             const double rawQ = r2 - r0;
             const double subI = c1 - c3;
             const double subQ = c2 - c0;
+
             const double subEnergy = subI * subI + subQ * subQ;
             const double subMagIRE = std::sqrt(subEnergy) * invI;
 
-            // Candidate 1 vs 2: existing vet blend (coherent ↔ residual).
-            // This produces the alpha that would be used without ownership.
             double alphaVet = 1.0;
-            if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0 && subMagIRE >= MIN_SUB_CHROMA_IRE) {
-                const double alphaFit = std::clamp((rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
-                                                   MIN_ALPHA, MAX_ALPHA);
-                const double conf = std::clamp(0.25 * (vetConf[p + 0] + vetConf[p + 1] +
-                                                       vetConf[p + 2] + vetConf[p + 3]),
-                                               0.0, 1.0);
-                const double profileWeight = T.VET_Y_CHROMA_LIKE_WEIGHT * (1.0 - conf);
+            if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0 &&
+                subMagIRE >= MIN_SUB_CHROMA_IRE)
+            {
+                const double alphaFit = std::clamp(
+                    (rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
+                    MIN_ALPHA, MAX_ALPHA);
+
+                const double conf = std::clamp(
+                    0.25 * (vetConf[p + 0] +
+                            vetConf[p + 1] +
+                            vetConf[p + 2] +
+                            vetConf[p + 3]),
+                    0.0, 1.0);
+
+                const double profileWeight =
+                    T.VET_Y_CHROMA_LIKE_WEIGHT * (1.0 - conf);
+
                 alphaVet = 1.0 + profileWeight * (alphaFit - 1.0);
             }
 
-            // Candidate 3: per-pixel ownership reassignment blended in.
-            for (int i = 0; i < 4; ++i) {
-                const int x = p + i;
-                if (x < 0 || x >= width) continue;
-                const int h = left + x;
-
-                double alphaEff = alphaVet;
-                
-                if (ownRow) {
-                    const double lc = ownRow[x].lumaClaim;
-                    const double chromaFrac = std::clamp(1.0 - lc, 0.0, 1.0);
-                    const double blend = ownershipWeight * lc;
-                
-                    alphaEff = alphaVet * (1.0 - blend) + chromaFrac * blend;
-                }
-                
-                const double yOut = (double)rawLine[h] - alphaEff * cHat[x];
-                Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet) : yOut;
-                
-                if (configuration.showMap)
-                    w2d_frame_weight[line][x] = (float)alphaEff;
-                
-                // Convert back to locked space for write-out
-                double tiLocked = 0.0, tqLocked = 0.0;
-                fourfscToLocked(tiAdjLn[x], tqAdjLn[x], bcos, bsin, tiLocked, tqLocked);
-                
-                tiRowW[x] = (float)(alphaEff * tiLocked);
-                tqRowW[x] = (float)(alphaEff * tqLocked);
+            for (int x = xBegin; x < xEnd; ++x) {
+                const double alphaEff = applyOwnership(x, alphaVet);
+                writePixel(x, alphaEff);
             }
+        };
+
+        // Full non-overlapping groups.
+        for (int p = 0; p + 3 < width; p += 4) {
+            processGroup(p, p, p + 4);
+        }
+
+        // Tail, without overwriting the previous group. It reuses the final valid
+        // 4-sample phase window but writes only the pixels not already processed.
+        const int tailStart = (width / 4) * 4;
+        if (tailStart < width) {
+            const int p = std::max(0, width - 4);
+            processGroup(p, tailStart, width);
         }
     }
 }
