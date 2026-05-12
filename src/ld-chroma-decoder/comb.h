@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "lddecodemetadata.h"
+#include "compositeownershipdefs.h"
 #include "componentframe.h"
 #include "decoder.h"
 #include "sourcefield.h"
@@ -335,504 +336,481 @@ private:
     Configuration configuration;
     LdDecodeMetaData::VideoParameters videoParameters;
 
-    class FrameBuffer {
-    public:
-        enum class DemodMode { Bucket, Locked };
+class FrameBuffer {
+public:
+	enum class DemodMode { Bucket, Locked };
 
-        // FVF model/context metrics (not candidate-specific).
-        // Stored per pixel so downstream consumers can understand why a line
-        // segment was treated as frame-model vs field-model, edge-risk, etc.
-        struct FvfModelMetrics {
-            double intakeNyquistRiskIRE = 0.0;
-            double chromaMagIRE = 0.0;
-            double verticalBoundaryIRE = 0.0;   // horizontal gradient: scanline crosses a vertical edge
-            double horizontalBoundaryIRE = 0.0; // vertical gradient: scanline runs along/grazes an edge
-            double fieldFrameDivergenceIRE = 0.0;
-            double interfieldDistinctIRE = 0.0;
-            double frameToFieldModelIRE = 0.0;  // interlace regime: |Frame - FieldA(model)|
-            double frameToBestFieldIRE = 0.0;   // progressive regime: |Frame - min(FieldA,FieldB)|
+	// FVF model/context metrics (not candidate-specific).
+	// Stored per pixel so downstream consumers can understand why a line
+	// segment was treated as frame-model vs field-model, edge-risk, etc.
+	struct FvfModelMetrics {
+		double intakeNyquistRiskIRE = 0.0;
+		double chromaMagIRE = 0.0;
+		double verticalBoundaryIRE = 0.0;   // horizontal gradient: scanline crosses a vertical edge
+		double horizontalBoundaryIRE = 0.0; // vertical gradient: scanline runs along/grazes an edge
+		double fieldFrameDivergenceIRE = 0.0;
+		double interfieldDistinctIRE = 0.0;
+		double frameToFieldModelIRE = 0.0;  // interlace regime: |Frame - FieldA(model)|
+		double frameToBestFieldIRE = 0.0;   // progressive regime: |Frame - min(FieldA,FieldB)|
 
-            double iqFineFrac = 0.0;
-            double iqMidFrac = 0.0;
-            double iqCoarseFrac = 0.0;
-            double chromaBandEnergyIRE = 0.0;
-            double lumaIncursionRiskIRE = 0.0;
-            double iqCoherence = 0.0;
-            double residualFitErrorIRE = 0.0;
+		double iqFineFrac = 0.0;
+		double iqMidFrac = 0.0;
+		double iqCoarseFrac = 0.0;
+		double chromaBandEnergyIRE = 0.0;
+		double lumaIncursionRiskIRE = 0.0;
+		double iqCoherence = 0.0;
+		double residualFitErrorIRE = 0.0;
 
-            bool frameModel = false;
-            bool managementVeto = false;
-            bool frameVertCoherent = false;
-            bool vdisSoft = false;
-            bool vdisHard = false;
-            int winner = 1;
-        };
+		bool frameModel = false;
+		bool managementVeto = false;
+		bool frameVertCoherent = false;
+		bool vdisSoft = false;
+		bool vdisHard = false;
+		int winner = 1;
+	};
 
-        // Signal ownership evidence, collected before election. This is not a
-        // scoring model; it records why bandpassed energy looks luma-owned,
-        // chroma-owned, or contested so demod/admission can later act on it.
-        struct OwnershipEvidence {
-            double bandpassFineIRE = 0.0;
-            double bandpassMidIRE = 0.0;
-            double bandpassCoarseIRE = 0.0;
-            double lumaExcursionIRE = 0.0;
-            double residualFitErrorIRE = 0.0;
-            double lumaIncursionRiskIRE = 0.0;
-            double icebergAlienYFraction = 0.0;
-            double locked1DChromaIRE = 0.0;
+	// Signal ownership evidence, collected before election. This is not a
+	// scoring model; it records why bandpassed energy looks luma-owned,
+	// chroma-owned, or contested so demod/admission can later act on it.
+	using OwnershipEvidence = lddecode::CompositeOwnershipEvidence;
 
-            double fieldAChromaIRE = 0.0;
-            double fieldBChromaIRE = 0.0;
-            double frameChromaIRE = 0.0;
-            double candidateSpreadIRE = 0.0;
-            double frameFieldAgreementIRE = 0.0;
-            double frameIQCoherence = 0.0;
-            double lumaShapeContinuation = 0.0;
-            double carrierPlausibility = 0.0;
-            double ownershipConflict = 0.0;
+	FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
+				const Configuration &configuration_);
 
-            double lumaClaim = 0.0;
-            double chromaClaim = 0.0;
-            double uncertainClaim = 1.0;
-        };
+	void loadFields(const SourceField &firstField, const SourceField &secondField);
 
-        FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
-                    const Configuration &configuration_);
+	void split1D();
+	void buildPhaseCorrected1D();
+	void rebuildLockedDemodFromSelectedComb();
+	void split2D();
+	void copy2DTo3D(); 
+	void split3D(const FrameBuffer &previousFrame,
+				 const FrameBuffer &nextFrame);
 
-        void loadFields(const SourceField &firstField, const SourceField &secondField);
+	void setComponentFrame(ComponentFrame &_componentFrame) { componentFrame = &_componentFrame; }
 
-        void split1D();
-        void buildPhaseCorrected1D();
-        void rebuildLockedDemodFromSelectedComb();
-        void split2D();
-        void copy2DTo3D(); 
-        void split3D(const FrameBuffer &previousFrame,
-                     const FrameBuffer &nextFrame);
+	void splitIQ();         // Bucket
+	// In FrameBuffer public section (near split1D / split2D declarations)
+	void phaseLocked();  // prepares locked-path LO / basis etc.
+	void splitIQlocked();   // Product (burst-locked)
 
-        void setComponentFrame(ComponentFrame &_componentFrame) { componentFrame = &_componentFrame; }
+	void filterIQ();
+	void filterIQLocked();
 
-        void splitIQ();         // Bucket
-        // In FrameBuffer public section (near split1D / split2D declarations)
-        void phaseLocked();  // prepares locked-path LO / basis etc.
-        void splitIQlocked();   // Product (burst-locked)
+	void adjustY();         // Bucket path
+	void produceY();        // Product path
+	void doCNR();
+	void doYNR();
+	void transformIQ(double chromaGain, double chromaPhase);
+	void overlayMap(const FrameBuffer &previousFrame,
+					const FrameBuffer &nextFrame);
 
-        void filterIQ();
-        void filterIQLocked();
+	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
+	const std::vector<std::vector<OwnershipEvidence>> &getOwnershipEvidence() const { return ownershipEvidence; }
 
-        void adjustY();         // Bucket path
-        void produceY();        // Product path
-        void doCNR();
-        void doYNR();
-        void transformIQ(double chromaGain, double chromaPhase);
-        void overlayMap(const FrameBuffer &previousFrame,
-                        const FrameBuffer &nextFrame);
+	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
+	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
+	const FrameBuffer *prevFrameForVet = nullptr;
+	const FrameBuffer *nextFrameForVet = nullptr;
 
-        const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
-        const std::vector<std::vector<OwnershipEvidence>> &getOwnershipEvidence() const { return ownershipEvidence; }
+	DemodMode demodMode = DemodMode::Bucket;
 
-        // Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
-        // Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
-        const FrameBuffer *prevFrameForVet = nullptr;
-        const FrameBuffer *nextFrameForVet = nullptr;
+	// Tracks if this frame is the start of a scene (edit boundary).
+	bool isSceneStart = false;
 
-        DemodMode demodMode = DemodMode::Bucket;
+private:
+	struct Candidate { double penalty; double sample; };
 
-        // Tracks if this frame is the start of a scene (edit boundary).
-        bool isSceneStart = false;
+	const LdDecodeMetaData::VideoParameters &videoParameters;
+	const Configuration &configuration;
 
-    private:
-        struct Candidate { double penalty; double sample; };
+	qint32 frameHeight = 0;
+	double irescale    = 1.0;
+	double invIreScale = 1.0;
 
-        const LdDecodeMetaData::VideoParameters &videoParameters;
-        const Configuration &configuration;
+	 // Store cadence ID to inform combing decisions (e.g. FVF model)
+	int cadenceId = -1; 
 
-        qint32 frameHeight = 0;
-        double irescale    = 1.0;
-        double invIreScale = 1.0;
+	SourceVideo::Data rawbuffer;
+	qint32 firstFieldPhaseID  = 0;
+	qint32 secondFieldPhaseID = 0;
+	struct LineAffine {
+		double R[2][2];  // rotation+gain (phase-clamped)
+		bool   valid;
+	};
+	struct SamplePlane {
+		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
+	} clpbuffer[3]; // [0]=1D, [1]=2D, [2]=3D
 
-         // Store cadence ID to inform combing decisions (e.g. FVF model)
-        int cadenceId = -1; 
+	struct CombTapSample {
+		double comp = 0.0;
+		double symMag = 0.0;
+		float ti = 0.0f;
+		float tq = 0.0f;
+		double iqMag = 0.0;
+		bool haveComp = false;
+		bool haveIQ = false;
+	};
 
-        SourceVideo::Data rawbuffer;
-        qint32 firstFieldPhaseID  = 0;
-        qint32 secondFieldPhaseID = 0;
-        struct LineAffine {
-            double R[2][2];  // rotation+gain (phase-clamped)
-            bool   valid;
-        };
-        struct SamplePlane {
-            alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
-        } clpbuffer[3]; // [0]=1D, [1]=2D, [2]=3D
+	struct CombTapPair {
+		double diffIRE = std::numeric_limits<double>::infinity();
+		double iqDiffIRE = std::numeric_limits<double>::infinity();
+		double coherence = 1.0;
+		double kScore = 0.0;
+		double weight = 1.0;
+	};
 
-        struct CombTapSample {
-            double comp = 0.0;
-            double symMag = 0.0;
-            float ti = 0.0f;
-            float tq = 0.0f;
-            double iqMag = 0.0;
-            bool haveComp = false;
-            bool haveIQ = false;
-        };
+	struct CombTapContour {
+		double curvMidIRE = 0.0;
+		double midOk = 1.0;
+		double upResIRE = 0.0;
+		double dnResIRE = 0.0;
+		double upSideOk = 1.0;
+		double dnSideOk = 1.0;
+		double upSim = 0.0;
+		double dnSim = 0.0;
+		double upTrust = 0.0;
+		double dnTrust = 0.0;
+		double upInfluence = 0.0;
+		double dnInfluence = 0.0;
+	};
 
-        struct CombTapPair {
-            double diffIRE = std::numeric_limits<double>::infinity();
-            double iqDiffIRE = std::numeric_limits<double>::infinity();
-            double coherence = 1.0;
-            double kScore = 0.0;
-            double weight = 1.0;
-        };
+	// Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
+	// collection and reusable geometry facts only; each comb remains a
+	// distinct consumer that applies its own model to this evidence.
+	struct CombTapLine {
+		int cacheLine = -1;
+		int width = 0;
+		unsigned builtFlags = 0;
+		int ln0 = -1;
+		int lnU1 = -1;
+		int lnD1 = -1;
+		int lnU2 = -1;
+		int lnD2 = -1;
+		int lnU4 = -1;
+		int lnD4 = -1;
+		bool haveU1 = false;
+		bool haveD1 = false;
+		bool haveU2 = false;
+		bool haveD2 = false;
+		bool haveU4 = false;
+		bool haveD4 = false;
+		std::vector<CombTapSample> tap0;
+		std::vector<CombTapSample> tapU1;
+		std::vector<CombTapSample> tapD1;
+		std::vector<CombTapSample> tapU2;
+		std::vector<CombTapSample> tapD2;
+		std::vector<CombTapSample> tapU4;
+		std::vector<CombTapSample> tapD4;
+		std::vector<CombTapPair> pairU1;
+		std::vector<CombTapPair> pairD1;
+		std::vector<CombTapPair> pairU2;
+		std::vector<CombTapPair> pairD2;
+		std::vector<CombTapContour> contour;
+		std::vector<double> hLumaDeltaIRE;
+	};
+	enum CombTapBuild : unsigned {
+		TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta
+		TapBuildFieldA = 1u << 1, // center + +/-2/+/-4 scalar contour facts
+		TapBuildFrame  = 1u << 2, // center + +/-1 for scalar frame comb
+		TapBuildAll    = TapBuildFieldB | TapBuildFieldA | TapBuildFrame
+	};
 
-        struct CombTapContour {
-            double curvMidIRE = 0.0;
-            double midOk = 1.0;
-            double upResIRE = 0.0;
-            double dnResIRE = 0.0;
-            double upSideOk = 1.0;
-            double dnSideOk = 1.0;
-            double upSim = 0.0;
-            double dnSim = 0.0;
-            double upTrust = 0.0;
-            double dnTrust = 0.0;
-            double upInfluence = 0.0;
-            double dnInfluence = 0.0;
-        };
+	void buildCompositeLumaDecompositionLine(const quint16 *rawLine,
+											 int left,
+											 int width,
+											 double *baseY4,
+											 double *hiRaw,
+											 double *lumaSmooth) const;
+	ComponentFrame *componentFrame = nullptr;
+	std::vector<float> demodBurstCos;
+	std::vector<float> demodBurstSin;
+	// Per-line fused locked demod LUTs for the 4 phase buckets (h&3).
+	// Computed in phaseLocked() and reused by buildPhaseCorrected1D/splitIQlocked/filterIQLocked.
+	std::vector<std::array<float,4>> demodLUTTi_locked;
+	std::vector<std::array<float,4>> demodLUTTq_locked;
 
-        // Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
-        // collection and reusable geometry facts only; each comb remains a
-        // distinct consumer that applies its own model to this evidence.
-        struct CombTapLine {
-            int cacheLine = -1;
-            int width = 0;
-            unsigned builtFlags = 0;
-            int ln0 = -1;
-            int lnU1 = -1;
-            int lnD1 = -1;
-            int lnU2 = -1;
-            int lnD2 = -1;
-            int lnU4 = -1;
-            int lnD4 = -1;
-            bool haveU1 = false;
-            bool haveD1 = false;
-            bool haveU2 = false;
-            bool haveD2 = false;
-            bool haveU4 = false;
-            bool haveD4 = false;
-            std::vector<CombTapSample> tap0;
-            std::vector<CombTapSample> tapU1;
-            std::vector<CombTapSample> tapD1;
-            std::vector<CombTapSample> tapU2;
-            std::vector<CombTapSample> tapD2;
-            std::vector<CombTapSample> tapU4;
-            std::vector<CombTapSample> tapD4;
-            std::vector<CombTapPair> pairU1;
-            std::vector<CombTapPair> pairD1;
-            std::vector<CombTapPair> pairU2;
-            std::vector<CombTapPair> pairD2;
-            std::vector<CombTapContour> contour;
-            std::vector<double> hLumaDeltaIRE;
-        };
-        enum CombTapBuild : unsigned {
-            TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta
-            TapBuildFieldA = 1u << 1, // center + +/-2/+/-4 scalar contour facts
-            TapBuildFrame  = 1u << 2, // center + +/-1 for scalar frame comb
-            TapBuildAll    = TapBuildFieldB | TapBuildFieldA | TapBuildFrame
-        };
+	// Flat/contiguous buffers (lines x width)
+	// Line-local locked IQ after burst alignment and affine trim.
+	std::vector<float> demodTI_flat;
+	std::vector<float> demodTQ_flat;
+	// Common 4fsc IQ export derived from the locked IQ. This is the seam
+	// between the line-local locked domain and the cross-line 4fsc domain.
+	std::vector<float> demodTI4fsc_flat;
+	std::vector<float> demodTQ4fsc_flat;
+	std::vector<double> scratch_lumaBaseY4;
+	std::vector<double> scratch_lumaHiRaw;
+	std::vector<double> scratch_lumaSmooth;
+	// 3-slot ring buffers caching an intrafield comb output (chroma + gate)
+	// used as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
+	std::array<std::vector<double>, 3> precleanRing;
+	std::array<std::vector<double>, 3> precleanGateRing;
+	std::array<int, 3> precleanRingLine = { -1, -1, -1 };
+	std::vector<double> scratch_frameBCenter;
+	std::vector<double> scratch_fieldBCenter;        // raw-composite demod storage (flat contiguous)
+	std::vector<float> demodTRI_flat;
+	std::vector<float> demodTRQ_flat;
+	std::vector<double> scratch_preI;          // unscaled pre-FIR storage (per-line)
+	std::vector<double> scratch_preQ;
+	std::vector<double> scratch_preI_ext;      // edge-extended for FIR (per-line)
+	std::vector<double> scratch_preQ_ext;
+	std::vector<double> scratch_comp_res;     // composite residual = raw - clp - chroma_est
+	// Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
+	std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
+	std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
+	std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
+	// in FrameBuffer private members (comb.h)
+	std::vector<int> lineFlip;  // +1 or -1 per frame line
+	std::vector<double> scratch_outMixed;
+	std::vector<double> scratch_lateralLine;
+	std::vector<std::vector<float>> w2d_frame_weight;
+	std::vector<std::vector<double>> w2d_fieldA_gate;
+	std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
+	std::vector<LineAffine> lineAffineLocked;
+	std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)
+	std::vector<std::complex<double>> scratch_centerIQ; // reused per-line preclean/locked frame IQ prep
+	std::vector<std::complex<double>> scratch_upIQ;
+	std::vector<std::complex<double>> scratch_dnIQ;
+	std::vector<double> scratch_fieldLine;
+	std::vector<double> scratch_fieldGate;
+	std::vector<double> scratch_fieldBLine;
+	// FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
+	std::vector<int>    scratch_fvf_winner;
+	std::vector<int>    scratch_fvf_winner2;
+	std::vector<double> scratch_fvf_outVal;
+	std::vector<float>  scratch_fvf_outShade;
+	std::vector<double> scratch_fvf_diffFVF;
+	std::vector<double> scratch_fvf_satMap;
+	// Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
+	// of framePreclean). Cached during the main scoring pass so the island
+	// filter and any post-processing can recover the Frame A output.
+	std::vector<double> scratch_fvf_frameAVal;
+	std::vector<double> scratch_filter_temp;
+	std::vector<double> scratch_hpI;
+	std::vector<double> scratch_hpQ;
+	std::vector<double> scratch_hpY;
+	std::vector<double> scratch_sinfit_mag;    // per-line |TRI/TRQ|
+	std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
+	std::vector<char> scratch_vdis_flag;
+	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
+	std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
+	std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
+	CombTapLine scratch_tapLine;
+	std::array<CombTapLine, 3> tapLineCache;
+	std::array<int, 3> tapLineCacheLine = { -1, -1, -1 };
+	unsigned combTapBuildFlags_ = TapBuildAll;
 
-		void buildCompositeLumaDecompositionLine(const quint16 *rawLine,
-												 int left,
-												 int width,
-												 double *baseY4,
-												 double *hiRaw,
-												 double *lumaSmooth) const;
-        ComponentFrame *componentFrame = nullptr;
-        std::vector<float> demodBurstCos;
-        std::vector<float> demodBurstSin;
-        // Per-line fused locked demod LUTs for the 4 phase buckets (h&3).
-        // Computed in phaseLocked() and reused by buildPhaseCorrected1D/splitIQlocked/filterIQLocked.
-        std::vector<std::array<float,4>> demodLUTTi_locked;
-        std::vector<std::array<float,4>> demodLUTTq_locked;
+	inline int precleanRingSlot(int lineNumber) const
+	{
+		int s = lineNumber % 3;
+		if (s < 0) s += 3;
+		return s;
+	}
 
-        // Flat/contiguous buffers (lines x width)
-        // Line-local locked IQ after burst alignment and affine trim.
-        std::vector<float> demodTI_flat;
-        std::vector<float> demodTQ_flat;
-        // Common 4fsc IQ export derived from the locked IQ. This is the seam
-        // between the line-local locked domain and the cross-line 4fsc domain.
-        std::vector<float> demodTI4fsc_flat;
-        std::vector<float> demodTQ4fsc_flat;
-        std::vector<double> scratch_lumaBaseY4;
-		std::vector<double> scratch_lumaHiRaw;
-		std::vector<double> scratch_lumaSmooth;
-        // 3-slot ring buffers caching an intrafield comb output (chroma + gate)
-        // used as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
-        std::array<std::vector<double>, 3> precleanRing;
-        std::array<std::vector<double>, 3> precleanGateRing;
-        std::array<int, 3> precleanRingLine = { -1, -1, -1 };
-        std::vector<double> scratch_frameBCenter;
-        std::vector<double> scratch_fieldBCenter;        // raw-composite demod storage (flat contiguous)
-        std::vector<float> demodTRI_flat;
-        std::vector<float> demodTRQ_flat;
-        std::vector<double> scratch_preI;          // unscaled pre-FIR storage (per-line)
-        std::vector<double> scratch_preQ;
-        std::vector<double> scratch_preI_ext;      // edge-extended for FIR (per-line)
-        std::vector<double> scratch_preQ_ext;
-        std::vector<double> scratch_comp_res;     // composite residual = raw - clp - chroma_est
-        // Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
-        std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
-        std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
-        std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
-        // in FrameBuffer private members (comb.h)
-        std::vector<int> lineFlip;  // +1 or -1 per frame line
-        std::vector<double> scratch_outMixed;
-        std::vector<double> scratch_lateralLine;
-        std::vector<std::vector<float>> w2d_frame_weight;
-        std::vector<std::vector<double>> w2d_fieldA_gate;
-        std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
-        std::vector<LineAffine> lineAffineLocked;
-        std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)
-        std::vector<std::complex<double>> scratch_centerIQ; // reused per-line preclean/locked frame IQ prep
-        std::vector<std::complex<double>> scratch_upIQ;
-        std::vector<std::complex<double>> scratch_dnIQ;
-        std::vector<double> scratch_fieldLine;
-        std::vector<double> scratch_fieldGate;
-        std::vector<double> scratch_fieldBLine;
-        // FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
-        std::vector<int>    scratch_fvf_winner;
-        std::vector<int>    scratch_fvf_winner2;
-        std::vector<double> scratch_fvf_outVal;
-        std::vector<float>  scratch_fvf_outShade;
-        std::vector<double> scratch_fvf_diffFVF;
-        std::vector<double> scratch_fvf_satMap;
-        // Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
-        // of framePreclean). Cached during the main scoring pass so the island
-        // filter and any post-processing can recover the Frame A output.
-        std::vector<double> scratch_fvf_frameAVal;
-        std::vector<double> scratch_filter_temp;
-        std::vector<double> scratch_hpI;
-        std::vector<double> scratch_hpQ;
-        std::vector<double> scratch_hpY;
-        std::vector<double> scratch_sinfit_mag;    // per-line |TRI/TRQ|
-        std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
-        std::vector<char> scratch_vdis_flag;
-        std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
-        std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
-        std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
-        CombTapLine scratch_tapLine;
-        std::array<CombTapLine, 3> tapLineCache;
-        std::array<int, 3> tapLineCacheLine = { -1, -1, -1 };
-        unsigned combTapBuildFlags_ = TapBuildAll;
+	inline bool havePrecleanLine(int lineNumber, int width) const
+	{
+		const int s = precleanRingSlot(lineNumber);
+		if (precleanRingLine[s] != lineNumber) return false;
+		return ((int)precleanRing[s].size() >= width);
+	}
 
-        inline int precleanRingSlot(int lineNumber) const
-        {
-            int s = lineNumber % 3;
-            if (s < 0) s += 3;
-            return s;
-        }
+	inline const double *precleanLinePtr(int lineNumber, int width) const
+	{
+		if (!havePrecleanLine(lineNumber, width)) return nullptr;
+		const int s = precleanRingSlot(lineNumber);
+		return precleanRing[s].data();
+	}
 
-        inline bool havePrecleanLine(int lineNumber, int width) const
-        {
-            const int s = precleanRingSlot(lineNumber);
-            if (precleanRingLine[s] != lineNumber) return false;
-            return ((int)precleanRing[s].size() >= width);
-        }
+	inline const double *precleanGateLinePtr(int lineNumber, int width) const
+	{
+		if (!havePrecleanLine(lineNumber, width)) return nullptr;
+		const int s = precleanRingSlot(lineNumber);
+		if ((int)precleanGateRing[s].size() < width) return nullptr;
+		return precleanGateRing[s].data();
+	}
 
-        inline const double *precleanLinePtr(int lineNumber, int width) const
-        {
-            if (!havePrecleanLine(lineNumber, width)) return nullptr;
-            const int s = precleanRingSlot(lineNumber);
-            return precleanRing[s].data();
-        }
+	inline double *precleanLinePtrMutable(int lineNumber, int width)
+	{
+		const int s = precleanRingSlot(lineNumber);
+		if ((int)precleanRing[s].size() < width) precleanRing[s].assign(width, 0.0);
+		precleanRingLine[s] = lineNumber;
+		return precleanRing[s].data();
+	}
 
-        inline const double *precleanGateLinePtr(int lineNumber, int width) const
-        {
-            if (!havePrecleanLine(lineNumber, width)) return nullptr;
-            const int s = precleanRingSlot(lineNumber);
-            if ((int)precleanGateRing[s].size() < width) return nullptr;
-            return precleanGateRing[s].data();
-        }
+	inline double *precleanGateLinePtrMutable(int lineNumber, int width)
+	{
+		const int s = precleanRingSlot(lineNumber);
+		if ((int)precleanGateRing[s].size() < width) precleanGateRing[s].assign(width, 1.0);
+		return precleanGateRing[s].data();
+	}
 
-        inline double *precleanLinePtrMutable(int lineNumber, int width)
-        {
-            const int s = precleanRingSlot(lineNumber);
-            if ((int)precleanRing[s].size() < width) precleanRing[s].assign(width, 0.0);
-            precleanRingLine[s] = lineNumber;
-            return precleanRing[s].data();
-        }
+	// Small helpers declared here; definitions provided after the class (in this header).
+	inline qint32 getFieldID(qint32 lineNumber) const;
+	inline bool   getLinePhase(qint32 lineNumber) const;
+	// Per-run 4fsc shifted basis LUT for locked path (phaseCompensation=true)
+	double spLUT_locked[4] = {1.0, 0.0, -1.0, 0.0};
+	double cpLUT_locked[4] = {0.0, 1.0,  0.0, -1.0};
+	bool   basisLockedInit = false;
+	bool hasVDIS(int lineNumber, int h) const;      
 
-        inline double *precleanGateLinePtrMutable(int lineNumber, int width)
-        {
-            const int s = precleanRingSlot(lineNumber);
-            if ((int)precleanGateRing[s].size() < width) precleanGateRing[s].assign(width, 1.0);
-            return precleanGateRing[s].data();
-        }
+	// Hybrid 2D helpers
+	void invalidateCombTapCache();
+	const CombTapLine &ensureCombTapLine(int lineNumber);
+	void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
+	void computeField2DLine(int lineNumber,
+						  double *outFieldLine,
+						  double  *outGate);
+	void computeField2DLine(const CombTapLine &tapLine,
+						  double *outFieldLine,
+						  double  *outGate);
 
-        // Small helpers declared here; definitions provided after the class (in this header).
-        inline qint32 getFieldID(qint32 lineNumber) const;
-        inline bool   getLinePhase(qint32 lineNumber) const;
-        // Per-run 4fsc shifted basis LUT for locked path (phaseCompensation=true)
-        double spLUT_locked[4] = {1.0, 0.0, -1.0, 0.0};
-        double cpLUT_locked[4] = {0.0, 1.0,  0.0, -1.0};
-        bool   basisLockedInit = false;
-        bool hasVDIS(int lineNumber, int h) const;      
+	void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
+	void computeSimpleField2DLine(const CombTapLine &tapLine, double *outFieldLine);
+	
+	void computeFrameScalarLine(int lineNumber, double *outFrameLine);
+	void computeFrameScalarLine(const CombTapLine &tapLine, double *outFrameLine);
 
-        // Hybrid 2D helpers
-        void invalidateCombTapCache();
-        const CombTapLine &ensureCombTapLine(int lineNumber);
-        void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
-        void computeField2DLine(int lineNumber,
-                              double *outFieldLine,
-                              double  *outGate);
-        void computeField2DLine(const CombTapLine &tapLine,
-                              double *outFieldLine,
-                              double  *outGate);
+	void computeFrameIQPrecleanLine(int line,
+									std::vector<std::complex<double>> &outFrameIQ,
+									bool enableLateralRefine = true);
+	void computeFrameIQLocked1DLine(int line,
+									std::vector<std::complex<double>> &outFrameIQ,
+									const std::vector<float> *tiOverride = nullptr,
+									const std::vector<float> *tqOverride = nullptr);
+	void computeFrameIQFromPreparedVectors(int line,
+										   const std::vector<std::complex<double>> &centerIQ,
+										   std::vector<std::complex<double>> &upIQ,
+										   std::vector<std::complex<double>> &dnIQ,
+										   std::vector<std::complex<double>> &outFrameIQ,
+										   const std::vector<float> *tiOverride,
+										   const std::vector<float> *tqOverride,
+										   bool enableLateralRefine);
+	void collectCombOwnershipEvidence(int line,
+									   const double *fieldA,
+									   const double *fieldB,
+									   const std::vector<double> &frameScalar,
+									   const std::vector<std::complex<double>> *frameIQ);
+	void finalizeOwnershipClaims(OwnershipEvidence &e,
+								 double neighborLumaMeanIRE = -1.0,
+								 double neighborBaseMeanIRE = -1.0) const;
+	void reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const;
+	// Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
+	// into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.
+	void computeVDISLine(int lineNumber);
+	static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
+									   const LdDecodeMetaData::VideoParameters &vp);
+	
+	// Minimal Field-vs-Frame scorer: uses normalized FieldB and Frame plus
+	// phase-corrected 1D as fallback reference only.
+	void scoreFieldVsFrame(
+		int line,
+		const CombTapLine &tapLine,
+		const double *fieldA,
+		const double *fieldB,
+		const double *fieldAGate,
+		const std::vector<double> &framePreclean,
+		const std::vector<double> *frameRaw,
+		double *outMixed,
+		bool writeWeights,
+		const double *lateral1D,
+		const std::vector<std::complex<double>> *frameIQ = nullptr);
 
-        void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
-        void computeSimpleField2DLine(const CombTapLine &tapLine, double *outFieldLine);
-        
-        void computeFrameScalarLine(int lineNumber, double *outFrameLine);
-        void computeFrameScalarLine(const CombTapLine &tapLine, double *outFrameLine);
+	static inline bool fvf_is_tri_safe(double candVal,
+									   double L1,
+									   double invIreScale,
+									   double triSafeIre)
+	{
+		const double dCand1D_ire = std::fabs(candVal - L1) * invIreScale;
+		return (dCand1D_ire <= triSafeIre);
+	}
 
-        void computeFrameIQPrecleanLine(int line,
-                                        std::vector<std::complex<double>> &outFrameIQ,
-                                        bool enableLateralRefine = true);
-        void computeFrameIQLocked1DLine(int line,
-                                        std::vector<std::complex<double>> &outFrameIQ,
-                                        const std::vector<float> *tiOverride = nullptr,
-                                        const std::vector<float> *tqOverride = nullptr);
-        void computeFrameIQFromPreparedVectors(int line,
-                                               const std::vector<std::complex<double>> &centerIQ,
-                                               std::vector<std::complex<double>> &upIQ,
-                                               std::vector<std::complex<double>> &dnIQ,
-                                               std::vector<std::complex<double>> &outFrameIQ,
-                                               const std::vector<float> *tiOverride,
-                                               const std::vector<float> *tqOverride,
-                                               bool enableLateralRefine);
-        void collectCombOwnershipEvidence(int line,
-                                           const double *fieldA,
-                                           const double *fieldB,
-                                           const std::vector<double> &frameScalar,
-                                           const std::vector<std::complex<double>> *frameIQ);
-        void finalizeOwnershipClaims(OwnershipEvidence &e,
-                                     double neighborLumaMeanIRE = -1.0,
-                                     double neighborBaseMeanIRE = -1.0) const;
-        void reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const;
-        // Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
-        // into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.
-        void computeVDISLine(int lineNumber);
-        static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
-                                           const LdDecodeMetaData::VideoParameters &vp);
-        
-        // Minimal Field-vs-Frame scorer: uses normalized FieldB and Frame plus
-        // phase-corrected 1D as fallback reference only.
-        void scoreFieldVsFrame(
-            int line,
-            const CombTapLine &tapLine,
-            const double *fieldA,
-            const double *fieldB,
-            const double *fieldAGate,
-            const std::vector<double> &framePreclean,
-            const std::vector<double> *frameRaw,
-            double *outMixed,
-            bool writeWeights,
-            const double *lateral1D,
-            const std::vector<std::complex<double>> *frameIQ = nullptr);
+	static inline double getNotchLumaEven2(const double* arr, int rel, int width)
+	{
+		if (!arr || width <= 0) return 0.0;
+		if (rel < 2) rel = 2;
+		if (rel > width - 3) rel = width - 3;
+		return 0.5 * (arr[rel - 2] + arr[rel + 2]);
+	}
 
-        static inline bool fvf_is_tri_safe(double candVal,
-                                           double L1,
-                                           double invIreScale,
-                                           double triSafeIre)
-        {
-            const double dCand1D_ire = std::fabs(candVal - L1) * invIreScale;
-            return (dCand1D_ire <= triSafeIre);
-        }
+	static inline double getNotchLumaEven2Vec(const std::vector<double>& vec, int rel)
+	{
+		const int width = (int)vec.size();
+		return (width > 0) ? getNotchLumaEven2(vec.data(), rel, width) : 0.0;
+	}
+		
+	void getBestCandidate(qint32 lineNumber, qint32 h,
+						  const FrameBuffer &previousFrame,
+						  const FrameBuffer &nextFrame,
+						  qint32 &bestIndex, double &bestSample) const;
 
-        static inline double getNotchLumaEven2(const double* arr, int rel, int width)
-        {
-            if (!arr || width <= 0) return 0.0;
-            if (rel < 2) rel = 2;
-            if (rel > width - 3) rel = width - 3;
-            return 0.5 * (arr[rel - 2] + arr[rel + 2]);
-        }
+	// getCandidate is declared here and implemented in comb_candidate.cpp
+	Candidate getCandidate(qint32 refLineNumber, qint32 refH,
+						   const FrameBuffer &frameBuffer,
+						   qint32 lineNumber, qint32 h,
+						   double adjustPenalty) const;
 
-        static inline double getNotchLumaEven2Vec(const std::vector<double>& vec, int rel)
-        {
-            const int width = (int)vec.size();
-            return (width > 0) ? getNotchLumaEven2(vec.data(), rel, width) : 0.0;
-        }
-            
-        void getBestCandidate(qint32 lineNumber, qint32 h,
-                              const FrameBuffer &previousFrame,
-                              const FrameBuffer &nextFrame,
-                              qint32 &bestIndex, double &bestSample) const;
+	// Dedicated 3D Residual Y selector
+	double getBestY(qint32 line, qint32 h, double currentY2D, 
+					const FrameBuffer &prev, const FrameBuffer &next) const;        
+	
+	int demodWidth  = 0;
+	int demodLines  = 0;
 
-        // getCandidate is declared here and implemented in comb_candidate.cpp
-        Candidate getCandidate(qint32 refLineNumber, qint32 refH,
-                               const FrameBuffer &frameBuffer,
-                               qint32 lineNumber, qint32 h,
-                               double adjustPenalty) const;
+	inline float* demodTI_line(int line) {
+		return demodTI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* demodTQ_line(int line) {
+		return demodTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* demodTI4fsc_line(int line) {
+		return demodTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* demodTQ4fsc_line(int line) {
+		return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodTI_line(int line) const {
+		return demodTI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodTQ_line(int line) const {
+		return demodTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodTI4fsc_line(int line) const {
+		return demodTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodTQ4fsc_line(int line) const {
+		return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
 
-        // Dedicated 3D Residual Y selector
-        double getBestY(qint32 line, qint32 h, double currentY2D, 
-                        const FrameBuffer &prev, const FrameBuffer &next) const;        
-        
-        int demodWidth  = 0;
-        int demodLines  = 0;
+	// Raw-composite demod accessors
+	inline float* demodTRI_line(int line) {
+		return demodTRI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* demodTRQ_line(int line) {
+		return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodTRI_line(int line) const {
+		return demodTRI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodTRQ_line(int line) const {
+		return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
 
-        inline float* demodTI_line(int line) {
-            return demodTI_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline float* demodTQ_line(int line) {
-            return demodTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline float* demodTI4fsc_line(int line) {
-            return demodTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline float* demodTQ4fsc_line(int line) {
-            return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline const float* demodTI_line(int line) const {
-            return demodTI_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline const float* demodTQ_line(int line) const {
-            return demodTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline const float* demodTI4fsc_line(int line) const {
-            return demodTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline const float* demodTQ4fsc_line(int line) const {
-            return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-
-        // Raw-composite demod accessors
-        inline float* demodTRI_line(int line) {
-            return demodTRI_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline float* demodTRQ_line(int line) {
-            return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline const float* demodTRI_line(int line) const {
-            return demodTRI_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-        inline const float* demodTRQ_line(int line) const {
-            return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
-        }
-
-        // Vet result container (used by locked-path coherent Y rebuild).
-        struct Vet1DResult {
-            double composite_bandpass = 0.0;        // raw - 2D clp (IRE units)
-            double leftScore         = std::numeric_limits<double>::infinity();  // smaller is better
-            double rightScore        = std::numeric_limits<double>::infinity();  // smaller is better
-            int    bestIndex         = -1;         //  -1 = none, 0 = left, 1 = right
-            double bestScore         = std::numeric_limits<double>::infinity();
-            double confidence        = 0.0;        // 0..1 confidence that replacement is safe
-            bool   accept            = false;      // true => safe to apply composite substitution
-            int    verticalAgree     = 0;          // number of vertical neighbors that agree (0..2)
-            // diagnostics for adjacent neighbor influence
-            int    adjNeighborCount  = 0;          // number of valid immediate neighbors (0..2)
-            double adjNeighborSupport= 0.0;        // average agreement of h±1 with residual (0..1)
-        };
-    };
-    // Inline definitions for FrameBuffer (out-of-class)
+	// Vet result container (used by locked-path coherent Y rebuild).
+	struct Vet1DResult {
+		double composite_bandpass = 0.0;        // raw - 2D clp (IRE units)
+		double leftScore         = std::numeric_limits<double>::infinity();  // smaller is better
+		double rightScore        = std::numeric_limits<double>::infinity();  // smaller is better
+		int    bestIndex         = -1;         //  -1 = none, 0 = left, 1 = right
+		double bestScore         = std::numeric_limits<double>::infinity();
+		double confidence        = 0.0;        // 0..1 confidence that replacement is safe
+		bool   accept            = false;      // true => safe to apply composite substitution
+		int    verticalAgree     = 0;          // number of vertical neighbors that agree (0..2)
+		// diagnostics for adjacent neighbor influence
+		int    adjNeighborCount  = 0;          // number of valid immediate neighbors (0..2)
+		double adjNeighborSupport= 0.0;        // average agreement of h±1 with residual (0..1)
+	};
+};
+// Inline definitions for FrameBuffer (out-of-class)
 };
 
 // Inline helper definitions for FrameBuffer (out-of-class)
