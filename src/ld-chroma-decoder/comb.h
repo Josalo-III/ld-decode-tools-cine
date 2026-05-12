@@ -538,12 +538,12 @@ private:
             TapBuildAll    = TapBuildFieldB | TapBuildFieldA | TapBuildFrame
         };
 
-		void buildCompositeLumaBaseLine(const quint16 *rawLine,
-										int left,
-										int width,
-										double *baseY,
-										double *hiRaw) const;
-
+		void buildCompositeLumaDecompositionLine(const quint16 *rawLine,
+												 int left,
+												 int width,
+												 double *baseY4,
+												 double *hiRaw,
+												 double *lumaSmooth) const;
         ComponentFrame *componentFrame = nullptr;
         std::vector<float> demodBurstCos;
         std::vector<float> demodBurstSin;
@@ -560,6 +560,9 @@ private:
         // between the line-local locked domain and the cross-line 4fsc domain.
         std::vector<float> demodTI4fsc_flat;
         std::vector<float> demodTQ4fsc_flat;
+        std::vector<double> scratch_lumaBaseY4;
+		std::vector<double> scratch_lumaHiRaw;
+		std::vector<double> scratch_lumaSmooth;
         // 3-slot ring buffers caching an intrafield comb output (chroma + gate)
         // used as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
         std::array<std::vector<double>, 3> precleanRing;

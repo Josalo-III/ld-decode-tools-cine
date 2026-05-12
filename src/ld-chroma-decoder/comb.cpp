@@ -447,6 +447,10 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_fieldBLine.assign(width, 0.0);
         scratch_outMixed.assign(width, 0.0);
         scratch_lateralLine.assign(width, 0.0);
+        // low-res luma (chroma cancelled fsc)        
+        scratch_lumaBaseY4.assign(width, 0.0);
+		scratch_lumaHiRaw.assign(width, 0.0);
+		scratch_lumaSmooth.assign(width, 0.0);
 
         // Filtering/NR temporaries
         scratch_filter_temp.assign(width, 0.0);
@@ -912,19 +916,29 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
     if (width <= 0 || first >= last) return;
 
-    // Scratch for iceberg luma smooth; reused each line.
-    std::vector<double> lumaSmooth(width, 0.0);
+    // Reusable shared 4fSC luma decomposition scratch.
+    // baseY4 is the hard four-sample luma floor; lumaSmooth is the interpolated
+    // guide through those block anchors for slope/crest/iceberg reasoning.
+    if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
+    if ((int)scratch_lumaHiRaw.size()   < width) scratch_lumaHiRaw.resize(width, 0.0);
+    if ((int)scratch_lumaSmooth.size()  < width) scratch_lumaSmooth.resize(width, 0.0);
+
+    double *lumaBaseY4 = scratch_lumaBaseY4.data();
+    double *lumaHiRaw  = scratch_lumaHiRaw.data();
+    double *lumaSmooth = scratch_lumaSmooth.data();
 
     if ((int)locked1DSource.size() < last) locked1DSource.resize(last);
+
     for (int line = first; line < last; ++line) {
+        const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
         const double *src = clpbuffer[0].pixel[line];
+
         auto &ldsRow = locked1DSource[line];
         if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
 
-        // lumaSmooth is filled below, after sampleSrc is defined.
-
         const double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
         const double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+
         double lutTi[4], lutTq[4];
         if (line < (int)demodLUTTi_locked.size()) {
             for (int i = 0; i < 4; ++i) {
@@ -935,8 +949,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
         }
 
-        float *tiRow = demodTI_line(line);
-        float *tqRow = demodTQ_line(line);
+        float *tiRow  = demodTI_line(line);
+        float *tqRow  = demodTQ_line(line);
         float *ti4Row = demodTI4fsc_line(line);
         float *tq4Row = demodTQ4fsc_line(line);
 
@@ -946,6 +960,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 && lineAffineLocked[line].valid) {
             lineAffine = &lineAffineLocked[line];
         }
+
         auto applyLineAffine = [&](double &ti, double &tq) {
             if (!lineAffine) return;
             const double ai = lineAffine->R[0][0] * ti + lineAffine->R[0][1] * tq;
@@ -959,15 +974,12 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             return src[left + rel];
         };
 
-        // Chroma-canceling smooth luma: [1,2,2,2,1]/8 applied to src.
-        // Same units as ti/tq so the iceberg bandpass correction is correctly scaled.
-        // Four-cycle averaging cancels the NTSC subcarrier exactly, leaving a smooth
-        // luma profile — the iceberg outline below the bandpass waterline.
-        // Also used for edge detection (chroma-immune slope signals on colored edges).
-        for (int xi = 0; xi < width; ++xi) {
-            lumaSmooth[xi] = (sampleSrc(xi-2) + 2.0*sampleSrc(xi-1) + 2.0*sampleSrc(xi)
-                              + 2.0*sampleSrc(xi+1) + sampleSrc(xi+2)) / 8.0;
-        }
+        // Shared 4fSC luma decomposition.
+        // This uses the original raw composite, not clpbuffer[0].
+        buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                            lumaBaseY4,
+                                            nullptr,
+                                            lumaSmooth);
 
         auto sampleIQ = [&](int rel, double &outI, double &outQ) {
             rel = std::clamp(rel, 0, width - 1);
@@ -980,8 +992,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         };
 
         for (int xi = 0; xi < width; ++xi) {
-            const int h    = left + xi;
-            const double c  = src[h];
+            const int h = left + xi;
+            const double c = src[h];
 
             const int ph = (h & 3);
             double ti = c * lutTi[ph];
@@ -1000,8 +1012,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
             if (xi >= 4 && xi < width - 4) {
                 const double c0 = src[left + xi];
-                fine = std::fabs(c0 - 0.5 * (src[left + xi - 1] + src[left + xi + 1])) * invIreScale;
-                mid = std::fabs(c0 - 0.5 * (src[left + xi - 2] + src[left + xi + 2])) * invIreScale;
+                fine   = std::fabs(c0 - 0.5 * (src[left + xi - 1] + src[left + xi + 1])) * invIreScale;
+                mid    = std::fabs(c0 - 0.5 * (src[left + xi - 2] + src[left + xi + 2])) * invIreScale;
                 coarse = std::fabs(c0 - 0.5 * (src[left + xi - 4] + src[left + xi + 4])) * invIreScale;
             } else {
                 fine = std::fabs(sampleSrc(xi) -
@@ -1011,6 +1023,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 coarse = std::fabs(sampleSrc(xi) -
                                    0.5 * (sampleSrc(xi - 4) + sampleSrc(xi + 4))) * invIreScale;
             }
+
             const double denom = fine + mid + coarse + 1e-9;
             const double fineFrac = fine / denom;
             const double nonFineFrac = std::max(mid, coarse) / denom;
@@ -1019,6 +1032,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
             double tiLm1 = 0.0, tqLm1 = 0.0, tiLp1 = 0.0, tqLp1 = 0.0;
             double tiLm2 = 0.0, tqLm2 = 0.0, tiLp2 = 0.0, tqLp2 = 0.0;
+
             if (xi >= 2 && xi < width - 2) {
                 {
                     const int hh = left + xi - 1;
@@ -1075,8 +1089,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             lumaIncursionRiskIRE = intakeNyquistRiskIRE * incoherence;
 
             {
-                // Use chroma-canceled smooth luma for slope detection — raw src has
-                // chroma oscillations that break monotonicity on colored text edges.
+                // Use the interpolated chroma-cancelled luma guide for slope
+                // detection. Raw src has chroma oscillations that break
+                // monotonicity on colored text edges.
                 const double cLm2 = lumaSmooth[std::clamp(xi - 2, 0, width - 1)];
                 const double cLm1 = lumaSmooth[std::clamp(xi - 1, 0, width - 1)];
                 const double c0   = lumaSmooth[xi];
@@ -1096,9 +1111,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     return std::sqrt(std::min(aa, bb) / std::max(aa, bb));
                 };
 
-                const double monotonicity = 0.4 * slopeAgreement(gL0, g0R) +
-                                            0.3 * slopeAgreement(gLm, gL0) +
-                                            0.3 * slopeAgreement(g0R, gRp);
+                const double monotonicity =
+                    0.4 * slopeAgreement(gL0, g0R) +
+                    0.3 * slopeAgreement(gLm, gL0) +
+                    0.3 * slopeAgreement(g0R, gRp);
 
                 const double edgeSpanIRE = std::fabs(cLp1 - cLm1) * invIreScale;
                 const double longSpanIRE = std::fabs(cLp2 - cLm2) * invIreScale;
@@ -1120,17 +1136,24 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     (edgeStrengthIRE - (0.20 * fine) - 0.5) /
                     std::max(1.5, (0.50 * fine) + 1.0),
                     0.0, 1.0);
+
                 directionalEdgeAsymmetry = std::clamp(
                     (0.65 * crestAsym) + (0.35 * centerAsym),
                     0.0, 1.0);
             }
 
-            if (T.LUMA_ICEBERG_RECOVERY > 0.0 && directionalEdgeSupport > 0.0
-                && xi >= 2 && xi < width - 2) {
+            if (T.LUMA_ICEBERG_RECOVERY > 0.0 &&
+                directionalEdgeSupport > 0.0 &&
+                xi >= 2 && xi < width - 2)
+            {
                 bpLumaPredicted =
-                    (lumaSmooth[xi] - 0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
-                bpLumaModeled = bpLumaPredicted * T.LUMA_ICEBERG_RECOVERY
-                                * directionalEdgeSupport;
+                    (lumaSmooth[xi] -
+                     0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
+
+                bpLumaModeled =
+                    bpLumaPredicted *
+                    T.LUMA_ICEBERG_RECOVERY *
+                    directionalEdgeSupport;
 
                 const double modeledAlienYIRE = std::fabs(bpLumaModeled) * invIreScale;
                 icebergAlienYFraction = std::clamp(
@@ -1143,12 +1166,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             {
                 fvfMetrics[line][xi].intakeNyquistRiskIRE = intakeNyquistRiskIRE;
                 fvfMetrics[line][xi].lumaIncursionRiskIRE = lumaIncursionRiskIRE;
-                fvfMetrics[line][xi].residualFitErrorIRE = residualFitErrorIRE;
+                fvfMetrics[line][xi].residualFitErrorIRE  = residualFitErrorIRE;
             }
+
             if (line >= 0 && line < (int)ownershipEvidence.size() &&
                 xi < (int)ownershipEvidence[line].size())
             {
                 OwnershipEvidence &e = ownershipEvidence[line][xi];
+
                 e.bandpassFineIRE = fine;
                 e.bandpassMidIRE = mid;
                 e.bandpassCoarseIRE = coarse;
@@ -1157,22 +1182,23 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 e.lumaIncursionRiskIRE = lumaIncursionRiskIRE;
                 e.icebergAlienYFraction = icebergAlienYFraction;
                 e.locked1DChromaIRE = std::hypot(ti, tq) * invIreScale;
-                
+
                 const double lumaT = std::max(
                     std::clamp(lumaIncursionRiskIRE / 8.0, 0.0, 1.0),
                     icebergAlienYFraction);
-                const double chromaStrength = std::clamp((e.locked1DChromaIRE - 2.0) / 10.0, 0.0, 1.0);
-                const double chromaCoherence = std::clamp(1.0 - (residualFitErrorIRE / 12.0), 0.0, 1.0);
-                
+
+                const double chromaStrength =
+                    std::clamp((e.locked1DChromaIRE - 2.0) / 10.0, 0.0, 1.0);
+                const double chromaCoherence =
+                    std::clamp(1.0 - (residualFitErrorIRE / 12.0), 0.0, 1.0);
+
                 e.lumaClaim = lumaT;
                 e.chromaClaim = chromaStrength * chromaCoherence * (1.0 - 0.5 * lumaT);
-                e.uncertainClaim = std::clamp(1.0 - std::max(e.lumaClaim, e.chromaClaim), 0.0, 1.0);            }
+                e.uncertainClaim =
+                    std::clamp(1.0 - std::max(e.lumaClaim, e.chromaClaim), 0.0, 1.0);
+            }
 
             // Iceberg alien-Y cancellation.
-            // bpLumaPredicted: bandpass of chroma-canceled smooth luma (same scale as src).
-            // directionalEdgeSupport gates the entire correction — zero at flat regions,
-            // full strength at monotonic ramps where luma transients alias into chroma.
-            // Ownership evidence above is written from the original ti/tq for diagnostics.
             if (bpLumaModeled != 0.0) {
                 double corrTi = bpLumaModeled * lutTi[ph];
                 double corrTq = bpLumaModeled * lutTq[ph];
@@ -1184,24 +1210,22 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
 
-            // Export locked IQ onto the common 4fsc frame exactly once here.
-            // Every phase bucket must keep the same role it had pre-transform,
-            // only with the per-line burst/affine correction already applied.
-            double ti4 = 0.0, tq4 = 0.0;
+            // Export locked IQ onto the common 4fSC frame exactly once here.
+            double ti4 = 0.0;
+            double tq4 = 0.0;
             lockedTo4fsc(ti, tq, bcos, bsin, ti4, tq4);
+
             ti4Row[xi] = (float)ti4;
             tq4Row[xi] = (float)tq4;
 
-            // Remodulate the common 4fsc export back to scalar composite.
+            // Remodulate the common 4fSC export back to scalar composite.
             ldsRow[xi] = remod4fscToComposite(ti4, tq4, h);
         }
 
-        // After remodulating onto the integer 4fsc grid, apply a bucket-preserving
-        // same-phase smooth (±4) once per line. This avoids recomputing the same
-        // operation in multiple Field comb paths during FVF, and does not touch
-        // the demodTI/TQ arrays used by Frame B IQ.
+        // Optional same-phase smooth on the exported locked 1D scalar source.
         if (FIELD_BUCKET_SMOOTH_STRENGTH > 0.0) {
-            if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.assign(width, 0.0);
+            if ((int)scratch_filter_temp.size() < width)
+                scratch_filter_temp.assign(width, 0.0);
 
             auto reflectXi = [&](int x)->int {
                 if (x < 0) return -x;
@@ -1214,9 +1238,12 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const int xp4 = reflectXi(xi + 4);
                 const double raw = ldsRow[xi];
                 const double est = 0.5 * (ldsRow[xm4] + ldsRow[xp4]);
-                scratch_filter_temp[xi] = raw + (est - raw) * FIELD_BUCKET_SMOOTH_STRENGTH;
+                scratch_filter_temp[xi] =
+                    raw + (est - raw) * FIELD_BUCKET_SMOOTH_STRENGTH;
             }
-            for (int xi = 0; xi < width; ++xi) ldsRow[xi] = scratch_filter_temp[xi];
+
+            for (int xi = 0; xi < width; ++xi)
+                ldsRow[xi] = scratch_filter_temp[xi];
         }
     }
 }
@@ -2340,72 +2367,129 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
     }
 }
 
-void Comb::FrameBuffer::buildCompositeLumaBaseLine(const quint16 *rawLine,
-                                                   int left,
-                                                   int width,
-                                                   double *baseY,
-                                                   double *hiRaw) const
+void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLine,
+                                                            int left,
+                                                            int width,
+                                                            double *baseY4,
+                                                            double *hiRaw,
+                                                            double *lumaSmooth) const
 {
-    if (!rawLine || !baseY || width <= 0)
+    if (!rawLine || width <= 0)
         return;
 
-    // A four-sample group spans one 4fSC cycle. Averaging the group cancels
-    // the chroma alternation and leaves a low-resolution luma floor.
-    //
-    // This is guaranteed-but-incomplete Y:
-    //
-    //   raw = baseY + hiRaw
-    //
-    // Callers may pass hiRaw == nullptr when only the base is needed.
-    if (width >= 4) {
-        int p = 0;
+    if (!baseY4 && !hiRaw && !lumaSmooth)
+        return;
 
-        for (; p + 3 < width; p += 4) {
-            const double avg =
-                0.25 * ((double)rawLine[left + p + 0] +
-                        (double)rawLine[left + p + 1] +
-                        (double)rawLine[left + p + 2] +
-                        (double)rawLine[left + p + 3]);
-
-            baseY[p + 0] = avg;
-            baseY[p + 1] = avg;
-            baseY[p + 2] = avg;
-            baseY[p + 3] = avg;
-        }
-
-        // Non-overlapping tail fill. Reuse the last complete 4-sample phase
-        // window, but only write pixels that were not already covered above.
-        if (p < width) {
-            const int tailBase = std::max(0, width - 4);
-            const double avg =
-                0.25 * ((double)rawLine[left + tailBase + 0] +
-                        (double)rawLine[left + tailBase + 1] +
-                        (double)rawLine[left + tailBase + 2] +
-                        (double)rawLine[left + tailBase + 3]);
-
-            for (int x = p; x < width; ++x) {
-                baseY[x] = avg;
-            }
-        }
-    } else {
-        // Degenerate active widths should not happen in normal NTSC 4fSC use,
-        // but keep the helper total and safe.
+    // Degenerate active widths should not happen in normal NTSC 4fSC use.
+    if (width < 4) {
         double avg = 0.0;
-        for (int x = 0; x < width; ++x) {
+        for (int x = 0; x < width; ++x)
             avg += (double)rawLine[left + x];
-        }
         avg /= (double)width;
 
-        for (int x = 0; x < width; ++x) {
-            baseY[x] = avg;
+        if (baseY4) {
+            for (int x = 0; x < width; ++x)
+                baseY4[x] = avg;
+        }
+        if (hiRaw) {
+            for (int x = 0; x < width; ++x)
+                hiRaw[x] = (double)rawLine[left + x] - avg;
+        }
+        if (lumaSmooth) {
+            for (int x = 0; x < width; ++x)
+                lumaSmooth[x] = avg;
+        }
+        return;
+    }
+
+    // First pass: hard 4fSC-cycle luma base and optional high-frequency residual.
+    // No temporary block vector; each block average is written directly.
+    int p = 0;
+    for (; p + 3 < width; p += 4) {
+        const double y =
+            0.25 * ((double)rawLine[left + p + 0] +
+                    (double)rawLine[left + p + 1] +
+                    (double)rawLine[left + p + 2] +
+                    (double)rawLine[left + p + 3]);
+
+        if (baseY4) {
+            baseY4[p + 0] = y;
+            baseY4[p + 1] = y;
+            baseY4[p + 2] = y;
+            baseY4[p + 3] = y;
+        }
+
+        if (hiRaw) {
+            hiRaw[p + 0] = (double)rawLine[left + p + 0] - y;
+            hiRaw[p + 1] = (double)rawLine[left + p + 1] - y;
+            hiRaw[p + 2] = (double)rawLine[left + p + 2] - y;
+            hiRaw[p + 3] = (double)rawLine[left + p + 3] - y;
         }
     }
 
-    if (hiRaw) {
-        for (int x = 0; x < width; ++x) {
-            hiRaw[x] = (double)rawLine[left + x] - baseY[x];
+    // Tail: reuse final complete 4-sample window.
+    if (p < width) {
+        const int tb = std::max(0, width - 4);
+        const double y =
+            0.25 * ((double)rawLine[left + tb + 0] +
+                    (double)rawLine[left + tb + 1] +
+                    (double)rawLine[left + tb + 2] +
+                    (double)rawLine[left + tb + 3]);
+
+        for (int x = p; x < width; ++x) {
+            if (baseY4)
+                baseY4[x] = y;
+            if (hiRaw)
+                hiRaw[x] = (double)rawLine[left + x] - y;
         }
     }
+
+    if (!lumaSmooth)
+        return;
+
+    // lumaSmooth is the interpolated curve through 4-sample block centers.
+    // Avoid floor() per pixel by filling spans between block anchors directly.
+    auto blockAvg = [&](int block)->double {
+        const int x0 = std::clamp(block * 4, 0, std::max(0, width - 4));
+        return 0.25 * ((double)rawLine[left + x0 + 0] +
+                       (double)rawLine[left + x0 + 1] +
+                       (double)rawLine[left + x0 + 2] +
+                       (double)rawLine[left + x0 + 3]);
+    };
+
+    const int blockCount = (width + 3) / 4;
+    if (blockCount <= 1) {
+        const double y = blockAvg(0);
+        for (int x = 0; x < width; ++x)
+            lumaSmooth[x] = y;
+        return;
+    }
+
+    // Head clamp before first anchor center.
+    const double yFirst = blockAvg(0);
+    if (width > 0) lumaSmooth[0] = yFirst;
+    if (width > 1) lumaSmooth[1] = yFirst;
+
+    for (int b = 0; b < blockCount - 1; ++b) {
+        const double y0 = blockAvg(b);
+        const double y1 = blockAvg(b + 1);
+        const double d  = (y1 - y0) * 0.25;
+
+        const int xStart = std::max(0, b * 4 + 2);
+        const int xEnd   = std::min(width, b * 4 + 6);
+
+        for (int x = xStart; x < xEnd; ++x) {
+            // t = (x - (b*4 + 1.5)) / 4.0
+            const double t = ((double)x - ((double)b * 4.0 + 1.5)) * 0.25;
+            lumaSmooth[x] = y0 + (y1 - y0) * t;
+        }
+    }
+
+    // Tail clamp after last anchor center.
+    const double yLast = blockAvg(blockCount - 1);
+    const int tailStart = std::max(0, (blockCount - 1) * 4 + 2);
+    for (int x = tailStart; x < width; ++x)
+        lumaSmooth[x] = yLast;
 }
 //diagnostic tool for comb development 
 void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const
@@ -3596,11 +3680,12 @@ void Comb::FrameBuffer::produceY()
         if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
         if ((int)scratch_comp_res.size() < width) scratch_comp_res.resize(width, 0.0);
         
-        double *baseY = scratch_frameBCenter.data();
+        double *baseY4 = scratch_frameBCenter.data();
         double *hiRaw = scratch_fieldBCenter.data();
         
-        buildCompositeLumaBaseLine(rawLine, left, width, baseY, hiRaw);
-        
+		buildCompositeLumaDecompositionLine(rawLine, left, width,
+											baseY4, hiRaw, nullptr);        
+
         std::copy(hiRaw, hiRaw + width, scratch_comp_res.begin());
         
         // Per-pixel outputs for the second-pass election:
@@ -3957,7 +4042,7 @@ void Comb::FrameBuffer::produceY()
         auto writePixel = [&](int x, double alphaEff) {
             const int h = left + x;
 
-            const double yOut = baseY[x] + (hiRaw[x] - alphaEff * cHat[x]);
+            const double yOut = baseY4[x] + (hiRaw[x] - alphaEff * cHat[x]);
             Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet)
                          : yOut;
 
