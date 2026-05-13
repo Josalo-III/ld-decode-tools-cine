@@ -27,35 +27,11 @@ struct CompositeOwnershipEvidence {
     double residualMidIRE = 0.0;
     double residualCoarseIRE = 0.0;
 
-    // Legacy/current ld-chroma-decoder names.  These are retained so the
-    // comb/candidate decoder can move to the shared type without a semantic
-    // rewrite.  New code should generally prefer residual*IRE unless it is
-    // specifically describing bandpass evidence.
-    double bandpassFineIRE = 0.0;
-    double bandpassMidIRE = 0.0;
-    double bandpassCoarseIRE = 0.0;
-
     double lumaExcursionIRE = 0.0;
     double residualFitErrorIRE = 0.0;
     double lumaIncursionRiskIRE = 0.0;
     double icebergAlienYFraction = 0.0;
     double lumaShapeContinuation = 0.0;
-
-    // ---------------------------------------------------------------------
-    // Legacy / comb-candidate chroma evidence
-    // ---------------------------------------------------------------------
-
-    // Current ld-chroma-decoder evidence.  These fields are shared so both
-    // decoders can inspect or preserve comparable evidence, but generic
-    // ownership policy should not depend on comb-family candidate details.
-    double locked1DChromaIRE = 0.0;
-
-    double fieldAChromaIRE = 0.0;
-    double fieldBChromaIRE = 0.0;
-    double frameChromaIRE = 0.0;
-    double candidateSpreadIRE = 0.0;
-    double frameFieldAgreementIRE = 0.0;
-    double frameIQCoherence = 0.0;
 
     // ---------------------------------------------------------------------
     // Composite / carrier-domain evidence
@@ -103,6 +79,16 @@ struct CompositeOwnershipEvidence {
     double quarterBoundaryPrior = 0.0;
     double quarterCoincidentTransition = 0.0;
     double quarterImpulseYPrior = 0.0;
+
+    // Difference between the two legal 4fsc-cycle coarse-Y explanations after
+    // expansion to the full sample grid:
+    //
+    //     quarterOffsetYDeltaIRE = abs(expandedB - expandedA)
+    //
+    // This is not final luma.  It marks where one 4fsc cancellation phase
+    // strands different material in the residual than the other.
+    double quarterOffsetYDeltaIRE = 0.0;
+    double quarterOffsetYPrior = 0.0;
 
     // ---------------------------------------------------------------------
     // Chroma-envelope / NTSC IQ evidence
@@ -163,77 +149,33 @@ struct CompositeOwnershipEvidence {
 
     double ownershipConflict = 0.0;
 
-    // Shared base claims.
+    // Composite-model attribution claims.
     //
     // lumaClaim:
     //     Attribution that contested residual energy is better explained as
-    //     luma than chroma.  In ld-chroma-decoder this also acts as an
-    //     alien-Y escape hatch for comb candidate construction.
+    //     luma than chroma.
     //
-    // chromaClaim:
-    //     Generic combined chroma attribution used by current
-    //     ld-chroma-decoder.  Model-based decoders may populate decomposed
-    //     claims and fold them into this field.
+    // The chroma side is deliberately decomposed.  There is no generic
+    // chromaClaim field here because the composite decoder should preserve
+    // whether the claim came from carrier, envelope, sideband, or current
+    // NTSC composite evidence.
     //
     // uncertainClaim:
-    //     Remaining unattributed confidence.  The default convention is:
+    //     Remaining unattributed confidence.  The convention is:
     //
-    //         uncertainClaim = 1 - max(lumaClaim, chromaClaim)
+    //         uncertainClaim = 1 - max(lumaClaim, combined chroma claim)
     //
     double lumaClaim = 0.0;
-    double chromaClaim = 0.0;
     double uncertainClaim = 1.0;
 
-    // Decomposed model claims.
-    //
-    // Generic/PAL-safe names:
+    // Generic/PAL-safe decomposed chroma claims.
     double carrierChromaClaim = 0.0;
     double envelopeChromaClaim = 0.0;
     double sidebandChromaClaim = 0.0;
 
-    // Current NTSC/composite decoder names retained for compatibility.
+    // Current NTSC/composite decoder claim aliases.
     double compositeChromaClaim = 0.0;
     double iqEnvelopeClaim = 0.0;
-};
-
-struct CombOwnershipEvidence {
-    // ---------------------------------------------------------------------
-    // Luma / residual waveform evidence used by current comb.cpp
-    // ---------------------------------------------------------------------
-
-    double bandpassFineIRE = 0.0;
-    double bandpassMidIRE = 0.0;
-    double bandpassCoarseIRE = 0.0;
-
-    double lumaExcursionIRE = 0.0;
-    double residualFitErrorIRE = 0.0;
-    double lumaIncursionRiskIRE = 0.0;
-    double icebergAlienYFraction = 0.0;
-    double lumaShapeContinuation = 0.0;
-
-    // ---------------------------------------------------------------------
-    // Comb-candidate chroma evidence
-    // ---------------------------------------------------------------------
-
-    double locked1DChromaIRE = 0.0;
-
-    double fieldAChromaIRE = 0.0;
-    double fieldBChromaIRE = 0.0;
-    double frameChromaIRE = 0.0;
-    double candidateSpreadIRE = 0.0;
-    double frameFieldAgreementIRE = 0.0;
-    double frameIQCoherence = 0.0;
-
-    // ---------------------------------------------------------------------
-    // Carrier / attribution scores used by current comb ownership logic
-    // ---------------------------------------------------------------------
-
-    double carrierPlausibility = 0.0;
-    double ownershipConflict = 0.0;
-
-    double lumaClaim = 0.0;
-    double chromaClaim = 0.0;
-    double uncertainClaim = 1.0;
 };
 
 inline double clamp01(double v)
@@ -266,30 +208,19 @@ inline double strongestChromaCoherence(const CompositeOwnershipEvidence &e)
 {
     return std::max({
         combinedCarrierChromaCoherence(e),
-        combinedEnvelopeChromaCoherence(e),
-        e.frameIQCoherence
+        combinedEnvelopeChromaCoherence(e)
     });
 }
 
-inline double combinedChromaClaim(const CompositeOwnershipEvidence &e)
+inline double combinedCompositeChromaClaim(const CompositeOwnershipEvidence &e)
 {
     return std::max({
-        e.chromaClaim,
         e.carrierChromaClaim,
         e.envelopeChromaClaim,
         e.sidebandChromaClaim,
         e.compositeChromaClaim,
         e.iqEnvelopeClaim
     });
-}
-
-inline void normalizeLegacyOwnershipClaims(CompositeOwnershipEvidence &e)
-{
-    e.lumaClaim = clamp01(e.lumaClaim);
-    e.chromaClaim = clamp01(e.chromaClaim);
-
-    e.uncertainClaim = clamp01(
-        1.0 - std::max(e.lumaClaim, e.chromaClaim));
 }
 
 inline void normalizeCompositeOwnershipClaims(CompositeOwnershipEvidence &e)
@@ -303,20 +234,21 @@ inline void normalizeCompositeOwnershipClaims(CompositeOwnershipEvidence &e)
     e.compositeChromaClaim = clamp01(e.compositeChromaClaim);
     e.iqEnvelopeClaim = clamp01(e.iqEnvelopeClaim);
 
-    e.chromaClaim = clamp01(combinedChromaClaim(e));
+    const double chromaClaim = clamp01(combinedCompositeChromaClaim(e));
 
     e.uncertainClaim = clamp01(
-        1.0 - std::max(e.lumaClaim, e.chromaClaim));
+        1.0 - std::max(e.lumaClaim, chromaClaim));
 }
 
 inline void applyOwnershipConflictSuppression(CompositeOwnershipEvidence &e,
                                               double conflictSuppress)
 {
     e.lumaClaim = clamp01(e.lumaClaim);
-    e.chromaClaim = clamp01(combinedChromaClaim(e));
+
+    const double chromaClaim = clamp01(combinedCompositeChromaClaim(e));
 
     const double conflict = std::sqrt(
-        std::max(0.0, e.lumaClaim * e.chromaClaim));
+        std::max(0.0, e.lumaClaim * chromaClaim));
 
     e.ownershipConflict = std::max(e.ownershipConflict, conflict);
 
@@ -325,7 +257,6 @@ inline void applyOwnershipConflictSuppression(CompositeOwnershipEvidence &e,
         1.0 - clamp01(conflictSuppress) * conflict);
 
     e.lumaClaim *= scale;
-    e.chromaClaim *= scale;
 
     e.carrierChromaClaim *= scale;
     e.envelopeChromaClaim *= scale;
@@ -334,41 +265,6 @@ inline void applyOwnershipConflictSuppression(CompositeOwnershipEvidence &e,
     e.iqEnvelopeClaim *= scale;
 
     normalizeCompositeOwnershipClaims(e);
-}
-
-
-inline CompositeOwnershipEvidence toCompositeOwnershipEvidence(
-    const CombOwnershipEvidence &e)
-{
-    CompositeOwnershipEvidence out;
-
-    out.bandpassFineIRE = e.bandpassFineIRE;
-    out.bandpassMidIRE = e.bandpassMidIRE;
-    out.bandpassCoarseIRE = e.bandpassCoarseIRE;
-
-    out.lumaExcursionIRE = e.lumaExcursionIRE;
-    out.residualFitErrorIRE = e.residualFitErrorIRE;
-    out.lumaIncursionRiskIRE = e.lumaIncursionRiskIRE;
-    out.icebergAlienYFraction = e.icebergAlienYFraction;
-    out.lumaShapeContinuation = e.lumaShapeContinuation;
-
-    out.locked1DChromaIRE = e.locked1DChromaIRE;
-
-    out.fieldAChromaIRE = e.fieldAChromaIRE;
-    out.fieldBChromaIRE = e.fieldBChromaIRE;
-    out.frameChromaIRE = e.frameChromaIRE;
-    out.candidateSpreadIRE = e.candidateSpreadIRE;
-    out.frameFieldAgreementIRE = e.frameFieldAgreementIRE;
-    out.frameIQCoherence = e.frameIQCoherence;
-
-    out.carrierPlausibility = e.carrierPlausibility;
-    out.ownershipConflict = e.ownershipConflict;
-
-    out.lumaClaim = e.lumaClaim;
-    out.chromaClaim = e.chromaClaim;
-    out.uncertainClaim = e.uncertainClaim;
-
-    return out;
 }
 
 } // namespace lddecode
