@@ -196,6 +196,46 @@ struct CompositeOwnershipEvidence {
     double iqEnvelopeClaim = 0.0;
 };
 
+struct CombOwnershipEvidence {
+    // ---------------------------------------------------------------------
+    // Luma / residual waveform evidence used by current comb.cpp
+    // ---------------------------------------------------------------------
+
+    double bandpassFineIRE = 0.0;
+    double bandpassMidIRE = 0.0;
+    double bandpassCoarseIRE = 0.0;
+
+    double lumaExcursionIRE = 0.0;
+    double residualFitErrorIRE = 0.0;
+    double lumaIncursionRiskIRE = 0.0;
+    double icebergAlienYFraction = 0.0;
+    double lumaShapeContinuation = 0.0;
+
+    // ---------------------------------------------------------------------
+    // Comb-candidate chroma evidence
+    // ---------------------------------------------------------------------
+
+    double locked1DChromaIRE = 0.0;
+
+    double fieldAChromaIRE = 0.0;
+    double fieldBChromaIRE = 0.0;
+    double frameChromaIRE = 0.0;
+    double candidateSpreadIRE = 0.0;
+    double frameFieldAgreementIRE = 0.0;
+    double frameIQCoherence = 0.0;
+
+    // ---------------------------------------------------------------------
+    // Carrier / attribution scores used by current comb ownership logic
+    // ---------------------------------------------------------------------
+
+    double carrierPlausibility = 0.0;
+    double ownershipConflict = 0.0;
+
+    double lumaClaim = 0.0;
+    double chromaClaim = 0.0;
+    double uncertainClaim = 1.0;
+};
+
 inline double clamp01(double v)
 {
     return std::clamp(v, 0.0, 1.0);
@@ -294,6 +334,41 @@ inline void applyOwnershipConflictSuppression(CompositeOwnershipEvidence &e,
     e.iqEnvelopeClaim *= scale;
 
     normalizeCompositeOwnershipClaims(e);
+}
+
+
+inline CompositeOwnershipEvidence toCompositeOwnershipEvidence(
+    const CombOwnershipEvidence &e)
+{
+    CompositeOwnershipEvidence out;
+
+    out.bandpassFineIRE = e.bandpassFineIRE;
+    out.bandpassMidIRE = e.bandpassMidIRE;
+    out.bandpassCoarseIRE = e.bandpassCoarseIRE;
+
+    out.lumaExcursionIRE = e.lumaExcursionIRE;
+    out.residualFitErrorIRE = e.residualFitErrorIRE;
+    out.lumaIncursionRiskIRE = e.lumaIncursionRiskIRE;
+    out.icebergAlienYFraction = e.icebergAlienYFraction;
+    out.lumaShapeContinuation = e.lumaShapeContinuation;
+
+    out.locked1DChromaIRE = e.locked1DChromaIRE;
+
+    out.fieldAChromaIRE = e.fieldAChromaIRE;
+    out.fieldBChromaIRE = e.fieldBChromaIRE;
+    out.frameChromaIRE = e.frameChromaIRE;
+    out.candidateSpreadIRE = e.candidateSpreadIRE;
+    out.frameFieldAgreementIRE = e.frameFieldAgreementIRE;
+    out.frameIQCoherence = e.frameIQCoherence;
+
+    out.carrierPlausibility = e.carrierPlausibility;
+    out.ownershipConflict = e.ownershipConflict;
+
+    out.lumaClaim = e.lumaClaim;
+    out.chromaClaim = e.chromaClaim;
+    out.uncertainClaim = e.uncertainClaim;
+
+    return out;
 }
 
 } // namespace lddecode

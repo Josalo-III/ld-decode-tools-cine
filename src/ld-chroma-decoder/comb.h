@@ -372,7 +372,7 @@ public:
 	// Signal ownership evidence, collected before election. This is not a
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
-	using OwnershipEvidence = lddecode::CompositeOwnershipEvidence;
+	using OwnershipEvidence = lddecode::CombOwnershipEvidence;
 
 	FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
 				const Configuration &configuration_);
@@ -595,9 +595,30 @@ private:
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
 	std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
 	std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
+	std::vector<double> lockedLumaBaseY4_flat;
+	std::vector<double> lockedLumaSmooth_flat;
+	bool lockedLumaCacheValid = false;
+	
+	inline double *lockedLumaBaseY4_line(int line) {
+		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
+	}
+	
+	inline double *lockedLumaSmooth_line(int line) {
+		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
+	}
+	
+	inline const double *lockedLumaBaseY4_line(int line) const {
+		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
+	}
+	
+	inline const double *lockedLumaSmooth_line(int line) const {
+		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
+	}
+	
 	CombTapLine scratch_tapLine;
 	std::array<CombTapLine, 3> tapLineCache;
 	std::array<int, 3> tapLineCacheLine = { -1, -1, -1 };
+
 	unsigned combTapBuildFlags_ = TapBuildAll;
 
 	inline int precleanRingSlot(int lineNumber) const

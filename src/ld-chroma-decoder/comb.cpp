@@ -399,6 +399,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         // (a "half-locked" backdoor some users rely on). Storage is gated on the
         // variant selection, while the locked-only computations remain gated on
         // phaseCompensation inside split2D/scoreFieldVsFrame.
+        
         const bool wantFvf  =
             (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
         const bool wantVdis = configuration.tunables.VDIS_ENABLE;
@@ -431,6 +432,10 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         if (wantLocked) {
             locked1DSource.assign(lines, std::vector<double>(width, 0.0));
             ownershipEvidence.assign(lines, std::vector<OwnershipEvidence>(width));
+        
+            lockedLumaBaseY4_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            lockedLumaSmooth_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            lockedLumaCacheValid = false;
         }
         // Preclean ring is only needed for Frame/FVF in locked mode.
         if (needFrameIQ) {
@@ -449,8 +454,8 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_lateralLine.assign(width, 0.0);
         // low-res luma (chroma cancelled fsc)        
         scratch_lumaBaseY4.assign(width, 0.0);
-		scratch_lumaHiRaw.assign(width, 0.0);
-		scratch_lumaSmooth.assign(width, 0.0);
+        scratch_lumaHiRaw.assign(width, 0.0);
+        scratch_lumaSmooth.assign(width, 0.0);
 
         // Filtering/NR temporaries
         scratch_filter_temp.assign(width, 0.0);
@@ -556,6 +561,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
             else std::fill(row.begin(), row.end(), 0);
         }
     }
+    lockedLumaCacheValid = false;
 }
 
 
@@ -686,7 +692,20 @@ void Comb::FrameBuffer::phaseLocked()
             demodLUTTq_locked[line][i] = (float)lutTq[i];
         }
     }
-
+    // cache fsc-cancelled luma and varietals
+    if (!lockedLumaBaseY4_flat.empty() &&
+        !lockedLumaSmooth_flat.empty() &&
+        demodWidth == width)
+    {
+        for (int line = firstLine; line < lastLine; ++line) {
+            const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
+            buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                                lockedLumaBaseY4_line(line),
+                                                nullptr,
+                                                lockedLumaSmooth_line(line));
+        }
+        lockedLumaCacheValid = true;
+    }
     // --- Pass 2: raw composite demod -> TRI/TRQ ---
     // Pre-demod the full line so the windowed fit in Pass 3 can read
     // neighbour samples without re-tracking dc or re-demodding from raw.
@@ -916,18 +935,46 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
     if (width <= 0 || first >= last) return;
 
-    // Reusable shared 4fSC luma decomposition scratch.
-    // baseY4 is the hard four-sample luma floor; lumaSmooth is the interpolated
-    // guide through those block anchors for slope/crest/iceberg reasoning.
     if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
-    if ((int)scratch_lumaHiRaw.size()   < width) scratch_lumaHiRaw.resize(width, 0.0);
     if ((int)scratch_lumaSmooth.size()  < width) scratch_lumaSmooth.resize(width, 0.0);
 
-    double *lumaBaseY4 = scratch_lumaBaseY4.data();
-    double *lumaHiRaw  = scratch_lumaHiRaw.data();
-    double *lumaSmooth = scratch_lumaSmooth.data();
-
     if ((int)locked1DSource.size() < last) locked1DSource.resize(last);
+
+    // Lazy-build the shared locked luma cache here. This function already runs
+    // before the later locked consumers, so this avoids needing a separate
+    // phaseLocked() integration point.
+    const bool cacheGeometryOk =
+        (demodWidth == width) &&
+        (demodLines > last) &&
+        (width > 0);
+
+    if (cacheGeometryOk) {
+        const size_t need = size_t(demodLines) * size_t(demodWidth);
+
+        if (lockedLumaBaseY4_flat.size() < need ||
+            lockedLumaSmooth_flat.size() < need)
+        {
+            lockedLumaBaseY4_flat.assign(need, 0.0);
+            lockedLumaSmooth_flat.assign(need, 0.0);
+            lockedLumaCacheValid = false;
+        }
+
+        if (!lockedLumaCacheValid) {
+            for (int line = first; line < last; ++line) {
+                const quint16 *rawLine =
+                    rawbuffer.data() + line * videoParameters.fieldWidth;
+
+                buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                                    lockedLumaBaseY4_line(line),
+                                                    nullptr,
+                                                    lockedLumaSmooth_line(line));
+            }
+
+            lockedLumaCacheValid = true;
+        }
+    } else {
+        lockedLumaCacheValid = false;
+    }
 
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
@@ -936,8 +983,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         auto &ldsRow = locked1DSource[line];
         if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
 
-        const double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
-        const double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+        const double bcos =
+            (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
+        const double bsin =
+            (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
 
         double lutTi[4], lutTq[4];
         if (line < (int)demodLUTTi_locked.size()) {
@@ -954,12 +1003,15 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         float *ti4Row = demodTI4fsc_line(line);
         float *tq4Row = demodTQ4fsc_line(line);
 
-        const LineAffine *lineAffine = nullptr;
-        if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
-                && line >= 0 && line < (int)lineAffineLocked.size()
-                && lineAffineLocked[line].valid) {
-            lineAffine = &lineAffineLocked[line];
-        }
+        const bool haveAffine =
+            configuration.residualVideo &&
+            T.Y_LINE_AFFINE_TRIM_ENABLE &&
+            line >= 0 &&
+            line < (int)lineAffineLocked.size() &&
+            lineAffineLocked[line].valid;
+
+        const LineAffine *lineAffine =
+            haveAffine ? &lineAffineLocked[line] : nullptr;
 
         auto applyLineAffine = [&](double &ti, double &tq) {
             if (!lineAffine) return;
@@ -974,12 +1026,19 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             return src[left + rel];
         };
 
-        // Shared 4fSC luma decomposition.
-        // This uses the original raw composite, not clpbuffer[0].
-        buildCompositeLumaDecompositionLine(rawLine, left, width,
-                                            lumaBaseY4,
-                                            nullptr,
-                                            lumaSmooth);
+        const double *lumaSmooth = nullptr;
+        if (lockedLumaCacheValid &&
+            !lockedLumaSmooth_flat.empty() &&
+            demodWidth == width)
+        {
+            lumaSmooth = lockedLumaSmooth_line(line);
+        } else {
+            buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                                scratch_lumaBaseY4.data(),
+                                                nullptr,
+                                                scratch_lumaSmooth.data());
+            lumaSmooth = scratch_lumaSmooth.data();
+        }
 
         auto sampleIQ = [&](int rel, double &outI, double &outQ) {
             rel = std::clamp(rel, 0, width - 1);
@@ -1005,8 +1064,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             double residualFitErrorIRE = 0.0;
             double fine = 0.0, mid = 0.0, coarse = 0.0;
             double directionalEdgeSupport = 0.0;
-            double directionalEdgeAsymmetry = 0.0;
-            double bpLumaPredicted = 0.0;
             double bpLumaModeled = 0.0;
             double icebergAlienYFraction = 0.0;
 
@@ -1027,7 +1084,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double denom = fine + mid + coarse + 1e-9;
             const double fineFrac = fine / denom;
             const double nonFineFrac = std::max(mid, coarse) / denom;
-            const double dominance = std::clamp((fineFrac - nonFineFrac - 0.15) / 0.35, 0.0, 1.0);
+            const double dominance =
+                std::clamp((fineFrac - nonFineFrac - 0.15) / 0.35, 0.0, 1.0);
+
             intakeNyquistRiskIRE = fine * dominance;
 
             double tiLm1 = 0.0, tqLm1 = 0.0, tiLp1 = 0.0, tqLp1 = 0.0;
@@ -1081,17 +1140,16 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double err1IRE = std::hypot(ti - avg1I, tq - avg1Q) * invIreScale;
             const double err2IRE = std::hypot(ti - avg2I, tq - avg2Q) * invIreScale;
             const double iqMagIRE = std::hypot(ti, tq) * invIreScale;
+
             residualFitErrorIRE = 0.65 * err1IRE + 0.35 * err2IRE;
 
             const double incoherence = std::clamp(
                 (residualFitErrorIRE - std::max(1.0, 0.25 * iqMagIRE)) / 4.0,
                 0.0, 1.0);
+
             lumaIncursionRiskIRE = intakeNyquistRiskIRE * incoherence;
 
             {
-                // Use the interpolated chroma-cancelled luma guide for slope
-                // detection. Raw src has chroma oscillations that break
-                // monotonicity on colored text edges.
                 const double cLm2 = lumaSmooth[std::clamp(xi - 2, 0, width - 1)];
                 const double cLm1 = lumaSmooth[std::clamp(xi - 1, 0, width - 1)];
                 const double c0   = lumaSmooth[xi];
@@ -1137,16 +1195,18 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     std::max(1.5, (0.50 * fine) + 1.0),
                     0.0, 1.0);
 
-                directionalEdgeAsymmetry = std::clamp(
+                const double directionalEdgeAsymmetry = std::clamp(
                     (0.65 * crestAsym) + (0.35 * centerAsym),
                     0.0, 1.0);
+
+                directionalEdgeSupport *= (1.0 - 0.35 * directionalEdgeAsymmetry);
             }
 
             if (T.LUMA_ICEBERG_RECOVERY > 0.0 &&
                 directionalEdgeSupport > 0.0 &&
                 xi >= 2 && xi < width - 2)
             {
-                bpLumaPredicted =
+                const double bpLumaPredicted =
                     (lumaSmooth[xi] -
                      0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
 
@@ -1198,7 +1258,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     std::clamp(1.0 - std::max(e.lumaClaim, e.chromaClaim), 0.0, 1.0);
             }
 
-            // Iceberg alien-Y cancellation.
             if (bpLumaModeled != 0.0) {
                 double corrTi = bpLumaModeled * lutTi[ph];
                 double corrTq = bpLumaModeled * lutTq[ph];
@@ -1210,7 +1269,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
 
-            // Export locked IQ onto the common 4fSC frame exactly once here.
             double ti4 = 0.0;
             double tq4 = 0.0;
             lockedTo4fsc(ti, tq, bcos, bsin, ti4, tq4);
@@ -1218,11 +1276,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             ti4Row[xi] = (float)ti4;
             tq4Row[xi] = (float)tq4;
 
-            // Remodulate the common 4fSC export back to scalar composite.
             ldsRow[xi] = remod4fscToComposite(ti4, tq4, h);
         }
 
-        // Optional same-phase smooth on the exported locked 1D scalar source.
         if (FIELD_BUCKET_SMOOTH_STRENGTH > 0.0) {
             if ((int)scratch_filter_temp.size() < width)
                 scratch_filter_temp.assign(width, 0.0);
@@ -3335,7 +3391,6 @@ void Comb::FrameBuffer::splitIQ()
 // to align the residual Y demod with the locked chroma reference.
 void Comb::FrameBuffer::splitIQlocked()
 {
-    // Safety check: ensure rawbuffer has enough lines to cover active video
     const int actualHeight = rawbuffer.size() / videoParameters.fieldWidth;
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = std::min(videoParameters.lastActiveFrameLine, actualHeight);
@@ -3345,7 +3400,8 @@ void Comb::FrameBuffer::splitIQlocked()
     const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
     const int width  = right - left;
 
-    // Ensure TRI/TRQ buffers sized  TI/TQ already guaranteed from phaseLocked
+    if (width <= 0 || firstLine >= lastLine) return;
+
     const int requiredLines = lastLine + 1;
     const size_t need = static_cast<size_t>(requiredLines) * static_cast<size_t>(width);
     if (demodTRI_flat.size() < need) {
@@ -3353,7 +3409,6 @@ void Comb::FrameBuffer::splitIQlocked()
         demodTRQ_flat.assign(need, 0.0f);
     }
 
-    // basisLockedInit guaranteed set by phaseLocked; guard retained for safety
     if (!basisLockedInit) {
         double Ce = 1.0, Se = 0.0;
         basisCoeffs(Ce, Se);
@@ -3365,6 +3420,9 @@ void Comb::FrameBuffer::splitIQlocked()
         }
         basisLockedInit = true;
     }
+
+    if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
+    if ((int)scratch_lumaSmooth.size()  < width) scratch_lumaSmooth.resize(width, 0.0);
 
     double* preI = scratch_preI.data();
     double* preQ = scratch_preQ.data();
@@ -3384,6 +3442,7 @@ void Comb::FrameBuffer::splitIQlocked()
             bcos = (double)demodBurstCos[line];
             bsin = (double)demodBurstSin[line];
         }
+
         double lutTi[4], lutTq[4];
         if (line < (int)demodLUTTi_locked.size()) {
             for (int i = 0; i < 4; ++i) {
@@ -3394,41 +3453,68 @@ void Comb::FrameBuffer::splitIQlocked()
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
         }
 
-        double       *Y     = componentFrame->y(line);
-        float        *tiRow = demodTI_line(line);
-        float        *tqRow = demodTQ_line(line);
-        float        *triRow = demodTRI_line(line);
-        float        *trqRow = demodTRQ_line(line);
-        const double *srcClp = clpbuffer[srcBuf].pixel[line];
+        float *tiRow  = demodTI_line(line);
+        float *tqRow  = demodTQ_line(line);
+        float *triRow = demodTRI_line(line);
+        float *trqRow = demodTRQ_line(line);
 
-        // PASS 1: initialise Y from comb estimate (needed for HP-Y in Pass 2)
-        for (int h = left; h < right; ++h)
-            Y[h] = (double)rawLine[h] - srcClp[h];
+        const double *lumaSmooth = nullptr;
+        if (lockedLumaCacheValid &&
+            !lockedLumaSmooth_flat.empty() &&
+            demodWidth == width)
+        {
+            lumaSmooth = lockedLumaSmooth_line(line);
+        } else {
+            buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                                scratch_lumaBaseY4.data(),
+                                                nullptr,
+                                                scratch_lumaSmooth.data());
+            lumaSmooth = scratch_lumaSmooth.data();
+        }
 
-        // PASS 2: demod raw composite -> TRI/TRQ; build preI/preQ and yI/yQ
-        double dc = (double)rawLine[left];
-        constexpr double DC_ALPHA = 1.0 / 64.0;
+        // demodTRI/TRQ are already generated by phaseLocked(). Do not recompute
+        // them here unless a malformed path left them unavailable.
+        const bool haveTri =
+            triRow &&
+            trqRow &&
+            demodTRI_flat.size() >= size_t(line + 1) * size_t(demodWidth) &&
+            demodTRQ_flat.size() >= size_t(line + 1) * size_t(demodWidth);
 
+        if (!haveTri) {
+            double dc = (double)rawLine[left];
+            constexpr double DC_ALPHA = 1.0 / 64.0;
+
+            for (int xi = 0; xi < width; ++xi) {
+                const int h = left + xi;
+                dc += DC_ALPHA * ((double)rawLine[h] - dc);
+                const double vraw = (double)rawLine[h] - dc;
+                const int ph = (h & 3);
+
+                if (triRow) triRow[xi] = (float)(vraw * lutTi[ph]);
+                if (trqRow) trqRow[xi] = (float)(vraw * lutTq[ph]);
+            }
+        }
+
+        // Build pre-IQ and HP-Y leakage buffers. The HP-Y scaffold now comes
+        // from the chroma-cancelled 4fSC luma smooth cache rather than the
+        // preliminary component Y estimate, so this pass no longer needs to
+        // initialize Y from raw - selected chroma.
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
-            dc += DC_ALPHA * ((double)rawLine[h] - dc);
-            const double vraw = (double)rawLine[h] - dc;
             const int ph = (h & 3);
 
             const double ti = tiRow ? (double)tiRow[xi] : 0.0;
             const double tq = tqRow ? (double)tqRow[xi] : 0.0;
-            const double ri = vraw * lutTi[ph];
-            const double rq = vraw * lutTq[ph];
-
-            triRow[xi] = (float)ri;
-            trqRow[xi] = (float)rq;
 
             preI[xi] = ti * effGI;
             preQ[xi] = tq * effGQ;
 
-            const int hm = (h > left)      ? h - 1 : h;
-            const int hp = (h < right - 1) ? h + 1 : h;
-            const double yh = Y[h] - 0.5 * (Y[hm] + Y[hp]);
+            const int xm = (xi > 0)         ? xi - 1 : xi;
+            const int xp = (xi < width - 1) ? xi + 1 : xi;
+
+            const double yh =
+                lumaSmooth[xi] - 0.5 * (lumaSmooth[xm] + lumaSmooth[xp]);
+
             yhp[xi] = yh;
             yI[xi] = yh * lutTi[ph];
             yQ[xi] = yh * lutTq[ph];
@@ -3444,11 +3530,13 @@ void Comb::FrameBuffer::splitIQlocked()
                 for (int xi = 0; xi < width; ++xi) {
                     const double yi  = yI[xi];
                     const double yqv = yQ[xi];
-                    yI[xi] = la.R[0][0]*yi + la.R[0][1]*yqv;
-                    yQ[xi] = la.R[1][0]*yi + la.R[1][1]*yqv;
+                    yI[xi] = la.R[0][0] * yi + la.R[0][1] * yqv;
+                    yQ[xi] = la.R[1][0] * yi + la.R[1][1] * yqv;
                 }
             }
         }
+
+        (void)srcBuf;
     }
 }
 
@@ -3593,6 +3681,7 @@ void Comb::FrameBuffer::filterIQLocked()
 }
 
 // Coherent Y rebuild (produceY)
+// Coherent Y rebuild (produceY)
 void Comb::FrameBuffer::produceY()
 {
     if (!configuration.phaseCompensation) return;
@@ -3608,15 +3697,43 @@ void Comb::FrameBuffer::produceY()
     const bool enableResidualY = T.VET_ENABLE_RESIDUAL_Y;
     const double invI = this->invIreScale;
 
-    // Window size (must be multiple of 4).
+    const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
+
     const int WIN  = std::max(4, (T.VET_ALIGN_WIN_SAMPLES / 4) * 4);
     const int HALF = WIN / 2;
 
-    // Fit gating. These remain deliberately conservative; the local affine is
-    // useful, but failed vets must not steer the chroma estimate used for Y.
     const double MIN_FIT_IRE      = 2.0;
     const double MAX_FIT_IRE      = 35.0;
     const double SAT_TROUBLE_IRE  = 18.0;
+
+    const double MIN_ALPHA = 0.75;
+    const double MAX_ALPHA = 1.25;
+    const double MIN_SUB_CHROMA_IRE = 2.0;
+
+    const bool showMap = configuration.showMap;
+    const bool chromaLikeEnabled = (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0);
+    const double chromaLikeWeight = T.VET_Y_CHROMA_LIKE_WEIGHT;
+    const bool do3D =
+        (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
+
+    if ((int)scratch_frameBCenter.size() < width) scratch_frameBCenter.resize(width, 0.0);
+    if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
+    if ((int)scratch_comp_res.size() < width) scratch_comp_res.resize(width, 0.0);
+
+    if ((int)scratch_fieldGate.size() < width) scratch_fieldGate.resize(width, 1.0);
+    if ((int)scratch_fieldLine.size() < width) scratch_fieldLine.resize(width, 0.0);
+    if ((int)scratch_fieldBLine.size() < width) scratch_fieldBLine.resize(width, 0.0);
+    if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
+
+    if ((int)scratch_yhp.size() < width) scratch_yhp.resize(width, 0.0);
+    if ((int)scratch_yI.size() < width) scratch_yI.resize(width, 0.0);
+    if ((int)scratch_yQ.size() < width) scratch_yQ.resize(width, 0.0);
+    if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
+    if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
+    if ((int)scratch_preI_ext.size() < width) scratch_preI_ext.resize(width, 0.0);
+    if ((int)scratch_preQ_ext.size() < width) scratch_preQ_ext.resize(width, 0.0);
+    if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
+    if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
@@ -3626,17 +3743,14 @@ void Comb::FrameBuffer::produceY()
         const double bsin = demodBurstSin[line];
 
         double *Y = componentFrame->y(line);
-
-        const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
         const double *clpLine = clpbuffer[srcBuf].pixel[line];
 
-        // Baseline when residual Y is disabled: preserve old behavior.
         if (!enableResidualY) {
             for (int h = left; h < right; ++h) {
                 Y[h] = (double)rawLine[h] - clpLine[h];
             }
 
-            if (configuration.showMap) {
+            if (showMap) {
                 std::fill(w2d_frame_weight[line].begin(),
                           w2d_frame_weight[line].end(), 0.0f);
             }
@@ -3648,71 +3762,46 @@ void Comb::FrameBuffer::produceY()
         float *tiRowW = demodTI_line(line);
         float *tqRowW = demodTQ_line(line);
 
-        // If selected chroma demod rows are unavailable, fall back to the direct
-        // selected-comb subtraction path.
         if (!tiRow || !tqRow || !tiRowW || !tqRowW) {
             for (int h = left; h < right; ++h) {
                 Y[h] = (double)rawLine[h] - clpLine[h];
             }
 
-            if (configuration.showMap) {
+            if (showMap) {
                 std::fill(w2d_frame_weight[line].begin(),
                           w2d_frame_weight[line].end(), 0.0f);
             }
             continue;
         }
 
-        // --------------------------------------------------------------------
-        // Guaranteed low-resolution Y base.
-        //
-        // Each four-sample group spans one 4fSC cycle. Its average is the
-        // low-resolution luma floor: guaranteed Y, but incomplete. All later
-        // chroma/residual decisions in produceY operate on the high-frequency
-        // remainder above this base.
-        //
-        //   raw = baseY + hiRaw
-        //   Y   = baseY + hiRaw - alpha * cHat
-        //
-        // This is a late-stage produceY decomposition. It does not feed earlier
-        // comb/election/ownership stages unless a separate earlier callsite is added.
-        // --------------------------------------------------------------------
-        if ((int)scratch_frameBCenter.size() < width) scratch_frameBCenter.resize(width, 0.0);
-        if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
-        if ((int)scratch_comp_res.size() < width) scratch_comp_res.resize(width, 0.0);
-        
         double *baseY4 = scratch_frameBCenter.data();
-        double *hiRaw = scratch_fieldBCenter.data();
-        
-		buildCompositeLumaDecompositionLine(rawLine, left, width,
-											baseY4, hiRaw, nullptr);        
+        double *hiRaw  = scratch_fieldBCenter.data();
+
+        const double *baseY4Src = nullptr;
+        if (lockedLumaCacheValid &&
+            !lockedLumaBaseY4_flat.empty() &&
+            demodWidth == width)
+        {
+            baseY4Src = lockedLumaBaseY4_line(line);
+        } else {
+            buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                                scratch_lumaBaseY4.data(),
+                                                nullptr,
+                                                nullptr);
+            baseY4Src = scratch_lumaBaseY4.data();
+        }
+
+        for (int x = 0; x < width; ++x) {
+            baseY4[x] = baseY4Src[x];
+            hiRaw[x]  = (double)rawLine[left + x] - baseY4Src[x];
+        }
 
         std::copy(hiRaw, hiRaw + width, scratch_comp_res.begin());
-        
-        // Per-pixel outputs for the second-pass election:
-        // - cHat: remodulated chroma estimate to subtract from hiRaw
-        // - tiAdj/tqAdj: adjusted selected chroma vectors in common 4fSC space
-        // - vetConf: local fit confidence
-        if ((int)scratch_fieldGate.size() < width) scratch_fieldGate.resize(width, 1.0);
-        if ((int)scratch_fieldLine.size() < width) scratch_fieldLine.resize(width, 0.0);
-        if ((int)scratch_fieldBLine.size() < width) scratch_fieldBLine.resize(width, 0.0);
-        if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
 
-        double *cHat    = scratch_fieldGate.data();
-        double *tiAdjLn = scratch_fieldLine.data();
-        double *tqAdjLn = scratch_fieldBLine.data();
-        double *vetConf = scratch_lateralLine.data();
-
-        // --------------------------------------------------------------------
-        // Precompute per-sample window contributions once per line.
-        // --------------------------------------------------------------------
-        if ((int)scratch_yhp.size() < width) scratch_yhp.resize(width, 0.0);
-        if ((int)scratch_yI.size() < width) scratch_yI.resize(width, 0.0);
-        if ((int)scratch_yQ.size() < width) scratch_yQ.resize(width, 0.0);
-        if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
-        if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
-        if ((int)scratch_preI_ext.size() < width) scratch_preI_ext.resize(width, 0.0);
-        if ((int)scratch_preQ_ext.size() < width) scratch_preQ_ext.resize(width, 0.0);
-        if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
+        double *cHat        = scratch_fieldGate.data();
+        double *tiAdjLocked = scratch_fieldLine.data();
+        double *tqAdjLocked = scratch_fieldBLine.data();
+        double *vetConf     = scratch_lateralLine.data();
 
         double *cSTT00 = scratch_yhp.data();
         double *cSTT01 = scratch_yI.data();
@@ -3726,21 +3815,19 @@ void Comb::FrameBuffer::produceY()
         for (int x = 0; x < width; ++x) {
             const int h = left + x;
 
-            const double tiLocked = (double)tiRow[x];
-            const double tqLocked = (double)tqRow[x];
+            const double tiLocked0 = (double)tiRow[x];
+            const double tqLocked0 = (double)tqRow[x];
 
-            // Selected chroma estimate: locked basis -> common 4fSC basis.
             double ti = 0.0;
             double tq = 0.0;
-            lockedTo4fsc(tiLocked, tqLocked, bcos, bsin, ti, tq);
+            lockedTo4fsc(tiLocked0, tqLocked0, bcos, bsin, ti, tq);
 
-            // Residual target: high-frequency composite above the 4-pixel Y base.
             double ri = 0.0;
             double rq = 0.0;
             demod4fscFromComposite(hiRaw[x], h, ri, rq);
 
-            tiAdjLn[x] = ti;
-            tqAdjLn[x] = tq;
+            tiAdjLocked[x] = ti;
+            tqAdjLocked[x] = tq;
 
             const double magT_ire = std::hypot(ti, tq) * invI;
             const double magR_ire = std::hypot(ri, rq) * invI;
@@ -3775,10 +3862,7 @@ void Comb::FrameBuffer::produceY()
             cN[x] = 1.0;
         }
 
-        // Sliding window sums. The window shifts to stay in-bounds, not shrink.
         const int winN = (width <= WIN) ? width : WIN;
-        int a = 0;
-        int b = winN - 1;
 
         double sSTT00 = 0.0;
         double sSTT01 = 0.0;
@@ -3789,97 +3873,37 @@ void Comb::FrameBuffer::produceY()
         double sSRT11 = 0.0;
         double sN = 0.0;
 
-        for (int x = a; x <= b; ++x) {
-            sSTT00 += cSTT00[x];
-            sSTT01 += cSTT01[x];
-            sSTT11 += cSTT11[x];
+        for (int i = 0; i < winN; ++i) {
+            sSTT00 += cSTT00[i];
+            sSTT01 += cSTT01[i];
+            sSTT11 += cSTT11[i];
 
-            sSRT00 += cSRT00[x];
-            sSRT01 += cSRT01[x];
-            sSRT10 += cSRT10[x];
-            sSRT11 += cSRT11[x];
+            sSRT00 += cSRT00[i];
+            sSRT01 += cSRT01[i];
+            sSRT10 += cSRT10[i];
+            sSRT11 += cSRT11[i];
 
-            sN += cN[x];
+            sN += cN[i];
         }
 
-        // --------------------------------------------------------------------
-        // First pass: local affine/vet and remodulated cHat.
-        // --------------------------------------------------------------------
         for (int x = 0; x < width; ++x) {
             const int h = left + x;
 
             if (width > WIN) {
-                int aWant = x - HALF;
-                int bWant = x + HALF - 1;
+                if (x > HALF && x <= width - HALF) {
+                    const int removeIdx = x - HALF - 1;
+                    const int addIdx    = x + HALF - 1;
 
-                if (aWant < 0) {
-                    bWant += -aWant;
-                    aWant = 0;
-                }
+                    sSTT00 += cSTT00[addIdx] - cSTT00[removeIdx];
+                    sSTT01 += cSTT01[addIdx] - cSTT01[removeIdx];
+                    sSTT11 += cSTT11[addIdx] - cSTT11[removeIdx];
 
-                if (bWant >= width) {
-                    const int over = bWant - (width - 1);
-                    bWant -= over;
-                    aWant -= over;
-                    if (aWant < 0) aWant = 0;
-                }
+                    sSRT00 += cSRT00[addIdx] - cSRT00[removeIdx];
+                    sSRT01 += cSRT01[addIdx] - cSRT01[removeIdx];
+                    sSRT10 += cSRT10[addIdx] - cSRT10[removeIdx];
+                    sSRT11 += cSRT11[addIdx] - cSRT11[removeIdx];
 
-                while (a < aWant) {
-                    sSTT00 -= cSTT00[a];
-                    sSTT01 -= cSTT01[a];
-                    sSTT11 -= cSTT11[a];
-
-                    sSRT00 -= cSRT00[a];
-                    sSRT01 -= cSRT01[a];
-                    sSRT10 -= cSRT10[a];
-                    sSRT11 -= cSRT11[a];
-
-                    sN -= cN[a];
-                    ++a;
-                }
-
-                while (a > aWant) {
-                    --a;
-
-                    sSTT00 += cSTT00[a];
-                    sSTT01 += cSTT01[a];
-                    sSTT11 += cSTT11[a];
-
-                    sSRT00 += cSRT00[a];
-                    sSRT01 += cSRT01[a];
-                    sSRT10 += cSRT10[a];
-                    sSRT11 += cSRT11[a];
-
-                    sN += cN[a];
-                }
-
-                while (b < bWant) {
-                    ++b;
-
-                    sSTT00 += cSTT00[b];
-                    sSTT01 += cSTT01[b];
-                    sSTT11 += cSTT11[b];
-
-                    sSRT00 += cSRT00[b];
-                    sSRT01 += cSRT01[b];
-                    sSRT10 += cSRT10[b];
-                    sSRT11 += cSRT11[b];
-
-                    sN += cN[b];
-                }
-
-                while (b > bWant) {
-                    sSTT00 -= cSTT00[b];
-                    sSTT01 -= cSTT01[b];
-                    sSTT11 -= cSTT11[b];
-
-                    sSRT00 -= cSRT00[b];
-                    sSRT01 -= cSRT01[b];
-                    sSRT10 -= cSRT10[b];
-                    sSRT11 -= cSRT11[b];
-
-                    sN -= cN[b];
-                    --b;
+                    sN += cN[addIdx] - cN[removeIdx];
                 }
             }
 
@@ -3961,7 +3985,6 @@ void Comb::FrameBuffer::produceY()
                 vet.confidence = vet.accept ? c : 0.0;
             }
 
-            // Local affine is useful, but only an accepted local fit may steer it.
             double Rm[2][2] = {{1, 0}, {0, 1}};
             double U[2][2]  = {{1, 0}, {0, 1}};
 
@@ -3973,8 +3996,8 @@ void Comb::FrameBuffer::produceY()
                 U[1][0] = UVet[1][0]; U[1][1] = UVet[1][1];
             }
 
-            const double ti0 = tiAdjLn[x];
-            const double tq0 = tqAdjLn[x];
+            const double ti0 = tiAdjLocked[x];
+            const double tq0 = tqAdjLocked[x];
 
             const double magX_ire = std::hypot(ti0, tq0) * invI;
             const bool satTrouble = (magX_ire > SAT_TROUBLE_IRE);
@@ -3986,27 +4009,21 @@ void Comb::FrameBuffer::produceY()
                                       T.Y_LOCAL_GAIN_MAX,
                                       satTrouble ? 0.0 : T.Y_LOCAL_MAX_SHEAR);
 
-            // Keep the application rotation-only. The affine/polar solve is still
-            // valuable because it finds a better local phase relation, but letting
-            // local gain/shear reshape chroma here is more dangerous than useful.
-            const double ti_adj = Rm[0][0] * ti0 + Rm[0][1] * tq0;
-            const double tq_adj = Rm[1][0] * ti0 + Rm[1][1] * tq0;
+            const double ti_adj_4fsc = Rm[0][0] * ti0 + Rm[0][1] * tq0;
+            const double tq_adj_4fsc = Rm[1][0] * ti0 + Rm[1][1] * tq0;
 
-            cHat[x] = remod4fscToComposite(ti_adj, tq_adj, h);
-            tiAdjLn[x] = ti_adj;
-            tqAdjLn[x] = tq_adj;
+            cHat[x] = remod4fscToComposite(ti_adj_4fsc, tq_adj_4fsc, h);
             vetConf[x] = vet.confidence;
+
+            double ti_locked_adj = 0.0;
+            double tq_locked_adj = 0.0;
+            fourfscToLocked(ti_adj_4fsc, tq_adj_4fsc,
+                            bcos, bsin,
+                            ti_locked_adj, tq_locked_adj);
+
+            tiAdjLocked[x] = ti_locked_adj;
+            tqAdjLocked[x] = tq_locked_adj;
         }
-
-        // --------------------------------------------------------------------
-        // Second pass: residual-safe Y reconstruction.
-        // --------------------------------------------------------------------
-        const bool do3D =
-            (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
-
-        const double MIN_ALPHA = 0.75;
-        const double MAX_ALPHA = 1.25;
-        const double MIN_SUB_CHROMA_IRE = 2.0;
 
         const bool ownershipEnabled =
             T.VET_OWNERSHIP_ENABLE &&
@@ -4018,55 +4035,56 @@ void Comb::FrameBuffer::produceY()
             ownershipEnabled ? ownershipEvidence[line].data() : nullptr;
 
         const double ownershipWeight = T.VET_OWNERSHIP_LUMA_WEIGHT;
+        const double ownershipChromaWeight = T.VET_OWNERSHIP_CHROMA_WEIGHT;
 
-        auto applyOwnership = [&](int x, double alphaVet) -> double {
-            if (!ownRow) return alphaVet;
-
+        auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
             const double lc = std::clamp(ownRow[x].lumaClaim, 0.0, 1.0);
             const double cc = std::clamp(ownRow[x].chromaClaim, 0.0, 1.0);
             const double uc = std::clamp(ownRow[x].uncertainClaim, 0.0, 1.0);
 
-            // Strong luma claim suppresses chroma subtraction, but chroma claim
-            // can earn back subtraction strength. Uncertainty damps the correction.
             const double support =
                 lc * (1.0 - 0.5 * cc) * (1.0 - 0.5 * uc);
 
             const double chromaFrac = std::clamp(
-                1.0 - lc + (T.VET_OWNERSHIP_CHROMA_WEIGHT * cc),
+                1.0 - lc + (ownershipChromaWeight * cc),
                 0.0, 1.0);
 
             const double blend = std::clamp(ownershipWeight * support, 0.0, 1.0);
             return alphaVet * (1.0 - blend) + chromaFrac * blend;
         };
 
-        auto writePixel = [&](int x, double alphaEff) {
+        auto writePixelNoOwnership = [&](int x, double alphaEff) {
             const int h = left + x;
 
             const double yOut = baseY4[x] + (hiRaw[x] - alphaEff * cHat[x]);
             Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet)
                          : yOut;
 
-            if (configuration.showMap) {
+            if (showMap) {
                 w2d_frame_weight[line][x] = (float)alphaEff;
             }
 
-            double tiLocked = 0.0;
-            double tqLocked = 0.0;
-            fourfscToLocked(tiAdjLn[x], tqAdjLn[x], bcos, bsin, tiLocked, tqLocked);
-
-            tiRowW[x] = (float)(alphaEff * tiLocked);
-            tqRowW[x] = (float)(alphaEff * tqLocked);
+            tiRowW[x] = (float)(alphaEff * tiAdjLocked[x]);
+            tqRowW[x] = (float)(alphaEff * tqAdjLocked[x]);
         };
 
-        if (width < 4) {
-            for (int x = 0; x < width; ++x) {
-                const double alphaEff = applyOwnership(x, 1.0);
-                writePixel(x, alphaEff);
-            }
-            continue;
-        }
+        auto writePixelWithOwnership = [&](int x, double alphaVet) {
+            const double alphaEff = alphaWithOwnership(x, alphaVet);
+            const int h = left + x;
 
-        auto processGroup = [&](int p, int xBegin, int xEnd) {
+            const double yOut = baseY4[x] + (hiRaw[x] - alphaEff * cHat[x]);
+            Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet)
+                         : yOut;
+
+            if (showMap) {
+                w2d_frame_weight[line][x] = (float)alphaEff;
+            }
+
+            tiRowW[x] = (float)(alphaEff * tiAdjLocked[x]);
+            tqRowW[x] = (float)(alphaEff * tqAdjLocked[x]);
+        };
+
+        auto computeAlphaVet = [&](int p) -> double {
             const double r0 = hiRaw[p + 0];
             const double r1 = hiRaw[p + 1];
             const double r2 = hiRaw[p + 2];
@@ -4077,7 +4095,6 @@ void Comb::FrameBuffer::produceY()
             const double c2 = cHat[p + 2];
             const double c3 = cHat[p + 3];
 
-            // Phase-agnostic 4fSC group vectors: I ~= s1-s3, Q ~= s2-s0.
             const double rawI = r1 - r3;
             const double rawQ = r2 - r0;
             const double subI = c1 - c3;
@@ -4086,44 +4103,72 @@ void Comb::FrameBuffer::produceY()
             const double subEnergy = subI * subI + subQ * subQ;
             const double subMagIRE = std::sqrt(subEnergy) * invI;
 
-            double alphaVet = 1.0;
-            if (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0 &&
-                subMagIRE >= MIN_SUB_CHROMA_IRE)
-            {
-                const double alphaFit = std::clamp(
-                    (rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
-                    MIN_ALPHA, MAX_ALPHA);
-
-                const double conf = std::clamp(
-                    0.25 * (vetConf[p + 0] +
-                            vetConf[p + 1] +
-                            vetConf[p + 2] +
-                            vetConf[p + 3]),
-                    0.0, 1.0);
-
-                const double profileWeight =
-                    T.VET_Y_CHROMA_LIKE_WEIGHT * (1.0 - conf);
-
-                alphaVet = 1.0 + profileWeight * (alphaFit - 1.0);
+            if (!chromaLikeEnabled || subMagIRE < MIN_SUB_CHROMA_IRE) {
+                return 1.0;
             }
 
-            for (int x = xBegin; x < xEnd; ++x) {
-                const double alphaEff = applyOwnership(x, alphaVet);
-                writePixel(x, alphaEff);
-            }
+            const double alphaFit = std::clamp(
+                (rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
+                MIN_ALPHA, MAX_ALPHA);
+
+            const double conf = std::clamp(
+                0.25 * (vetConf[p + 0] +
+                        vetConf[p + 1] +
+                        vetConf[p + 2] +
+                        vetConf[p + 3]),
+                0.0, 1.0);
+
+            const double profileWeight = chromaLikeWeight * (1.0 - conf);
+            return 1.0 + profileWeight * (alphaFit - 1.0);
         };
 
-        // Full non-overlapping groups.
-        for (int p = 0; p + 3 < width; p += 4) {
-            processGroup(p, p, p + 4);
+        if (width < 4) {
+            if (ownershipEnabled) {
+                for (int x = 0; x < width; ++x) {
+                    writePixelWithOwnership(x, 1.0);
+                }
+            } else {
+                for (int x = 0; x < width; ++x) {
+                    writePixelNoOwnership(x, 1.0);
+                }
+            }
+            continue;
         }
 
-        // Tail, without overwriting the previous group. It reuses the final valid
-        // 4-sample phase window but writes only the pixels not already processed.
         const int tailStart = (width / 4) * 4;
-        if (tailStart < width) {
-            const int p = std::max(0, width - 4);
-            processGroup(p, tailStart, width);
+
+        if (ownershipEnabled) {
+            for (int p = 0; p + 3 < width; p += 4) {
+                const double alphaVet = computeAlphaVet(p);
+                writePixelWithOwnership(p + 0, alphaVet);
+                writePixelWithOwnership(p + 1, alphaVet);
+                writePixelWithOwnership(p + 2, alphaVet);
+                writePixelWithOwnership(p + 3, alphaVet);
+            }
+
+            if (tailStart < width) {
+                const int p = std::max(0, width - 4);
+                const double alphaVet = computeAlphaVet(p);
+                for (int x = tailStart; x < width; ++x) {
+                    writePixelWithOwnership(x, alphaVet);
+                }
+            }
+        } else {
+            for (int p = 0; p + 3 < width; p += 4) {
+                const double alphaVet = computeAlphaVet(p);
+                writePixelNoOwnership(p + 0, alphaVet);
+                writePixelNoOwnership(p + 1, alphaVet);
+                writePixelNoOwnership(p + 2, alphaVet);
+                writePixelNoOwnership(p + 3, alphaVet);
+            }
+
+            if (tailStart < width) {
+                const int p = std::max(0, width - 4);
+                const double alphaVet = computeAlphaVet(p);
+                for (int x = tailStart; x < width; ++x) {
+                    writePixelNoOwnership(x, alphaVet);
+                }
+            }
         }
     }
 }
