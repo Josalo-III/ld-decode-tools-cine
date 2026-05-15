@@ -242,7 +242,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         if (configuration.phaseCompensation) {
             current->demodMode = FrameBuffer::DemodMode::Locked;
 
-            // 1) Sinusoidal-fit pre-clean and affine solve (fills clpbuffer[0], lineAffineLocked)
+            // 1) Sinusoidal-fit pre-clean and affine solve (fills clpbuffer[0], carrierGrammar.affine)
             // 2) Phase-corrected 1D demod for 2D work (via buildPhaseCorrected1D inside split2D)
             // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
             // 4) Re-demod final selected comb into demodTI_flat/TQ_flat
@@ -474,13 +474,11 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         // demodLines indexed by absolute line number (safe upper bound)
         demodWidth = width;
         demodLines = lines + 1;
-        demodBurstCos.assign(demodLines, 1.0f);
-        demodBurstSin.assign(demodLines, 0.0f);
+        carrierGrammar.assign(demodLines, CombCarrierGrammar{});
         demodTI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTI4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        lineAffineLocked.assign(lines, LineAffine{{{1,0},{0,1}}, false});
         demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         scratch_comp_res.assign(width, 0.0);
@@ -492,7 +490,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
 // Interleave the two source fields into rawbuffer in frame-line order (even lines
 // from firstField, odd lines from secondField), record their phase IDs, and derive
 // a single cadenceId representative for this frame from the two fields' cinemap
-// metadata. Also initialises lineFlip (per-line subcarrier polarity) and clears
+// metadata. Also initialises per-line carrier grammar polarity and clears
 // the VDIS mask. capturePartnerSeqNo records the original TBC frame pairing for
 // each field, carried forward for reconstruction.
 void Comb::FrameBuffer::loadFields(const SourceField &firstField,
@@ -543,12 +541,14 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 
     componentFrame = nullptr;
 
-    // --- Initialize per-line flip from existing getLinePhase() ---
+    // --- Initialize per-line grammar from existing getLinePhase() ---
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
-    lineFlip.assign(last, +1);
+    if ((int)carrierGrammar.size() < last) carrierGrammar.resize(last);
     for (int line = first; line < last; ++line) {
-        lineFlip[line] = getLinePhase(line) ? -1 : +1;
+        CombCarrierGrammar &grammar = carrierGrammar[line];
+        grammar = CombCarrierGrammar{};
+        grammar.lineFlip = getLinePhase(line) ? -1 : +1;
     }
 
     // Clear VDIS mask for this frame
@@ -572,7 +572,11 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 // phase for this line. The optional floor clamp prevents burst collapse on
 // very noisy lines from producing a near-zero (and hence useless) phasor.
 namespace {
-    struct BurstInfo { double bsin; double bcos; };
+    struct BurstInfo {
+        double bsin;
+        double bcos;
+        double carrierScale;
+    };
     BurstInfo detectBurst(const quint16 *lineData,
                           const LdDecodeMetaData::VideoParameters &vp,
                           bool floorEnable,
@@ -586,7 +590,8 @@ namespace {
         }
         const int len = vp.colourBurstEnd - vp.colourBurstStart;
         if (len > 0) { const double invLen = 1.0 / len; bsin *= invLen; bcos *= invLen; }
-        double mag = std::sqrt(bsin * bsin + bcos * bcos);
+        const double carrierScale = std::sqrt(bsin * bsin + bcos * bcos);
+        double mag = carrierScale;
 
         if (floorEnable && mag < floorFactor && mag > 1e-9) {
             const double s = floorFactor / mag;
@@ -594,7 +599,7 @@ namespace {
         }
         if (mag > 1e-9) { const double invMag = 1.0 / mag; bsin *= invMag; bcos *= invMag; }
         else { bsin = 0.0; bcos = 1.0; }
-        return {bsin, bcos};
+        return {bsin, bcos, carrierScale};
     }
 }
 
@@ -626,7 +631,7 @@ void Comb::FrameBuffer::split1D()
 }
 
 // Locked-path pre-processing: burst detection, raw composite demodulation into
-// TRI/TRQ, and a per-line affine solve stored in lineAffineLocked.
+// TRI/TRQ, and a per-line affine solve stored in carrierGrammar.
 //
 // Note: We intentionally do not overwrite clpbuffer[0] here; split1D populates
 // clpbuffer[0] (1D bandpass), and buildPhaseCorrected1D demodulates that using
@@ -647,14 +652,8 @@ void Comb::FrameBuffer::phaseLocked()
         return;
 
     const int requiredLines = lastLine + 1;
-    if ((int)demodBurstCos.size() < requiredLines) {
-        demodBurstCos.assign(requiredLines, 1.0f);
-        demodBurstSin.assign(requiredLines, 0.0f);
-    }
-    if ((int)demodLUTTi_locked.size() < requiredLines) {
-        demodLUTTi_locked.assign(requiredLines, std::array<float,4>{});
-        demodLUTTq_locked.assign(requiredLines, std::array<float,4>{});
-    }
+    if ((int)carrierGrammar.size() < requiredLines)
+        carrierGrammar.resize(requiredLines);
     // Basis coefficients — computed once, used by all passes
     double Ce = 1.0, Se = 0.0;
     basisCoeffs(Ce, Se);
@@ -674,22 +673,28 @@ void Comb::FrameBuffer::phaseLocked()
     const bool   floorEnable = configuration.burstFloorEnable;
     const double floorFactor = configuration.burstFloorFactor;
     const auto  &T           = configuration.tunables;
+    constexpr double MIN_PHASE_CONFIDENCE = 1e-6;
 
-    // --- Pass 1: burst detection -> demodBurstCos/Sin ---
+    // --- Pass 1: burst detection -> carrier grammar ---
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
         auto burst = detectBurst(rawLine, videoParameters, floorEnable, floorFactor);
         double bcos = burst.bcos, bsin = burst.bsin;
         const double bc2 = bcos * cRb - bsin * sRb;
         const double bs2 = bcos * sRb + bsin * cRb;
-        demodBurstCos[line] = static_cast<float>(bc2);
-        demodBurstSin[line] = static_cast<float>(bs2);
+        CombCarrierGrammar &grammar = carrierGrammar[line];
+        grammar.burstCos = bc2;
+        grammar.burstSin = bs2;
+        grammar.carrierScale = burst.carrierScale * invIreScale;
+        grammar.phaseConfidence =
+            std::clamp((grammar.carrierScale - 3.0) / 7.0, 0.0, 1.0);
+        grammar.grammarLocked = grammar.phaseConfidence > MIN_PHASE_CONFIDENCE;
 
         double lutTi[4], lutTq[4];
         fusedDemodLUT(bc2, bs2, spLUT_locked, cpLUT_locked, lutTi, lutTq);
         for (int i = 0; i < 4; ++i) {
-            demodLUTTi_locked[line][i] = (float)lutTi[i];
-            demodLUTTq_locked[line][i] = (float)lutTq[i];
+            grammar.demodLUTTi[i] = (float)lutTi[i];
+            grammar.demodLUTTq[i] = (float)lutTq[i];
         }
     }
     // cache fsc-cancelled luma and varietals
@@ -720,8 +725,16 @@ void Comb::FrameBuffer::phaseLocked()
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
             float *triRow          = demodTRI_line(line);
             float *trqRow          = demodTRQ_line(line);
-            const float *lutTi = demodLUTTi_locked[line].data();
-            const float *lutTq = demodLUTTq_locked[line].data();
+            const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+            double lutTi[4], lutTq[4];
+            if (grammar && grammar->grammarLocked) {
+                for (int i = 0; i < 4; ++i) {
+                    lutTi[i] = (double)grammar->demodLUTTi[i];
+                    lutTq[i] = (double)grammar->demodLUTTq[i];
+                }
+            } else {
+                fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+            }
 
             double dc = (double)rawLine[left];
             constexpr double DC_ALPHA = 1.0 / 64.0;
@@ -731,13 +744,13 @@ void Comb::FrameBuffer::phaseLocked()
                 dc += DC_ALPHA * ((double)rawLine[h] - dc);
                 const double vraw = (double)rawLine[h] - dc;
                 const int ph = (h & 3);
-                triRow[xi] = (float)(vraw * (double)lutTi[ph]);
-                trqRow[xi] = (float)(vraw * (double)lutTq[ph]);
+                triRow[xi] = (float)(vraw * lutTi[ph]);
+                trqRow[xi] = (float)(vraw * lutTq[ph]);
             }
         }
     }
 
-    // --- Pass 3: sinusoidal fit + affine solve -> lineAffineLocked ---
+    // --- Pass 3: sinusoidal fit + affine solve -> carrierGrammar.affine ---
     // Reads TRI/TRQ from Pass 2. For each sample, estimates local chroma amplitude
     // from a windowed mean of TRI/TRQ magnitudes, computes a fitted IQ that prefers
     // the window-coherent phase direction when available, and uses a soft quality
@@ -746,23 +759,24 @@ void Comb::FrameBuffer::phaseLocked()
     {
         const int WIN  = std::max(4, (T.SINFIT_WIN_SAMPLES / 4) * 4);
         const int HALF = WIN / 2;
-        const bool doAffine = configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE;
+        const bool writeAffine = configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE;
+        constexpr double PHASE_ERROR_CAP = M_PI / 8.0;
 
         for (int line = firstLine; line < lastLine; ++line) {
-            if (!doAffine) {
-                if (line >= 0 && line < (int)lineAffineLocked.size())
-                    lineAffineLocked[line].valid = false;
+            const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
+            CombCarrierGrammar *grammar = carrierGrammarLine(line);
+            if (!grammar || !grammar->grammarLocked) {
+                if (grammar) {
+                    grammar->phaseError = 0.0;
+                    grammar->affine.valid = false;
+                }
                 continue;
             }
-
-            const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
-            const double bcos      = (double)demodBurstCos[line];
-            const double bsin      = (double)demodBurstSin[line];
+            const double bcos      = grammar->burstCos;
+            const double bsin      = grammar->burstSin;
             const float *triRow    = demodTRI_line(line);
             const float *trqRow    = demodTRQ_line(line);
-            const double lineScale = (!lineFlip.empty() && line < (int)lineFlip.size())
-                ? (double)lineFlip[line]
-                : 1.0;
+            const double lineScale = (double)carrierLineFlip(line);
 
             double STT[2][2] = {{0,0},{0,0}};
             double SRT[2][2] = {{0,0},{0,0}};
@@ -888,9 +902,9 @@ void Comb::FrameBuffer::phaseLocked()
                 const double qualityWeight = (0.25 + 0.75 * coherence)
                     / (1.0 + vetNorm * vetNorm);
 
-                // Accumulate affine matrices with soft support so steep saturated
-                // regions still inform the solve without dominating it.
-                if (doAffine && qualityWeight > 1e-6) {
+                // Accumulate the line-level rotation fit with soft support so
+                // steep saturated regions inform the solve without dominating it.
+                if (qualityWeight > 1e-6) {
                     STT[0][0] += qualityWeight * fI*fI; STT[0][1] += qualityWeight * fI*fQ;
                     STT[1][0] += qualityWeight * fI*fQ; STT[1][1] += qualityWeight * fQ*fQ;
                     SRT[0][0] += qualityWeight * ri*fI; SRT[0][1] += qualityWeight * ri*fQ;
@@ -898,8 +912,9 @@ void Comb::FrameBuffer::phaseLocked()
                 }
             }
             // Affine solve — stored for buildPhaseCorrected1D to apply after split1D
-            LineAffine &la = lineAffineLocked[line];
+            LineAffine &la = grammar->affine;
             la.valid = false;
+            grammar->phaseError = 0.0;
             double STTinv[2][2];
             if (mat2_inv(STT, STTinv)) {
                 double tmp[2][2], A[2][2];
@@ -908,6 +923,13 @@ void Comb::FrameBuffer::phaseLocked()
                 A[1][0]=tmp[1][0]; A[1][1]=tmp[1][1];
                 double Rm[2][2], U[2][2];
                 polar_decompose_2x2(A, Rm, U);
+                const double measuredPhase = std::atan2(Rm[1][0], Rm[0][0]);
+                grammar->phaseError = std::clamp(
+                    measuredPhase,
+                    -PHASE_ERROR_CAP,
+                    PHASE_ERROR_CAP);
+                if (!writeAffine)
+                    continue;
                 const double pMax = T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
                 clamp_rotation_gain_shear(Rm, U, pMax,
                                           T.Y_LINE_ALLOW_GAIN_ON_IQ,
@@ -916,6 +938,29 @@ void Comb::FrameBuffer::phaseLocked()
                 la.R[0][0]=Rm[0][0]; la.R[0][1]=Rm[0][1];
                 la.R[1][0]=Rm[1][0]; la.R[1][1]=Rm[1][1];
                 la.valid = true;
+            }
+        }
+
+        if (T.Y_LINE_PHASE_ERROR_LUT_ENABLE && !writeAffine) {
+            for (int line = firstLine; line < lastLine; ++line) {
+                CombCarrierGrammar *grammar = carrierGrammarLine(line);
+                if (!grammar || !grammar->grammarLocked)
+                    continue;
+                if (grammar->phaseConfidence < T.Y_LINE_PHASE_ERROR_MIN_CONF)
+                    continue;
+
+                const double phase = grammar->phaseError;
+                if (!std::isfinite(phase) || std::fabs(phase) < 1e-12)
+                    continue;
+
+                const double c = std::cos(phase);
+                const double s = std::sin(phase);
+                for (int i = 0; i < 4; ++i) {
+                    const double ti = (double)grammar->demodLUTTi[i];
+                    const double tq = (double)grammar->demodLUTTq[i];
+                    grammar->demodLUTTi[i] = (float)(c * ti - s * tq);
+                    grammar->demodLUTTq[i] = (float)(s * ti + c * tq);
+                }
             }
         }
     }
@@ -988,17 +1033,18 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
         auto &ldsRow = locked1DSource[line];
         if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
+        seedCombOwnershipPerLine(line);
 
-        const double bcos =
-            (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
-        const double bsin =
-            (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        const double bcos = grammarLocked ? grammar->burstCos : 1.0;
+        const double bsin = grammarLocked ? grammar->burstSin : 0.0;
 
         double lutTi[4], lutTq[4];
-        if (line < (int)demodLUTTi_locked.size()) {
+        if (grammarLocked) {
             for (int i = 0; i < 4; ++i) {
-                lutTi[i] = (double)demodLUTTi_locked[line][i];
-                lutTq[i] = (double)demodLUTTq_locked[line][i];
+                lutTi[i] = (double)grammar->demodLUTTi[i];
+                lutTq[i] = (double)grammar->demodLUTTq[i];
             }
         } else {
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
@@ -1012,12 +1058,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         const bool haveAffine =
             configuration.residualVideo &&
             T.Y_LINE_AFFINE_TRIM_ENABLE &&
-            line >= 0 &&
-            line < (int)lineAffineLocked.size() &&
-            lineAffineLocked[line].valid;
+            grammarLocked &&
+            grammar->affine.valid;
 
         const LineAffine *lineAffine =
-            haveAffine ? &lineAffineLocked[line] : nullptr;
+            haveAffine ? &grammar->affine : nullptr;
 
         auto applyLineAffine = [&](double &ti, double &tq) {
             if (!lineAffine) return;
@@ -1210,7 +1255,15 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 xi < (int)ownershipEvidence[line].size())
             {
                 OwnershipEvidence &e = ownershipEvidence[line][xi];
+                const double carrierScaleIRE = e.carrierScaleIRE;
+                const double carrierPhaseErrorRad = e.carrierPhaseErrorRad;
+                const double carrierPhaseConfidence = e.carrierPhaseConfidence;
+                const double carrierPrior = e.carrierPlausibility;
                 e = OwnershipEvidence{};
+                e.carrierScaleIRE = carrierScaleIRE;
+                e.carrierPhaseErrorRad = carrierPhaseErrorRad;
+                e.carrierPhaseConfidence = carrierPhaseConfidence;
+                e.carrierPlausibility = carrierPrior;
 
                 e.bandpassFineIRE = fine;
                 e.bandpassMidIRE = mid;
@@ -1283,13 +1336,15 @@ void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
     for (int line = first; line < last; ++line) {
         const double *src = clpbuffer[srcBuf].pixel[line];
 
-        const double bcos = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
-        const double bsin = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        const double bcos = grammarLocked ? grammar->burstCos : 1.0;
+        const double bsin = grammarLocked ? grammar->burstSin : 0.0;
         double lutTi[4], lutTq[4];
-        if (line < (int)demodLUTTi_locked.size()) {
+        if (grammarLocked) {
             for (int i = 0; i < 4; ++i) {
-                lutTi[i] = (double)demodLUTTi_locked[line][i];
-                lutTq[i] = (double)demodLUTTq_locked[line][i];
+                lutTi[i] = (double)grammar->demodLUTTi[i];
+                lutTq[i] = (double)grammar->demodLUTTq[i];
             }
         } else {
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
@@ -1302,9 +1357,8 @@ void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
 
         const LineAffine *lineAffine = nullptr;
         if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
-                && line >= 0 && line < (int)lineAffineLocked.size()
-                && lineAffineLocked[line].valid) {
-            lineAffine = &lineAffineLocked[line];
+                && grammarLocked && grammar->affine.valid) {
+            lineAffine = &grammar->affine;
         }
         auto applyLineAffine = [&](double &ti, double &tq) {
             if (!lineAffine) return;
@@ -1327,6 +1381,38 @@ void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
             ti4Row[xi] = (float)ti4;
             tq4Row[xi] = (float)tq4;
         }
+    }
+}
+
+void Comb::FrameBuffer::seedCombOwnershipPerLine(int line)
+{
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - videoParameters.activeVideoStart;
+
+    if (width <= 0 || line < 0)
+        return;
+
+    if ((int)ownershipEvidence.size() <= line)
+        ownershipEvidence.resize(line + 1);
+
+    auto &row = ownershipEvidence[line];
+    if ((int)row.size() < width)
+        row.assign(width, OwnershipEvidence{});
+
+    const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+    const bool grammarLocked = grammar && grammar->grammarLocked;
+    const double carrierScaleIRE = grammar ? grammar->carrierScale : 0.0;
+    const double carrierPhaseErrorRad = grammar ? grammar->phaseError : 0.0;
+    const double carrierPhaseConfidence = grammar
+        ? std::clamp(grammar->phaseConfidence, 0.0, 1.0)
+        : 0.0;
+    const double carrierPrior = grammarLocked ? carrierPhaseConfidence : 0.0;
+
+    for (int rel = 0; rel < width; ++rel) {
+        row[rel].carrierScaleIRE = carrierScaleIRE;
+        row[rel].carrierPhaseErrorRad = carrierPhaseErrorRad;
+        row[rel].carrierPhaseConfidence = carrierPhaseConfidence;
+        row[rel].carrierPlausibility = carrierPrior;
     }
 }
 
@@ -1367,9 +1453,15 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
         : std::clamp(1.0 - (e.residualFitErrorIRE / 12.0), 0.0, 1.0);
     const double agreement = 1.0 - std::clamp(e.frameFieldAgreementIRE / 6.0, 0.0, 1.0);
     const double spreadPenalty = std::clamp(e.candidateSpreadIRE / 10.0, 0.0, 1.0);
+    const double carrierPrior = configuration.phaseCompensation
+        ? std::clamp(e.carrierPlausibility, 0.0, 1.0)
+        : 1.0;
     
     e.carrierPlausibility = std::clamp(
-        chromaStrength * ((0.65 * coherence) + (0.35 * agreement)) * (1.0 - (0.5 * spreadPenalty)),
+        carrierPrior *
+        chromaStrength *
+        ((0.65 * coherence) + (0.35 * agreement)) *
+        (1.0 - (0.5 * spreadPenalty)),
         0.0, 1.0);
     
     double lumaClaim = std::clamp(
@@ -2231,8 +2323,10 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
         ownershipEvidence.resize(line + 1);
 
     auto &row = ownershipEvidence[line];
-    if ((int)row.size() < width)
+    if ((int)row.size() < width) {
         row.assign(width, OwnershipEvidence());
+        seedCombOwnershipPerLine(line);
+    }
 
     const bool haveFrameScalar = !frameScalar.empty();
 
@@ -2490,20 +2584,15 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         double ti = 0.0;
         double tq = 0.0;
 
-        if (line >= 0 && line < (int)demodLUTTi_locked.size() &&
-            line < (int)demodLUTTq_locked.size())
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        if (grammarLocked)
         {
-            ti = (double)demodLUTTi_locked[line][ph];
-            tq = (double)demodLUTTq_locked[line][ph];
+            ti = (double)grammar->demodLUTTi[ph];
+            tq = (double)grammar->demodLUTTq[ph];
         } else {
-            const double bcos = (line >= 0 && line < (int)demodBurstCos.size())
-                ? (double)demodBurstCos[line]
-                : 1.0;
-            const double bsin = (line >= 0 && line < (int)demodBurstSin.size())
-                ? (double)demodBurstSin[line]
-                : 0.0;
             double lutTi[4], lutTq[4];
-            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+            fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
             ti = lutTi[ph];
             tq = lutTq[ph];
         }
@@ -2518,11 +2607,11 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         double ti = 0.0;
         double tq = 0.0;
 
-        if (line >= 0 && line < (int)demodLUTTi_locked.size() &&
-            line < (int)demodLUTTq_locked.size())
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        if (grammar && grammar->grammarLocked)
         {
-            ti = (double)demodLUTTi_locked[line][ph];
-            tq = (double)demodLUTTq_locked[line][ph];
+            ti = (double)grammar->demodLUTTi[ph];
+            tq = (double)grammar->demodLUTTq[ph];
         } else {
             return {0.0, 0.0};
         }
@@ -2730,6 +2819,9 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
     double sumLumaIncursion = 0.0;
     double sumCandidateSpread = 0.0;
     double sumFrameCoherence = 0.0;
+    double sumCarrierScale = 0.0;
+    double sumCarrierConfidence = 0.0;
+    double sumCarrierPhaseErrorAbs = 0.0;
     for (int line = firstLine; line < lastLine; ++line) {
         if (line < 0 || line >= (int)ownershipEvidence.size())
             continue;
@@ -2745,18 +2837,24 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             sumLumaIncursion += e.lumaIncursionRiskIRE;
             sumCandidateSpread += e.candidateSpreadIRE;
             sumFrameCoherence += e.frameIQCoherence;
+            sumCarrierScale += e.carrierScaleIRE;
+            sumCarrierConfidence += e.carrierPhaseConfidence;
+            sumCarrierPhaseErrorAbs += std::fabs(e.carrierPhaseErrorRad);
         }
     }
     if (ownN > 0) {
         const double invOwnN = 1.0 / (double)ownN;
-        msg += QString(" ownership(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7)")
+        msg += QString(" ownership(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7,carScale=%8,carConf=%9,carPhaseAbsDeg=%10)")
             .arg(ownN)
             .arg(sumLumaClaim * invOwnN, 0, 'f', 3)
             .arg(sumChromaClaim * invOwnN, 0, 'f', 3)
             .arg(sumUncertainClaim * invOwnN, 0, 'f', 3)
             .arg(sumLumaIncursion * invOwnN, 0, 'f', 3)
             .arg(sumCandidateSpread * invOwnN, 0, 'f', 3)
-            .arg(sumFrameCoherence * invOwnN, 0, 'f', 3);
+            .arg(sumFrameCoherence * invOwnN, 0, 'f', 3)
+            .arg(sumCarrierScale * invOwnN, 0, 'f', 3)
+            .arg(sumCarrierConfidence * invOwnN, 0, 'f', 3)
+            .arg(sumCarrierPhaseErrorAbs * invOwnN * 180.0 / M_PI, 0, 'f', 3);
     }
 
     const qint64 oddEdgeN = legs[1].edgeN + legs[3].edgeN;
@@ -3245,12 +3343,8 @@ void Comb::FrameBuffer::splitIQ()
         double *I = componentFrame->u(lineNumber);
         double *Q = componentFrame->v(lineNumber);
 
-        // Apply per-line subcarrier polarity flip from lineFlip (populated in loadFields).
-        int f = 1;
-        if (!lineFlip.empty() &&
-            lineNumber >= firstLine && lineNumber < (int)lineFlip.size()) {
-            f = lineFlip[lineNumber];   // +1 or -1
-        }
+        // Apply per-line subcarrier polarity flip from carrierGrammar (populated in loadFields).
+        const int f = carrierLineFlip(lineNumber);
 
         double si = 0, sq = 0;
         for (qint32 h = videoParameters.activeVideoStart;
@@ -3278,10 +3372,10 @@ void Comb::FrameBuffer::splitIQ()
 
 
 // Locked-path demodulation: separates I and Q using the per-line burst phasor
-// (demodBurstCos/Sin) computed by phaseLocked, rather than relying on the 4fsc
+// stored in carrierGrammar by phaseLocked, rather than relying on the 4fsc
 // sampling assumption. Also demodulates the raw composite into TRI/TRQ for
 // the residual Y path, and builds the HP-Y leakage buffers (yI, yQ) needed
-// by produceY. The affine stored in lineAffineLocked is applied to yI/yQ here
+// by produceY. The affine stored in carrierGrammar is applied to yI/yQ here
 // to align the residual Y demod with the locked chroma reference.
 void Comb::FrameBuffer::splitIQlocked()
 {
@@ -3330,18 +3424,17 @@ void Comb::FrameBuffer::splitIQlocked()
 
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
 
-        double bcos = 1.0, bsin = 0.0;
-        if (line < (int)demodBurstCos.size()) {
-            bcos = (double)demodBurstCos[line];
-            bsin = (double)demodBurstSin[line];
-        }
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        const double bcos = grammarLocked ? grammar->burstCos : 1.0;
+        const double bsin = grammarLocked ? grammar->burstSin : 0.0;
 
         double lutTi[4], lutTq[4];
-        if (line < (int)demodLUTTi_locked.size()) {
+        if (grammarLocked) {
             for (int i = 0; i < 4; ++i) {
-                lutTi[i] = (double)demodLUTTi_locked[line][i];
-                lutTq[i] = (double)demodLUTTq_locked[line][i];
+                lutTi[i] = (double)grammar->demodLUTTi[i];
+                lutTq[i] = (double)grammar->demodLUTTq[i];
             }
         } else {
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
@@ -3418,8 +3511,8 @@ void Comb::FrameBuffer::splitIQlocked()
         // tiRow/tqRow and preI/preQ are already affine-corrected by
         // buildPhaseCorrected1D.
         if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
-                && line < (int)lineAffineLocked.size()) {
-            const LineAffine &la = lineAffineLocked[line];
+                && grammarLocked) {
+            const LineAffine &la = grammar->affine;
             if (la.valid) {
                 for (int xi = 0; xi < width; ++xi) {
                     const double yi  = yI[xi];
@@ -3505,13 +3598,15 @@ void Comb::FrameBuffer::filterIQLocked()
 
         const quint16* rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
         const double*  Yrow    = componentFrame->y(line);
-        const double   bcos    = (line < (int)demodBurstCos.size()) ? (double)demodBurstCos[line] : 1.0;
-        const double   bsin    = (line < (int)demodBurstSin.size()) ? (double)demodBurstSin[line] : 0.0;
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        const double   bcos    = grammarLocked ? grammar->burstCos : 1.0;
+        const double   bsin    = grammarLocked ? grammar->burstSin : 0.0;
         double lutTi[4], lutTq[4];
-        if (line < (int)demodLUTTi_locked.size()) {
+        if (grammarLocked) {
             for (int i = 0; i < 4; ++i) {
-                lutTi[i] = (double)demodLUTTi_locked[line][i];
-                lutTq[i] = (double)demodLUTTq_locked[line][i];
+                lutTi[i] = (double)grammar->demodLUTTi[i];
+                lutTq[i] = (double)grammar->demodLUTTq[i];
             }
         } else {
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
@@ -3634,8 +3729,10 @@ void Comb::FrameBuffer::produceY()
         if (line >= demodLines) continue;
 
         const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
-        const double bcos = demodBurstCos[line];
-        const double bsin = demodBurstSin[line];
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        const double bcos = grammarLocked ? grammar->burstCos : 1.0;
+        const double bsin = grammarLocked ? grammar->burstSin : 0.0;
 
         double *Y = componentFrame->y(line);
         const double *clpLine = clpbuffer[srcBuf].pixel[line];

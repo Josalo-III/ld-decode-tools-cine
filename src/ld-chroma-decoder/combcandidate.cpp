@@ -869,15 +869,12 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
         outQ = M[1][0] * I + M[1][1] * Q;
     };
 
-    const double sign0Line = (configuration.phaseCompensation && !lineFlip.empty() &&
-                              tapLine.ln0 >= 0 && tapLine.ln0 < (int)lineFlip.size())
-        ? (double)lineFlip[tapLine.ln0] : 1.0;
-    const double signULine = (configuration.phaseCompensation && !lineFlip.empty() &&
-                              tapLine.lnU1 >= 0 && tapLine.lnU1 < (int)lineFlip.size())
-        ? (double)lineFlip[tapLine.lnU1] : 1.0;
-    const double signDLine = (configuration.phaseCompensation && !lineFlip.empty() &&
-                              tapLine.lnD1 >= 0 && tapLine.lnD1 < (int)lineFlip.size())
-        ? (double)lineFlip[tapLine.lnD1] : 1.0;
+    const double sign0Line = configuration.phaseCompensation
+        ? (double)carrierLineFlip(tapLine.ln0) : 1.0;
+    const double signULine = configuration.phaseCompensation
+        ? (double)carrierLineFlip(tapLine.lnU1) : 1.0;
+    const double signDLine = configuration.phaseCompensation
+        ? (double)carrierLineFlip(tapLine.lnD1) : 1.0;
 
     auto solveFamilyRotation = [&](const std::vector<CombTapIQ> &nbrIQ,
                                    bool haveNbr,
@@ -1964,11 +1961,8 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
 
     // --- Chrominance Penalty (2D) ---
     // (Kept similar to previous, but could also add vertical if desired. Sticking to H for speed/legacy match)
-    int fRef = 1, fCand = 1;
-    if (!lineFlip.empty()) {
-        if (refLineNumber < (int)lineFlip.size()) fRef = lineFlip[refLineNumber];
-        if (lineNumber < (int)lineFlip.size())    fCand = lineFlip[lineNumber];
-    }
+    const int fRef = carrierLineFlip(refLineNumber);
+    const int fCand = carrierLineFlip(lineNumber);
 
     double iqPen = (std::fabs(fRef * refClpC[r0] - fCand * candClpC[c0]) * 0.5 +
                     std::fabs(fRef * refClpC[r1] - fCand * candClpC[c1]) * 1.0 +

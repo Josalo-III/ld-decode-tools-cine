@@ -61,8 +61,8 @@ public:
         bool locked2DSourceTo4fsc = true;
 
         // Per-axis product gains: multipliers applied to I and Q before filtering.
-        double gi_product = 1.0;
-        double gq_product = 1.1;
+   //     double gi_product = 1.0;
+  //      double gq_product = 1.1;
 
         // Noise reduction levels (0 = disabled)
         double cNRLevel = 0.0;
@@ -274,6 +274,8 @@ public:
             double Y_LINE_GAIN_MIN                = 0.95;
             double Y_LINE_GAIN_MAX                = 1.05;
             double Y_LINE_MAX_SHEAR               = 0.08;
+            bool   Y_LINE_PHASE_ERROR_LUT_ENABLE  = true;
+            double Y_LINE_PHASE_ERROR_MIN_CONF    = 0.50;
             
             // 3D Residual Y Logic
             bool   RESIDUAL_Y_ELECTION            = true; // false = Blend (Median-ish), true = Winner-take-all
@@ -438,6 +440,19 @@ private:
 		double R[2][2];  // rotation+gain (phase-clamped)
 		bool   valid;
 	};
+	struct CombCarrierGrammar {
+		double burstCos = 1.0;
+		double burstSin = 0.0;
+		double carrierScale = 0.0;     // IRE burst magnitude before normalization/flooring
+		double phaseError = 0.0;       // measured carrier-phase error, radians
+		double phaseConfidence = 0.0;  // 0..1 confidence from burst magnitude
+		int    lineFlip = 1;           // +1 or -1 subcarrier polarity for this line
+		int    samplePhase0 = 0;       // reserved seam for future line/sample offset grammar
+		bool   grammarLocked = false;
+		std::array<float,4> demodLUTTi = {0.0f, 0.0f, 0.0f, 0.0f};
+		std::array<float,4> demodLUTTq = {0.0f, 0.0f, 0.0f, 0.0f};
+		LineAffine affine = {{{1.0, 0.0}, {0.0, 1.0}}, false};
+	};
 	struct SamplePlane {
 		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
 	} clpbuffer[3]; // [0]=1D, [1]=2D, [2]=3D
@@ -538,12 +553,7 @@ private:
 											 double *hiRaw,
 											 double *lumaSmooth) const;
 	ComponentFrame *componentFrame = nullptr;
-	std::vector<float> demodBurstCos;
-	std::vector<float> demodBurstSin;
-	// Per-line fused locked demod LUTs for the 4 phase buckets (h&3).
-	// Computed in phaseLocked() and reused by buildPhaseCorrected1D/splitIQlocked/filterIQLocked.
-	std::vector<std::array<float,4>> demodLUTTi_locked;
-	std::vector<std::array<float,4>> demodLUTTq_locked;
+	std::vector<CombCarrierGrammar> carrierGrammar;
 
 	// Flat/contiguous buffers (lines x width)
 	// Line-local locked IQ after burst alignment and affine trim.
@@ -574,14 +584,11 @@ private:
 	std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
 	std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
 	std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
-	// in FrameBuffer private members (comb.h)
-	std::vector<int> lineFlip;  // +1 or -1 per frame line
 	std::vector<double> scratch_outMixed;
 	std::vector<double> scratch_lateralLine;
 	std::vector<std::vector<float>> w2d_frame_weight;
 	std::vector<std::vector<double>> w2d_fieldA_gate;
 	std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
-	std::vector<LineAffine> lineAffineLocked;
 	std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)
 	std::vector<std::complex<double>> scratch_centerIQ; // reused per-line preclean/locked frame IQ prep
 	std::vector<std::complex<double>> scratch_upIQ;
@@ -627,6 +634,23 @@ private:
 	
 	inline const double *lockedLumaSmooth_line(int line) const {
 		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline CombCarrierGrammar *carrierGrammarLine(int line) {
+		return (line >= 0 && line < static_cast<int>(carrierGrammar.size()))
+			? &carrierGrammar[line]
+			: nullptr;
+	}
+
+	inline const CombCarrierGrammar *carrierGrammarLine(int line) const {
+		return (line >= 0 && line < static_cast<int>(carrierGrammar.size()))
+			? &carrierGrammar[line]
+			: nullptr;
+	}
+
+	inline int carrierLineFlip(int line) const {
+		const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+		return grammar ? grammar->lineFlip : 1;
 	}
 	
 	CombTapLine scratch_tapLine;
@@ -725,6 +749,7 @@ private:
 									   const double *fieldB,
 									   const std::vector<double> &frameScalar,
 									   const std::vector<std::complex<double>> *frameIQ);
+	void seedCombOwnershipPerLine(int line);
 	void finalizeOwnershipClaims(OwnershipEvidence &e,
 								 double neighborLumaMeanIRE = -1.0,
 								 double neighborBaseMeanIRE = -1.0) const;
