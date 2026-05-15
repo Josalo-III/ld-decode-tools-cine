@@ -442,14 +442,15 @@ private:
 		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
 	} clpbuffer[3]; // [0]=1D, [1]=2D, [2]=3D
 
-	struct CombTapSample {
+	struct CombTapScalar {
 		double comp = 0.0;
 		double symMag = 0.0;
+	};
+
+	struct CombTapIQ {
 		float ti = 0.0f;
 		float tq = 0.0f;
 		double iqMag = 0.0;
-		bool haveComp = false;
-		bool haveIQ = false;
 	};
 
 	struct CombTapPair {
@@ -495,13 +496,27 @@ private:
 		bool haveD2 = false;
 		bool haveU4 = false;
 		bool haveD4 = false;
-		std::vector<CombTapSample> tap0;
-		std::vector<CombTapSample> tapU1;
-		std::vector<CombTapSample> tapD1;
-		std::vector<CombTapSample> tapU2;
-		std::vector<CombTapSample> tapD2;
-		std::vector<CombTapSample> tapU4;
-		std::vector<CombTapSample> tapD4;
+		bool haveIQ0 = false;
+		bool haveIQU1 = false;
+		bool haveIQD1 = false;
+		bool haveIQU2 = false;
+		bool haveIQD2 = false;
+		bool haveIQU4 = false;
+		bool haveIQD4 = false;
+		std::vector<CombTapScalar> tap0;
+		std::vector<CombTapScalar> tapU1;
+		std::vector<CombTapScalar> tapD1;
+		std::vector<CombTapScalar> tapU2;
+		std::vector<CombTapScalar> tapD2;
+		std::vector<CombTapScalar> tapU4;
+		std::vector<CombTapScalar> tapD4;
+		std::vector<CombTapIQ> tap0IQ;
+		std::vector<CombTapIQ> tapU1IQ;
+		std::vector<CombTapIQ> tapD1IQ;
+		std::vector<CombTapIQ> tapU2IQ;
+		std::vector<CombTapIQ> tapD2IQ;
+		std::vector<CombTapIQ> tapU4IQ;
+		std::vector<CombTapIQ> tapD4IQ;
 		std::vector<CombTapPair> pairU1;
 		std::vector<CombTapPair> pairD1;
 		std::vector<CombTapPair> pairU2;
@@ -584,7 +599,6 @@ private:
 	// Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
 	// of framePreclean). Cached during the main scoring pass so the island
 	// filter and any post-processing can recover the Frame A output.
-	std::vector<double> scratch_fvf_frameAVal;
 	std::vector<double> scratch_filter_temp;
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;

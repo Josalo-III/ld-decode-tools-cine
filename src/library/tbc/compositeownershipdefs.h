@@ -3,6 +3,7 @@
  * ld-decode-tools shared composite/luma/chroma ownership definitions
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2026 Joseph Burns
  *
  * This header defines the shared attribution vocabulary used by composite
  * decoding stages.  It intentionally contains evidence storage and small
@@ -16,6 +17,40 @@
 #include <cmath>
 
 namespace lddecode {
+
+// Evidence produced by the NTSC/PAL comb/chroma decoder.
+// This is intentionally compact and tailored to the comb ownership heuristics.
+struct CombOwnershipEvidence {
+    // Bandpass magnitudes of the residual/luma (IRE)
+    double bandpassFineIRE = 0.0;
+    double bandpassMidIRE = 0.0;
+    double bandpassCoarseIRE = 0.0;
+
+    // Luma / residual evidence (IRE)
+    double lumaExcursionIRE = 0.0;
+    double residualFitErrorIRE = 0.0;
+    double lumaIncursionRiskIRE = 0.0;
+    double icebergAlienYFraction = 0.0;
+    double lumaShapeContinuation = 0.0;
+
+    // Chroma evidence (IRE)
+    double locked1DChromaIRE = 0.0;
+    double fieldAChromaIRE = 0.0;
+    double fieldBChromaIRE = 0.0;
+    double frameChromaIRE = 0.0;
+
+    // Agreement/coherence between domains
+    double candidateSpreadIRE = 0.0;
+    double frameFieldAgreementIRE = 0.0;
+    double frameIQCoherence = 0.0;
+    double carrierPlausibility = 0.0;
+
+    // Attribution claims
+    double ownershipConflict = 0.0;
+    double lumaClaim = 0.0;
+    double chromaClaim = 0.0;
+    double uncertainClaim = 1.0;
+};
 
 struct CompositeOwnershipEvidence {
     // ---------------------------------------------------------------------
@@ -181,6 +216,44 @@ struct CompositeOwnershipEvidence {
 inline double clamp01(double v)
 {
     return std::clamp(v, 0.0, 1.0);
+}
+
+inline double strongestCombChromaIRE(const CombOwnershipEvidence &e)
+{
+    return std::max({
+        e.locked1DChromaIRE,
+        e.fieldAChromaIRE,
+        e.fieldBChromaIRE,
+        e.frameChromaIRE
+    });
+}
+
+inline void normalizeCombOwnershipClaims(CombOwnershipEvidence &e)
+{
+    e.lumaClaim = clamp01(e.lumaClaim);
+    e.chromaClaim = clamp01(e.chromaClaim);
+    e.uncertainClaim = clamp01(
+        1.0 - std::max(e.lumaClaim, e.chromaClaim));
+}
+
+inline void applyOwnershipConflictSuppression(CombOwnershipEvidence &e,
+                                              double conflictSuppress)
+{
+    normalizeCombOwnershipClaims(e);
+
+    const double conflict = std::sqrt(
+        std::max(0.0, e.lumaClaim * e.chromaClaim));
+
+    e.ownershipConflict = std::max(e.ownershipConflict, conflict);
+
+    const double scale = std::max(
+        0.0,
+        1.0 - clamp01(conflictSuppress) * conflict);
+
+    e.lumaClaim *= scale;
+    e.chromaClaim *= scale;
+
+    normalizeCombOwnershipClaims(e);
 }
 
 inline double combinedCarrierChromaCoherence(const CompositeOwnershipEvidence &e)

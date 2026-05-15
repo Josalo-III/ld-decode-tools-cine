@@ -144,7 +144,6 @@ bool DecoderPool::process()
     baselineFramesQueued.clear();
     resolvedOutputFrames.clear();
     upgradedTbcFrames.clear();
-    baselineFramesQueued.clear();
     nextOutputKey24p = startFrame;
     writeCursor24p   = startFrame;
 
