@@ -555,6 +555,10 @@ int main(int argc, char *argv[])
         combConfig.chromaWeight = v;
     }
 
+    if (parser.isSet(residualVideo3DOption)) {
+        combConfig.residualVideo3D = true;
+    }
+
     if (parser.isSet(transformThresholdOption)) {
         palConfig.transformThreshold = parser.value(transformThresholdOption).toDouble();
         if (palConfig.transformThreshold < 0.0 || palConfig.transformThreshold > 1.0) {
@@ -662,10 +666,6 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    if (parser.isSet(residualVideo3DOption)) {
-        combConfig.residualVideo3D = true;
-    }
-    
     // Select output format
     QString outputFormatName;
     if (parser.isSet(outputFormatOption)) {
