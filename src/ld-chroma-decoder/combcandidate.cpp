@@ -1331,11 +1331,15 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
+        const float *cached = locked1DTI4fsc_line(ln);
+        if (!locked1DTI4fsc_flat.empty()) return cached;
         return demodTI4fsc_line(ln);
     };
     auto tqLine = [&](int ln)->const float* {
         if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
             return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
+        const float *cached = locked1DTQ4fsc_line(ln);
+        if (!locked1DTQ4fsc_flat.empty()) return cached;
         return demodTQ4fsc_line(ln);
     };
 
@@ -1838,12 +1842,12 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return demodTI4fsc_line(ln);
+        return locked1DTI4fsc_line(ln);
     };
     auto tqLine = [&](int ln)->const float* {
         if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
             return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return demodTQ4fsc_line(ln);
+        return locked1DTQ4fsc_line(ln);
     };
 
     const float *ti0_raw  = tiLine(line);
@@ -1866,6 +1870,31 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     }
 
     computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, false);
+}
+
+void Comb::FrameBuffer::computeFrameBLocked1DLine(
+    int line,
+    std::vector<std::complex<double>> &outFrameIQ,
+    std::vector<double> &outFrameScalar)
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+
+    outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
+    outFrameScalar.assign(width, 0.0);
+    if (width <= 0 || line < first || line >= last) return;
+    if (line >= demodLines || demodWidth <= 0) return;
+
+    computeFrameIQLocked1DLine(line, outFrameIQ);
+
+    for (int x = 0; x < width; ++x) {
+        const int h = left + x;
+        const auto &z = outFrameIQ[x];
+        outFrameScalar[x] = remod4fscToComposite(z.real(), z.imag(), h);
+    }
 }
 
 // 3D Section

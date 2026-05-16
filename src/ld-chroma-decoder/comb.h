@@ -563,6 +563,15 @@ private:
 	// between the line-local locked domain and the cross-line 4fsc domain.
 	std::vector<float> demodTI4fsc_flat;
 	std::vector<float> demodTQ4fsc_flat;
+	// Preserved 4fsc IQ produced by buildPhaseCorrected1D().
+	// Frame B should read this earlier cache instead of depending on later
+	// repurposing of the shared demodTI4fsc/TQ4fsc working buffers.
+	std::vector<float> locked1DTI4fsc_flat;
+	std::vector<float> locked1DTQ4fsc_flat;
+	// Product-scaled locked IQ prepared by splitIQLocked() for the output FIR.
+	// Later stages may refine this cache, but they should not overwrite demodTI/TQ.
+	std::vector<float> lockedProductI_flat;
+	std::vector<float> lockedProductQ_flat;
 	std::vector<double> scratch_lumaBaseY4;
 	std::vector<double> scratch_lumaHiRaw;
 	std::vector<double> scratch_lumaSmooth;
@@ -732,6 +741,9 @@ private:
 	void computeFrameIQPrecleanLine(int line,
 									std::vector<std::complex<double>> &outFrameIQ,
 									bool enableLateralRefine = true);
+	void computeFrameBLocked1DLine(int line,
+								   std::vector<std::complex<double>> &outFrameIQ,
+								   std::vector<double> &outFrameScalar);
 	void computeFrameIQLocked1DLine(int line,
 									std::vector<std::complex<double>> &outFrameIQ,
 									const std::vector<float> *tiOverride = nullptr,
@@ -760,8 +772,8 @@ private:
 	static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
 									   const LdDecodeMetaData::VideoParameters &vp);
 	
-	// Minimal Field-vs-Frame scorer: uses normalized FieldB and Frame plus
-	// phase-corrected 1D as fallback reference only.
+	// Field-vs-Frame elects scalar bandpass candidates. IQ evidence can inform
+	// the scores, but IQ-derived candidates must be remodulated before entry.
 	void scoreFieldVsFrame(
 		int line,
 		const CombTapLine &tapLine,
@@ -839,6 +851,30 @@ private:
 	}
 	inline const float* demodTQ4fsc_line(int line) const {
 		return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* locked1DTI4fsc_line(int line) {
+		return locked1DTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* locked1DTQ4fsc_line(int line) {
+		return locked1DTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* locked1DTI4fsc_line(int line) const {
+		return locked1DTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* locked1DTQ4fsc_line(int line) const {
+		return locked1DTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* lockedProductI_line(int line) {
+		return lockedProductI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* lockedProductQ_line(int line) {
+		return lockedProductQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* lockedProductI_line(int line) const {
+		return lockedProductI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* lockedProductQ_line(int line) const {
+		return lockedProductQ_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Raw-composite demod accessors

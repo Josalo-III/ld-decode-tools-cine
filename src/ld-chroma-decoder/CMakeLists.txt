@@ -9,6 +9,7 @@ add_library(lddecode-chroma STATIC
 	cadenceassembler.cpp
     comb.cpp
     combcandidate.cpp
+    comblocked.cpp
     componentframe.cpp
     framecanvas.cpp
     outputwriter.cpp

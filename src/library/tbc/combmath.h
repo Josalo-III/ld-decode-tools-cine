@@ -15,7 +15,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
+
+#include "lddecodemetadata.h"
 
 // 4fSC sine/cosine helpers shared across translation units.
 static constexpr double sin4fsc_data_global[] = { 1.0, 0.0, -1.0, 0.0 };
@@ -26,6 +29,19 @@ inline double cos4fsc(int i) { return sin4fsc((i + 1) & 3); }
 // Shared fractional-basis demod helpers. These are tiny math utilities used by
 // both the locked demod path and candidate generation.
 inline constexpr double CAL_EPS_SAMPLES = -0.07;
+
+// Global LO trim in degrees applied during burst rotation in phaseLocked().
+// Negative values counteract a slight green bias. Zero = no trim.
+inline constexpr double CAL_LO_ROT_DEG = 0.0;
+
+// Locked-path per-axis chroma gain. GQ < 1.0 trims the Q axis to compensate
+// for the slight chroma ellipse produced by the locked demod.
+inline constexpr double GI_PRODUCT = 1.0;
+inline constexpr double GQ_PRODUCT = 0.9;
+
+// Bucket-smooth strength applied to locked1DSource in buildPhaseCorrected1D.
+// Zero disables the smooth entirely (current default).
+inline constexpr double FIELD_BUCKET_SMOOTH_STRENGTH = 0.0;
 
 inline void basisCoeffs(double& Ce, double& Se)
 {
@@ -245,6 +261,44 @@ inline double median3(double a, double b, double c)
 {
     if (a > b) { if (b > c) return b; else if (a > c) return c; else return a; }
     else       { if (a > c) return a; else if (b > c) return c; else return b; }
+}
+
+// Colour burst measurement result for a single line.
+// bcos/bsin: normalised unit-magnitude phasor (post-floor-clamp).
+// carrierScale: raw burst magnitude before normalisation (in sample units).
+struct BurstInfo {
+    double bsin        = 0.0;
+    double bcos        = 1.0;
+    double carrierScale = 0.0;
+};
+
+// Measure the colour burst in the horizontal blanking interval to derive a
+// normalised phasor (bcos, bsin). If floorEnable is true and the measured
+// magnitude falls below floorFactor, the phasor is clamped to floorFactor
+// so very noisy lines still produce a usable reference.
+inline BurstInfo detectBurst(const quint16 *lineData,
+                             const LdDecodeMetaData::VideoParameters &vp,
+                             bool floorEnable,
+                             double floorFactor)
+{
+    double bsin = 0.0, bcos = 0.0;
+    for (int i = vp.colourBurstStart; i < vp.colourBurstEnd; ++i) {
+        const double s = lineData[i];
+        bsin += s * sin4fsc(i);
+        bcos += s * cos4fsc(i);
+    }
+    const int len = vp.colourBurstEnd - vp.colourBurstStart;
+    if (len > 0) { const double invLen = 1.0 / len; bsin *= invLen; bcos *= invLen; }
+    const double carrierScale = std::sqrt(bsin * bsin + bcos * bcos);
+    double mag = carrierScale;
+
+    if (floorEnable && mag < floorFactor && mag > 1e-9) {
+        const double s = floorFactor / mag;
+        bsin *= s; bcos *= s; mag = floorFactor;
+    }
+    if (mag > 1e-9) { const double invMag = 1.0 / mag; bsin *= invMag; bcos *= invMag; }
+    else { bsin = 0.0; bcos = 1.0; }
+    return {bsin, bcos, carrierScale};
 }
 
 // Demodulation result for a single line: separated Y, I, Q arrays and the
