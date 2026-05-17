@@ -205,12 +205,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->split3D(*previous, *next);
         }
 
-        if (configuration.phaseCompensation) {
-            // After 2D/3D selection has settled, downstream locked-path IQ should
-            // follow the final selected comb buffer rather than the earlier 1D demod.
-            current->rebuildLockedDemodFromSelectedComb();
-        }
-
         // Wire up temporal context for Residual Y if enabled
         if (configuration.residualVideo3D) {
         if (!isStartUp) {
@@ -232,7 +226,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             // 1) Sinusoidal-fit pre-clean and affine solve (fills clpbuffer[0], carrierGrammar.affine)
             // 2) Phase-corrected 1D demod for 2D work (via buildPhaseCorrected1D inside split2D)
             // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
-            // 4) Re-demod final selected comb into demodTI_flat/TQ_flat
+            // 4) Re-demod final selected comb and produce locked-product cache
             current->splitIQlocked();
             current->doCNR();
             current->produceY();
@@ -596,20 +590,17 @@ void Comb::FrameBuffer::seedCombOwnershipPerLine(int line)
     if ((int)row.size() < width)
         row.assign(width, OwnershipEvidence{});
 
+    // Carrier metadata lives in carrierGrammar; consumers read it there directly.
+    // Seed only the plausibility prior so finalize has a starting point.
     const CombCarrierGrammar *grammar = carrierGrammarLine(line);
     const bool grammarLocked = grammar && grammar->grammarLocked;
-    const double carrierScaleIRE = grammar ? grammar->carrierScale : 0.0;
-    const double carrierPhaseErrorRad = grammar ? grammar->phaseError : 0.0;
-    const double carrierPhaseConfidence = grammar
+    const double carrierPrior = grammarLocked
         ? std::clamp(grammar->phaseConfidence, 0.0, 1.0)
         : 0.0;
-    const double carrierPrior = grammarLocked ? carrierPhaseConfidence : 0.0;
 
     for (int rel = 0; rel < width; ++rel) {
-        row[rel].carrierScaleIRE = carrierScaleIRE;
-        row[rel].carrierPhaseErrorRad = carrierPhaseErrorRad;
-        row[rel].carrierPhaseConfidence = carrierPhaseConfidence;
         row[rel].carrierPlausibility = carrierPrior;
+        row[rel].ownershipConflict = 0.0;
     }
 }
 
@@ -653,18 +644,18 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
     const double carrierPrior = configuration.phaseCompensation
         ? std::clamp(e.carrierPlausibility, 0.0, 1.0)
         : 1.0;
-    
+
     e.carrierPlausibility = std::clamp(
         carrierPrior *
         chromaStrength *
         ((0.65 * coherence) + (0.35 * agreement)) *
         (1.0 - (0.5 * spreadPenalty)),
         0.0, 1.0);
-    
+
     double lumaClaim = std::clamp(
         (0.55 * lumaRisk) + (0.25 * lumaResidual) + (0.20 * e.lumaShapeContinuation),
         0.0, 1.0);
-    
+
     double chromaClaim = std::clamp(
         chromaStrength * ((0.65 * e.carrierPlausibility) + (0.35 * coherence)),
         0.0, 1.0);
@@ -1579,6 +1570,14 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
 
     }
 
+    // Scale the seeded carrier prior by line-level fit quality before finalize.
+    const CombCarrierGrammar *lineGrammar = carrierGrammarLine(line);
+    if (configuration.phaseCompensation && lineGrammar && lineGrammar->projectionValid) {
+        const double fitScale = std::sqrt(std::clamp(lineGrammar->carrierFitRatio, 0.0, 1.0));
+        for (int rel = 0; rel < width; ++rel)
+            row[rel].carrierPlausibility *= fitScale;
+    }
+
     // Final ownership needs cross-path evidence plus a same-phase continuity
     // check, not just the local 1D residual snapshot.
     for (int rel = 0; rel < width; ++rel) {
@@ -2025,6 +2024,11 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         const auto &row = ownershipEvidence[line];
         if ((int)row.size() < width)
             continue;
+        // Carrier fields live in the grammar, not in per-pixel evidence.
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const double lineCarrierScale = grammar ? grammar->carrierScale : 0.0;
+        const double lineCarrierConf  = grammar ? std::clamp(grammar->phaseConfidence, 0.0, 1.0) : 0.0;
+        const double lineCarrierPhase = grammar ? grammar->phaseError : 0.0;
         for (int rel = 0; rel < width; ++rel) {
             const OwnershipEvidence &e = row[rel];
             ++ownN;
@@ -2034,9 +2038,9 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             sumLumaIncursion += e.lumaIncursionRiskIRE;
             sumCandidateSpread += e.candidateSpreadIRE;
             sumFrameCoherence += e.frameIQCoherence;
-            sumCarrierScale += e.carrierScaleIRE;
-            sumCarrierConfidence += e.carrierPhaseConfidence;
-            sumCarrierPhaseErrorAbs += std::fabs(e.carrierPhaseErrorRad);
+            sumCarrierScale += lineCarrierScale;
+            sumCarrierConfidence += lineCarrierConf;
+            sumCarrierPhaseErrorAbs += std::fabs(lineCarrierPhase);
         }
     }
     if (ownN > 0) {

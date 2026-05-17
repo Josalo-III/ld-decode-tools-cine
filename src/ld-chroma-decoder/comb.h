@@ -383,7 +383,6 @@ public:
 
 	void split1D();
 	void buildPhaseCorrected1D();
-	void rebuildLockedDemodFromSelectedComb();
 	void split2D();
 	void copy2DTo3D(); 
 	void split3D(const FrameBuffer &previousFrame,
@@ -392,7 +391,6 @@ public:
 	void setComponentFrame(ComponentFrame &_componentFrame) { componentFrame = &_componentFrame; }
 
 	void splitIQ();         // Bucket
-	// In FrameBuffer public section (near split1D / split2D declarations)
 	void phaseLocked();  // prepares locked-path LO / basis etc.
 	void splitIQlocked();   // Product (burst-locked)
 
@@ -451,7 +449,13 @@ private:
 		bool   grammarLocked = false;
 		std::array<float,4> demodLUTTi = {0.0f, 0.0f, 0.0f, 0.0f};
 		std::array<float,4> demodLUTTq = {0.0f, 0.0f, 0.0f, 0.0f};
-		LineAffine affine = {{{1.0, 0.0}, {0.0, 1.0}}, false};
+		LineAffine affine;
+
+		// Line-level carrier projection summary (filled by projectCarrierPerLine).
+		double meanForwardErrorIRE = 0.0;  // mean |residual − C_model| in IRE
+		double meanChromaMagIRE    = 0.0;  // mean |I,Q| from residual demod, IRE
+		double carrierFitRatio     = 0.0;  // 1 − (forwardError / residualEnergy), [0,1]
+		bool   projectionValid     = false;
 	};
 	struct SamplePlane {
 		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];

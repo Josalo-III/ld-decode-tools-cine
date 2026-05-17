@@ -11,7 +11,7 @@
  * SPDX-FileCopyrightText: 2025-2026 Joseph Burns
  *
  * This file is part of ld-decode-tools.
- *
+ * A subset of comb functions used when --ntsc-phase-comp is active
  ******************************************************************************/
 
 #include "comb.h"
@@ -426,10 +426,18 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
         seedCombOwnershipPerLine(line);
 
-        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
         const double bcos = grammarLocked ? grammar->burstCos : 1.0;
         const double bsin = grammarLocked ? grammar->burstSin : 0.0;
+        const double lineScale = grammarLocked ? (double)grammar->lineFlip : 1.0;
+
+        const double *baseY4 = (lockedLumaCacheValid &&
+            !lockedLumaBaseY4_flat.empty() && demodWidth == width)
+            ? lockedLumaBaseY4_line(line) : nullptr;
+        double sumFwdError = 0.0, sumChromaMag = 0.0;
+        double sumResidualSq = 0.0, sumErrorSq = 0.0;
+        int projCount = 0;
 
         double lutTi[4], lutTq[4];
         if (grammarLocked) {
@@ -648,16 +656,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 xi < (int)ownershipEvidence[line].size())
             {
                 OwnershipEvidence &e = ownershipEvidence[line][xi];
-                const double carrierScaleIRE = e.carrierScaleIRE;
-                const double carrierPhaseErrorRad = e.carrierPhaseErrorRad;
-                const double carrierPhaseConfidence = e.carrierPhaseConfidence;
-                const double carrierPrior = e.carrierPlausibility;
-                e = OwnershipEvidence{};
-                e.carrierScaleIRE = carrierScaleIRE;
-                e.carrierPhaseErrorRad = carrierPhaseErrorRad;
-                e.carrierPhaseConfidence = carrierPhaseConfidence;
-                e.carrierPlausibility = carrierPrior;
-
+                // Write only the fields this stage produces; the full struct was
+                // zeroed at construction and collectCombOwnershipEvidence overwrites
+                // the remaining consumer-visible fields before finalize reads them.
                 e.bandpassFineIRE = fine;
                 e.bandpassMidIRE = mid;
                 e.bandpassCoarseIRE = coarse;
@@ -689,6 +690,33 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             locked1DTq4Row[xi] = (float)tq4;
 
             ldsRow[xi] = remod4fscToComposite(ti4, tq4, h);
+
+            if (baseY4 && grammarLocked) {
+                const double residual = (double)rawLine[h] - baseY4[xi];
+                const double rI = residual * lutTi[ph];
+                const double rQ = residual * lutTq[ph];
+                double rI4, rQ4;
+                lockedTo4fsc(rI, rQ, bcos, bsin, rI4, rQ4);
+                const double cModel = remod4fscToComposite(rI4, rQ4, h, lineScale);
+                const double fwdErr = residual - cModel;
+                sumFwdError   += std::fabs(fwdErr);
+                sumChromaMag  += std::hypot(rI4, rQ4);
+                sumResidualSq += residual * residual;
+                sumErrorSq    += fwdErr * fwdErr;
+                ++projCount;
+            }
+        }
+
+        if (grammarLocked && grammar && projCount > 0) {
+            const double invCount = 1.0 / (double)projCount;
+            grammar->meanForwardErrorIRE = sumFwdError * invCount * invIreScale;
+            grammar->meanChromaMagIRE    = sumChromaMag * invCount * invIreScale;
+            grammar->carrierFitRatio     = (sumResidualSq > 1e-12)
+                ? std::clamp(1.0 - sumErrorSq / sumResidualSq, 0.0, 1.0)
+                : 0.0;
+            grammar->projectionValid = true;
+        } else if (grammar) {
+            grammar->projectionValid = false;
         }
 
         if (FIELD_BUCKET_SMOOTH_STRENGTH > 0.0) {
@@ -717,19 +745,36 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
 }
 
-void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
+void Comb::FrameBuffer::splitIQlocked()
 {
-    const int first  = videoParameters.firstActiveFrameLine;
-    const int last   = videoParameters.lastActiveFrameLine;
-    const int left   = videoParameters.activeVideoStart;
-    const int right  = videoParameters.activeVideoEnd;
-    const int width  = right - left;
-    const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
-    const auto &T    = configuration.tunables;
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+    const int srcBuf    = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
+    const auto &T       = configuration.tunables;
 
-    if (width <= 0 || first >= last) return;
+    if (width <= 0 || firstLine >= lastLine) return;
 
-    for (int line = first; line < last; ++line) {
+    if (!basisLockedInit) {
+        double Ce = 1.0, Se = 0.0;
+        basisCoeffs(Ce, Se);
+        for (int i = 0; i < 4; ++i) {
+            double sp, cp;
+            shiftedBasis(i, Ce, Se, sp, cp);
+            spLUT_locked[i] = sp;
+            cpLUT_locked[i] = cp;
+        }
+        basisLockedInit = true;
+    }
+
+    if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
+    if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
+
+    // splitIQlocked owns the post-comb locked demod. It refreshes the stable
+    // selected-comb demod reference and seeds the downstream locked-product cache.
+    for (int line = firstLine; line < lastLine; ++line) {
         const double *src = clpbuffer[srcBuf].pixel[line];
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
@@ -750,6 +795,8 @@ void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
         float *tqRow = demodTQ_line(line);
         float *ti4Row = demodTI4fsc_line(line);
         float *tq4Row = demodTQ4fsc_line(line);
+        float *prodIRow = lockedProductI_line(line);
+        float *prodQRow = lockedProductQ_line(line);
 
         const LineAffine *lineAffine = nullptr;
         if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
@@ -770,56 +817,18 @@ void Comb::FrameBuffer::rebuildLockedDemodFromSelectedComb()
             double ti = src[h] * lutTi[ph];
             double tq = src[h] * lutTq[ph];
             applyLineAffine(ti, tq);
-            double ti4 = 0.0, tq4 = 0.0;
+
+            double ti4 = 0.0;
+            double tq4 = 0.0;
             lockedTo4fsc(ti, tq, bcos, bsin, ti4, tq4);
-            tiRow[xi] = (float)ti;
-            tqRow[xi] = (float)tq;
-            ti4Row[xi] = (float)ti4;
-            tq4Row[xi] = (float)tq4;
-        }
-    }
-}
 
-
-void Comb::FrameBuffer::splitIQlocked()
-{
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int width     = right - left;
-
-    if (width <= 0 || firstLine >= lastLine) return;
-
-    if (!basisLockedInit) {
-        double Ce = 1.0, Se = 0.0;
-        basisCoeffs(Ce, Se);
-        for (int i = 0; i < 4; ++i) {
-            double sp, cp;
-            shiftedBasis(i, Ce, Se, sp, cp);
-            spLUT_locked[i] = sp;
-            cpLUT_locked[i] = cp;
-        }
-        basisLockedInit = true;
-    }
-
-    if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
-    if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
-
-    // splitIQlocked is the producer for the downstream locked-product cache.
-    // Later stages may refine lockedProductI/Q, but they should not mutate
-    // demodTI/TQ, which remain the stable selected-comb demod reference.
-    for (int line = firstLine; line < lastLine; ++line) {
-        const float *tiRow = demodTI_line(line);
-        const float *tqRow = demodTQ_line(line);
-        float *prodIRow = lockedProductI_line(line);
-        float *prodQRow = lockedProductQ_line(line);
-
-        for (int xi = 0; xi < width; ++xi) {
-            const double ti = tiRow ? (double)tiRow[xi] : 0.0;
-            const double tq = tqRow ? (double)tqRow[xi] : 0.0;
             const float prodI = (float)(ti * GI_PRODUCT);
             const float prodQ = (float)(tq * GQ_PRODUCT);
+
+            if (tiRow) tiRow[xi] = (float)ti;
+            if (tqRow) tqRow[xi] = (float)tq;
+            if (ti4Row) ti4Row[xi] = (float)ti4;
+            if (tq4Row) tq4Row[xi] = (float)tq4;
             if (prodIRow) prodIRow[xi] = prodI;
             if (prodQRow) prodQRow[xi] = prodQ;
             scratch_preI[xi] = prodI;
@@ -1451,4 +1460,5 @@ void Comb::FrameBuffer::produceY()
             }
         }
     }
+
 }
