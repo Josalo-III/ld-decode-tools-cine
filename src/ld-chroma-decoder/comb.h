@@ -61,8 +61,8 @@ public:
         bool locked2DSourceTo4fsc = true;
 
         // Per-axis product gains: multipliers applied to I and Q before filtering.
-   //     double gi_product = 1.0;
-  //      double gq_product = 1.1;
+        double gi_product = 1.0;
+        double gq_product = 1.1;
 
         // Noise reduction levels (0 = disabled)
         double cNRLevel = 0.0;
@@ -187,8 +187,7 @@ public:
             double FVF_BLEND_MIN_FRAME_FRACTION   = 0.20;
             double ONE_D_NEAR_THRESH_IRE          = 1.5;  
             // Neighbor Shaping for FVF
-            double FVF_SHAPE_STRENGTH             = 0.75;
-            // (reserved)
+            double FVF_SHAPE_STRENGTH             = 0.85;
             // Neighbor-based cross-domain estimate shaping (FVF)
             double NEIGHBOR_EST_WEIGHT        = 0.25;  // penalty weight (in IRE units); keep small
             double NEIGHBOR_EST_SAT_MAX_IRE   = 12.0; // disable in strong saturation
@@ -218,7 +217,7 @@ public:
             
             // Scale-bias strengths (fine vs mid structure) per mode.
             // Progressive: keep some; Interlace: usually 0.0 to disable.
-            double FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE = 0.15;
+            double FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE = 0.25;
             double FRAME_SCALE_BIAS_STRENGTH_INTERLACE   = 0.0;
                                     
             // =========================================================================
@@ -244,23 +243,11 @@ public:
             //   global "temporal mixing veto" control. When the material disagrees
             //   beyond this point, both 3D candidate selection and residual-Y temporal
             //   mixing are suppressed consistently.
-            double AGREEMENT_REWARD_RADIUS_IRE    = 5.5;  // reward region radius (IRE)
+            double AGREEMENT_REWARD_RADIUS_IRE    = 8.5;  // reward region radius (IRE)
             double AGREEMENT_REWARD_MAX           = 3.3;  // max reward at d=0 (penalty units, scaled by adaptThreshold)
             double AGREEMENT_VETO_BASE            = 7.0; // base penalty once d exceeds deviationThreshold
             double deviationThreshold            = 8.0; // start of veto region (IRE)
             double deviationPenalty               = 3.3;  // penalty slope beyond deviationThreshold (per IRE)
-
-            // We look for Y leakage in our chroma
-            double LEAKAGE_ALPHA_MAX              = 0.60;
-            double LEAKAGE_ALPHA_GAIN             = 1.00;
-            double LEAKAGE_MIN_ENERGY_IRE         = 1.0;
-            bool   LEAKAGE_GATE_BY_COHERENCE      = true;
-            // We look for coherence loss to target errors
-            bool   CHROMA_COHERENCE_ENABLE        = true;
-            int    CHROMA_COH_WIN_SAMPLES         = 16;
-            double CHROMA_COH_R0                  = 0.35;
-            double CHROMA_COH_GAMMA               = 1.5;
-            double CHROMA_COH_SUPPRESS_MAX        = 0.70;
 
             // Affine of residual Y - required to allow more detail
             bool   Y_LOCAL_AFFINE_ENABLE          = true;
@@ -296,8 +283,8 @@ public:
             // bandpassed energy is luma-owned, return it to Y instead of
             // subtracting it as chroma.
             bool   VET_OWNERSHIP_ENABLE            = true;
-            double VET_OWNERSHIP_LUMA_WEIGHT       = 0.5;  // blend strength for lumaClaim reassignment (0=off, 1=full)
-            double VET_OWNERSHIP_CHROMA_WEIGHT = 0.12;
+            double VET_OWNERSHIP_LUMA_WEIGHT       = 0.75;  // blend strength for lumaClaim reassignment (0=off, 1=full)
+            double VET_OWNERSHIP_CHROMA_WEIGHT = 0.75;
             double VET_OWNERSHIP_CONFLICT_SUPPRESS = 0.65;
             double VET_Y_COHERENCE_ROLLBACK_WEIGHT = 0.75;
             double VET_Y_COHERENCE_BADNESS_IRE = 1.5;
@@ -308,14 +295,14 @@ public:
             // Scales the bandpass-of-smooth-luma prediction at directional edges to
             // compensate for the chroma-canceling smooth blunting the peak height.
             // 1.0 = no recovery boost, 2.0–3.0 = moderate-to-strong boost.
-            double LUMA_ICEBERG_RECOVERY           = 2.0;
+            double LUMA_ICEBERG_RECOVERY           = 2.5;
             double VET_Y_ADAPTIVE_SCALE           = 0.0;
             double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
             bool   VET_RESIDUAL_FIR_ENABLE        = false;
             double VET_RESIDUAL_FIR_THRESH_IRE    = 1.0;
             int    VET_RESIDUAL_FIR_HALF_WIDTH    = 2;
             int    VET_ALIGN_WIN_SAMPLES          = 16;
-            double VET_ALIGN_PHASE_MAX_DEG        = 10.0;
+            double VET_ALIGN_PHASE_MAX_DEG        = 12.0;
             double VET_ALIGN_MIN_RHO              = 0.75;
             double VET_ALIGN_MAX_SHEAR            = 0.15;
         };
