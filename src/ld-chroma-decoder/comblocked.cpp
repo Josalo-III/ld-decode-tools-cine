@@ -134,7 +134,7 @@ void Comb::FrameBuffer::phaseLocked()
                 const int h      = left + xi;
                 dc += DC_ALPHA * ((double)rawLine[h] - dc);
                 const double vraw = (double)rawLine[h] - dc;
-                const int ph = (h & 3);
+                const int ph = carrierSampleClass(line, h);
                 triRow[xi] = (float)(vraw * lutTi[ph]);
                 trqRow[xi] = (float)(vraw * lutTq[ph]);
             }
@@ -497,7 +497,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
-            const int ph = (h & 3);
+            const int ph = carrierSampleClass(line, h);
             double ti = src[h] * lutTi[ph];
             double tq = src[h] * lutTq[ph];
             applyLineAffine(ti, tq);
@@ -507,7 +507,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
-            const int ph = (h & 3);
+            const int ph = carrierSampleClass(line, h);
             double ti = tiBase[xi];
             double tq = tqBase[xi];
 
@@ -659,14 +659,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 // Write only the fields this stage produces; the full struct was
                 // zeroed at construction and collectCombOwnershipEvidence overwrites
                 // the remaining consumer-visible fields before finalize reads them.
-                e.bandpassFineIRE = fine;
-                e.bandpassMidIRE = mid;
-                e.bandpassCoarseIRE = coarse;
-                e.lumaExcursionIRE = intakeNyquistRiskIRE;
-                e.residualFitErrorIRE = residualFitErrorIRE;
-                e.lumaIncursionRiskIRE = lumaIncursionRiskIRE;
-                e.icebergAlienYFraction = icebergAlienYFraction;
-                e.locked1DChromaIRE = std::hypot(ti, tq) * invIreScale;
+                e.facts.bandpassFineIRE = fine;
+                e.facts.bandpassMidIRE = mid;
+                e.facts.bandpassCoarseIRE = coarse;
+                e.facts.lumaExcursionIRE = intakeNyquistRiskIRE;
+                e.facts.residualFitErrorIRE = residualFitErrorIRE;
+                e.facts.lumaIncursionRiskIRE = lumaIncursionRiskIRE;
+                e.facts.icebergAlienYFraction = icebergAlienYFraction;
+                e.facts.locked1DChromaIRE = std::hypot(ti, tq) * invIreScale;
             }
 
             if (bpLumaModeled != 0.0) {
@@ -689,7 +689,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             locked1DTi4Row[xi] = (float)ti4;
             locked1DTq4Row[xi] = (float)tq4;
 
-            ldsRow[xi] = remod4fscToComposite(ti4, tq4, h);
+            ldsRow[xi] = remod4fscToCompositePhase(ti4, tq4, carrierSampleClass(line, h));
 
             if (baseY4 && grammarLocked) {
                 const double residual = (double)rawLine[h] - baseY4[xi];
@@ -697,7 +697,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const double rQ = residual * lutTq[ph];
                 double rI4, rQ4;
                 lockedTo4fsc(rI, rQ, bcos, bsin, rI4, rQ4);
-                const double cModel = remod4fscToComposite(rI4, rQ4, h, lineScale);
+                const double cModel = remod4fscToCompositePhase(rI4, rQ4, carrierSampleClass(line, h), lineScale);
                 const double fwdErr = residual - cModel;
                 sumFwdError   += std::fabs(fwdErr);
                 sumChromaMag  += std::hypot(rI4, rQ4);
@@ -813,7 +813,7 @@ void Comb::FrameBuffer::splitIQlocked()
 
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
-            const int ph = (h & 3);
+            const int ph = carrierSampleClass(line, h);
             double ti = src[h] * lutTi[ph];
             double tq = src[h] * lutTq[ph];
             applyLineAffine(ti, tq);
@@ -922,7 +922,7 @@ void Comb::FrameBuffer::filterIQLocked()
                 const double chromaRaw = (double)rawLine[h] - Yrow[h];
                 dc += DC_ALPHA * (chromaRaw - dc);
                 const double chroma = chromaRaw - dc;
-                const int ph = (h & 3);
+                const int ph = carrierSampleClass(line, h);
                 scratch_preI[i] = (chroma * lutTi[ph]) * GI_PRODUCT;
                 scratch_preQ[i] = (chroma * lutTq[ph]) * GQ_PRODUCT;
             }
@@ -1301,7 +1301,7 @@ void Comb::FrameBuffer::produceY()
             const double ti_adj_4fsc = Rm[0][0] * ti0 + Rm[0][1] * tq0;
             const double tq_adj_4fsc = Rm[1][0] * ti0 + Rm[1][1] * tq0;
 
-            cHat[x] = remod4fscToComposite(ti_adj_4fsc, tq_adj_4fsc, h);
+            cHat[x] = remod4fscToCompositePhase(ti_adj_4fsc, tq_adj_4fsc, carrierSampleClass(line, h));
             vetConf[x] = vet.confidence;
 
             double ti_locked_adj = 0.0;
@@ -1327,9 +1327,10 @@ void Comb::FrameBuffer::produceY()
         const double ownershipChromaWeight = T.VET_OWNERSHIP_CHROMA_WEIGHT;
 
         auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
-            const double lc = std::clamp(ownRow[x].lumaClaim, 0.0, 1.0);
-            const double cc = std::clamp(ownRow[x].chromaClaim, 0.0, 1.0);
-            const double uc = std::clamp(ownRow[x].uncertainClaim, 0.0, 1.0);
+            const OwnershipAssessment &a = ownRow[x].assessment;
+            const double lc = std::clamp(a.lumaClaim, 0.0, 1.0);
+            const double cc = std::clamp(a.chromaClaim, 0.0, 1.0);
+            const double uc = std::clamp(a.uncertainClaim, 0.0, 1.0);
 
             const double support =
                 lc * (1.0 - 0.5 * cc) * (1.0 - 0.5 * uc);

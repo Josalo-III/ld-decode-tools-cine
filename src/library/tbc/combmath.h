@@ -109,6 +109,13 @@ inline double remod4fscToComposite(double i4fsc, double q4fsc, int h,
     return lineScale * 0.5 * (i4fsc * sin4fsc(h) + q4fsc * cos4fsc(h));
 }
 
+// Remodulate using a grammar-derived phase index rather than a raw sample position.
+inline double remod4fscToCompositePhase(double i4fsc, double q4fsc,
+                                        int phase, double lineScale = 1.0)
+{
+    return lineScale * 0.5 * (i4fsc * sin4fsc(phase) + q4fsc * cos4fsc(phase));
+}
+
 // Remodulate common 4fsc IQ back into the shifted sample basis used by the
 // burst-locked demod path. This preserves the fractional basis choice while
 // staying explicit about the fact that the IQ itself is already canonical 4fsc.

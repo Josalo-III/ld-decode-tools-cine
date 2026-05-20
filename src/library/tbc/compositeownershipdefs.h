@@ -139,11 +139,36 @@ struct CompositeParserState {
     std::vector<CompositeSpan> spans;
 };
 
-// CombOwnershipEvidence is the lean, comb-decoder-facing ownership record.
-// Keep this separate from the richer composite-model record below so the
-// chroma decoder can manage its own memory layout and evidence vocabulary
-// without pulling in parser-only fields it does not produce.
-struct CombOwnershipEvidence {
+// Immutable ownership-rule defaults.
+//
+// These rules define how claim sets are normalized and how competing luma
+// and chroma attributions interact. Decoder-specific code may create local
+// software redefinitions of these rules, but the shared header establishes
+// the canonical defaults and vocabulary.
+enum class OwnershipConflictRule {
+    GeometricMean,
+};
+
+enum class OwnershipUncertaintyRule {
+    OneMinusMaxClaim,
+};
+
+enum class OwnershipClaimMergeRule {
+    Max,
+};
+
+struct OwnershipRules {
+    OwnershipConflictRule conflictRule = OwnershipConflictRule::GeometricMean;
+    OwnershipUncertaintyRule uncertaintyRule = OwnershipUncertaintyRule::OneMinusMaxClaim;
+    OwnershipClaimMergeRule chromaMergeRule = OwnershipClaimMergeRule::Max;
+    double conflictSuppress = 0.65;
+};
+
+inline constexpr OwnershipRules kDefaultOwnershipRules{};
+
+// Comb ownership facts are narrow observed/derived measurements only. They are
+// evidence, not conclusions.
+struct CombOwnershipFacts {
     double bandpassFineIRE = 0.0;
     double bandpassMidIRE = 0.0;
     double bandpassCoarseIRE = 0.0;
@@ -161,11 +186,22 @@ struct CombOwnershipEvidence {
     double residualFitErrorIRE = 0.0;
     double lumaIncursionRiskIRE = 0.0;
     double icebergAlienYFraction = 0.0;
-    double lumaShapeContinuation = 0.0;
+};
 
-    double carrierScaleIRE = 0.0;
-    double carrierPhaseErrorRad = 0.0;
-    double carrierPhaseConfidence = 0.0;
+// Comb ownership assessment is the software interpretation of the facts under
+// a chosen rule set. This is where claims and decoder-local reinterpretations
+// belong.
+struct CombOwnershipAssessment {
+    double lumaRisk = 0.0;
+    double lumaResidual = 0.0;
+    double baseSupport = 0.0;
+    double neighborSupport = 0.0;
+    double lumaShapeContinuation = 0.0;
+    double chromaStrength = 0.0;
+    double coherence = 0.0;
+    double agreement = 0.0;
+    double spreadPenalty = 0.0;
+    double carrierPrior = 0.0;
     double carrierPlausibility = 0.0;
 
     double ownershipConflict = 0.0;
@@ -174,12 +210,19 @@ struct CombOwnershipEvidence {
     double uncertainClaim = 1.0;
 };
 
+struct CombOwnershipRecord {
+    CombOwnershipFacts facts;
+    CombOwnershipAssessment assessment;
+};
 
-// CompositeOwnershipEvidence is the richer, parser-facing ownership record
-// used by the composite decoder branch.  It carries the more decomposed
-// carrier/envelope/sideband vocabulary and should stay separate from the
-// comb-specific record above.
-struct CompositeOwnershipEvidence {
+// Transitional alias: existing code may still refer to OwnershipEvidence while
+// the implementation is moved over to facts + assessment explicitly.
+using CombOwnershipEvidence = CombOwnershipRecord;
+
+
+// Composite ownership facts are the richer, parser-facing observed/derived
+// measurements used by the model-based decoder branch.
+struct CompositeOwnershipFacts {
     // ---------------------------------------------------------------------
     // Luma / residual waveform evidence
     // ---------------------------------------------------------------------
@@ -193,7 +236,6 @@ struct CompositeOwnershipEvidence {
     double residualFitErrorIRE = 0.0;
     double lumaIncursionRiskIRE = 0.0;
     double icebergAlienYFraction = 0.0;
-    double lumaShapeContinuation = 0.0;
 
     // ---------------------------------------------------------------------
     // Composite / carrier-domain evidence
@@ -220,8 +262,6 @@ struct CompositeOwnershipEvidence {
     double compositeStableSideCoherence = 0.0;
     double compositePatternDepth = 0.0;
     double compositePatternLevels = 0.0;
-
-    double carrierPlausibility = 0.0;
 
     // ---------------------------------------------------------------------
     // Early coarse-Y / quarter-stage evidence
@@ -320,7 +360,6 @@ struct CompositeOwnershipEvidence {
     double subtractionErrorIRE = 0.0;
     double reverseLumaIRE = 0.0;
     double forwardChromaIRE = 0.0;
-    double modelAgreementClaim = 0.0;
 
     // Waveform-level forward-model diagnostics.
     //
@@ -337,30 +376,17 @@ struct CompositeOwnershipEvidence {
     double yContributionSupport = 0.0;
     double iqContributionSupport = 0.0;
     double lumaImpulseCaution = 0.0;
+};
+
+// Composite ownership assessment holds the software interpretation of the
+// facts under a chosen rule set. It includes both decomposed chroma claims
+// and intermediate model-interpretation terms.
+struct CompositeOwnershipAssessment {
+    double modelAgreementClaim = 0.0;
     double waveformClaimConflict = 0.0;
-
-    // ---------------------------------------------------------------------
-    // Attribution claims
-    // ---------------------------------------------------------------------
-
+    double lumaShapeContinuation = 0.0;
+    double carrierPlausibility = 0.0;
     double ownershipConflict = 0.0;
-
-    // Composite-model attribution claims.
-    //
-    // lumaClaim:
-    //     Attribution that contested residual energy is better explained as
-    //     luma than chroma.
-    //
-    // The chroma side is deliberately decomposed.  There is no generic
-    // chromaClaim field here because the composite decoder should preserve
-    // whether the claim came from carrier, envelope, sideband, or current
-    // NTSC composite evidence.
-    //
-    // uncertainClaim:
-    //     Remaining unattributed confidence.  The convention is:
-    //
-    //         uncertainClaim = 1 - max(lumaClaim, combined chroma claim)
-    //
     double lumaClaim = 0.0;
     double uncertainClaim = 1.0;
 
@@ -372,139 +398,165 @@ struct CompositeOwnershipEvidence {
     // Current NTSC/composite decoder claim aliases.
     double compositeChromaClaim = 0.0;
     double iqEnvelopeClaim = 0.0;
-
 };
+
+struct CompositeOwnershipRecord {
+    CompositeOwnershipFacts facts;
+    CompositeOwnershipAssessment assessment;
+};
+
+using CompositeOwnershipEvidence = CompositeOwnershipRecord;
 
 inline double clamp01(double v)
 {
     return std::clamp(v, 0.0, 1.0);
 }
 
-inline double combinedCarrierChromaCoherence(const CompositeOwnershipEvidence &e)
+inline double combinedCarrierChromaCoherence(const CompositeOwnershipFacts &f)
 {
     return std::max({
-        e.carrierChromaCoherence,
-        e.carrierPhaseCoherence,
-        e.compositeChromaCoherence,
-        e.compositeCarrierCoherence,
-        e.compositeLinePatternCoherence,
-        e.compositeFieldCoherence,
-        e.compositeBoundaryCoherence,
-        e.compositeStableSideCoherence,
-        e.carrierPlausibility,
-        e.sidebandCoherence
+        f.carrierChromaCoherence,
+        f.carrierPhaseCoherence,
+        f.compositeChromaCoherence,
+        f.compositeCarrierCoherence,
+        f.compositeLinePatternCoherence,
+        f.compositeFieldCoherence,
+        f.compositeBoundaryCoherence,
+        f.compositeStableSideCoherence,
+        f.sidebandCoherence
     });
 }
 
-inline double combinedEnvelopeChromaCoherence(const CompositeOwnershipEvidence &e)
+inline double combinedEnvelopeChromaCoherence(const CompositeOwnershipFacts &f)
 {
     return std::max({
-        e.iqChromaCoherence,
-        e.iqEnvelopeCoherence,
-        e.chromaEnvelopeCoherence
+        f.iqChromaCoherence,
+        f.iqEnvelopeCoherence,
+        f.chromaEnvelopeCoherence
     });
 }
 
-inline double strongestChromaCoherence(const CompositeOwnershipEvidence &e)
+inline double strongestChromaCoherence(const CompositeOwnershipFacts &f)
 {
     return std::max({
-        combinedCarrierChromaCoherence(e),
-        combinedEnvelopeChromaCoherence(e)
+        combinedCarrierChromaCoherence(f),
+        combinedEnvelopeChromaCoherence(f)
     });
 }
 
-inline double combinedCompositeChromaClaim(const CompositeOwnershipEvidence &e)
+inline double combinedCompositeChromaClaim(const CompositeOwnershipAssessment &a,
+                                           const OwnershipRules &rules = kDefaultOwnershipRules)
 {
-    return std::max({
-        e.carrierChromaClaim,
-        e.envelopeChromaClaim,
-        e.sidebandChromaClaim,
-        e.compositeChromaClaim,
-        e.iqEnvelopeClaim
-    });
+    switch (rules.chromaMergeRule) {
+    case OwnershipClaimMergeRule::Max:
+    default:
+        return std::max({
+            a.carrierChromaClaim,
+            a.envelopeChromaClaim,
+            a.sidebandChromaClaim,
+            a.compositeChromaClaim,
+            a.iqEnvelopeClaim
+        });
+    }
 }
 
-inline void normalizeCompositeOwnershipClaims(CompositeOwnershipEvidence &e)
+inline double computeOwnershipConflict(double lumaClaim,
+                                       double chromaClaim,
+                                       const OwnershipRules &rules = kDefaultOwnershipRules)
 {
-    e.lumaClaim = clamp01(e.lumaClaim);
-
-    e.carrierChromaClaim = clamp01(e.carrierChromaClaim);
-    e.envelopeChromaClaim = clamp01(e.envelopeChromaClaim);
-    e.sidebandChromaClaim = clamp01(e.sidebandChromaClaim);
-
-    e.compositeChromaClaim = clamp01(e.compositeChromaClaim);
-    e.iqEnvelopeClaim = clamp01(e.iqEnvelopeClaim);
-
-    const double chromaClaim = clamp01(combinedCompositeChromaClaim(e));
-
-    e.uncertainClaim = clamp01(
-        1.0 - std::max(e.lumaClaim, chromaClaim));
+    switch (rules.conflictRule) {
+    case OwnershipConflictRule::GeometricMean:
+    default:
+        return std::sqrt(std::max(0.0, clamp01(lumaClaim) * clamp01(chromaClaim)));
+    }
 }
 
-inline void applyOwnershipConflictSuppression(CompositeOwnershipEvidence &e,
-                                              double conflictSuppress)
+inline double computeUncertainClaim(double lumaClaim,
+                                    double chromaClaim,
+                                    const OwnershipRules &rules = kDefaultOwnershipRules)
 {
-    e.lumaClaim = clamp01(e.lumaClaim);
+    switch (rules.uncertaintyRule) {
+    case OwnershipUncertaintyRule::OneMinusMaxClaim:
+    default:
+        return clamp01(1.0 - std::max(clamp01(lumaClaim), clamp01(chromaClaim)));
+    }
+}
 
-    const double chromaClaim = clamp01(combinedCompositeChromaClaim(e));
+inline void normalizeCompositeOwnershipAssessment(CompositeOwnershipAssessment &a,
+                                                  const OwnershipRules &rules = kDefaultOwnershipRules)
+{
+    a.lumaClaim = clamp01(a.lumaClaim);
 
-    const double conflict = std::sqrt(
-        std::max(0.0, e.lumaClaim * chromaClaim));
+    a.carrierChromaClaim = clamp01(a.carrierChromaClaim);
+    a.envelopeChromaClaim = clamp01(a.envelopeChromaClaim);
+    a.sidebandChromaClaim = clamp01(a.sidebandChromaClaim);
+    a.compositeChromaClaim = clamp01(a.compositeChromaClaim);
+    a.iqEnvelopeClaim = clamp01(a.iqEnvelopeClaim);
 
-    e.ownershipConflict = std::max(e.ownershipConflict, conflict);
+    const double chromaClaim = clamp01(combinedCompositeChromaClaim(a, rules));
+    a.uncertainClaim = computeUncertainClaim(a.lumaClaim, chromaClaim, rules);
+}
+
+inline void applyOwnershipConflictSuppression(CompositeOwnershipAssessment &a,
+                                              const OwnershipRules &rules = kDefaultOwnershipRules)
+{
+    a.lumaClaim = clamp01(a.lumaClaim);
+
+    const double chromaClaim = clamp01(combinedCompositeChromaClaim(a, rules));
+    const double conflict = computeOwnershipConflict(a.lumaClaim, chromaClaim, rules);
+
+    a.ownershipConflict = std::max(a.ownershipConflict, conflict);
 
     const double scale = std::max(
         0.0,
-        1.0 - clamp01(conflictSuppress) * conflict);
+        1.0 - clamp01(rules.conflictSuppress) * conflict);
 
-    e.lumaClaim *= scale;
+    a.lumaClaim *= scale;
+    a.carrierChromaClaim *= scale;
+    a.envelopeChromaClaim *= scale;
+    a.sidebandChromaClaim *= scale;
+    a.compositeChromaClaim *= scale;
+    a.iqEnvelopeClaim *= scale;
 
-    e.carrierChromaClaim *= scale;
-    e.envelopeChromaClaim *= scale;
-    e.sidebandChromaClaim *= scale;
-    e.compositeChromaClaim *= scale;
-    e.iqEnvelopeClaim *= scale;
-
-    normalizeCompositeOwnershipClaims(e);
+    normalizeCompositeOwnershipAssessment(a, rules);
 }
 
-inline double strongestCombChromaIRE(const CombOwnershipEvidence &e)
+inline double strongestCombChromaIRE(const CombOwnershipFacts &f)
 {
     return std::max({
-        e.fieldAChromaIRE,
-        e.fieldBChromaIRE,
-        e.frameChromaIRE,
-        e.locked1DChromaIRE
+        f.fieldAChromaIRE,
+        f.fieldBChromaIRE,
+        f.frameChromaIRE,
+        f.locked1DChromaIRE
     });
 }
 
-inline void normalizeCombOwnershipClaims(CombOwnershipEvidence &e)
+inline void normalizeCombOwnershipAssessment(CombOwnershipAssessment &a,
+                                             const OwnershipRules &rules = kDefaultOwnershipRules)
 {
-    e.lumaClaim = clamp01(e.lumaClaim);
-    e.chromaClaim = clamp01(e.chromaClaim);
-    e.uncertainClaim = clamp01(
-        1.0 - std::max(e.lumaClaim, e.chromaClaim));
+    a.lumaClaim = clamp01(a.lumaClaim);
+    a.chromaClaim = clamp01(a.chromaClaim);
+    a.uncertainClaim = computeUncertainClaim(a.lumaClaim, a.chromaClaim, rules);
 }
 
-inline void applyOwnershipConflictSuppression(CombOwnershipEvidence &e,
-                                              double conflictSuppress)
+inline void applyOwnershipConflictSuppression(CombOwnershipAssessment &a,
+                                              const OwnershipRules &rules = kDefaultOwnershipRules)
 {
-    e.lumaClaim = clamp01(e.lumaClaim);
-    e.chromaClaim = clamp01(e.chromaClaim);
+    a.lumaClaim = clamp01(a.lumaClaim);
+    a.chromaClaim = clamp01(a.chromaClaim);
 
-    const double conflict = std::sqrt(
-        std::max(0.0, e.lumaClaim * e.chromaClaim));
+    const double conflict = computeOwnershipConflict(a.lumaClaim, a.chromaClaim, rules);
 
-    e.ownershipConflict = std::max(e.ownershipConflict, conflict);
+    a.ownershipConflict = std::max(a.ownershipConflict, conflict);
 
     const double scale = std::max(
         0.0,
-        1.0 - clamp01(conflictSuppress) * conflict);
+        1.0 - clamp01(rules.conflictSuppress) * conflict);
 
-    e.lumaClaim *= scale;
-    e.chromaClaim *= scale;
+    a.lumaClaim *= scale;
+    a.chromaClaim *= scale;
 
-    normalizeCombOwnershipClaims(e);
+    normalizeCombOwnershipAssessment(a, rules);
 }
 
 } // namespace lddecode

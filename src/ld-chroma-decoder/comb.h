@@ -31,6 +31,7 @@
 
 #include "lddecodemetadata.h"
 #include "compositeownershipdefs.h"
+#include "combmath.h"
 #include "componentframe.h"
 #include "decoder.h"
 #include "sourcefield.h"
@@ -113,198 +114,169 @@ public:
             // =========================================================================
             // 1D / Lateral baseline
             // =========================================================================
-            bool   BUCKET_NORM_ENABLE    = true;
-            double BUCKET_NORM_GAIN_MIN  = 0.85;
-            double BUCKET_NORM_GAIN_MAX  = 1.20;
-        
-            int    NEIGH_WIN_RADIUS      = 2;
-            double NEIGH_TOL_IRE         = 1.0;
-            double NEIGH_MAX_IRE         = 5.0;
-            double NEIGH_MIN_WEIGHT      = 0.2;
-            // Sinusoidal subcarrier fit (phaseLocked pre-clean of clpbuffer[0])
-            int    SINFIT_WIN_SAMPLES        = 16;   // window for local amplitude estimate (must be multiple of 4)
-            double SINFIT_VET_THRESHOLD_IRE  = 3.0;  // residual energy above which fit is rejected per-sample        
+            // Sinusoidal fit used by the phaseLocked pre-clean of clpbuffer[0].
+            int    SINFIT_WIN_SAMPLES       = 16;  // samples per window; must be a multiple of 4 (one 4fsc period)
+            double SINFIT_VET_THRESHOLD_IRE = 3.0; // per-sample fit residual above which that sample is rejected
+
             // =========================================================================
             // 2D Field extraction (FieldA/B) and vertical gating
             // =========================================================================
-            double FIELD_K_RANGE_IRE           = 45.0;
-            bool   FIELD_VERT_EXTENDED_ENABLE  = true;
-            double FIELD_VERT_FAR_WEIGHT       = 0.45;
-            double FIELD_VERT_FAR_BLEND        = 0.60;
-            double FIELD_VERT_K_RANGE_SCALE    = 1.00;
-            double FIELD_CONTOUR_FAR_INFLUENCE = 0.55;
-            double FIELD_CONTOUR_SOFT_IRE      = 4.0;
-            double FIELD_CONTOUR_HARD_IRE      = 10.0;
-            double FIELD_CONTOUR_SIM_START     = 0.55;
-            double FIELD_CONTOUR_SIM_FULL      = 0.85;
-        
-            double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0;
-            double FIELD_VERT_DISAGREE_SUPPRESS   = 1.00;
-            bool   FIELD_SYMMETRIC_H_NEIGHBOR     = true;
-        
-            double FIELD_LUMA_EDGE_THRESH_IRE       = 18.0;
-            double FIELD_LUMA_EDGE_STRICT_RATIO     = 1.5;
-            bool   FIELD_LUMA_EDGE_EXCLUDE_ENABLE   = true;
+            double FIELD_K_RANGE_IRE           = 45.0; // max kScore diff (IRE) before field 2D output is penalized
+            double FIELD_CONTOUR_FAR_INFLUENCE = 0.55; // weight of ±4-line neighbors relative to ±2 in contour detection
+            double FIELD_CONTOUR_SOFT_IRE      = 4.0;  // contour curvature below this → no edge penalty applied
+            double FIELD_CONTOUR_HARD_IRE      = 10.0; // contour curvature above this → full edge penalty applied
+            double FIELD_CONTOUR_SIM_START     = 0.55; // vertical chroma similarity below which contour gate begins to open
+            double FIELD_CONTOUR_SIM_FULL      = 0.85; // similarity above which contour gate is fully closed
 
-            
+            double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0; // suppress 2D field output when ±2 line pair disagrees beyond this
+
+            double FIELD_LUMA_EDGE_THRESH_IRE = 18.0; // horizontal luma gradient above this suppresses vertical 2D comb
+
             // =========================================================================
             // VDIS (Vertical Differential Isolation System)
             // =========================================================================
-            // (opt-in ultra conservative 2D via CLI)
-            bool   VDIS_ENABLE                = false; // default disabled; set via --vdis
-            double VDIS_PHASE_THRESH_DEG      = 20.0;
-            double VDIS_MIN_CHROMA_IRE        = 5.0;
-            bool   VDIS_USE_FAR               = false;
-            bool   VDIS_NEIGH_CONFIRM         = false;
-            bool   VDIS_HARD_FALLBACK         = true;
-            double VDIS_SUPPRESS_FACTOR       = 0.0;
-            int    VDIS_WIN_SAMPLES           = 4;
-            bool   VDIS_CEP_NEIGH_CONFIRM     = true;
-            bool   FIELD_VDIS_DISABLE_DILATION      = false;
-            bool   VDIS_USE_PLUS1             = true;   // include ±1 evidence along with ±2/±4
-            double VDIS_1D_DIFF_THRESH_IRE    = 2.0;    // when VDIS fires, escalate if 2D vs 1D diff > this
-            double VDIS_DETAIL_GATE_THRESH_IRE = 2.0;   // If |VDIS - Std2D| < this, revert to Std2D
-            double VDIS_1D_BIAS_WEIGHT         = 0.5;   // Bias towards 1D in the gating logic
-        
+            // Conservative 2D fallback that reverts to 1D when carrier phase is incoherent
+            // across lines (edit cuts, TBC errors, head-switching noise). Off by default.
+            bool   VDIS_ENABLE             = false; // opt-in via --vdis
+            double VDIS_PHASE_THRESH_DEG   = 20.0;  // carrier phase difference across ±2 lines that triggers VDIS
+            double VDIS_MIN_CHROMA_IRE     = 5.0;   // minimum chroma amplitude for VDIS to be sensitive (below this, phase is noisy)
+            bool   VDIS_HARD_FALLBACK      = true;  // true → replace 2D with 1D; false → blend by VDIS_SUPPRESS_FACTOR
+            double VDIS_SUPPRESS_FACTOR    = 0.0;   // 2D output scale when soft fallback active (0 = full 1D, 1 = no change)
+            bool   VDIS_USE_PLUS1          = true;  // include ±1-line phase evidence alongside ±2/±4
+            double VDIS_1D_DIFF_THRESH_IRE = 2.0;   // escalate to hard fallback when |2D − 1D| exceeds this after VDIS fires
+
             // =========================================================================
             // Frame comb on phase-corrected 1D
             // =========================================================================
-            double FRAME_COMB_STRENGTH            = 1.125; // Frame A
-            double FRAME_B_COMB_STRENGTH          = 1.00; // Frame B
-            double FRAME_PHASE_DOT_COS            = 0.0;
-            double FRAME_CHROMA_MIN_IRE           = 2.5;
-            double FRAME_IQ_RAW_MAX_DELTA_IRE     = 8.0;
-        
+            double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
+            double FRAME_B_COMB_STRENGTH      = 1.00;  // same for Frame B (raw locked-1D interframe path)
+            double FRAME_CHROMA_MIN_IRE       = 2.5;   // minimum chroma amplitude to engage the frame IQ path
+            double FRAME_IQ_RAW_MAX_DELTA_IRE = 8.0;   // max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
+
             // =========================================================================
-            // FVF (Field vs Frame) scoring (core ±1 vs ±2 diff)
+            // FVF (Field vs Frame) scoring
             // =========================================================================
-            double FVF_SMALL_DIFF_IRE             = 2.0;  // Give Frame a bonus if diff is ≤ this
-            double FVF_LARGE_DIFF_IRE             = 5.0;  // sideline Frame if diff ≥ this
-            bool   FVF_BLEND_ENABLE               = false;
-            double FVF_BLEND_CHROMA_MIN_IRE       = 12.0;
-            double FVF_BLEND_DEV_RATIO            = 1.3;
-            double FVF_BLEND_FRAME_BONUS          = 0.25;
-            double FVF_BLEND_MIN_FRAME_FRACTION   = 0.20;
-            double ONE_D_NEAR_THRESH_IRE          = 1.5;  
-            // Neighbor Shaping for FVF
-            double FVF_SHAPE_STRENGTH             = 0.85;
-            // Neighbor-based cross-domain estimate shaping (FVF)
-            double NEIGHBOR_EST_WEIGHT        = 0.25;  // penalty weight (in IRE units); keep small
-            double NEIGHBOR_EST_SAT_MAX_IRE   = 12.0; // disable in strong saturation
-            double NEIGHBOR_EST_EDGE_MAX_IRE  = 10.0; // only use when horizEdgeIRE below this
-            double NEIGHBOR_EST_FVF_MAX_IRE   = 4.0;  // only when FVF diff is small / ambiguous
+            double FVF_SMALL_DIFF_IRE = 2.0; // ±1 vs ±2 scalar diff ≤ this → field and frame agree; Frame gets a score bonus
+
+            // Spatial neighbor shaping: pulls the FVF winner toward the local majority decision.
+            double FVF_SHAPE_STRENGTH = 0.85; // 0 = disabled, 1 = full neighbor pull
+
+            // Scale-regime biasing. The scale estimate is a horizontal proxy derived from
+            // Frame B IQ magnitude, then applied as evidence for the vertical-reach election.
+            double FVF_SCALE_FINE_FRAME_A_BONUS  = 0.06;
+            double FVF_SCALE_FINE_FRAME_B_BONUS  = 0.12;
+            double FVF_SCALE_MID_FIELD_B_BONUS   = 0.14;
+            double FVF_SCALE_MID_FIELD_A_BONUS   = 0.10;
+            double FVF_SCALE_MID_FRAME_A_BONUS   = 0.06;
+            double FVF_SCALE_COARSE_FIELD_A_BONUS = 0.14;
+            double FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS = 0.05;
+
+            // Edge-regime biasing for the 4-member election.
+            double FVF_VERT_FIELD_A_PENALTY  = 0.16; // Field A penalty under vertical contrast (±2 comb produces crosstalk)
+            double FVF_VERT_FRAME_A_BONUS    = 0.16; // Frame A (precleaned) bonus under vertical contrast (unaffected by vertical luma)
+            double FVF_HEDGE_FIELD_B_PENALTY = 0.18; // Field B penalty at horizontal luma edges (zipper risk)
+            double FVF_HEDGE_FRAME_B_BONUS   = 0.18; // Frame B bonus at horizontal luma edges (interframe is stable there)
+
+            // Transition sharpness reward strength.
+            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.10;
+
+            // Saturation regime biasing.
+            double FVF_SAT_FIELD_A_PEN   = 0.06; // Field A penalty in high saturation
+            double FVF_SAT_FIELD_B_PEN   = 0.24; // Field B penalty in high saturation (higher: zipper risk)
+            double FVF_SAT_FRAME_A_BONUS = 0.10; // Frame A bonus in high saturation (smaller: boundary caution)
+            double FVF_SAT_FRAME_B_BONUS = 0.18; // Frame B bonus in high saturation when coherent
+
+            // Cross-domain penalty derived from a spatial neighbor estimate; guards ambiguous pixels
+            // where horizontal structure could alias the interfield or interframe comb.
+            double NEIGHBOR_EST_WEIGHT      = 0.25; // penalty weight applied to the cross-domain estimate (IRE units)
+            double NEIGHBOR_EST_SAT_MAX_IRE = 12.0; // disable neighbor estimate when local chroma exceeds this
+            double NEIGHBOR_EST_EDGE_MAX_IRE = 10.0; // disable when horizontal luma edge exceeds this
+            double NEIGHBOR_EST_FVF_MAX_IRE  = 4.0;  // only apply when the FVF diff itself is small / ambiguous
+
             // =========================================================================
             // FVF / Model interaction tuning
             // =========================================================================
-            
-            // How strongly a candidate is penalized for distance from the primary model
-            // (Frame A in progressive; Field A in interlace). Larger => more model dominance.
-            double FVF_MODEL_PRIMARY_WEIGHT   = 0.33;
-            
-            // Secondary model coherence weight (distance to the "other domain"):
-            // - Progressive: distance to best Field
-            // - Interlace:   distance to Frame (and/or best field)
-            double FVF_MODEL_SECONDARY_WEIGHT = 0.3;
-            
-            // Small multiplicative advantage to the model domain in its regime.
-            // < 1.0 => cheaper score for model candidate.
-            double FRAME_MODEL_BIAS  = 0.90;  // progressive: Frame gets small edge
-            double FIELD_MODEL_BIAS  = 0.50;  // interlace: Field A gets small edge
-            
-            // Soft handicap for Frame when we're clearly in interlace regime.
-            // > 1.0 => Frame is slightly more "expensive".
+            // Penalty for a candidate being far from the regime model
+            // (Frame A in progressive; Field A in interlace). Larger → more model dominance.
+            double FVF_MODEL_PRIMARY_WEIGHT = 0.33;
+
+            // Multiplicative cost advantage for the model-domain candidate in its own regime.
+            // < 1.0 → model candidate gets a cheaper score.
+            double FRAME_MODEL_BIAS = 0.90; // progressive: Frame A costs less
+            double FIELD_MODEL_BIAS = 0.50; // interlace: Field A costs less
+
+            // > 1.0 → Frame candidate costs slightly more when regime is clearly interlace.
             double FRAME_IN_INTERLACE_PENALTY = 1.10;
-            
-            // Scale-bias strengths (fine vs mid structure) per mode.
-            // Progressive: keep some; Interlace: usually 0.0 to disable.
-            double FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE = 0.25;
-            double FRAME_SCALE_BIAS_STRENGTH_INTERLACE   = 0.0;
-                                    
+
             // =========================================================================
             // 3D candidate / vet / Y path
             // =========================================================================
-            int    CANDIDATE_SYSTEM                 = 0;
-            // 2D Similarity Curve for temporal candidates (getBestCandidate).
-            //
-            // We compare a temporal candidate sample to the local 2D estimate (clpbuffer[1]).
-            // Let d = |cand - ref2d| in IRE. We then add a delta to the candidate penalty:
-            //   if d <= AGREEMENT_REWARD_RADIUS_IRE:
-            //     delta = -AGREEMENT_REWARD_MAX * adaptThreshold * (1 - (d/r)^2)
-            //   else if d <= deviationThreshold:
-            //     delta = 0
-            //   else:
-            //     delta = AGREEMENT_VETO_BASE + deviationPenalty * (d - deviationThreshold)
-            //
-            // Notes:
-            // - AGREEMENT_REWARD_MAX is in the same penalty units as getCandidate() (roughly IRE).
-            // - adaptThreshold scales only the reward lobe (user-facing strength control).
-            // - deviationThreshold and deviationPenalty define the veto knee and slope.
-            // - deviationThreshold is shared with getBestY(): it is the
-            //   global "temporal mixing veto" control. When the material disagrees
-            //   beyond this point, both 3D candidate selection and residual-Y temporal
-            //   mixing are suppressed consistently.
-            double AGREEMENT_REWARD_RADIUS_IRE    = 8.5;  // reward region radius (IRE)
-            double AGREEMENT_REWARD_MAX           = 3.3;  // max reward at d=0 (penalty units, scaled by adaptThreshold)
-            double AGREEMENT_VETO_BASE            = 7.0; // base penalty once d exceeds deviationThreshold
-            double deviationThreshold            = 8.0; // start of veto region (IRE)
-            double deviationPenalty               = 3.3;  // penalty slope beyond deviationThreshold (per IRE)
+            // Similarity curve for temporal candidate scoring in getBestCandidate.
+            // Let d = |candidate − 2D reference| in IRE:
+            //   d ≤ AGREEMENT_REWARD_RADIUS_IRE  → reward: −AGREEMENT_REWARD_MAX·(1−(d/r)²)
+            //   d ≤ deviationThreshold            → neutral
+            //   d > deviationThreshold            → veto: +AGREEMENT_VETO_BASE + deviationPenalty·(d−threshold)
+            // deviationThreshold is shared with getBestY() as the global temporal-mixing veto.
+            double AGREEMENT_REWARD_RADIUS_IRE = 8.5; // half-width of the reward lobe (IRE)
+            double AGREEMENT_REWARD_MAX        = 3.3; // peak reward at d=0 (penalty units, scaled by adaptThreshold)
+            double AGREEMENT_VETO_BASE         = 7.0; // base penalty added once d exceeds deviationThreshold
+            double deviationThreshold          = 8.0; // start of veto region (IRE); shared with getBestY
+            double deviationPenalty            = 3.3; // penalty slope beyond deviationThreshold (per IRE)
 
-            // Affine of residual Y - required to allow more detail
-            bool   Y_LOCAL_AFFINE_ENABLE          = true;
-            double Y_LOCAL_MAX_PHASE_DEG          = 14.0;
-            double Y_LOCAL_GAIN_MIN               = 0.90;
-            double Y_LOCAL_GAIN_MAX               = 1.10;
-            double Y_LOCAL_MAX_SHEAR              = 0.12;
-            bool   Y_LINE_AFFINE_TRIM_ENABLE      = true;
-            double Y_LINE_MAX_PHASE_DEG           = 10.0;
-            bool   Y_LINE_ALLOW_GAIN_ON_IQ        = false;
-            double Y_LINE_GAIN_MIN                = 0.95;
-            double Y_LINE_GAIN_MAX                = 1.05;
-            double Y_LINE_MAX_SHEAR               = 0.08;
-            bool   Y_LINE_PHASE_ERROR_LUT_ENABLE  = true;
-            double Y_LINE_PHASE_ERROR_MIN_CONF    = 0.50;
-            
-            // 3D Residual Y Logic
-            bool   RESIDUAL_Y_ELECTION            = true; // false = Blend (Median-ish), true = Winner-take-all
-            double NEIGHBOR_SHAPE_STRENGTH        = 0.5;   // Weight for spatial neighbor agreement     
-            // The Vet removes bad residual Y from use.     
-            bool   VET_ENABLE_RESIDUAL_Y          = true;
-            double VET_PASS_CLOSE_Y_IRE           = 100.0;
-            double SELF_INCUMBENT_BONUS           = 0.2; //default 1.0
-            double VET_ADJ_NEIGH_THRESH_IRE       = 0.33;
-            double VET_ADJ_NEIGH_WEIGHT_CONF      = 0.27;
-            double VET_ADJ_NEIGH_WEIGHT_SCORE     = 0.30;
-            double VET_Y_NEIGHBOR_WEIGHT          = 0.25;
-            // Residual-Y subtraction: in uncertain cases, use 4fSC chroma/luma
-            // profile agreement to make a bounded correction to the chroma
-            // subtraction amount.
-            double VET_Y_CHROMA_LIKE_WEIGHT       = 0.12;
-            // Ownership-informed Y reassignment: when ownership evidence says
-            // bandpassed energy is luma-owned, return it to Y instead of
-            // subtracting it as chroma.
+            // Frame-level affine correction applied to locked-1D IQ before chroma subtraction.
+            // Corrects residual carrier phase/gain drift across the frame.
+            bool   Y_LOCAL_AFFINE_ENABLE = true;
+            double Y_LOCAL_MAX_PHASE_DEG = 14.0; // maximum phase correction the frame affine may apply
+            double Y_LOCAL_GAIN_MIN      = 0.90; // frame affine gain clamp lower bound
+            double Y_LOCAL_GAIN_MAX      = 1.10; // frame affine gain clamp upper bound
+            double Y_LOCAL_MAX_SHEAR     = 0.12; // maximum I/Q cross-coupling (shear) the frame affine may apply
+
+            // Per-line affine trim: refines the frame-level fit on a line-by-line basis.
+            bool   Y_LINE_AFFINE_TRIM_ENABLE     = true;
+            double Y_LINE_MAX_PHASE_DEG          = 10.0;  // maximum per-line phase adjustment
+            bool   Y_LINE_ALLOW_GAIN_ON_IQ       = false; // allow gain adjustment on IQ (vs phase-only trim)
+            double Y_LINE_GAIN_MIN               = 0.95;  // per-line gain clamp lower bound
+            double Y_LINE_GAIN_MAX               = 1.05;  // per-line gain clamp upper bound
+            double Y_LINE_MAX_SHEAR              = 0.08;  // maximum per-line shear
+            bool   Y_LINE_PHASE_ERROR_LUT_ENABLE = true;  // apply a LUT to correct known per-line carrier phase errors
+            double Y_LINE_PHASE_ERROR_MIN_CONF   = 0.50;  // minimum burst confidence for LUT correction to engage
+
+            // 3D Residual Y selection
+            bool   RESIDUAL_Y_ELECTION     = true; // true = winner-take-all; false = median-weighted blend
+            double NEIGHBOR_SHAPE_STRENGTH = 0.5;  // how strongly spatial neighbor consensus pulls the 3D Y election
+
+            // Vet gate: screens residual Y candidates before they are applied.
+            bool   VET_ENABLE_RESIDUAL_Y = true;
+
+            // Chroma-profile correction: adjusts subtraction alpha when the vet is uncertain,
+            // using 4fsc chroma/luma profile agreement as a bounded correction signal.
+            double VET_Y_CHROMA_LIKE_WEIGHT = 0.12; // weight of chroma-profile match on the subtraction alpha
+
+            // Ownership-informed Y reassignment: returns bandpassed energy to Y when
+            // ownership evidence says it is luma-owned rather than chroma-owned.
             bool   VET_OWNERSHIP_ENABLE            = true;
-            double VET_OWNERSHIP_LUMA_WEIGHT       = 0.75;  // blend strength for lumaClaim reassignment (0=off, 1=full)
-            double VET_OWNERSHIP_CHROMA_WEIGHT = 0.75;
-            double VET_OWNERSHIP_CONFLICT_SUPPRESS = 0.65;
-            double VET_Y_COHERENCE_ROLLBACK_WEIGHT = 0.75;
-            double VET_Y_COHERENCE_BADNESS_IRE = 1.5;
-			double FVF_OWNERSHIP_LUMA_WEIGHT     = 0.14; // lumaClaim favors less chroma-removal / safer field-side witnesses
-			double FVF_OWNERSHIP_CHROMA_WEIGHT   = 0.18; // chromaClaim favors coherent chroma witnesses
-			double LOCKED1D_OWNERSHIP_DAMP_WEIGHT = 0.25; // early positive fork: damp 1D chroma when luma-owned
-            // Iceberg alien-Y cancellation in buildPhaseCorrected1D.
-            // Scales the bandpass-of-smooth-luma prediction at directional edges to
-            // compensate for the chroma-canceling smooth blunting the peak height.
-            // 1.0 = no recovery boost, 2.0–3.0 = moderate-to-strong boost.
-            double LUMA_ICEBERG_RECOVERY           = 2.5;
-            double VET_Y_ADAPTIVE_SCALE           = 0.0;
-            double VET_Y_ADAPTIVE_CUTOFF          = 0.05;
-            bool   VET_RESIDUAL_FIR_ENABLE        = false;
-            double VET_RESIDUAL_FIR_THRESH_IRE    = 1.0;
-            int    VET_RESIDUAL_FIR_HALF_WIDTH    = 2;
-            int    VET_ALIGN_WIN_SAMPLES          = 16;
-            double VET_ALIGN_PHASE_MAX_DEG        = 12.0;
-            double VET_ALIGN_MIN_RHO              = 0.75;
-            double VET_ALIGN_MAX_SHEAR            = 0.15;
+            double VET_OWNERSHIP_LUMA_WEIGHT       = 0.75; // blend strength for lumaClaim → Y reassignment (0=off, 1=full)
+            double VET_OWNERSHIP_CHROMA_WEIGHT     = 0.75; // blend strength for chromaClaim → chroma retention
+            double VET_OWNERSHIP_CONFLICT_SUPPRESS = 0.65; // attenuate ownership adjustment when luma and chroma claims both high
+
+            // FVF ownership: ownership evidence adjusts field vs frame penalty before election.
+            double FVF_OWNERSHIP_LUMA_WEIGHT   = 0.14; // lumaClaim → added to frame scores (field is safer when luma-owned)
+            double FVF_OWNERSHIP_CHROMA_WEIGHT = 0.18; // chromaClaim → added to field scores (frame is safer when chroma coherent)
+
+            // Locked-1D ownership damp: scales locked-1D IQ down when early luma-ownership
+            // evidence is strong, before tiRow/tqRow and downstream consumers receive it.
+            double LOCKED1D_OWNERSHIP_DAMP_WEIGHT = 0.25; // damp strength (0=off, 1=full suppression at lumaClaim=1)
+
+            // Iceberg recovery: compensates for smooth-luma cancellation underestimating
+            // alien-Y amplitude at directional edges in buildPhaseCorrected1D.
+            // 1.0 = no boost; 2.0–3.0 = moderate-to-strong recovery.
+            double LUMA_ICEBERG_RECOVERY = 2.5;
+
+            // Alignment check applied before residual Y to verify carrier coherence.
+            int    VET_ALIGN_WIN_SAMPLES   = 16;   // samples in the alignment correlation window
+            double VET_ALIGN_PHASE_MAX_DEG = 12.0; // maximum phase error the alignment correction may apply
+            double VET_ALIGN_MIN_RHO       = 0.75; // minimum burst correlation for alignment to be trusted
+            double VET_ALIGN_MAX_SHEAR     = 0.15; // maximum shear the alignment correction may apply
         };
         Tunables tunables;
     };
@@ -362,6 +334,9 @@ public:
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
 	using OwnershipEvidence = lddecode::CombOwnershipEvidence;
+	using OwnershipFacts = lddecode::CombOwnershipFacts;
+	using OwnershipAssessment = lddecode::CombOwnershipAssessment;
+	using OwnershipRules = lddecode::OwnershipRules;
 
 	FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
 				const Configuration &configuration_);
@@ -431,8 +406,12 @@ private:
 		double carrierScale = 0.0;     // IRE burst magnitude before normalization/flooring
 		double phaseError = 0.0;       // measured carrier-phase error, radians
 		double phaseConfidence = 0.0;  // 0..1 confidence from burst magnitude
+		int    fieldPhaseId = 0;       // 1..4 from metadata
+		int    lineParity = 0;         // frame-line parity
+		int    fieldLine = 0;          // line / 2 in the interleaved frame
 		int    lineFlip = 1;           // +1 or -1 subcarrier polarity for this line
-		int    samplePhase0 = 0;       // reserved seam for future line/sample offset grammar
+		int    samplePhase0 = 0;       // h&3 origin for this line's carrier grid
+		bool   frameVerticalAllowed = false;
 		bool   grammarLocked = false;
 		std::array<float,4> demodLUTTi = {0.0f, 0.0f, 0.0f, 0.0f};
 		std::array<float,4> demodLUTTq = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -652,6 +631,51 @@ private:
 		const CombCarrierGrammar *grammar = carrierGrammarLine(line);
 		return grammar ? grammar->lineFlip : 1;
 	}
+
+	inline bool carrierFrameVerticalAllowed(int line) const {
+		const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+		return grammar ? grammar->frameVerticalAllowed : true;
+	}
+
+	inline int carrierLineParity(int line) const {
+		const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+		return grammar ? grammar->lineParity : (line & 1);
+	}
+
+	inline int carrierSampleClass(int line, int h) const {
+		const CombCarrierGrammar *g = carrierGrammarLine(line);
+		const int phase0 = g ? g->samplePhase0 : 0;
+		return (h + phase0) & 3;
+	}
+
+	inline int carrierSignedSampleClass(int line, int h) const {
+		int ph = carrierSampleClass(line, h);
+		const CombCarrierGrammar *g = carrierGrammarLine(line);
+		if (g && g->lineFlip < 0)
+			ph = (ph + 2) & 3;
+		return ph;
+	}
+
+	inline int carrierOppositeSampleClass(int line, int h) const {
+		return (carrierSignedSampleClass(line, h) + 2) & 3;
+	}
+
+	inline double carrierPlausibility(const CombCarrierGrammar *grammar) const {
+		if (!configuration.phaseCompensation)
+			return 1.0;
+		if (!grammar || !grammar->grammarLocked)
+			return 0.0;
+		if (grammar->projectionValid)
+			return std::clamp(grammar->carrierFitRatio, 0.0, 1.0);
+		return std::clamp(grammar->phaseConfidence, 0.0, 1.0);
+	}
+
+	inline double remodGrammarToComposite(int line, int h,
+	                                      double I, double Q) const {
+		const int ph = carrierSampleClass(line, h);
+		const int f = carrierLineFlip(line);
+		return remod4fscToCompositePhase(I, Q, ph, f);
+	}
 	
 	CombTapLine scratch_tapLine;
 	std::array<CombTapLine, 3> tapLineCache;
@@ -705,7 +729,6 @@ private:
 
 	// Small helpers declared here; definitions provided after the class (in this header).
 	inline qint32 getFieldID(qint32 lineNumber) const;
-	inline bool   getLinePhase(qint32 lineNumber) const;
 	// Per-run 4fsc shifted basis LUT for locked path (phaseCompensation=true)
 	double spLUT_locked[4] = {1.0, 0.0, -1.0, 0.0};
 	double cpLUT_locked[4] = {0.0, 1.0,  0.0, -1.0};
@@ -903,14 +926,6 @@ private:
 // Inline helper definitions for FrameBuffer (out-of-class)
 inline qint32 Comb::FrameBuffer::getFieldID(qint32 lineNumber) const {
     return ((lineNumber % 2) == 0) ? firstFieldPhaseID : secondFieldPhaseID;
-}
-
-inline bool Comb::FrameBuffer::getLinePhase(qint32 lineNumber) const {
-    const qint32 fieldID = getFieldID(lineNumber);
-    const bool positiveOnEven = (fieldID == 1) || (fieldID == 4);
-    const qint32 fieldLine = lineNumber / 2;
-    const bool evenLine = (fieldLine % 2) == 0;
-    return evenLine ? positiveOnEven : !positiveOnEven;
 }
 
 #endif // COMB_H
