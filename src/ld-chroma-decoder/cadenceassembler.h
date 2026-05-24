@@ -69,13 +69,17 @@ private:
     std::deque<WorkItem> workQueue;
 	 // history model: full field timeline with consumption tracking.
 	struct HistoryField {
-		SourceField field;
-		bool consumed = false;
-		int capturePartnerSeqNo = -1;
-	};
-	inline void releaseToBaseline(SourceField&& sf) {
-		if (onFieldReleasedToBaseline) onFieldReleasedToBaseline(sf.field.seqNo);
-	}
+			SourceField field;
+			bool consumed = false;
+			int capturePartnerSeqNo = -1;
+		};
+		QSet<qint32> baselineOwnedSeqNos;
+		inline void releaseSeqToBaseline(qint32 seqNo) {
+			if (onFieldReleasedToBaseline) onFieldReleasedToBaseline(seqNo);
+		}
+		inline void releaseToBaseline(SourceField&& sf) {
+			releaseSeqToBaseline(sf.field.seqNo);
+		}
 	enum class FilmFieldRole { Def, Comp, Spare, Other };
 	
 	static inline FilmFieldRole classifyRole(int cid) {
@@ -114,10 +118,11 @@ private:
     // NEW: Fully disentangled forced cadence pipeline
     void processWindowForced(bool flushMode);
 
-    // Mapping helper: setCadence (1..5) -> starting offset in 0..9
-    int forcedStartIndex() const;
-        // Helper to mark a history index consumed and remove its seqNo mapping.
-    // Always use this instead of directly assigning history[pos].consumed = true,
-    // because the seq->index map must be updated to avoid stale lookups.
-    void markHistoryConsumed(int pos);
-};
+	    // Mapping helper: setCadence (1..5) -> starting offset in 0..9
+	    int forcedStartIndex() const;
+	        // Helper to mark a history index consumed and remove its seqNo mapping.
+	    // Always use this instead of directly assigning history[pos].consumed = true,
+	    // because the seq->index map must be updated to avoid stale lookups.
+	    void markHistoryConsumed(int pos);
+		void handOffCaptureFrameToBaseline(int pos);
+	};

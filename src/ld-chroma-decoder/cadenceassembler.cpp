@@ -294,6 +294,32 @@ void CadenceAssembler::markHistoryConsumed(int pos)
     history[pos].consumed = true;
 }
 
+void CadenceAssembler::handOffCaptureFrameToBaseline(int pos)
+{
+    if (pos < 0 || pos >= history.size()) return;
+    if (history[pos].consumed) return;
+
+    const qint32 seqNo = history[pos].field.field.seqNo;
+    const qint32 partnerSeqNo = history[pos].capturePartnerSeqNo;
+
+    baselineOwnedSeqNos.insert(seqNo);
+    if (partnerSeqNo >= 0) baselineOwnedSeqNos.insert(partnerSeqNo);
+
+    int partnerPos = -1;
+    if (partnerSeqNo >= 0) {
+        auto it = seqNoToHistoryIndex.find(partnerSeqNo);
+        if (it != seqNoToHistoryIndex.end() && !history[it.value()].consumed) {
+            partnerPos = it.value();
+        }
+    }
+
+    // Transfer responsibility to the baseline path before retiring history ownership.
+    releaseSeqToBaseline(seqNo);
+
+    if (partnerPos >= 0 && partnerPos != pos) markHistoryConsumed(partnerPos);
+    markHistoryConsumed(pos);
+}
+
 void CadenceAssembler::push(const QVector<SourceField>& newFields)
 {
     if (config.setCadence != 0 && !config.noPA) {
@@ -635,18 +661,7 @@ void CadenceAssembler::processWindowForced(bool flushMode)
 
 void CadenceAssembler::processHistory(bool flushMode)
 {
-    // "Enough buffered" to conclude we're stuck and must force passthrough.
-    constexpr int kStuckBufferFields = 8;
-
-    auto haveAtLeastNUnconsumedFrom = [&](int start, int needed) -> bool {
-        int count = 0;
-        for (int i = std::max(0, start); i < (int)history.size(); ++i) {
-            if (!history[i].consumed) {
-                if (++count >= needed) return true;
-            }
-        }
-        return false;
-    };
+    constexpr int kDefaultFallbackLookaheadFields = 4;
 
     auto advanceCursorPastConsumed = [&]() {
         while (cursor < (int)history.size() && history[cursor].consumed) {
@@ -666,6 +681,13 @@ void CadenceAssembler::processHistory(bool flushMode)
         // 1) Try film extraction (handles spares and standard pairs)
         if (tryExtractFilmFrameAtCursor()) {
             continue;
+        }
+
+        // Default 29.97i output gives film assembly one additional frame of lookahead
+        // before surrendering ownership to plain passthrough/baseline handling.
+        if (!flushMode && !config.export24p &&
+            countUnconsumedFrom(i0, kDefaultFallbackLookaheadFields) < kDefaultFallbackLookaheadFields) {
+            break;
         }
 
         // 2) Normal passthrough (must be allowed to make progress)
@@ -735,9 +757,13 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
         if (idx0 == 5) {
             int i1 = nextUnconsumedIndex(i0 + 1);
             if (i1 >= 0 && history[i1].field.field.cinemap.isEditBoundary) {
-                SourceField discarded = std::move(history[i0].field);
-                markHistoryConsumed(i0);
-                releaseToBaseline(std::move(discarded));
+                if (config.export24p) {
+                    SourceField discarded = std::move(history[i0].field);
+                    markHistoryConsumed(i0);
+                    releaseToBaseline(std::move(discarded));
+                } else {
+                    handOffCaptureFrameToBaseline(i0);
+                }
                 return true;
             }
             int i2 = (i1 >= 0) ? nextUnconsumedIndex(i1 + 1) : -1;
@@ -749,18 +775,27 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
                  cadenceFilmLetter(history[i2].field.field.cinemap.cadenceId) == 'C');
 
             if (hasCBody) {
-                markHistoryConsumed(i0);
                 markHistoryConsumed(i1);
                 markHistoryConsumed(i2);
 
-                SourceField spare = std::move(history[i0].field); // 5
                 SourceField comp  = std::move(history[i1].field); // 6
                 SourceField def   = std::move(history[i2].field); // 7
+                bool spareUsed = false;
 
-                if (!config.dgDiscard && !mergeDgPairWithSanityWrapper(def, spare, comp)) {
-                    releaseToBaseline(std::move(spare));
-                } else if (config.dgDiscard) {
-                    releaseToBaseline(std::move(spare));
+                if (config.export24p) {
+                    SourceField spare = std::move(history[i0].field); // 5
+                    markHistoryConsumed(i0);
+                    if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+                        spareUsed = true;
+                    } else {
+                        releaseToBaseline(std::move(spare));
+                    }
+                } else {
+                    SourceField spare = history[i0].field; // work on a copy; baseline retains original ownership
+                    if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+                        spareUsed = true;
+                    }
+                    handOffCaptureFrameToBaseline(i0);
                 }
 
                 bool swapped = orderPairForComb(comp, def);
@@ -771,7 +806,8 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
                 } else {
                     wi.kind = WorkItem::Kind::TelecineFrame;
                     wi.fieldsSwapped = swapped;
-                    wi.expansion = WorkItem::Expansion::Leading;
+                    wi.expansion = spareUsed ? WorkItem::Expansion::Leading
+                                             : WorkItem::Expansion::None;
                 }
                 wi.filmLabel = 'C';
                 wi.f1 = std::move(comp);
@@ -901,9 +937,26 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
         if (letter == 'A' && candRef.field.cinemap.isEditBoundary) return;
         if (letter == 'C' && head.field.cinemap.isEditBoundary) return;
 
-        markHistoryConsumed(pos);
-        SourceField spare = std::move(history[pos].field);
+        if (config.export24p) {
+            markHistoryConsumed(pos);
+            SourceField spare = std::move(history[pos].field);
 
+            if (!config.dgDiscard) {
+                SourceField defCopy   = *def;
+                SourceField spareCopy = spare;
+                SourceField compCopy  = *comp;
+                if (mergeDgPairWithSanityWrapper(defCopy, spareCopy, compCopy)) {
+                    *def  = std::move(defCopy);
+                    *comp = std::move(compCopy);
+                    spareUsed = true;
+                    return;
+                }
+            }
+            releaseToBaseline(std::move(spare));
+            return;
+        }
+
+        SourceField spare = history[pos].field;
         if (!config.dgDiscard) {
             SourceField defCopy   = *def;
             SourceField spareCopy = spare;
@@ -912,10 +965,9 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
                 *def  = std::move(defCopy);
                 *comp = std::move(compCopy);
                 spareUsed = true;
-                return;
             }
         }
-        releaseToBaseline(std::move(spare));
+        handOffCaptureFrameToBaseline(pos);
     };
     
     // Normalize baseSeq to the definitional anchor for spare lookup:
@@ -959,10 +1011,15 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
 bool CadenceAssembler::tryEmitPassthroughAtCursor(bool flushMode, bool force)
 {
     (void)flushMode;
-    (void)force;
 
     int i0 = nextUnconsumedIndex(cursor);
     if (i0 < 0) return false;
+
+    const qint32 seqNo = history[i0].field.field.seqNo;
+    if (baselineOwnedSeqNos.contains(seqNo)) {
+        markHistoryConsumed(i0);
+        return true;
+    }
 
     const int partnerSeqNo = history[i0].capturePartnerSeqNo;
     int i1 = -1;
@@ -975,6 +1032,10 @@ bool CadenceAssembler::tryEmitPassthroughAtCursor(bool flushMode, bool force)
 
     // Partner not available — orphaned field, release to baseline.
     if (i1 < 0) {
+        if (!config.export24p || force) {
+            handOffCaptureFrameToBaseline(i0);
+            return true;
+        }
         markHistoryConsumed(i0);
         releaseToBaseline(std::move(history[i0].field));
         return true;
