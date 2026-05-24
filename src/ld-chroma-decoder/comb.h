@@ -152,6 +152,13 @@ public:
             double FRAME_B_COMB_STRENGTH      = 1.00;  // same for Frame B (raw locked-1D interframe path)
             double FRAME_CHROMA_MIN_IRE       = 2.5;   // minimum chroma amplitude to engage the frame IQ path
             double FRAME_IQ_RAW_MAX_DELTA_IRE = 8.0;   // max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
+            double FRAME_B_LEAK_NEG_CORR_START = 0.30; // signed corr negativity where Frame B starts treating vertical alternation as leakage
+            double FRAME_B_LEAK_NEG_CORR_FULL  = 0.70; // signed corr negativity where leakage confidence is full
+            double FRAME_B_LEAK_NEIGHBOR_AGREE_START = 0.20; // Up/Dn signed corr where leakage support begins
+            double FRAME_B_LEAK_NEIGHBOR_AGREE_FULL  = 0.70; // Up/Dn signed corr where leakage support is full
+            double FRAME_B_LEAK_CENTER_DELTA_START_IRE = 1.5; // |center - avg(Up,Dn)| where symmetric cleanup starts to look worthwhile
+            double FRAME_B_LEAK_CENTER_DELTA_FULL_IRE  = 5.5; // |center - avg(Up,Dn)| where symmetric cleanup confidence is full
+            double FRAME_B_LEAK_STRENGTH_BOOST = 0.45; // extra push toward full comb strength when leakage is likely
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -595,6 +602,8 @@ private:
 	std::vector<float>  scratch_fvf_outShade;
 	std::vector<double> scratch_fvf_diffFVF;
 	std::vector<double> scratch_fvf_satMap;
+	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
+	std::vector<double> scratch_coe_coherence; // per-line IQ coherence pre-pass (collectCombOwnershipEvidence)
 	// Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
 	// of framePreclean). Cached during the main scoring pass so the island
 	// filter and any post-processing can recover the Frame A output.
@@ -781,14 +790,15 @@ private:
 									std::vector<std::complex<double>> &outFrameIQ,
 									const std::vector<float> *tiOverride = nullptr,
 									const std::vector<float> *tqOverride = nullptr);
-	void computeFrameIQFromPreparedVectors(int line,
-										   const std::vector<std::complex<double>> &centerIQ,
-										   std::vector<std::complex<double>> &upIQ,
-										   std::vector<std::complex<double>> &dnIQ,
-										   std::vector<std::complex<double>> &outFrameIQ,
-										   const std::vector<float> *tiOverride,
-										   const std::vector<float> *tqOverride,
-										   bool enableLateralRefine);
+		void computeFrameIQFromPreparedVectors(int line,
+											   const std::vector<std::complex<double>> &centerIQ,
+											   std::vector<std::complex<double>> &upIQ,
+											   std::vector<std::complex<double>> &dnIQ,
+											   std::vector<std::complex<double>> &outFrameIQ,
+											   const std::vector<float> *tiOverride,
+											   const std::vector<float> *tqOverride,
+											   bool enableLateralRefine,
+											   bool allowSymmetricLeakCancel = false);
 	void collectCombOwnershipEvidence(int line,
 									   const double *fieldA,
 									   const double *fieldB,
@@ -797,7 +807,8 @@ private:
 	void seedCombOwnershipPerLine(int line);
 	void finalizeOwnershipClaims(OwnershipEvidence &e,
 								 double neighborLumaMeanIRE = -1.0,
-								 double neighborBaseMeanIRE = -1.0) const;
+								 double neighborBaseMeanIRE = -1.0,
+								 double lineForwardErrorIRE = 0.0) const;
 	void reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const;
 	// Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
 	// into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.

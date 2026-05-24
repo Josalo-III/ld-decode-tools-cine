@@ -627,7 +627,8 @@ void Comb::FrameBuffer::seedCombOwnershipPerLine(int line)
 
 void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
                                                 double neighborLumaMeanIRE,
-                                                double neighborBaseMeanIRE) const
+                                                double neighborBaseMeanIRE,
+                                                double lineForwardErrorIRE) const
 {
     const auto &T = configuration.tunables;
     OwnershipRules rules = lddecode::kDefaultOwnershipRules;
@@ -642,8 +643,17 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
     a.lumaRisk = std::max(
         std::clamp(f.lumaIncursionRiskIRE / 8.0, 0.0, 1.0),
         std::clamp(f.icebergAlienYFraction, 0.0, 1.0));
+    // Scale lumaResidual against the line-level forward-model error rather than
+    // a fixed 8.0.  When the grammar has a valid projection, samples that merely
+    // match the line's measured noise floor should not accumulate luma risk; the
+    // denominator grows proportionally so only samples that significantly exceed
+    // the line mean are flagged.  Falls back to 8.0 when lineForwardErrorIRE is
+    // unavailable (grammar not locked or projection not valid).
+    const double lumaResScale = (lineForwardErrorIRE > 0.0)
+        ? std::max(8.0, 2.5 * lineForwardErrorIRE)
+        : 8.0;
     a.lumaResidual = std::clamp(
-        (f.residualFitErrorIRE - std::max(1.0, 0.2 * maxChromaIRE)) / 8.0,
+        (f.residualFitErrorIRE - std::max(1.0, 0.2 * maxChromaIRE)) / lumaResScale,
         0.0, 1.0);
 
     a.baseSupport = std::clamp(
@@ -661,9 +671,17 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
     a.lumaShapeContinuation = std::clamp((0.65 * a.baseSupport) + (0.35 * a.neighborSupport), 0.0, 1.0);
     
     a.chromaStrength = std::clamp((maxChromaIRE - 2.0) / 10.0, 0.0, 1.0);
+    // Coherence fallback (used when frameIQCoherence is unavailable):
+    // normalize per-sample fit error against the line's mean forward error
+    // rather than the fixed 12.0.  A sample at the line mean gets coherence
+    // ≈ 0.5; samples far below get ≈ 1.0; samples far above get ≈ 0.0.
+    // Falls back to the hard-coded 12.0 when lineForwardErrorIRE is zero.
+    const double cohScale = (lineForwardErrorIRE > 0.0)
+        ? std::max(12.0, 2.0 * lineForwardErrorIRE)
+        : 12.0;
     a.coherence = (f.frameIQCoherence > 0.0)
         ? f.frameIQCoherence
-        : std::clamp(1.0 - (f.residualFitErrorIRE / 12.0), 0.0, 1.0);
+        : std::clamp(1.0 - (f.residualFitErrorIRE / cohScale), 0.0, 1.0);
     a.agreement = 1.0 - std::clamp(f.frameFieldAgreementIRE / 6.0, 0.0, 1.0);
     a.spreadPenalty = std::clamp(f.candidateSpreadIRE / 10.0, 0.0, 1.0);
     const double carrierPrior = configuration.phaseCompensation
@@ -859,6 +877,41 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
          (int)ownershipEvidence[line].size() >= width)
         ? ownershipEvidence[line].data()
         : nullptr;
+
+    // IQ magnitude pre-pass: compute std::hypot() once per pixel (width calls)
+    // rather than 7× per sample inside the hot loop.  A second sweep over the
+    // flat magnitude array derives the line-level mean IQ coherence, which gates
+    // the per-sample iqCoherence diagnostic so that a single noisy pixel cannot
+    // claim coarseness on an otherwise smooth line.
+    if ((int)scratch_fvf_iqMag.size() != width)
+        scratch_fvf_iqMag.assign(width, 0.0);
+    double lineMeanIqCoherence = 1.0;   // assume coherent when frameIQ absent
+    if (frameIQ && (int)frameIQ->size() >= width) {
+        // Pass 1: magnitudes (one hypot per pixel)
+        for (int r = 0; r < width; ++r) {
+            const auto &z = (*frameIQ)[r];
+            scratch_fvf_iqMag[r] = std::hypot(z.real(), z.imag());
+        }
+        // Pass 2: line-level mean IQ coherence (arithmetic only, no hypot)
+        double sumCoh = 0.0;
+        for (int r = 0; r < width; ++r) {
+            const double m0  = scratch_fvf_iqMag[r];
+            const double m_1 = scratch_fvf_iqMag[std::max(0, r - 1)];
+            const double mp1 = scratch_fvf_iqMag[std::min(width - 1, r + 1)];
+            const double m_2 = scratch_fvf_iqMag[std::max(0, r - 2)];
+            const double mp2 = scratch_fvf_iqMag[std::min(width - 1, r + 2)];
+            const double m_4 = scratch_fvf_iqMag[std::max(0, r - 4)];
+            const double mp4 = scratch_fvf_iqMag[std::min(width - 1, r + 4)];
+            const double fine   = std::fabs(m0 - 0.5 * (m_1 + mp1));
+            const double mid    = std::fabs(m0 - 0.5 * (m_2 + mp2));
+            const double coarse = std::fabs(m0 - 0.5 * (m_4 + mp4));
+            const double denom  = fine + mid + coarse + 1e-9;
+            sumCoh += 1.0 - coarse / denom;
+        }
+        lineMeanIqCoherence = (width > 0)
+            ? std::clamp(sumCoh / static_cast<double>(width), 0.0, 1.0)
+            : 1.0;
+    }
 
     for (int rel = 0; rel < width; ++rel) {
         const int rm1 = std::max(0, rel - 1);
@@ -1126,24 +1179,31 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
 
             if (frameIQ && rel < (int)frameIQ->size()) {
-                auto iqMag = [&](int r)->double {
-                    r = std::clamp(r, 0, width - 1);
-                    const auto &z = (*frameIQ)[r];
-                    return std::hypot(z.real(), z.imag());
-                };
+                // Pre-pass filled scratch_fvf_iqMag; 7 array reads replace
+                // 7 hypot() calls.  rm1/rp1/rm2/rp2 are already clamped above.
+                const int rm4 = std::max(0, rel - 4);
+                const int rp4 = std::min(width - 1, rel + 4);
+                const double m0  = scratch_fvf_iqMag[rel];
+                const double m_1 = scratch_fvf_iqMag[rm1];
+                const double mp1 = scratch_fvf_iqMag[rp1];
+                const double m_2 = scratch_fvf_iqMag[rm2];
+                const double mp2 = scratch_fvf_iqMag[rp2];
+                const double m_4 = scratch_fvf_iqMag[rm4];
+                const double mp4 = scratch_fvf_iqMag[rp4];
 
-                const double fine = std::fabs(iqMag(rel) -
-                                              0.5 * (iqMag(rel - 1) + iqMag(rel + 1)));
-                const double mid  = std::fabs(iqMag(rel) -
-                                              0.5 * (iqMag(rel - 2) + iqMag(rel + 2)));
-                const double coarse = std::fabs(iqMag(rel) -
-                                                0.5 * (iqMag(rel - 4) + iqMag(rel + 4)));
+                const double fine   = std::fabs(m0 - 0.5 * (m_1 + mp1));
+                const double mid    = std::fabs(m0 - 0.5 * (m_2 + mp2));
+                const double coarse = std::fabs(m0 - 0.5 * (m_4 + mp4));
 
                 const double denom = fine + mid + coarse + 1e-9;
                 const double fineFrac   = fine   / denom;
                 const double midFrac    = mid    / denom;
                 const double coarseFrac = coarse / denom;
-                iqCoherence = 1.0 - std::clamp(coarseFrac, 0.0, 1.0);
+                // Gate iqCoherence against the line-level mean: an isolated
+                // noisy pixel cannot claim coarseness on a smooth line.
+                iqCoherence = std::clamp(
+                    (1.0 - coarseFrac) * (0.3 + 0.7 * lineMeanIqCoherence),
+                    0.0, 1.0);
                 if (metrics) {
                     metrics->iqFineFrac = fineFrac;
                     metrics->iqMidFrac = midFrac;
@@ -1550,6 +1610,20 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
             : 0.0;
     };
 
+    // IQ coherence pre-pass: evaluate frameCoherence() once per pixel into a
+    // flat array rather than 758× in the hot loop.  The line-level mean gates
+    // per-sample values — a globally incoherent line cannot inflate isolated
+    // samples (hot-loop disconnection principle): coherence is a line property,
+    // not a pixel property, and should be established before the hot loop runs.
+    if ((int)scratch_coe_coherence.size() != width)
+        scratch_coe_coherence.assign(width, 0.0);
+    double lineMeanFrameCoherence = 0.0;
+    for (int r = 0; r < width; ++r) {
+        scratch_coe_coherence[r]  = frameCoherence(r);  // 0.0 when !frameIQ
+        lineMeanFrameCoherence   += scratch_coe_coherence[r];
+    }
+    if (width > 0) lineMeanFrameCoherence /= static_cast<double>(width);
+
     for (int rel = 0; rel < width; ++rel) {
         OwnershipEvidence &e = row[rel];
         OwnershipFacts &f = e.facts;
@@ -1574,7 +1648,11 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
             ? std::min(std::fabs(fr - fa), std::fabs(fr - fb)) * invIreScale
             : 0.0;
 
-        f.frameIQCoherence = frameCoherence(rel);
+        // Gate per-sample coherence against the line-level mean.
+        // If the line as a whole is incoherent, an isolated coherent pixel
+        // is not evidence of a clean carrier — it is measurement noise.
+        f.frameIQCoherence = scratch_coe_coherence[rel]
+                             * (0.3 + 0.7 * lineMeanFrameCoherence);
 
     }
 
@@ -1585,6 +1663,14 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
     const double lineCarrierPrior = carrierPlausibility(lineGrammar);
     for (int rel = 0; rel < width; ++rel)
         row[rel].assessment.carrierPrior = lineCarrierPrior;
+
+    // Extract the line-level forward model error from the grammar (only when
+    // the carrier projection was successfully computed on a locked line).
+    // 0.0 signals "not available" and causes finalizeOwnershipClaims() to fall
+    // back to its hard-coded denominators — behaviour is identical to before.
+    const double lineForwardErrorIRE = (lineGrammar && lineGrammar->projectionValid)
+        ? lineGrammar->meanForwardErrorIRE
+        : 0.0;
 
     // Final ownership needs cross-path evidence plus a same-phase continuity
     // check, not just the local 1D residual snapshot.
@@ -1602,7 +1688,8 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
         finalizeOwnershipClaims(
             e,
             0.5 * (leftFacts.lumaExcursionIRE + rightFacts.lumaExcursionIRE),
-            0.5 * (leftBaseIRE + rightBaseIRE));
+            0.5 * (leftBaseIRE + rightBaseIRE),
+            lineForwardErrorIRE);
     }
 }
 
