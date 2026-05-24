@@ -167,8 +167,6 @@ void Comb::FrameBuffer::phaseLocked()
             const double bsin      = grammar->burstSin;
             const float *triRow    = demodTRI_line(line);
             const float *trqRow    = demodTRQ_line(line);
-            const double lineScale = (double)carrierLineFlip(line);
-
             double STT[2][2] = {{0,0},{0,0}};
             double SRT[2][2] = {{0,0},{0,0}};
 
@@ -185,8 +183,11 @@ void Comb::FrameBuffer::phaseLocked()
                 const double mag_k = std::hypot(rik, rqk);
                 magRow[k] = mag_k;
                 if (mag_k > 1e-9) {
+                    // TRI/TRQ is BurstLockedSigned: the burst-locked demod
+                    // already captured the carrier polarity.  Remod without
+                    // lineScale to avoid double-applying the sign.
                     const double fitted_k = remodLockedToShiftedComposite(
-                        rik, rqk, hk, bcos, bsin, spLUT_locked, cpLUT_locked, lineScale);
+                        rik, rqk, hk, bcos, bsin, spLUT_locked, cpLUT_locked);
                     const double corr_k   = (double)rawLine[hk] - fitted_k;
                     double rsk = 0.0, rck = 0.0;
                     demod4fscFromComposite(corr_k, hk, rsk, rck);
@@ -319,6 +320,12 @@ void Comb::FrameBuffer::phaseLocked()
                     measuredPhase,
                     -PHASE_ERROR_CAP,
                     PHASE_ERROR_CAP);
+                // Unclamped phase error magnitude against quarter-turn: how
+                // far the burst-derived carrier model diverges from the
+                // metadata-derived schedule.  ≥45° would indicate a full
+                // polarity disagreement.
+                grammar->phaseScheduleConflict = std::clamp(
+                    std::fabs(measuredPhase) / (M_PI / 4.0), 0.0, 1.0);
                 if (!writeAffine)
                     continue;
                 const double pMax = T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
@@ -430,8 +437,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         const bool grammarLocked = grammar && grammar->grammarLocked;
         const double bcos = grammarLocked ? grammar->burstCos : 1.0;
         const double bsin = grammarLocked ? grammar->burstSin : 0.0;
-        const double lineScale = grammarLocked ? (double)grammar->lineFlip : 1.0;
-
         const double *baseY4 = (lockedLumaCacheValid &&
             !lockedLumaBaseY4_flat.empty() && demodWidth == width)
             ? lockedLumaBaseY4_line(line) : nullptr;
@@ -697,7 +702,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const double rQ = residual * lutTq[ph];
                 double rI4, rQ4;
                 lockedTo4fsc(rI, rQ, bcos, bsin, rI4, rQ4);
-                const double cModel = remod4fscToCompositePhase(rI4, rQ4, carrierSampleClass(line, h), lineScale);
+                // IQ is BurstLockedSigned: the burst-locked demod already
+                // captured the carrier polarity.  Do not re-apply lineFlip.
+                const double cModel = remod4fscToCompositePhase(rI4, rQ4, carrierSampleClass(line, h));
                 const double fwdErr = residual - cModel;
                 sumFwdError   += std::fabs(fwdErr);
                 sumChromaMag  += std::hypot(rI4, rQ4);

@@ -413,6 +413,19 @@ private:
 		int    samplePhase0 = 0;       // h&3 origin for this line's carrier grid
 		bool   frameVerticalAllowed = false;
 		bool   grammarLocked = false;
+
+		// Schedule conflict diagnostics (filled in loadFields; may be
+		// refined by phaseLocked if burst measurement diverges from metadata).
+		//
+		// lineFlipAuthority records the source of lineFlip above.
+		// rigidScheduleLineFlip stores the rigid-schedule derivation for
+		// diagnostic comparison.  phaseScheduleConflict is non-zero when
+		// they disagree.  Downstream code must not "fix" lineFlip by
+		// substituting rigidScheduleLineFlip.
+		lddecode::CarrierPhaseAuthority lineFlipAuthority = lddecode::CarrierPhaseAuthority::Metadata;
+		int    rigidScheduleLineFlip = +1;
+		double phaseScheduleConflict = 0.0;  // 0 = agreement, 1 = full conflict
+
 		std::array<float,4> demodLUTTi = {0.0f, 0.0f, 0.0f, 0.0f};
 		std::array<float,4> demodLUTTq = {0.0f, 0.0f, 0.0f, 0.0f};
 		LineAffine affine;

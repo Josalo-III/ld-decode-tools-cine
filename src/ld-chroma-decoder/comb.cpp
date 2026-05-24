@@ -541,6 +541,14 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 
         grammar.lineFlip = linePhase ? -1 : +1;
         grammar.samplePhase0 = 0;
+        // lineFlip is derived from fieldPhaseId which comes from capture metadata,
+        // so it holds Metadata authority.  rigidScheduleLineFlip mirrors it for
+        // now because no independent rigid derivation is available at this stage;
+        // phaseLocked() should update phaseScheduleConflict if burst measurement
+        // diverges.
+        grammar.lineFlipAuthority    = lddecode::CarrierPhaseAuthority::Metadata;
+        grammar.rigidScheduleLineFlip = grammar.lineFlip;
+        grammar.phaseScheduleConflict = 0.0;
         // If the paired fields already straddle an edit boundary, cross-field
         // vertical reasoning for this frame should be treated as schedule-invalid.
         grammar.frameVerticalAllowed = !editSplit;

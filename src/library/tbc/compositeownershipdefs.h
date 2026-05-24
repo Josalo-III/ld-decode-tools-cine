@@ -45,7 +45,113 @@ namespace lddecode {
 // frameVerticalAllowed) frames the line but the line is the carrier-
 // grammar unit: the larger schedule sets the line's phase, the line
 // dictates the per-sample interpretation.
+//
+// Carrier sign contract:
+//
+// Carrier sign is state, not a local repair.  A consumer that needs signed
+// carrier phase should receive it through parser/metadata state or through a
+// buffer whose contract explicitly says sign has already been preserved.  It
+// should not recreate a sign from a rigid line pattern merely because a local
+// formula can produce one.
+//
+// The preferred authority order is:
+//
+//   1. capture metadata / field cadence / parser state
+//   2. measured burst and line-level calibration evidence
+//   3. rigid NTSC schedule derivation as fallback or diagnostic comparison
+//
+// If the disc or metadata implies a phase shift, parser state should carry
+// that shift forward.  Local code may compare against the rigid schedule to
+// lower confidence or flag a conflict, but should not silently overwrite the
+// metadata-derived state with its own pattern.
+//
+// This is especially important for lineFlip and signed remodulation.  Some
+// IQ/scalar buffers already preserve line polarity in their values; other
+// buffers are unsigned 4fsc bucket views.  Applying lineFlip at a call site is
+// correct only when the input buffer contract says the sign is absent.  If a
+// call site cannot know that, the pipeline should be extended to carry the
+// real sign/phase state explicitly rather than synthesizing a fake one.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// CarrierSignFrame — signal-frame vocabulary for buffers and call sites.
+//
+// Every buffer that carries composite-domain or IQ-domain samples belongs to
+// exactly one signal frame.  Call sites must know the frame of their input
+// before deciding whether lineFlip is needed.
+//
+//   UnsignedBucket
+//       Values are indexed by (h + samplePhase0) & 3 with no carrier
+//       polarity applied.  Safe for LUT indexing, cancellation windows,
+//       and same-bucket math.
+//       Examples: clpbuffer[0], locked1DSource.
+//       → Remodulation that needs carrier sign MUST apply lineFlip.
+//
+//   BurstLockedSigned
+//       Burst phasor and lineFlip are already baked into the values.
+//       The signal carries the line's real carrier polarity.
+//       Examples: demodTI/TQ (line-local locked IQ).
+//       → Applying lineFlip again would invert the sign.  Do not.
+//
+//   MetadataPreservedSigned
+//       Carrier polarity is preserved from parser/metadata state, not
+//       reconstructed locally.  lineFlip is implicit in the value.
+//       Examples: lockedProductI/Q, componentFrame U/V before transformIQ().
+//       → Do not apply lineFlip at a remod or demod call site.
+//
+//   Grid4fsc
+//       Cross-line or cross-frame analysis basis.  Whether carrier polarity
+//       is already present depends on the producer contract.
+//       Examples: demodTI4fsc/TQ4fsc, locked1DTI4fsc/TQ4fsc.
+//       → Consult the producer.  If the contract is unclear, extend the
+//         pipe to carry an explicit CarrierSignFrame tag rather than guess.
+//
+// The practical rule at every remod/demod call site:
+//
+//   if (inputFrame == UnsignedBucket)   → apply lineFlip
+//   else                                → trust the sign already in values
+//
+// Never synthesize a lineFlip from a local carrier formula when the input
+// frame is already signed.  If the frame is genuinely unknown, that is a
+// contract gap: trace the producer and fix the contract; do not guess.
+// ---------------------------------------------------------------------------
+enum class CarrierSignFrame {
+    UnsignedBucket,           // (h + samplePhase0) & 3; no polarity in values
+    BurstLockedSigned,        // burst phasor + lineFlip baked in; do not re-sign
+    MetadataPreservedSigned,  // parser/metadata polarity preserved; do not re-sign
+    Grid4fsc,                 // cross-line analysis; producer declares sign state
+};
+
+// ---------------------------------------------------------------------------
+// CarrierPhaseAuthority — source priority for lineFlip and carrier polarity.
+//
+// When two sources give different polarity for the same line, the higher-
+// priority authority wins.  The lower-priority source becomes a diagnostic
+// comparison only: it may reduce phaseConfidence or set phaseScheduleConflict,
+// but it must not silently replace the higher-priority lineFlip value.
+//
+//   Metadata      Capture metadata and field cadence — highest priority.
+//                 If the disc has an irregular or shifted phase, metadata
+//                 carries that fact.  Downstream code must not correct it
+//                 away using a rigid schedule.
+//
+//   BurstMeasured Per-line burst calibration — confirmation and confidence.
+//                 Strong burst measurement can confirm the metadata reading
+//                 or reduce phaseConfidence when they diverge, but should
+//                 not replace lineFlip without explicit reconciliation.
+//
+//   RigidSchedule Rigid NTSC line pattern — fallback and diagnostic only.
+//                 Used when neither metadata nor burst measurement is
+//                 available, or as a sanity check against the other two.
+//                 A rigid-schedule result that disagrees with metadata must
+//                 set phaseScheduleConflict; it must not silently overwrite
+//                 the metadata-derived lineFlip.
+// ---------------------------------------------------------------------------
+enum class CarrierPhaseAuthority {
+    Metadata,       // capture metadata / field cadence — highest priority
+    BurstMeasured,  // per-line burst measurement — calibration evidence
+    RigidSchedule,  // rigid NTSC derivation — fallback / diagnostic only
+};
 
 struct CompositeSpan {
     int x0 = 0;
@@ -108,9 +214,11 @@ struct CompositeParserState {
     //                        (currently always 0; reserved for future
     //                        line-level sample-phase calibration).
     //
-    // lineFlip               +1 or -1, alternation sign from line/field
-    //                        parity.  Applied as lineScale to all
-    //                        remodulation calls for the line.
+    // lineFlip               +1 or -1 carrier polarity for this line from
+    //                        parser/metadata state.  This is a real line
+    //                        identity value, not permission to re-sign every
+    //                        remodulation call.  Apply it only at boundaries
+    //                        whose input contract says carrier sign is absent.
     //
     // grammarLocked          true when phaseConfidence is above the
     //                        usable threshold; downstream tiers should
@@ -125,6 +233,26 @@ struct CompositeParserState {
     int samplePhase0             = 0;
     int lineFlip                 = +1;
     bool grammarLocked           = false;
+
+    // -----------------------------------------------------------------
+    // Schedule conflict diagnostics (filled during tier 1 lock).
+    //
+    // lineFlipAuthority records which source determined lineFlip for
+    // this line.  Metadata is preferred whenever field phase identity
+    // is available from capture; BurstMeasured when burst evidence
+    // alone justifies the polarity; RigidSchedule only as fallback.
+    //
+    // rigidScheduleLineFlip stores what the rigid NTSC pattern would
+    // give, kept as a reference whether or not it was used as authority.
+    //
+    // phaseScheduleConflict is non-zero when lineFlip and
+    // rigidScheduleLineFlip disagree.  Consumers should treat a non-zero
+    // value as additional uncertainty; they must not "fix" lineFlip by
+    // replacing it with rigidScheduleLineFlip.
+    // -----------------------------------------------------------------
+    CarrierPhaseAuthority lineFlipAuthority  = CarrierPhaseAuthority::Metadata;
+    int    rigidScheduleLineFlip             = +1;
+    double phaseScheduleConflict             = 0.0;  // 0 = agreement, 1 = full conflict
 
     // -----------------------------------------------------------------
     // Tier 2 / tier 3 line-level summaries.  All in [0,1].

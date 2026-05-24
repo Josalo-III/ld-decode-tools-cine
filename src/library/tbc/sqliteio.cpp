@@ -251,6 +251,7 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
 {
     // Check if blanking_16b_ire column exists (for backward compatibility)
     bool hasBlankingColumn = false;
+    bool hasCinemappedColumn = false;
     QSqlQuery checkQuery(db);
     checkQuery.prepare("PRAGMA table_info(capture)");
     if (checkQuery.exec()) {
@@ -258,8 +259,10 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
             QString columnName = checkQuery.value("name").toString();
             if (columnName == "blanking_16b_ire") {
                 hasBlankingColumn = true;
-                break;
+            } else if (columnName == "is_cinemapped") {
+                hasCinemappedColumn = true;
             }
+            if (hasBlankingColumn && hasCinemappedColumn) break;
         }
     }
 
@@ -267,7 +270,11 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
     QString queryStr = "SELECT capture_id, system, decoder, git_branch, git_commit, "
                        "video_sample_rate, active_video_start, active_video_end, "
                        "field_width, field_height, number_of_sequential_fields, "
-                       "colour_burst_start, colour_burst_end, is_mapped, is_cinemapped, is_subcarrier_locked, "
+                       "colour_burst_start, colour_burst_end, is_mapped, ";
+    if (hasCinemappedColumn) {
+        queryStr += "is_cinemapped, ";
+    }
+    queryStr += "is_subcarrier_locked, "
                        "is_widescreen, white_16b_ire, black_16b_ire";
     if (hasBlankingColumn) {
         queryStr += ", blanking_16b_ire";
@@ -300,7 +307,7 @@ bool SqliteReader::readCaptureMetadata(int &captureId, QString &system, QString 
     colourBurstStart = SqliteValue::toIntOrDefault(query, "colour_burst_start");
     colourBurstEnd = SqliteValue::toIntOrDefault(query, "colour_burst_end");
     isMapped = SqliteValue::toBoolOrDefault(query, "is_mapped");
-    isCinemapped = SqliteValue::toBoolOrDefault(query, "is_cinemapped");
+    isCinemapped = hasCinemappedColumn ? SqliteValue::toBoolOrDefault(query, "is_cinemapped") : false;
     isSubcarrierLocked = SqliteValue::toBoolOrDefault(query, "is_subcarrier_locked");
     isWidescreen = SqliteValue::toBoolOrDefault(query, "is_widescreen");
     white16bIre = SqliteValue::toIntOrDefault(query, "white_16b_ire");
@@ -971,5 +978,3 @@ bool SqliteWriter::writeFieldCinemapManual(int captureId, int fieldId,
     }
     return true;
 }
-
-
