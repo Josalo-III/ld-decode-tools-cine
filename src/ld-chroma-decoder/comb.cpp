@@ -2024,18 +2024,21 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
     double sumCarrierConfidence = 0.0;
     double sumCarrierPlausibility = 0.0;
     double sumCarrierPhaseErrorAbs = 0.0;
+    double sumPhaseScheduleConflict = 0.0;
+    int scheduleConflictLines = 0;
     for (int line = firstLine; line < lastLine; ++line) {
         if (line < 0 || line >= (int)ownershipEvidence.size())
             continue;
         const auto &row = ownershipEvidence[line];
         if ((int)row.size() < width)
             continue;
-        // Carrier fields live in the grammar, not in per-pixel evidence.
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const double lineCarrierScale = grammar ? grammar->carrierScale : 0.0;
         const double lineCarrierConf  = grammar ? std::clamp(grammar->phaseConfidence, 0.0, 1.0) : 0.0;
         const double lineCarrierPlausibility = carrierPlausibility(grammar);
         const double lineCarrierPhase = grammar ? grammar->phaseError : 0.0;
+        const double lineConflict = grammar ? grammar->phaseScheduleConflict : 0.0;
+        if (lineConflict > 0.0) ++scheduleConflictLines;
         for (int rel = 0; rel < width; ++rel) {
             const OwnershipEvidence &e = row[rel];
             ++ownN;
@@ -2049,11 +2052,12 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             sumCarrierConfidence += lineCarrierConf;
             sumCarrierPlausibility += lineCarrierPlausibility;
             sumCarrierPhaseErrorAbs += std::fabs(lineCarrierPhase);
+            sumPhaseScheduleConflict += lineConflict;
         }
     }
     if (ownN > 0) {
         const double invOwnN = 1.0 / (double)ownN;
-        msg += QString(" ownership(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7,carScale=%8,carConf=%9,carPlaus=%10,carPhaseAbsDeg=%11)")
+        msg += QString(" ownership(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7,carScale=%8,carConf=%9,carPlaus=%10,carPhaseAbsDeg=%11,schedConf=%12,schedConfLines=%13)")
             .arg(ownN)
             .arg(sumLumaClaim * invOwnN, 0, 'f', 3)
             .arg(sumChromaClaim * invOwnN, 0, 'f', 3)
@@ -2064,7 +2068,9 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             .arg(sumCarrierScale * invOwnN, 0, 'f', 3)
             .arg(sumCarrierConfidence * invOwnN, 0, 'f', 3)
             .arg(sumCarrierPlausibility * invOwnN, 0, 'f', 3)
-            .arg(sumCarrierPhaseErrorAbs * invOwnN * 180.0 / M_PI, 0, 'f', 3);
+            .arg(sumCarrierPhaseErrorAbs * invOwnN * 180.0 / M_PI, 0, 'f', 3)
+            .arg(sumPhaseScheduleConflict * invOwnN, 0, 'f', 3)
+            .arg(scheduleConflictLines);
     }
 
     const qint64 oddEdgeN = legs[1].edgeN + legs[3].edgeN;

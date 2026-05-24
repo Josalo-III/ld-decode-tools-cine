@@ -678,9 +678,15 @@ private:
 			return 1.0;
 		if (!grammar || !grammar->grammarLocked)
 			return 0.0;
-		if (grammar->projectionValid)
-			return std::clamp(grammar->carrierFitRatio, 0.0, 1.0);
-		return std::clamp(grammar->phaseConfidence, 0.0, 1.0);
+		double base = grammar->projectionValid
+			? std::clamp(grammar->carrierFitRatio, 0.0, 1.0)
+			: std::clamp(grammar->phaseConfidence, 0.0, 1.0);
+		// Burst-vs-metadata disagreement reduces plausibility.  A conflict
+		// of 1.0 (≥45° divergence) halves the score; partial conflict
+		// attenuates proportionally.
+		const double conflictPenalty =
+			1.0 - 0.5 * std::clamp(grammar->phaseScheduleConflict, 0.0, 1.0);
+		return base * conflictPenalty;
 	}
 
 	inline double remodGrammarToComposite(int line, int h,

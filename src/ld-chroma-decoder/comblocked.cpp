@@ -326,6 +326,9 @@ void Comb::FrameBuffer::phaseLocked()
                 // polarity disagreement.
                 grammar->phaseScheduleConflict = std::clamp(
                     std::fabs(measuredPhase) / (M_PI / 4.0), 0.0, 1.0);
+                if (grammar->phaseScheduleConflict < 0.1)
+                    grammar->lineFlipAuthority =
+                        lddecode::CarrierPhaseAuthority::BurstMeasured;
                 if (!writeAffine)
                     continue;
                 const double pMax = T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
