@@ -549,15 +549,15 @@ private:
 	// Line-local locked IQ after burst alignment and affine trim.
 	std::vector<float> demodTI_flat;
 	std::vector<float> demodTQ_flat;
-		// Parser-aligned 4fsc IQ export derived from the locked IQ. Consumers must
-		// consult carrierGrammar before assuming how cross-line sign relations work.
-		std::vector<float> demodTI4fsc_flat;
-		std::vector<float> demodTQ4fsc_flat;
-		// Preserved parser-aligned 4fsc IQ produced by buildPhaseCorrected1D().
-		// Frame B should read this earlier cache instead of depending on later
-		// repurposing of the shared demodTI4fsc/TQ4fsc working buffers.
-		std::vector<float> locked1DTI4fsc_flat;
-		std::vector<float> locked1DTQ4fsc_flat;
+	// Common 4fsc IQ export derived from the locked IQ. This is the seam
+	// between the line-local locked domain and the cross-line 4fsc domain.
+	std::vector<float> demodTI4fsc_flat;
+	std::vector<float> demodTQ4fsc_flat;
+	// Preserved 4fsc IQ produced by buildPhaseCorrected1D().
+	// Frame B should read this earlier cache instead of depending on later
+	// repurposing of the shared demodTI4fsc/TQ4fsc working buffers.
+	std::vector<float> locked1DTI4fsc_flat;
+	std::vector<float> locked1DTQ4fsc_flat;
 	// Product-scaled locked IQ prepared by splitIQLocked() for the output FIR.
 	// Later stages may refine this cache, but they should not overwrite demodTI/TQ.
 	std::vector<float> lockedProductI_flat;
@@ -615,7 +615,7 @@ private:
 	std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
 	std::vector<char> scratch_vdis_flag;
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
-		std::vector<std::vector<double>> locked1DSource; // [line][rel], grid-aligned scalar export for locked 2D
+	std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
 	std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
@@ -678,90 +678,9 @@ private:
 		return ph;
 	}
 
-		inline int carrierOppositeSampleClass(int line, int h) const {
-			return (carrierSignedSampleClass(line, h) + 2) & 3;
-		}
-
-		enum class CarrierLineRelation {
-			Invalid,
-			Same,
-			Opposite
-		};
-
-		inline CarrierLineRelation carrierLineRelation(int referenceLine, int sourceLine) const {
-			const CombCarrierGrammar *ref = carrierGrammarLine(referenceLine);
-			const CombCarrierGrammar *src = carrierGrammarLine(sourceLine);
-			if (!ref || !src)
-				return CarrierLineRelation::Invalid;
-			if (!ref->frameVerticalAllowed || !src->frameVerticalAllowed)
-				return CarrierLineRelation::Invalid;
-			return (ref->lineFlip == src->lineFlip)
-				? CarrierLineRelation::Same
-				: CarrierLineRelation::Opposite;
-		}
-
-		inline void demodGridComposite(int line, int h, double value,
-		                               double &i4fsc, double &q4fsc) const {
-			demod4fscFromCompositePhase(value, carrierSampleClass(line, h), i4fsc, q4fsc);
-		}
-
-		inline double remodGridComposite(int line, int h,
-		                                 double i4fsc, double q4fsc) const {
-			return remod4fscToCompositePhase(i4fsc, q4fsc, carrierSampleClass(line, h));
-		}
-
-		inline std::complex<double> alignGridIQForComparison(
-		    int referenceLine,
-		    int sourceLine,
-		    const std::complex<double> &sourceIQ) const {
-			if (carrierLineRelation(referenceLine, sourceLine) == CarrierLineRelation::Opposite)
-				return -sourceIQ;
-			return sourceIQ;
-		}
-
-		inline std::complex<double> orientGridIQToReference(
-		    int referenceLine,
-		    int sourceLine,
-		    const std::complex<double> &sourceIQ,
-		    double extraPol = 1.0) const {
-			return alignGridIQForComparison(referenceLine, sourceLine, sourceIQ) * extraPol;
-		}
-
-		inline double orientGridScalarToReference(int referenceLine,
-		                                          int sourceLine,
-		                                          double sourceValue,
-		                                          double extraPol = 1.0) const {
-			const double aligned = (carrierLineRelation(referenceLine, sourceLine) == CarrierLineRelation::Opposite)
-				? -sourceValue
-				: sourceValue;
-			return aligned * extraPol;
-		}
-
-		inline double compareGridIQ(int referenceLine,
-		                            const std::complex<double> &referenceIQ,
-		                            int sourceLine,
-		                            const std::complex<double> &sourceIQ) const {
-			const double refMag = std::hypot(referenceIQ.real(), referenceIQ.imag());
-			if (refMag <= 1e-12)
-				return 0.0;
-			const std::complex<double> aligned = alignGridIQForComparison(referenceLine, sourceLine, sourceIQ);
-			const double srcMag = std::hypot(aligned.real(), aligned.imag());
-			if (srcMag <= 1e-12)
-				return 0.0;
-			return ((referenceIQ.real() * aligned.real()) +
-			        (referenceIQ.imag() * aligned.imag())) / (refMag * srcMag + 1e-12);
-		}
-
-		inline double remodComparisonGridComposite(
-		    int referenceLine,
-		    int h,
-		    int sourceLine,
-		    const std::complex<double> &sourceIQ,
-		    double extraPol = 1.0) const {
-			const std::complex<double> aligned =
-				orientGridIQToReference(referenceLine, sourceLine, sourceIQ, extraPol);
-			return remodGridComposite(referenceLine, h, aligned.real(), aligned.imag());
-		}
+	inline int carrierOppositeSampleClass(int line, int h) const {
+		return (carrierSignedSampleClass(line, h) + 2) & 3;
+	}
 
 	inline double carrierPlausibility(const CombCarrierGrammar *grammar) const {
 		if (!configuration.phaseCompensation)
@@ -848,70 +767,35 @@ private:
 	void invalidateCombTapCache();
 	const CombTapLine &ensureCombTapLine(int lineNumber);
 	void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
-	// User-facing comb names: Field A, Field B, Frame A, Frame B.
-	//
-	//   Field A  — same-line ±2 comb with gating (intra-field, primary phase)
-	//   Field B  — same-line ±2 simple comb (intra-field, alt phase)
-	//   Frame A  — interfield IQ comb fed by precleaned Field-B input
-	//   Frame B  — direct interfield IQ comb on the parser's 4fsc-grid affined IQ
-	void computeFieldALine(int lineNumber,
+	void computeField2DLine(int lineNumber,
 						  double *outFieldLine,
 						  double  *outGate);
-	void computeFieldALine(const CombTapLine &tapLine,
+	void computeField2DLine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  double  *outGate);
 
-	void computeFieldBLine(int lineNumber, double *outFieldLine);
-	void computeFieldBLine(const CombTapLine &tapLine, double *outFieldLine);
-
+	void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
+	void computeSimpleField2DLine(const CombTapLine &tapLine, double *outFieldLine);
+	
 	void computeFrameScalarLine(int lineNumber, double *outFrameLine);
 	void computeFrameScalarLine(const CombTapLine &tapLine, double *outFrameLine);
 
-	void computeFrameALine(int line,
-						   std::vector<std::complex<double>> &outFrameIQ,
-						   bool enableLateralRefine = true);
-						   
-	void computeFrameBLine(int line,
-						   std::vector<std::complex<double>> &outFrameIQ,
-						   std::vector<double> &outFrameScalar);
-
-	struct FrameBLineCache {
-		int line = -1;
-		bool valid = false;
-		std::vector<float> ti;
-		std::vector<float> tq;
-	};
-
-	struct FrameBDebugLegStats {
-		qint64 edgeN = 0;
-		double sumEdgeBias = 0.0;
-		double sumAbsEdgeBias = 0.0;
-		double sumBaseShift = 0.0;
-		double sumAbsBaseShift = 0.0;
-	};
-
-	struct FrameBDebugStats {
-		std::array<FrameBDebugLegStats, 4> iqLegs;
-		std::array<FrameBDebugLegStats, 4> scalarLegs;
-	};
-	
-	std::array<FrameBLineCache, 3> frameBRing;
-	FrameBDebugStats frameBDebugStats;
-	
-	const FrameBLineCache *ensureFrameBLine(int lineNumber);
-	void resetFrameBDebugStats();
-	void accumulateFrameBDebugStats(int line,
-	                                const std::vector<std::complex<double>> &outFrameIQ,
-	                                const std::vector<double> &outFrameScalar);
-	void reportFrameBDebugStats(const char *label) const;
-
-	void computeFrameIQFromPreparedVectors(int line,
-
-						   const std::vector<std::complex<double>> &centerIQ,
-						   std::vector<std::complex<double>> &upIQ,
-						   std::vector<std::complex<double>> &dnIQ,
-						   std::vector<std::complex<double>> &outFrameIQ,
-						   const std::vector<float> *tiOverride,
+	void computeFrameIQPrecleanLine(int line,
+									std::vector<std::complex<double>> &outFrameIQ,
+									bool enableLateralRefine = true);
+	void computeFrameBLocked1DLine(int line,
+								   std::vector<std::complex<double>> &outFrameIQ,
+								   std::vector<double> &outFrameScalar);
+	void computeFrameIQLocked1DLine(int line,
+									std::vector<std::complex<double>> &outFrameIQ,
+									const std::vector<float> *tiOverride = nullptr,
+									const std::vector<float> *tqOverride = nullptr);
+		void computeFrameIQFromPreparedVectors(int line,
+											   const std::vector<std::complex<double>> &centerIQ,
+											   std::vector<std::complex<double>> &upIQ,
+											   std::vector<std::complex<double>> &dnIQ,
+											   std::vector<std::complex<double>> &outFrameIQ,
+											   const std::vector<float> *tiOverride,
 											   const std::vector<float> *tqOverride,
 											   bool enableLateralRefine,
 											   bool allowSymmetricLeakCancel = false);

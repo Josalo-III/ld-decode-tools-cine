@@ -1243,7 +1243,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const bool satFrameOk = !managementVeto &&
                     (localUseFrameModel ? !frameInsane : b2VertCoherent);
                 if (satFrameOk) {
-                    scoreR_A *= (1.0 - T.FVF_SAT_FRAME_A_BONUS * sat_t);
+                    scoreR_B *= (1.0 - T.FVF_SAT_FRAME_B_BONUS * sat_t);
                 }
             }
 
@@ -1818,94 +1818,6 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
         lumaSmooth[x] = yLast;
 }
 //diagnostic tool for comb development 
-void Comb::FrameBuffer::resetFrameBDebugStats()
-{
-    frameBDebugStats = FrameBDebugStats{};
-}
-
-void Comb::FrameBuffer::reportFrameBDebugStats(const char *label) const
-{
-    if (!configuration.debugPhaseLegs || !configuration.phaseCompensation)
-        return;
-
-    auto appendLegSummary = [](QString &msg,
-                               const char *section,
-                               const std::array<FrameBDebugLegStats, 4> &legs)
-    {
-        const qint64 oddEdgeN = legs[1].edgeN + legs[3].edgeN;
-        const qint64 evenEdgeN = legs[0].edgeN + legs[2].edgeN;
-
-        const double oddEdgeBias = (oddEdgeN > 0)
-            ? ((legs[1].sumEdgeBias + legs[3].sumEdgeBias) / (double)oddEdgeN)
-            : 0.0;
-        const double evenEdgeBias = (evenEdgeN > 0)
-            ? ((legs[0].sumEdgeBias + legs[2].sumEdgeBias) / (double)evenEdgeN)
-            : 0.0;
-        const double oddAbsEdgeBias = (oddEdgeN > 0)
-            ? ((legs[1].sumAbsEdgeBias + legs[3].sumAbsEdgeBias) / (double)oddEdgeN)
-            : 0.0;
-        const double evenAbsEdgeBias = (evenEdgeN > 0)
-            ? ((legs[0].sumAbsEdgeBias + legs[2].sumAbsEdgeBias) / (double)evenEdgeN)
-            : 0.0;
-        const double oddBaseShift = (oddEdgeN > 0)
-            ? ((legs[1].sumBaseShift + legs[3].sumBaseShift) / (double)oddEdgeN)
-            : 0.0;
-        const double evenBaseShift = (evenEdgeN > 0)
-            ? ((legs[0].sumBaseShift + legs[2].sumBaseShift) / (double)evenEdgeN)
-            : 0.0;
-        const double oddAbsBaseShift = (oddEdgeN > 0)
-            ? ((legs[1].sumAbsBaseShift + legs[3].sumAbsBaseShift) / (double)oddEdgeN)
-            : 0.0;
-        const double evenAbsBaseShift = (evenEdgeN > 0)
-            ? ((legs[0].sumAbsBaseShift + legs[2].sumAbsBaseShift) / (double)evenEdgeN)
-            : 0.0;
-
-        msg += QString(" %1(oddN=%2,evenN=%3,oddPull=%4,evenPull=%5,pullDelta=%6,absPull=%7/%8,oddShift=%9,evenShift=%10,shiftDelta=%11,absShift=%12/%13)")
-            .arg(section)
-            .arg(oddEdgeN)
-            .arg(evenEdgeN)
-            .arg(oddEdgeBias, 0, 'f', 3)
-            .arg(evenEdgeBias, 0, 'f', 3)
-            .arg(oddEdgeBias - evenEdgeBias, 0, 'f', 3)
-            .arg(oddAbsEdgeBias, 0, 'f', 3)
-            .arg(evenAbsEdgeBias, 0, 'f', 3)
-            .arg(oddBaseShift, 0, 'f', 3)
-            .arg(evenBaseShift, 0, 'f', 3)
-            .arg(oddBaseShift - evenBaseShift, 0, 'f', 3)
-            .arg(oddAbsBaseShift, 0, 'f', 3)
-            .arg(evenAbsBaseShift, 0, 'f', 3);
-
-        for (int phase = 0; phase < 4; ++phase) {
-            const FrameBDebugLegStats &s = legs[phase];
-            if (s.edgeN <= 0)
-                continue;
-            const double meanEdgeBias = s.sumEdgeBias / (double)s.edgeN;
-            const double meanAbsEdgeBias = s.sumAbsEdgeBias / (double)s.edgeN;
-            const double meanBaseShift = s.sumBaseShift / (double)s.edgeN;
-            const double meanAbsBaseShift = s.sumAbsBaseShift / (double)s.edgeN;
-            msg += QString(" %1p%2(n=%3,pull=%4,absPull=%5,shift=%6,absShift=%7)")
-                .arg(section)
-                .arg(phase)
-                .arg(s.edgeN)
-                .arg(meanEdgeBias, 0, 'f', 3)
-                .arg(meanAbsEdgeBias, 0, 'f', 3)
-                .arg(meanBaseShift, 0, 'f', 3)
-                .arg(meanAbsBaseShift, 0, 'f', 3);
-        }
-    };
-
-    QString msg = QString("FrameBPhaseStats %1 cadence=%2 fieldPhase=%3/%4")
-        .arg(label)
-        .arg(cadenceId)
-        .arg(firstFieldPhaseID)
-        .arg(secondFieldPhaseID);
-
-    appendLegSummary(msg, "iqEdgeZip", frameBDebugStats.iqLegs);
-    appendLegSummary(msg, "scalarEdgeZip", frameBDebugStats.scalarLegs);
-
-    qInfo().noquote() << msg;
-}
-
 void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const
 {
     if (!configuration.debugPhaseLegs || !configuration.phaseCompensation)
@@ -2325,8 +2237,6 @@ void Comb::FrameBuffer::split2D()
 
     if (width <= 0 || firstLine >= lastLine) return;
 
-    resetFrameBDebugStats();
-
     if (configuration.phaseCompensation) {
         buildPhaseCorrected1D(); // writes locked-1D directly into locked1DSource
         reportPhaseLegStats("locked1d", 1, true);
@@ -2409,7 +2319,7 @@ void Comb::FrameBuffer::split2D()
                 if (ln < firstLine || ln >= lastLine) return;
                 if (havePrecleanLine(ln, width)) return;
                 double *preclean = precleanLinePtrMutable(ln, width);
-                computeFieldBLine(ensureCombTapLine(ln), preclean);
+                computeSimpleField2DLine(ensureCombTapLine(ln), preclean);
                 double *gate = precleanGateLinePtrMutable(ln, width);
                 std::fill(gate, gate + width, 1.0);
             };
@@ -2423,13 +2333,13 @@ void Comb::FrameBuffer::split2D()
             if (fieldBPreclean) {
                 std::copy(fieldBPreclean, fieldBPreclean + width, scratch_fieldBLine.begin());
             } else {
-                computeFieldBLine(tapLine, scratch_fieldBLine.data());
+                computeSimpleField2DLine(tapLine, scratch_fieldBLine.data());
             }
         } else {
             std::fill(scratch_fieldBLine.begin(), scratch_fieldBLine.begin() + width, 0.0);
         }
         if (combTapBuildFlags_ & TapBuildFieldA) {
-            computeFieldALine(tapLine, scratch_fieldLine.data(), scratch_fieldGate.data());
+            computeField2DLine(tapLine, scratch_fieldLine.data(), scratch_fieldGate.data());
         } else {
             std::fill(scratch_fieldLine.begin(), scratch_fieldLine.begin() + width, 0.0);
             std::fill(scratch_fieldGate.begin(), scratch_fieldGate.begin() + width, 1.0);
@@ -2458,7 +2368,7 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameIQCompute) {
-            computeFrameALine(line, frameIQPreclean, false);
+            computeFrameIQPrecleanLine(line, frameIQPreclean, false);
             if ((int)scratch_fieldBCenter.size() < width)
                 scratch_fieldBCenter.resize(width);
             for (int rel = 0; rel < width; ++rel) {
@@ -2471,7 +2381,7 @@ void Comb::FrameBuffer::split2D()
                 }
             }
 
-            computeFrameBLine(line, frameIQ, scratch_frameBCenter);
+            computeFrameBLocked1DLine(line, frameIQ, scratch_frameBCenter);
             if ((int)scratch_frameBCenter.size() < width)
                 scratch_frameBCenter.resize(width);
         }
@@ -2539,8 +2449,6 @@ void Comb::FrameBuffer::split2D()
         }
     }
 
-    if (needFrameIQCompute)
-        reportFrameBDebugStats("frameB");
     reportPhaseLegStats("2d-final", 1, false);
 }
 
