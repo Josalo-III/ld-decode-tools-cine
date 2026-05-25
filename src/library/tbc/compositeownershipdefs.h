@@ -100,8 +100,10 @@ namespace lddecode {
 //       → Do not apply lineFlip at a remod or demod call site.
 //
 //   Grid4fsc
-//       Cross-line or cross-frame analysis basis.  Whether carrier polarity
-//       is already present depends on the producer contract.
+//       Cross-line or cross-frame analysis basis on the parser-aligned 4fsc
+//       grid. This does not imply that phase alternation has been normalized
+//       away; the producer contract still determines how cross-line sign
+//       relations should be interpreted.
 //       Examples: demodTI4fsc/TQ4fsc, locked1DTI4fsc/TQ4fsc.
 //       → Consult the producer.  If the contract is unclear, extend the
 //         pipe to carry an explicit CarrierSignFrame tag rather than guess.
@@ -119,7 +121,7 @@ enum class CarrierSignFrame {
     UnsignedBucket,           // (h + samplePhase0) & 3; no polarity in values
     BurstLockedSigned,        // burst phasor + lineFlip baked in; do not re-sign
     MetadataPreservedSigned,  // parser/metadata polarity preserved; do not re-sign
-    Grid4fsc,                 // cross-line analysis; producer declares sign state
+    Grid4fsc,                 // parser-aligned 4fsc grid; producer declares sign relation
 };
 
 // ---------------------------------------------------------------------------
