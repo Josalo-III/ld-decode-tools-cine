@@ -102,6 +102,13 @@ inline void demod4fscFromComposite(double v, int h, double &i4fsc, double &q4fsc
     q4fsc = v * cos4fsc(h) * 2.0;
 }
 
+// Demodulate using a grammar-derived phase index rather than a raw sample position.
+inline void demod4fscFromCompositePhase(double v, int phase, double &i4fsc, double &q4fsc)
+{
+    i4fsc = v * sin4fsc(phase) * 2.0;
+    q4fsc = v * cos4fsc(phase) * 2.0;
+}
+
 // Remodulate common 4fsc IQ back into composite sample space at position h.
 inline double remod4fscToComposite(double i4fsc, double q4fsc, int h,
                                    double lineScale = 1.0)
