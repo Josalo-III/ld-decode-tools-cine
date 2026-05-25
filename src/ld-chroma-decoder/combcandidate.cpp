@@ -1224,13 +1224,16 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     std::vector<std::complex<double>> &outFrameIQ,
     const std::vector<float> *tiOverride,
     const std::vector<float> *tqOverride,
-    bool enableLateralRefine)
+    bool enableLateralRefine,
+    bool allowSymmetricLeakCancel)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
+
+    (void)allowSymmetricLeakCancel;
 
     outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
 
