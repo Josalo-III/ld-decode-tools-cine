@@ -21,6 +21,48 @@
 #include <cmath>
 #include <mutex>
 
+namespace {
+
+enum class YSourceNativeSpace {
+    RawComposite,
+    RawCompositeHigh,
+    CompositeLuma,
+    LockedIQ,
+    BandpassComb
+};
+
+enum class YSourceHomeOrientation {
+    None,
+    GrammarComposite,
+    BurstLockedIQ
+};
+
+struct YSourceView {
+    const char *name = "";
+    YSourceNativeSpace nativeSpace = YSourceNativeSpace::RawComposite;
+    YSourceHomeOrientation homeOrientation = YSourceHomeOrientation::None;
+    double *samples = nullptr;
+};
+
+inline double sourceToWorkingSample(const YSourceView &source, int x)
+{
+    if (!source.samples) return 0.0;
+
+    // produceY composes in a common 4fsc working space. The intake contract
+    // tracks each source's home orientation into that table explicitly so we
+    // can add real transforms later without rediscovering source identity.
+    switch (source.homeOrientation) {
+    case YSourceHomeOrientation::None:
+    case YSourceHomeOrientation::GrammarComposite:
+    case YSourceHomeOrientation::BurstLockedIQ:
+        return source.samples[x];
+    }
+
+    return source.samples[x];
+}
+
+} // namespace
+
 // Locked-path pre-processing: burst detection, raw composite demodulation into
 // TRI/TRQ, and a per-line affine solve stored in carrierGrammar.
 //
@@ -637,6 +679,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 directionalEdgeSupport > 0.0 &&
                 xi >= 2 && xi < width - 2)
             {
+                // Current path: bandpass-derived alien-Y estimate is projected
+                // straight back into chroma-space correction. The intended next
+                // step is to keep this as a guide and rebuild the alien-Y curve
+                // from the high raw-composite residual instead.
                 const double bpLumaPredicted =
                     (lumaSmooth[xi] -
                      0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
@@ -1095,6 +1141,19 @@ void Comb::FrameBuffer::produceY()
             hiRaw[x]  = (double)rawLine[left + x] - baseY4Src[x];
         }
 
+        YSourceView coarseY {
+            "coarseY",
+            YSourceNativeSpace::CompositeLuma,
+            YSourceHomeOrientation::None,
+            baseY4
+        };
+        YSourceView highRawY {
+            "highRawY",
+            YSourceNativeSpace::RawCompositeHigh,
+            YSourceHomeOrientation::GrammarComposite,
+            hiRaw
+        };
+
         std::copy(hiRaw, hiRaw + width, scratch_comp_res.begin());
 
         double *cHat        = scratch_fieldGate.data();
@@ -1128,6 +1187,7 @@ void Comb::FrameBuffer::produceY()
             tiAdjLocked[x] = ti;
             tqAdjLocked[x] = tq;
 
+            const double residualWorking = sourceToWorkingSample(highRawY, x);
             const double magT_ire = std::hypot(ti, tq) * invI;
             const double magR_ire = std::hypot(ri, rq) * invI;
 
@@ -1221,7 +1281,7 @@ void Comb::FrameBuffer::produceY()
             Vet1DResult vet;
             vet.accept = true;
             vet.confidence = 1.0;
-            vet.composite_bandpass = scratch_comp_res[x];
+            vet.composite_bandpass = sourceToWorkingSample(highRawY, x);
 
             double STTinv[2][2];
             const bool invOk = mat2_inv(STT, STTinv);
@@ -1324,6 +1384,15 @@ void Comb::FrameBuffer::produceY()
             tqAdjLocked[x] = tq_locked_adj;
         }
 
+        YSourceView coherentCombY {
+            "coherentCombY",
+            YSourceNativeSpace::LockedIQ,
+            // Born in burst-locked IQ, then affine-aligned onto the common 4fsc
+            // table before being remodulated back onto the grammar sample phase.
+            YSourceHomeOrientation::BurstLockedIQ,
+            cHat
+        };
+
         const bool ownershipEnabled =
             T.VET_OWNERSHIP_ENABLE &&
             line >= 0 &&
@@ -1349,14 +1418,30 @@ void Comb::FrameBuffer::produceY()
                 1.0 - lc + (ownershipChromaWeight * cc),
                 0.0, 1.0);
 
-            const double blend = std::clamp(ownershipWeight * support, 0.0, 1.0);
+            const double lumaIRE = ((baseY4[x] - videoParameters.black16bIre) * invI);
+            const double chromaIRE = std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI;
+            const double brightT = std::clamp(
+                (lumaIRE - T.VET_OWNERSHIP_BRIGHT_START_IRE) /
+                std::max(1e-9, T.VET_OWNERSHIP_BRIGHT_FULL_IRE - T.VET_OWNERSHIP_BRIGHT_START_IRE),
+                0.0, 1.0);
+            const double satT = std::clamp(
+                (chromaIRE - T.VET_OWNERSHIP_SAT_START_IRE) /
+                std::max(1e-9, T.VET_OWNERSHIP_SAT_FULL_IRE - T.VET_OWNERSHIP_SAT_START_IRE),
+                0.0, 1.0);
+            const double brightSatSuppress = brightT * satT;
+            const double blend = std::clamp(
+                ownershipWeight * support * (1.0 - brightSatSuppress),
+                0.0, 1.0);
             return alphaVet * (1.0 - blend) + chromaFrac * blend;
         };
 
         auto writePixelNoOwnership = [&](int x, double alphaEff) {
             const int h = left + x;
+            const double coarseWorking = sourceToWorkingSample(coarseY, x);
+            const double residualWorking = sourceToWorkingSample(highRawY, x);
+            const double coherentWorking = sourceToWorkingSample(coherentCombY, x);
 
-            const double yOut = baseY4[x] + (hiRaw[x] - alphaEff * cHat[x]);
+            const double yOut = coarseWorking + (residualWorking - alphaEff * coherentWorking);
             Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet)
                          : yOut;
 
@@ -1371,8 +1456,11 @@ void Comb::FrameBuffer::produceY()
         auto writePixelWithOwnership = [&](int x, double alphaVet) {
             const double alphaEff = alphaWithOwnership(x, alphaVet);
             const int h = left + x;
+            const double coarseWorking = sourceToWorkingSample(coarseY, x);
+            const double residualWorking = sourceToWorkingSample(highRawY, x);
+            const double coherentWorking = sourceToWorkingSample(coherentCombY, x);
 
-            const double yOut = baseY4[x] + (hiRaw[x] - alphaEff * cHat[x]);
+            const double yOut = coarseWorking + (residualWorking - alphaEff * coherentWorking);
             Y[h] = do3D ? getBestY(line, h, yOut, *prevFrameForVet, *nextFrameForVet)
                          : yOut;
 
@@ -1385,15 +1473,15 @@ void Comb::FrameBuffer::produceY()
         };
 
         auto computeAlphaVet = [&](int p) -> double {
-            const double r0 = hiRaw[p + 0];
-            const double r1 = hiRaw[p + 1];
-            const double r2 = hiRaw[p + 2];
-            const double r3 = hiRaw[p + 3];
+            const double r0 = sourceToWorkingSample(highRawY, p + 0);
+            const double r1 = sourceToWorkingSample(highRawY, p + 1);
+            const double r2 = sourceToWorkingSample(highRawY, p + 2);
+            const double r3 = sourceToWorkingSample(highRawY, p + 3);
 
-            const double c0 = cHat[p + 0];
-            const double c1 = cHat[p + 1];
-            const double c2 = cHat[p + 2];
-            const double c3 = cHat[p + 3];
+            const double c0 = sourceToWorkingSample(coherentCombY, p + 0);
+            const double c1 = sourceToWorkingSample(coherentCombY, p + 1);
+            const double c2 = sourceToWorkingSample(coherentCombY, p + 2);
+            const double c3 = sourceToWorkingSample(coherentCombY, p + 3);
 
             const double rawI = r1 - r3;
             const double rawQ = r2 - r0;

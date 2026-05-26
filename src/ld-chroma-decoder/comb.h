@@ -265,6 +265,10 @@ public:
             double VET_OWNERSHIP_LUMA_WEIGHT       = 0.75; // blend strength for lumaClaim → Y reassignment (0=off, 1=full)
             double VET_OWNERSHIP_CHROMA_WEIGHT     = 0.75; // blend strength for chromaClaim → chroma retention
             double VET_OWNERSHIP_CONFLICT_SUPPRESS = 0.65; // attenuate ownership adjustment when luma and chroma claims both high
+            double VET_OWNERSHIP_BRIGHT_START_IRE  = 55.0; // begin bowing out of ownership reassignment above this luma level
+            double VET_OWNERSHIP_BRIGHT_FULL_IRE   = 80.0; // fully disable ownership reassignment by this luma level
+            double VET_OWNERSHIP_SAT_START_IRE     = 8.0; // begin bowing out when local chroma reaches this amplitude
+            double VET_OWNERSHIP_SAT_FULL_IRE      = 20.0; // fully disable ownership reassignment by this chroma amplitude
 
             // FVF ownership: ownership evidence adjusts field vs frame penalty before election.
             double FVF_OWNERSHIP_LUMA_WEIGHT   = 0.14; // lumaClaim → added to frame scores (field is safer when luma-owned)
