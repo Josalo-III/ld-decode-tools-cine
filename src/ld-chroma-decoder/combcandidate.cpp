@@ -1742,7 +1742,13 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
 
     computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, enableLateralRefine);
 }
-// skip preprocessing and take IQ directly from buildPhaseCorrected1D for interfield comb
+// Frame B interfield comb.
+// Sources from Field B precleaned composite (preclean ring), re-demodulated
+// to 4fsc grid IQ.  Extracts the interfield difference — the component of
+// center that disagrees with its ±1 frame-line neighbors — and removes it.
+// No rotation or per-pixel sign decisions; sign structure is already resolved
+// by the composite parser and burst-locked demod.
+// Gate: suppress when the two neighbors disagree with each other (motion).
 void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ,
@@ -1760,6 +1766,19 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     if (width <= 0 || line < first || line >= last) return;
     if (line >= demodLines || demodWidth <= 0) return;
 
+    // Preclean demod: Field B precleaned scalar → 4fsc grid IQ.
+    auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
+        if (ln < first || ln >= last) return false;
+        const double *row = precleanLinePtr(ln, width);
+        if (!row) return false;
+        const int h = left + x;
+        double i4fsc = 0.0, q4fsc = 0.0;
+        demod4fscFromComposite(row[x], h, i4fsc, q4fsc);
+        Z = std::complex<double>(i4fsc, q4fsc);
+        return true;
+    };
+
+    // Locked1D fallback when preclean is unavailable for a line.
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
@@ -1779,18 +1798,73 @@ void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     const float *tqDn_raw = (verticalAllowed && line + 1 <  last)  ? tqLine(line + 1) : nullptr;
     if (!ti0_raw || !tq0_raw) return;
 
-    scratch_centerIQ.resize(width);
-    scratch_upIQ.resize(width);
-    scratch_dnIQ.resize(width);
-    for (int x = 0; x < width; ++x) {
-        scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
-        scratch_upIQ[x]     = (tiUp_raw && tqUp_raw) ? std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x])
-                                                     : std::complex<double>(0.0, 0.0);
-        scratch_dnIQ[x]     = (tiDn_raw && tqDn_raw) ? std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x])
-                                                     : std::complex<double>(0.0, 0.0);
-    }
+    const auto  &T    = configuration.tunables;
+    const double invI = invIreScale;
+    const double COMB_STRENGTH   = std::max(0.0, T.FRAME_B_COMB_STRENGTH);
+    const double MIN_CHROMA_IRE  = T.FRAME_CHROMA_MIN_IRE;
+    const double VDIS_THRESH_IRE = std::max(4.0, T.VDIS_MIN_CHROMA_IRE);
+    const double VDIS_RAMP_IRE   = 4.0;
 
-    computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ, outFrameIQ, tiOverride, tqOverride, false);
+    const bool haveUpLine = (verticalAllowed && line - 1 >= first);
+    const bool haveDnLine = (verticalAllowed && line + 1 <  last);
+
+    for (int x = 0; x < width; ++x) {
+        // Load center: prefer preclean, fall back to locked1D.
+        std::complex<double> Z0;
+        if (!demodPrecleanAt(line, x, Z0))
+            Z0 = { (double)ti0_raw[x], (double)tq0_raw[x] };
+
+        // Load neighbors: prefer preclean, fall back to locked1D.
+        std::complex<double> ZUp(0.0, 0.0), ZDn(0.0, 0.0);
+        bool haveUp = false, haveDn = false;
+
+        if (haveUpLine) {
+            if (demodPrecleanAt(line - 1, x, ZUp))
+                haveUp = true;
+            else if (tiUp_raw && tqUp_raw) {
+                ZUp = { (double)tiUp_raw[x], (double)tqUp_raw[x] };
+                haveUp = true;
+            }
+        }
+        if (haveDnLine) {
+            if (demodPrecleanAt(line + 1, x, ZDn))
+                haveDn = true;
+            else if (tiDn_raw && tqDn_raw) {
+                ZDn = { (double)tiDn_raw[x], (double)tqDn_raw[x] };
+                haveDn = true;
+            }
+        }
+
+        if (cmag(Z0) * invI < MIN_CHROMA_IRE || (!haveUp && !haveDn)) {
+            outFrameIQ[x] = Z0;
+            continue;
+        }
+
+        const std::complex<double> nbrAvg = (haveUp && haveDn) ? 0.5 * (ZUp + ZDn)
+                                          : haveUp             ? ZUp
+                                                               : ZDn;
+
+        // Motion gate: suppress when neighbors disagree with each other.
+        double motionGate = 1.0;
+        if (haveUp && haveDn) {
+            const double nbrDiffIRE = cmag(ZUp - ZDn) * invI;
+            if (T.VDIS_HARD_FALLBACK && nbrDiffIRE > VDIS_THRESH_IRE) {
+                outFrameIQ[x] = Z0;
+                continue;
+            }
+            if (nbrDiffIRE > VDIS_THRESH_IRE) {
+                const double t = std::clamp(
+                    (nbrDiffIRE - VDIS_THRESH_IRE) / VDIS_RAMP_IRE, 0.0, 1.0);
+                motionGate = std::max(0.0, 1.0 - T.VDIS_SUPPRESS_FACTOR * t);
+            }
+        }
+
+        // Interfield difference extraction: delta is the component of center
+        // that differs from its interfield neighbors (the per-field error).
+        // Remove it from center, scaled by comb strength and motion gate.
+        const std::complex<double> delta = Z0 - nbrAvg;
+        outFrameIQ[x] = Z0 - delta * (0.5 * COMB_STRENGTH * motionGate);
+    }
 }
 
 void Comb::FrameBuffer::computeFrameBLocked1DLine(
