@@ -66,9 +66,9 @@ inline double sourceToWorkingSample(const YSourceView &source, int x)
 // Locked-path pre-processing: burst detection, raw composite demodulation into
 // TRI/TRQ, and a per-line affine solve stored in carrierGrammar.
 //
-// Note: We intentionally do not overwrite clpbuffer[0] here; split1D populates
-// clpbuffer[0] (1D bandpass), and buildPhaseCorrected1D demodulates that using
-// the locked basis and applies the stored affine afterwards.
+// Locked-path pre-processing.  buildPhaseCorrected1D now sources from
+// combedCarrier (the LS carrier model after line-to-line cancellation),
+// not clpbuffer[0].  split1D is skipped entirely for the locked path.
 void Comb::FrameBuffer::phaseLocked()
 {
     if (!configuration.phaseCompensation)
@@ -409,13 +409,15 @@ void Comb::FrameBuffer::phaseLocked()
     }
 }
 
-// Demodulates clpbuffer[0] into two explicit products:
+// Demodulates the combed carrier (from buildCarrierRetracted) into two
+// explicit products:
 //   1) demodTI/TQ: line-local locked IQ after burst alignment and affine trim.
-//   2) demodTI4fsc/TQ4fsc + clpbuffer[1]: the common 4fsc export derived from
-//      that locked IQ, used as the cross-line scalar reference for 2D work.
+//   2) demodTI4fsc/TQ4fsc + locked1DSource: the common 4fsc export derived
+//      from that locked IQ, used as the cross-line scalar reference for 2D work.
 //
-// Keeping this seam here avoids each consumer privately deciding how locked IQ
-// should be interpreted on the common 4fsc grid.
+// The combed carrier is the LS carrier fit after line-to-line cancellation —
+// alien-Y at fsc has been rejected and only carrier-shaped energy that
+// inverts between opposite-phase lines survives.
 void Comb::FrameBuffer::buildPhaseCorrected1D()
 {
     const int first  = videoParameters.firstActiveFrameLine;
@@ -434,45 +436,18 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
     if ((int)locked1DSource.size() < last) locked1DSource.resize(last);
 
-    // Lazy-build the shared locked luma cache here. This function already runs
-    // before the later locked consumers, so this avoids needing a separate
-    // phaseLocked() integration point.
-    const bool cacheGeometryOk =
-        (demodWidth == width) &&
-        (demodLines > last) &&
-        (width > 0);
-
-    if (cacheGeometryOk) {
-        const size_t need = size_t(demodLines) * size_t(demodWidth);
-
-        if (lockedLumaBaseY4_flat.size() < need ||
-            lockedLumaSmooth_flat.size() < need)
-        {
-            lockedLumaBaseY4_flat.assign(need, 0.0);
-            lockedLumaSmooth_flat.assign(need, 0.0);
-            lockedLumaCacheValid = false;
-        }
-
-        if (!lockedLumaCacheValid) {
-            for (int line = first; line < last; ++line) {
-                const quint16 *rawLine =
-                    rawbuffer.data() + line * videoParameters.fieldWidth;
-
-                buildCompositeLumaDecompositionLine(rawLine, left, width,
-                                                    lockedLumaBaseY4_line(line),
-                                                    nullptr,
-                                                    lockedLumaSmooth_line(line));
-            }
-
-            lockedLumaCacheValid = true;
-        }
-    } else {
-        lockedLumaCacheValid = false;
-    }
+    // Source: combed carrier from buildCarrierRetracted().
+    // This replaces the blind bandpass (clpbuffer[0]) with the LS carrier
+    // model that has been cleaned by line-to-line cancellation.  Alien-Y
+    // at fsc has been rejected; only carrier-shaped energy that inverts
+    // between opposite-phase lines survives.
+    const bool haveCombedCarrier = carrierRetractedValid && !combedCarrier_flat.empty();
 
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
-        const double *src = clpbuffer[0].pixel[line];
+
+        // xi-indexed combed carrier for this line (null if retraction unavailable)
+        const float *combSrc = haveCombedCarrier ? combedCarrier_line(line) : nullptr;
 
         auto &ldsRow = locked1DSource[line];
         if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
@@ -523,11 +498,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             tq = aq;
         };
 
-        auto sampleSrc = [&](int rel)->double {
-            rel = std::clamp(rel, 0, width - 1);
-            return src[left + rel];
-        };
-
+        // Luma smooth for directional edge analysis (still from the luma
+        // decomposition, not the carrier source).
         const double *lumaSmooth = nullptr;
         if (lockedLumaCacheValid &&
             !lockedLumaSmooth_flat.empty() &&
@@ -545,15 +517,25 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         double *tiBase = scratch_preI.data();
         double *tqBase = scratch_preQ.data();
 
+        // Demod the combed carrier through the locked basis.
+        // combSrc is xi-indexed (0..width-1); the demod LUT uses the
+        // carrier sample class at absolute position h.
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
             const int ph = carrierSampleClass(line, h);
-            double ti = src[h] * lutTi[ph];
-            double tq = src[h] * lutTq[ph];
+            const double cv = combSrc ? static_cast<double>(combSrc[xi]) : 0.0;
+            double ti = cv * lutTi[ph];
+            double tq = cv * lutTq[ph];
             applyLineAffine(ti, tq);
             tiBase[xi] = ti;
             tqBase[xi] = tq;
         }
+
+        // Sample accessor for bandpass-scale metrics on the combed carrier.
+        auto sampleComb = [&](int rel)->double {
+            rel = std::clamp(rel, 0, width - 1);
+            return combSrc ? static_cast<double>(combSrc[rel]) : 0.0;
+        };
 
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
@@ -569,18 +551,19 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             double bpLumaModeled = 0.0;
             double icebergAlienYFraction = 0.0;
 
+            // Bandpass-scale metrics on the combed carrier.
             if (xi >= 4 && xi < width - 4) {
-                const double c0 = src[left + xi];
-                fine   = std::fabs(c0 - 0.5 * (src[left + xi - 1] + src[left + xi + 1])) * invIreScale;
-                mid    = std::fabs(c0 - 0.5 * (src[left + xi - 2] + src[left + xi + 2])) * invIreScale;
-                coarse = std::fabs(c0 - 0.5 * (src[left + xi - 4] + src[left + xi + 4])) * invIreScale;
+                const double c0 = sampleComb(xi);
+                fine   = std::fabs(c0 - 0.5 * (sampleComb(xi - 1) + sampleComb(xi + 1))) * invIreScale;
+                mid    = std::fabs(c0 - 0.5 * (sampleComb(xi - 2) + sampleComb(xi + 2))) * invIreScale;
+                coarse = std::fabs(c0 - 0.5 * (sampleComb(xi - 4) + sampleComb(xi + 4))) * invIreScale;
             } else {
-                fine = std::fabs(sampleSrc(xi) -
-                                 0.5 * (sampleSrc(xi - 1) + sampleSrc(xi + 1))) * invIreScale;
-                mid = std::fabs(sampleSrc(xi) -
-                                0.5 * (sampleSrc(xi - 2) + sampleSrc(xi + 2))) * invIreScale;
-                coarse = std::fabs(sampleSrc(xi) -
-                                   0.5 * (sampleSrc(xi - 4) + sampleSrc(xi + 4))) * invIreScale;
+                fine = std::fabs(sampleComb(xi) -
+                                 0.5 * (sampleComb(xi - 1) + sampleComb(xi + 1))) * invIreScale;
+                mid = std::fabs(sampleComb(xi) -
+                                0.5 * (sampleComb(xi - 2) + sampleComb(xi + 2))) * invIreScale;
+                coarse = std::fabs(sampleComb(xi) -
+                                   0.5 * (sampleComb(xi - 4) + sampleComb(xi + 4))) * invIreScale;
             }
 
             const double denom = fine + mid + coarse + 1e-9;
@@ -679,10 +662,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 directionalEdgeSupport > 0.0 &&
                 xi >= 2 && xi < width - 2)
             {
-                // Current path: bandpass-derived alien-Y estimate is projected
-                // straight back into chroma-space correction. The intended next
-                // step is to keep this as a guide and rebuild the alien-Y curve
-                // from the high raw-composite residual instead.
                 const double bpLumaPredicted =
                     (lumaSmooth[xi] -
                      0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
@@ -710,9 +689,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 xi < (int)ownershipEvidence[line].size())
             {
                 OwnershipEvidence &e = ownershipEvidence[line][xi];
-                // Write only the fields this stage produces; the full struct was
-                // zeroed at construction and collectCombOwnershipEvidence overwrites
-                // the remaining consumer-visible fields before finalize reads them.
                 e.facts.bandpassFineIRE = fine;
                 e.facts.bandpassMidIRE = mid;
                 e.facts.bandpassCoarseIRE = coarse;
@@ -753,8 +729,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const double rQ = residual * lutTq[ph];
                 double rI4, rQ4;
                 lockedTo4fsc(rI, rQ, bcos, bsin, rI4, rQ4);
-                // IQ is BurstLockedSigned: the burst-locked demod already
-                // captured the carrier polarity.  Do not re-apply lineFlip.
                 const double cModel = remod4fscToCompositePhase(rI4, rQ4, carrierSampleClass(line, h));
                 const double fwdErr = residual - cModel;
                 sumFwdError   += std::fabs(fwdErr);
@@ -1599,18 +1573,22 @@ auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
 
 }
 
-// Build the carrier-retracted view: for each active sample, fit a windowed LS
-// carrier model to the (rawLine - lockedLumaBaseY4) residual, then store
-// (rawLine - carrierFit) in carrierRetracted_flat.  This mirrors the carrier
-// withdrawal in composite decoder's refineY().
+// Build the carrier-retracted view and its derived products.
 //
-// Called between phaseLocked() and split2D() so buildPhaseCorrected1D and
-// the full 2D/3D path can read carrierRetracted_line(line) for ownership and
-// alien-Y diagnostics.  Only needs the burst phasor (from carrierGrammar) and
-// lockedLumaBaseY4 (filled by phaseLocked) — no comb output required.
+// Per-line pass:
+//   1. Windowed LS carrier fit on (raw - lockedLumaBaseY4) → carrierFit_flat
+//   2. raw - carrierFit → carrierRetracted_flat (flattened view)
+//   3. Sliding 4-sample mean of flattened → flatFloor_flat (carrier-free
+//      luma floor; the 4-sample mean cancels carrier-shaped residual at
+//      color transitions, leaving only genuine DC alien-Y)
 //
-// A repeating pattern that disappears here is carrier-shaped and should not
-// be present in Y.
+// Cross-line pass (after all per-line fits):
+//   4. Line-to-line cancellation on carrierFit → combedCarrier_flat
+//      Real chroma inverts between opposite-phase lines, alien-Y doesn't.
+//      combedCarrier preserves chroma and rejects alien-Y.
+//
+// Called between phaseLocked() and split2D().  Only needs the burst phasor
+// and lockedLumaBaseY4 (both from phaseLocked) — no comb output required.
 void Comb::FrameBuffer::buildCarrierRetracted()
 {
     carrierRetractedValid = false;
@@ -1632,38 +1610,45 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         return;
 
     const size_t need = static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
+    if (carrierFit_flat.size() < need)
+        carrierFit_flat.assign(need, 0.0f);
     if (carrierRetracted_flat.size() < need)
         carrierRetracted_flat.assign(need, 0.0f);
+    if (flatFloor_flat.size() < need)
+        flatFloor_flat.assign(need, 0.0f);
+    if (combedCarrier_flat.size() < need)
+        combedCarrier_flat.assign(need, 0.0f);
 
     const auto &T    = configuration.tunables;
     const int fitWin = std::max(32, (T.SINFIT_WIN_SAMPLES / 4) * 4);
     const int halfWin = fitWin / 2;
 
-    // Re-use existing per-line scratch (all pre-sized by loadFields before this
-    // runs); no conflict since buildCarrierRetracted precedes buildPhaseCorrected1D.
     if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
     if ((int)scratch_fieldLine.size()   < width) scratch_fieldLine.resize(width, 0.0);
     if ((int)scratch_fieldBLine.size()  < width) scratch_fieldBLine.resize(width, 0.0);
     if ((int)scratch_lumaBaseY4.size()  < width) scratch_lumaBaseY4.resize(width, 0.0);
+    if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
 
-    double *rawWhole   = scratch_preI.data();
-    double *coarseY    = scratch_preQ.data();
-    double *carrierFit = scratch_fieldLine.data();
-    double *flattened  = scratch_fieldBLine.data();
+    double *rawWhole    = scratch_preI.data();
+    double *coarseY     = scratch_preQ.data();
+    double *carrierFit  = scratch_fieldLine.data();
+    double *flattened   = scratch_fieldBLine.data();
+    double *slideMean4  = scratch_lateralLine.data();
 
+    // ---------------------------------------------------------------
+    // Pass 1: per-line LS carrier fit, flattened, and flatFloor
+    // ---------------------------------------------------------------
     for (int line = firstLine; line < lastLine; ++line) {
-        float *outRow = carrierRetracted_flat.data() +
-                        static_cast<size_t>(line) * demodWidth;
+        float *fitRow       = carrierFit_flat.data()       + static_cast<size_t>(line) * demodWidth;
+        float *retractedRow = carrierRetracted_flat.data()  + static_cast<size_t>(line) * demodWidth;
+        float *floorRow     = flatFloor_flat.data()         + static_cast<size_t>(line) * demodWidth;
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
 
         const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
 
-        // coarseY: use the fsc-cancelled luma filled by phaseLocked().
-        // Fall back to an inline decomposition if the cache is not ready
-        // (first frame before buildPhaseCorrected1D has sized the buffers).
         const double *baseY4Src;
         if (lockedLumaCacheValid && demodWidth == width &&
             !lockedLumaBaseY4_flat.empty())
@@ -1682,25 +1667,20 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         }
 
         if (!grammarLocked) {
-            // Grammar not established: pass rawWhole through unchanged so the
-            // buffer is always populated; consumers can check grammar lock
-            // before interpreting the values as carrier-free.
-            for (int xi = 0; xi < width; ++xi)
-                outRow[xi] = static_cast<float>(rawWhole[xi]);
+            for (int xi = 0; xi < width; ++xi) {
+                fitRow[xi]       = 0.0f;
+                retractedRow[xi] = static_cast<float>(rawWhole[xi]);
+                floorRow[xi]     = static_cast<float>(coarseY[xi]);
+            }
             continue;
         }
 
         const double bcos = grammar->burstCos;
         const double bsin = grammar->burstSin;
-        // carrierScale is in IRE (multiplied by invIreScale in phaseLocked).
-        // Multiply back to samples for the clamp, matching refineY's convention.
         const double maxCarrierSamples =
             std::max(24.0, grammar->carrierScale * 3.0) * irescale;
 
         // Windowed LS carrier withdrawal.
-        // Each sample xi uses a shifted window [a, b] that stays inside [0, width).
-        // Basis vectors are built from unit locked-IQ remodulated through the
-        // shifted basis, matching how locked IQ was originally demodulated.
         for (int xi = 0; xi < width; ++xi) {
             int a = xi - halfWin;
             int b = xi + halfWin - 1;
@@ -1727,7 +1707,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 const double bQ = remodLockedToShiftedComposite(
                     0.0, 1.0, hk, bcos, bsin, spLUT_locked, cpLUT_locked);
 
-                // Hanning-like taper: full weight at xi, 35 % floor at window edge.
                 const double dist = std::fabs(static_cast<double>(k - xi));
                 const double w = 1.0 - 0.65 * std::min(
                     1.0, dist / std::max(1.0, static_cast<double>(halfWin)));
@@ -1748,7 +1727,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 fitQ = (-sIQ * sIY + sII * sQY) * inv;
             }
 
-            const int    h  = left + xi;
+            const int    h   = left + xi;
             const double bI0 = remodLockedToShiftedComposite(
                 1.0, 0.0, h, bcos, bsin, spLUT_locked, cpLUT_locked);
             const double bQ0 = remodLockedToShiftedComposite(
@@ -1757,12 +1736,101 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             double c = fitI * bI0 + fitQ * bQ0;
             c = std::clamp(c, -maxCarrierSamples, maxCarrierSamples);
 
-            carrierFit[xi] = c;
-            flattened[xi]  = rawWhole[xi] - c;
+            carrierFit[xi]  = c;
+            flattened[xi]   = rawWhole[xi] - c;
+            fitRow[xi]      = static_cast<float>(c);
+            retractedRow[xi] = static_cast<float>(flattened[xi]);
         }
 
-        for (int xi = 0; xi < width; ++xi)
-            outRow[xi] = static_cast<float>(flattened[xi]);
+        // flatFloor: sliding 4-sample mean of flattened.
+        // A 4-sample mean at fsc cancels any carrier-shaped oscillation,
+        // so color-transition residual is stripped and only genuine DC-offset
+        // alien luma survives.
+        if (width >= 4) {
+            const int meanCount = width - 3;
+            for (int s = 0; s < meanCount; ++s) {
+                slideMean4[s] = 0.25 * (flattened[s]     + flattened[s + 1]
+                                       + flattened[s + 2] + flattened[s + 3]);
+            }
+
+            for (int xi = 0; xi < width; ++xi) {
+                const int sFirst = std::max(0, xi - 3);
+                const int sLast  = std::min(xi, meanCount - 1);
+                double sum = 0.0;
+                int n = 0;
+                for (int s = sFirst; s <= sLast; ++s) {
+                    sum += slideMean4[s];
+                    ++n;
+                }
+                floorRow[xi] = static_cast<float>(n > 0 ? sum / n : coarseY[xi]);
+            }
+        } else {
+            for (int xi = 0; xi < width; ++xi)
+                floorRow[xi] = static_cast<float>(coarseY[xi]);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Pass 2: line-to-line cancellation on carrierFit → combedCarrier
+    //
+    // Between adjacent lines with opposite chroma phase:
+    //   real chroma inverts  →  carrierFit[N] ≈ -carrierFit[N±1]
+    //   alien luma persists  →  carrierFit[N] ≈ +carrierFit[N±1]
+    //
+    // Subtraction preserves chroma (doubled) and cancels alien-Y (zeroed).
+    // We average the upward and downward neighbors when both are available.
+    // ---------------------------------------------------------------
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *fitRow = carrierFit_flat.data()
+                              + static_cast<size_t>(line) * demodWidth;
+        float *combRow = combedCarrier_flat.data()
+                         + static_cast<size_t>(line) * demodWidth;
+
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        if (!grammar || !grammar->grammarLocked) {
+            std::fill(combRow, combRow + width, 0.0f);
+            continue;
+        }
+
+        const int lineAbove = line - 1;
+        const int lineBelow = line + 1;
+
+        const CombCarrierGrammar *gAbove =
+            (lineAbove >= firstLine) ? carrierGrammarLine(lineAbove) : nullptr;
+        const CombCarrierGrammar *gBelow =
+            (lineBelow < lastLine)  ? carrierGrammarLine(lineBelow) : nullptr;
+
+        const bool haveAbove = gAbove && gAbove->grammarLocked;
+        const bool haveBelow = gBelow && gBelow->grammarLocked;
+
+        const float *fitAbove = haveAbove
+            ? (carrierFit_flat.data() + static_cast<size_t>(lineAbove) * demodWidth)
+            : nullptr;
+        const float *fitBelow = haveBelow
+            ? (carrierFit_flat.data() + static_cast<size_t>(lineBelow) * demodWidth)
+            : nullptr;
+
+        // Scale by 0.5 so pure chroma emerges at carrier amplitude A
+        // (the raw subtraction doubles it to 2A; this restores parity
+        // with split1D's output scale).
+        if (haveAbove && haveBelow) {
+            for (int xi = 0; xi < width; ++xi)
+                combRow[xi] = static_cast<float>(
+                    0.5 * (fitRow[xi] - 0.5 * (fitAbove[xi] + fitBelow[xi])));
+        } else if (haveAbove) {
+            for (int xi = 0; xi < width; ++xi)
+                combRow[xi] = static_cast<float>(
+                    0.5 * (fitRow[xi] - fitAbove[xi]));
+        } else if (haveBelow) {
+            for (int xi = 0; xi < width; ++xi)
+                combRow[xi] = static_cast<float>(
+                    0.5 * (fitRow[xi] - fitBelow[xi]));
+        } else {
+            // No neighbors — can't cancel alien-Y.  Pass through the
+            // per-line fit at half amplitude for scale consistency.
+            for (int xi = 0; xi < width; ++xi)
+                combRow[xi] = static_cast<float>(0.5 * fitRow[xi]);
+        }
     }
 
     carrierRetractedValid = true;

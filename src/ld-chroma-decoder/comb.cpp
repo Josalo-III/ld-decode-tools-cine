@@ -182,15 +182,18 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
         if (canLoadNext && (fieldIndex + 2 >= 0)) {
             next->loadFields(inputFields[fieldIndex + 2], inputFields[fieldIndex + 3]);
-            next->split1D();
             if (configuration.phaseCompensation) {
-                // Heavy locked pre-processing between 1D and 2D
+                // Locked path: the LS carrier model + line-to-line cancellation
+                // replaces split1D's blind bandpass entirely.
+                //   phaseLocked        → burst grammar, baseY4, raw TRI/TRQ, affine
+                //   buildCarrierRetracted → per-line LS carrier fit, flatFloor,
+                //                           combed carrier (alien-Y rejected)
+                //   split2D → buildPhaseCorrected1D demods the combed carrier
                 next->phaseLocked();
-                // Carrier-retracted view: needs only the burst phasor and
-                // lockedLumaBaseY4 (both filled by phaseLocked above).
-                // Runs here so buildPhaseCorrected1D and the full 2D/3D path
-                // can consult it for ownership and alien-Y diagnostics.
                 next->buildCarrierRetracted();
+            } else {
+                // Bucket path: still needs the blind bandpass.
+                next->split1D();
             }
 
             next->split2D();
@@ -228,8 +231,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         if (configuration.phaseCompensation) {
             current->demodMode = FrameBuffer::DemodMode::Locked;
 
-            // 1) Sinusoidal-fit pre-clean and affine solve (fills clpbuffer[0], carrierGrammar.affine)
-            // 2) Phase-corrected 1D demod for 2D work (via buildPhaseCorrected1D inside split2D)
+            // 1) Carrier grammar + LS carrier fit + line cancellation (pre-pass)
+            // 2) Combed-carrier demod for 1D, 2D scoring (via buildPhaseCorrected1D)
             // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
             // 4) Re-demod final selected comb and produce locked-product cache
             current->splitIQlocked();
@@ -576,8 +579,8 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 
 // 1D horizontal bandpass: isolates subcarrier energy by subtracting the average
 // of the samples two positions either side (a 2-tap comb at 2fsc), scaled by 0.5.
-// This is the simplest possible chroma separator and serves as the baseline
-// reference for 2D and 3D candidates. Result written to clpbuffer[0].
+// Bucket-path only; the locked path skips this and uses the LS combed carrier
+// from buildCarrierRetracted() instead.  Result written to clpbuffer[0].
 void Comb::FrameBuffer::split1D()
 {
     const int left      = videoParameters.activeVideoStart;
@@ -2486,7 +2489,15 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             getBestCandidate(line, h, previousFrame, nextFrame, bestIndex, bestSample);
         
             const int h0 = clampH(h);
-            const double base1d = clpbuffer[0].pixel[line][h0];
+            double base1d;
+            if (configuration.phaseCompensation &&
+                line >= 0 && line < (int)locked1DSource.size() &&
+                (int)locked1DSource[line].size() > (h0 - left))
+            {
+                base1d = locked1DSource[line][h0 - left];
+            } else {
+                base1d = clpbuffer[0].pixel[line][h0];
+            }
         
             if (bestIndex < CAND_PREV_FIELD) {
                  // Best is 1D/2D; keep pre-filled 2D value

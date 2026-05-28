@@ -372,13 +372,14 @@ public:
 
 	void adjustY();         // Bucket path
 	void produceY();        // Product path
-	// Build the carrier-retracted view of the raw composite waveform.
-	// For each sample, fits a windowed LS carrier model to
-	// (rawLine - lockedLumaBaseY4), then stores (rawLine - carrierFit)
-	// in carrierRetracted_flat.
-	// Must be called after phaseLocked() (which populates lockedLumaBaseY4
-	// and the burst grammar) and before split2D() / buildPhaseCorrected1D().
-	// The result is read-only for all downstream stages.
+	// Build the carrier-retracted view and derived products:
+	//   carrierFit_flat       — per-line LS carrier model
+	//   carrierRetracted_flat — raw minus carrier fit (flattened)
+	//   flatFloor_flat        — 4-sample-mean carrier-free luma floor
+	//   combedCarrier_flat    — line-to-line cancelled carrier fit
+	// Must be called after phaseLocked() and before split2D().
+	// The locked path skips split1D; buildPhaseCorrected1D sources
+	// from combedCarrier instead of clpbuffer[0].
 	void buildCarrierRetracted();
 	void doCNR();
 	void doYNR();
@@ -632,10 +633,22 @@ private:
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
-	// Raw composite with the windowed LS carrier fit removed (per-line, same
-	// geometry as the demod flat buffers).  Populated by buildCarrierRetracted()
-	// after produceY(); valid when carrierRetractedValid is true.
+	// Carrier-retracted pipeline buffers.  All populated by buildCarrierRetracted()
+	// after phaseLocked(); valid when carrierRetractedValid is true.
+	// Same geometry as the demod flat buffers (demodLines x demodWidth).
+	//
+	// carrierFit_flat       — per-line LS carrier fit (composite-space scalar).
+	// carrierRetracted_flat — raw composite minus carrierFit (flattened view).
+	// flatFloor_flat        — 4-sample sliding-mean of flattened (carrier-free
+	//                         luma floor; safe for alien-Y reasoning because the
+	//                         4-sample mean cancels carrier-shaped residual).
+	// combedCarrier_flat    — line-to-line cancelled carrier fit: chroma that
+	//                         inverts between opposite-phase lines survives;
+	//                         alien-Y that doesn't invert is rejected.
+	std::vector<float> carrierFit_flat;
 	std::vector<float> carrierRetracted_flat;
+	std::vector<float> flatFloor_flat;
+	std::vector<float> combedCarrier_flat;
 	bool carrierRetractedValid = false;
 	
 	inline double *lockedLumaBaseY4_line(int line) {
@@ -952,6 +965,16 @@ private:
 		return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
+	inline float* carrierFit_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierFit_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierFit_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierFit_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
 	inline float* carrierRetracted_line(int line) {
 		if (!carrierRetractedValid || demodWidth <= 0 ||
 		    line < 0 || line >= demodLines) return nullptr;
@@ -961,6 +984,26 @@ private:
 		if (!carrierRetractedValid || demodWidth <= 0 ||
 		    line < 0 || line >= demodLines) return nullptr;
 		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* flatFloor_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return flatFloor_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* flatFloor_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return flatFloor_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* combedCarrier_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return combedCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* combedCarrier_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return combedCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

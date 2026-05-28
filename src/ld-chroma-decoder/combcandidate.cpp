@@ -58,11 +58,19 @@ void Comb::FrameBuffer::computeVDISLine(int lineNumber)
         const double th1d_s   = (th1d_ire > 0.0) ? th1d_ire * irescale : 0.0;
 
         if (th1d_s > 0.0) {
+            auto vdisSample = [&](int ln, int rel)->double {
+                if (configuration.phaseCompensation) {
+                    if (ln >= 0 && ln < (int)locked1DSource.size() &&
+                        (int)locked1DSource[ln].size() > rel)
+                        return locked1DSource[ln][rel];
+                    return 0.0;
+                }
+                return clpbuffer[0].pixel[ln][left + rel];
+            };
             for (int rel = 0; rel < width; ++rel) {
-                int h = left + rel;
-                double c = clpbuffer[0].pixel[lineNumber][h];
-                double u = clpbuffer[0].pixel[up2][h];
-                double d = clpbuffer[0].pixel[dn2][h];
+                double c = vdisSample(lineNumber, rel);
+                double u = vdisSample(up2, rel);
+                double d = vdisSample(dn2, rel);
                 double maxDiff = std::max(std::fabs(c - u), std::fabs(c - d));
                 if (maxDiff > th1d_s) {
                     scratch_vdis_flag[rel] = 1;
@@ -1935,8 +1943,16 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // 1D sample
-    result.sample = frameBuffer.clpbuffer[0].pixel[lineNumber][hh];
+    // 1D sample: locked path reads from locked1DSource (combed carrier);
+    // bucket path reads from clpbuffer[0] (blind bandpass).
+    if (frameBuffer.configuration.phaseCompensation &&
+        lineNumber >= 0 && lineNumber < (int)frameBuffer.locked1DSource.size() &&
+        (int)frameBuffer.locked1DSource[lineNumber].size() > (hh - left))
+    {
+        result.sample = frameBuffer.locked1DSource[lineNumber][hh - left];
+    } else {
+        result.sample = frameBuffer.clpbuffer[0].pixel[lineNumber][hh];
+    }
 
     // --- Luma Penalty with Neighbor Shaping (Cross Pattern) ---
     // Horizontal (Current Line)
