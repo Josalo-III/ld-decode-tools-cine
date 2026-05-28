@@ -723,6 +723,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 e.facts.locked1DChromaIRE = std::hypot(ti, tq) * invIreScale;
             }
 
+#if 0   // diagnostic: disable to test Suspect 1 (alien-Y double-counting in produceY)
             if (bpLumaModeled != 0.0) {
                 double corrTi = bpLumaModeled * lutTi[ph];
                 double corrTq = bpLumaModeled * lutTq[ph];
@@ -730,6 +731,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 ti -= corrTi;
                 tq -= corrTq;
             }
+#endif
 
             tiRow[xi] = (float)ti;
             tqRow[xi] = (float)tq;
@@ -1371,7 +1373,11 @@ void Comb::FrameBuffer::produceY()
             const double ti_adj_4fsc = Rm[0][0] * ti0 + Rm[0][1] * tq0;
             const double tq_adj_4fsc = Rm[1][0] * ti0 + Rm[1][1] * tq0;
 
-            cHat[x] = remod4fscToCompositePhase(ti_adj_4fsc, tq_adj_4fsc, carrierSampleClass(line, h));
+            // Use the shifted basis to round-trip the same ε offset used by the
+            // locked demod (spLUT_locked built with CAL_EPS_SAMPLES). Plain
+            // remod4fscToCompositePhase leaves a carrier-shaped residual in Y
+            // because the demod/remod bases don't cancel.
+            cHat[x] = remod4fscToShiftedComposite(ti_adj_4fsc, tq_adj_4fsc, h, spLUT_locked, cpLUT_locked);
             vetConf[x] = vet.confidence;
 
             double ti_locked_adj = 0.0;
@@ -1405,35 +1411,66 @@ void Comb::FrameBuffer::produceY()
         const double ownershipWeight = T.VET_OWNERSHIP_LUMA_WEIGHT;
         const double ownershipChromaWeight = T.VET_OWNERSHIP_CHROMA_WEIGHT;
 
-        auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
-            const OwnershipAssessment &a = ownRow[x].assessment;
-            const double lc = std::clamp(a.lumaClaim, 0.0, 1.0);
-            const double cc = std::clamp(a.chromaClaim, 0.0, 1.0);
-            const double uc = std::clamp(a.uncertainClaim, 0.0, 1.0);
+auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
+    const OwnershipAssessment &a = ownRow[x].assessment;
+    const double lc = std::clamp(a.lumaClaim, 0.0, 1.0);
+    const double cc = std::clamp(a.chromaClaim, 0.0, 1.0);
+    const double uc = std::clamp(a.uncertainClaim, 0.0, 1.0);
 
-            const double support =
-                lc * (1.0 - 0.5 * cc) * (1.0 - 0.5 * uc);
+    const double chromaFrac = std::clamp(
+        1.0 - lc + (ownershipChromaWeight * cc),
+        0.0, 1.0);
 
-            const double chromaFrac = std::clamp(
-                1.0 - lc + (ownershipChromaWeight * cc),
-                0.0, 1.0);
+    const double lumaIRE =
+        ((baseY4[x] - videoParameters.black16bIre) * invI);
 
-            const double lumaIRE = ((baseY4[x] - videoParameters.black16bIre) * invI);
-            const double chromaIRE = std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI;
-            const double brightT = std::clamp(
-                (lumaIRE - T.VET_OWNERSHIP_BRIGHT_START_IRE) /
-                std::max(1e-9, T.VET_OWNERSHIP_BRIGHT_FULL_IRE - T.VET_OWNERSHIP_BRIGHT_START_IRE),
-                0.0, 1.0);
-            const double satT = std::clamp(
-                (chromaIRE - T.VET_OWNERSHIP_SAT_START_IRE) /
-                std::max(1e-9, T.VET_OWNERSHIP_SAT_FULL_IRE - T.VET_OWNERSHIP_SAT_START_IRE),
-                0.0, 1.0);
-            const double brightSatSuppress = brightT * satT;
-            const double blend = std::clamp(
-                ownershipWeight * support * (1.0 - brightSatSuppress),
-                0.0, 1.0);
-            return alphaVet * (1.0 - blend) + chromaFrac * blend;
-        };
+    const double chromaIRE =
+        std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI;
+
+    const double brightT = std::clamp(
+        (lumaIRE - T.VET_OWNERSHIP_BRIGHT_START_IRE) /
+        std::max(1e-9,
+                 T.VET_OWNERSHIP_BRIGHT_FULL_IRE -
+                 T.VET_OWNERSHIP_BRIGHT_START_IRE),
+        0.0,
+        1.0);
+
+    const double satT = std::clamp(
+        (chromaIRE - T.VET_OWNERSHIP_SAT_START_IRE) /
+        std::max(1e-9,
+                 T.VET_OWNERSHIP_SAT_FULL_IRE -
+                 T.VET_OWNERSHIP_SAT_START_IRE),
+        0.0,
+        1.0);
+
+    // Strong chroma or explicit chroma ownership should block luma-ownership
+    // from reducing residual chroma subtraction. This is especially important
+    // for saturated blue, where lumaIRE may not trip the brightness ramp.
+    const double chromaBlock = std::clamp(
+        cc + 0.65 * satT,
+        0.0,
+        1.0);
+
+    const double support =
+        lc * (1.0 - chromaBlock) * (1.0 - 0.5 * uc);
+
+    // Saturated color is already a warning that carrier-band energy is probably
+    // chroma-owned; do not require high luma for ownership reassignment to bow out.
+    const double satProtect = satT;
+    const double brightSatProtect = brightT * satT;
+
+    const double ownershipProtect = std::clamp(
+        std::max(satProtect, brightSatProtect),
+        0.0,
+        1.0);
+
+    const double blend = std::clamp(
+        ownershipWeight * support * (1.0 - ownershipProtect),
+        0.0,
+        1.0);
+
+    return alphaVet * (1.0 - blend) + chromaFrac * blend;
+};
 
         auto writePixelNoOwnership = [&](int x, double alphaEff) {
             const int h = left + x;
