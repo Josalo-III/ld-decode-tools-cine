@@ -372,6 +372,14 @@ public:
 
 	void adjustY();         // Bucket path
 	void produceY();        // Product path
+	// Build the carrier-retracted view of the raw composite waveform.
+	// For each sample, fits a windowed LS carrier model to
+	// (rawLine - lockedLumaBaseY4), then stores (rawLine - carrierFit)
+	// in carrierRetracted_flat.
+	// Must be called after phaseLocked() (which populates lockedLumaBaseY4
+	// and the burst grammar) and before split2D() / buildPhaseCorrected1D().
+	// The result is read-only for all downstream stages.
+	void buildCarrierRetracted();
 	void doCNR();
 	void doYNR();
 	void transformIQ(double chromaGain, double chromaPhase);
@@ -624,6 +632,11 @@ private:
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
+	// Raw composite with the windowed LS carrier fit removed (per-line, same
+	// geometry as the demod flat buffers).  Populated by buildCarrierRetracted()
+	// after produceY(); valid when carrierRetractedValid is true.
+	std::vector<float> carrierRetracted_flat;
+	bool carrierRetractedValid = false;
 	
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
@@ -937,6 +950,17 @@ private:
 	}
 	inline const float* demodTRQ_line(int line) const {
 		return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline float* carrierRetracted_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierRetracted_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

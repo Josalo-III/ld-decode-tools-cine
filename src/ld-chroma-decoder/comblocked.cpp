@@ -1598,3 +1598,172 @@ auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
     }
 
 }
+
+// Build the carrier-retracted view: for each active sample, fit a windowed LS
+// carrier model to the (rawLine - lockedLumaBaseY4) residual, then store
+// (rawLine - carrierFit) in carrierRetracted_flat.  This mirrors the carrier
+// withdrawal in composite decoder's refineY().
+//
+// Called between phaseLocked() and split2D() so buildPhaseCorrected1D and
+// the full 2D/3D path can read carrierRetracted_line(line) for ownership and
+// alien-Y diagnostics.  Only needs the burst phasor (from carrierGrammar) and
+// lockedLumaBaseY4 (filled by phaseLocked) — no comb output required.
+//
+// A repeating pattern that disappears here is carrier-shaped and should not
+// be present in Y.
+void Comb::FrameBuffer::buildCarrierRetracted()
+{
+    carrierRetractedValid = false;
+
+    if (!configuration.phaseCompensation)
+        return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+
+    if (width <= 0 || firstLine >= lastLine)
+        return;
+    if (demodWidth != width || demodLines < lastLine)
+        return;
+    if (!basisLockedInit)
+        return;
+
+    const size_t need = static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
+    if (carrierRetracted_flat.size() < need)
+        carrierRetracted_flat.assign(need, 0.0f);
+
+    const auto &T    = configuration.tunables;
+    const int fitWin = std::max(32, (T.SINFIT_WIN_SAMPLES / 4) * 4);
+    const int halfWin = fitWin / 2;
+
+    // Re-use existing per-line scratch (all pre-sized by loadFields before this
+    // runs); no conflict since buildCarrierRetracted precedes buildPhaseCorrected1D.
+    if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
+    if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
+    if ((int)scratch_fieldLine.size()   < width) scratch_fieldLine.resize(width, 0.0);
+    if ((int)scratch_fieldBLine.size()  < width) scratch_fieldBLine.resize(width, 0.0);
+    if ((int)scratch_lumaBaseY4.size()  < width) scratch_lumaBaseY4.resize(width, 0.0);
+
+    double *rawWhole   = scratch_preI.data();
+    double *coarseY    = scratch_preQ.data();
+    double *carrierFit = scratch_fieldLine.data();
+    double *flattened  = scratch_fieldBLine.data();
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        float *outRow = carrierRetracted_flat.data() +
+                        static_cast<size_t>(line) * demodWidth;
+
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+
+        const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
+
+        // coarseY: use the fsc-cancelled luma filled by phaseLocked().
+        // Fall back to an inline decomposition if the cache is not ready
+        // (first frame before buildPhaseCorrected1D has sized the buffers).
+        const double *baseY4Src;
+        if (lockedLumaCacheValid && demodWidth == width &&
+            !lockedLumaBaseY4_flat.empty())
+        {
+            baseY4Src = lockedLumaBaseY4_line(line);
+        } else {
+            buildCompositeLumaDecompositionLine(rawLine, left, width,
+                                                scratch_lumaBaseY4.data(),
+                                                nullptr, nullptr);
+            baseY4Src = scratch_lumaBaseY4.data();
+        }
+
+        for (int xi = 0; xi < width; ++xi) {
+            rawWhole[xi] = static_cast<double>(rawLine[left + xi]);
+            coarseY[xi]  = baseY4Src[xi];
+        }
+
+        if (!grammarLocked) {
+            // Grammar not established: pass rawWhole through unchanged so the
+            // buffer is always populated; consumers can check grammar lock
+            // before interpreting the values as carrier-free.
+            for (int xi = 0; xi < width; ++xi)
+                outRow[xi] = static_cast<float>(rawWhole[xi]);
+            continue;
+        }
+
+        const double bcos = grammar->burstCos;
+        const double bsin = grammar->burstSin;
+        // carrierScale is in IRE (multiplied by invIreScale in phaseLocked).
+        // Multiply back to samples for the clamp, matching refineY's convention.
+        const double maxCarrierSamples =
+            std::max(24.0, grammar->carrierScale * 3.0) * irescale;
+
+        // Windowed LS carrier withdrawal.
+        // Each sample xi uses a shifted window [a, b] that stays inside [0, width).
+        // Basis vectors are built from unit locked-IQ remodulated through the
+        // shifted basis, matching how locked IQ was originally demodulated.
+        for (int xi = 0; xi < width; ++xi) {
+            int a = xi - halfWin;
+            int b = xi + halfWin - 1;
+            if (a < 0) {
+                b += -a;
+                a = 0;
+            }
+            if (b >= width) {
+                const int over = b - (width - 1);
+                b    -= over;
+                a    -= over;
+                if (a < 0) a = 0;
+            }
+
+            double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
+            double sIY = 0.0, sQY = 0.0, wSum = 0.0;
+
+            for (int k = a; k <= b; ++k) {
+                const int    hk   = left + k;
+                const double obs  = rawWhole[k] - coarseY[k];
+
+                const double bI = remodLockedToShiftedComposite(
+                    1.0, 0.0, hk, bcos, bsin, spLUT_locked, cpLUT_locked);
+                const double bQ = remodLockedToShiftedComposite(
+                    0.0, 1.0, hk, bcos, bsin, spLUT_locked, cpLUT_locked);
+
+                // Hanning-like taper: full weight at xi, 35 % floor at window edge.
+                const double dist = std::fabs(static_cast<double>(k - xi));
+                const double w = 1.0 - 0.65 * std::min(
+                    1.0, dist / std::max(1.0, static_cast<double>(halfWin)));
+
+                sII  += w * bI * bI;
+                sIQ  += w * bI * bQ;
+                sQQ  += w * bQ * bQ;
+                sIY  += w * bI * obs;
+                sQY  += w * bQ * obs;
+                wSum += w;
+            }
+
+            double fitI = 0.0, fitQ = 0.0;
+            const double det = sII * sQQ - sIQ * sIQ;
+            if (wSum > 1e-9 && std::fabs(det) > 1e-9) {
+                const double inv = 1.0 / det;
+                fitI = ( sQQ * sIY - sIQ * sQY) * inv;
+                fitQ = (-sIQ * sIY + sII * sQY) * inv;
+            }
+
+            const int    h  = left + xi;
+            const double bI0 = remodLockedToShiftedComposite(
+                1.0, 0.0, h, bcos, bsin, spLUT_locked, cpLUT_locked);
+            const double bQ0 = remodLockedToShiftedComposite(
+                0.0, 1.0, h, bcos, bsin, spLUT_locked, cpLUT_locked);
+
+            double c = fitI * bI0 + fitQ * bQ0;
+            c = std::clamp(c, -maxCarrierSamples, maxCarrierSamples);
+
+            carrierFit[xi] = c;
+            flattened[xi]  = rawWhole[xi] - c;
+        }
+
+        for (int xi = 0; xi < width; ++xi)
+            outRow[xi] = static_cast<float>(flattened[xi]);
+    }
+
+    carrierRetractedValid = true;
+}

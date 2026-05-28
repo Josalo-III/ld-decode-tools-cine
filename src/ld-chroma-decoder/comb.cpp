@@ -186,6 +186,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             if (configuration.phaseCompensation) {
                 // Heavy locked pre-processing between 1D and 2D
                 next->phaseLocked();
+                // Carrier-retracted view: needs only the burst phasor and
+                // lockedLumaBaseY4 (both filled by phaseLocked above).
+                // Runs here so buildPhaseCorrected1D and the full 2D/3D path
+                // can consult it for ownership and alien-Y diagnostics.
+                next->buildCarrierRetracted();
             }
 
             next->split2D();
