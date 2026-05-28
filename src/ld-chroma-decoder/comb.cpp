@@ -2259,7 +2259,7 @@ void Comb::FrameBuffer::split2D()
             {
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = locked1DSource[line][rel];
             } else {
-                const double *src1d = clpbuffer[1].pixel[line];
+                const double *src1d = clpbuffer[0].pixel[line];
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = src1d[left + rel];
             }
             if (writeWeights && line < (int)w2d_frame_weight.size())

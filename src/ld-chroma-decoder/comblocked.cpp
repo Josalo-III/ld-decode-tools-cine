@@ -460,6 +460,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         const double *baseY4 = (lockedLumaCacheValid &&
             !lockedLumaBaseY4_flat.empty() && demodWidth == width)
             ? lockedLumaBaseY4_line(line) : nullptr;
+        const float *floorRow = (carrierRetractedValid &&
+            !flatFloor_flat.empty() && demodWidth == width)
+            ? flatFloor_line(line) : nullptr;
         double sumFwdError = 0.0, sumChromaMag = 0.0;
         double sumResidualSq = 0.0, sumErrorSq = 0.0;
         int projCount = 0;
@@ -659,17 +662,22 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
 
             if (T.LUMA_ICEBERG_RECOVERY > 0.0 &&
-                directionalEdgeSupport > 0.0 &&
-                xi >= 2 && xi < width - 2)
+                directionalEdgeSupport > 0.0)
             {
-                const double bpLumaPredicted =
-                    (lumaSmooth[xi] -
-                     0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
-
-                bpLumaModeled =
-                    bpLumaPredicted *
-                    T.LUMA_ICEBERG_RECOVERY *
-                    directionalEdgeSupport;
+                if (floorRow && baseY4) {
+                    bpLumaModeled =
+                        (static_cast<double>(floorRow[xi]) - baseY4[xi]) *
+                        T.LUMA_ICEBERG_RECOVERY *
+                        directionalEdgeSupport;
+                } else if (xi >= 2 && xi < width - 2) {
+                    const double bpLumaPredicted =
+                        (lumaSmooth[xi] -
+                         0.5 * (lumaSmooth[xi - 2] + lumaSmooth[xi + 2])) * 0.5;
+                    bpLumaModeled =
+                        bpLumaPredicted *
+                        T.LUMA_ICEBERG_RECOVERY *
+                        directionalEdgeSupport;
+                }
 
                 const double modeledAlienYIRE = std::fabs(bpLumaModeled) * invIreScale;
                 icebergAlienYFraction = std::clamp(
@@ -699,7 +707,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 e.facts.locked1DChromaIRE = std::hypot(ti, tq) * invIreScale;
             }
 
-#if 0   // diagnostic: disable to test Suspect 1 (alien-Y double-counting in produceY)
+#if 0   // disabled: produceY now handles alien-Y via flatFloor decomposition;
+        // enabling here would double-count in the 1D→2D→3D candidate path
             if (bpLumaModeled != 0.0) {
                 double corrTi = bpLumaModeled * lutTi[ph];
                 double corrTq = bpLumaModeled * lutTq[ph];
@@ -721,7 +730,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             locked1DTi4Row[xi] = (float)ti4;
             locked1DTq4Row[xi] = (float)tq4;
 
-            ldsRow[xi] = remod4fscToCompositePhase(ti4, tq4, carrierSampleClass(line, h));
+            ldsRow[xi] = remod4fscToShiftedComposite(ti4, tq4, h, spLUT_locked, cpLUT_locked);
 
             if (baseY4 && grammarLocked) {
                 const double residual = (double)rawLine[h] - baseY4[xi];
@@ -729,7 +738,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const double rQ = residual * lutTq[ph];
                 double rI4, rQ4;
                 lockedTo4fsc(rI, rQ, bcos, bsin, rI4, rQ4);
-                const double cModel = remod4fscToCompositePhase(rI4, rQ4, carrierSampleClass(line, h));
+                const double cModel = remod4fscToShiftedComposite(rI4, rQ4, h, spLUT_locked, cpLUT_locked);
                 const double fwdErr = residual - cModel;
                 sumFwdError   += std::fabs(fwdErr);
                 sumChromaMag  += std::hypot(rI4, rQ4);
@@ -772,6 +781,22 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
             for (int xi = 0; xi < width; ++xi)
                 ldsRow[xi] = scratch_filter_temp[xi];
+        }
+    }
+
+    // Populate clpbuffer[0] from locked1DSource so all downstream consumers
+    // (produceY no-residual path, diagnostics, any future code) get the
+    // upgraded carrier model output without needing to branch on locked path.
+    if (configuration.phaseCompensation) {
+        for (int line = first; line < last; ++line) {
+            if (line < (int)locked1DSource.size() &&
+                (int)locked1DSource[line].size() >= width)
+            {
+                double *dst = clpbuffer[0].pixel[line];
+                const auto &src = locked1DSource[line];
+                for (int xi = 0; xi < width; ++xi)
+                    dst[left + xi] = src[xi];
+            }
         }
     }
 
@@ -1001,6 +1026,272 @@ void Comb::FrameBuffer::filterIQLocked()
     }
 }
 
+// ---------------------------------------------------------------------------
+// produceY helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Ownership alpha blend given pre-computed per-pixel scalars.
+// Returns the effective alpha (0 = full chroma subtraction, 1 = no subtraction
+// modified by ownership and saturation guards).
+double computeOwnershipAlpha(
+    const lddecode::CombOwnershipAssessment &a,
+    double alphaVet,
+    double lumaIRE,
+    double chromaIRE,
+    double ownershipWeight,
+    double ownershipChromaWeight,
+    double brightStartIRE, double brightFullIRE,
+    double satStartIRE,    double satFullIRE)
+{
+    const double lc = std::clamp(a.lumaClaim,    0.0, 1.0);
+    const double cc = std::clamp(a.chromaClaim,  0.0, 1.0);
+    const double uc = std::clamp(a.uncertainClaim, 0.0, 1.0);
+
+    const double chromaFrac = std::clamp(
+        1.0 - lc + ownershipChromaWeight * cc, 0.0, 1.0);
+
+    const double brightT = std::clamp(
+        (lumaIRE - brightStartIRE) /
+        std::max(1e-9, brightFullIRE - brightStartIRE),
+        0.0, 1.0);
+
+    const double satT = std::clamp(
+        (chromaIRE - satStartIRE) /
+        std::max(1e-9, satFullIRE - satStartIRE),
+        0.0, 1.0);
+
+    // Strong chroma or explicit chroma ownership should block luma-ownership
+    // from reducing residual chroma subtraction. This is especially important
+    // for saturated blue, where lumaIRE may not trip the brightness ramp.
+    const double chromaBlock = std::clamp(cc + 0.65 * satT, 0.0, 1.0);
+    const double support = lc * (1.0 - chromaBlock) * (1.0 - 0.5 * uc);
+
+    // Saturated color is already a warning that carrier-band energy is probably
+    // chroma-owned; do not require high luma for ownership reassignment to bow out.
+    const double ownershipProtect = std::clamp(
+        std::max(satT, brightT * satT), 0.0, 1.0);
+
+    const double blend = std::clamp(
+        ownershipWeight * support * (1.0 - ownershipProtect), 0.0, 1.0);
+
+    return alphaVet * (1.0 - blend) + chromaFrac * blend;
+}
+
+} // namespace
+
+void Comb::FrameBuffer::ensureProduceYScratch(int width)
+{
+    if ((int)scratch_frameBCenter.size() < width) scratch_frameBCenter.resize(width, 0.0);
+    if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
+    if ((int)scratch_comp_res.size()     < width) scratch_comp_res.resize(width, 0.0);
+    if ((int)scratch_fieldGate.size()    < width) scratch_fieldGate.resize(width, 1.0);
+    if ((int)scratch_fieldLine.size()    < width) scratch_fieldLine.resize(width, 0.0);
+    if ((int)scratch_fieldBLine.size()   < width) scratch_fieldBLine.resize(width, 0.0);
+    if ((int)scratch_lateralLine.size()  < width) scratch_lateralLine.resize(width, 0.0);
+    if ((int)scratch_yhp.size()          < width) scratch_yhp.resize(width, 0.0);
+    if ((int)scratch_yI.size()           < width) scratch_yI.resize(width, 0.0);
+    if ((int)scratch_yQ.size()           < width) scratch_yQ.resize(width, 0.0);
+    if ((int)scratch_hpI.size()          < width) scratch_hpI.resize(width, 0.0);
+    if ((int)scratch_hpQ.size()          < width) scratch_hpQ.resize(width, 0.0);
+    if ((int)scratch_hpY.size()          < width) scratch_hpY.resize(width, 0.0);
+    if ((int)scratch_outMixed.size()     < width) scratch_outMixed.resize(width, 0.0);
+    if ((int)scratch_filter_temp.size()  < width) scratch_filter_temp.resize(width, 0.0);
+    if ((int)scratch_lumaBaseY4.size()   < width) scratch_lumaBaseY4.resize(width, 0.0);
+}
+
+// Windowed affine solve for one scan line.
+//
+// Reads tiRow/tqRow (BurstLockedSigned IQ from phaseLocked) and hiRaw
+// (raw − baseY4).  Accumulates per-pixel moment matrices (STT, SRT),
+// slides a WIN-wide window across them, inverts STT, polar-decomposes the
+// affine, vets phase/rho/shear, clamps rotation/gain/shear, remods cHat.
+//
+// Outputs written to member scratch buffers:
+//   scratch_fieldGate   → cHat  (remodulated coherent carrier estimate)
+//   scratch_fieldLine   → tiAdjLocked (IQ after affine, in locked space)
+//   scratch_fieldBLine  → tqAdjLocked
+//   scratch_lateralLine → vetConf (VET confidence [0,1])
+void Comb::FrameBuffer::buildCoherentCarrierRow(
+    const float *tiRow, const float *tqRow,
+    const double *hiRaw,
+    int left, int width,
+    double bcos, double bsin,
+    int WIN, int HALF,
+    double invI)
+{
+    const auto &T = configuration.tunables;
+
+    constexpr double MIN_FIT_IRE = 2.0;
+    constexpr double MAX_FIT_IRE = 35.0;
+    constexpr double SAT_TROUBLE_IRE = 18.0;
+
+    double *cHat        = scratch_fieldGate.data();
+    double *tiAdjLocked = scratch_fieldLine.data();
+    double *tqAdjLocked = scratch_fieldBLine.data();
+    double *vetConf     = scratch_lateralLine.data();
+
+    double *cSTT00 = scratch_yhp.data();
+    double *cSTT01 = scratch_yI.data();
+    double *cSTT11 = scratch_yQ.data();
+    double *cSRT00 = scratch_hpI.data();
+    double *cSRT01 = scratch_hpQ.data();
+    double *cSRT10 = scratch_hpY.data();
+    double *cSRT11 = scratch_outMixed.data();
+    double *cN     = scratch_filter_temp.data();
+
+    // Pass 1: accumulate per-pixel moment matrices
+    for (int x = 0; x < width; ++x) {
+        const int h = left + x;
+
+        double ti = 0.0, tq = 0.0;
+        lockedTo4fsc((double)tiRow[x], (double)tqRow[x], bcos, bsin, ti, tq);
+
+        double ri = 0.0, rq = 0.0;
+        demod4fscFromComposite(hiRaw[x], h, ri, rq);
+
+        tiAdjLocked[x] = ti;
+        tqAdjLocked[x] = tq;
+
+        const double magT_ire = std::hypot(ti, tq) * invI;
+        const double magR_ire = std::hypot(ri, rq) * invI;
+
+        if (magT_ire < MIN_FIT_IRE || magR_ire < MIN_FIT_IRE) {
+            cSTT00[x] = cSTT01[x] = cSTT11[x] = 0.0;
+            cSRT00[x] = cSRT01[x] = cSRT10[x] = cSRT11[x] = 0.0;
+            cN[x] = 0.0;
+            continue;
+        }
+
+        double w = 1.0;
+        if (magT_ire > MAX_FIT_IRE) {
+            const double t = (magT_ire - MAX_FIT_IRE) / (MAX_FIT_IRE + 1e-9);
+            w = 1.0 / (1.0 + 4.0 * t * t);
+        }
+
+        cSTT00[x] = w * ti * ti;
+        cSTT01[x] = w * ti * tq;
+        cSTT11[x] = w * tq * tq;
+        cSRT00[x] = w * ri * ti;
+        cSRT01[x] = w * ri * tq;
+        cSRT10[x] = w * rq * ti;
+        cSRT11[x] = w * rq * tq;
+        cN[x] = 1.0;
+    }
+
+    // Pass 2: sliding-window affine solve + VET + remod
+    const int winN = (width <= WIN) ? width : WIN;
+
+    double sSTT00 = 0.0, sSTT01 = 0.0, sSTT11 = 0.0;
+    double sSRT00 = 0.0, sSRT01 = 0.0, sSRT10 = 0.0, sSRT11 = 0.0;
+    double sN = 0.0;
+
+    for (int i = 0; i < winN; ++i) {
+        sSTT00 += cSTT00[i]; sSTT01 += cSTT01[i]; sSTT11 += cSTT11[i];
+        sSRT00 += cSRT00[i]; sSRT01 += cSRT01[i];
+        sSRT10 += cSRT10[i]; sSRT11 += cSRT11[i];
+        sN += cN[i];
+    }
+
+    for (int x = 0; x < width; ++x) {
+        const int h = left + x;
+
+        if (width > WIN && x > HALF && x <= width - HALF) {
+            const int rem = x - HALF - 1;
+            const int add = x + HALF - 1;
+            sSTT00 += cSTT00[add] - cSTT00[rem];
+            sSTT01 += cSTT01[add] - cSTT01[rem];
+            sSTT11 += cSTT11[add] - cSTT11[rem];
+            sSRT00 += cSRT00[add] - cSRT00[rem];
+            sSRT01 += cSRT01[add] - cSRT01[rem];
+            sSRT10 += cSRT10[add] - cSRT10[rem];
+            sSRT11 += cSRT11[add] - cSRT11[rem];
+            sN += cN[add] - cN[rem];
+        }
+
+        double STT[2][2] = {{sSTT00, sSTT01}, {sSTT01, sSTT11}};
+        double SRT[2][2] = {{sSRT00, sSRT01}, {sSRT10, sSRT11}};
+        const int n = (int)(sN + 0.5);
+
+        double STTinv[2][2];
+        const bool invOk = mat2_inv(STT, STTinv);
+
+        double RmVet[2][2] = {{1, 0}, {0, 1}};
+        double UVet[2][2]  = {{1, 0}, {0, 1}};
+        bool vetAccept = invOk && n >= 8;
+        double vetConfidence = 0.0;
+
+        if (vetAccept) {
+            double Avet[2][2];
+            mat2_mul(SRT, STTinv, Avet);
+            polar_decompose_2x2(Avet, RmVet, UVet);
+
+            const double phase = std::atan2(RmVet[1][0], RmVet[0][0]);
+
+            double l1 = 1.0, l2 = 1.0;
+            double V_[2][2];
+            eig2_sym(UVet, l1, l2, V_);
+
+            const double g = 0.5 * (std::max(0.0, l1) + std::max(0.0, l2));
+            const double shear = (g > 1e-12)
+                ? std::fabs(std::max(0.0, l1) - std::max(0.0, l2)) / g : 0.0;
+
+            const double numRho = std::sqrt(
+                SRT[0][0]*SRT[0][0] + SRT[0][1]*SRT[0][1] +
+                SRT[1][0]*SRT[1][0] + SRT[1][1]*SRT[1][1]);
+            const double rho = numRho / std::max(1e-9, STT[0][0] + STT[1][1]);
+
+            const double pMaxVet = T.VET_ALIGN_PHASE_MAX_DEG * M_PI / 180.0;
+            vetAccept = std::fabs(phase) <= pMaxVet &&
+                        rho >= T.VET_ALIGN_MIN_RHO &&
+                        shear <= T.VET_ALIGN_MAX_SHEAR;
+
+            const double c_phase =
+                1.0 - std::min(1.0, std::fabs(phase) / (pMaxVet + 1e-12));
+            const double c_shear =
+                1.0 - std::min(1.0, shear / (T.VET_ALIGN_MAX_SHEAR + 1e-12));
+            double c = 0.5  * std::max(0.0, std::min(1.0, rho)) +
+                       0.25 * c_phase + 0.25 * c_shear;
+            vetConfidence = vetAccept ? std::clamp(c, 0.0, 1.0) : 0.0;
+        }
+
+        double Rm[2][2] = {{1, 0}, {0, 1}};
+        double U[2][2]  = {{1, 0}, {0, 1}};
+        if (T.Y_LOCAL_AFFINE_ENABLE && n >= 16 && invOk && vetAccept) {
+            Rm[0][0] = RmVet[0][0]; Rm[0][1] = RmVet[0][1];
+            Rm[1][0] = RmVet[1][0]; Rm[1][1] = RmVet[1][1];
+            U[0][0]  = UVet[0][0];  U[0][1]  = UVet[0][1];
+            U[1][0]  = UVet[1][0];  U[1][1]  = UVet[1][1];
+        }
+
+        const double ti0 = tiAdjLocked[x];
+        const double tq0 = tqAdjLocked[x];
+        const bool satTrouble = (std::hypot(ti0, tq0) * invI > SAT_TROUBLE_IRE);
+
+        clamp_rotation_gain_shear(Rm, U,
+            T.Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0,
+            /*allowGain=*/!satTrouble,
+            T.Y_LOCAL_GAIN_MIN, T.Y_LOCAL_GAIN_MAX,
+            satTrouble ? 0.0 : T.Y_LOCAL_MAX_SHEAR);
+
+        const double ti_adj = Rm[0][0] * ti0 + Rm[0][1] * tq0;
+        const double tq_adj = Rm[1][0] * ti0 + Rm[1][1] * tq0;
+
+        // Use the shifted basis to round-trip the same ε offset used by the
+        // locked demod (spLUT_locked built with CAL_EPS_SAMPLES). Plain
+        // remod4fscToCompositePhase leaves a carrier-shaped residual in Y
+        // because the demod/remod bases don't cancel.
+        cHat[x]    = remod4fscToShiftedComposite(ti_adj, tq_adj, h, spLUT_locked, cpLUT_locked);
+        vetConf[x] = vetConfidence;
+
+        double ti_locked_adj = 0.0, tq_locked_adj = 0.0;
+        fourfscToLocked(ti_adj, tq_adj, bcos, bsin, ti_locked_adj, tq_locked_adj);
+        tiAdjLocked[x] = ti_locked_adj;
+        tqAdjLocked[x] = tq_locked_adj;
+    }
+}
+
 void Comb::FrameBuffer::produceY()
 {
     if (!configuration.phaseCompensation) return;
@@ -1021,10 +1312,6 @@ void Comb::FrameBuffer::produceY()
     const int WIN  = std::max(4, (T.VET_ALIGN_WIN_SAMPLES / 4) * 4);
     const int HALF = WIN / 2;
 
-    const double MIN_FIT_IRE      = 2.0;
-    const double MAX_FIT_IRE      = 35.0;
-    const double SAT_TROUBLE_IRE  = 18.0;
-
     const double MIN_ALPHA = 0.75;
     const double MAX_ALPHA = 1.25;
     const double MIN_SUB_CHROMA_IRE = 2.0;
@@ -1035,24 +1322,7 @@ void Comb::FrameBuffer::produceY()
     const bool do3D =
         (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
 
-    if ((int)scratch_frameBCenter.size() < width) scratch_frameBCenter.resize(width, 0.0);
-    if ((int)scratch_fieldBCenter.size() < width) scratch_fieldBCenter.resize(width, 0.0);
-    if ((int)scratch_comp_res.size() < width) scratch_comp_res.resize(width, 0.0);
-
-    if ((int)scratch_fieldGate.size() < width) scratch_fieldGate.resize(width, 1.0);
-    if ((int)scratch_fieldLine.size() < width) scratch_fieldLine.resize(width, 0.0);
-    if ((int)scratch_fieldBLine.size() < width) scratch_fieldBLine.resize(width, 0.0);
-    if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
-
-    if ((int)scratch_yhp.size() < width) scratch_yhp.resize(width, 0.0);
-    if ((int)scratch_yI.size() < width) scratch_yI.resize(width, 0.0);
-    if ((int)scratch_yQ.size() < width) scratch_yQ.resize(width, 0.0);
-    if ((int)scratch_hpI.size() < width) scratch_hpI.resize(width, 0.0);
-    if ((int)scratch_hpQ.size() < width) scratch_hpQ.resize(width, 0.0);
-    if ((int)scratch_hpY.size() < width) scratch_hpY.resize(width, 0.0);
-    if ((int)scratch_outMixed.size() < width) scratch_outMixed.resize(width, 0.0);
-    if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.resize(width, 0.0);
-    if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
+    ensureProduceYScratch(width);
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
@@ -1078,12 +1348,10 @@ void Comb::FrameBuffer::produceY()
             continue;
         }
 
-        const float *tiRow = demodTI_line(line);
-        const float *tqRow = demodTQ_line(line);
         float *prodIRow = lockedProductI_line(line);
         float *prodQRow = lockedProductQ_line(line);
 
-        if (!tiRow || !tqRow || !prodIRow || !prodQRow) {
+        if (!prodIRow || !prodQRow) {
             for (int h = left; h < right; ++h) {
                 Y[h] = (double)rawLine[h] - clpLine[h];
             }
@@ -1093,6 +1361,16 @@ void Comb::FrameBuffer::produceY()
                           w2d_frame_weight[line].end(), 0.0f);
             }
             continue;
+        }
+
+        double lutTi[4], lutTq[4];
+        if (grammarLocked) {
+            for (int i = 0; i < 4; ++i) {
+                lutTi[i] = (double)grammar->demodLUTTi[i];
+                lutTq[i] = (double)grammar->demodLUTTq[i];
+            }
+        } else {
+            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
         }
 
         double *baseY4 = scratch_frameBCenter.data();
@@ -1130,246 +1408,38 @@ void Comb::FrameBuffer::produceY()
             hiRaw
         };
 
-        std::copy(hiRaw, hiRaw + width, scratch_comp_res.begin());
-
         double *cHat        = scratch_fieldGate.data();
         double *tiAdjLocked = scratch_fieldLine.data();
         double *tqAdjLocked = scratch_fieldBLine.data();
         double *vetConf     = scratch_lateralLine.data();
 
-        double *cSTT00 = scratch_yhp.data();
-        double *cSTT01 = scratch_yI.data();
-        double *cSTT11 = scratch_yQ.data();
-        double *cSRT00 = scratch_hpI.data();
-        double *cSRT01 = scratch_hpQ.data();
-        double *cSRT10 = scratch_hpY.data();
-        double *cSRT11 = scratch_outMixed.data();
-        double *cN     = scratch_filter_temp.data();
+        // Carrier estimate comes from the dimensionally-appropriate source.
+        // For 1D the elected buffer is locked1DSource, which has no inter-line
+        // cancellation: luma-near-fsc rides on it and subtracting it from raw
+        // pulls a phase-alternating error into Y (the alien-chroma checkerboard).
+        // combedCarrier from buildCarrierRetracted is the LS carrier fit after
+        // line-to-line cancellation — real chroma is preserved, alien-Y is
+        // zeroed. 2D/3D paths already carry cancellation in their own comb
+        // election, so clpLine stays correct there.
+        const float *combedCarrierRow = (srcBuf == 0 && carrierRetractedValid)
+            ? combedCarrier_line(line) : nullptr;
 
         for (int x = 0; x < width; ++x) {
             const int h = left + x;
-
-            const double tiLocked0 = (double)tiRow[x];
-            const double tqLocked0 = (double)tqRow[x];
-
-            double ti = 0.0;
-            double tq = 0.0;
-            lockedTo4fsc(tiLocked0, tqLocked0, bcos, bsin, ti, tq);
-
-            double ri = 0.0;
-            double rq = 0.0;
-            demod4fscFromComposite(hiRaw[x], h, ri, rq);
-
-            tiAdjLocked[x] = ti;
-            tqAdjLocked[x] = tq;
-
-            const double residualWorking = sourceToWorkingSample(highRawY, x);
-            const double magT_ire = std::hypot(ti, tq) * invI;
-            const double magR_ire = std::hypot(ri, rq) * invI;
-
-            if (magT_ire < MIN_FIT_IRE || magR_ire < MIN_FIT_IRE) {
-                cSTT00[x] = 0.0;
-                cSTT01[x] = 0.0;
-                cSTT11[x] = 0.0;
-                cSRT00[x] = 0.0;
-                cSRT01[x] = 0.0;
-                cSRT10[x] = 0.0;
-                cSRT11[x] = 0.0;
-                cN[x] = 0.0;
-                continue;
-            }
-
-            double w = 1.0;
-            if (magT_ire > MAX_FIT_IRE) {
-                const double t = (magT_ire - MAX_FIT_IRE) / (MAX_FIT_IRE + 1e-9);
-                w = 1.0 / (1.0 + 4.0 * t * t);
-            }
-
-            cSTT00[x] = w * ti * ti;
-            cSTT01[x] = w * ti * tq;
-            cSTT11[x] = w * tq * tq;
-
-            cSRT00[x] = w * ri * ti;
-            cSRT01[x] = w * ri * tq;
-            cSRT10[x] = w * rq * ti;
-            cSRT11[x] = w * rq * tq;
-
-            cN[x] = 1.0;
-        }
-
-        const int winN = (width <= WIN) ? width : WIN;
-
-        double sSTT00 = 0.0;
-        double sSTT01 = 0.0;
-        double sSTT11 = 0.0;
-        double sSRT00 = 0.0;
-        double sSRT01 = 0.0;
-        double sSRT10 = 0.0;
-        double sSRT11 = 0.0;
-        double sN = 0.0;
-
-        for (int i = 0; i < winN; ++i) {
-            sSTT00 += cSTT00[i];
-            sSTT01 += cSTT01[i];
-            sSTT11 += cSTT11[i];
-
-            sSRT00 += cSRT00[i];
-            sSRT01 += cSRT01[i];
-            sSRT10 += cSRT10[i];
-            sSRT11 += cSRT11[i];
-
-            sN += cN[i];
-        }
-
-        for (int x = 0; x < width; ++x) {
-            const int h = left + x;
-
-            if (width > WIN) {
-                if (x > HALF && x <= width - HALF) {
-                    const int removeIdx = x - HALF - 1;
-                    const int addIdx    = x + HALF - 1;
-
-                    sSTT00 += cSTT00[addIdx] - cSTT00[removeIdx];
-                    sSTT01 += cSTT01[addIdx] - cSTT01[removeIdx];
-                    sSTT11 += cSTT11[addIdx] - cSTT11[removeIdx];
-
-                    sSRT00 += cSRT00[addIdx] - cSRT00[removeIdx];
-                    sSRT01 += cSRT01[addIdx] - cSRT01[removeIdx];
-                    sSRT10 += cSRT10[addIdx] - cSRT10[removeIdx];
-                    sSRT11 += cSRT11[addIdx] - cSRT11[removeIdx];
-
-                    sN += cN[addIdx] - cN[removeIdx];
-                }
-            }
-
-            double STT[2][2] = {
-                {sSTT00, sSTT01},
-                {sSTT01, sSTT11}
-            };
-
-            double SRT[2][2] = {
-                {sSRT00, sSRT01},
-                {sSRT10, sSRT11}
-            };
-
-            const int n = (int)(sN + 0.5);
-
-            Vet1DResult vet;
-            vet.accept = true;
-            vet.confidence = 1.0;
-            vet.composite_bandpass = sourceToWorkingSample(highRawY, x);
-
-            double STTinv[2][2];
-            const bool invOk = mat2_inv(STT, STTinv);
-
-            double RmVet[2][2] = {{1, 0}, {0, 1}};
-            double UVet[2][2]  = {{1, 0}, {0, 1}};
-
-            if (!invOk || n < 8) {
-                vet.accept = false;
-                vet.confidence = 0.0;
-            } else {
-                double Avet[2][2];
-                mat2_mul(SRT, STTinv, Avet);
-                polar_decompose_2x2(Avet, RmVet, UVet);
-
-                const double phase = std::atan2(RmVet[1][0], RmVet[0][0]);
-
-                double l1 = 1.0;
-                double l2 = 1.0;
-                double V_[2][2];
-                eig2_sym(UVet, l1, l2, V_);
-
-                const double s1 = std::max(0.0, l1);
-                const double s2 = std::max(0.0, l2);
-                const double g  = 0.5 * (s1 + s2);
-                const double shear = (g > 1e-12) ? std::fabs(s1 - s2) / g : 0.0;
-
-                const double srt00 = SRT[0][0];
-                const double srt01 = SRT[0][1];
-                const double srt10 = SRT[1][0];
-                const double srt11 = SRT[1][1];
-
-                const double numRho = std::sqrt(
-                    srt00 * srt00 + srt01 * srt01 +
-                    srt10 * srt10 + srt11 * srt11);
-
-                const double denRho = std::max(1e-9, STT[0][0] + STT[1][1]);
-                const double rho = numRho / denRho;
-
-                const double pMaxVet = T.VET_ALIGN_PHASE_MAX_DEG * M_PI / 180.0;
-
-                if (std::fabs(phase) > pMaxVet ||
-                    rho < T.VET_ALIGN_MIN_RHO ||
-                    shear > T.VET_ALIGN_MAX_SHEAR)
-                {
-                    vet.accept = false;
-                }
-
-                const double c_phase =
-                    1.0 - std::min(1.0, std::fabs(phase) / (pMaxVet + 1e-12));
-                const double c_shear =
-                    1.0 - std::min(1.0, shear / (T.VET_ALIGN_MAX_SHEAR + 1e-12));
-
-                double c =
-                    0.5  * std::max(0.0, std::min(1.0, rho)) +
-                    0.25 * c_phase +
-                    0.25 * c_shear;
-
-                c = std::clamp(c, 0.0, 1.0);
-                vet.confidence = vet.accept ? c : 0.0;
-            }
-
-            double Rm[2][2] = {{1, 0}, {0, 1}};
-            double U[2][2]  = {{1, 0}, {0, 1}};
-
-            if (T.Y_LOCAL_AFFINE_ENABLE && n >= 16 && invOk && vet.accept) {
-                Rm[0][0] = RmVet[0][0]; Rm[0][1] = RmVet[0][1];
-                Rm[1][0] = RmVet[1][0]; Rm[1][1] = RmVet[1][1];
-
-                U[0][0] = UVet[0][0]; U[0][1] = UVet[0][1];
-                U[1][0] = UVet[1][0]; U[1][1] = UVet[1][1];
-            }
-
-            const double ti0 = tiAdjLocked[x];
-            const double tq0 = tqAdjLocked[x];
-
-            const double magX_ire = std::hypot(ti0, tq0) * invI;
-            const bool satTrouble = (magX_ire > SAT_TROUBLE_IRE);
-
-            const double pMax = T.Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0;
-            clamp_rotation_gain_shear(Rm, U, pMax,
-                                      /*allowGain=*/!satTrouble,
-                                      T.Y_LOCAL_GAIN_MIN,
-                                      T.Y_LOCAL_GAIN_MAX,
-                                      satTrouble ? 0.0 : T.Y_LOCAL_MAX_SHEAR);
-
-            const double ti_adj_4fsc = Rm[0][0] * ti0 + Rm[0][1] * tq0;
-            const double tq_adj_4fsc = Rm[1][0] * ti0 + Rm[1][1] * tq0;
-
-            // Use the shifted basis to round-trip the same ε offset used by the
-            // locked demod (spLUT_locked built with CAL_EPS_SAMPLES). Plain
-            // remod4fscToCompositePhase leaves a carrier-shaped residual in Y
-            // because the demod/remod bases don't cancel.
-            cHat[x] = remod4fscToShiftedComposite(ti_adj_4fsc, tq_adj_4fsc, h, spLUT_locked, cpLUT_locked);
-            vetConf[x] = vet.confidence;
-
-            double ti_locked_adj = 0.0;
-            double tq_locked_adj = 0.0;
-            fourfscToLocked(ti_adj_4fsc, tq_adj_4fsc,
-                            bcos, bsin,
-                            ti_locked_adj, tq_locked_adj);
-
-            tiAdjLocked[x] = ti_locked_adj;
-            tqAdjLocked[x] = tq_locked_adj;
+            const int ph = carrierSampleClass(line, h);
+            const double carrier = combedCarrierRow
+                ? (double)combedCarrierRow[x]
+                : clpLine[h];
+            cHat[x]        = carrier;
+            tiAdjLocked[x] = carrier * lutTi[ph];
+            tqAdjLocked[x] = carrier * lutTq[ph];
+            vetConf[x]     = 1.0;
         }
 
         YSourceView coherentCombY {
             "coherentCombY",
-            YSourceNativeSpace::LockedIQ,
-            // Born in burst-locked IQ, then affine-aligned onto the common 4fsc
-            // table before being remodulated back onto the grammar sample phase.
-            YSourceHomeOrientation::BurstLockedIQ,
+            YSourceNativeSpace::BandpassComb,
+            YSourceHomeOrientation::GrammarComposite,
             cHat
         };
 
@@ -1385,66 +1455,15 @@ void Comb::FrameBuffer::produceY()
         const double ownershipWeight = T.VET_OWNERSHIP_LUMA_WEIGHT;
         const double ownershipChromaWeight = T.VET_OWNERSHIP_CHROMA_WEIGHT;
 
-auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
-    const OwnershipAssessment &a = ownRow[x].assessment;
-    const double lc = std::clamp(a.lumaClaim, 0.0, 1.0);
-    const double cc = std::clamp(a.chromaClaim, 0.0, 1.0);
-    const double uc = std::clamp(a.uncertainClaim, 0.0, 1.0);
-
-    const double chromaFrac = std::clamp(
-        1.0 - lc + (ownershipChromaWeight * cc),
-        0.0, 1.0);
-
-    const double lumaIRE =
-        ((baseY4[x] - videoParameters.black16bIre) * invI);
-
-    const double chromaIRE =
-        std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI;
-
-    const double brightT = std::clamp(
-        (lumaIRE - T.VET_OWNERSHIP_BRIGHT_START_IRE) /
-        std::max(1e-9,
-                 T.VET_OWNERSHIP_BRIGHT_FULL_IRE -
-                 T.VET_OWNERSHIP_BRIGHT_START_IRE),
-        0.0,
-        1.0);
-
-    const double satT = std::clamp(
-        (chromaIRE - T.VET_OWNERSHIP_SAT_START_IRE) /
-        std::max(1e-9,
-                 T.VET_OWNERSHIP_SAT_FULL_IRE -
-                 T.VET_OWNERSHIP_SAT_START_IRE),
-        0.0,
-        1.0);
-
-    // Strong chroma or explicit chroma ownership should block luma-ownership
-    // from reducing residual chroma subtraction. This is especially important
-    // for saturated blue, where lumaIRE may not trip the brightness ramp.
-    const double chromaBlock = std::clamp(
-        cc + 0.65 * satT,
-        0.0,
-        1.0);
-
-    const double support =
-        lc * (1.0 - chromaBlock) * (1.0 - 0.5 * uc);
-
-    // Saturated color is already a warning that carrier-band energy is probably
-    // chroma-owned; do not require high luma for ownership reassignment to bow out.
-    const double satProtect = satT;
-    const double brightSatProtect = brightT * satT;
-
-    const double ownershipProtect = std::clamp(
-        std::max(satProtect, brightSatProtect),
-        0.0,
-        1.0);
-
-    const double blend = std::clamp(
-        ownershipWeight * support * (1.0 - ownershipProtect),
-        0.0,
-        1.0);
-
-    return alphaVet * (1.0 - blend) + chromaFrac * blend;
-};
+        auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
+            return computeOwnershipAlpha(
+                ownRow[x].assessment, alphaVet,
+                (baseY4[x] - videoParameters.black16bIre) * invI,
+                std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI,
+                ownershipWeight, ownershipChromaWeight,
+                T.VET_OWNERSHIP_BRIGHT_START_IRE, T.VET_OWNERSHIP_BRIGHT_FULL_IRE,
+                T.VET_OWNERSHIP_SAT_START_IRE,    T.VET_OWNERSHIP_SAT_FULL_IRE);
+        };
 
         auto writePixelNoOwnership = [&](int x, double alphaEff) {
             const int h = left + x;

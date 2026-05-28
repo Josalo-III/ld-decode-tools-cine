@@ -372,6 +372,14 @@ public:
 
 	void adjustY();         // Bucket path
 	void produceY();        // Product path
+	void ensureProduceYScratch(int width);
+	void buildCoherentCarrierRow(
+		const float *tiRow, const float *tqRow,
+		const double *hiRaw,
+		int left, int width,
+		double bcos, double bsin,
+		int WIN, int HALF,
+		double invI);
 	// Build the carrier-retracted view and derived products:
 	//   carrierFit_flat       — per-line LS carrier model
 	//   carrierRetracted_flat — raw minus carrier fit (flattened)
