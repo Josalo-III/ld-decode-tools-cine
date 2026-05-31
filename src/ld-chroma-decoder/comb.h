@@ -30,7 +30,8 @@
 #include <vector>
 
 #include "lddecodemetadata.h"
-#include "compositeownershipdefs.h"
+#include "attributiondefs.h"
+#include "carriergrammar.h"
 #include "combmath.h"
 #include "componentframe.h"
 #include "decoder.h"
@@ -276,24 +277,24 @@ public:
             // using 4fsc chroma/luma profile agreement as a bounded correction signal.
             double VET_Y_CHROMA_LIKE_WEIGHT = 0.12; // weight of chroma-profile match on the subtraction alpha
 
-            // Ownership-informed Y reassignment: returns bandpassed energy to Y when
-            // ownership evidence says it is luma-owned rather than chroma-owned.
-            bool   VET_OWNERSHIP_ENABLE            = true;
-            double VET_OWNERSHIP_LUMA_WEIGHT       = 0.75; // blend strength for lumaClaim → Y reassignment (0=off, 1=full)
-            double VET_OWNERSHIP_CHROMA_WEIGHT     = 0.75; // blend strength for chromaClaim → chroma retention
-            double VET_OWNERSHIP_CONFLICT_SUPPRESS = 0.65; // attenuate ownership adjustment when luma and chroma claims both high
-            double VET_OWNERSHIP_BRIGHT_START_IRE  = 55.0; // begin bowing out of ownership reassignment above this luma level
-            double VET_OWNERSHIP_BRIGHT_FULL_IRE   = 80.0; // fully disable ownership reassignment by this luma level
-            double VET_OWNERSHIP_SAT_START_IRE     = 8.0; // begin bowing out when local chroma reaches this amplitude
-            double VET_OWNERSHIP_SAT_FULL_IRE      = 20.0; // fully disable ownership reassignment by this chroma amplitude
+            // Attribution-informed Y reassignment: returns bandpassed energy to Y when
+            // attribution evidence says it is luma-owned rather than chroma-owned.
+            bool   VET_ATTRIBUTION_ENABLE            = true;
+            double VET_ATTRIBUTION_LUMA_WEIGHT       = 0.75; // blend strength for lumaClaim -> Y reassignment (0=off, 1=full)
+            double VET_ATTRIBUTION_CHROMA_WEIGHT     = 0.75; // blend strength for chromaClaim -> chroma retention
+            double VET_ATTRIBUTION_CONFLICT_SUPPRESS = 0.65; // attenuate attribution adjustment when luma and chroma claims both high
+            double VET_ATTRIBUTION_BRIGHT_START_IRE  = 55.0; // begin bowing out of attribution reassignment above this luma level
+            double VET_ATTRIBUTION_BRIGHT_FULL_IRE   = 80.0; // fully disable attribution reassignment by this luma level
+            double VET_ATTRIBUTION_SAT_START_IRE     = 8.0; // begin bowing out when local chroma reaches this amplitude
+            double VET_ATTRIBUTION_SAT_FULL_IRE      = 20.0; // fully disable attribution reassignment by this chroma amplitude
 
-            // FVF ownership: ownership evidence adjusts field vs frame penalty before election.
-            double FVF_OWNERSHIP_LUMA_WEIGHT   = 0.14; // lumaClaim → added to frame scores (field is safer when luma-owned)
-            double FVF_OWNERSHIP_CHROMA_WEIGHT = 0.18; // chromaClaim → added to field scores (frame is safer when chroma coherent)
+            // FVF attribution: attribution evidence adjusts field vs frame penalty before election.
+            double FVF_ATTRIBUTION_LUMA_WEIGHT   = 0.14; // lumaClaim -> added to frame scores (field is safer when luma-owned)
+            double FVF_ATTRIBUTION_CHROMA_WEIGHT = 0.18; // chromaClaim -> added to field scores (frame is safer when chroma coherent)
 
-            // Locked-1D ownership damp: scales locked-1D IQ down when early luma-ownership
+            // Locked-1D attribution damp: scales locked-1D IQ down when early luma attribution
             // evidence is strong, before tiRow/tqRow and downstream consumers receive it.
-            double LOCKED1D_OWNERSHIP_DAMP_WEIGHT = 0.25; // damp strength (0=off, 1=full suppression at lumaClaim=1)
+            double LOCKED1D_ATTRIBUTION_DAMP_WEIGHT = 0.25; // damp strength (0=off, 1=full suppression at lumaClaim=1)
 
             // Iceberg recovery: compensates for smooth-luma cancellation underestimating
             // alien-Y amplitude at directional edges in buildPhaseCorrected1D.
@@ -368,13 +369,13 @@ public:
 		int winner = 1;
 	};
 
-	// Signal ownership evidence, collected before election. This is not a
+	// Signal attribution evidence, collected before election. This is not a
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
-	using OwnershipEvidence = lddecode::CombOwnershipEvidence;
-	using OwnershipFacts = lddecode::CombOwnershipFacts;
-	using OwnershipAssessment = lddecode::CombOwnershipAssessment;
-	using OwnershipRules = lddecode::OwnershipRules;
+	using AttributionEvidence = lddecode::CombAttributionEvidence;
+	using AttributionFacts = lddecode::CombAttributionFacts;
+	using AttributionAssessment = lddecode::CombAttributionAssessment;
+	using AttributionRules = lddecode::AttributionRules;
 
 	FrameBuffer(const LdDecodeMetaData::VideoParameters &videoParameters_,
 				const Configuration &configuration_);
@@ -423,7 +424,7 @@ public:
 					const FrameBuffer &nextFrame);
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
-	const std::vector<std::vector<OwnershipEvidence>> &getOwnershipEvidence() const { return ownershipEvidence; }
+	const std::vector<std::vector<AttributionEvidence>> &getAttributionEvidence() const { return attributionEvidence; }
 
 	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
 	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
@@ -451,46 +452,8 @@ private:
 	SourceVideo::Data rawbuffer;
 	qint32 firstFieldPhaseID  = 0;
 	qint32 secondFieldPhaseID = 0;
-	struct LineAffine {
-		double R[2][2];  // rotation+gain (phase-clamped)
-		bool   valid;
-	};
-	struct CombCarrierGrammar {
-		double burstCos = 1.0;
-		double burstSin = 0.0;
-		double carrierScale = 0.0;     // IRE burst magnitude before normalization/flooring
-		double phaseError = 0.0;       // measured carrier-phase error, radians
-		double phaseConfidence = 0.0;  // 0..1 confidence from burst magnitude
-		int    fieldPhaseId = 0;       // 1..4 from metadata
-		int    lineParity = 0;         // frame-line parity
-		int    fieldLine = 0;          // line / 2 in the interleaved frame
-		int    lineFlip = 1;           // +1 or -1 subcarrier polarity for this line
-		int    samplePhase0 = 0;       // h&3 origin for this line's carrier grid
-		bool   frameVerticalAllowed = false;
-		bool   grammarLocked = false;
-
-		// Schedule conflict diagnostics (filled in loadFields; may be
-		// refined by phaseLocked if burst measurement diverges from metadata).
-		//
-		// lineFlipAuthority records the source of lineFlip above.
-		// rigidScheduleLineFlip stores the rigid-schedule derivation for
-		// diagnostic comparison.  phaseScheduleConflict is non-zero when
-		// they disagree.  Downstream code must not "fix" lineFlip by
-		// substituting rigidScheduleLineFlip.
-		lddecode::CarrierPhaseAuthority lineFlipAuthority = lddecode::CarrierPhaseAuthority::Metadata;
-		int    rigidScheduleLineFlip = +1;
-		double phaseScheduleConflict = 0.0;  // 0 = agreement, 1 = full conflict
-
-		std::array<float,4> demodLUTTi = {0.0f, 0.0f, 0.0f, 0.0f};
-		std::array<float,4> demodLUTTq = {0.0f, 0.0f, 0.0f, 0.0f};
-		LineAffine affine;
-
-		// Line-level carrier projection summary (filled by projectCarrierPerLine).
-		double meanForwardErrorIRE = 0.0;  // mean |residual − C_model| in IRE
-		double meanChromaMagIRE    = 0.0;  // mean |I,Q| from residual demod, IRE
-		double carrierFitRatio     = 0.0;  // 1 − (forwardError / residualEnergy), [0,1]
-		bool   projectionValid     = false;
-	};
+	using LineAffine = lddecode::CarrierGrammarAffine;
+	using CombCarrierGrammar = lddecode::CarrierGrammarState;
 	struct SamplePlane {
 		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
 	} clpbuffer[3]; // [0]=1D, [1]=2D, [2]=3D
@@ -651,7 +614,7 @@ private:
 	std::vector<double> scratch_fvf_diffFVF;
 	std::vector<double> scratch_fvf_satMap;
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
-	std::vector<double> scratch_coe_coherence; // per-line IQ coherence pre-pass (collectCombOwnershipEvidence)
+	std::vector<double> scratch_coe_coherence; // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
 	// Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
 	// of framePreclean). Cached during the main scoring pass so the island
 	// filter and any post-processing can recover the Frame A output.
@@ -664,7 +627,7 @@ private:
 	std::vector<char> scratch_vdis_flag;
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
 	std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
-	std::vector<std::vector<OwnershipEvidence>> ownershipEvidence; // [line][rel]
+	std::vector<std::vector<AttributionEvidence>> attributionEvidence; // [line][rel]
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
@@ -822,7 +785,6 @@ private:
 	}
 
 	// Small helpers declared here; definitions provided after the class (in this header).
-	inline qint32 getFieldID(qint32 lineNumber) const;
 	// Per-run 4fsc shifted basis LUT for locked path (phaseCompensation=true)
 	double spLUT_locked[4] = {1.0, 0.0, -1.0, 0.0};
 	double cpLUT_locked[4] = {0.0, 1.0,  0.0, -1.0};
@@ -865,13 +827,13 @@ private:
 											   const std::vector<float> *tqOverride,
 											   bool enableLateralRefine,
 											   bool allowSymmetricLeakCancel = false);
-	void collectCombOwnershipEvidence(int line,
+	void collectCombAttributionEvidence(int line,
 									   const double *fieldA,
 									   const double *fieldB,
 									   const std::vector<double> &frameScalar,
 									   const std::vector<std::complex<double>> *frameIQ);
-	void seedCombOwnershipPerLine(int line);
-	void finalizeOwnershipClaims(OwnershipEvidence &e,
+	void seedCombAttributionPerLine(int line);
+	void finalizeAttributionClaims(AttributionEvidence &e,
 								 double neighborLumaMeanIRE = -1.0,
 								 double neighborBaseMeanIRE = -1.0,
 								 double lineForwardErrorIRE = 0.0) const;
@@ -1065,10 +1027,5 @@ private:
 };
 // Inline definitions for FrameBuffer (out-of-class)
 };
-
-// Inline helper definitions for FrameBuffer (out-of-class)
-inline qint32 Comb::FrameBuffer::getFieldID(qint32 lineNumber) const {
-    return ((lineNumber % 2) == 0) ? firstFieldPhaseID : secondFieldPhaseID;
-}
 
 #endif // COMB_H

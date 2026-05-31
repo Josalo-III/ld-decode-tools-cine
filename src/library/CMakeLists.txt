@@ -1,4 +1,5 @@
 add_library(lddecode-library STATIC
+    tbc/carriergrammar.cpp
     tbc/dropouts.cpp
     tbc/filters.cpp
     tbc/sqliteio.cpp

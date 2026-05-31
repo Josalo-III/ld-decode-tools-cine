@@ -1022,15 +1022,15 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
         bucketPol[bucketClass] = bestPol;
     }
 
-    // Ownership evidence for this line (populated by buildPhaseCorrected1D).
+    // Attribution evidence for this line (populated by buildPhaseCorrected1D).
     // lumaClaim identifies alien-Y pixels where the sign convention is wrong
     // and the raw composite comb should be used instead.
-    const int ownerLine = tapLine.ln0;
-    const bool haveOwnership = configuration.phaseCompensation
-        && ownerLine >= 0 && ownerLine < (int)ownershipEvidence.size()
-        && (int)ownershipEvidence[ownerLine].size() >= width;
-    const OwnershipEvidence *ownRow = haveOwnership
-        ? ownershipEvidence[ownerLine].data() : nullptr;
+    const int attrLine = tapLine.ln0;
+    const bool haveAttribution = configuration.phaseCompensation
+        && attrLine >= 0 && attrLine < (int)attributionEvidence.size()
+        && (int)attributionEvidence[attrLine].size() >= width;
+    const AttributionEvidence *attrRow = haveAttribution
+        ? attributionEvidence[attrLine].data() : nullptr;
     const double *pre0 = precleanLinePtr(tapLine.ln0, width);
     const double *preU = precleanLinePtr(tapLine.lnU1, width);
     const double *preD = precleanLinePtr(tapLine.lnD1, width);
@@ -1090,10 +1090,10 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
             }
         }
 
-        // Ownership blend factor for this pixel. As lumaClaim → 1, all gate
+        // Attribution blend factor for this pixel. As lumaClaim -> 1, all gate
         // signals migrate from the signed domain to the raw composite domain,
         // so the transition to the unsigned regime is integrated and continuous.
-        const double lcEff = ownRow ? ownRow[rel].assessment.lumaClaim : 0.0;
+        const double lcEff = attrRow ? attrRow[rel].assessment.lumaClaim : 0.0;
 
         // dynamicVThreshold: at sharp luma edges it tightens to 6 IRE to reject
         // motion/boundary noise, but alien-Y edges are exactly those pixels.
@@ -1104,7 +1104,7 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
 
         // Keep Frame A's local decision-making in scalar composite space.
         // Carrier alignment has already happened at the line level via the
-        // bucket/sign setup and ownership blend, so repeating per-pixel IQ
+        // bucket/sign setup and attribution blend, so repeating per-pixel IQ
         // coherence tests here tends to reintroduce checkerboard texture.
         const double cohUp = haveUp ? 1.0 : 0.0;
         const double cohDn = haveDn ? 1.0 : 0.0;
@@ -1188,15 +1188,15 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
             // else tc = C — magnitude fallback also failed; preserve signal
         }
 
-        // Ownership-guided alien-Y cancellation.
+        // Attribution-guided alien-Y cancellation.
         // When lumaClaim is high, the sign convention is wrong for these pixels
         // (alien Y is a luma transient, not carrier-modulated, so the interfield
         // sign flip that aligns chroma instead anti-aligns alien Y).
         // Fall back to the raw composite comb which naturally cancels alien Y:
         // in the common 4fsc domain, alien Y is identical on both fields, so
         // rawC - rawCup ≈ 0 for alien Y while preserving partial chroma.
-        if (ownRow) {
-            const double lc = ownRow[rel].assessment.lumaClaim;
+        if (attrRow) {
+            const double lc = attrRow[rel].assessment.lumaClaim;
             if (lc > 0.0 && (haveUp || haveDn)) {
                 double rawNbrMix;
                 if (haveUp && haveDn)
@@ -1755,7 +1755,7 @@ void Comb::FrameBuffer::computeFrameIQPrecleanLine(
 // to 4fsc grid IQ.  Extracts the interfield difference — the component of
 // center that disagrees with its ±1 frame-line neighbors — and removes it.
 // No rotation or per-pixel sign decisions; sign structure is already resolved
-// by the composite parser and burst-locked demod.
+// by the carrier grammar and burst-locked demod.
 // Gate: suppress when the two neighbors disagree with each other (motion).
 void Comb::FrameBuffer::computeFrameIQLocked1DLine(
     int line,

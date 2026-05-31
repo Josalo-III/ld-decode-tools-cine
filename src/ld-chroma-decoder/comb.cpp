@@ -290,15 +290,15 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             // Convention:
             //   editTop    -> '/' leads  the frame:  /A  or /AB
             //   editBottom -> '/' splits the frame:  A/B
-            //   -2 cadenceId -> "i" (confirmed interlaced)
-            //   -3 cadenceId -> "p" (confirmed progressive)
+            //   video cadence sentinel       -> "i" (confirmed interlaced)
+            //   progressive cadence sentinel -> "p" (confirmed progressive)
             //   unknown    -> cycle-position digit
 
             // Determine display label for each field position.
             // Returns a 1-char label: film letter, digit, 'i', or 'p'.
             auto fieldLabel = [&](int cid, int fallbackCyclePos) -> char {
-                if (cid == -2) return 'i';
-                if (cid == -3) return 'p';
+                if (cid == lddecode::kCadenceVideo) return 'i';
+                if (cid == lddecode::kCadenceProgressive) return 'p';
                 if (cadenceKnown(cid)) return cadenceFilmLetter(cid);
                 return static_cast<char>('0' + ((fallbackCyclePos % 5) + 1));
             };
@@ -309,7 +309,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             // Determine whether the two fields show the same label (pure frame)
             const bool pureFrame = (labelTop == labelBottom)
-                                && (cidTop >= -3) && (cidBottom >= -3)
+                                && (cidTop >= lddecode::kCadenceProgressive)
+                                && (cidBottom >= lddecode::kCadenceProgressive)
                                 && !editTop && !editBottom; 
 
             // Count characters needed: labels + optional slashes
@@ -416,7 +417,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         // Locked-path-only stable 1D source.
         if (wantLocked) {
             locked1DSource.assign(lines, std::vector<double>(width, 0.0));
-            ownershipEvidence.assign(lines, std::vector<OwnershipEvidence>(width));
+            attributionEvidence.assign(lines, std::vector<AttributionEvidence>(width));
         
             lockedLumaBaseY4_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaSmooth_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
@@ -502,21 +503,8 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     
     const qint32 cidA = firstField.field.cinemap.cadenceId;
     const qint32 cidB = secondField.field.cinemap.cadenceId;
-    
-    auto mergeCadenceForComb = [&](qint32 a, qint32 b) -> qint32 {
-        // If the edit split happens between these two fields, force Video mode.
-        if (editSplit) return -2;
-    
-        const bool aFilm = (a >= 0);
-        const bool bFilm = (b >= 0);
-        if (aFilm && bFilm) return (a < b) ? a : b;
-        if (aFilm) return a;
-        if (bFilm) return b;
-        if (a == -3 || b == -3) return -3;
-        return -2;
-    };
-    
-    cadenceId = mergeCadenceForComb(cidA, cidB);
+    cadenceId = lddecode::mergeCadenceIdForInterleavedFrame(
+        cidA, cidB, editSplit);
     // Clear working planes only in active region for safety
     for (int buf = 0; buf < 3; ++buf) {
         for (int y = videoParameters.firstActiveFrameLine;
@@ -530,37 +518,16 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 
     componentFrame = nullptr;
 
-    // --- Initialize per-line grammar with full schedule identity ---
+    // Initialize per-line grammar with schedule identity and metadata authority.
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
-    if ((int)carrierGrammar.size() < last) carrierGrammar.resize(last);
-    for (int line = first; line < last; ++line) {
-        CombCarrierGrammar &grammar = carrierGrammar[line];
-        grammar = CombCarrierGrammar{};
-
-        grammar.fieldPhaseId = getFieldID(line);
-        grammar.lineParity = line & 1;
-        grammar.fieldLine = line / 2;
-
-        const bool positiveOnEven =
-            (grammar.fieldPhaseId == 1) || (grammar.fieldPhaseId == 4);
-        const bool evenFieldLine = ((grammar.fieldLine & 1) == 0);
-        const bool linePhase = evenFieldLine ? positiveOnEven : !positiveOnEven;
-
-        grammar.lineFlip = linePhase ? -1 : +1;
-        grammar.samplePhase0 = 0;
-        // lineFlip is derived from fieldPhaseId which comes from capture metadata,
-        // so it holds Metadata authority.  rigidScheduleLineFlip mirrors it for
-        // now because no independent rigid derivation is available at this stage;
-        // phaseLocked() should update phaseScheduleConflict if burst measurement
-        // diverges.
-        grammar.lineFlipAuthority    = lddecode::CarrierPhaseAuthority::Metadata;
-        grammar.rigidScheduleLineFlip = grammar.lineFlip;
-        grammar.phaseScheduleConflict = 0.0;
-        // If the paired fields already straddle an edit boundary, cross-field
-        // vertical reasoning for this frame should be treated as schedule-invalid.
-        grammar.frameVerticalAllowed = !editSplit;
-    }
+    lddecode::initializeCarrierGrammarSchedule(
+        carrierGrammar,
+        first,
+        last,
+        firstFieldPhaseID,
+        secondFieldPhaseID,
+        !editSplit);
 
     // Clear VDIS mask for this frame
     if (!vdisMask.empty()) {
@@ -605,7 +572,7 @@ void Comb::FrameBuffer::split1D()
 }
 
 
-void Comb::FrameBuffer::seedCombOwnershipPerLine(int line)
+void Comb::FrameBuffer::seedCombAttributionPerLine(int line)
 {
     const int right = videoParameters.activeVideoEnd;
     const int width = right - videoParameters.activeVideoStart;
@@ -613,36 +580,36 @@ void Comb::FrameBuffer::seedCombOwnershipPerLine(int line)
     if (width <= 0 || line < 0)
         return;
 
-    if ((int)ownershipEvidence.size() <= line)
-        ownershipEvidence.resize(line + 1);
+    if ((int)attributionEvidence.size() <= line)
+        attributionEvidence.resize(line + 1);
 
-    auto &row = ownershipEvidence[line];
+    auto &row = attributionEvidence[line];
     if ((int)row.size() < width)
-        row.assign(width, OwnershipEvidence{});
+        row.assign(width, AttributionEvidence{});
 
     // Carrier metadata lives in carrierGrammar; consumers read it there directly.
-    // Seed only the line-level plausibility prior so later ownership stages start
+    // Seed only the line-level plausibility prior so later attribution stages start
     // from one canonical carrier verdict instead of privately reconstructing one.
     const CombCarrierGrammar *grammar = carrierGrammarLine(line);
     const double carrierPrior = carrierPlausibility(grammar);
 
     for (int rel = 0; rel < width; ++rel) {
-        row[rel].facts = OwnershipFacts{};
-        row[rel].assessment = OwnershipAssessment{};
+        row[rel].facts = AttributionFacts{};
+        row[rel].assessment = AttributionAssessment{};
         row[rel].assessment.carrierPrior = carrierPrior;
     }
 }
 
-void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
+void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
                                                 double neighborLumaMeanIRE,
                                                 double neighborBaseMeanIRE,
                                                 double lineForwardErrorIRE) const
 {
     const auto &T = configuration.tunables;
-    OwnershipRules rules = lddecode::kDefaultOwnershipRules;
-    rules.conflictSuppress = T.VET_OWNERSHIP_CONFLICT_SUPPRESS;
-    const OwnershipFacts &f = e.facts;
-    OwnershipAssessment &a = e.assessment;
+    AttributionRules rules = lddecode::kDefaultAttributionRules;
+    rules.conflictSuppress = T.VET_ATTRIBUTION_CONFLICT_SUPPRESS;
+    const AttributionFacts &f = e.facts;
+    AttributionAssessment &a = e.assessment;
 
     const double crestIRE = f.bandpassFineIRE;
     const double baseIRE = std::max(f.bandpassMidIRE, f.bandpassCoarseIRE);
@@ -725,16 +692,16 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
         ((0.65 * a.carrierPlausibility) + (0.35 * a.coherence)),
         0.0, 1.0);
 
-    lddecode::applyOwnershipConflictSuppression(
+    lddecode::applyAttributionConflictSuppression(
         a,
         rules);
 
     a.chromaClaim *= std::max(
         0.0,
-        1.0 - (T.VET_OWNERSHIP_CHROMA_WEIGHT *
+        1.0 - (T.VET_ATTRIBUTION_CHROMA_WEIGHT *
                std::max(0.0, a.lumaShapeContinuation - 0.25)));
     a.chromaClaim *= std::max(0.0, 1.0 - (0.5 * a.lumaClaim));
-    lddecode::normalizeCombOwnershipAssessment(a, rules);
+    lddecode::normalizeCombAttributionAssessment(a, rules);
 }
 
 // 2D comb scorer (4-member Field-vs-Frame election)
@@ -754,8 +721,8 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
 // Otherwise the existing election rules settle the contest (model-aware
 // scoring, FrameIQ coherence, neighbor estimate, sharpness reward, etc.).
 //
-// Model: Field — when cadenceId is not (>= 0 || -3), i.e. true interlace.
-// Model: Frame — progressive (>= 0) or 29.97p (-3); Frame is favored and
+// Model: Field — when cadenceId is not (>= 0 || progressive sentinel), i.e. true interlace.
+// Model: Frame — progressive (>= 0) or progressive sentinel; Frame is favored and
 //                fields are scored by deviation from the frame model.
 void Comb::FrameBuffer::scoreFieldVsFrame(
     int line,
@@ -887,7 +854,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
     // Core Logic of Field Vs Frame
     // when the footage is progressive we prefer interfield comb
-    bool useFrameModel = (cadenceId >= 0 || cadenceId == -3);
+    bool useFrameModel = (cadenceId >= 0 || cadenceId == lddecode::kCadenceProgressive);
     bool localUseFrameModel = useFrameModel;
 
     FvfModelMetrics *metricRow =
@@ -896,10 +863,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         ? fvfMetrics[line].data()
         : nullptr;
 
-    const OwnershipEvidence *fvfOwnRow =
-        (line >= 0 && line < (int)ownershipEvidence.size() &&
-         (int)ownershipEvidence[line].size() >= width)
-        ? ownershipEvidence[line].data()
+    const AttributionEvidence *fvfAttrRow =
+        (line >= 0 && line < (int)attributionEvidence.size() &&
+         (int)attributionEvidence[line].size() >= width)
+        ? attributionEvidence[line].data()
         : nullptr;
 
     // IQ magnitude pre-pass: compute std::hypot() once per pixel (width calls)
@@ -1003,7 +970,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     
             // --- Veto Logic ---
             const bool frameVerticalAllowed = carrierFrameVerticalAllowed(line);
-            bool managementVeto = (cadenceId == -2) || !frameVerticalAllowed;
+            bool managementVeto = (cadenceId == lddecode::kCadenceVideo) || !frameVerticalAllowed;
             bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
             double targetModel = localUseFrameModel ? FR_s : FA_s;
 
@@ -1143,13 +1110,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             scoreR_A = (1.0 - satScale) * devR_A + satScale * errR_notch;
             scoreR_B = (1.0 - satScale) * devR_B + satScale * errRRaw_notch;
 
-            if (fvfOwnRow) {
-                const double lc = std::clamp(fvfOwnRow[rel].assessment.lumaClaim,   0.0, 1.0);
-                const double cc = std::clamp(fvfOwnRow[rel].assessment.chromaClaim, 0.0, 1.0);
-                scoreR_A += T.FVF_OWNERSHIP_LUMA_WEIGHT   * lc;
-                scoreR_B += T.FVF_OWNERSHIP_LUMA_WEIGHT   * lc;
-                scoreA   += T.FVF_OWNERSHIP_CHROMA_WEIGHT * cc;
-                scoreB   += T.FVF_OWNERSHIP_CHROMA_WEIGHT * cc;
+            if (fvfAttrRow) {
+                const double lc = std::clamp(fvfAttrRow[rel].assessment.lumaClaim,   0.0, 1.0);
+                const double cc = std::clamp(fvfAttrRow[rel].assessment.chromaClaim, 0.0, 1.0);
+                scoreR_A += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * lc;
+                scoreR_B += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * lc;
+                scoreA   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * cc;
+                scoreB   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * cc;
             }
 
             // ------------------------------------------------------------
@@ -1582,7 +1549,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     }
 }
 
-void Comb::FrameBuffer::collectCombOwnershipEvidence(
+void Comb::FrameBuffer::collectCombAttributionEvidence(
     int line,
     const double *fieldA,
     const double *fieldB,
@@ -1598,13 +1565,13 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
     if (width <= 0 || !fieldA || !fieldB || line < 0)
         return;
 
-    if ((int)ownershipEvidence.size() <= line)
-        ownershipEvidence.resize(line + 1);
+    if ((int)attributionEvidence.size() <= line)
+        attributionEvidence.resize(line + 1);
 
-    auto &row = ownershipEvidence[line];
+    auto &row = attributionEvidence[line];
     if ((int)row.size() < width) {
-        row.assign(width, OwnershipEvidence());
-        seedCombOwnershipPerLine(line);
+        row.assign(width, AttributionEvidence());
+        seedCombAttributionPerLine(line);
     }
 
     const bool haveFrameScalar = !frameScalar.empty();
@@ -1649,8 +1616,8 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
     if (width > 0) lineMeanFrameCoherence /= static_cast<double>(width);
 
     for (int rel = 0; rel < width; ++rel) {
-        OwnershipEvidence &e = row[rel];
-        OwnershipFacts &f = e.facts;
+        AttributionEvidence &e = row[rel];
+        AttributionFacts &f = e.facts;
 
         const double fa = fieldA[rel];
         const double fb = fieldB[rel];
@@ -1690,26 +1657,26 @@ void Comb::FrameBuffer::collectCombOwnershipEvidence(
 
     // Extract the line-level forward model error from the grammar (only when
     // the carrier projection was successfully computed on a locked line).
-    // 0.0 signals "not available" and causes finalizeOwnershipClaims() to fall
+    // 0.0 signals "not available" and causes finalizeAttributionClaims() to fall
     // back to its hard-coded denominators — behaviour is identical to before.
     const double lineForwardErrorIRE = (lineGrammar && lineGrammar->projectionValid)
         ? lineGrammar->meanForwardErrorIRE
         : 0.0;
 
-    // Final ownership needs cross-path evidence plus a same-phase continuity
+    // Final attribution needs cross-path evidence plus a same-phase continuity
     // check, not just the local 1D residual snapshot.
     for (int rel = 0; rel < width; ++rel) {
         const int rm4 = std::max(0, rel - 4);
         const int rp4 = std::min(width - 1, rel + 4);
-        OwnershipEvidence &e = row[rel];
-        const OwnershipFacts &leftFacts = row[rm4].facts;
-        const OwnershipFacts &rightFacts = row[rp4].facts;
+        AttributionEvidence &e = row[rel];
+        const AttributionFacts &leftFacts = row[rm4].facts;
+        const AttributionFacts &rightFacts = row[rp4].facts;
         const double leftBaseIRE = std::max(leftFacts.bandpassMidIRE,
                                             leftFacts.bandpassCoarseIRE);
         const double rightBaseIRE = std::max(rightFacts.bandpassMidIRE,
                                              rightFacts.bandpassCoarseIRE);
 
-        finalizeOwnershipClaims(
+        finalizeAttributionClaims(
             e,
             0.5 * (leftFacts.lumaExcursionIRE + rightFacts.lumaExcursionIRE),
             0.5 * (leftBaseIRE + rightBaseIRE),
@@ -2124,7 +2091,7 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         .arg(phaseDeg(sameMean), 0, 'f', 2)
         .arg(coherence(sameMean), 0, 'f', 3);
 
-    qint64 ownN = 0;
+    qint64 attrN = 0;
     double sumLumaClaim = 0.0;
     double sumChromaClaim = 0.0;
     double sumUncertainClaim = 0.0;
@@ -2138,9 +2105,9 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
     double sumPhaseScheduleConflict = 0.0;
     int scheduleConflictLines = 0;
     for (int line = firstLine; line < lastLine; ++line) {
-        if (line < 0 || line >= (int)ownershipEvidence.size())
+        if (line < 0 || line >= (int)attributionEvidence.size())
             continue;
-        const auto &row = ownershipEvidence[line];
+        const auto &row = attributionEvidence[line];
         if ((int)row.size() < width)
             continue;
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
@@ -2151,8 +2118,8 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         const double lineConflict = grammar ? grammar->phaseScheduleConflict : 0.0;
         if (lineConflict > 0.0) ++scheduleConflictLines;
         for (int rel = 0; rel < width; ++rel) {
-            const OwnershipEvidence &e = row[rel];
-            ++ownN;
+            const AttributionEvidence &e = row[rel];
+            ++attrN;
             sumLumaClaim += e.assessment.lumaClaim;
             sumChromaClaim += e.assessment.chromaClaim;
             sumUncertainClaim += e.assessment.uncertainClaim;
@@ -2166,21 +2133,21 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             sumPhaseScheduleConflict += lineConflict;
         }
     }
-    if (ownN > 0) {
-        const double invOwnN = 1.0 / (double)ownN;
-        msg += QString(" ownership(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7,carScale=%8,carConf=%9,carPlaus=%10,carPhaseAbsDeg=%11,schedConf=%12,schedConfLines=%13)")
-            .arg(ownN)
-            .arg(sumLumaClaim * invOwnN, 0, 'f', 3)
-            .arg(sumChromaClaim * invOwnN, 0, 'f', 3)
-            .arg(sumUncertainClaim * invOwnN, 0, 'f', 3)
-            .arg(sumLumaIncursion * invOwnN, 0, 'f', 3)
-            .arg(sumCandidateSpread * invOwnN, 0, 'f', 3)
-            .arg(sumFrameCoherence * invOwnN, 0, 'f', 3)
-            .arg(sumCarrierScale * invOwnN, 0, 'f', 3)
-            .arg(sumCarrierConfidence * invOwnN, 0, 'f', 3)
-            .arg(sumCarrierPlausibility * invOwnN, 0, 'f', 3)
-            .arg(sumCarrierPhaseErrorAbs * invOwnN * 180.0 / M_PI, 0, 'f', 3)
-            .arg(sumPhaseScheduleConflict * invOwnN, 0, 'f', 3)
+    if (attrN > 0) {
+        const double invAttrN = 1.0 / (double)attrN;
+        msg += QString(" attribution(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7,carScale=%8,carConf=%9,carPlaus=%10,carPhaseAbsDeg=%11,schedConf=%12,schedConfLines=%13)")
+            .arg(attrN)
+            .arg(sumLumaClaim * invAttrN, 0, 'f', 3)
+            .arg(sumChromaClaim * invAttrN, 0, 'f', 3)
+            .arg(sumUncertainClaim * invAttrN, 0, 'f', 3)
+            .arg(sumLumaIncursion * invAttrN, 0, 'f', 3)
+            .arg(sumCandidateSpread * invAttrN, 0, 'f', 3)
+            .arg(sumFrameCoherence * invAttrN, 0, 'f', 3)
+            .arg(sumCarrierScale * invAttrN, 0, 'f', 3)
+            .arg(sumCarrierConfidence * invAttrN, 0, 'f', 3)
+            .arg(sumCarrierPlausibility * invAttrN, 0, 'f', 3)
+            .arg(sumCarrierPhaseErrorAbs * invAttrN * 180.0 / M_PI, 0, 'f', 3)
+            .arg(sumPhaseScheduleConflict * invAttrN, 0, 'f', 3)
             .arg(scheduleConflictLines);
     }
 
@@ -2410,7 +2377,7 @@ void Comb::FrameBuffer::split2D()
                 scratch_frameBCenter.resize(width);
         }
 
-        collectCombOwnershipEvidence(
+        collectCombAttributionEvidence(
             line,
             scratch_fieldLine.data(),
             scratch_fieldBLine.data(),

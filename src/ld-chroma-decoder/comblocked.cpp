@@ -453,7 +453,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
         auto &ldsRow = locked1DSource[line];
         if ((int)ldsRow.size() < width) ldsRow.assign(width, 0.0);
-        seedCombOwnershipPerLine(line);
+        seedCombAttributionPerLine(line);
 
         CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
@@ -707,10 +707,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 fvfMetrics[line][xi].residualFitErrorIRE  = residualFitErrorIRE;
             }
 
-            if (line >= 0 && line < (int)ownershipEvidence.size() &&
-                xi < (int)ownershipEvidence[line].size())
+            if (line >= 0 && line < (int)attributionEvidence.size() &&
+                xi < (int)attributionEvidence[line].size())
             {
-                OwnershipEvidence &e = ownershipEvidence[line][xi];
+                AttributionEvidence &e = attributionEvidence[line][xi];
                 e.facts.bandpassFineIRE = fine;
                 e.facts.bandpassMidIRE = mid;
                 e.facts.bandpassCoarseIRE = coarse;
@@ -723,7 +723,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 // Luma-side checkerboard witness from the retracted view
                 // (raw - asserted carrier).  This is not a chroma source; it
                 // marks carrier-phase structure that survived into the luma
-                // witness so ownership can treat it as suspect during final
+                // witness so attribution can treat it as suspect during final
                 // subtraction/election.
                 if (retractedRow) {
                     const double center = static_cast<double>(retractedRow[xi]);
@@ -1133,16 +1133,16 @@ void Comb::FrameBuffer::filterIQLocked()
 
 namespace {
 
-// Ownership alpha blend given pre-computed per-pixel scalars.
+// Attribution alpha blend given pre-computed per-pixel scalars.
 // Returns the effective alpha (0 = full chroma subtraction, 1 = no subtraction
-// modified by ownership and saturation guards).
-double computeOwnershipAlpha(
-    const lddecode::CombOwnershipAssessment &a,
+// modified by attribution and saturation guards).
+double computeAttributionAlpha(
+    const lddecode::CombAttributionAssessment &a,
     double alphaVet,
     double lumaIRE,
     double chromaIRE,
-    double ownershipWeight,
-    double ownershipChromaWeight,
+    double attributionWeight,
+    double attributionChromaWeight,
     double brightStartIRE, double brightFullIRE,
     double satStartIRE,    double satFullIRE)
 {
@@ -1151,7 +1151,7 @@ double computeOwnershipAlpha(
     const double uc = std::clamp(a.uncertainClaim, 0.0, 1.0);
 
     const double chromaFrac = std::clamp(
-        1.0 - lc + ownershipChromaWeight * cc, 0.0, 1.0);
+        1.0 - lc + attributionChromaWeight * cc, 0.0, 1.0);
 
     const double brightT = std::clamp(
         (lumaIRE - brightStartIRE) /
@@ -1163,19 +1163,19 @@ double computeOwnershipAlpha(
         std::max(1e-9, satFullIRE - satStartIRE),
         0.0, 1.0);
 
-    // Strong chroma or explicit chroma ownership should block luma-ownership
+    // Strong chroma or explicit chroma attribution should block luma attribution
     // from reducing residual chroma subtraction. This is especially important
     // for saturated blue, where lumaIRE may not trip the brightness ramp.
     const double chromaBlock = std::clamp(cc + 0.65 * satT, 0.0, 1.0);
     const double support = lc * (1.0 - chromaBlock) * (1.0 - 0.5 * uc);
 
     // Saturated color is already a warning that carrier-band energy is probably
-    // chroma-owned; do not require high luma for ownership reassignment to bow out.
-    const double ownershipProtect = std::clamp(
+    // chroma-owned; do not require high luma for attribution reassignment to bow out.
+    const double attributionProtect = std::clamp(
         std::max(satT, brightT * satT), 0.0, 1.0);
 
     const double blend = std::clamp(
-        ownershipWeight * support * (1.0 - ownershipProtect), 0.0, 1.0);
+        attributionWeight * support * (1.0 - attributionProtect), 0.0, 1.0);
 
     return alphaVet * (1.0 - blend) + chromaFrac * blend;
 }
@@ -1574,26 +1574,26 @@ void Comb::FrameBuffer::produceY()
             retractedRow ? retractedY : nullptr
         };
 
-        const bool ownershipEnabled =
-            T.VET_OWNERSHIP_ENABLE &&
+        const bool attributionEnabled =
+            T.VET_ATTRIBUTION_ENABLE &&
             line >= 0 &&
-            line < (int)ownershipEvidence.size() &&
-            (int)ownershipEvidence[line].size() >= width;
+            line < (int)attributionEvidence.size() &&
+            (int)attributionEvidence[line].size() >= width;
 
-        const OwnershipEvidence *ownRow =
-            ownershipEnabled ? ownershipEvidence[line].data() : nullptr;
+        const AttributionEvidence *attrRow =
+            attributionEnabled ? attributionEvidence[line].data() : nullptr;
 
-        const double ownershipWeight = T.VET_OWNERSHIP_LUMA_WEIGHT;
-        const double ownershipChromaWeight = T.VET_OWNERSHIP_CHROMA_WEIGHT;
+        const double attributionWeight = T.VET_ATTRIBUTION_LUMA_WEIGHT;
+        const double attributionChromaWeight = T.VET_ATTRIBUTION_CHROMA_WEIGHT;
 
-        auto alphaWithOwnership = [&](int x, double alphaVet) -> double {
-            return computeOwnershipAlpha(
-                ownRow[x].assessment, alphaVet,
+        auto alphaWithAttribution = [&](int x, double alphaVet) -> double {
+            return computeAttributionAlpha(
+                attrRow[x].assessment, alphaVet,
                 (baseY4[x] - videoParameters.black16bIre) * invI,
                 std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI,
-                ownershipWeight, ownershipChromaWeight,
-                T.VET_OWNERSHIP_BRIGHT_START_IRE, T.VET_OWNERSHIP_BRIGHT_FULL_IRE,
-                T.VET_OWNERSHIP_SAT_START_IRE,    T.VET_OWNERSHIP_SAT_FULL_IRE);
+                attributionWeight, attributionChromaWeight,
+                T.VET_ATTRIBUTION_BRIGHT_START_IRE, T.VET_ATTRIBUTION_BRIGHT_FULL_IRE,
+                T.VET_ATTRIBUTION_SAT_START_IRE,    T.VET_ATTRIBUTION_SAT_FULL_IRE);
         };
 
         auto smoothStep01 = [](double t) {
@@ -1887,7 +1887,7 @@ void Comb::FrameBuffer::produceY()
             // complement, the retracted view at this sample is built
             // from a structurally superior carrier model.  Inject that
             // as candidate support so the vet lets the retracted view
-            // dominate.  Ownership and chroma protection still apply
+            // dominate.  Attribution and chroma protection still apply
             // downstream — this only opens the candidateGate, it
             // doesn't bypass the safety checks.
             const double lsGate = (lsGateRow && x >= 0 && x < width)
@@ -1897,11 +1897,11 @@ void Comb::FrameBuffer::produceY()
             if (candidateGate <= 0.0)
                 return finishRetractedBlend(0.0);
 
-            double ownershipInvite = 0.0;
+            double attributionInvite = 0.0;
             double chromaProtect = 0.0;
-            if (ownRow) {
-                const auto &a = ownRow[x].assessment;
-                ownershipInvite = std::clamp(
+            if (attrRow) {
+                const auto &a = attrRow[x].assessment;
+                attributionInvite = std::clamp(
                     0.60 * a.lumaClaim + 0.40 * a.checkerboardRisk -
                     0.50 * a.chromaClaim,
                     0.0, 1.0);
@@ -1909,9 +1909,9 @@ void Comb::FrameBuffer::produceY()
             }
 
             const double satT = std::clamp(
-                (chromaIRE - T.VET_OWNERSHIP_SAT_START_IRE) /
-                std::max(1e-9, T.VET_OWNERSHIP_SAT_FULL_IRE -
-                               T.VET_OWNERSHIP_SAT_START_IRE),
+                (chromaIRE - T.VET_ATTRIBUTION_SAT_START_IRE) /
+                std::max(1e-9, T.VET_ATTRIBUTION_SAT_FULL_IRE -
+                               T.VET_ATTRIBUTION_SAT_START_IRE),
                 0.0, 1.0);
             chromaProtect = std::max(chromaProtect, 0.35 * satT);
             const double stableProtect = stableChromaProtectAt(x);
@@ -1925,10 +1925,10 @@ void Comb::FrameBuffer::produceY()
             }
             chromaProtect = std::max(chromaProtect, stableProtect);
 
-            if (ownershipInvite <= 0.0)
+            if (attributionInvite <= 0.0)
                 return finishRetractedBlend(0.0);
 
-            const double invite = ownershipInvite;
+            const double invite = attributionInvite;
             const double protect = 1.0 - 0.75 * chromaProtect;
             const double blend = std::clamp(
                 T.VET_RETRACTED_Y_WEIGHT * candidateGate * invite * protect,
@@ -1936,7 +1936,7 @@ void Comb::FrameBuffer::produceY()
             return finishRetractedBlend(blend);
         };
 
-        auto writePixelNoOwnership = [&](int x, double alphaEff) {
+        auto writePixelNoAttribution = [&](int x, double alphaEff) {
             const int h = left + x;
             const double coarseWorking = sourceToWorkingSample(coarseY, x);
             const double residualWorking = sourceToWorkingSample(highRawY, x);
@@ -1968,8 +1968,8 @@ void Comb::FrameBuffer::produceY()
             prodQRow[x] = (float)(prodQ * GQ_PRODUCT);
         };
 
-        auto writePixelWithOwnership = [&](int x, double alphaVet) {
-            const double alphaEff = alphaWithOwnership(x, alphaVet);
+        auto writePixelWithAttribution = [&](int x, double alphaVet) {
+            const double alphaEff = alphaWithAttribution(x, alphaVet);
             const int h = left + x;
             const double coarseWorking = sourceToWorkingSample(coarseY, x);
             const double residualWorking = sourceToWorkingSample(highRawY, x);
@@ -2040,13 +2040,13 @@ void Comb::FrameBuffer::produceY()
         };
 
         if (width < 4) {
-            if (ownershipEnabled) {
+            if (attributionEnabled) {
                 for (int x = 0; x < width; ++x) {
-                    writePixelWithOwnership(x, 1.0);
+                    writePixelWithAttribution(x, 1.0);
                 }
             } else {
                 for (int x = 0; x < width; ++x) {
-                    writePixelNoOwnership(x, 1.0);
+                    writePixelNoAttribution(x, 1.0);
                 }
             }
             continue;
@@ -2054,36 +2054,36 @@ void Comb::FrameBuffer::produceY()
 
         const int tailStart = (width / 4) * 4;
 
-        if (ownershipEnabled) {
+        if (attributionEnabled) {
             for (int p = 0; p + 3 < width; p += 4) {
                 const double alphaVet = computeAlphaVet(p);
-                writePixelWithOwnership(p + 0, alphaVet);
-                writePixelWithOwnership(p + 1, alphaVet);
-                writePixelWithOwnership(p + 2, alphaVet);
-                writePixelWithOwnership(p + 3, alphaVet);
+                writePixelWithAttribution(p + 0, alphaVet);
+                writePixelWithAttribution(p + 1, alphaVet);
+                writePixelWithAttribution(p + 2, alphaVet);
+                writePixelWithAttribution(p + 3, alphaVet);
             }
 
             if (tailStart < width) {
                 const int p = std::max(0, width - 4);
                 const double alphaVet = computeAlphaVet(p);
                 for (int x = tailStart; x < width; ++x) {
-                    writePixelWithOwnership(x, alphaVet);
+                    writePixelWithAttribution(x, alphaVet);
                 }
             }
         } else {
             for (int p = 0; p + 3 < width; p += 4) {
                 const double alphaVet = computeAlphaVet(p);
-                writePixelNoOwnership(p + 0, alphaVet);
-                writePixelNoOwnership(p + 1, alphaVet);
-                writePixelNoOwnership(p + 2, alphaVet);
-                writePixelNoOwnership(p + 3, alphaVet);
+                writePixelNoAttribution(p + 0, alphaVet);
+                writePixelNoAttribution(p + 1, alphaVet);
+                writePixelNoAttribution(p + 2, alphaVet);
+                writePixelNoAttribution(p + 3, alphaVet);
             }
 
             if (tailStart < width) {
                 const int p = std::max(0, width - 4);
                 const double alphaVet = computeAlphaVet(p);
                 for (int x = tailStart; x < width; ++x) {
-                    writePixelNoOwnership(x, alphaVet);
+                    writePixelNoAttribution(x, alphaVet);
                 }
             }
         }
