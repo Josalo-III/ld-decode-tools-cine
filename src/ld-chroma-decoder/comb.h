@@ -255,6 +255,23 @@ public:
             // Vet gate: screens residual Y candidates before they are applied.
             bool   VET_ENABLE_RESIDUAL_Y = true;
 
+            // Carrier-retracted Y candidate: lets raw-carrierFit compete with
+            // residual-minus-coherent-carrier when the residual candidate shows
+            // same-lattice alternation that the retracted view does not.
+            bool   VET_RETRACTED_Y_ENABLE       = true;
+            double VET_RETRACTED_Y_WEIGHT       = 0.30; // maximum blend toward retracted Y candidate
+            double VET_RETRACTED_ALT_START_IRE  = 1.5;  // residual-vs-retracted alternation advantage where blend begins
+            double VET_RETRACTED_ALT_FULL_IRE   = 7.0;  // alternation advantage where blend reaches full strength
+            bool   VET_NEIGHBOR_ANCHOR_ENABLE      = true; // use same-lattice spatial anchor as a vet influence
+            double VET_NEIGHBOR_ANCHOR_WEIGHT      = 0.60; // how strongly anchor agreement can open retracted Y
+            double VET_NEIGHBOR_ANCHOR_START_IRE   = 0.75; // retracted-vs-residual anchor advantage where blend begins
+            double VET_NEIGHBOR_ANCHOR_FULL_IRE    = 4.0;  // anchor advantage where blend reaches full strength
+            bool   VET_RETRACTED_STABLE_CHROMA_PROTECT = true; // penalize retracted Y inside sustained saturated color
+            int    VET_RETRACTED_STABLE_CHROMA_RUN     = 4;    // minimum same-run samples for stable-color protection
+            double VET_RETRACTED_STABLE_CHROMA_START_IRE = 10.0; // stable chroma protection starts here
+            double VET_RETRACTED_STABLE_CHROMA_FULL_IRE  = 20.0; // stable chroma protection is full here
+            double VET_RETRACTED_STABLE_CHROMA_DEV_IRE   = 4.0;  // max vector deviation for a consistent color run
+
             // Chroma-profile correction: adjusts subtraction alpha when the vet is uncertain,
             // using 4fsc chroma/luma profile agreement as a bounded correction signal.
             double VET_Y_CHROMA_LIKE_WEIGHT = 0.12; // weight of chroma-profile match on the subtraction alpha

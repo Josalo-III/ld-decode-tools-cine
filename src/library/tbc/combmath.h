@@ -39,6 +39,11 @@ inline constexpr double CAL_LO_ROT_DEG = 0.0;
 inline constexpr double GI_PRODUCT = 1.0;
 inline constexpr double GQ_PRODUCT = 0.9;
 
+// Per-bucket carrier-excursion gain.  Indexed by carrierSampleClass & 3.
+// Set to 1.0 (neutral): per-bucket magnitude asymmetry was shown to be
+// scene-dependent and does not track the visible checkerboard artifact.
+inline constexpr double CARRIER_BUCKET_GAIN[4] = { 1.0, 1.0, 1.0, 1.0 };
+
 // Bucket-smooth strength applied to locked1DSource in buildPhaseCorrected1D.
 // Zero disables the smooth entirely (current default).
 inline constexpr double FIELD_BUCKET_SMOOTH_STRENGTH = 0.0;

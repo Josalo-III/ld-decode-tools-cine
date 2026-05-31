@@ -314,6 +314,23 @@ struct CombOwnershipFacts {
     double residualFitErrorIRE = 0.0;
     double lumaIncursionRiskIRE = 0.0;
     double icebergAlienYFraction = 0.0;
+    double quarterCheckerboardRisk = 0.0;
+
+    // Sine/cosine (I/Q lattice) carrier-residual sideband evidence.
+    //
+    // After carrier withdrawal, the leftover (raw - coarseY - carrierFit) is
+    // split by carrier sample axis: the sine/I lattice (bucket 0,2) and the
+    // cosine/Q lattice (bucket 1,3).  A narrow ±2 carrier model cannot follow
+    // chroma-envelope curvature, so real sideband energy rides the dominant
+    // axis and correlates with envelope curvature; a luma / cross-color
+    // impostor leaves residual that does not.  These facts let ownership tell
+    // sideband chroma from cross-color by structure rather than a frequency
+    // filter (which would discard the sidebands the carrier-retracted path
+    // exists to preserve).
+    double sidebandSinResidualIRE = 0.0;     // leftover energy on sine/I lattice
+    double sidebandCosResidualIRE = 0.0;     // leftover energy on cosine/Q lattice
+    double sidebandAxisAsymmetry = 0.0;      // (sin - cos)/(sin + cos)
+    double sidebandCurvatureCoherence = 0.0; // |res| vs envelope-curvature corr [0..1]
 };
 
 // Comb ownership assessment is the software interpretation of the facts under
@@ -326,9 +343,11 @@ struct CombOwnershipAssessment {
     double neighborSupport = 0.0;
     double lumaShapeContinuation = 0.0;
     double chromaStrength = 0.0;
+    double sidebandChromaSupport = 0.0;
     double coherence = 0.0;
     double agreement = 0.0;
     double spreadPenalty = 0.0;
+    double checkerboardRisk = 0.0;
     double carrierPrior = 0.0;
     double carrierPlausibility = 0.0;
 
@@ -471,6 +490,20 @@ struct CompositeOwnershipFacts {
     double sidebandUpperIRE = 0.0;
     double sidebandCoherence = 0.0;
     double sidebandAsymmetry = 0.0;
+
+    // Sine/cosine (I/Q lattice) carrier-residual sideband evidence.
+    //
+    // After carrier withdrawal, the leftover is split by carrier sample axis:
+    // the sine/I lattice (bucket 0,2) and the cosine/Q lattice (bucket 1,3).
+    // A narrow ±2 carrier model cannot follow chroma-envelope curvature, so
+    // real sideband energy rides the dominant axis and correlates with
+    // envelope curvature; a luma / cross-color impostor does not.  This
+    // distinguishes sideband chroma from cross-color by structure rather than
+    // a frequency filter.
+    double sidebandSinResidualIRE = 0.0;     // leftover energy on sine/I lattice
+    double sidebandCosResidualIRE = 0.0;     // leftover energy on cosine/Q lattice
+    double sidebandAxisAsymmetry = 0.0;      // (sin - cos)/(sin + cos)
+    double sidebandCurvatureCoherence = 0.0; // |res| vs envelope-curvature corr [0..1]
 
     // ---------------------------------------------------------------------
     // Subtraction reconciliation evidence

@@ -651,6 +651,7 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
     a.lumaRisk = std::max(
         std::clamp(f.lumaIncursionRiskIRE / 8.0, 0.0, 1.0),
         std::clamp(f.icebergAlienYFraction, 0.0, 1.0));
+    a.checkerboardRisk = std::clamp(f.quarterCheckerboardRisk, 0.0, 1.0);
     // Scale lumaResidual against the line-level forward-model error rather than
     // a fixed 8.0.  When the grammar has a valid projection, samples that merely
     // match the line's measured noise floor should not accumulate luma risk; the
@@ -679,6 +680,19 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
     a.lumaShapeContinuation = std::clamp((0.65 * a.baseSupport) + (0.35 * a.neighborSupport), 0.0, 1.0);
     
     a.chromaStrength = std::clamp((maxChromaIRE - 2.0) / 10.0, 0.0, 1.0);
+
+    const double sidebandResidualIRE =
+        std::max(f.sidebandSinResidualIRE, f.sidebandCosResidualIRE);
+    const double sidebandMagSupport = std::clamp(
+        (sidebandResidualIRE - 0.35) / 4.0,
+        0.0, 1.0);
+    const double sidebandAxisSupport = std::clamp(
+        (std::fabs(f.sidebandAxisAsymmetry) - 0.10) / 0.65,
+        0.0, 1.0);
+    const double sidebandCoherence =
+        std::clamp(f.sidebandCurvatureCoherence, 0.0, 1.0);
+    a.sidebandChromaSupport = sidebandMagSupport *
+        (0.35 + 0.45 * sidebandAxisSupport + 0.20 * sidebandCoherence);
     // Coherence fallback (used when frameIQCoherence is unavailable):
     // normalize per-sample fit error against the line's mean forward error
     // rather than the fixed 12.0.  A sample at the line mean gets coherence
@@ -702,11 +716,13 @@ void Comb::FrameBuffer::finalizeOwnershipClaims(OwnershipEvidence &e,
     a.carrierPlausibility = carrierPrior;
 
     a.lumaClaim = std::clamp(
-        (0.55 * a.lumaRisk) + (0.25 * a.lumaResidual) + (0.20 * a.lumaShapeContinuation),
+        (0.50 * a.lumaRisk) + (0.22 * a.lumaResidual) +
+        (0.18 * a.lumaShapeContinuation) + (0.10 * a.checkerboardRisk),
         0.0, 1.0);
 
     a.chromaClaim = std::clamp(
-        a.chromaStrength * ((0.65 * a.carrierPlausibility) + (0.35 * a.coherence)),
+        std::max(a.chromaStrength, a.sidebandChromaSupport) *
+        ((0.65 * a.carrierPlausibility) + (0.35 * a.coherence)),
         0.0, 1.0);
 
     lddecode::applyOwnershipConflictSuppression(
