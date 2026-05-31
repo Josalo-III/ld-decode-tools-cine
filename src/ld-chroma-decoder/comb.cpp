@@ -229,8 +229,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
         // Coherent Demod + Y pipeline
         if (configuration.phaseCompensation) {
-            current->demodMode = FrameBuffer::DemodMode::Locked;
-
             // 1) Carrier grammar + LS carrier fit + line cancellation (pre-pass)
             // 2) Combed-carrier demod for 1D, 2D scoring (via buildPhaseCorrected1D)
             // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
@@ -242,7 +240,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->doYNR();
             current->transformIQ(configuration.chromaGain, configuration.chromaPhase);
         } else {
-            current->demodMode = FrameBuffer::DemodMode::Bucket;
             current->splitIQ();
             current->adjustY();
             current->filterIQ();
@@ -416,9 +413,6 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         }
         // Locked-path-only stable 1D source.
         if (wantLocked) {
-            locked1DSource.assign(lines, std::vector<double>(width, 0.0));
-            attributionEvidence.assign(lines, std::vector<AttributionEvidence>(width));
-        
             lockedLumaBaseY4_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaSmooth_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaCacheValid = false;
@@ -433,9 +427,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         }
 
         // Accumulators for raster synthesis
-        scratch_fieldLine.assign(width, 0.0);
-        scratch_fieldGate.assign(width, 1.0);
-        scratch_fieldBLine.assign(width, 0.0);
+        scratch_lineWorkA.assign(width, 0.0);
+        scratch_lineWorkB.assign(width, 1.0);
+        scratch_lineWorkC.assign(width, 0.0);
         scratch_outMixed.assign(width, 0.0);
         scratch_lateralLine.assign(width, 0.0);
         // low-res luma (chroma cancelled fsc)        
@@ -444,7 +438,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_lumaSmooth.assign(width, 0.0);
 
         // Filtering/NR temporaries
-        scratch_filter_temp.assign(width, 0.0);
+        scratch_lineWorkD.assign(width, 0.0);
         scratch_hpI.assign(width + 64, 0.0);
         scratch_hpQ.assign(width + 64, 0.0);
         scratch_hpY.assign(width + 64, 0.0);
@@ -471,7 +465,12 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        scratch_comp_res.assign(width, 0.0);
+        if (wantLocked) {
+            locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
+            attributionEvidence_flat.assign(
+                size_t(demodLines) * demodWidth, AttributionEvidence{});
+        }
+        scratch_residualContested.assign(width, 0.0);
         scratch_frameBCenter.assign(width, 0.0);
         scratch_fieldBCenter.assign(width, 0.0);
     }
@@ -580,12 +579,9 @@ void Comb::FrameBuffer::seedCombAttributionPerLine(int line)
     if (width <= 0 || line < 0)
         return;
 
-    if ((int)attributionEvidence.size() <= line)
-        attributionEvidence.resize(line + 1);
-
-    auto &row = attributionEvidence[line];
-    if ((int)row.size() < width)
-        row.assign(width, AttributionEvidence{});
+    AttributionEvidence *row = attributionEvidence_line(line);
+    if (!row)
+        return;
 
     // Carrier metadata lives in carrierGrammar; consumers read it there directly.
     // Seed only the line-level plausibility prior so later attribution stages start
@@ -864,10 +860,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         : nullptr;
 
     const AttributionEvidence *fvfAttrRow =
-        (line >= 0 && line < (int)attributionEvidence.size() &&
-         (int)attributionEvidence[line].size() >= width)
-        ? attributionEvidence[line].data()
-        : nullptr;
+        (demodWidth == width) ? attributionEvidence_line(line) : nullptr;
 
     // IQ magnitude pre-pass: compute std::hypot() once per pixel (width calls)
     // rather than 7× per sample inside the hot loop.  A second sweep over the
@@ -1565,14 +1558,9 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
     if (width <= 0 || !fieldA || !fieldB || line < 0)
         return;
 
-    if ((int)attributionEvidence.size() <= line)
-        attributionEvidence.resize(line + 1);
-
-    auto &row = attributionEvidence[line];
-    if ((int)row.size() < width) {
-        row.assign(width, AttributionEvidence());
-        seedCombAttributionPerLine(line);
-    }
+    AttributionEvidence *row = attributionEvidence_line(line);
+    if (!row)
+        return;
 
     const bool haveFrameScalar = !frameScalar.empty();
 
@@ -1845,10 +1833,8 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
     auto sampleRow = [&](int line, int rel)->double {
         rel = std::clamp(rel, 0, width - 1);
         if (useLockedSource) {
-            if (line < 0 || line >= (int)locked1DSource.size())
-                return 0.0;
-            const auto &row = locked1DSource[line];
-            if ((int)row.size() < width)
+            const double *row = locked1DSource_line(line);
+            if (!row)
                 return 0.0;
             return row[rel];
         }
@@ -1895,10 +1881,8 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             return {0.0, 0.0};
         }
 
-        if (line < 0 || line >= (int)locked1DSource.size())
-            return {0.0, 0.0};
-        const auto &row = locked1DSource[line];
-        if ((int)row.size() < width)
+        const double *row = locked1DSource_line(line);
+        if (!row)
             return {0.0, 0.0};
 
         const double c = row[std::clamp(rel, 0, width - 1)];
@@ -1906,10 +1890,8 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
     };
 
     auto lockedScalar = [&](int line, int rel)->double {
-        if (line < 0 || line >= (int)locked1DSource.size())
-            return 0.0;
-        const auto &row = locked1DSource[line];
-        if ((int)row.size() < width)
+        const double *row = locked1DSource_line(line);
+        if (!row)
             return 0.0;
         return row[std::clamp(rel, 0, width - 1)];
     };
@@ -1921,9 +1903,7 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             continue;
 
         if (useLockedSource) {
-            if (line < 0 || line >= (int)locked1DSource.size())
-                continue;
-            if ((int)locked1DSource[line].size() < width)
+            if (!locked1DSource_line(line))
                 continue;
         }
 
@@ -1963,10 +1943,7 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
             addPhaseCross(line + 2, sameFieldCross, sameFieldN);
 
             if (!useLockedSource && line > firstLine && line + 1 < lastLine &&
-                line - 1 < (int)locked1DSource.size() &&
-                line + 1 < (int)locked1DSource.size() &&
-                (int)locked1DSource[line - 1].size() >= width &&
-                (int)locked1DSource[line + 1].size() >= width)
+                locked1DSource_line(line - 1) && locked1DSource_line(line + 1))
             {
                 const double vEdgeIRE = std::max(
                     std::fabs(lockedScalar(line, rel) - lockedScalar(line - 1, rel)),
@@ -2105,10 +2082,8 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
     double sumPhaseScheduleConflict = 0.0;
     int scheduleConflictLines = 0;
     for (int line = firstLine; line < lastLine; ++line) {
-        if (line < 0 || line >= (int)attributionEvidence.size())
-            continue;
-        const auto &row = attributionEvidence[line];
-        if ((int)row.size() < width)
+        const AttributionEvidence *row = attributionEvidence_line(line);
+        if (!row)
             continue;
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const double lineCarrierScale = grammar ? grammar->carrierScale : 0.0;
@@ -2229,18 +2204,18 @@ void Comb::FrameBuffer::split2D()
     if (width <= 0 || firstLine >= lastLine) return;
 
     if (configuration.phaseCompensation) {
-        buildPhaseCorrected1D(); // writes locked-1D directly into locked1DSource
+        buildPhaseCorrected1D(); // writes locked-1D directly into locked1DSource_flat
         reportPhaseLegStats("locked1d", 1, true);
     }
 
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
         for (int line = firstLine; line < lastLine; ++line) {
             double *dst = clpbuffer[1].pixel[line];
-            if (configuration.phaseCompensation &&
-                line >= 0 && line < (int)locked1DSource.size() &&
-                (int)locked1DSource[line].size() >= width)
+            const double *lockedRow = configuration.phaseCompensation
+                ? locked1DSource_line(line) : nullptr;
+            if (lockedRow)
             {
-                for (int rel = 0; rel < width; ++rel) dst[left + rel] = locked1DSource[line][rel];
+                for (int rel = 0; rel < width; ++rel) dst[left + rel] = lockedRow[rel];
             } else {
                 const double *src1d = clpbuffer[0].pixel[line];
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = src1d[left + rel];
@@ -2322,18 +2297,18 @@ void Comb::FrameBuffer::split2D()
         if (combTapBuildFlags_ & TapBuildFieldB) {
             const double *fieldBPreclean = precleanLinePtr(line, width);
             if (fieldBPreclean) {
-                std::copy(fieldBPreclean, fieldBPreclean + width, scratch_fieldBLine.begin());
+                std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
             } else {
-                computeSimpleField2DLine(tapLine, scratch_fieldBLine.data());
+                computeSimpleField2DLine(tapLine, scratch_lineWorkC.data());
             }
         } else {
-            std::fill(scratch_fieldBLine.begin(), scratch_fieldBLine.begin() + width, 0.0);
+            std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
         }
         if (combTapBuildFlags_ & TapBuildFieldA) {
-            computeField2DLine(tapLine, scratch_fieldLine.data(), scratch_fieldGate.data());
+            computeField2DLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
         } else {
-            std::fill(scratch_fieldLine.begin(), scratch_fieldLine.begin() + width, 0.0);
-            std::fill(scratch_fieldGate.begin(), scratch_fieldGate.begin() + width, 1.0);
+            std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
+            std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
         }
 
         {
@@ -2343,13 +2318,11 @@ void Comb::FrameBuffer::split2D()
             if ((int)scratch_lateralLine.size() < width)
                 scratch_lateralLine.resize(width);
             if (configuration.phaseCompensation) {
-                if (line >= 0 && line < (int)locked1DSource.size() &&
-                    (int)locked1DSource[line].size() >= width)
-                {
-                    std::copy(locked1DSource[line].begin(),
-                              locked1DSource[line].begin() + width,
-                              scratch_lateralLine.begin());
-                } else {
+                const double *lockedRow = locked1DSource_line(line);
+                if (lockedRow) {
+                    std::copy(lockedRow, lockedRow + width, scratch_lateralLine.begin());
+                }
+                else {
                     std::fill(scratch_lateralLine.begin(), scratch_lateralLine.begin() + width, 0.0);
                 }
             } else {
@@ -2379,8 +2352,8 @@ void Comb::FrameBuffer::split2D()
 
         collectCombAttributionEvidence(
             line,
-            scratch_fieldLine.data(),
-            scratch_fieldBLine.data(),
+            scratch_lineWorkA.data(),
+            scratch_lineWorkC.data(),
             needFrameIQCompute ? scratch_fieldBCenter : scratch_frameBCenter,
             needFrameIQCompute ? &frameIQ : nullptr);
 
@@ -2390,11 +2363,11 @@ void Comb::FrameBuffer::split2D()
         };
 
         if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Field) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_fieldLine[rel]);
+            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkA[rel]);
             if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
         }
         else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldB) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_fieldBLine[rel]);
+            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkC[rel]);
             if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.35f);
         }
         else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FramePreclean && configuration.phaseCompensation) {
@@ -2408,7 +2381,7 @@ void Comb::FrameBuffer::split2D()
         else {
             if (!configuration.phaseCompensation) {
                 for (int rel = 0; rel < width; ++rel) {
-                    dst[left + rel] = scratch_fieldBLine[rel];
+                    dst[left + rel] = scratch_lineWorkC[rel];
                     if (writeWeights && line < (int)w2d_frame_weight.size()) {
                         w2d_frame_weight[line][rel] = 0.35f; 
                     }
@@ -2417,9 +2390,9 @@ void Comb::FrameBuffer::split2D()
                 scoreFieldVsFrame(
                     line,
                     tapLine,
-                    scratch_fieldLine.data(),
-                    scratch_fieldBLine.data(),
-                    scratch_fieldGate.data(),
+                    scratch_lineWorkA.data(),
+                    scratch_lineWorkC.data(),
+                    scratch_lineWorkB.data(),
                     scratch_fieldBCenter,
                     &scratch_frameBCenter,
                     scratch_outMixed.data(),
@@ -2432,7 +2405,7 @@ void Comb::FrameBuffer::split2D()
                         double vMixed = scratch_outMixed[rel];
                     
                         // Keep only the numeric-sanity fallback:
-                        if (!std::isfinite(vMixed)) vMixed = scratch_fieldBLine[rel];
+                        if (!std::isfinite(vMixed)) vMixed = scratch_lineWorkC[rel];
                     
                         emitSelected(rel, vMixed);
                     }
@@ -2472,12 +2445,13 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             getBestCandidate(line, h, previousFrame, nextFrame, bestIndex, bestSample);
         
             const int h0 = clampH(h);
+            const int rel0 = h0 - left;
             double base1d;
-            if (configuration.phaseCompensation &&
-                line >= 0 && line < (int)locked1DSource.size() &&
-                (int)locked1DSource[line].size() > (h0 - left))
+            const double *lockedRow = configuration.phaseCompensation
+                ? locked1DSource_line(line) : nullptr;
+            if (lockedRow && rel0 >= 0)
             {
-                base1d = locked1DSource[line][h0 - left];
+                base1d = lockedRow[rel0];
             } else {
                 base1d = clpbuffer[0].pixel[line][h0];
             }
@@ -2708,8 +2682,8 @@ void Comb::FrameBuffer::filterIQ()
     auto iqFilter = makeFIRFilter(c_colorlp_b);
     const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
 
-    if ((int)scratch_filter_temp.size() < width) scratch_filter_temp.assign(width, 0.0);
-    double *temp = scratch_filter_temp.data();
+    if ((int)scratch_lineWorkD.size() < width) scratch_lineWorkD.assign(width, 0.0);
+    double *temp = scratch_lineWorkD.data();
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
@@ -2825,7 +2799,7 @@ void Comb::FrameBuffer::doYNR()
 // aligned to the 4fsc sampling grid (base 33).
 void Comb::FrameBuffer::transformIQ(double chromaGain, double chromaPhase)
 {
-    if (demodMode == DemodMode::Locked) {
+    if (configuration.phaseCompensation) {
         constexpr double BASE_LOCKED = 70.0;
         const double theta = (BASE_LOCKED + chromaPhase) * M_PI / 180.0;
         const double c = std::cos(theta);

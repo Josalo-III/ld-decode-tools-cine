@@ -60,9 +60,9 @@ void Comb::FrameBuffer::computeVDISLine(int lineNumber)
         if (th1d_s > 0.0) {
             auto vdisSample = [&](int ln, int rel)->double {
                 if (configuration.phaseCompensation) {
-                    if (ln >= 0 && ln < (int)locked1DSource.size() &&
-                        (int)locked1DSource[ln].size() > rel)
-                        return locked1DSource[ln][rel];
+                    const double *row = locked1DSource_line(ln);
+                    if (row && rel >= 0 && rel < width)
+                        return row[rel];
                     return 0.0;
                 }
                 return clpbuffer[0].pixel[ln][left + rel];
@@ -382,10 +382,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
         if (configuration.phaseCompensation) {
-            if (ln < 0 || ln >= (int)locked1DSource.size()) return nullptr;
-            const auto &row = locked1DSource[ln];
-            if ((int)row.size() < width) return nullptr;
-            return row.data();
+            return locked1DSource_line(ln);
         }
         return clpbuffer[0].pixel[ln] + left;
     };
@@ -767,7 +764,7 @@ void Comb::FrameBuffer::computeSimpleField2DLine(const CombTapLine &tapLine, dou
 
         // Soft weights from pre-computed kRange magnitude agreement (same formula
         // as Luma Wow). In locked mode the tap .comp values already come from
-        // locked1DSource (phase-aligned), so the weight already encodes phase
+        // locked1DSource_flat (phase-aligned), so the weight already encodes phase
         // quality. A separate coherence multiplier is redundant and creates sharp
         // drops at color-region edges that feed splitIQ checkerboards.
         double wUp = tapLine.pairU2[rel].weight;
@@ -1027,10 +1024,9 @@ void Comb::FrameBuffer::computeFrameScalarLine(const CombTapLine &tapLine, doubl
     // and the raw composite comb should be used instead.
     const int attrLine = tapLine.ln0;
     const bool haveAttribution = configuration.phaseCompensation
-        && attrLine >= 0 && attrLine < (int)attributionEvidence.size()
-        && (int)attributionEvidence[attrLine].size() >= width;
+        && attributionEvidence_line(attrLine);
     const AttributionEvidence *attrRow = haveAttribution
-        ? attributionEvidence[attrLine].data() : nullptr;
+        ? attributionEvidence_line(attrLine) : nullptr;
     const double *pre0 = precleanLinePtr(tapLine.ln0, width);
     const double *preU = precleanLinePtr(tapLine.lnU1, width);
     const double *preD = precleanLinePtr(tapLine.lnD1, width);
@@ -1943,13 +1939,13 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // 1D sample: locked path reads from locked1DSource (combed carrier);
+    // 1D sample: locked path reads from locked1DSource_flat (combed carrier);
     // bucket path reads from clpbuffer[0] (blind bandpass).
-    if (frameBuffer.configuration.phaseCompensation &&
-        lineNumber >= 0 && lineNumber < (int)frameBuffer.locked1DSource.size() &&
-        (int)frameBuffer.locked1DSource[lineNumber].size() > (hh - left))
+    const double *lockedRow = frameBuffer.configuration.phaseCompensation
+        ? frameBuffer.locked1DSource_line(lineNumber) : nullptr;
+    if (lockedRow && (hh - left) >= 0 && (hh - left) < (right - left))
     {
-        result.sample = frameBuffer.locked1DSource[lineNumber][hh - left];
+        result.sample = lockedRow[hh - left];
     } else {
         result.sample = frameBuffer.clpbuffer[0].pixel[lineNumber][hh];
     }

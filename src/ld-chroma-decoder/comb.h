@@ -338,8 +338,6 @@ private:
 
 class FrameBuffer {
 public:
-	enum class DemodMode { Bucket, Locked };
-
 	// FVF model/context metrics (not candidate-specific).
 	// Stored per pixel so downstream consumers can understand why a line
 	// segment was treated as frame-model vs field-model, edge-risk, etc.
@@ -401,13 +399,6 @@ public:
 	void adjustY();         // Bucket path
 	void produceY();        // Product path
 	void ensureProduceYScratch(int width);
-	void buildCoherentCarrierRow(
-		const float *tiRow, const float *tqRow,
-		const double *hiRaw,
-		int left, int width,
-		double bcos, double bsin,
-		int WIN, int HALF,
-		double invI);
 	// Build the carrier-retracted view and derived products:
 	//   carrierFit_flat       — per-line LS carrier model
 	//   carrierRetracted_flat — raw minus carrier fit (flattened)
@@ -424,14 +415,12 @@ public:
 					const FrameBuffer &nextFrame);
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
-	const std::vector<std::vector<AttributionEvidence>> &getAttributionEvidence() const { return attributionEvidence; }
+	const std::vector<AttributionEvidence> &getAttributionEvidenceFlat() const { return attributionEvidence_flat; }
 
 	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
 	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
 	const FrameBuffer *prevFrameForVet = nullptr;
 	const FrameBuffer *nextFrameForVet = nullptr;
-
-	DemodMode demodMode = DemodMode::Bucket;
 
 	// Tracks if this frame is the start of a scene (edit boundary).
 	bool isSceneStart = false;
@@ -581,31 +570,33 @@ private:
 	std::array<std::vector<double>, 3> precleanRing;
 	std::array<std::vector<double>, 3> precleanGateRing;
 	std::array<int, 3> precleanRingLine = { -1, -1, -1 };
-	std::vector<double> scratch_frameBCenter;
-	std::vector<double> scratch_fieldBCenter;        // raw-composite demod storage (flat contiguous)
-	std::vector<float> demodTRI_flat;
-	std::vector<float> demodTRQ_flat;
-	std::vector<double> scratch_preI;          // unscaled pre-FIR storage (per-line)
-	std::vector<double> scratch_preQ;
-	std::vector<double> scratch_preI_ext;      // edge-extended for FIR (per-line)
-	std::vector<double> scratch_preQ_ext;
-	std::vector<double> scratch_comp_res;     // composite residual = raw - clp - chroma_est
-	// Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
-	std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
-	std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
-	std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
-	std::vector<double> scratch_outMixed;
-	std::vector<double> scratch_lateralLine;
-	std::vector<std::vector<float>> w2d_frame_weight;
-	std::vector<std::vector<double>> w2d_fieldA_gate;
-	std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
+		std::vector<double> scratch_frameBCenter; // Frame B scalar candidate (locked 1D interfield path).
+		std::vector<double> scratch_fieldBCenter; // Frame A scalar candidate / preclean remod composite.
+		std::vector<float> demodTRI_flat;
+		std::vector<float> demodTRQ_flat;
+		std::vector<double> scratch_preI;          // Unscaled pre-FIR I row (per-line).
+		std::vector<double> scratch_preQ;          // Unscaled pre-FIR Q row (per-line).
+		std::vector<double> scratch_preI_ext;      // Edge-extended I row for FIR.
+		std::vector<double> scratch_preQ_ext;      // Edge-extended Q row for FIR.
+		// Contested HF residual after coherent-carrier subtraction (produceY path).
+		std::vector<double> scratch_residualContested;
+		// Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
+		std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
+		std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
+		std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
+		std::vector<double> scratch_outMixed; // FVF elected mixed scalar output row.
+		std::vector<double> scratch_lateralLine; // 1D lateral reference row / vet confidence row.
+		std::vector<std::vector<float>> w2d_frame_weight;
+		std::vector<std::vector<double>> w2d_fieldA_gate;
+		std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
 	std::vector<std::complex<double>> scratch_iq; // reused per-line I/Q scratch (phase-corrected 1D)
 	std::vector<std::complex<double>> scratch_centerIQ; // reused per-line preclean/locked frame IQ prep
 	std::vector<std::complex<double>> scratch_upIQ;
 	std::vector<std::complex<double>> scratch_dnIQ;
-	std::vector<double> scratch_fieldLine;
-	std::vector<double> scratch_fieldGate;
-	std::vector<double> scratch_fieldBLine;
+		// Shared line scratch planes used by split2D / produceY / buildCarrierRetracted.
+		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY; LS carrier fit row.
+		std::vector<double> scratch_lineWorkB; // Field gate row; coherent carrier estimate (cHat) in produceY.
+		std::vector<double> scratch_lineWorkC; // Field B scalar row; tqAdjLocked in produceY; flattened row.
 	// FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
 	std::vector<int>    scratch_fvf_winner;
 	std::vector<int>    scratch_fvf_winner2;
@@ -615,10 +606,7 @@ private:
 	std::vector<double> scratch_fvf_satMap;
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
 	std::vector<double> scratch_coe_coherence; // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
-	// Per-pixel precleaned Frame A value (1D-conditioned same-phase blend
-	// of framePreclean). Cached during the main scoring pass so the island
-	// filter and any post-processing can recover the Frame A output.
-	std::vector<double> scratch_filter_temp;
+		std::vector<double> scratch_lineWorkD; // Generic temp row (filter scratch / retractedY working row).
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;
 	std::vector<double> scratch_hpY;
@@ -626,8 +614,9 @@ private:
 	std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
 	std::vector<char> scratch_vdis_flag;
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
-	std::vector<std::vector<double>> locked1DSource; // [line][rel], common-4fsc scalar export for locked 2D
-	std::vector<std::vector<AttributionEvidence>> attributionEvidence; // [line][rel]
+		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
+		std::vector<double> locked1DSource_flat; // 1D locked scalar export used by 2D/3D and diagnostics.
+		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
@@ -664,6 +653,30 @@ private:
 	
 	inline const double *lockedLumaSmooth_line(int line) const {
 		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline double *locked1DSource_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DSource_flat.empty()) return nullptr;
+		return locked1DSource_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const double *locked1DSource_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DSource_flat.empty()) return nullptr;
+		return locked1DSource_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline AttributionEvidence *attributionEvidence_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    attributionEvidence_flat.empty()) return nullptr;
+		return attributionEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const AttributionEvidence *attributionEvidence_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    attributionEvidence_flat.empty()) return nullptr;
+		return attributionEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	inline CombCarrierGrammar *carrierGrammarLine(int line) {

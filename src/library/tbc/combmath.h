@@ -44,10 +44,6 @@ inline constexpr double GQ_PRODUCT = 0.9;
 // scene-dependent and does not track the visible checkerboard artifact.
 inline constexpr double CARRIER_BUCKET_GAIN[4] = { 1.0, 1.0, 1.0, 1.0 };
 
-// Bucket-smooth strength applied to locked1DSource in buildPhaseCorrected1D.
-// Zero disables the smooth entirely (current default).
-inline constexpr double FIELD_BUCKET_SMOOTH_STRENGTH = 0.0;
-
 inline void basisCoeffs(double& Ce, double& Se)
 {
     const double K = 0.5 * M_PI;
