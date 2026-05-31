@@ -305,6 +305,16 @@ public:
             double VET_ALIGN_PHASE_MAX_DEG = 12.0; // maximum phase error the alignment correction may apply
             double VET_ALIGN_MIN_RHO       = 0.75; // minimum burst correlation for alignment to be trusted
             double VET_ALIGN_MAX_SHEAR     = 0.15; // maximum shear the alignment correction may apply
+
+            // LS carrier refit guard: at colored luma edges, the bright side is
+            // more likely to trick the sinusoidal refit into spreading checkerboard.
+            // Restrict LS support to the dark side when the bright side carries
+            // substantial chroma.
+            bool   LS_REFIT_BRIGHT_COLOR_GUARD      = true;
+            double LS_REFIT_BRIGHT_COLOR_START_IRE  = 6.0;  // bright-side chroma where suppression begins
+            double LS_REFIT_BRIGHT_COLOR_FULL_IRE   = 14.0; // bright-side chroma where bright-half LS is fully suppressed
+            double LS_REFIT_BRIGHT_SIDE_SOFT_IRE    = 0.5;  // bright-side membership begins this far above the local edge midpoint
+            double LS_REFIT_BRIGHT_SIDE_HARD_IRE    = 3.0;  // bright-side membership is full this far above the local edge midpoint
         };
         Tunables tunables;
     };
@@ -674,6 +684,7 @@ private:
 	std::vector<float> carrierRetracted_flat;
 	std::vector<float> flatFloor_flat;
 	std::vector<float> combedCarrier_flat;
+	std::vector<float> lsRefitGate_flat;
 	bool carrierRetractedValid = false;
 	
 	inline double *lockedLumaBaseY4_line(int line) {
@@ -1029,6 +1040,12 @@ private:
 		if (!carrierRetractedValid || demodWidth <= 0 ||
 		    line < 0 || line >= demodLines) return nullptr;
 		return combedCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* lsRefitGate_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines ||
+		    lsRefitGate_flat.empty()) return nullptr;
+		return lsRefitGate_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

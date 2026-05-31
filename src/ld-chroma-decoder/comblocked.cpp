@@ -909,8 +909,8 @@ void Comb::FrameBuffer::splitIQlocked()
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
-    const int srcBuf    = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
     const auto &T       = configuration.tunables;
+    const int srcBuf    = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
 
     if (width <= 0 || firstLine >= lastLine) return;
 
@@ -1001,6 +1001,7 @@ void Comb::FrameBuffer::filterIQLocked()
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
+    const auto &T       = configuration.tunables;
 
     constexpr bool   EXP_IQ_FIR_ENABLE = true;
     constexpr int    EXP_FIR_TAPS      = 21;
@@ -1626,6 +1627,8 @@ void Comb::FrameBuffer::produceY()
              !carrierRetracted_flat.empty() &&
              demodWidth == width);
 
+        const float *lsGateRow = lsRefitGate_line(line);
+
         auto lineInActive = [&](int y) -> bool {
             return y >= firstLine && y < lastLine && y < demodLines;
         };
@@ -1879,7 +1882,18 @@ void Comb::FrameBuffer::produceY()
                 anchorGate *= std::clamp(T.VET_NEIGHBOR_ANCHOR_WEIGHT, 0.0, 1.0);
             }
 
-            const double candidateGate = std::max(altGate, anchorGate);
+            // LS refit gate: when buildCarrierRetracted detected a luma
+            // edge where the LS sinusoidal fit disagrees with the
+            // complement, the retracted view at this sample is built
+            // from a structurally superior carrier model.  Inject that
+            // as candidate support so the vet lets the retracted view
+            // dominate.  Ownership and chroma protection still apply
+            // downstream — this only opens the candidateGate, it
+            // doesn't bypass the safety checks.
+            const double lsGate = (lsGateRow && x >= 0 && x < width)
+                ? static_cast<double>(lsGateRow[x]) : 0.0;
+
+            const double candidateGate = std::max({altGate, anchorGate, lsGate});
             if (candidateGate <= 0.0)
                 return finishRetractedBlend(0.0);
 
@@ -2122,6 +2136,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
+    const auto &T       = configuration.tunables;
 
     if (width <= 0 || firstLine >= lastLine)
         return;
@@ -2139,6 +2154,8 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         flatFloor_flat.assign(need, 0.0f);
     if (combedCarrier_flat.size() < need)
         combedCarrier_flat.assign(need, 0.0f);
+    if (lsRefitGate_flat.size() < need)
+        lsRefitGate_flat.assign(need, 0.0f);
 
     if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
@@ -2268,6 +2285,164 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             flattened[xi]    = rawWhole[xi] - cf;
             fitRow[xi]       = static_cast<float>(cf);
             retractedRow[xi] = static_cast<float>(flattened[xi]);
+        }
+
+        // LS carrier refit at luma edges.
+        //
+        // The complement cancellation cannot structurally separate
+        // alien-Y from carrier.  Where a luma edge is present AND a
+        // windowed LS sinusoidal fit disagrees with the complement, the
+        // complement has absorbed alien-Y as if it were carrier.  The LS
+        // fit projects onto explicit carrier basis functions, naturally
+        // rejecting non-sinusoidal alien-Y.
+        //
+        // Two conditions must both be met:
+        //   1. coarseY gradient (luma edge present)
+        //   2. LS fit disagrees with complement (the edge actually
+        //      contaminated the complement — if they agree, no gain)
+        //
+        // The resulting gate is stored in lsRefitGate_flat so
+        // retractedBlendFor() can ensure the retracted view dominates
+        // at these samples.  Without that coupling, the bandpass-
+        // clipped Y wins the vet and the refit is wasted.
+        {
+            constexpr double EDGE_SOFT_IRE  = 3.0;
+            constexpr double EDGE_HARD_IRE  = 10.0;
+            constexpr double DISC_SOFT_IRE  = 1.0;
+            constexpr double DISC_HARD_IRE  = 4.0;
+            constexpr int    LS_HALF_WIN    = 16;
+            const double bcos = grammar->burstCos;
+            const double bsin = grammar->burstSin;
+            auto smoothStep01 = [](double t) {
+                t = std::clamp(t, 0.0, 1.0);
+                return t * t * (3.0 - 2.0 * t);
+            };
+
+            float *gateRow = lsRefitGate_flat.data()
+                             + static_cast<size_t>(line) * demodWidth;
+
+            // eCorr is free after Step 3; reuse as the edge pre-gate.
+            double *edgeGate = eCorr;
+            bool anyEdge = false;
+            for (int xi = 0; xi < width; ++xi) {
+                const int xm = std::max(0, xi - 2);
+                const int xp = std::min(width - 1, xi + 2);
+                const double gradIRE =
+                    std::fabs(coarseY[xp] - coarseY[xm]) * invIreScale;
+                const double gate = std::clamp(
+                    (gradIRE - EDGE_SOFT_IRE) /
+                    std::max(1e-9, EDGE_HARD_IRE - EDGE_SOFT_IRE),
+                    0.0, 1.0);
+                edgeGate[xi] = gate;
+                if (gate > 0.0) anyEdge = true;
+                gateRow[xi] = 0.0f;
+            }
+
+            if (anyEdge) {
+                for (int xi = 0; xi < width; ++xi) {
+                    if (edgeGate[xi] <= 0.0) continue;
+
+                    int a = std::max(0, xi - LS_HALF_WIN);
+                    int b = std::min(width - 1, xi + LS_HALF_WIN - 1);
+
+                    double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
+                    double sIY = 0.0, sQY = 0.0;
+
+                    for (int k = a; k <= b; ++k) {
+                        const int hk = left + k;
+                        const double obs = rawWhole[k] - coarseY[k];
+                        const double bI = remodLockedToShiftedComposite(
+                            1.0, 0.0, hk, bcos, bsin,
+                            spLUT_locked, cpLUT_locked);
+                        const double bQ = remodLockedToShiftedComposite(
+                            0.0, 1.0, hk, bcos, bsin,
+                            spLUT_locked, cpLUT_locked);
+                        const double dist = std::fabs(
+                            static_cast<double>(k - xi));
+                        const double w = 1.0 - 0.65 * std::min(
+                            1.0, dist / std::max(1.0,
+                                static_cast<double>(LS_HALF_WIN)));
+                        sII += w * bI * bI;
+                        sIQ += w * bI * bQ;
+                        sQQ += w * bQ * bQ;
+                        sIY += w * bI * obs;
+                        sQY += w * bQ * obs;
+                    }
+
+                    double fitI = 0.0, fitQ = 0.0;
+                    const double det = sII * sQQ - sIQ * sIQ;
+                    if (std::fabs(det) > 1e-9) {
+                        const double inv = 1.0 / det;
+                        fitI = ( sQQ * sIY - sIQ * sQY) * inv;
+                        fitQ = (-sIQ * sIY + sII * sQY) * inv;
+                    }
+
+                    const int h = left + xi;
+                    const double bI0 = remodLockedToShiftedComposite(
+                        1.0, 0.0, h, bcos, bsin,
+                        spLUT_locked, cpLUT_locked);
+                    const double bQ0 = remodLockedToShiftedComposite(
+                        0.0, 1.0, h, bcos, bsin,
+                        spLUT_locked, cpLUT_locked);
+
+                    double lsFit = fitI * bI0 + fitQ * bQ0;
+                    lsFit = std::clamp(lsFit,
+                        -maxCarrierSamples, maxCarrierSamples);
+
+                    const double discrepancyIRE =
+                        std::fabs(lsFit - carrierFit[xi]) * invIreScale;
+                    const double discGate = std::clamp(
+                        (discrepancyIRE - DISC_SOFT_IRE) /
+                        std::max(1e-9, DISC_HARD_IRE - DISC_SOFT_IRE),
+                        0.0, 1.0);
+
+                    double brightColorProtect = 0.0;
+                    if (T.LS_REFIT_BRIGHT_COLOR_GUARD) {
+                        const int xm = std::max(0, xi - 2);
+                        const int xp = std::min(width - 1, xi + 2);
+                        const double lumaM = coarseY[xm];
+                        const double lumaP = coarseY[xp];
+                        const double dir = (lumaP >= lumaM) ? 1.0 : -1.0;
+                        const double lumaMid = 0.5 * (lumaM + lumaP);
+                        const double brightOffsetIRE =
+                            dir * (coarseY[xi] - lumaMid) * invIreScale;
+                        const double brightSideGate = smoothStep01(
+                            (brightOffsetIRE - T.LS_REFIT_BRIGHT_SIDE_SOFT_IRE) /
+                            std::max(1e-9, T.LS_REFIT_BRIGHT_SIDE_HARD_IRE -
+                                           T.LS_REFIT_BRIGHT_SIDE_SOFT_IRE));
+
+                        const int brightIdx = (dir > 0.0) ? xp : xm;
+                        const int brightJ = (brightIdx + 1 < width)
+                            ? (brightIdx + 1)
+                            : (brightIdx > 0 ? brightIdx - 1 : brightIdx);
+                        const int xiJ = (xi + 1 < width) ? (xi + 1) : (xi > 0 ? xi - 1 : xi);
+                        const double brightAmpIRE =
+                            std::hypot(carrierFit[brightIdx], carrierFit[brightJ]) * invIreScale;
+                        const double localAmpIRE =
+                            std::hypot(carrierFit[xi], carrierFit[xiJ]) * invIreScale;
+                        const double coloredBrightIRE = std::max(brightAmpIRE, localAmpIRE);
+                        const double brightColorGate = smoothStep01(
+                            (coloredBrightIRE - T.LS_REFIT_BRIGHT_COLOR_START_IRE) /
+                            std::max(1e-9, T.LS_REFIT_BRIGHT_COLOR_FULL_IRE -
+                                           T.LS_REFIT_BRIGHT_COLOR_START_IRE));
+
+                        brightColorProtect = brightSideGate * brightColorGate;
+                    }
+
+                    const double g =
+                        edgeGate[xi] * discGate * (1.0 - brightColorProtect);
+                    gateRow[xi] = static_cast<float>(g);
+
+                    if (g > 0.0) {
+                        const double blended =
+                            carrierFit[xi] * (1.0 - g) + lsFit * g;
+                        carrierFit[xi]   = blended;
+                        fitRow[xi]       = static_cast<float>(blended);
+                        retractedRow[xi] = static_cast<float>(
+                            rawWhole[xi] - blended);
+                    }
+                }
+            }
         }
 
         // flatFloor: coarseY is the DC luma floor for this line.
