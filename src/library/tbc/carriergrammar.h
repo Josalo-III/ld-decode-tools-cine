@@ -15,6 +15,8 @@
 #include <array>
 #include <vector>
 
+#include "combmath.h"
+
 namespace lddecode {
 
 // Shared cadence sentinels used by current decoders.
@@ -35,6 +37,13 @@ enum class CarrierPhaseAuthority {
     Metadata,       // capture metadata / field cadence; highest priority
     BurstMeasured,  // per-line burst measurement; calibration evidence
     RigidSchedule,  // rigid NTSC derivation; fallback / diagnostic only
+};
+
+enum class CarrierPhaseRelation {
+    Unknown,
+    Same,
+    Opposite,
+    Other
 };
 
 struct CarrierGrammarSpan {
@@ -63,6 +72,23 @@ struct CarrierGrammarSpan {
 struct CarrierGrammarAffine {
     double R[2][2] = {{1.0, 0.0}, {0.0, 1.0}};
     bool   valid   = false;
+};
+
+struct CarrierGrammarDemodCoefficients {
+    double ti = 0.0;
+    double tq = 0.0;
+    int phase = 0;
+    bool valid = false;
+};
+
+struct CarrierGrammarCompositeRemodPlan {
+    int samplePhase0 = 0;
+    double lineScale = 1.0;
+};
+
+struct CarrierGrammarCompositeRemodCursor {
+    int phase = 0;
+    double lineScale = 1.0;
 };
 
 struct CarrierGrammarState {
@@ -115,6 +141,163 @@ struct CarrierGrammarState {
 
     std::vector<CarrierGrammarSpan> spans;
 };
+
+inline int carrierGrammarSampleClass(const CarrierGrammarState *grammar, int h)
+{
+    const int phase0 = grammar ? grammar->samplePhase0 : 0;
+    return (h + phase0) & 3;
+}
+
+inline int carrierGrammarSampleClass(const CarrierGrammarState &grammar, int h)
+{
+    return carrierGrammarSampleClass(&grammar, h);
+}
+
+inline int carrierGrammarSignedSampleClass(const CarrierGrammarState *grammar, int h)
+{
+    int phase = carrierGrammarSampleClass(grammar, h);
+    if (grammar && grammar->lineFlip < 0)
+        phase = (phase + 2) & 3;
+    return phase;
+}
+
+inline int carrierGrammarSignedSampleClass(const CarrierGrammarState &grammar, int h)
+{
+    return carrierGrammarSignedSampleClass(&grammar, h);
+}
+
+inline int carrierGrammarOppositeSampleClass(const CarrierGrammarState *grammar, int h)
+{
+    return (carrierGrammarSignedSampleClass(grammar, h) + 2) & 3;
+}
+
+inline int carrierGrammarOppositeSampleClass(const CarrierGrammarState &grammar, int h)
+{
+    return carrierGrammarOppositeSampleClass(&grammar, h);
+}
+
+inline CarrierPhaseRelation carrierGrammarPhaseRelation(int phaseA, int phaseB)
+{
+    phaseA &= 3;
+    phaseB &= 3;
+    if (phaseA == phaseB)
+        return CarrierPhaseRelation::Same;
+    if (((phaseA + 2) & 3) == phaseB)
+        return CarrierPhaseRelation::Opposite;
+    return CarrierPhaseRelation::Other;
+}
+
+inline CarrierPhaseRelation carrierGrammarSignedPhaseRelation(
+    const CarrierGrammarState *aGrammar, int aH,
+    const CarrierGrammarState *bGrammar, int bH)
+{
+    if (!aGrammar || !bGrammar)
+        return CarrierPhaseRelation::Unknown;
+    return carrierGrammarPhaseRelation(
+        carrierGrammarSignedSampleClass(aGrammar, aH),
+        carrierGrammarSignedSampleClass(bGrammar, bH));
+}
+
+inline bool carrierGrammarLockedDemodCoefficients(
+    const CarrierGrammarState *grammar,
+    int h,
+    CarrierGrammarDemodCoefficients &out)
+{
+    out = {};
+    if (!grammar || !grammar->grammarLocked)
+        return false;
+
+    out.phase = carrierGrammarSampleClass(grammar, h);
+    out.ti = static_cast<double>(grammar->demodLUTTi[out.phase]);
+    out.tq = static_cast<double>(grammar->demodLUTTq[out.phase]);
+    out.valid = true;
+    return true;
+}
+
+inline bool carrierGrammarHasAffine(const CarrierGrammarState *grammar)
+{
+    return grammar && grammar->affine.valid;
+}
+
+inline void carrierGrammarApplyAffine(const CarrierGrammarState *grammar,
+                                      double &ti,
+                                      double &tq)
+{
+    if (!carrierGrammarHasAffine(grammar))
+        return;
+
+    const CarrierGrammarAffine &affine = grammar->affine;
+    const double ai = affine.R[0][0] * ti + affine.R[0][1] * tq;
+    const double aq = affine.R[1][0] * ti + affine.R[1][1] * tq;
+    ti = ai;
+    tq = aq;
+}
+
+inline CarrierGrammarCompositeRemodPlan carrierGrammarCompositeRemodPlan(
+    const CarrierGrammarState *grammar,
+    double lineScale = 1.0,
+    CarrierSignFrame sourceFrame = CarrierSignFrame::Grid4fsc)
+{
+    CarrierGrammarCompositeRemodPlan plan;
+    plan.samplePhase0 = grammar ? grammar->samplePhase0 : 0;
+    const bool needsScheduleSign = sourceFrame == CarrierSignFrame::UnsignedBucket;
+    plan.lineScale = (needsScheduleSign && grammar)
+        ? lineScale * static_cast<double>(grammar->lineFlip)
+        : lineScale;
+    return plan;
+}
+
+inline CarrierGrammarCompositeRemodCursor carrierGrammarCompositeRemodCursor(
+    const CarrierGrammarState *grammar,
+    int firstH,
+    double lineScale = 1.0,
+    CarrierSignFrame sourceFrame = CarrierSignFrame::Grid4fsc)
+{
+    const CarrierGrammarCompositeRemodPlan plan =
+        carrierGrammarCompositeRemodPlan(grammar, lineScale, sourceFrame);
+    CarrierGrammarCompositeRemodCursor cursor;
+    cursor.phase = (firstH + plan.samplePhase0) & 3;
+    cursor.lineScale = plan.lineScale;
+    return cursor;
+}
+
+inline double carrierGrammarRemod4fscToComposite(
+    const CarrierGrammarCompositeRemodPlan &plan,
+    int h,
+    double i4fsc,
+    double q4fsc)
+{
+    const int phase = (h + plan.samplePhase0) & 3;
+    return remod4fscToCompositePhase(i4fsc, q4fsc, phase, plan.lineScale);
+}
+
+inline double carrierGrammarRemod4fscToComposite(
+    CarrierGrammarCompositeRemodCursor &cursor,
+    double i4fsc,
+    double q4fsc)
+{
+    const int phase = cursor.phase;
+    cursor.phase = (cursor.phase + 1) & 3;
+    return remod4fscToCompositePhase(i4fsc, q4fsc, phase, cursor.lineScale);
+}
+
+inline void carrierGrammarAdvanceRemodCursor(CarrierGrammarCompositeRemodCursor &cursor)
+{
+    cursor.phase = (cursor.phase + 1) & 3;
+}
+
+inline double carrierGrammarRemod4fscToComposite(
+    const CarrierGrammarState *grammar,
+    int h,
+    double i4fsc,
+    double q4fsc,
+    double lineScale = 1.0,
+    CarrierSignFrame sourceFrame = CarrierSignFrame::Grid4fsc)
+{
+    const CarrierGrammarCompositeRemodPlan plan =
+        carrierGrammarCompositeRemodPlan(grammar, lineScale, sourceFrame);
+    return carrierGrammarRemod4fscToComposite(plan, h, i4fsc, q4fsc);
+}
 
 // Policy for merging the two per-field cadence IDs into one frame-level mode.
 // Defaults preserve current chroma-decoder behavior.

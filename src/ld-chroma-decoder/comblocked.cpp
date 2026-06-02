@@ -473,11 +473,15 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             grammarLocked &&
             grammar->affine.valid;
 
-        const CombCarrierGrammar *affineGrammar =
-            haveAffine ? grammar : nullptr;
+        const LineAffine *lineAffine =
+            haveAffine ? &grammar->affine : nullptr;
 
         auto applyLineAffine = [&](double &ti, double &tq) {
-            lddecode::carrierGrammarApplyAffine(affineGrammar, ti, tq);
+            if (!lineAffine) return;
+            const double ai = lineAffine->R[0][0] * ti + lineAffine->R[0][1] * tq;
+            const double aq = lineAffine->R[1][0] * ti + lineAffine->R[1][1] * tq;
+            ti = ai;
+            tq = aq;
         };
 
         // Luma smooth for directional edge analysis (still from the luma
@@ -905,13 +909,17 @@ void Comb::FrameBuffer::splitIQlocked()
         float *prodIRow = lockedProductI_line(line);
         float *prodQRow = lockedProductQ_line(line);
 
-        const CombCarrierGrammar *affineGrammar = nullptr;
+        const LineAffine *lineAffine = nullptr;
         if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
                 && grammarLocked && grammar->affine.valid) {
-            affineGrammar = grammar;
+            lineAffine = &grammar->affine;
         }
         auto applyLineAffine = [&](double &ti, double &tq) {
-            lddecode::carrierGrammarApplyAffine(affineGrammar, ti, tq);
+            if (!lineAffine) return;
+            const double ai = lineAffine->R[0][0] * ti + lineAffine->R[0][1] * tq;
+            const double aq = lineAffine->R[1][0] * ti + lineAffine->R[1][1] * tq;
+            ti = ai;
+            tq = aq;
         };
 
         for (int xi = 0; xi < width; ++xi) {

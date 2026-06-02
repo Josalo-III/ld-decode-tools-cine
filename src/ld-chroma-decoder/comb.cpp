@@ -2058,10 +2058,11 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         double tq = 0.0;
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        lddecode::CarrierGrammarDemodCoefficients coeff;
-        if (lddecode::carrierGrammarLockedDemodCoefficients(grammar, h, coeff)) {
-            ti = coeff.ti;
-            tq = coeff.tq;
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        if (grammarLocked)
+        {
+            ti = (double)grammar->demodLUTTi[ph];
+            tq = (double)grammar->demodLUTTq[ph];
         } else {
             double lutTi[4], lutTq[4];
             fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
@@ -2075,18 +2076,25 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
 
     auto sampleLockedIQ = [&](int line, int rel)->std::complex<double> {
         const int h = left + std::clamp(rel, 0, width - 1);
+        const int ph = carrierSampleClass(line, h);
+        double ti = 0.0;
+        double tq = 0.0;
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        lddecode::CarrierGrammarDemodCoefficients coeff;
-        if (!lddecode::carrierGrammarLockedDemodCoefficients(grammar, h, coeff))
+        if (grammar && grammar->grammarLocked)
+        {
+            ti = (double)grammar->demodLUTTi[ph];
+            tq = (double)grammar->demodLUTTq[ph];
+        } else {
             return {0.0, 0.0};
+        }
 
         const double *row = locked1DSource_line(line);
         if (!row)
             return {0.0, 0.0};
 
         const double c = row[std::clamp(rel, 0, width - 1)];
-        return { c * coeff.ti, c * coeff.tq };
+        return { c * ti, c * tq };
     };
 
     auto lockedScalar = [&](int line, int rel)->double {
