@@ -1958,9 +1958,12 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
         return;
 
     // lumaSmooth is the interpolated curve through 4-sample block centers.
-    // Avoid floor() per pixel by filling spans between block anchors directly.
+    // Reuse the baseY4 block means when available so we don't re-average the
+    // same 4-sample windows a second time just to build the smooth scaffold.
     auto blockAvg = [&](int block)->double {
         const int x0 = std::clamp(block * 4, 0, std::max(0, width - 4));
+        if (baseY4)
+            return baseY4[x0];
         return 0.25 * ((double)rawLine[left + x0 + 0] +
                        (double)rawLine[left + x0 + 1] +
                        (double)rawLine[left + x0 + 2] +
@@ -2055,11 +2058,10 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         double tq = 0.0;
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        const bool grammarLocked = grammar && grammar->grammarLocked;
-        if (grammarLocked)
-        {
-            ti = (double)grammar->demodLUTTi[ph];
-            tq = (double)grammar->demodLUTTq[ph];
+        lddecode::CarrierGrammarDemodCoefficients coeff;
+        if (lddecode::carrierGrammarLockedDemodCoefficients(grammar, h, coeff)) {
+            ti = coeff.ti;
+            tq = coeff.tq;
         } else {
             double lutTi[4], lutTq[4];
             fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
@@ -2073,25 +2075,18 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
 
     auto sampleLockedIQ = [&](int line, int rel)->std::complex<double> {
         const int h = left + std::clamp(rel, 0, width - 1);
-        const int ph = carrierSampleClass(line, h);
-        double ti = 0.0;
-        double tq = 0.0;
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        if (grammar && grammar->grammarLocked)
-        {
-            ti = (double)grammar->demodLUTTi[ph];
-            tq = (double)grammar->demodLUTTq[ph];
-        } else {
+        lddecode::CarrierGrammarDemodCoefficients coeff;
+        if (!lddecode::carrierGrammarLockedDemodCoefficients(grammar, h, coeff))
             return {0.0, 0.0};
-        }
 
         const double *row = locked1DSource_line(line);
         if (!row)
             return {0.0, 0.0};
 
         const double c = row[std::clamp(rel, 0, width - 1)];
-        return { c * ti, c * tq };
+        return { c * coeff.ti, c * coeff.tq };
     };
 
     auto lockedScalar = [&](int line, int rel)->double {

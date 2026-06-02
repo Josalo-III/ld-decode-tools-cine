@@ -12,7 +12,6 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 
 namespace lddecode {
@@ -58,7 +57,6 @@ struct FourViewCarrierView {
 };
 
 struct FourViewCarrierAttribution {
-    std::array<FourViewCarrierView, 4> views = {};
     int viewCount = 0;
     bool valid = false;
 
@@ -86,9 +84,6 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
 
     if (!views || out.viewCount <= 0)
         return out;
-
-    for (int i = 0; i < out.viewCount; ++i)
-        out.views[i] = views[i];
 
     out.valid = true;
 
