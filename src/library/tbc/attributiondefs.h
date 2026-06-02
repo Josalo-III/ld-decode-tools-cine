@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace lddecode {
@@ -41,6 +42,125 @@ struct AttributionRules {
 };
 
 inline constexpr AttributionRules kDefaultAttributionRules = {};
+
+// Four legal 4fSC luma-floor views of the same raw waveform form a local
+// parallax set.  The carrier model should come from the IQ component that is
+// common across those views; disagreement between views is attribution evidence,
+// not just a private decoder heuristic.
+struct FourViewCarrierView {
+    double yFloor = 0.0;
+    double carrierI = 0.0;
+    double carrierQ = 0.0;
+    double remodErrorIRE = 0.0;
+    double latticeRiskIRE = 0.0;
+    double ySpanIRE = 0.0;
+    double score = 0.0;
+};
+
+struct FourViewCarrierAttribution {
+    std::array<FourViewCarrierView, 4> views = {};
+    int viewCount = 0;
+    bool valid = false;
+
+    double yCenter = 0.0;
+    double ySpreadIRE = 0.0;
+    double ySlopeIRE = 0.0;
+    double yCurvatureIRE = 0.0;
+
+    double commonI = 0.0;
+    double commonQ = 0.0;
+    double commonMagIRE = 0.0;
+    double carrierSpreadIRE = 0.0;
+    double carrierCoherence = 0.0;
+    double latticeRiskIRE = 0.0;
+    double carrierScore = 0.0;
+};
+
+inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
+    const FourViewCarrierView *views,
+    int viewCount,
+    double invIreScale)
+{
+    FourViewCarrierAttribution out;
+    out.viewCount = std::clamp(viewCount, 0, 4);
+
+    if (!views || out.viewCount <= 0)
+        return out;
+
+    for (int i = 0; i < out.viewCount; ++i)
+        out.views[i] = views[i];
+
+    out.valid = true;
+
+    double minFloor = views[0].yFloor;
+    double maxFloor = views[0].yFloor;
+    double sumFloor = 0.0;
+    for (int i = 0; i < out.viewCount; ++i) {
+        minFloor = std::min(minFloor, views[i].yFloor);
+        maxFloor = std::max(maxFloor, views[i].yFloor);
+        sumFloor += views[i].yFloor;
+    }
+    out.yCenter = sumFloor / static_cast<double>(out.viewCount);
+    out.ySpreadIRE = (maxFloor - minFloor) * invIreScale;
+
+    if (out.viewCount >= 2) {
+        out.ySlopeIRE =
+            (views[out.viewCount - 1].yFloor - views[0].yFloor) * invIreScale /
+            static_cast<double>(out.viewCount - 1);
+    }
+    if (out.viewCount >= 3) {
+        double curvSum = 0.0;
+        int curvN = 0;
+        for (int i = 1; i + 1 < out.viewCount; ++i) {
+            curvSum += std::fabs(views[i - 1].yFloor -
+                                 2.0 * views[i].yFloor +
+                                 views[i + 1].yFloor);
+            ++curvN;
+        }
+        out.yCurvatureIRE = (curvN > 0)
+            ? (curvSum / static_cast<double>(curvN)) * invIreScale
+            : 0.0;
+    }
+
+    int best = 0;
+    double bestCost = 1e300;
+    for (int i = 0; i < out.viewCount; ++i) {
+        double cost = 0.0;
+        for (int j = 0; j < out.viewCount; ++j) {
+            cost += std::hypot(views[i].carrierI - views[j].carrierI,
+                               views[i].carrierQ - views[j].carrierQ) * invIreScale;
+        }
+        cost += 0.05 * std::max(0.0, views[i].score);
+        if (cost < bestCost) {
+            bestCost = cost;
+            best = i;
+        }
+    }
+
+    out.commonI = views[best].carrierI;
+    out.commonQ = views[best].carrierQ;
+    out.commonMagIRE = std::hypot(out.commonI, out.commonQ) * invIreScale;
+    out.carrierScore = views[best].score;
+
+    double spread = 0.0;
+    double lattice = 0.0;
+    for (int i = 0; i < out.viewCount; ++i) {
+        spread = std::max(
+            spread,
+            std::hypot(views[i].carrierI - out.commonI,
+                       views[i].carrierQ - out.commonQ) * invIreScale);
+        lattice = std::max(lattice, views[i].latticeRiskIRE);
+    }
+
+    out.carrierSpreadIRE = spread;
+    out.latticeRiskIRE = lattice;
+    out.carrierCoherence = 1.0 - std::clamp(
+        spread / std::max(3.0, 0.35 * out.commonMagIRE + 1.0),
+        0.0,
+        1.0);
+
+    return out;
+}
 
 struct AttributionEvidence {
     // Luma / residual waveform evidence.
@@ -102,6 +222,11 @@ struct AttributionEvidence {
     double quarterSlidingCoherence = 0.0;
     double quarterSlidingPhaseDisorder = 0.0;
     double quarterSlidingYPrior = 0.0;
+    double carrierParallaxYSpreadIRE = 0.0;
+    double carrierParallaxYCurvatureIRE = 0.0;
+    double carrierParallaxSpreadIRE = 0.0;
+    double carrierParallaxCoherence = 0.0;
+    double carrierParallaxLatticeRiskIRE = 0.0;
 
     // IQ / chroma-envelope evidence.
     double iqChromaMagIRE = 0.0;
@@ -276,6 +401,11 @@ struct CombAttributionFacts {
     double bandpassCoarseIRE = 0.0;
 
     double quarterCheckerboardRisk = 0.0;
+    double carrierParallaxYSpreadIRE = 0.0;
+    double carrierParallaxYCurvatureIRE = 0.0;
+    double carrierParallaxSpreadIRE = 0.0;
+    double carrierParallaxCoherence = 0.0;
+    double carrierParallaxLatticeRiskIRE = 0.0;
     double sidebandSinResidualIRE = 0.0;
     double sidebandCosResidualIRE = 0.0;
     double sidebandAxisAsymmetry = 0.0;

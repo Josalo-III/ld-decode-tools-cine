@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
     QCommandLineOption twoDVariantOption(
         QStringList() << QCoreApplication::translate("main", "two-d-variant"),
         QCoreApplication::translate("main",
-            "2D comb variant: line | field | fieldb | frame-preclean | frameb | fvf (default)"),
+            "2D comb variant: line | field-a-contour | field-b-simple | frame-a-adaptive-iq | frame-b-direct-iq | fvf (default)"),
         QCoreApplication::translate("main", "variant"),
         QCoreApplication::translate("main", "fvf"));
     parser.addOption(twoDVariantOption);
@@ -314,7 +314,7 @@ int main(int argc, char *argv[])
     parser.addOption(debugCadenceOption);
 
     QCommandLineOption debugPhaseLegsOption(QStringList() << "debug-phase-legs",
-                                    QCoreApplication::translate("main", "NTSC locked mode: log per-(h&3) phase-leg demod residual statistics for diagnosing ordered column artifacts"));
+                                    QCoreApplication::translate("main", "NTSC locked mode: log carrier-fit residual statistics for diagnosing ordered column artifacts"));
     parser.addOption(debugPhaseLegsOption);
 
     QCommandLineOption noPAOption(QStringList() << "no-pa",
@@ -426,20 +426,23 @@ int main(int argc, char *argv[])
     QString v = parser.value(twoDVariantOption).toLower();
     if (v == "line") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Line;
-    } else if (v == "field" || v == "fielda") {
-        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::Field;
-    } else if (v == "fieldb") {
-        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldB;
-    } else if (v == "frame-preclean" || v == "preclean-frame" || v == "framea") {
-        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FramePreclean;
-    } else if (v == "frameb" || v == "frame-b" || v == "frame-b-preclean" ||
+    } else if (v == "field-a-contour" || v == "contour-field" || v == "field" || v == "fielda") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldAContour;
+    } else if (v == "field-b-simple" || v == "simple-field" || v == "fieldb") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldBSimple;
+    } else if (v == "frame-a-adaptive-iq" || v == "adaptive-frame-iq" ||
+               v == "preclean-frame-iq" || v == "frame-preclean" ||
+               v == "preclean-frame" || v == "framea") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ;
+    } else if (v == "frame-b-direct-iq" || v == "direct-frame-iq" ||
+               v == "locked-frame-iq" || v == "frameb" || v == "frame-b" || v == "frame-b-preclean" ||
                v == "frame-raw" || v == "raw-frame") {
-        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameRaw;
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameBDirectIQ;
     } else if (v == "frame") {
         // Backward-compat: historically "frame" was ambiguous / repurposed in experiments.
         // Default it to the precleaned interfield Frame to preserve legacy expectations.
-        qWarning() << "two-d-variant=frame is deprecated; use frame-preclean or frameb";
-        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FramePreclean;
+        qWarning() << "two-d-variant=frame is deprecated; use frame-a-adaptive-iq or frame-b-direct-iq";
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ;
     } else if (v == "fvf" || v == "fieldvframe") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FieldVsFrame;
     } else {

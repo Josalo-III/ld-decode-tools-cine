@@ -82,12 +82,12 @@ public:
 
         // Scoring / penalties used in candidate selection:
         enum TwoDVariant {
-            Line,           // 1D only
-            Field,          // Field A (longer reach; more rules)
-            FieldB,         // Field B (Simple)
-            FramePreclean,  // Frame A: scalar interfield frame from Field B-precleaned scalar
-            FrameRaw,       // Frame B: simple interfield frame from locked 1D IQ
-            FieldVsFrame    // FVF (Default)
+            Line,             // 1D only
+            FieldAContour,    // Field A: contour-aware same-field +/-2 comb with +/-4 support
+            FieldBSimple,     // Field B: direct same-field +/-2 comb
+            FrameAAdaptiveIQ, // Frame A: column-phase-aligned adaptive interframe IQ comb
+            FrameBDirectIQ,   // Frame B: direct interframe IQ comb without neighbor phase alignment
+            FieldVsFrame      // FVF (Default)
         };
         TwoDVariant twoDVariant = FieldVsFrame;
     
@@ -150,7 +150,7 @@ public:
             // Frame comb on phase-corrected 1D
             // =========================================================================
             double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
-            double FRAME_B_COMB_STRENGTH      = 1.00;  // same for Frame B (raw locked-1D interframe path)
+            double FRAME_B_COMB_STRENGTH      = 1.00;  // same for Frame B's direct interframe path
             double FRAME_CHROMA_MIN_IRE       = 2.5;   // minimum chroma amplitude to engage the frame IQ path
             double FRAME_IQ_RAW_MAX_DELTA_IRE = 8.0;   // max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
             double FRAME_B_LEAK_NEG_CORR_START = 0.30; // signed corr negativity where Frame B starts treating vertical alternation as leakage
@@ -160,6 +160,13 @@ public:
             double FRAME_B_LEAK_CENTER_DELTA_START_IRE = 1.5; // |center - avg(Up,Dn)| where symmetric cleanup starts to look worthwhile
             double FRAME_B_LEAK_CENTER_DELTA_FULL_IRE  = 5.5; // |center - avg(Up,Dn)| where symmetric cleanup confidence is full
             double FRAME_B_LEAK_STRENGTH_BOOST = 0.45; // extra push toward full comb strength when leakage is likely
+
+            // Carrier-retracted upstream comb: in progressive saturated color,
+            // let carrier sign agreement override luma-edge caution so Field A/B
+            // receive a pre-cancelled source instead of inherited checkerboards.
+            double RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE = 8.0;
+            double RETRACTED_PROGRESSIVE_CHROMA_RELAX_FULL_IRE  = 20.0;
+            double RETRACTED_PROGRESSIVE_LUMA_GATE_FLOOR        = 0.85;
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -400,10 +407,10 @@ public:
 	void produceY();        // Product path
 	void ensureProduceYScratch(int width);
 	// Build the carrier-retracted view and derived products:
-	//   carrierFit_flat       — per-line LS carrier model
-	//   carrierRetracted_flat — raw minus carrier fit (flattened)
+	//   carrierFit_flat       — per-line carrier model
+	//   carrierRetracted_flat — raw minus carrier model (flattened)
 	//   flatFloor_flat        — 4-sample-mean carrier-free luma floor
-	//   combedCarrier_flat    — line-to-line cancelled carrier fit
+	//   combedCarrier_flat    — line-to-line cancelled carrier model
 	// Must be called after phaseLocked() and before split2D().
 	// The locked path skips split1D; buildPhaseCorrected1D sources
 	// from combedCarrier instead of clpbuffer[0].
@@ -461,9 +468,13 @@ private:
 	struct CombTapPair {
 		double diffIRE = std::numeric_limits<double>::infinity();
 		double iqDiffIRE = std::numeric_limits<double>::infinity();
+		double lumaDiffIRE = std::numeric_limits<double>::infinity();
 		double coherence = 1.0;
 		double kScore = 0.0;
 		double weight = 1.0;
+		double reachGate = 1.0;       // shared IQ/contour limiter for this side's vertical reach
+		double iqReachGate = 1.0;     // locked-IQ material match limiter
+		double contourReachGate = 1.0;// scalar contour limiter (same-field reaches)
 	};
 
 	struct CombTapContour {
@@ -565,13 +576,13 @@ private:
 	std::vector<double> scratch_lumaBaseY4;
 	std::vector<double> scratch_lumaHiRaw;
 	std::vector<double> scratch_lumaSmooth;
-	// 3-slot ring buffers caching an intrafield comb output (chroma + gate)
-	// used as preclean input for locked Frame IQ demod. Only adjacent lines are needed.
+	// 3-slot ring buffers caching Field B output as shared preclean input.
+	// Frame A and Frame B only need the center line and adjacent frame lines.
 	std::array<std::vector<double>, 3> precleanRing;
 	std::array<std::vector<double>, 3> precleanGateRing;
 	std::array<int, 3> precleanRingLine = { -1, -1, -1 };
-		std::vector<double> scratch_frameBCenter; // Frame B scalar candidate (locked 1D interfield path).
-		std::vector<double> scratch_fieldBCenter; // Frame A scalar candidate / preclean remod composite.
+		std::vector<double> scratch_frameAAdaptiveIQComposite; // Frame A IQ candidate remodulated to composite.
+		std::vector<double> scratch_frameBDirectIQComposite;   // Frame B IQ candidate remodulated to composite.
 		std::vector<float> demodTRI_flat;
 		std::vector<float> demodTRQ_flat;
 		std::vector<double> scratch_preI;          // Unscaled pre-FIR I row (per-line).
@@ -594,7 +605,7 @@ private:
 	std::vector<std::complex<double>> scratch_upIQ;
 	std::vector<std::complex<double>> scratch_dnIQ;
 		// Shared line scratch planes used by split2D / produceY / buildCarrierRetracted.
-		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY; LS carrier fit row.
+		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY; carrier-model row.
 		std::vector<double> scratch_lineWorkB; // Field gate row; coherent carrier estimate (cHat) in produceY.
 		std::vector<double> scratch_lineWorkC; // Field B scalar row; tqAdjLocked in produceY; flattened row.
 	// FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
@@ -617,6 +628,7 @@ private:
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
 		std::vector<double> locked1DSource_flat; // 1D locked scalar export used by 2D/3D and diagnostics.
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
+		std::vector<lddecode::FourViewCarrierAttribution> carrierParallax_flat; // Four-view carrier/Y attribution analysis from buildCarrierRetracted.
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
@@ -624,7 +636,8 @@ private:
 	// after phaseLocked(); valid when carrierRetractedValid is true.
 	// Same geometry as the demod flat buffers (demodLines x demodWidth).
 	//
-	// carrierFit_flat       — per-line LS carrier fit (composite-space scalar).
+	// carrierFit_flat       — per-line carrier model from four-view common-IQ
+	//                         attribution; LS can refit gated luma edges.
 	// carrierRetracted_flat — raw composite minus carrierFit (flattened view).
 	// flatFloor_flat        — 4-sample sliding-mean of flattened (carrier-free
 	//                         luma floor; safe for alien-Y reasoning because the
@@ -808,29 +821,31 @@ private:
 	void invalidateCombTapCache();
 	const CombTapLine &ensureCombTapLine(int lineNumber);
 	void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
-	void computeField2DLine(int lineNumber,
+	void computeContourFieldLine(int lineNumber,
 						  double *outFieldLine,
 						  double  *outGate);
-	void computeField2DLine(const CombTapLine &tapLine,
+	void computeContourFieldLine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  double  *outGate);
 
-	void computeSimpleField2DLine(int lineNumber, double *outFieldLine);
-	void computeSimpleField2DLine(const CombTapLine &tapLine, double *outFieldLine);
-	
-	void computeFrameScalarLine(int lineNumber, double *outFrameLine);
-	void computeFrameScalarLine(const CombTapLine &tapLine, double *outFrameLine);
+	void computeSimpleFieldLine(int lineNumber, double *outFieldLine);
+	void computeSimpleFieldLine(const CombTapLine &tapLine, double *outFieldLine);
 
-	void computeFrameIQPrecleanLine(int line,
-									std::vector<std::complex<double>> &outFrameIQ,
-									bool enableLateralRefine = true);
-	void computeFrameBLocked1DLine(int line,
+	void computeFrameAAdaptiveIQLine(int line,
+									std::vector<std::complex<double>> &outFrameIQ);
+	void computeFrameBDirectIQCompositeLine(int line,
 								   std::vector<std::complex<double>> &outFrameIQ,
 								   std::vector<double> &outFrameScalar);
-	void computeFrameIQLocked1DLine(int line,
+	void computeFrameBDirectIQLine(int line,
 									std::vector<std::complex<double>> &outFrameIQ,
 									const std::vector<float> *tiOverride = nullptr,
 									const std::vector<float> *tqOverride = nullptr);
+	void computeFrameBDirectIQFromPreparedVectors(int line,
+									const std::vector<std::complex<double>> &centerIQ,
+									const std::vector<std::complex<double>> &upIQ,
+									const std::vector<std::complex<double>> &dnIQ,
+									std::vector<std::complex<double>> &outFrameIQ,
+									const CombTapLine *reachTapLine = nullptr);
 		void computeFrameIQFromPreparedVectors(int line,
 											   const std::vector<std::complex<double>> &centerIQ,
 											   std::vector<std::complex<double>> &upIQ,
@@ -838,7 +853,7 @@ private:
 											   std::vector<std::complex<double>> &outFrameIQ,
 											   const std::vector<float> *tiOverride,
 											   const std::vector<float> *tqOverride,
-											   bool enableLateralRefine,
+											   const CombTapLine *reachTapLine = nullptr,
 											   bool allowSymmetricLeakCancel = false);
 	void collectCombAttributionEvidence(int line,
 									   const double *fieldA,
@@ -865,8 +880,8 @@ private:
 		const double *fieldA,
 		const double *fieldB,
 		const double *fieldAGate,
-		const std::vector<double> &framePreclean,
-		const std::vector<double> *frameRaw,
+		const std::vector<double> &frameA,
+		const std::vector<double> *frameB,
 		double *outMixed,
 		bool writeWeights,
 		const double *lateral1D,

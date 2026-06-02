@@ -183,10 +183,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         if (canLoadNext && (fieldIndex + 2 >= 0)) {
             next->loadFields(inputFields[fieldIndex + 2], inputFields[fieldIndex + 3]);
             if (configuration.phaseCompensation) {
-                // Locked path: the LS carrier model + line-to-line cancellation
+                // Locked path: the four-view carrier attribution model plus
+                // line-to-line cancellation
                 // replaces split1D's blind bandpass entirely.
-                //   phaseLocked        → burst grammar, baseY4, raw TRI/TRQ, affine
-                //   buildCarrierRetracted → per-line LS carrier fit, flatFloor,
+                //   phaseLocked        → burst grammar, baseY4, raw TRI/TRQ
+                //   buildCarrierRetracted → per-line carrier fit, flatFloor,
                 //                           combed carrier (alien-Y rejected)
                 //   split2D → buildPhaseCorrected1D demods the combed carrier
                 next->phaseLocked();
@@ -229,7 +230,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
         // Coherent Demod + Y pipeline
         if (configuration.phaseCompensation) {
-            // 1) Carrier grammar + LS carrier fit + line cancellation (pre-pass)
+            // 1) Carrier grammar + four-view carrier fit + line cancellation (pre-pass)
             // 2) Combed-carrier demod for 1D, 2D scoring (via buildPhaseCorrected1D)
             // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
             // 4) Re-demod final selected comb and produce locked-product cache
@@ -387,8 +388,8 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
         const bool wantVdis = configuration.tunables.VDIS_ENABLE;
         const bool needFrameIQ =
-            (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FramePreclean ||
-             configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameRaw ||
+            (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
+             configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ ||
              wantFvf);
 
         // 2D score blending visualization (only written when showMap is true)
@@ -469,10 +470,13 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
+            carrierParallax_flat.assign(
+                size_t(demodLines) * demodWidth,
+                lddecode::FourViewCarrierAttribution{});
         }
         scratch_residualContested.assign(width, 0.0);
-        scratch_frameBCenter.assign(width, 0.0);
-        scratch_fieldBCenter.assign(width, 0.0);
+        scratch_frameBDirectIQComposite.assign(width, 0.0);
+        scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
     }
 }
 
@@ -614,7 +618,14 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
     a.lumaRisk = std::max(
         std::clamp(f.lumaIncursionRiskIRE / 8.0, 0.0, 1.0),
         std::clamp(f.icebergAlienYFraction, 0.0, 1.0));
-    a.checkerboardRisk = std::clamp(f.quarterCheckerboardRisk, 0.0, 1.0);
+    const double parallaxLatticeRisk = std::clamp(
+        f.carrierParallaxLatticeRiskIRE /
+        std::max(3.0, 0.35 * maxChromaIRE + 1.0),
+        0.0,
+        1.0);
+    a.checkerboardRisk = std::max(
+        std::clamp(f.quarterCheckerboardRisk, 0.0, 1.0),
+        parallaxLatticeRisk);
     // Scale lumaResidual against the line-level forward-model error rather than
     // a fixed 8.0.  When the grammar has a valid projection, samples that merely
     // match the line's measured noise floor should not accumulate luma risk; the
@@ -667,8 +678,18 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
     a.coherence = (f.frameIQCoherence > 0.0)
         ? f.frameIQCoherence
         : std::clamp(1.0 - (f.residualFitErrorIRE / cohScale), 0.0, 1.0);
+    if (f.carrierParallaxCoherence > 0.0) {
+        a.coherence = std::max(
+            a.coherence,
+            std::clamp(f.carrierParallaxCoherence, 0.0, 1.0));
+    }
     a.agreement = 1.0 - std::clamp(f.frameFieldAgreementIRE / 6.0, 0.0, 1.0);
-    a.spreadPenalty = std::clamp(f.candidateSpreadIRE / 10.0, 0.0, 1.0);
+    a.spreadPenalty = std::max(
+        std::clamp(f.candidateSpreadIRE / 10.0, 0.0, 1.0),
+        std::clamp(f.carrierParallaxSpreadIRE /
+                   std::max(4.0, 0.35 * maxChromaIRE + 1.0),
+                   0.0,
+                   1.0));
     const double carrierPrior = configuration.phaseCompensation
         ? std::clamp(a.carrierPrior, 0.0, 1.0)
         : 1.0;
@@ -704,16 +725,14 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
 // Paradigm: sample @ ±1 (interfield) = Frame. Sample @ ±2 (intra) = Field.
 //
 // Candidates:
-//   idx 0 : Field A — same-line ±2 influenced by ±4 (intra-field, primary phase)
-//   idx 1 : Field B — same-line ±2 (intra-field, alt phase)
-//   idx 2 : Frame A — scalar interfield Frame (1D-conditioned same-phase
-//                     blend of framePreclean; cancels 1D chroma variations)
-//   idx 3 : Frame B — Field B-precleaned IQ interfield Frame
+//   idx 0 : Field A contour       - same-field +/-2 with +/-4 contour support
+//   idx 1 : Field B simple        - direct same-field +/-2
+//   idx 2 : Frame A adaptive IQ   - column-phase-aligned adaptive interframe IQ
+//   idx 3 : Frame B direct IQ     - direct interframe IQ without neighbor phase alignment
 //
 // Diverging Frame preferences are scored independently:
-//   Frame A is favored under a vertical contrast regime and where same-phase
-//   1D conditioning has materially corrected a chroma deviation.
-//   Frame B is favored under a strong horizontal luma edge.
+//   Frame A is favored where adaptive response and fine detail matter.
+//   Frame B is favored under strong edges and saturated color.
 // Otherwise the existing election rules settle the contest (model-aware
 // scoring, FrameIQ coherence, neighbor estimate, sharpness reward, etc.).
 //
@@ -726,8 +745,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double *fieldA,
     const double *fieldB,
     const double *fieldAGate,
-    const std::vector<double> &framePreclean,
-    const std::vector<double> *frameRaw,
+    const std::vector<double> &frameA,
+    const std::vector<double> *frameB,
     double *outMixed,
     bool writeWeights,
     const double *lateral1D,
@@ -737,7 +756,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
     if (width <= 0) return;
-    if (!fieldA || !fieldB || (int)framePreclean.size() < width || !outMixed) return;
+    if (!fieldA || !fieldB || (int)frameA.size() < width || !outMixed) return;
     if (line >= 0 && line < (int)fvfMetrics.size() &&
         (int)fvfMetrics[line].size() < width)
     {
@@ -812,6 +831,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double rv = srcLine[rp2];
         return 0.25 * (l + 2.0 * c + rv);
     };
+    auto sameLatticeAltIRE = [&](double c, double l2, double r2)->double {
+        return std::fabs(c - 0.5 * (l2 + r2)) * invI;
+    };
     auto vertContrastIRE = [&](int rel)->double {
         int upLine = line - 2, dnLine = line + 2;
         if (upLine < firstLine || dnLine >= lastLine) return 0.0;
@@ -845,8 +867,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double SAT_FALLBACK_FULL  = 20.0;
     double prev_interfield_luma_ire = 0.0;
     double prev_sat_t = 0.0;
-    const double *frameRawData =
-        (frameRaw && (int)frameRaw->size() >= width) ? frameRaw->data() : nullptr;
+    const double *frameBData =
+        (frameB && (int)frameB->size() >= width) ? frameB->data() : nullptr;
 
     // Core Logic of Field Vs Frame
     // when the footage is progressive we prefer interfield comb
@@ -904,8 +926,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         const int rp2 = std::min(width - 1, rel + 2);
         double FA = fieldA[rel];
         double FB = fieldB[rel];
-        double FR = framePreclean[rel];
-        double FR_raw = (frameRaw && rel < (int)frameRaw->size()) ? (*frameRaw)[rel] : FR;
+        double FR = frameA[rel];
+        double FR_raw = (frameB && rel < (int)frameB->size()) ? (*frameB)[rel] : FR;
         double L1 = sample1D(rel);
 
         double satFR_demod = 0.0;
@@ -919,12 +941,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         const double FA_s = FA;
         const double FB_s = FB;
         const double FR_s = FR;
+        const double FRB_s = FR_raw;
         // Luma proxies: prefer the pure even-offset notch (±2 average), which is
         // less sensitive to single-pixel spikes than a [1,2,1] that includes center.
         double lumFA = getNotchLumaEven2(fieldA, rel, width);
         double lumFB = getNotchLumaEven2(fieldB, rel, width);
-        double lumFR = getNotchLumaEven2Vec(framePreclean, rel);
-        double lumFRRaw = frameRaw ? getNotchLumaEven2Vec(*frameRaw, rel) : lumFR;
+        double lumFR = getNotchLumaEven2Vec(frameA, rel);
+        double lumFRRaw = frameB ? getNotchLumaEven2Vec(*frameB, rel) : lumFR;
 
         int maskVal = 0;
         if (line >= firstLine && line < lastLine &&
@@ -994,6 +1017,72 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         double vIRE = vertContrastIRE(rel);
         double hIRE = horizEdgeIRE(rel);
+        double contourStraight = 1.0;
+        if (rel >= 0 && rel < (int)tapLine.contour.size()) {
+            const CombTapContour &curve = tapLine.contour[rel];
+            const double contourTrust = std::clamp(
+                curve.midOk * 0.5 * (curve.upSideOk + curve.dnSideOk), 0.0, 1.0);
+            const double contourCurvNorm = std::clamp(
+                curve.curvMidIRE / std::max(1.0, T.FIELD_CONTOUR_HARD_IRE), 0.0, 1.0);
+            contourStraight = std::clamp(
+                0.70 * contourTrust + 0.30 * (1.0 - contourCurvNorm), 0.0, 1.0);
+        }
+        const double srcAltIRE = sameLatticeAltIRE(C0, srcLine0[rm2], srcLine0[rp2]);
+        const double altAIRE = sameLatticeAltIRE(FA_s, fieldA[rm2], fieldA[rp2]);
+        const double altBIRE = sameLatticeAltIRE(FB_s, fieldB[rm2], fieldB[rp2]);
+        const double altRAIRE = sameLatticeAltIRE(FR_s, frameA[rm2], frameA[rp2]);
+        const double altRBIRE = frameBData
+            ? sameLatticeAltIRE(FRB_s, frameBData[rm2], frameBData[rp2])
+            : altRAIRE;
+        const double engageAIRE = std::fabs(FA_s - C0) * invI;
+        const double engageBIRE = std::fabs(FB_s - C0) * invI;
+        const double engageRAIRE = std::fabs(FR_s - C0) * invI;
+        const double engageRBIRE = std::fabs(FRB_s - C0) * invI;
+        auto buildReachPenalty = [&](bool near)->std::pair<double, double> {
+            if (!configuration.phaseCompensation || rel < 0 || rel >= tapLine.width)
+                return {0.0, 0.0};
+
+            const bool haveUp = near ? tapLine.haveU1 : tapLine.haveU2;
+            const bool haveDn = near ? tapLine.haveD1 : tapLine.haveD2;
+            const auto &upPair = near ? tapLine.pairU1 : tapLine.pairU2;
+            const auto &dnPair = near ? tapLine.pairD1 : tapLine.pairD2;
+            if (!haveUp || !haveDn ||
+                rel >= (int)upPair.size() || rel >= (int)dnPair.size())
+                return {0.0, 0.0};
+
+            const double upGate = std::clamp(upPair[rel].reachGate, 0.0, 1.0);
+            const double dnGate = std::clamp(dnPair[rel].reachGate, 0.0, 1.0);
+            const double inhibit = 1.0 - std::min(upGate, dnGate);
+            if (inhibit <= 0.02)
+                return {0.0, 0.0};
+
+            const double c0  = tapLine.tap0[rel].comp;
+            const double cUp = near ? tapLine.tapU1[rel].comp : tapLine.tapU2[rel].comp;
+            const double cDn = near ? tapLine.tapD1[rel].comp : tapLine.tapD2[rel].comp;
+            const double sideComp = (upGate >= dnGate) ? cUp : cDn;
+            const double expected = 0.5 * (c0 - sideComp);
+            return {inhibit, expected};
+        };
+        const auto reachNear = buildReachPenalty(true);
+        const auto reachFar = buildReachPenalty(false);
+        const double reachNearInhibit = reachNear.first;
+        const double reachNearExpected = reachNear.second;
+        const double reachFarInhibit = reachFar.first;
+        const double reachFarExpected = reachFar.second;
+        const double iqReachInhibit = std::max(reachNearInhibit, reachFarInhibit);
+        auto iqReachPenalty = [&](double candVal, bool near)->double {
+            const double inhibit = near ? reachNearInhibit : reachFarInhibit;
+            if (inhibit <= 0.0)
+                return 0.0;
+            const double expected = near ? reachNearExpected : reachFarExpected;
+            const double mismatchIRE = std::fabs(candVal - expected) * invI;
+            const double mismatchT = std::clamp((mismatchIRE - 0.8) / 3.0, 0.0, 1.0);
+            return inhibit * mismatchT;
+        };
+        const double iqPenA = iqReachPenalty(FA_s, false);
+        const double iqPenB = iqReachPenalty(FB_s, false);
+        const double iqPenRA = iqReachPenalty(FR_s, true);
+        const double iqPenRB = iqReachPenalty(FRB_s, true);
 
         const double TRI_SAFE_IRE = 3.0;
         bool safeA = fvf_is_tri_safe(FA_s, L1, invI, TRI_SAFE_IRE);
@@ -1032,12 +1121,15 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             int    bestIdx = 1;
             float  bestSh  = 0.0f;
 
-            auto consider = [&](int candIdx, double candVal,
+            auto consider = [&](int candIdx, double candVal, double iqPen,
                                 bool safeCand, float shadeCand)
             {
                 if (!safeCand) return;
                 double curDiff = std::fabs(bestVal - L1) * invI;
                 double newDiff = std::fabs(candVal - L1) * invI;
+                // One-sided saturated reach inhibition: if the candidate implies
+                // reaching across the wrong side, it should lose even in hard mode.
+                newDiff += 2.0 * iqPen;
                 if (newDiff < curDiff) {
                     bestVal = candVal;
                     bestIdx = candIdx;
@@ -1045,10 +1137,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             };
 
-            consider(0, FA,         safeA, 0.25f);
-            consider(1, FB,         safeB, 0.35f);
-            consider(2, FR_s,       safeR, 0.7f);   // Frame A (precleaned)
-            consider(3, FR_raw,     safeR, 0.85f);  // Frame B (Field B-precleaned IQ)
+            consider(0, FA,         iqPenA, safeA, 0.25f);
+            consider(1, FB,         iqPenB, safeB, 0.35f);
+            consider(2, FR_s,       iqPenRA, safeR, 0.7f);   // Frame A (precleaned)
+            consider(3, FR_raw,     iqPenRB, safeR, 0.85f);  // Frame B (Field B-precleaned IQ)
 
             idx   = bestIdx;
             val   = bestVal;
@@ -1062,7 +1154,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 auto getM = [&](int r) {
                     r = std::clamp(r, 0, width - 1);
                     if (localUseFrameModel)
-                        return framePreclean[r];
+                        return frameA[r];
                     else
                         return fieldA[r];
                 };
@@ -1079,9 +1171,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 double FA_r = fieldA[rp1];
                 double FB_l = fieldB[rm1];
                 double FB_r = fieldB[rp1];
-                double FR_l = framePreclean[rm1];
-                double FR_r = framePreclean[rp1];
-                const std::vector<double> &rawFrameVec = frameRaw ? *frameRaw : framePreclean;
+                double FR_l = frameA[rm1];
+                double FR_r = frameA[rp1];
+                const std::vector<double> &rawFrameVec = frameB ? *frameB : frameA;
                 double FRB_l = rawFrameVec[rm1];
                 double FRB_r = rawFrameVec[rp1];
 
@@ -1102,14 +1194,81 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
             scoreR_A = (1.0 - satScale) * devR_A + satScale * errR_notch;
             scoreR_B = (1.0 - satScale) * devR_B + satScale * errRRaw_notch;
+            // Shared IQ reach inhibition map, computed once from locked taps.
+            // Penalize candidates that would comb across a one-sided saturated boundary.
+            if (iqReachInhibit > 0.0) {
+                scoreA += 0.42 * iqPenA;
+                scoreB += 0.38 * iqPenB;
+                scoreR_A += 0.48 * iqPenRA;
+                scoreR_B += 0.44 * iqPenRB;
+            }
 
+            double attrLumaClaim = 0.0;
+            double attrChromaClaim = 0.0;
+            double attrCheckerRisk = 0.0;
+            double attrIncursionNorm = 0.0;
             if (fvfAttrRow) {
-                const double lc = std::clamp(fvfAttrRow[rel].assessment.lumaClaim,   0.0, 1.0);
-                const double cc = std::clamp(fvfAttrRow[rel].assessment.chromaClaim, 0.0, 1.0);
-                scoreR_A += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * lc;
-                scoreR_B += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * lc;
-                scoreA   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * cc;
-                scoreB   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * cc;
+                attrLumaClaim = std::clamp(fvfAttrRow[rel].assessment.lumaClaim, 0.0, 1.0);
+                attrChromaClaim = std::clamp(fvfAttrRow[rel].assessment.chromaClaim, 0.0, 1.0);
+                attrCheckerRisk = std::clamp(fvfAttrRow[rel].assessment.checkerboardRisk, 0.0, 1.0);
+                attrIncursionNorm = std::clamp(
+                    fvfAttrRow[rel].facts.lumaIncursionRiskIRE / 6.0, 0.0, 1.0);
+
+                scoreR_A += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * attrLumaClaim;
+                scoreR_B += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * attrLumaClaim;
+                scoreA   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * attrChromaClaim;
+                scoreB   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * attrChromaClaim;
+            }
+
+            // Checkerboard suppression from the new 1D path: both field combs
+            // are exposed, while Frame combs are relatively immune.
+            const double checkerFieldRisk = std::clamp(
+                0.65 * attrCheckerRisk + 0.35 * attrLumaClaim, 0.0, 1.0);
+            if (checkerFieldRisk > 0.0) {
+                scoreA *= (1.0 + 0.22 * checkerFieldRisk);
+                scoreB *= (1.0 + 0.32 * checkerFieldRisk);
+                scoreR_A *= (1.0 - 0.06 * checkerFieldRisk);
+                scoreR_B *= (1.0 - 0.10 * checkerFieldRisk);
+            }
+
+            // "No comb, no win": when the source clearly shows same-lattice
+            // alternation, candidates that stay near pass-through are de-prioritized.
+            const double altNeedT = std::clamp((srcAltIRE - 1.2) / 5.0, 0.0, 1.0);
+            const double satNeedT = std::clamp((chromaMagIRE - 4.0) / 12.0, 0.0, 1.0);
+            const double edgeNeedT = std::clamp(vIRE / std::max(6.0, VERT_THRESH_IRE), 0.0, 1.0);
+            const double combNeedT = std::clamp(
+                std::max(altNeedT, satNeedT * edgeNeedT), 0.0, 1.0);
+            auto noCombPenalty = [&](double engageIRE, double weight)->double {
+                const double disengaged = std::clamp((1.2 - engageIRE) / 1.2, 0.0, 1.0);
+                return weight * combNeedT * disengaged;
+            };
+            auto rollingPenalty = [&](double candAltIRE, double weight)->double {
+                const double srcBase = std::max(srcAltIRE, 1.0);
+                const double reduction = (srcAltIRE - candAltIRE) / srcBase;
+                const double fail = std::clamp((0.30 - reduction) / 0.80, 0.0, 1.0);
+                return weight * combNeedT * contourStraight * fail;
+            };
+
+            scoreA += noCombPenalty(engageAIRE, 0.30);
+            scoreB += noCombPenalty(engageBIRE, 0.24);
+            const double frameAEngageWeight = 0.24 + 0.10 * sat_t;
+            const double frameBEngageWeight = 0.24 + 0.02 * sat_t;
+            scoreR_A += noCombPenalty(engageRAIRE, frameAEngageWeight);
+            scoreR_B += noCombPenalty(engageRBIRE, frameBEngageWeight);
+
+            scoreA += rollingPenalty(altAIRE, 0.26);
+            scoreB += rollingPenalty(altBIRE, 0.30);
+            const double frameARollWeight = 0.22 + 0.28 * sat_t;
+            const double frameBRollWeight = 0.24 + 0.06 * sat_t;
+            scoreR_A += rollingPenalty(altRAIRE, frameARollWeight);
+            scoreR_B += rollingPenalty(altRBIRE, frameBRollWeight);
+
+            // In unsaturated comb-needed zones, let Frame A react faster than
+            // Frame B; retain the saturated handoff to Frame B elsewhere.
+            const double frameAFastCommit = combNeedT * contourStraight * (1.0 - sat_t);
+            if (frameAFastCommit > 0.0) {
+                scoreR_A *= (1.0 - 0.22 * frameAFastCommit);
+                scoreR_B *= (1.0 + 0.06 * frameAFastCommit);
             }
 
             // ------------------------------------------------------------
@@ -1195,14 +1354,28 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     metrics->iqCoherence = iqCoherence;
                 }
 
+                // Current environment: Frame A tends to carry cleaner fine detail,
+                // while Frame B is smoother/softer. Tilt toward A at high fineFrac.
+                scoreR_A *= (1.0 - 0.08 * fineFrac);
+                scoreR_B *= (1.0 + 0.04 * fineFrac);
+                // Fine texture ladder: Frame A best, then Field/Frame B, then Field A.
+                scoreA   *= (1.0 + 0.10 * fineFrac);
+                scoreB   *= (1.0 + 0.06 * fineFrac);
+
                 scoreR_A *= (1.0 - T.FVF_SCALE_FINE_FRAME_A_BONUS * fineFrac);
                 scoreR_B *= (1.0 - T.FVF_SCALE_FINE_FRAME_B_BONUS * fineFrac);
 
                 scoreB   *= (1.0 - T.FVF_SCALE_MID_FIELD_B_BONUS * midFrac);
                 scoreA   *= (1.0 - T.FVF_SCALE_MID_FIELD_A_BONUS * midFrac);
                 scoreR_A *= (1.0 - T.FVF_SCALE_MID_FRAME_A_BONUS * midFrac);
+                // Mid texture ladder: Frame B and Field B are the preferred middle ground.
+                scoreR_B *= (1.0 - 0.10 * midFrac);
+                scoreR_A *= (1.0 + 0.04 * midFrac);
 
                 scoreA   *= (1.0 - T.FVF_SCALE_COARSE_FIELD_A_BONUS * coarseFrac);
+                // Coarse texture ladder: keep Field A as the coarse winner.
+                scoreR_A *= (1.0 + 0.08 * coarseFrac);
+                scoreR_B *= (1.0 + 0.04 * coarseFrac);
 
                 const bool dual4Accepted =
                     tapLine.haveU4 && tapLine.haveD4 &&
@@ -1221,13 +1394,22 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // introduce zipper/alternation more readily than Field A.
             // Apply a soft bias rather than a hard override.
             // ------------------------------------------------------------
+            const double frameBCrossColorRisk = std::clamp(
+                0.45 * attrLumaClaim + 0.35 * attrCheckerRisk + 0.20 * attrIncursionNorm,
+                0.0, 1.0);
             if (sat_t > 0.15) {
+                scoreA *= (1.0 + T.FVF_SAT_FIELD_A_PEN * sat_t);
                 scoreB *= (1.0 + T.FVF_SAT_FIELD_B_PEN * sat_t);
 
                 const bool satFrameOk = !managementVeto &&
                     (localUseFrameModel ? !frameInsane : b2VertCoherent);
                 if (satFrameOk) {
+                    scoreR_A *= (1.0 - T.FVF_SAT_FRAME_A_BONUS * sat_t);
                     scoreR_B *= (1.0 - T.FVF_SAT_FRAME_B_BONUS * sat_t);
+                    // Frame B survives high saturation best, but police known
+                    // cross-color signatures so it doesn't run unchecked.
+                    const double guard = frameBCrossColorRisk * (0.6 + 0.4 * (1.0 - iqCoherence));
+                    scoreR_B *= (1.0 + 0.40 * guard * sat_t);
                 }
             }
 
@@ -1300,8 +1482,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
                         applySharpReward(scoreA, fieldA, nullptr);
                         applySharpReward(scoreB, fieldB, nullptr);
-                        applySharpReward(scoreR_A, nullptr, &framePreclean);
-                        applySharpReward(scoreR_B, nullptr, frameRaw ? frameRaw : &framePreclean);
+                        applySharpReward(scoreR_A, nullptr, &frameA);
+                        applySharpReward(scoreR_B, nullptr, frameB ? frameB : &frameA);
                     }
                 }
             }
@@ -1314,16 +1496,16 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             {
                 double estA2 = 0.5 * (fieldA[rm2]  + fieldA[rp2]);
                 double estB2 = 0.5 * (fieldB[rm2]  + fieldB[rp2]);
-                double estF2 = 0.5 * (framePreclean[rm2] + framePreclean[rp2]);
-                double estRB2 = frameRawData
-                    ? 0.5 * (frameRawData[rm2] + frameRawData[rp2])
+                double estF2 = 0.5 * (frameA[rm2] + frameA[rp2]);
+                double estRB2 = frameBData
+                    ? 0.5 * (frameBData[rm2] + frameBData[rp2])
                     : estF2;
 
                 double E2 = median4_average_middle(estA2, estB2, estF2, estRB2);
 
                 bool allowPm1 = true;
                 {
-                    double altF = std::fabs(framePreclean[rm1] - framePreclean[rp1]) * invI;
+                    double altF = std::fabs(frameA[rm1] - frameA[rp1]) * invI;
                     if (altF > 6.0) allowPm1 = false;
                 }
 
@@ -1331,9 +1513,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (allowPm1) {
                     double estA1 = 0.5 * (fieldA[rm1]  + fieldA[rp1]);
                     double estB1 = 0.5 * (fieldB[rm1]  + fieldB[rp1]);
-                    double estF1 = 0.5 * (framePreclean[rm1] + framePreclean[rp1]);
-                    double estRB1 = frameRawData
-                        ? 0.5 * (frameRawData[rm1] + frameRawData[rp1])
+                    double estF1 = 0.5 * (frameA[rm1] + frameA[rp1]);
+                    double estRB1 = frameBData
+                        ? 0.5 * (frameBData[rm1] + frameBData[rp1])
                         : estF1;
 
                     double E1 = median4_average_middle(estA1, estB1, estF1, estRB1);
@@ -1368,13 +1550,19 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // the split between the two same-domain buddies.
             // ------------------------------------------------------------
             // Vertical contrast: when ±2 lines differ in luma, Field A's ±2
-            // comb is unreliable (luma-chroma crosstalk).  Penalize it and
-            // reward Frame A which doesn't use vertical neighbors.
+            // comb is unreliable (luma-chroma crosstalk). Penalize it.
+            // In low saturation, favor Frame A for detail retention.
+            // In high saturation, redirect edge cleanup to Frame B to avoid
+            // Frame A alternation artifacts on saturated vertical edges.
             {
                 const double VERT_NORM       = std::max(VERT_THRESH_IRE, 1.0);
-                const double frameA_vert_t   = std::clamp(vIRE / VERT_NORM, 0.0, 1.0);
-                scoreA   *= (1.0 + T.FVF_VERT_FIELD_A_PENALTY * frameA_vert_t);
-                scoreR_A *= (1.0 - T.FVF_VERT_FRAME_A_BONUS * frameA_vert_t);
+                const double vert_t          = std::clamp(vIRE / VERT_NORM, 0.0, 1.0);
+                const double satEdge_t       = vert_t * sat_t;
+                const double unsatEdge_t     = vert_t * (1.0 - sat_t);
+                scoreA   *= (1.0 + T.FVF_VERT_FIELD_A_PENALTY * vert_t);
+                scoreR_A *= (1.0 - T.FVF_VERT_FRAME_A_BONUS * unsatEdge_t);
+                scoreR_A *= (1.0 + 0.16 * satEdge_t);
+                scoreR_B *= (1.0 - 0.20 * satEdge_t);
             }
 
             // Strong horizontal edges favor Frame B and de-emphasize Field B.
@@ -1402,7 +1590,24 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 else                       pickCandidate(3, FR_raw,     shadeB);
             };
 
-            if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
+            const bool satForceFrameB =
+                (sat_t >= 0.72) && !managementVeto && !frameInsane;
+            if (satForceFrameB) {
+                const double guard = frameBCrossColorRisk * (0.6 + 0.4 * (1.0 - iqCoherence));
+                const double bestFieldScore = std::min(scoreA, scoreB);
+                // Saturated-color first policy: prefer Frame B unless the guard
+                // is strongly warning and Frame B is clearly losing.
+                if (guard < 0.72 || scoreR_B <= bestFieldScore * 1.18) {
+                    pickCandidate(3, FR_raw, 0.85f);
+                } else if (!frameInsane && scoreR_A <= bestFieldScore) {
+                    pickCandidate(2, FR_s, 0.7f);
+                } else if (scoreA < scoreB) {
+                    pickCandidate(0, FA, 0.25f);
+                } else {
+                    pickCandidate(1, FB, 0.35f);
+                }
+            }
+            else if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
                 // Strong horizontal luma edge: score-based 4-way election.
                 // Interframe combs are more reliable here than interfield.
                 if (!frameInsane && scoreR_B <= scoreR_A && scoreR_B <= scoreA &&
@@ -1481,8 +1686,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 int idx = winner[rel];
                 if      (idx == 0) { outVal[rel] = fieldA[rel];                outShade[rel] = 0.25f; }
                 else if (idx == 1) { outVal[rel] = fieldB[rel];                outShade[rel] = 0.35f; }
-                else if (idx == 2) { outVal[rel] = framePreclean[rel];         outShade[rel] = 0.7f;  }
-                else               { outVal[rel] = frameRawData ? frameRawData[rel] : framePreclean[rel]; outShade[rel] = 0.85f; }
+                else if (idx == 2) { outVal[rel] = frameA[rel];         outShade[rel] = 0.7f;  }
+                else               { outVal[rel] = frameBData ? frameBData[rel] : frameA[rel]; outShade[rel] = 0.85f; }
             }
         }
     };
@@ -2189,11 +2394,13 @@ void Comb::FrameBuffer::split2D()
 {
     const bool writeWeights = configuration.showMap;
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
-    const bool needFrameIQStorage =
-        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FramePreclean ||
-         configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameRaw ||
+    const bool needFrameACompute = configuration.phaseCompensation &&
+        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
          wantFvf);
-    const bool needFrameIQCompute = configuration.phaseCompensation && needFrameIQStorage;
+    const bool needFrameBCompute = configuration.phaseCompensation &&
+        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ ||
+         wantFvf);
+    const bool needFrameIQCompute = needFrameACompute || needFrameBCompute;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
@@ -2236,17 +2443,17 @@ void Comb::FrameBuffer::split2D()
     {
         using V = Comb::Configuration::TwoDVariant;
         switch (configuration.twoDVariant) {
-        case V::Field:
+        case V::FieldAContour:
             combTapBuildFlags_ = TapBuildFieldA | TapBuildFieldB;
             break;
-        case V::FieldB:
+        case V::FieldBSimple:
             combTapBuildFlags_ = TapBuildFieldB;
             break;
-        case V::FramePreclean:
+        case V::FrameAAdaptiveIQ:
+            combTapBuildFlags_ = TapBuildFrame | TapBuildFieldA | TapBuildFieldB;
+            break;
+        case V::FrameBDirectIQ:
             combTapBuildFlags_ = TapBuildFrame | TapBuildFieldB;
-            break;
-        case V::FrameRaw:
-            combTapBuildFlags_ = TapBuildFieldB;
             break;
         default:
             combTapBuildFlags_ = TapBuildAll;
@@ -2272,7 +2479,7 @@ void Comb::FrameBuffer::split2D()
     }
 
     std::vector<std::complex<double>> frameIQ;
-    std::vector<std::complex<double>> frameIQPreclean;
+    std::vector<std::complex<double>> frameAIQ;
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
@@ -2285,7 +2492,7 @@ void Comb::FrameBuffer::split2D()
                 if (ln < firstLine || ln >= lastLine) return;
                 if (havePrecleanLine(ln, width)) return;
                 double *preclean = precleanLinePtrMutable(ln, width);
-                computeSimpleField2DLine(ensureCombTapLine(ln), preclean);
+                computeSimpleFieldLine(ensureCombTapLine(ln), preclean);
                 double *gate = precleanGateLinePtrMutable(ln, width);
                 std::fill(gate, gate + width, 1.0);
             };
@@ -2299,13 +2506,13 @@ void Comb::FrameBuffer::split2D()
             if (fieldBPreclean) {
                 std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
             } else {
-                computeSimpleField2DLine(tapLine, scratch_lineWorkC.data());
+                computeSimpleFieldLine(tapLine, scratch_lineWorkC.data());
             }
         } else {
             std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
         }
         if (combTapBuildFlags_ & TapBuildFieldA) {
-            computeField2DLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
+            computeContourFieldLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
         } else {
             std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
             std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
@@ -2331,51 +2538,57 @@ void Comb::FrameBuffer::split2D()
             }
         }
 
-        if (needFrameIQCompute) {
-            computeFrameIQPrecleanLine(line, frameIQPreclean, false);
-            if ((int)scratch_fieldBCenter.size() < width)
-                scratch_fieldBCenter.resize(width);
+        if (needFrameACompute) {
+            computeFrameAAdaptiveIQLine(line, frameAIQ);
+            if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
+                scratch_frameAAdaptiveIQComposite.resize(width);
             for (int rel = 0; rel < width; ++rel) {
                 const int h = left + rel;
-                if (rel < (int)frameIQPreclean.size()) {
-                    const auto &Z = frameIQPreclean[rel];
-                    scratch_fieldBCenter[rel] = remod4fscToCompositePhase(Z.real(), Z.imag(), carrierSampleClass(line, h));
+                if (rel < (int)frameAIQ.size()) {
+                    const auto &Z = frameAIQ[rel];
+                    scratch_frameAAdaptiveIQComposite[rel] = remod4fscToCompositePhase(Z.real(), Z.imag(), carrierSampleClass(line, h));
                 } else {
-                    scratch_fieldBCenter[rel] = 0.0;
+                    scratch_frameAAdaptiveIQComposite[rel] = 0.0;
                 }
             }
-
-            computeFrameBLocked1DLine(line, frameIQ, scratch_frameBCenter);
-            if ((int)scratch_frameBCenter.size() < width)
-                scratch_frameBCenter.resize(width);
         }
 
+        if (needFrameBCompute) {
+            computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
+            if ((int)scratch_frameBDirectIQComposite.size() < width)
+                scratch_frameBDirectIQComposite.resize(width);
+        }
+
+        const std::vector<double> &frameAttrScalar =
+            needFrameBCompute ? scratch_frameBDirectIQComposite : scratch_frameAAdaptiveIQComposite;
+        const std::vector<std::complex<double>> *frameAttrIQ =
+            needFrameBCompute ? &frameIQ : (needFrameACompute ? &frameAIQ : nullptr);
         collectCombAttributionEvidence(
             line,
             scratch_lineWorkA.data(),
             scratch_lineWorkC.data(),
-            needFrameIQCompute ? scratch_fieldBCenter : scratch_frameBCenter,
-            needFrameIQCompute ? &frameIQ : nullptr);
+            needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
+            frameAttrIQ);
 
         double *dst = clpbuffer[1].pixel[line];
         auto emitSelected = [&](int rel, double v) {
             dst[left + rel] = v;
         };
 
-        if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Field) {
+        if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldAContour) {
             for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkA[rel]);
             if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
         }
-        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldB) {
+        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple) {
             for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkC[rel]);
             if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.35f);
         }
-        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FramePreclean && configuration.phaseCompensation) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_fieldBCenter[rel]);
+        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ && configuration.phaseCompensation) {
+            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameAAdaptiveIQComposite[rel]);
             if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.8f);
         }
-        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameRaw && configuration.phaseCompensation) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameBCenter[rel]);
+        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ && configuration.phaseCompensation) {
+            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameBDirectIQComposite[rel]);
             if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.85f);
         }
         else {
@@ -2393,8 +2606,8 @@ void Comb::FrameBuffer::split2D()
                     scratch_lineWorkA.data(),
                     scratch_lineWorkC.data(),
                     scratch_lineWorkB.data(),
-                    scratch_fieldBCenter,
-                    &scratch_frameBCenter,
+                    scratch_frameAAdaptiveIQComposite,
+                    &scratch_frameBDirectIQComposite,
                     scratch_outMixed.data(),
                     writeWeights,
                     scratch_lateralLine.data(),
