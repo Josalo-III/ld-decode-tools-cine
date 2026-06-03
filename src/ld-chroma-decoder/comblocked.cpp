@@ -1923,6 +1923,12 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     if ((int)scratch_lumaBaseY4.size()  < width) scratch_lumaBaseY4.resize(width, 0.0);
     if ((int)scratch_lumaSmooth.size()  < width) scratch_lumaSmooth.resize(width, 0.0);
     if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
+    if ((int)scratch_yhp.size()         < width) scratch_yhp.resize(width, 0.0);
+    if ((int)scratch_yI.size()          < width) scratch_yI.resize(width, 0.0);
+    if ((int)scratch_yQ.size()          < width) scratch_yQ.resize(width, 0.0);
+    if ((int)scratch_hpI.size()         < width) scratch_hpI.resize(width, 0.0);
+    if ((int)scratch_hpQ.size()         < width) scratch_hpQ.resize(width, 0.0);
+    if ((int)scratch_hpY.size()         < width) scratch_hpY.resize(width, 0.0);
 
     double *rawWhole   = scratch_preI.data();
     double *coarseY    = scratch_preQ.data();
@@ -1932,6 +1938,12 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     double *basisQ     = scratch_lineWorkD.data();
     double *refinedY   = scratch_lumaSmooth.data();
     double *slideMean4 = scratch_lateralLine.data();
+    double *discResponseSupport = scratch_yhp.data();
+    double *discResponseI = scratch_yI.data();
+    double *discResponseQ = scratch_yQ.data();
+    double *discResponseSupportSmooth = scratch_hpY.data();
+    double *discResponseISmooth = scratch_hpI.data();
+    double *discResponseQSmooth = scratch_hpQ.data();
 
     std::vector<double> winFloor;
     std::vector<double> winI;
@@ -2209,6 +2221,81 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                     0.10 * std::min(ampIRE, 24.0);
             }
 
+            std::fill(discResponseSupport, discResponseSupport + width, 0.0);
+            std::fill(discResponseI, discResponseI + width, 0.0);
+            std::fill(discResponseQ, discResponseQ + width, 0.0);
+            std::fill(discResponseSupportSmooth, discResponseSupportSmooth + width, 0.0);
+            std::fill(discResponseISmooth, discResponseISmooth + width, 0.0);
+            std::fill(discResponseQSmooth, discResponseQSmooth + width, 0.0);
+
+            if (T.RETRACTED_DISC_RESPONSE_ENABLE) {
+                for (int s = 0; s < meanCount; ++s) {
+                    const double ampIRE =
+                        std::hypot(winI[s], winQ[s]) * invIreScale;
+                    const double ampGate = smoothStep01(
+                        (ampIRE - T.RETRACTED_DISC_RESPONSE_STABLE_START_IRE) /
+                        std::max(1e-9,
+                            T.RETRACTED_DISC_RESPONSE_STABLE_FULL_IRE -
+                            T.RETRACTED_DISC_RESPONSE_STABLE_START_IRE));
+                    const double fitGate = 1.0 - smoothStep01((winErrorIRE[s] - 1.5) / 5.0);
+                    const double latticeGate = 1.0 - smoothStep01((winLatticeIRE[s] - 1.0) / 5.0);
+                    const double spanGate = 1.0 - smoothStep01((winYSpanIRE[s] - 3.0) / 9.0);
+                    const double support = ampGate * fitGate * latticeGate * spanGate;
+                    if (support <= 1e-6)
+                        continue;
+
+                    for (int k = 0; k < 4; ++k) {
+                        const int xi = s + k;
+                        discResponseSupport[xi] += support;
+                        discResponseI[xi] += support * winI[s];
+                        discResponseQ[xi] += support * winQ[s];
+                    }
+                }
+
+                for (int xi = 0; xi < width; ++xi) {
+                    const double support = discResponseSupport[xi];
+                    if (support > 1e-9) {
+                        discResponseI[xi] /= support;
+                        discResponseQ[xi] /= support;
+                        discResponseSupport[xi] = std::clamp(0.25 * support, 0.0, 1.0);
+                    }
+                }
+
+                const int radius = std::clamp(
+                    T.RETRACTED_DISC_RESPONSE_RADIUS,
+                    1,
+                    std::max(1, width - 1));
+                for (int xi = 0; xi < width; ++xi) {
+                    double sumBase = 0.0;
+                    double sumSupport = 0.0;
+                    double sumWeight = 0.0;
+                    double sumI = 0.0;
+                    double sumQ = 0.0;
+
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        const int xx = std::clamp(xi + dx, 0, width - 1);
+                        const double baseW =
+                            static_cast<double>(radius + 1 - std::abs(dx));
+                        const double support = discResponseSupport[xx];
+                        sumBase += baseW;
+                        sumSupport += baseW * support;
+                        const double w = baseW * support;
+                        sumWeight += w;
+                        sumI += w * discResponseI[xx];
+                        sumQ += w * discResponseQ[xx];
+                    }
+
+                    discResponseSupportSmooth[xi] =
+                        (sumBase > 1e-9)
+                            ? std::clamp(sumSupport / sumBase, 0.0, 1.0)
+                            : 0.0;
+                    if (sumWeight > 1e-9) {
+                        discResponseISmooth[xi] = sumI / sumWeight;
+                        discResponseQSmooth[xi] = sumQ / sumWeight;
+                    }
+                }
+            }
+
             for (int xi = 0; xi < width; ++xi) {
                 const int sFirst = std::max(0, xi - 3);
                 const int sLast  = std::min(xi, meanCount - 1);
@@ -2219,9 +2306,16 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 for (int s = sFirst; s <= sLast; ++s) {
                     if (viewCount >= 4)
                         break;
+                    const double carrierSample = rawWhole[xi] - winFloor[s];
+                    const double fittedSample =
+                        winI[s] * basisI[xi] + winQ[s] * basisQ[xi];
                     views[viewCount].yFloor = winFloor[s];
+                    views[viewCount].carrierSample = carrierSample;
+                    views[viewCount].fittedSample = fittedSample;
                     views[viewCount].carrierI = winI[s];
                     views[viewCount].carrierQ = winQ[s];
+                    views[viewCount].sampleFitErrorIRE =
+                        std::fabs(carrierSample - fittedSample) * invIreScale;
                     views[viewCount].remodErrorIRE = winErrorIRE[s];
                     views[viewCount].latticeRiskIRE = winLatticeIRE[s];
                     views[viewCount].ySpanIRE = winYSpanIRE[s];
@@ -2229,17 +2323,102 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                     ++viewCount;
                 }
 
-                const auto parallax = lddecode::buildFourViewCarrierAttribution(
+                auto parallax = lddecode::buildFourViewCarrierAttribution(
                     views,
                     viewCount,
                     invIreScale);
+
+                double modelI = parallax.valid ? parallax.commonI : 0.0;
+                double modelQ = parallax.valid ? parallax.commonQ : 0.0;
+                double discResponseBlend = 0.0;
+                double stableI = 0.0;
+                double stableQ = 0.0;
+                double stableMagIRE = 0.0;
+
+                if (parallax.valid &&
+                    T.RETRACTED_DISC_RESPONSE_ENABLE &&
+                    discResponseSupportSmooth[xi] > 0.0)
+                {
+                    stableI = discResponseISmooth[xi];
+                    stableQ = discResponseQSmooth[xi];
+                    stableMagIRE = std::hypot(stableI, stableQ) * invIreScale;
+                    const double chromaGate = smoothStep01(
+                        (std::max(stableMagIRE, parallax.commonMagIRE) -
+                         T.RETRACTED_DISC_RESPONSE_STABLE_START_IRE) /
+                        std::max(1e-9,
+                            T.RETRACTED_DISC_RESPONSE_STABLE_FULL_IRE -
+                            T.RETRACTED_DISC_RESPONSE_STABLE_START_IRE));
+                    const double yContextGate = smoothStep01(
+                        (std::max(parallax.yCurvatureIRE,
+                                  0.5 * parallax.ySpreadIRE) - 2.0) / 10.0);
+                    const double fitRisk = smoothStep01(
+                        (parallax.sampleFitErrorIRE - 1.0) / 5.0);
+                    const double spreadRisk = std::clamp(
+                        parallax.carrierSpreadIRE /
+                        std::max(4.0, 0.35 * parallax.commonMagIRE + 1.0),
+                        0.0,
+                        1.0);
+                    const double hostileGate = std::max(
+                        yContextGate,
+                        std::max(fitRisk,
+                                 std::max(spreadRisk,
+                                          1.0 - parallax.carrierCoherence)));
+                    discResponseBlend = std::min(
+                        std::clamp(T.RETRACTED_DISC_RESPONSE_WEIGHT, 0.0, 1.0),
+                        std::clamp(T.RETRACTED_DISC_RESPONSE_WEIGHT, 0.0, 1.0) *
+                        discResponseSupportSmooth[xi] *
+                        chromaGate *
+                        (0.20 + 0.80 * hostileGate));
+
+                    modelI = modelI * (1.0 - discResponseBlend) +
+                             stableI * discResponseBlend;
+                    modelQ = modelQ * (1.0 - discResponseBlend) +
+                             stableQ * discResponseBlend;
+                }
+
+                parallax.discResponseI = stableI;
+                parallax.discResponseQ = stableQ;
+                parallax.discResponseMagIRE = stableMagIRE;
+                parallax.discResponseSupport = discResponseSupportSmooth[xi];
+                parallax.discResponseBlend = discResponseBlend;
                 if (parallaxRow)
                     parallaxRow[xi] = parallax;
 
-                double cf = parallax.valid
-                    ? (parallax.commonI * basisI[xi] +
-                       parallax.commonQ * basisQ[xi])
-                    : 0.0;
+                double cf = modelI * basisI[xi] + modelQ * basisQ[xi];
+
+                if (parallax.valid) {
+                    constexpr double SAMPLE_DISC_SOFT_IRE = 1.5;
+                    constexpr double SAMPLE_DISC_HARD_IRE = 5.0;
+                    constexpr double CONTEXT_SOFT_IRE = 3.0;
+                    constexpr double CONTEXT_HARD_IRE = 12.0;
+
+                    const double sampleDisagreementIRE =
+                        std::fabs(cf - parallax.commonSample) * invIreScale;
+                    const double disagreementGate = smoothStep01(
+                        (sampleDisagreementIRE - SAMPLE_DISC_SOFT_IRE) /
+                        std::max(1e-9, SAMPLE_DISC_HARD_IRE - SAMPLE_DISC_SOFT_IRE));
+                    const double contextIRE =
+                        std::max(parallax.yCurvatureIRE,
+                                 0.5 * parallax.ySpreadIRE);
+                    const double contextGate = smoothStep01(
+                        (contextIRE - CONTEXT_SOFT_IRE) /
+                        std::max(1e-9, CONTEXT_HARD_IRE - CONTEXT_SOFT_IRE));
+
+                    // The per-pixel floor residual is not a replacement model;
+                    // it is a witness that can pull a bad window IQ fit back
+                    // toward what all legal Y floors say at this sample.
+                    const double sampleTrust =
+                        std::clamp(parallax.sampleCoherence, 0.0, 1.0);
+                    const double sampleAnchor =
+                        std::min(0.85,
+                                 disagreementGate *
+                                 sampleTrust *
+                                 (0.25 + 0.75 * contextGate) *
+                                 (1.0 - discResponseBlend));
+
+                    cf = cf * (1.0 - sampleAnchor) +
+                         parallax.commonSample * sampleAnchor;
+                }
 
                 cf = std::clamp(cf, -maxCarrierSamples, maxCarrierSamples);
 
@@ -2269,7 +2448,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             constexpr double EDGE_HARD_IRE  = 10.0;
             constexpr double DISC_SOFT_IRE  = 1.0;
             constexpr double DISC_HARD_IRE  = 4.0;
-            constexpr int    LS_HALF_WIN    = 4;
+            constexpr int    LS_HALF_WIN    = 2;
 
             double *edgeGate = slideMean4;
             bool anyEdge = false;
@@ -2508,6 +2687,12 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             ? (flatFloor_flat.data() + static_cast<size_t>(lineBelow) * demodWidth)
             : nullptr;
 
+        double *wAboveRaw = scratch_preI.data();
+        double *wBelowRaw = scratch_preQ.data();
+        double *wAboveSmooth = scratch_lineWorkA.data();
+        double *wBelowSmooth = scratch_lineWorkB.data();
+        double *decisionBlend = scratch_lineWorkC.data();
+
         auto reachGate = [&](int xi, const float *neighborFit,
                              const float *neighborFloor) {
             if (!neighborFit || !neighborFloor)
@@ -2551,17 +2736,63 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             return lumaGate * carrierGate;
         };
 
+        auto localCarrierAmpIRE = [&](int xi) {
+            const int xm = std::max(0, xi - 1);
+            const int xp = std::min(width - 1, xi + 1);
+            double amp = std::fabs(static_cast<double>(fitRow[xi]));
+            amp = std::max(amp, std::fabs(static_cast<double>(fitRow[xm])));
+            amp = std::max(amp, std::fabs(static_cast<double>(fitRow[xp])));
+            if (fitAbove) {
+                amp = std::max(amp, std::fabs(static_cast<double>(fitAbove[xi])));
+                amp = std::max(amp, std::fabs(static_cast<double>(fitAbove[xm])));
+                amp = std::max(amp, std::fabs(static_cast<double>(fitAbove[xp])));
+            }
+            if (fitBelow) {
+                amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xi])));
+                amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xm])));
+                amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xp])));
+            }
+            return amp * invIreScale;
+        };
+
         for (int xi = 0; xi < width; ++xi) {
-            const double wAbove =
+            wAboveRaw[xi] =
                 haveAbove ? reachGate(xi, fitAbove, floorAbove) : 0.0;
-            const double wBelow =
+            wBelowRaw[xi] =
                 haveBelow ? reachGate(xi, fitBelow, floorBelow) : 0.0;
+            decisionBlend[xi] = smoothStep01((localCarrierAmpIRE(xi) - 8.0) / 10.0);
+        }
+
+        for (int xi = 0; xi < width; ++xi) {
+            double sumW = 0.0;
+            double sumAbove = 0.0;
+            double sumBelow = 0.0;
+            for (int dx = -2; dx <= 2; ++dx) {
+                const int xx = std::clamp(xi + dx, 0, width - 1);
+                const double w = (dx == 0) ? 3.0 : (std::abs(dx) == 1 ? 2.0 : 1.0);
+                sumW += w;
+                sumAbove += w * wAboveRaw[xx];
+                sumBelow += w * wBelowRaw[xx];
+            }
+            wAboveSmooth[xi] = sumAbove / std::max(1e-9, sumW);
+            wBelowSmooth[xi] = sumBelow / std::max(1e-9, sumW);
+        }
+
+        for (int xi = 0; xi < width; ++xi) {
+            const double blend = decisionBlend[xi];
+            const double wAbove =
+                wAboveRaw[xi] * (1.0 - blend) + wAboveSmooth[xi] * blend;
+            const double wBelow =
+                wBelowRaw[xi] * (1.0 - blend) + wBelowSmooth[xi] * blend;
             const double wSum = wAbove + wBelow;
 
             if (wSum > 1e-9) {
-                const double neighborFit =
-                    ((wAbove * static_cast<double>(fitAbove[xi])) +
-                     (wBelow * static_cast<double>(fitBelow[xi]))) / wSum;
+                double neighborFit = 0.0;
+                if (wAbove > 0.0 && fitAbove)
+                    neighborFit += wAbove * static_cast<double>(fitAbove[xi]);
+                if (wBelow > 0.0 && fitBelow)
+                    neighborFit += wBelow * static_cast<double>(fitBelow[xi]);
+                neighborFit /= wSum;
 
                 combRow[xi] = static_cast<float>(
                     0.5 * (static_cast<double>(fitRow[xi]) - neighborFit));

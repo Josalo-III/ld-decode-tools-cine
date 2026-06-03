@@ -167,6 +167,11 @@ public:
             double RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE = 8.0;
             double RETRACTED_PROGRESSIVE_CHROMA_RELAX_FULL_IRE  = 20.0;
             double RETRACTED_PROGRESSIVE_LUMA_GATE_FLOOR        = 0.85;
+            bool   RETRACTED_DISC_RESPONSE_ENABLE              = false; // learn smooth local carrier response from stable chroma spans
+            int    RETRACTED_DISC_RESPONSE_RADIUS              = 3;     // horizontal support radius for stable same-line response
+            double RETRACTED_DISC_RESPONSE_STABLE_START_IRE    = 6.0;  // chroma where stable-span response starts to vote
+            double RETRACTED_DISC_RESPONSE_STABLE_FULL_IRE     = 16.0; // chroma where stable-span response has full amplitude support
+            double RETRACTED_DISC_RESPONSE_WEIGHT              = 0.55; // max blend toward stable on-disc response at hostile edges
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -720,21 +725,15 @@ private:
 	}
 
 	inline int carrierSampleClass(int line, int h) const {
-		const CombCarrierGrammar *g = carrierGrammarLine(line);
-		const int phase0 = g ? g->samplePhase0 : 0;
-		return (h + phase0) & 3;
+		return lddecode::carrierGrammarSampleClass(carrierGrammarLine(line), h);
 	}
 
 	inline int carrierSignedSampleClass(int line, int h) const {
-		int ph = carrierSampleClass(line, h);
-		const CombCarrierGrammar *g = carrierGrammarLine(line);
-		if (g && g->lineFlip < 0)
-			ph = (ph + 2) & 3;
-		return ph;
+		return lddecode::carrierGrammarSignedSampleClass(carrierGrammarLine(line), h);
 	}
 
 	inline int carrierOppositeSampleClass(int line, int h) const {
-		return (carrierSignedSampleClass(line, h) + 2) & 3;
+		return lddecode::carrierGrammarOppositeSampleClass(carrierGrammarLine(line), h);
 	}
 
 	inline double carrierPlausibility(const CombCarrierGrammar *grammar) const {
@@ -745,21 +744,38 @@ private:
 		double base = grammar->projectionValid
 			? std::clamp(grammar->carrierFitRatio, 0.0, 1.0)
 			: std::clamp(grammar->phaseConfidence, 0.0, 1.0);
-		// Burst-vs-metadata disagreement reduces plausibility.  A conflict
-		// of 1.0 (≥45° divergence) halves the score; partial conflict
-		// attenuates proportionally.
 		const double conflictPenalty =
 			1.0 - 0.5 * std::clamp(grammar->phaseScheduleConflict, 0.0, 1.0);
 		return base * conflictPenalty;
 	}
 
+	inline double remodUnsignedBucketToComposite(int line, int h,
+	                                             double I, double Q) const {
+		return lddecode::carrierGrammarRemod4fscToComposite(
+			carrierGrammarLine(line),
+			h,
+			I,
+			Q,
+			1.0,
+			lddecode::CarrierSignFrame::UnsignedBucket);
+	}
+
+	inline double remodGrid4fscToComposite(int line, int h,
+	                                       double I, double Q) const {
+		return lddecode::carrierGrammarRemod4fscToComposite(
+			carrierGrammarLine(line),
+			h,
+			I,
+			Q,
+			1.0,
+			lddecode::CarrierSignFrame::Grid4fsc);
+	}
+
 	inline double remodGrammarToComposite(int line, int h,
 	                                      double I, double Q) const {
-		const int ph = carrierSampleClass(line, h);
-		const int f = carrierLineFlip(line);
-		return remod4fscToCompositePhase(I, Q, ph, f);
+		return remodUnsignedBucketToComposite(line, h, I, Q);
 	}
-	
+		
 	CombTapLine scratch_tapLine;
 	std::array<CombTapLine, 3> tapLineCache;
 	std::array<int, 3> tapLineCacheLine = { -1, -1, -1 };

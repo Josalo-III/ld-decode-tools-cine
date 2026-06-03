@@ -48,8 +48,11 @@ inline constexpr AttributionRules kDefaultAttributionRules = {};
 // not just a private decoder heuristic.
 struct FourViewCarrierView {
     double yFloor = 0.0;
+    double carrierSample = 0.0;
+    double fittedSample = 0.0;
     double carrierI = 0.0;
     double carrierQ = 0.0;
+    double sampleFitErrorIRE = 0.0;
     double remodErrorIRE = 0.0;
     double latticeRiskIRE = 0.0;
     double ySpanIRE = 0.0;
@@ -67,9 +70,18 @@ struct FourViewCarrierAttribution {
 
     double commonI = 0.0;
     double commonQ = 0.0;
+    double commonSample = 0.0;
     double commonMagIRE = 0.0;
     double carrierSpreadIRE = 0.0;
     double carrierCoherence = 0.0;
+    double sampleSpreadIRE = 0.0;
+    double sampleFitErrorIRE = 0.0;
+    double sampleCoherence = 0.0;
+    double discResponseI = 0.0;
+    double discResponseQ = 0.0;
+    double discResponseMagIRE = 0.0;
+    double discResponseSupport = 0.0;
+    double discResponseBlend = 0.0;
     double latticeRiskIRE = 0.0;
     double carrierScore = 0.0;
 };
@@ -125,6 +137,7 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
             cost += std::hypot(views[i].carrierI - views[j].carrierI,
                                views[i].carrierQ - views[j].carrierQ) * invIreScale;
         }
+        cost += 0.35 * std::max(0.0, views[i].sampleFitErrorIRE);
         cost += 0.05 * std::max(0.0, views[i].score);
         if (cost < bestCost) {
             bestCost = cost;
@@ -137,20 +150,49 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
     out.commonMagIRE = std::hypot(out.commonI, out.commonQ) * invIreScale;
     out.carrierScore = views[best].score;
 
+    int sampleBest = 0;
+    double sampleBestCost = 1e300;
+    for (int i = 0; i < out.viewCount; ++i) {
+        double cost = 0.0;
+        for (int j = 0; j < out.viewCount; ++j)
+            cost += std::fabs(views[i].carrierSample -
+                              views[j].carrierSample) * invIreScale;
+        cost += 0.25 * std::max(0.0, views[i].sampleFitErrorIRE);
+        cost += 0.03 * std::max(0.0, views[i].score);
+        if (cost < sampleBestCost) {
+            sampleBestCost = cost;
+            sampleBest = i;
+        }
+    }
+
+    out.commonSample = views[sampleBest].carrierSample;
+
     double spread = 0.0;
+    double sampleSpread = 0.0;
     double lattice = 0.0;
     for (int i = 0; i < out.viewCount; ++i) {
         spread = std::max(
             spread,
             std::hypot(views[i].carrierI - out.commonI,
                        views[i].carrierQ - out.commonQ) * invIreScale);
+        sampleSpread = std::max(
+            sampleSpread,
+            std::fabs(views[i].carrierSample - out.commonSample) * invIreScale);
         lattice = std::max(lattice, views[i].latticeRiskIRE);
     }
 
     out.carrierSpreadIRE = spread;
+    out.sampleSpreadIRE = sampleSpread;
+    out.sampleFitErrorIRE = std::max(
+        views[sampleBest].sampleFitErrorIRE,
+        std::fabs(out.commonSample - views[sampleBest].fittedSample) * invIreScale);
     out.latticeRiskIRE = lattice;
     out.carrierCoherence = 1.0 - std::clamp(
         spread / std::max(3.0, 0.35 * out.commonMagIRE + 1.0),
+        0.0,
+        1.0);
+    out.sampleCoherence = 1.0 - std::clamp(
+        sampleSpread / std::max(3.0, 0.35 * std::fabs(out.commonSample) * invIreScale + 1.0),
         0.0,
         1.0);
 
