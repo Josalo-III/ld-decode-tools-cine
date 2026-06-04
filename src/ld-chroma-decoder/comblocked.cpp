@@ -1192,6 +1192,7 @@ void Comb::FrameBuffer::produceY()
     const bool showMap = configuration.showMap;
     const bool chromaLikeEnabled = (T.VET_Y_CHROMA_LIKE_WEIGHT > 0.0);
     const double chromaLikeWeight = T.VET_Y_CHROMA_LIKE_WEIGHT;
+    const double ccSuppressionWeight = std::clamp(T.CC_SUPPRESSION_WEIGHT, 0.0, 1.0);
     const bool do3D =
         (configuration.residualVideo3D && prevFrameForVet && nextFrameForVet);
 
@@ -1346,6 +1347,14 @@ void Comb::FrameBuffer::produceY()
         const AttributionEvidence *attrRow =
             T.VET_ATTRIBUTION_ENABLE ? attributionEvidence_line(line) : nullptr;
         const bool attributionEnabled = (attrRow != nullptr);
+
+        // Cross-color risk from the wide-window LS detector in
+        // buildCarrierRetracted.  Where risk is high, the four-view
+        // carrier estimate contains luma-near-fsc that should not be
+        // subtracted.  Reduce the effective subtraction alpha so the
+        // cross-color contamination stays in Y rather than being
+        // pulled out as false chroma.
+        const float *ccRiskRow = crossColorRisk_line(line);
 
         const double attributionWeight = T.VET_ATTRIBUTION_LUMA_WEIGHT;
         const double attributionChromaWeight = T.VET_ATTRIBUTION_CHROMA_WEIGHT;
@@ -1713,12 +1722,29 @@ void Comb::FrameBuffer::produceY()
         };
 
         auto writePixelNoAttribution = [&](int x, double alphaEff) {
+            // Cross-color protection: where the wide-window detector flags
+            // luma-near-fsc contamination in the carrier estimate, reduce the
+            // subtraction strength so the false-chroma component stays in Y.
+            // CC_SUPPRESSION_WEIGHT scales the detector sensitivity (0=off, 1=full).
+            if (ccRiskRow && ccSuppressionWeight > 0.0) {
+                const double risk = static_cast<double>(ccRiskRow[x]) * ccSuppressionWeight;
+                if (risk > 0.0)
+                    alphaEff *= (1.0 - risk);
+            }
+
             const int h = left + x;
             const double coarseWorking = sourceToWorkingSample(coarseY, x);
             const double residualWorking = sourceToWorkingSample(highRawY, x);
             const double coherentWorking = sourceToWorkingSample(coherentCombY, x);
             const double chromaIRE = std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI;
             const double retBlend = retractedBlendFor(x, alphaEff, chromaIRE);
+            if (instrumentProduceY) {
+                ++produceYInstrumentation.pixels;
+                if (retractedYView.samples) ++produceYInstrumentation.retractedAvailablePixels;
+                if (retBlend > 0.0) ++produceYInstrumentation.retractedAppliedPixels;
+                produceYInstrumentation.retractedBlendSum += retBlend;
+                if (do3D) ++produceYInstrumentation.residual3DPixels;
+            }
 
             const double residualY = coarseWorking + (residualWorking - alphaEff * coherentWorking);
             double retractedThenResidualY = residualY;
@@ -1745,13 +1771,32 @@ void Comb::FrameBuffer::produceY()
         };
 
         auto writePixelWithAttribution = [&](int x, double alphaVet) {
-            const double alphaEff = alphaWithAttribution(x, alphaVet);
+            double alphaEff = alphaWithAttribution(x, alphaVet);
+
+            // Cross-color protection: where the wide-window detector flags
+            // luma-near-fsc contamination in the carrier estimate, reduce the
+            // subtraction strength so the false-chroma component stays in Y.
+            // CC_SUPPRESSION_WEIGHT scales the detector sensitivity (0=off, 1=full).
+            if (ccRiskRow && ccSuppressionWeight > 0.0) {
+                const double risk = static_cast<double>(ccRiskRow[x]) * ccSuppressionWeight;
+                if (risk > 0.0)
+                    alphaEff *= (1.0 - risk);
+            }
+
             const int h = left + x;
             const double coarseWorking = sourceToWorkingSample(coarseY, x);
             const double residualWorking = sourceToWorkingSample(highRawY, x);
             const double coherentWorking = sourceToWorkingSample(coherentCombY, x);
             const double chromaIRE = std::hypot(tiAdjLocked[x], tqAdjLocked[x]) * invI;
             const double retBlend = retractedBlendFor(x, alphaEff, chromaIRE);
+            if (instrumentProduceY) {
+                ++produceYInstrumentation.pixels;
+                ++produceYInstrumentation.attributionPixels;
+                if (retractedYView.samples) ++produceYInstrumentation.retractedAvailablePixels;
+                if (retBlend > 0.0) ++produceYInstrumentation.retractedAppliedPixels;
+                produceYInstrumentation.retractedBlendSum += retBlend;
+                if (do3D) ++produceYInstrumentation.residual3DPixels;
+            }
 
             const double residualY = coarseWorking + (residualWorking - alphaEff * coherentWorking);
             double retractedThenResidualY = residualY;
@@ -1949,6 +1994,8 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         combedCarrier_flat.assign(need, 0.0f);
     if (lsRefitGate_flat.size() < need)
         lsRefitGate_flat.assign(need, 0.0f);
+    if (crossColorRisk_flat.size() < need)
+        crossColorRisk_flat.assign(need, 0.0f);
     if (carrierParallax_flat.size() < need)
         carrierParallax_flat.assign(need, lddecode::FourViewCarrierAttribution{});
 
@@ -2058,8 +2105,11 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                               ? nullptr
                               : carrierParallax_flat.data()
                                 + static_cast<size_t>(line) * demodWidth;
+        float *ccRiskRow    = crossColorRisk_flat.data()
+                              + static_cast<size_t>(line) * demodWidth;
 
         std::fill(gateRow, gateRow + width, 0.0f);
+        std::fill(ccRiskRow, ccRiskRow + width, 0.0f);
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
@@ -2620,6 +2670,126 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                         flattened[xi] = rawWhole[xi] - blended;
                         fitRow[xi] = static_cast<float>(blended);
                         retractedRow[xi] = static_cast<float>(flattened[xi]);
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Cross-color detector.
+        //
+        // A sliding wide-window LS carrier fit (~32 samples, ~8 carrier
+        // cycles) exploits the fact that real chroma is a coherent sinusoid
+        // over many cycles while luma-near-fsc is not.  Where the wide
+        // window sees materially less carrier than the four-view estimate
+        // that just produced carrierFit[], the excess is cross-color:
+        // high-frequency luma misread as carrier by the narrow windows.
+        //
+        // The basis gram matrix (sII, sIQ, sQQ) is constant for the entire
+        // line because basisI/Q cycle with period 4 and the window length
+        // is a multiple of 4.  Only sIY and sQY need to slide.  Cost: ~10
+        // operations per pixel after the initial fill.
+        // ---------------------------------------------------------------
+        {
+            constexpr int CC_WIN = 32;
+            constexpr int CC_HALF = CC_WIN / 2;
+
+            if (width >= CC_WIN) {
+                // Gram matrix for uniform-weight LS over CC_WIN samples.
+                // basisI/Q have period 4, so over 4N samples the sums are
+                // just N times the single-period values.
+                const int periods = CC_WIN / 4;
+                double sII_1 = 0.0, sIQ_1 = 0.0, sQQ_1 = 0.0;
+                for (int p = 0; p < 4; ++p) {
+                    sII_1 += basisI4[p] * basisI4[p];
+                    sIQ_1 += basisI4[p] * basisQ4[p];
+                    sQQ_1 += basisQ4[p] * basisQ4[p];
+                }
+                const double gramII = sII_1 * periods;
+                const double gramIQ = sIQ_1 * periods;
+                const double gramQQ = sQQ_1 * periods;
+                const double gramDet = gramII * gramQQ - gramIQ * gramIQ;
+
+                if (std::fabs(gramDet) > 1e-9) {
+                    const double gramInv = 1.0 / gramDet;
+
+                    // Initial window [0, CC_WIN-1].
+                    double sIY = 0.0, sQY = 0.0;
+                    for (int k = 0; k < CC_WIN; ++k) {
+                        const double obs = rawWhole[k] - coarseY[k];
+                        sIY += basisI[k] * obs;
+                        sQY += basisQ[k] * obs;
+                    }
+
+                    // Slide the window across the line.  At each position,
+                    // solve for the wide-window carrier IQ, compute its
+                    // magnitude, and compare against the four-view carrier
+                    // magnitude from carrierFit[].
+                    for (int xi = 0; xi < width; ++xi) {
+                        // Center of window for this pixel.
+                        int wantA = xi - CC_HALF;
+                        int wantB = xi + CC_HALF - 1;
+                        if (wantA < 0) { wantB += -wantA; wantA = 0; }
+                        if (wantB >= width) {
+                            const int ov = wantB - (width - 1);
+                            wantB -= ov;
+                            wantA -= ov;
+                            if (wantA < 0) wantA = 0;
+                        }
+
+                        // On first pixel the window is already at [0, CC_WIN-1].
+                        // For subsequent pixels, slide by adjusting sIY/sQY.
+                        if (xi > 0) {
+                            int prevA = (xi - 1) - CC_HALF;
+                            int prevB = (xi - 1) + CC_HALF - 1;
+                            if (prevA < 0) { prevB += -prevA; prevA = 0; }
+                            if (prevB >= width) {
+                                const int ov = prevB - (width - 1);
+                                prevB -= ov;
+                                prevA -= ov;
+                                if (prevA < 0) prevA = 0;
+                            }
+
+                            // Remove samples that left the window.
+                            for (int k = prevA; k < wantA; ++k) {
+                                const double obs = rawWhole[k] - coarseY[k];
+                                sIY -= basisI[k] * obs;
+                                sQY -= basisQ[k] * obs;
+                            }
+                            // Add samples that entered the window.
+                            for (int k = prevB + 1; k <= wantB; ++k) {
+                                const double obs = rawWhole[k] - coarseY[k];
+                                sIY += basisI[k] * obs;
+                                sQY += basisQ[k] * obs;
+                            }
+                        }
+
+                        const double wideI = ( gramQQ * sIY - gramIQ * sQY) * gramInv;
+                        const double wideQ = (-gramIQ * sIY + gramII * sQY) * gramInv;
+                        const double wideMagIRE = std::hypot(wideI, wideQ) * invIreScale;
+
+                        // Four-view carrier magnitude at this sample.
+                        // Use a 2-sample envelope so zero-crossings in the
+                        // carrier don't create false risk spikes.
+                        const int xi1 = std::min(xi + 1, width - 1);
+                        const double fitMagIRE =
+                            std::hypot(static_cast<double>(fitRow[xi]),
+                                       static_cast<double>(fitRow[xi1])) * invIreScale;
+
+                        // Cross-color risk: how much more carrier the narrow
+                        // four-view windows see compared to the wide coherent
+                        // estimate.  Normalized by the fit magnitude so the
+                        // risk is scale-independent.  Floored at 2 IRE so
+                        // low-amplitude regions (where the ratio is noisy)
+                        // don't produce false positives.
+                        double risk = 0.0;
+                        if (fitMagIRE > 2.0 && wideMagIRE < fitMagIRE) {
+                            const double excessIRE = fitMagIRE - wideMagIRE;
+                            risk = std::clamp(
+                                excessIRE / std::max(2.0, fitMagIRE),
+                                0.0, 1.0);
+                        }
+                        ccRiskRow[xi] = static_cast<float>(risk);
                     }
                 }
             }
