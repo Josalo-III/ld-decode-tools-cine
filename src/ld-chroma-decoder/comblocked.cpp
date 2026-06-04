@@ -1293,7 +1293,6 @@ void Comb::FrameBuffer::produceY()
         double *cHat        = scratch_lineWorkB.data();
         double *tiAdjLocked = scratch_lineWorkA.data();
         double *tqAdjLocked = scratch_lineWorkC.data();
-        double *vetConf     = scratch_lateralLine.data();
         double *retractedY  = scratch_lineWorkD.data();
 
         // Carrier estimate comes from the dimensionally-appropriate source.
@@ -1316,7 +1315,6 @@ void Comb::FrameBuffer::produceY()
             cHat[x]        = carrier;
             tiAdjLocked[x] = carrier * lutTi[ph];
             tqAdjLocked[x] = carrier * lutTq[ph];
-            vetConf[x]     = 1.0;
         }
 
         YSourceView coherentCombY {
@@ -1798,22 +1796,38 @@ void Comb::FrameBuffer::produceY()
             const double subEnergy = subI * subI + subQ * subQ;
             const double subMagIRE = std::sqrt(subEnergy) * invI;
 
-            if (!chromaLikeEnabled || subMagIRE < MIN_SUB_CHROMA_IRE) {
+            if (instrumentProduceY) {
+                produceYInstrumentation.alphaVetSubMagSum += subMagIRE;
+                produceYInstrumentation.alphaVetSubMagMax =
+                    std::max(produceYInstrumentation.alphaVetSubMagMax, subMagIRE);
+                produceYInstrumentation.alphaVetLutMagSum += lutMag;
+                produceYInstrumentation.alphaVetLutMagMax =
+                    std::max(produceYInstrumentation.alphaVetLutMagMax, lutMag);
+                if (lutMag < MIN_SUB_CHROMA_IRE)
+                    ++produceYInstrumentation.alphaVetGateFailCalls;
+            }
+
+            if (!chromaLikeEnabled || lutMag < MIN_SUB_CHROMA_IRE) {
                 return 1.0;
             }
+
+            // Guard: if the fixed-index sub-energy is negligible the
+            // projection denominator is unreliable regardless of lutMag.
+            if (subEnergy < 1e-6)
+                return 1.0;
 
             const double alphaFit = std::clamp(
                 (rawI * subI + rawQ * subQ) / (subEnergy + 1e-12),
                 MIN_ALPHA, MAX_ALPHA);
 
-            const double conf = std::clamp(
-                0.25 * (vetConf[p + 0] +
-                        vetConf[p + 1] +
-                        vetConf[p + 2] +
-                        vetConf[p + 3]),
-                0.0, 1.0);
+            // Projection confidence scales with chroma magnitude:
+            // just above MIN_SUB_CHROMA_IRE the SNR is marginal;
+            // at VET_ALPHA_FIT_FULL_IRE it is fully reliable.
+            const double fitReliability = smoothStep01(
+                (lutMag - MIN_SUB_CHROMA_IRE) /
+                std::max(1e-9, T.VET_ALPHA_FIT_FULL_IRE - MIN_SUB_CHROMA_IRE));
 
-            const double profileWeight = chromaLikeWeight * (1.0 - conf);
+            const double profileWeight = chromaLikeWeight * fitReliability;
             return 1.0 + profileWeight * (alphaFit - 1.0);
         };
 
