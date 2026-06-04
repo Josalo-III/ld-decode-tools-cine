@@ -407,6 +407,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         }
     }
 
+    std::vector<double> envLine;
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
 
@@ -522,6 +523,21 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             rel = std::clamp(rel, 0, width - 1);
             return combSrc ? static_cast<double>(combSrc[rel]) : 0.0;
         };
+
+        // Precompute per-sample envelope for the sideband block below.
+        // envLine[xi] = hypot(carrierFit[xi], carrierFit[xi+1]) * invIreScale.
+        // Replaces per-pixel envAt() hypot calls: ~27 hypots/pixel → 0 in the window loop.
+        const double *envLinePtr = nullptr;
+        if (carrierFitRow && floorRow) {
+            if ((int)envLine.size() < width)
+                envLine.resize(width);
+            for (int xi = 0; xi < width; ++xi)
+                envLine[xi] = std::hypot(
+                    static_cast<double>(carrierFitRow[xi]),
+                    static_cast<double>(carrierFitRow[std::min(xi + 1, width - 1)]))
+                    * invIreScale;
+            envLinePtr = envLine.data();
+        }
 
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
@@ -741,11 +757,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                         return exc - static_cast<double>(carrierFitRow[kk]);
                     };
                     auto envAt = [&](int k) -> double {
-                        const int kk = clampIdx(k);
-                        const int kn = clampIdx(kk + 1);
-                        return std::hypot(static_cast<double>(carrierFitRow[kk]),
-                                          static_cast<double>(carrierFitRow[kn]))
-                               * invIreScale;
+                        return envLinePtr[clampIdx(k)];
                     };
 
                     int nSin = 0, nCos = 0, nWin = 0;
