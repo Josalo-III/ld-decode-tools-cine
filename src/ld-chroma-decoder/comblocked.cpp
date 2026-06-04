@@ -1625,13 +1625,38 @@ void Comb::FrameBuffer::produceY()
                 return blend;
             };
 
+            // LS refit gate: when buildCarrierRetracted detected a luma
+            // edge where the LS sinusoidal fit disagrees with the
+            // complement, the retracted view at this sample is built
+            // from a structurally superior carrier model.  Inject that
+            // as candidate support so the vet lets the retracted view
+            // dominate.  Attribution and chroma protection still apply
+            // downstream — this only opens the candidateGate, it
+            // doesn't bypass the safety checks.
+            const double lsGate = (lsGateRow && x >= 0 && x < width)
+                ? static_cast<double>(lsGateRow[x]) : 0.0;
+
+            // currentSameLatticeAlt is cheap (~3 currentYAt calls).
+            // Since retractedAltIRE >= 0, altAdvantageIRE <= currentAltIRE.
+            // If currentAltIRE is already at or below the start threshold
+            // and lsGate is silent, altGate is provably 0: skip the
+            // expensive sequencedSameLatticeAlt and neighborAnchorAt.
             const double currentAltIRE = currentSameLatticeAlt(x, alphaEff) * invI;
+            if (currentAltIRE <= T.VET_RETRACTED_ALT_START_IRE && lsGate <= 0.0)
+                return finishRetractedBlend(0.0);
+
             const double retractedAltIRE = sequencedSameLatticeAlt(x, alphaEff) * invI;
             const double altAdvantageIRE = currentAltIRE - retractedAltIRE;
             const double altGate = smoothStep01(
                 (altAdvantageIRE - T.VET_RETRACTED_ALT_START_IRE) /
                 std::max(1e-9, T.VET_RETRACTED_ALT_FULL_IRE -
                                T.VET_RETRACTED_ALT_START_IRE));
+
+            // Skip neighborAnchorAt (~352 reads/pixel) when both primary
+            // gates are silent — anchorGate alone is not intended as the
+            // primary vet driver and the vet is dormant on nearly all pixels.
+            if (altGate <= 0.0 && lsGate <= 0.0)
+                return finishRetractedBlend(0.0);
 
             double anchorGate = 0.0;
             if (T.VET_NEIGHBOR_ANCHOR_ENABLE) {
@@ -1648,20 +1673,7 @@ void Comb::FrameBuffer::produceY()
                 anchorGate *= std::clamp(T.VET_NEIGHBOR_ANCHOR_WEIGHT, 0.0, 1.0);
             }
 
-            // LS refit gate: when buildCarrierRetracted detected a luma
-            // edge where the LS sinusoidal fit disagrees with the
-            // complement, the retracted view at this sample is built
-            // from a structurally superior carrier model.  Inject that
-            // as candidate support so the vet lets the retracted view
-            // dominate.  Attribution and chroma protection still apply
-            // downstream — this only opens the candidateGate, it
-            // doesn't bypass the safety checks.
-            const double lsGate = (lsGateRow && x >= 0 && x < width)
-                ? static_cast<double>(lsGateRow[x]) : 0.0;
-
             const double candidateGate = std::max({altGate, anchorGate, lsGate});
-            if (candidateGate <= 0.0)
-                return finishRetractedBlend(0.0);
 
             double attributionInvite = 0.0;
             double chromaProtect = 0.0;
