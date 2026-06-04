@@ -54,13 +54,10 @@ public:
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
         bool   debugPhaseLegs = false; // Log per-(h&3) locked-demod residual stats.
+        bool   stageTimers = false; // Log per-stage timing summaries for the locked NTSC path.
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
-
-        // If true, keep clpbuffer[1] burst-referenced, but feed the 2D comb stage
-        // from a 4fsc-grid remodulated copy (reduces 2D Nyquist/zipper artifacts).
-        bool locked2DSourceTo4fsc = true;
 
         // Per-axis product gains: multipliers applied to I and Q before filtering.
         double gi_product = 1.0;
@@ -90,7 +87,7 @@ public:
             FieldVsFrame      // FVF (Default)
         };
         TwoDVariant twoDVariant = FieldVsFrame;
-    
+
         // Opt-in for 3D temporal checks in Residual Y (getBestY)
         bool residualVideo3D = false;
         bool residualVideo = false;
@@ -167,6 +164,11 @@ public:
             double RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE = 8.0;
             double RETRACTED_PROGRESSIVE_CHROMA_RELAX_FULL_IRE  = 20.0;
             double RETRACTED_PROGRESSIVE_LUMA_GATE_FLOOR        = 0.85;
+            // Carrier-gate floor in progressive + saturated regions.  The
+            // carrierGate closes on carrier mismatch — but carrier mismatch
+            // is the zipper alternation we want to cancel.  Without a floor,
+            // the gate suppresses cancellation exactly where it would help.
+            double RETRACTED_PROGRESSIVE_CARRIER_GATE_FLOOR     = 0.85;
             bool   RETRACTED_DISC_RESPONSE_ENABLE              = false; // learn smooth local carrier response from stable chroma spans
             int    RETRACTED_DISC_RESPONSE_RADIUS              = 3;     // horizontal support radius for stable same-line response
             double RETRACTED_DISC_RESPONSE_STABLE_START_IRE    = 6.0;  // chroma where stable-span response starts to vote
@@ -188,8 +190,12 @@ public:
             double FVF_SCALE_MID_FIELD_B_BONUS   = 0.14;
             double FVF_SCALE_MID_FIELD_A_BONUS   = 0.10;
             double FVF_SCALE_MID_FRAME_A_BONUS   = 0.06;
-            double FVF_SCALE_COARSE_FIELD_A_BONUS = 0.14;
-            double FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS = 0.05;
+            double FVF_SCALE_COARSE_FIELD_A_BONUS = 0.25;
+            // Additional bonus when tap-line ±4 contour confirms both sides
+            // (haveU4 && haveD4 && upSideOk && dnSideOk).  The ±4 evidence
+            // is chroma-cancelled same-phase, so when it's vetted Field A
+            // is on its strongest footing and deserves a real bonus.
+            double FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS = 0.12;
 
             // Edge-regime biasing for the 4-member election.
             double FVF_VERT_FIELD_A_PENALTY  = 0.16; // Field A penalty under vertical contrast (±2 comb produces crosstalk)
@@ -208,7 +214,7 @@ public:
 
             // Cross-domain penalty derived from a spatial neighbor estimate; guards ambiguous pixels
             // where horizontal structure could alias the interfield or interframe comb.
-            double NEIGHBOR_EST_WEIGHT      = 0.25; // penalty weight applied to the cross-domain estimate (IRE units)
+            double NEIGHBOR_EST_WEIGHT      = 0.60; // luma-domain neighbor consensus weight (IRE units) — sized to tip elections, not just decorate them
             double NEIGHBOR_EST_SAT_MAX_IRE = 12.0; // disable neighbor estimate when local chroma exceeds this
             double NEIGHBOR_EST_EDGE_MAX_IRE = 10.0; // disable when horizontal luma edge exceeds this
             double NEIGHBOR_EST_FVF_MAX_IRE  = 4.0;  // only apply when the FVF diff itself is small / ambiguous
@@ -219,6 +225,12 @@ public:
             // Penalty for a candidate being far from the regime model
             // (Frame A in progressive; Field A in interlace). Larger → more model dominance.
             double FVF_MODEL_PRIMARY_WEIGHT = 0.33;
+            // Cross-domain candidates pay model-distance only past this deadband
+            // (IRE).  Inside the deadband the cross-domain comb is considered
+            // model-equivalent — lets Field A through on flat, low-contrast
+            // regions (e.g. black of space) where Field A's coarse-scale bonus
+            // should actually surface.
+            double FVF_MODEL_PRIMARY_DEADBAND_IRE = 2.0;
 
             // Multiplicative cost advantage for the model-domain candidate in its own regime.
             // < 1.0 → model candidate gets a cheaper score.
@@ -242,6 +254,15 @@ public:
             double AGREEMENT_VETO_BASE         = 7.0; // base penalty added once d exceeds deviationThreshold
             double deviationThreshold          = 8.0; // start of veto region (IRE); shared with getBestY
             double deviationPenalty            = 3.3; // penalty slope beyond deviationThreshold (per IRE)
+
+            // Luma-stationarity gating for the veto region.
+            // When retracted-Y luma between current and candidate is below
+            // VETO_LUMA_STATIC_IRE, the veto is attenuated — high chroma dIRE
+            // over static luma likely indicates a 2D comb error (cancellation
+            // opportunity) rather than physical motion.
+            double VETO_LUMA_STATIC_IRE       = 4.0;  // luma diff below which content is "static"
+            double VETO_LUMA_MOTION_IRE        = 12.0; // luma diff above which full veto applies
+            bool   VETO_LUMA_GATE_ENABLE       = true; // enable retracted-Y luma gating of veto
 
             // Frame-level affine correction applied to locked-1D IQ before chroma subtraction.
             // Corrects residual carrier phase/gain drift across the frame.
@@ -285,9 +306,12 @@ public:
             double VET_RETRACTED_STABLE_CHROMA_FULL_IRE  = 20.0; // stable chroma protection is full here
             double VET_RETRACTED_STABLE_CHROMA_DEV_IRE   = 4.0;  // max vector deviation for a consistent color run
 
-            // Chroma-profile correction: adjusts subtraction alpha when the vet is uncertain,
-            // using 4fsc chroma/luma profile agreement as a bounded correction signal.
+            // Chroma-profile correction: adjusts subtraction alpha when the carrier
+            // projection shows the comb over- or under-predicts the raw carrier.
+            // Confidence ramp: below MIN_SUB_CHROMA_IRE the projection is noise;
+            // at VET_ALPHA_FIT_FULL_IRE it is reliable enough to apply fully.
             double VET_Y_CHROMA_LIKE_WEIGHT = 0.12; // weight of chroma-profile match on the subtraction alpha
+            double VET_ALPHA_FIT_FULL_IRE   = 12.0; // LUT-demod chroma magnitude where projection confidence reaches 1.0
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
             // attribution evidence says it is luma-owned rather than chroma-owned.
@@ -328,6 +352,14 @@ public:
             double LS_REFIT_BRIGHT_COLOR_FULL_IRE   = 14.0; // bright-side chroma where bright-half LS is fully suppressed
             double LS_REFIT_BRIGHT_SIDE_SOFT_IRE    = 0.5;  // bright-side membership begins this far above the local edge midpoint
             double LS_REFIT_BRIGHT_SIDE_HARD_IRE    = 3.0;  // bright-side membership is full this far above the local edge midpoint
+
+            // Cross-color suppression: wide-window LS detector identifies pixels
+            // where the four-view carrier estimate is contaminated by luma-near-fsc.
+            // The risk [0,1] is multiplied by this weight before being applied as a
+            // subtraction-alpha reduction in produceY.  1.0 = full detector strength
+            // (risk maps directly to alpha reduction).  0 = detector disabled.
+            // Values above 1.0 are not meaningful; the reduction is clamped at 1.0.
+            double CC_SUPPRESSION_WEIGHT = 1.0; // cross-color risk multiplier (0=off, 1=full)
         };
         Tunables tunables;
     };
@@ -379,6 +411,82 @@ public:
 		int winner = 1;
 	};
 
+    struct FvfInstrumentation {
+        std::array<qint64, 4> rawWinnerCounts = {0, 0, 0, 0};
+        std::array<qint64, 4> finalWinnerCounts = {0, 0, 0, 0};
+        qint64 frameAHeadToHeadWins = 0;
+        qint64 frameBHeadToHeadWins = 0;
+        qint64 frameModelPixels = 0;
+        qint64 fieldModelPixels = 0;
+        qint64 islandChangedPixels = 0;
+        qint64 blockFieldCommitPixels = 0;
+        // Island flips bucketed by [center loser C][agreed neighbor L]; tells us
+        // whether cleanup is correcting Frame/Frame disagreement or Field/Frame
+        // noise. Diagonal is unused (a flip requires C != L).
+        std::array<std::array<qint64, 4>, 4> islandFlipPairs = {};
+
+        void reset()
+        {
+            rawWinnerCounts = {0, 0, 0, 0};
+            finalWinnerCounts = {0, 0, 0, 0};
+            frameAHeadToHeadWins = 0;
+            frameBHeadToHeadWins = 0;
+            frameModelPixels = 0;
+            fieldModelPixels = 0;
+            islandChangedPixels = 0;
+            blockFieldCommitPixels = 0;
+            for (auto &row : islandFlipPairs) row = {0, 0, 0, 0};
+        }
+    };
+
+    struct ProduceYInstrumentation {
+        qint64 pixels = 0;
+        qint64 attributionPixels = 0;
+        qint64 residualBypassPixels = 0;
+        qint64 noProductFallbackPixels = 0;
+        qint64 alphaVetCalls = 0;
+        qint64 alphaVetAdjustedCalls = 0;
+        qint64 alphaVetPixels = 0;
+        // Quads that returned 1.0 because the fixed-index sub magnitude fell
+        // below MIN_SUB_CHROMA_IRE. gateFail vs (calls - gateFail - adjusted)
+        // separates "no subcarrier to fit" from "conf saturated the trim".
+        qint64 alphaVetGateFailCalls = 0;
+        // Sub-magnitude the gate actually sees (fixed-index c1-c3 / c2-c0) vs the
+        // LUT-demodulated carrier magnitude computed in parallel. If the LUT path
+        // clears MIN_SUB_CHROMA_IRE where the fixed-index path does not, the vet
+        // is measuring on the wrong phase grid and the rewiring is justified.
+        double alphaVetSubMagSum = 0.0;
+        double alphaVetSubMagMax = 0.0;
+        double alphaVetLutMagSum = 0.0;
+        double alphaVetLutMagMax = 0.0;
+        qint64 retractedAvailablePixels = 0;
+        qint64 retractedAppliedPixels = 0;
+        qint64 residual3DPixels = 0;
+        double alphaVetDeltaSum = 0.0;
+        double retractedBlendSum = 0.0;
+
+        void reset()
+        {
+            pixels = 0;
+            attributionPixels = 0;
+            residualBypassPixels = 0;
+            noProductFallbackPixels = 0;
+            alphaVetCalls = 0;
+            alphaVetAdjustedCalls = 0;
+            alphaVetPixels = 0;
+            alphaVetGateFailCalls = 0;
+            alphaVetSubMagSum = 0.0;
+            alphaVetSubMagMax = 0.0;
+            alphaVetLutMagSum = 0.0;
+            alphaVetLutMagMax = 0.0;
+            retractedAvailablePixels = 0;
+            retractedAppliedPixels = 0;
+            residual3DPixels = 0;
+            alphaVetDeltaSum = 0.0;
+            retractedBlendSum = 0.0;
+        }
+    };
+
 	// Signal attribution evidence, collected before election. This is not a
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
@@ -428,6 +536,8 @@ public:
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
 	const std::vector<AttributionEvidence> &getAttributionEvidenceFlat() const { return attributionEvidence_flat; }
+    const FvfInstrumentation &getFvfInstrumentation() const { return fvfInstrumentation; }
+    const ProduceYInstrumentation &getProduceYInstrumentation() const { return produceYInstrumentation; }
 
 	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
 	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
@@ -594,9 +704,7 @@ private:
 		std::vector<double> scratch_preQ;          // Unscaled pre-FIR Q row (per-line).
 		std::vector<double> scratch_preI_ext;      // Edge-extended I row for FIR.
 		std::vector<double> scratch_preQ_ext;      // Edge-extended Q row for FIR.
-		// Contested HF residual after coherent-carrier subtraction (produceY path).
-		std::vector<double> scratch_residualContested;
-		// Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
+        // Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
 		std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
 		std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
 		std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
@@ -655,8 +763,18 @@ private:
 	std::vector<float> flatFloor_flat;
 	std::vector<float> combedCarrier_flat;
 	std::vector<float> lsRefitGate_flat;
+	// Cross-color detector: per-pixel risk [0,1] that the four-view carrier
+	// estimate is contaminated by luma-near-fsc.  Computed by a sliding
+	// wide-window LS carrier fit (≥32 samples, ~8 carrier cycles) that has
+	// enough aperture to distinguish coherent carrier from incoherent
+	// luma-near-fsc.  Where the wide-window carrier magnitude is materially
+	// lower than the four-view estimate, the difference is cross-color.
+	// Consumed by produceY to attenuate chroma subtraction in affected regions.
+	std::vector<float> crossColorRisk_flat;
 	bool carrierRetractedValid = false;
-	
+    FvfInstrumentation fvfInstrumentation;
+    ProduceYInstrumentation produceYInstrumentation;
+
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
 	}
@@ -1052,6 +1170,12 @@ private:
 		    line < 0 || line >= demodLines ||
 		    lsRefitGate_flat.empty()) return nullptr;
 		return lsRefitGate_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* crossColorRisk_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines ||
+		    crossColorRisk_flat.empty()) return nullptr;
+		return crossColorRisk_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

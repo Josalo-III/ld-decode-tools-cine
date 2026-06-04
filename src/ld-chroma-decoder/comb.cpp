@@ -19,6 +19,7 @@
 #include "deemp.h"
 #include "firfilter.h"
 
+#include <QElapsedTimer>
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -160,6 +161,89 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     assert(configurationSet);
     assert(componentFrames.size() * 2 == (endIndex - startIndex));
 
+    enum StageIndex {
+        StagePhaseLocked,
+        StageCarrierRetracted,
+        StageSplit2D,
+        StageCopy2DTo3D,
+        StageSplit3D,
+        StageSplitIQLocked,
+        StageDoCNR,
+        StageProduceY,
+        StageFilterIQLocked,
+        StageDoYNR,
+        StageTransformIQ,
+        StageCount
+    };
+    struct StageStat {
+        const char *name;
+        qint64 totalNs = 0;
+        qint64 calls = 0;
+    };
+    std::array<StageStat, StageCount> stageStats = {{
+        {"phaseLocked"},
+        {"buildCarrierRetracted"},
+        {"split2D"},
+        {"copy2DTo3D"},
+        {"split3D"},
+        {"splitIQlocked"},
+        {"doCNR"},
+        {"produceY"},
+        {"filterIQLocked"},
+        {"doYNR"},
+        {"transformIQ"},
+    }};
+    const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
+    FrameBuffer::FvfInstrumentation fvfStatsTotal;
+    FrameBuffer::ProduceYInstrumentation produceYStatsTotal;
+    auto accumulateFvfStats = [&](const FrameBuffer::FvfInstrumentation &stats) {
+        for (int i = 0; i < 4; ++i) {
+            fvfStatsTotal.rawWinnerCounts[i] += stats.rawWinnerCounts[i];
+            fvfStatsTotal.finalWinnerCounts[i] += stats.finalWinnerCounts[i];
+        }
+        fvfStatsTotal.frameAHeadToHeadWins += stats.frameAHeadToHeadWins;
+        fvfStatsTotal.frameBHeadToHeadWins += stats.frameBHeadToHeadWins;
+        fvfStatsTotal.frameModelPixels += stats.frameModelPixels;
+        fvfStatsTotal.fieldModelPixels += stats.fieldModelPixels;
+        fvfStatsTotal.islandChangedPixels += stats.islandChangedPixels;
+        fvfStatsTotal.blockFieldCommitPixels += stats.blockFieldCommitPixels;
+        for (int c = 0; c < 4; ++c)
+            for (int l = 0; l < 4; ++l)
+                fvfStatsTotal.islandFlipPairs[c][l] += stats.islandFlipPairs[c][l];
+    };
+    auto accumulateProduceYStats = [&](const FrameBuffer::ProduceYInstrumentation &stats) {
+        produceYStatsTotal.pixels += stats.pixels;
+        produceYStatsTotal.attributionPixels += stats.attributionPixels;
+        produceYStatsTotal.residualBypassPixels += stats.residualBypassPixels;
+        produceYStatsTotal.noProductFallbackPixels += stats.noProductFallbackPixels;
+        produceYStatsTotal.alphaVetCalls += stats.alphaVetCalls;
+        produceYStatsTotal.alphaVetAdjustedCalls += stats.alphaVetAdjustedCalls;
+        produceYStatsTotal.alphaVetPixels += stats.alphaVetPixels;
+        produceYStatsTotal.alphaVetGateFailCalls += stats.alphaVetGateFailCalls;
+        produceYStatsTotal.alphaVetSubMagSum += stats.alphaVetSubMagSum;
+        produceYStatsTotal.alphaVetSubMagMax =
+            std::max(produceYStatsTotal.alphaVetSubMagMax, stats.alphaVetSubMagMax);
+        produceYStatsTotal.alphaVetLutMagSum += stats.alphaVetLutMagSum;
+        produceYStatsTotal.alphaVetLutMagMax =
+            std::max(produceYStatsTotal.alphaVetLutMagMax, stats.alphaVetLutMagMax);
+        produceYStatsTotal.retractedAvailablePixels += stats.retractedAvailablePixels;
+        produceYStatsTotal.retractedAppliedPixels += stats.retractedAppliedPixels;
+        produceYStatsTotal.residual3DPixels += stats.residual3DPixels;
+        produceYStatsTotal.alphaVetDeltaSum += stats.alphaVetDeltaSum;
+        produceYStatsTotal.retractedBlendSum += stats.retractedBlendSum;
+    };
+    auto measureStage = [&](StageIndex idx, auto &&fn) {
+        if (!stageTimers) {
+            fn();
+            return;
+        }
+        QElapsedTimer timer;
+        timer.start();
+        fn();
+        stageStats[idx].totalNs += timer.nsecsElapsed();
+        stageStats[idx].calls += 1;
+    };
+
     auto next     = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto current  = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
@@ -190,14 +274,19 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 //   buildCarrierRetracted → per-line carrier fit, flatFloor,
                 //                           combed carrier (alien-Y rejected)
                 //   split2D → buildPhaseCorrected1D demods the combed carrier
-                next->phaseLocked();
-                next->buildCarrierRetracted();
+                measureStage(StagePhaseLocked, [&]() { next->phaseLocked(); });
+                measureStage(StageCarrierRetracted, [&]() { next->buildCarrierRetracted(); });
             } else {
                 // Bucket path: still needs the blind bandpass.
                 next->split1D();
             }
 
-            next->split2D();
+            measureStage(StageSplit2D, [&]() { next->split2D(); });
+            if (stageTimers &&
+                configuration.twoDVariant ==
+                    Comb::Configuration::TwoDVariant::FieldVsFrame) {
+                accumulateFvfStats(next->getFvfInstrumentation());
+            }
         }
 
         if (fieldIndex < startIndex)
@@ -206,12 +295,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         // 3D temporal stage (if requested)
         bool isStartUp = (fieldIndex < startIndex + 4); 
         if (configuration.dimensions == 3) {
-            current->copy2DTo3D(); 
+            measureStage(StageCopy2DTo3D, [&]() { current->copy2DTo3D(); });
         }
         
         if (configuration.dimensions == 3 && !isStartUp) {
             // Now refine 3D buffer with temporal candidates where possible
-            current->split3D(*previous, *next);
+            measureStage(StageSplit3D, [&]() { current->split3D(*previous, *next); });
         }
 
         // Wire up temporal context for Residual Y if enabled
@@ -234,12 +323,17 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             // 2) Combed-carrier demod for 1D, 2D scoring (via buildPhaseCorrected1D)
             // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
             // 4) Re-demod final selected comb and produce locked-product cache
-            current->splitIQlocked();
-            current->doCNR();
-            current->produceY();
-            current->filterIQLocked();
-            current->doYNR();
-            current->transformIQ(configuration.chromaGain, configuration.chromaPhase);
+            measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
+            measureStage(StageDoCNR, [&]() { current->doCNR(); });
+            measureStage(StageProduceY, [&]() { current->produceY(); });
+            if (stageTimers) {
+                accumulateProduceYStats(current->getProduceYInstrumentation());
+            }
+            measureStage(StageFilterIQLocked, [&]() { current->filterIQLocked(); });
+            measureStage(StageDoYNR, [&]() { current->doYNR(); });
+            measureStage(StageTransformIQ, [&]() {
+                current->transformIQ(configuration.chromaGain, configuration.chromaPhase);
+            });
         } else {
             current->splitIQ();
             current->adjustY();
@@ -343,6 +437,109 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 drawNext(labelBottom);
             }
         }
+    }
+
+    if (stageTimers) {
+        QStringList parts;
+        for (const StageStat &stat : stageStats) {
+            if (stat.calls <= 0) continue;
+            const double avgMs = (static_cast<double>(stat.totalNs) / 1.0e6) /
+                                 static_cast<double>(stat.calls);
+            parts << QString("%1=%2ms (%3 calls)")
+                         .arg(stat.name)
+                         .arg(avgMs, 0, 'f', 3)
+                         .arg(stat.calls);
+        }
+        if (!parts.isEmpty()) {
+            qInfo().noquote() << QString("Locked stage timers: %1").arg(parts.join(", "));
+        }
+
+        const qint64 fvfPixels =
+            std::accumulate(fvfStatsTotal.finalWinnerCounts.begin(),
+                            fvfStatsTotal.finalWinnerCounts.end(), qint64{0});
+        if (fvfPixels > 0) {
+            qInfo().noquote() << QString(
+                "Locked FVF counters: raw(FA=%1,FB=%2,FRA=%3,FRB=%4) "
+                "final(FA=%5,FB=%6,FRA=%7,FRB=%8) "
+                "model(frame=%9,field=%10) frameHeadToHead(A=%11,B=%12) "
+                "cleanup(island=%13,blockField=%14)")
+                .arg(fvfStatsTotal.rawWinnerCounts[0])
+                .arg(fvfStatsTotal.rawWinnerCounts[1])
+                .arg(fvfStatsTotal.rawWinnerCounts[2])
+                .arg(fvfStatsTotal.rawWinnerCounts[3])
+                .arg(fvfStatsTotal.finalWinnerCounts[0])
+                .arg(fvfStatsTotal.finalWinnerCounts[1])
+                .arg(fvfStatsTotal.finalWinnerCounts[2])
+                .arg(fvfStatsTotal.finalWinnerCounts[3])
+                .arg(fvfStatsTotal.frameModelPixels)
+                .arg(fvfStatsTotal.fieldModelPixels)
+                .arg(fvfStatsTotal.frameAHeadToHeadWins)
+                .arg(fvfStatsTotal.frameBHeadToHeadWins)
+                .arg(fvfStatsTotal.islandChangedPixels)
+                .arg(fvfStatsTotal.blockFieldCommitPixels);
+
+            const auto &fp = fvfStatsTotal.islandFlipPairs;
+            qInfo().noquote() << QString(
+                "Locked FVF island flips [C->L] "
+                "FA(->FB=%1,->FRA=%2,->FRB=%3) FB(->FA=%4,->FRA=%5,->FRB=%6) "
+                "FRA(->FA=%7,->FB=%8,->FRB=%9) FRB(->FA=%10,->FB=%11,->FRA=%12)")
+                .arg(fp[0][1]).arg(fp[0][2]).arg(fp[0][3])
+                .arg(fp[1][0]).arg(fp[1][2]).arg(fp[1][3])
+                .arg(fp[2][0]).arg(fp[2][1]).arg(fp[2][3])
+                .arg(fp[3][0]).arg(fp[3][1]).arg(fp[3][2]);
+        }
+
+        if (produceYStatsTotal.pixels > 0) {
+            const double avgAlphaVetDelta = (produceYStatsTotal.alphaVetCalls > 0)
+                ? (produceYStatsTotal.alphaVetDeltaSum /
+                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
+                : 0.0;
+            const double avgRetractedBlend = (produceYStatsTotal.retractedAvailablePixels > 0)
+                ? (produceYStatsTotal.retractedBlendSum /
+                   static_cast<double>(produceYStatsTotal.retractedAvailablePixels))
+                : 0.0;
+            qInfo().noquote() << QString(
+                "Locked produceY counters: pixels=%1 attribution=%2 residualBypass=%3 "
+                "noProductFallback=%4 residual3D=%5 alphaVet(calls=%6,adjusted=%7,"
+                "pixels=%8,avgAbsDelta=%9) retracted(available=%10,applied=%11,avgBlend=%12)")
+                .arg(produceYStatsTotal.pixels)
+                .arg(produceYStatsTotal.attributionPixels)
+                .arg(produceYStatsTotal.residualBypassPixels)
+                .arg(produceYStatsTotal.noProductFallbackPixels)
+                .arg(produceYStatsTotal.residual3DPixels)
+                .arg(produceYStatsTotal.alphaVetCalls)
+                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
+                .arg(produceYStatsTotal.alphaVetPixels)
+                .arg(avgAlphaVetDelta, 0, 'f', 4)
+                .arg(produceYStatsTotal.retractedAvailablePixels)
+                .arg(produceYStatsTotal.retractedAppliedPixels)
+                .arg(avgRetractedBlend, 0, 'f', 4);
+
+            const double avgSubMag = (produceYStatsTotal.alphaVetCalls > 0)
+                ? (produceYStatsTotal.alphaVetSubMagSum /
+                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
+                : 0.0;
+            const double avgLutMag = (produceYStatsTotal.alphaVetCalls > 0)
+                ? (produceYStatsTotal.alphaVetLutMagSum /
+                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
+                : 0.0;
+            const qint64 alphaVetNoEffect =
+                produceYStatsTotal.alphaVetCalls -
+                produceYStatsTotal.alphaVetGateFailCalls -
+                produceYStatsTotal.alphaVetAdjustedCalls;
+            qInfo().noquote() << QString(
+                "Locked alphaVet diagnosis: calls=%1 gateFail=%2 noEffect=%3 adjusted=%4 "
+                "subMagIRE(avg=%5,max=%6) lutMagIRE(avg=%7,max=%8)")
+                .arg(produceYStatsTotal.alphaVetCalls)
+                .arg(produceYStatsTotal.alphaVetGateFailCalls)
+                .arg(alphaVetNoEffect)
+                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
+                .arg(avgSubMag, 0, 'f', 4)
+                .arg(produceYStatsTotal.alphaVetSubMagMax, 0, 'f', 4)
+                .arg(avgLutMag, 0, 'f', 4)
+                .arg(produceYStatsTotal.alphaVetLutMagMax, 0, 'f', 4);
+        }
+
     }
 }
 
@@ -456,17 +653,17 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         demodWidth = width;
         demodLines = lines + 1;
         carrierGrammar.assign(demodLines, CombCarrierGrammar{});
-        demodTI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        demodTQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        demodTI4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        demodTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        locked1DTI4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        locked1DTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-        demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         if (wantLocked) {
+            demodTI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            demodTQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            demodTI4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            demodTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            locked1DTI4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            locked1DTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
@@ -474,7 +671,6 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
                 size_t(demodLines) * demodWidth,
                 lddecode::FourViewCarrierAttribution{});
         }
-        scratch_residualContested.assign(width, 0.0);
         scratch_frameBDirectIQComposite.assign(width, 0.0);
         scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
     }
@@ -757,6 +953,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int width = right - left;
     if (width <= 0) return;
     if (!fieldA || !fieldB || (int)frameA.size() < width || !outMixed) return;
+    const bool instrumentFvf = configuration.stageTimers;
     if (line >= 0 && line < (int)fvfMetrics.size() &&
         (int)fvfMetrics[line].size() < width)
     {
@@ -874,6 +1071,44 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // when the footage is progressive we prefer interfield comb
     bool useFrameModel = (cadenceId >= 0 || cadenceId == lddecode::kCadenceProgressive);
     bool localUseFrameModel = useFrameModel;
+    if (instrumentFvf) {
+        if (localUseFrameModel) fvfInstrumentation.frameModelPixels += width;
+        else                    fvfInstrumentation.fieldModelPixels += width;
+    }
+
+    // Luma-domain neighbor consensus setup.
+    //
+    // Each candidate is a scalar carrier estimate; the implied luma at a pixel
+    // is raw - candidate.  We compare that implied luma to a luma-only spatial
+    // reference built from lockedLumaBaseY4 (the 4fsc-cancelled Y anchor, see
+    // buffer flow doc) at this line and at the regime-appropriate vertical
+    // step.  Composite alternation never enters the score because every term
+    // on both sides is in the luma domain.
+    //
+    // Vertical step matches the produceY anchor: progressive (frame model)
+    // uses ±1 line because adjacent woven-frame lines carry opposite chroma
+    // phase, so the candidate-side raw-minus-luma comparison stays clean.
+    // Interlace (field model) uses ±2 to stay within the same field.
+    const quint16 *neighRawLine = rawbuffer.data() +
+        static_cast<size_t>(line) *
+        static_cast<size_t>(videoParameters.fieldWidth);
+    const bool lumaCacheUsable =
+        lockedLumaCacheValid &&
+        !lockedLumaBaseY4_flat.empty() &&
+        demodWidth == width;
+    const double *lumaBaseRow = lumaCacheUsable
+        ? lockedLumaBaseY4_line(line) : nullptr;
+    const int vStep = localUseFrameModel ? 1 : 2;
+    const int vLineUp = line - vStep;
+    const int vLineDn = line + vStep;
+    const double *lumaUpRow = nullptr;
+    const double *lumaDnRow = nullptr;
+    if (lumaCacheUsable) {
+        if (vLineUp >= firstLine && vLineUp < demodLines)
+            lumaUpRow = lockedLumaBaseY4_line(vLineUp);
+        if (vLineDn < lastLine && vLineDn < demodLines)
+            lumaDnRow = lockedLumaBaseY4_line(vLineDn);
+    }
 
     FvfModelMetrics *metricRow =
         (line >= 0 && line < (int)fvfMetrics.size() &&
@@ -969,8 +1204,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double fieldLikeStack = 0.5 * (Cpm2 + Cpp2);
         double diff_stack_ire = std::fabs(frameLikeStack - fieldLikeStack) * invI;
 
-        double diff_candA_ire = std::fabs(lumFR - lumFA) * invI;
-        double diff_candB_ire = std::fabs(lumFR - lumFB) * invI;
+        // Frame B is the interfield (frame) model: cross-domain field candidates
+        // pay their distance from Frame B, and frameInsane is measured against it.
+        // lumFRRaw falls back to lumFR (Frame A) only when no Frame B exists.
+        double diff_candA_ire = std::fabs(lumFRRaw - lumFA) * invI;
+        double diff_candB_ire = std::fabs(lumFRRaw - lumFB) * invI;
         double diff_cand_ire  = std::min(diff_candA_ire, diff_candB_ire);
         double frameModelDistIRE = localUseFrameModel ? diff_cand_ire : diff_candA_ire;
         bool frameInsane = (frameModelDistIRE > FRAME_MAX_DIST_IRE);
@@ -988,7 +1226,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             const bool frameVerticalAllowed = carrierFrameVerticalAllowed(line);
             bool managementVeto = (cadenceId == lddecode::kCadenceVideo) || !frameVerticalAllowed;
             bool b2VertCoherent = (smoothed_interfield < FIELD_DIVERGE_IRE) && !frameInsane;
-            double targetModel = localUseFrameModel ? FR_s : FA_s;
+            double targetModel = localUseFrameModel ? FRB_s : FA_s;
 
             // diffFVF uses the geometric interfield stack divergence only
             double diff_fvf_ire = diff_stack_ire;
@@ -1137,7 +1375,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             };
 
-            consider(0, FA,         iqPenA, safeA, 0.25f);
+            // Field A retired from election; 3-way among FB, Frame A, Frame B.
             consider(1, FB,         iqPenB, safeB, 0.35f);
             consider(2, FR_s,       iqPenRA, safeR, 0.7f);   // Frame A (precleaned)
             consider(3, FR_raw,     iqPenRB, safeR, 0.85f);  // Frame B (Field B-precleaned IQ)
@@ -1154,7 +1392,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 auto getM = [&](int r) {
                     r = std::clamp(r, 0, width - 1);
                     if (localUseFrameModel)
-                        return frameA[r];
+                        return (frameB && r < (int)frameB->size())
+                                   ? (*frameB)[r] : frameA[r];
                     else
                         return fieldA[r];
                 };
@@ -1190,7 +1429,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             double errR_notch = std::fabs(lumFR);
             double errRRaw_notch = std::fabs(lumFRRaw);
 
-            scoreA = (1.0 - satScale) * devA + satScale * errA_notch;
+            // Field A is retired from the election; Field B now carries ±4
+            // extensions in coarse regime.  scoreA is set to +inf so FA
+            // naturally loses every comparison — no downstream branches change.
+            scoreA = std::numeric_limits<double>::infinity();
             scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
             scoreR_A = (1.0 - satScale) * devR_A + satScale * errR_notch;
             scoreR_B = (1.0 - satScale) * devR_B + satScale * errRRaw_notch;
@@ -1298,23 +1540,29 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // ------------------------------------------------------------
             // Model-aware regime scoring.
             // The active model has a same-domain buddy: Field B for Field A,
-            // Frame B for Frame A. Cross-domain candidates pay the model
-            // distance; the buddy is left to compete on its own evidence.
+            // Frame A for Frame B. Cross-domain candidates pay the model
+            // distance past a deadband so cross-domain combs that agree with
+            // the model to within DEADBAND_IRE compete unpenalized.  Frame B
+            // is the interfield model but takes no bias bonus — it wins on
+            // evidence; cross-domain candidates simply pay for divergence.
             // ------------------------------------------------------------
+            const double crossDomainDeadband = T.FVF_MODEL_PRIMARY_DEADBAND_IRE;
             if (localUseFrameModel) {
-                scoreA += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
-                scoreB += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
-                if (!managementVeto && !frameInsane) {
-                    scoreR_A *= T.FRAME_MODEL_BIAS;
-                    scoreR_B *= T.FRAME_MODEL_BIAS;
-                }
+                scoreA += T.FVF_MODEL_PRIMARY_WEIGHT *
+                          std::max(0.0, diff_candA_ire - crossDomainDeadband);
+                scoreB += T.FVF_MODEL_PRIMARY_WEIGHT *
+                          std::max(0.0, diff_candB_ire - crossDomainDeadband);
+                // Frame B (model) and Frame A (buddy) both compete on their
+                // own evidence.  No bias multiplier — let quality decide.
             } else {
                 const double closeFrameBonus = std::clamp(
                     1.0 - (diff_candA_ire / std::max(1e-9, T.FVF_SMALL_DIFF_IRE)),
                     0.0, 1.0);
                 scoreA *= T.FIELD_MODEL_BIAS;
-                scoreR_A += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
-                scoreR_B += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
+                scoreR_A += T.FVF_MODEL_PRIMARY_WEIGHT *
+                            std::max(0.0, diff_candA_ire - crossDomainDeadband);
+                scoreR_B += T.FVF_MODEL_PRIMARY_WEIGHT *
+                            std::max(0.0, diff_candA_ire - crossDomainDeadband);
                 scoreR_A *= T.FRAME_IN_INTERLACE_PENALTY;
                 scoreR_B *= T.FRAME_IN_INTERLACE_PENALTY;
                 scoreR_A *= (1.0 - 0.08 * closeFrameBonus);
@@ -1354,28 +1602,27 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     metrics->iqCoherence = iqCoherence;
                 }
 
-                // Current environment: Frame A tends to carry cleaner fine detail,
-                // while Frame B is smoother/softer. Tilt toward A at high fineFrac.
-                scoreR_A *= (1.0 - 0.08 * fineFrac);
-                scoreR_B *= (1.0 + 0.04 * fineFrac);
-                // Fine texture ladder: Frame A best, then Field/Frame B, then Field A.
-                scoreA   *= (1.0 + 0.10 * fineFrac);
+                // Texture scale ladder (3-way: FB, FRA, FRB):
+                //   Fine  → Frame B wins (interframe detail)
+                //   Mid   → flat election, no regime bonuses
+                //   Coarse → Field B wins (±2/±4 same-field stability)
+
+                // Fine: Frame B bonus, Field B penalized for reaching
+                scoreR_B *= (1.0 - T.FVF_SCALE_FINE_FRAME_B_BONUS * fineFrac);
                 scoreB   *= (1.0 + 0.06 * fineFrac);
 
-                scoreR_A *= (1.0 - T.FVF_SCALE_FINE_FRAME_A_BONUS * fineFrac);
-                scoreR_B *= (1.0 - T.FVF_SCALE_FINE_FRAME_B_BONUS * fineFrac);
+                // Mid: no bonuses or penalties — all three compete on evidence.
 
-                scoreB   *= (1.0 - T.FVF_SCALE_MID_FIELD_B_BONUS * midFrac);
-                scoreA   *= (1.0 - T.FVF_SCALE_MID_FIELD_A_BONUS * midFrac);
-                scoreR_A *= (1.0 - T.FVF_SCALE_MID_FRAME_A_BONUS * midFrac);
-                // Mid texture ladder: Frame B and Field B are the preferred middle ground.
-                scoreR_B *= (1.0 - 0.10 * midFrac);
-                scoreR_A *= (1.0 + 0.04 * midFrac);
-
-                scoreA   *= (1.0 - T.FVF_SCALE_COARSE_FIELD_A_BONUS * coarseFrac);
-                // Coarse texture ladder: keep Field A as the coarse winner.
-                scoreR_A *= (1.0 + 0.08 * coarseFrac);
-                scoreR_B *= (1.0 + 0.04 * coarseFrac);
+                // Coarse: Field B bonus, frames penalized for fine-scale noise.
+                // In saturated color (especially yellow), interfield combs
+                // carry residual zipper artifacts that the coarse regime
+                // averages out — amplify the coarse preference with sat_t so
+                // Field B's ±2/±4 stability wins more decisively where the
+                // frames are most likely to zipper.
+                const double satCoarseAmp = 1.0 + 0.50 * sat_t;
+                scoreB   *= (1.0 - T.FVF_SCALE_COARSE_FIELD_A_BONUS * coarseFrac * satCoarseAmp);
+                scoreR_A *= (1.0 + 0.08 * coarseFrac * satCoarseAmp);
+                scoreR_B *= (1.0 + 0.04 * coarseFrac * satCoarseAmp);
 
                 const bool dual4Accepted =
                     tapLine.haveU4 && tapLine.haveD4 &&
@@ -1383,7 +1630,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     tapLine.contour[rel].upSideOk > 0.5 &&
                     tapLine.contour[rel].dnSideOk > 0.5;
                 if (dual4Accepted) {
-                    scoreA *= (1.0 - T.FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS * coarseFrac);
+                    scoreB *= (1.0 - T.FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS *
+                               coarseFrac * satCoarseAmp);
                 }
             }
 
@@ -1488,52 +1736,60 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
-            // VDIS
-            if (!vdisHard &&
-                hIRE < T.NEIGHBOR_EST_EDGE_MAX_IRE &&
-                diff_stack_ire < T.NEIGHBOR_EST_FVF_MAX_IRE &&
-                chromaMagIRE < T.NEIGHBOR_EST_SAT_MAX_IRE)
-            {
-                double estA2 = 0.5 * (fieldA[rm2]  + fieldA[rp2]);
-                double estB2 = 0.5 * (fieldB[rm2]  + fieldB[rp2]);
-                double estF2 = 0.5 * (frameA[rm2] + frameA[rp2]);
-                double estRB2 = frameBData
-                    ? 0.5 * (frameBData[rm2] + frameBData[rp2])
-                    : estF2;
+            // Luma-domain neighbor consensus.
+            //
+            // Engagement is now strongest when candidates disagree (we need to
+            // arbitrate) and weakest when they agree (no information to gain).
+            // The previous gate was inverted from this — it excluded engagement
+            // exactly when neighbors mattered.
+            //
+            // Reference: lockedLumaBaseY4 at this line plus, where regime
+            // permits, line±vStep.  Per the buffer flow doc this buffer is a
+            // 4fsc-cancelled Y anchor — pure luma, regardless of saturation.
+            //
+            // Score: implied luma per candidate (raw − candidate) versus
+            // the luma reference.  All quantities are luma; carrier alternation
+            // never enters the comparison.
+            if (!vdisHard && lumaBaseRow) {
+                const double rawAtRel =
+                    static_cast<double>(neighRawLine[left + rel]);
 
-                double E2 = median4_average_middle(estA2, estB2, estF2, estRB2);
+                const double yViaA   = rawAtRel - FA_s;
+                const double yViaB   = rawAtRel - FB_s;
+                const double yViaR_A = rawAtRel - FR_s;
+                const double yViaR_B = rawAtRel - FR_raw;
 
-                bool allowPm1 = true;
-                {
-                    double altF = std::fabs(frameA[rm1] - frameA[rp1]) * invI;
-                    if (altF > 6.0) allowPm1 = false;
-                }
+                // Luma reference: at-pixel value plus vertical neighbors when
+                // regime/bounds permit.  Vertical step is regime-correct
+                // (progressive ±1, interlace ±2) — see line-level setup.
+                double sumLuma = lumaBaseRow[rel];
+                int nLuma = 1;
+                if (lumaUpRow) { sumLuma += lumaUpRow[rel]; ++nLuma; }
+                if (lumaDnRow) { sumLuma += lumaDnRow[rel]; ++nLuma; }
+                const double lumaRef = sumLuma / static_cast<double>(nLuma);
 
-                double E = E2;
-                if (allowPm1) {
-                    double estA1 = 0.5 * (fieldA[rm1]  + fieldA[rp1]);
-                    double estB1 = 0.5 * (fieldB[rm1]  + fieldB[rp1]);
-                    double estF1 = 0.5 * (frameA[rm1] + frameA[rp1]);
-                    double estRB1 = frameBData
-                        ? 0.5 * (frameBData[rm1] + frameBData[rp1])
-                        : estF1;
+                const double dA   = std::fabs(yViaA   - lumaRef) * invI;
+                const double dB   = std::fabs(yViaB   - lumaRef) * invI;
+                const double dR_A = std::fabs(yViaR_A - lumaRef) * invI;
+                const double dR_B = std::fabs(yViaR_B - lumaRef) * invI;
 
-                    double E1 = median4_average_middle(estA1, estB1, estF1, estRB1);
+                // Engagement profile:
+                //   disagreeT: 0 at fully-agreed candidates, 1 at ≥6 IRE spread.
+                //   edgeProtect: 0.5..1.0 — damp at structural horizontal
+                //     edges where the lumaRef is itself less trustworthy.
+                const double disagreeT = std::clamp(
+                    diff_stack_ire / 6.0, 0.0, 1.0);
+                const double edgeProtect = 1.0 - 0.50 * std::clamp(
+                    (hIRE - T.NEIGHBOR_EST_EDGE_MAX_IRE) /
+                    std::max(1e-9, T.NEIGHBOR_EST_EDGE_MAX_IRE),
+                    0.0, 1.0);
+                const double W = T.NEIGHBOR_EST_WEIGHT *
+                    (0.35 + 0.65 * disagreeT) * edgeProtect;
 
-                    const double K_PM1 = 0.5;
-                    E = (E2 + K_PM1 * E1) / (1.0 + K_PM1);
-                }
-
-                double dA = std::fabs(FA_s - E) * invI;
-                double dB = std::fabs(FB_s - E) * invI;
-                double dR_A = std::fabs(FR_s - E) * invI;
-                double dR_B = std::fabs(FR_raw - E) * invI;
-
-                const double W_NEIGH = T.NEIGHBOR_EST_WEIGHT;
-                scoreA += W_NEIGH * dA;
-                scoreB += W_NEIGH * dB;
-                scoreR_A += W_NEIGH * dR_A;
-                scoreR_B += W_NEIGH * dR_B;
+                scoreA   += W * dA;
+                scoreB   += W * dB;
+                scoreR_A += W * dR_A;
+                scoreR_B += W * dR_B;
             }
 
             // When Field/Frame are already close, Frame receives a score reward
@@ -1589,6 +1845,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (scoreR_A <= scoreR_B) pickCandidate(2, FR_s,   shadeA);
                 else                       pickCandidate(3, FR_raw,     shadeB);
             };
+            if (instrumentFvf &&
+                std::isfinite(scoreR_A) &&
+                std::isfinite(scoreR_B))
+            {
+                if (scoreR_A <= scoreR_B) ++fvfInstrumentation.frameAHeadToHeadWins;
+                else                      ++fvfInstrumentation.frameBHeadToHeadWins;
+            }
 
             const bool satForceFrameB =
                 (sat_t >= 0.72) && !managementVeto && !frameInsane;
@@ -1651,6 +1914,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         winner[rel]   = idx;
         outVal[rel]   = val;
         outShade[rel] = shade;
+        if (instrumentFvf && idx >= 0 && idx < 4) {
+            ++fvfInstrumentation.rawWinnerCounts[idx];
+        }
         if      (idx == 2 || idx == 3) frameCountTotal++;
         else if (idx == 0 || idx == 1) fieldCountTotal++;
         if (metrics)
@@ -1676,6 +1942,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
             if (L == R && C != L) {
                 w2[rel] = L;
+                if (instrumentFvf) {
+                    ++fvfInstrumentation.islandChangedPixels;
+                    ++fvfInstrumentation.islandFlipPairs[C][L];
+                }
                 changed = true;
             }
         }
@@ -1722,8 +1992,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     else                     cntF++;   // Frame A (2) or Frame B (3)
                 }
                 if (cntF > 0 && (cntA + cntB) > 0) {
-                    int blockIdx = (cntA >= cntB) ? 0 : 1;
+                    int blockIdx = 1; // Field B only; FA retired
                     for (int r = b; r < e; ++r) {
+                        if (instrumentFvf && winner[r] != blockIdx) {
+                            ++fvfInstrumentation.blockFieldCommitPixels;
+                        }
                         winner[r] = blockIdx;
                         if (blockIdx == 0) { outVal[r] = fieldA[r]; outShade[r] = 0.25f; }
                         else               { outVal[r] = fieldB[r]; outShade[r] = 0.35f; }
@@ -1734,6 +2007,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     }
     for (int rel = 0; rel < width; ++rel) {
         outMixed[rel] = outVal[rel];
+        if (instrumentFvf) {
+            const int idx = winner[rel];
+            if (idx >= 0 && idx < 4) ++fvfInstrumentation.finalWinnerCounts[idx];
+        }
         if (line >= 0 && line < (int)fvfMetrics.size() &&
             rel < (int)fvfMetrics[line].size())
         {
@@ -2397,6 +2674,9 @@ void Comb::FrameBuffer::split2D()
 {
     const bool writeWeights = configuration.showMap;
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
+    if (configuration.stageTimers && wantFvf) {
+        fvfInstrumentation.reset();
+    }
     const bool needFrameACompute = configuration.phaseCompensation &&
         (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
          wantFvf);
@@ -2616,15 +2896,14 @@ void Comb::FrameBuffer::split2D()
                     scratch_lateralLine.data(),
                     &frameIQ);
 
-                const double OUT_CLAMP_MAG = std::max(32.0 * irescale, 1.0);
-                    for (int rel = 0; rel < width; ++rel) {
-                        double vMixed = scratch_outMixed[rel];
-                    
-                        // Keep only the numeric-sanity fallback:
-                        if (!std::isfinite(vMixed)) vMixed = scratch_lineWorkC[rel];
-                    
-                        emitSelected(rel, vMixed);
-                    }
+                for (int rel = 0; rel < width; ++rel) {
+                    double vMixed = scratch_outMixed[rel];
+
+                    // Keep only the numeric-sanity fallback:
+                    if (!std::isfinite(vMixed)) vMixed = scratch_lineWorkC[rel];
+
+                    emitSelected(rel, vMixed);
+                }
                 }
         }
     }
@@ -2767,23 +3046,56 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         const double ref2d = clpbuffer[1].pixel[lineNumber][h];
         const auto &T = configuration.tunables;
 
+        const float *curFloor = (carrierRetractedValid && !flatFloor_flat.empty()
+                                 && demodWidth > 0)
+                                ? flatFloor_line(lineNumber) : nullptr;
+
+        static constexpr int candLine[NUM_CANDIDATES] = {
+             0,  0,  // LEFT, RIGHT  (same line — skipped by s==this)
+             0,  0,  // UP, DOWN     (skipped by s==this)
+            -1,      // PREV_FIELD
+             1,      // NEXT_FIELD
+             0,      // PREV_FRAME
+             0,      // NEXT_FRAME
+        };
+
         for (int i = 0; i < NUM_CANDIDATES; ++i) {
             const FrameBuffer* s = src[i];
             if (!s || s == this || c[i].penalty >= 1000.0) continue;
 
             double dIRE = std::fabs(c[i].sample - ref2d) / irescale;
             double delta = 0.0;
-            // Agreement shaping: reward temporal candidates that agree with the 2D
-            // estimate (parabolic bonus within AGREEMENT_REWARD_RADIUS_IRE), apply no
-            // adjustment in the neutral zone, and heavily penalise deviations beyond
-            // deviationThreshold to veto temporally incoherent candidates.
-             if (dIRE <= T.AGREEMENT_REWARD_RADIUS_IRE) {
+
+            if (dIRE <= T.AGREEMENT_REWARD_RADIUS_IRE) {
                 double x = dIRE / T.AGREEMENT_REWARD_RADIUS_IRE;
                 delta = - (T.AGREEMENT_REWARD_MAX * configuration.adaptThreshold) * (1.0 - x * x);
             } else if (dIRE <= T.deviationThreshold) {
                 delta = 0.0;
             } else {
-                delta = T.AGREEMENT_VETO_BASE + T.deviationPenalty * (dIRE - T.deviationThreshold);
+                double rawVeto = T.AGREEMENT_VETO_BASE
+                               + T.deviationPenalty * (dIRE - T.deviationThreshold);
+
+                double vetoScale = 1.0;
+                if (T.VETO_LUMA_GATE_ENABLE && curFloor) {
+                    int cLine = lineNumber + candLine[i];
+                    const float *srcFloor = s->carrierRetractedValid
+                        ? s->flatFloor_line(cLine) : nullptr;
+                    if (srcFloor) {
+                        double lumaD = std::fabs((double)curFloor[h]
+                                                 - (double)srcFloor[h])
+                                       * invIreScale;
+                        if (lumaD <= T.VETO_LUMA_STATIC_IRE) {
+                            vetoScale = 0.0;
+                        } else if (lumaD >= T.VETO_LUMA_MOTION_IRE) {
+                            vetoScale = 1.0;
+                        } else {
+                            vetoScale = (lumaD - T.VETO_LUMA_STATIC_IRE)
+                                      / (T.VETO_LUMA_MOTION_IRE
+                                         - T.VETO_LUMA_STATIC_IRE);
+                        }
+                    }
+                }
+                delta = rawVeto * vetoScale;
             }
             c[i].penalty += delta;
         }

@@ -129,14 +129,31 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
             : 0.0;
     }
 
+    // Precompute the symmetric IQ-distance matrix once.  With viewCount ≤ 4
+    // this means at most 6 hypot calls instead of viewCount² (= 16) when
+    // looped naively below, and the same matrix is reused for the spread
+    // computation later — together cutting parallax hypot calls from ~20
+    // per pixel to ~6 without changing any output.
+    double iqDist[4][4] = {{0.0, 0.0, 0.0, 0.0},
+                            {0.0, 0.0, 0.0, 0.0},
+                            {0.0, 0.0, 0.0, 0.0},
+                            {0.0, 0.0, 0.0, 0.0}};
+    for (int i = 0; i < out.viewCount; ++i) {
+        for (int j = i + 1; j < out.viewCount; ++j) {
+            const double d = std::hypot(
+                views[i].carrierI - views[j].carrierI,
+                views[i].carrierQ - views[j].carrierQ) * invIreScale;
+            iqDist[i][j] = d;
+            iqDist[j][i] = d;
+        }
+    }
+
     int best = 0;
     double bestCost = 1e300;
     for (int i = 0; i < out.viewCount; ++i) {
         double cost = 0.0;
-        for (int j = 0; j < out.viewCount; ++j) {
-            cost += std::hypot(views[i].carrierI - views[j].carrierI,
-                               views[i].carrierQ - views[j].carrierQ) * invIreScale;
-        }
+        for (int j = 0; j < out.viewCount; ++j)
+            cost += iqDist[i][j];
         cost += 0.35 * std::max(0.0, views[i].sampleFitErrorIRE);
         cost += 0.05 * std::max(0.0, views[i].score);
         if (cost < bestCost) {
@@ -171,10 +188,9 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
     double sampleSpread = 0.0;
     double lattice = 0.0;
     for (int i = 0; i < out.viewCount; ++i) {
-        spread = std::max(
-            spread,
-            std::hypot(views[i].carrierI - out.commonI,
-                       views[i].carrierQ - out.commonQ) * invIreScale);
+        // commonI/Q == views[best].carrierI/Q, so the IQ distance is exactly
+        // iqDist[i][best] from the precomputed matrix — no extra hypot.
+        spread = std::max(spread, iqDist[i][best]);
         sampleSpread = std::max(
             sampleSpread,
             std::fabs(views[i].carrierSample - out.commonSample) * invIreScale);

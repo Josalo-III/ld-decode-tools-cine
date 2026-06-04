@@ -876,10 +876,33 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine, doubl
         return;
     }
 
+    const bool have4 = tapLine.haveU4 && tapLine.haveD4 &&
+                        (int)tapLine.tapU4.size() >= width &&
+                        (int)tapLine.tapD4.size() >= width &&
+                        (int)tapLine.contour.size() >= width;
+
     for (int rel = 0; rel < width; ++rel) {
         const double C   = tapLine.tap0[rel].comp;
-        const double Cup = tapLine.tapU2[rel].comp;
-        const double Cdn = tapLine.tapD2[rel].comp;
+        double Cup = tapLine.tapU2[rel].comp;
+        double Cdn = tapLine.tapD2[rel].comp;
+
+        if (have4) {
+            const CombTapContour &curve = tapLine.contour[rel];
+            if (curve.upSideOk > 0.5 && curve.dnSideOk > 0.5) {
+                const double Cup4 = tapLine.tapU4[rel].comp;
+                const double Cdn4 = tapLine.tapD4[rel].comp;
+                auto refineNear = [](double nearS, double farS, double influence) {
+                    if (influence <= 0.0 || nearS == 0.0) return nearS;
+                    if ((nearS > 0.0) != (farS > 0.0)) return nearS;
+                    const double nearMag = std::fabs(nearS);
+                    const double farMag  = std::fabs(farS);
+                    return std::copysign(
+                        (nearMag + influence * farMag) / (1.0 + influence), nearS);
+                };
+                Cup = refineNear(Cup, Cup4, curve.upInfluence);
+                Cdn = refineNear(Cdn, Cdn4, curve.dnInfluence);
+            }
+        }
 
         // Soft weights from pre-computed kRange magnitude agreement (same formula
         // as Luma Wow). In locked mode the tap .comp values already come from

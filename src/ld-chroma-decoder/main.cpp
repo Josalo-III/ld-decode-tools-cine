@@ -317,6 +317,10 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "NTSC locked mode: log carrier-fit residual statistics for diagnosing ordered column artifacts"));
     parser.addOption(debugPhaseLegsOption);
 
+    QCommandLineOption stageTimersOption(QStringList() << "stage-timers",
+                                    QCoreApplication::translate("main", "NTSC locked mode: log per-stage timing summaries"));
+    parser.addOption(stageTimersOption);
+
     QCommandLineOption noPAOption(QStringList() << "no-pa",
         QCoreApplication::translate("main", "Disable pulldown awareness - reverts to original 29.97 video process"));
     parser.addOption(noPAOption);
@@ -416,6 +420,9 @@ int main(int argc, char *argv[])
     }
     if (parser.isSet(debugPhaseLegsOption)) {
         combConfig.debugPhaseLegs = true;
+    }
+    if (parser.isSet(stageTimersOption)) {
+        combConfig.stageTimers = true;
     }
 
     if (cadenceConfig.noPA && cadenceConfig.setCadence != 0) {
@@ -527,13 +534,19 @@ int main(int argc, char *argv[])
         combConfig.tunables.VDIS_ENABLE = true;
     }
 
-    // Residual video: enabled by default when phase compensation is active
+    // Residual video rollout: locked mode defaults to both residual Y and
+    // residual color. --no-residual-video disables both; --no-residual-color
+    // keeps residual Y but falls back to coherent color from splitIQlocked().
+    if (combConfig.phaseCompensation) {
+        combConfig.residualVideo = true;
+        combConfig.tunables.VET_ENABLE_RESIDUAL_Y = true;
+        combConfig.residualColor = true;
+    }
+
     if (parser.isSet(noResidualVideoOption)) {
+        combConfig.residualVideo = false;
         combConfig.tunables.VET_ENABLE_RESIDUAL_Y = false;
         combConfig.residualColor = false;
-    } else {
-        combConfig.tunables.VET_ENABLE_RESIDUAL_Y = combConfig.phaseCompensation ? true : combConfig.tunables.VET_ENABLE_RESIDUAL_Y;
-        combConfig.residualColor = combConfig.phaseCompensation ? true : false;
     }
 
     if (parser.isSet(noResidualColorOption)) {
