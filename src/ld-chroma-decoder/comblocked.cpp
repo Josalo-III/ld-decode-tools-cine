@@ -1152,7 +1152,6 @@ void Comb::FrameBuffer::ensureProduceYScratch(int width)
 {
     if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
     if ((int)scratch_lumaHiRaw.size() < width) scratch_lumaHiRaw.resize(width, 0.0);
-    if ((int)scratch_residualContested.size() < width) scratch_residualContested.resize(width, 0.0);
     if ((int)scratch_lineWorkB.size()    < width) scratch_lineWorkB.resize(width, 1.0);
     if ((int)scratch_lineWorkA.size()    < width) scratch_lineWorkA.resize(width, 0.0);
     if ((int)scratch_lineWorkC.size()    < width) scratch_lineWorkC.resize(width, 0.0);
@@ -1178,6 +1177,10 @@ void Comb::FrameBuffer::produceY()
     const int fullWidth = videoParameters.fieldWidth;
     const int width     = right - left;
     if (width <= 0) return;
+    const bool instrumentProduceY = configuration.stageTimers;
+    if (instrumentProduceY) {
+        produceYInstrumentation.reset();
+    }
 
     const auto &T = configuration.tunables;
     const bool enableResidualY = T.VET_ENABLE_RESIDUAL_Y;
@@ -1220,6 +1223,10 @@ void Comb::FrameBuffer::produceY()
         const double *clpLine = clpbuffer[srcBuf].pixel[line];
 
         if (!enableResidualY) {
+            if (instrumentProduceY) {
+                produceYInstrumentation.pixels += width;
+                produceYInstrumentation.residualBypassPixels += width;
+            }
             for (int h = left; h < right; ++h) {
                 Y[h] = (double)rawLine[h] - clpLine[h];
             }
@@ -1235,6 +1242,10 @@ void Comb::FrameBuffer::produceY()
         float *prodQRow = lockedProductQ_line(line);
 
         if (!prodIRow || !prodQRow) {
+            if (instrumentProduceY) {
+                produceYInstrumentation.pixels += width;
+                produceYInstrumentation.noProductFallbackPixels += width;
+            }
             for (int h = left; h < right; ++h) {
                 Y[h] = (double)rawLine[h] - clpLine[h];
             }
@@ -1823,6 +1834,15 @@ void Comb::FrameBuffer::produceY()
         };
 
         auto computeAlphaVet = [&](int p) -> double {
+            // LUT-demodulated chroma magnitude — phase-correct, the same
+            // measurement the rest of produceY trusts.  Used for both the
+            // engagement gate and the projection confidence ramp.
+            const double lutMag = 0.25 * (
+                std::hypot(tiAdjLocked[p + 0], tqAdjLocked[p + 0]) +
+                std::hypot(tiAdjLocked[p + 1], tqAdjLocked[p + 1]) +
+                std::hypot(tiAdjLocked[p + 2], tqAdjLocked[p + 2]) +
+                std::hypot(tiAdjLocked[p + 3], tqAdjLocked[p + 3])) * invI;
+
             const double r0 = sourceToWorkingSample(highRawY, p + 0);
             const double r1 = sourceToWorkingSample(highRawY, p + 1);
             const double r2 = sourceToWorkingSample(highRawY, p + 2);
@@ -1833,6 +1853,10 @@ void Comb::FrameBuffer::produceY()
             const double c2 = sourceToWorkingSample(coherentCombY, p + 2);
             const double c3 = sourceToWorkingSample(coherentCombY, p + 3);
 
+            // Fixed-index carrier projection.  The ratio rawI/subI is
+            // coordinate-independent so the fixed-index frame is fine
+            // for the scalar projection even though the magnitude is
+            // slightly inflated relative to the LUT demod.
             const double rawI = r1 - r3;
             const double rawQ = r2 - r0;
             const double subI = c1 - c3;
@@ -1894,6 +1918,14 @@ void Comb::FrameBuffer::produceY()
         if (attributionEnabled) {
             for (int p = 0; p + 3 < width; p += 4) {
                 const double alphaVet = computeAlphaVet(p);
+                if (instrumentProduceY) {
+                    ++produceYInstrumentation.alphaVetCalls;
+                    produceYInstrumentation.alphaVetPixels += 4;
+                    produceYInstrumentation.alphaVetDeltaSum += std::fabs(alphaVet - 1.0);
+                    if (std::fabs(alphaVet - 1.0) > 1e-6) {
+                        ++produceYInstrumentation.alphaVetAdjustedCalls;
+                    }
+                }
                 writePixelWithAttribution(p + 0, alphaVet);
                 writePixelWithAttribution(p + 1, alphaVet);
                 writePixelWithAttribution(p + 2, alphaVet);
@@ -1903,6 +1935,15 @@ void Comb::FrameBuffer::produceY()
             if (tailStart < width) {
                 const int p = std::max(0, width - 4);
                 const double alphaVet = computeAlphaVet(p);
+                if (instrumentProduceY) {
+                    const int tailPixels = width - tailStart;
+                    ++produceYInstrumentation.alphaVetCalls;
+                    produceYInstrumentation.alphaVetPixels += tailPixels;
+                    produceYInstrumentation.alphaVetDeltaSum += std::fabs(alphaVet - 1.0);
+                    if (std::fabs(alphaVet - 1.0) > 1e-6) {
+                        ++produceYInstrumentation.alphaVetAdjustedCalls;
+                    }
+                }
                 for (int x = tailStart; x < width; ++x) {
                     writePixelWithAttribution(x, alphaVet);
                 }
@@ -1910,6 +1951,14 @@ void Comb::FrameBuffer::produceY()
         } else {
             for (int p = 0; p + 3 < width; p += 4) {
                 const double alphaVet = computeAlphaVet(p);
+                if (instrumentProduceY) {
+                    ++produceYInstrumentation.alphaVetCalls;
+                    produceYInstrumentation.alphaVetPixels += 4;
+                    produceYInstrumentation.alphaVetDeltaSum += std::fabs(alphaVet - 1.0);
+                    if (std::fabs(alphaVet - 1.0) > 1e-6) {
+                        ++produceYInstrumentation.alphaVetAdjustedCalls;
+                    }
+                }
                 writePixelNoAttribution(p + 0, alphaVet);
                 writePixelNoAttribution(p + 1, alphaVet);
                 writePixelNoAttribution(p + 2, alphaVet);
@@ -1919,6 +1968,15 @@ void Comb::FrameBuffer::produceY()
             if (tailStart < width) {
                 const int p = std::max(0, width - 4);
                 const double alphaVet = computeAlphaVet(p);
+                if (instrumentProduceY) {
+                    const int tailPixels = width - tailStart;
+                    ++produceYInstrumentation.alphaVetCalls;
+                    produceYInstrumentation.alphaVetPixels += tailPixels;
+                    produceYInstrumentation.alphaVetDeltaSum += std::fabs(alphaVet - 1.0);
+                    if (std::fabs(alphaVet - 1.0) > 1e-6) {
+                        ++produceYInstrumentation.alphaVetAdjustedCalls;
+                    }
+                }
                 for (int x = tailStart; x < width; ++x) {
                     writePixelNoAttribution(x, alphaVet);
                 }
@@ -2151,14 +2209,25 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         const double maxCarrierSamples =
             std::max(24.0, grammar->carrierScale * 5.0) * irescale;
 
+        // basisI/Q at position h depend only on (h & 3) given the line's
+        // burst phasor and locked basis (remod4fscToShiftedComposite indexes
+        // spLUT/cpLUT by (h & 3); lockedTo4fsc takes no h).  Precompute the
+        // four phase values and fill by lookup — replaces 2*width function
+        // calls per line with 8 function calls + 2*width table reads.
+        double basisI4[4];
+        double basisQ4[4];
+        for (int p = 0; p < 4; ++p) {
+            basisI4[p] = remodLockedToShiftedComposite(
+                1.0, 0.0, p, bcos, bsin,
+                spLUT_locked, cpLUT_locked);
+            basisQ4[p] = remodLockedToShiftedComposite(
+                0.0, 1.0, p, bcos, bsin,
+                spLUT_locked, cpLUT_locked);
+        }
         for (int xi = 0; xi < width; ++xi) {
-            const int h = left + xi;
-            basisI[xi] = remodLockedToShiftedComposite(
-                1.0, 0.0, h, bcos, bsin,
-                spLUT_locked, cpLUT_locked);
-            basisQ[xi] = remodLockedToShiftedComposite(
-                0.0, 1.0, h, bcos, bsin,
-                spLUT_locked, cpLUT_locked);
+            const int idx = (left + xi) & 3;
+            basisI[xi] = basisI4[idx];
+            basisQ[xi] = basisQ4[idx];
         }
 
         if (width >= 4) {
@@ -2389,6 +2458,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 const int sLast  = std::min(xi, meanCount - 1);
 
                 lddecode::FourViewCarrierView views[4];
+                double viewCenters[4] = {0.0, 0.0, 0.0, 0.0};
                 int viewCount = 0;
 
                 for (int s = sFirst; s <= sLast; ++s) {
@@ -2408,6 +2478,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                     views[viewCount].latticeRiskIRE = winLatticeIRE[s];
                     views[viewCount].ySpanIRE = winYSpanIRE[s];
                     views[viewCount].score = winScore[s];
+                    viewCenters[viewCount] = static_cast<double>(s) + 1.5;
                     ++viewCount;
                 }
 
@@ -2471,44 +2542,49 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 parallax.discResponseBlend = discResponseBlend;
                 if (parallaxRow)
                     parallaxRow[xi] = parallax;
+                auto finalizeCarrierSample = [&](double candidateI) {
+                    double sample = candidateI * basisI[xi] + modelQ * basisQ[xi];
 
-                double cf = modelI * basisI[xi] + modelQ * basisQ[xi];
+                    if (parallax.valid) {
+                        constexpr double SAMPLE_DISC_SOFT_IRE = 1.5;
+                        constexpr double SAMPLE_DISC_HARD_IRE = 5.0;
+                        constexpr double CONTEXT_SOFT_IRE = 3.0;
+                        constexpr double CONTEXT_HARD_IRE = 12.0;
 
-                if (parallax.valid) {
-                    constexpr double SAMPLE_DISC_SOFT_IRE = 1.5;
-                    constexpr double SAMPLE_DISC_HARD_IRE = 5.0;
-                    constexpr double CONTEXT_SOFT_IRE = 3.0;
-                    constexpr double CONTEXT_HARD_IRE = 12.0;
+                        const double sampleDisagreementIRE =
+                            std::fabs(sample - parallax.commonSample) * invIreScale;
+                        const double disagreementGate = smoothStep01(
+                            (sampleDisagreementIRE - SAMPLE_DISC_SOFT_IRE) /
+                            std::max(1e-9, SAMPLE_DISC_HARD_IRE - SAMPLE_DISC_SOFT_IRE));
+                        const double contextIRE =
+                            std::max(parallax.yCurvatureIRE,
+                                     0.5 * parallax.ySpreadIRE);
+                        const double contextGate = smoothStep01(
+                            (contextIRE - CONTEXT_SOFT_IRE) /
+                            std::max(1e-9, CONTEXT_HARD_IRE - CONTEXT_SOFT_IRE));
 
-                    const double sampleDisagreementIRE =
-                        std::fabs(cf - parallax.commonSample) * invIreScale;
-                    const double disagreementGate = smoothStep01(
-                        (sampleDisagreementIRE - SAMPLE_DISC_SOFT_IRE) /
-                        std::max(1e-9, SAMPLE_DISC_HARD_IRE - SAMPLE_DISC_SOFT_IRE));
-                    const double contextIRE =
-                        std::max(parallax.yCurvatureIRE,
-                                 0.5 * parallax.ySpreadIRE);
-                    const double contextGate = smoothStep01(
-                        (contextIRE - CONTEXT_SOFT_IRE) /
-                        std::max(1e-9, CONTEXT_HARD_IRE - CONTEXT_SOFT_IRE));
+                        // The per-pixel floor residual is not a replacement model;
+                        // it is a witness that can pull a bad window IQ fit back
+                        // toward what all legal Y floors say at this sample.
+                        const double sampleTrust =
+                            std::clamp(parallax.sampleCoherence, 0.0, 1.0);
+                        const double sampleAnchor =
+                            std::min(0.85,
+                                     disagreementGate *
+                                     sampleTrust *
+                                     (0.25 + 0.75 * contextGate) *
+                                     (1.0 - discResponseBlend));
 
-                    // The per-pixel floor residual is not a replacement model;
-                    // it is a witness that can pull a bad window IQ fit back
-                    // toward what all legal Y floors say at this sample.
-                    const double sampleTrust =
-                        std::clamp(parallax.sampleCoherence, 0.0, 1.0);
-                    const double sampleAnchor =
-                        std::min(0.85,
-                                 disagreementGate *
-                                 sampleTrust *
-                                 (0.25 + 0.75 * contextGate) *
-                                 (1.0 - discResponseBlend));
+                        sample = sample * (1.0 - sampleAnchor) +
+                                 parallax.commonSample * sampleAnchor;
+                    }
 
-                    cf = cf * (1.0 - sampleAnchor) +
-                         parallax.commonSample * sampleAnchor;
-                }
+                    return std::clamp(sample, -maxCarrierSamples, maxCarrierSamples);
+                };
 
-                cf = std::clamp(cf, -maxCarrierSamples, maxCarrierSamples);
+                const double baselineModelI = modelI;
+                const double baselineCf = finalizeCarrierSample(baselineModelI);
+                double cf = baselineCf;
 
                 carrierFit[xi] = cf;
                 flattened[xi] = rawWhole[xi] - cf;
@@ -2920,7 +2996,29 @@ void Comb::FrameBuffer::buildCarrierRetracted()
 
             double lumaGate = softReachGate(lumaDiffIRE, 3.0, 10.0);
 
+            const double carrierSoftIRE = std::max(3.0, 0.25 * carrierAmpIRE);
+            const double carrierHardIRE = std::max(10.0, 0.80 * carrierAmpIRE);
+            double carrierGate =
+                softReachGate(carrierMismatchIRE,
+                              carrierSoftIRE,
+                              carrierHardIRE);
+
             if (progressiveCarrierModel) {
+                // Saturation-driven cancellation relax with bevel protection.
+                //
+                // In progressive + high-color regions, both lumaDiff and
+                // carrierMismatch can be elevated by the same per-line zipper
+                // we want to cancel.  Gating on either suppresses the cure.
+                //
+                // BUT: lumaDiff is also elevated in bevel-approach zones
+                // (e.g. soft luma ramps approaching the top/bottom edge of
+                // yellow text).  Cancelling through those zones smears the
+                // bevel.  So the relax is itself gated by lumaDiff — fully
+                // applied only where lumaDiff is small enough to plausibly
+                // be the zipper, withdrawn where lumaDiff indicates a real
+                // luma transition.  The withdrawal band matches the original
+                // lumaGate's softReachGate(3.0, 10.0) so the geometry of
+                // "real transitions suppress cancellation" is preserved.
                 const double chromaT = std::clamp(
                     (carrierAmpIRE -
                      T.RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE) /
@@ -2928,18 +3026,23 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                         T.RETRACTED_PROGRESSIVE_CHROMA_RELAX_FULL_IRE -
                         T.RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE),
                     0.0, 1.0);
-                const double relax = chromaT * chromaT * (3.0 - 2.0 * chromaT);
+                const double satRelax = chromaT * chromaT * (3.0 - 2.0 * chromaT);
+                // bevelGuard: 1.0 when lumaDiff is in the zipper band
+                // (≤3 IRE), 0.0 when it's clearly a real transition (≥10
+                // IRE), smooth between.  Multiplied into the relax so the
+                // floors only engage where the relax is appropriate.
+                const double bevelT = std::clamp(
+                    (lumaDiffIRE - 3.0) / 7.0, 0.0, 1.0);
+                const double bevelGuard =
+                    1.0 - (bevelT * bevelT * (3.0 - 2.0 * bevelT));
+                const double relax = satRelax * bevelGuard;
                 lumaGate = std::max(
                     lumaGate,
                     T.RETRACTED_PROGRESSIVE_LUMA_GATE_FLOOR * relax);
+                carrierGate = std::max(
+                    carrierGate,
+                    T.RETRACTED_PROGRESSIVE_CARRIER_GATE_FLOOR * relax);
             }
-
-            const double carrierSoftIRE = std::max(3.0, 0.25 * carrierAmpIRE);
-            const double carrierHardIRE = std::max(10.0, 0.80 * carrierAmpIRE);
-            const double carrierGate =
-                softReachGate(carrierMismatchIRE,
-                              carrierSoftIRE,
-                              carrierHardIRE);
 
             return lumaGate * carrierGate;
         };
