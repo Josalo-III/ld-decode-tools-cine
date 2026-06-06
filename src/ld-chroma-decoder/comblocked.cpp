@@ -866,6 +866,27 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         }
     }
 
+    // Precompute per-pixel IQ magnitude from the 4fsc demod output.
+    // buildCombTapLine fills iqMag via std::hypot for every tap layer it
+    // processes — up to 7 layers per line, each recomputing the same
+    // magnitude from the same (ti, tq) source data.  This table turns
+    // all of those into a single indexed read per pixel per layer.
+    {
+        const size_t need = static_cast<size_t>(last) * static_cast<size_t>(demodWidth);
+        if (demodIQMag4fsc_flat.size() < need)
+            demodIQMag4fsc_flat.resize(need);
+        for (int line = first; line < last; ++line) {
+            const float *ti = demodTI4fsc_line(line);
+            const float *tq = demodTQ4fsc_line(line);
+            float *mag = demodIQMag4fsc_flat.data()
+                         + static_cast<size_t>(line) * demodWidth;
+            for (int xi = 0; xi < width; ++xi)
+                mag[xi] = static_cast<float>(
+                    std::hypot(static_cast<double>(ti[xi]),
+                               static_cast<double>(tq[xi])));
+        }
+    }
+
 }
 
 void Comb::FrameBuffer::splitIQlocked()
@@ -2852,6 +2873,18 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                             std::hypot(static_cast<double>(fitRow[xi]),
                                        static_cast<double>(fitRow[xi1])) * invIreScale;
 
+                        // Luma edge guard: at horizontal luma transitions the
+                        // carrier envelope changes within a few samples.  The
+                        // wide window averages across the transition and sees
+                        // a lower magnitude — that is expected, not cross-color.
+                        // Suppress risk where the local luma gradient is steep.
+                        const int xL = std::max(0, xi - 2);
+                        const int xR = std::min(width - 1, xi + 2);
+                        const double lumaGradIRE =
+                            std::fabs(refinedY[xR] - refinedY[xL]) * invIreScale;
+                        const double edgeGuard = std::clamp(
+                            (lumaGradIRE - 3.0) / 7.0, 0.0, 1.0);
+
                         // Cross-color risk: how much more carrier the narrow
                         // four-view windows see compared to the wide coherent
                         // estimate.  Normalized by the fit magnitude so the
@@ -2864,6 +2897,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                             risk = std::clamp(
                                 excessIRE / std::max(2.0, fitMagIRE),
                                 0.0, 1.0);
+                            risk *= (1.0 - edgeGuard);
                         }
                         ccRiskRow[xi] = static_cast<float>(risk);
                     }
@@ -2971,12 +3005,9 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             ? (flatFloor_flat.data() + static_cast<size_t>(lineBelow) * demodWidth)
             : nullptr;
 
-        double *wAboveRaw = scratch_preI.data();
-        double *wBelowRaw = scratch_preQ.data();
-        double *wAboveSmooth = scratch_lineWorkA.data();
-        double *wBelowSmooth = scratch_lineWorkB.data();
-        double *decisionBlend = scratch_lineWorkC.data();
-
+        // Reach gate: determines per-pixel cancellation strength toward
+        // each neighbor line.  Inlined here (was a lambda) to keep the
+        // data flow visible in the fused loop below.
         auto reachGate = [&](int xi, const float *neighborFit,
                              const float *neighborFloor) {
             if (!neighborFit || !neighborFloor)
@@ -3004,21 +3035,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                               carrierHardIRE);
 
             if (progressiveCarrierModel) {
-                // Saturation-driven cancellation relax with bevel protection.
-                //
-                // In progressive + high-color regions, both lumaDiff and
-                // carrierMismatch can be elevated by the same per-line zipper
-                // we want to cancel.  Gating on either suppresses the cure.
-                //
-                // BUT: lumaDiff is also elevated in bevel-approach zones
-                // (e.g. soft luma ramps approaching the top/bottom edge of
-                // yellow text).  Cancelling through those zones smears the
-                // bevel.  So the relax is itself gated by lumaDiff — fully
-                // applied only where lumaDiff is small enough to plausibly
-                // be the zipper, withdrawn where lumaDiff indicates a real
-                // luma transition.  The withdrawal band matches the original
-                // lumaGate's softReachGate(3.0, 10.0) so the geometry of
-                // "real transitions suppress cancellation" is preserved.
                 const double chromaT = std::clamp(
                     (carrierAmpIRE -
                      T.RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE) /
@@ -3027,10 +3043,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                         T.RETRACTED_PROGRESSIVE_CHROMA_RELAX_START_IRE),
                     0.0, 1.0);
                 const double satRelax = chromaT * chromaT * (3.0 - 2.0 * chromaT);
-                // bevelGuard: 1.0 when lumaDiff is in the zipper band
-                // (≤3 IRE), 0.0 when it's clearly a real transition (≥10
-                // IRE), smooth between.  Multiplied into the relax so the
-                // floors only engage where the relax is appropriate.
                 const double bevelT = std::clamp(
                     (lumaDiffIRE - 3.0) / 7.0, 0.0, 1.0);
                 const double bevelGuard =
@@ -3047,7 +3059,51 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             return lumaGate * carrierGate;
         };
 
-        auto localCarrierAmpIRE = [&](int xi) {
+        // -----------------------------------------------------------------
+        // Fused reach-gate sweep.
+        //
+        // The original three-pass design was:
+        //   Sweep 1: compute raw gates and decisionBlend into per-pixel arrays
+        //   Sweep 2: 5-tap [1,2,3,2,1] smooth of raw gates → smooth arrays
+        //   Sweep 3: blend raw/smooth by decisionBlend, produce combRow
+        //
+        // Fused into two passes: first compute the raw gates (needed as
+        // lookahead input for the stencil), then a single output pass that
+        // evaluates the 5-tap smooth, the decision blend, and the final
+        // combRow per pixel — eliminating 3 scratch arrays and 2 loop
+        // traversals.
+        // -----------------------------------------------------------------
+        double *wAboveRaw = scratch_preI.data();
+        double *wBelowRaw = scratch_preQ.data();
+
+        // Pass A: raw gates — must be fully materialized before the stencil
+        // can read ±2 neighbors.
+        for (int xi = 0; xi < width; ++xi) {
+            wAboveRaw[xi] =
+                haveAbove ? reachGate(xi, fitAbove, floorAbove) : 0.0;
+            wBelowRaw[xi] =
+                haveBelow ? reachGate(xi, fitBelow, floorBelow) : 0.0;
+        }
+
+        // Pass B: inline 5-tap smooth + decision blend + combRow output.
+        // The smooth kernel is [1,2,3,2,1] (sum = 9 in the interior).
+        // At edges, the kernel is clamped and the divisor adjusts.
+        constexpr double kWeights[5] = {1.0, 2.0, 3.0, 2.0, 1.0};
+
+        for (int xi = 0; xi < width; ++xi) {
+            // Inline 5-tap smooth of the raw gate arrays.
+            double sumW = 0.0, sumAbove = 0.0, sumBelow = 0.0;
+            for (int dx = -2; dx <= 2; ++dx) {
+                const int xx = std::clamp(xi + dx, 0, width - 1);
+                const double w = kWeights[dx + 2];
+                sumW += w;
+                sumAbove += w * wAboveRaw[xx];
+                sumBelow += w * wBelowRaw[xx];
+            }
+            const double smoothAbove = sumAbove / sumW;
+            const double smoothBelow = sumBelow / sumW;
+
+            // Inline localCarrierAmpIRE + decision blend.
             const int xm = std::max(0, xi - 1);
             const int xp = std::min(width - 1, xi + 1);
             double amp = std::fabs(static_cast<double>(fitRow[xi]));
@@ -3063,38 +3119,13 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xm])));
                 amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xp])));
             }
-            return amp * invIreScale;
-        };
+            const double blend = smoothStep01((amp * invIreScale - 8.0) / 10.0);
 
-        for (int xi = 0; xi < width; ++xi) {
-            wAboveRaw[xi] =
-                haveAbove ? reachGate(xi, fitAbove, floorAbove) : 0.0;
-            wBelowRaw[xi] =
-                haveBelow ? reachGate(xi, fitBelow, floorBelow) : 0.0;
-            decisionBlend[xi] = smoothStep01((localCarrierAmpIRE(xi) - 8.0) / 10.0);
-        }
-
-        for (int xi = 0; xi < width; ++xi) {
-            double sumW = 0.0;
-            double sumAbove = 0.0;
-            double sumBelow = 0.0;
-            for (int dx = -2; dx <= 2; ++dx) {
-                const int xx = std::clamp(xi + dx, 0, width - 1);
-                const double w = (dx == 0) ? 3.0 : (std::abs(dx) == 1 ? 2.0 : 1.0);
-                sumW += w;
-                sumAbove += w * wAboveRaw[xx];
-                sumBelow += w * wBelowRaw[xx];
-            }
-            wAboveSmooth[xi] = sumAbove / std::max(1e-9, sumW);
-            wBelowSmooth[xi] = sumBelow / std::max(1e-9, sumW);
-        }
-
-        for (int xi = 0; xi < width; ++xi) {
-            const double blend = decisionBlend[xi];
+            // Final gated cancellation.
             const double wAbove =
-                wAboveRaw[xi] * (1.0 - blend) + wAboveSmooth[xi] * blend;
+                wAboveRaw[xi] * (1.0 - blend) + smoothAbove * blend;
             const double wBelow =
-                wBelowRaw[xi] * (1.0 - blend) + wBelowSmooth[xi] * blend;
+                wBelowRaw[xi] * (1.0 - blend) + smoothBelow * blend;
             const double wSum = wAbove + wBelow;
 
             if (wSum > 1e-9) {

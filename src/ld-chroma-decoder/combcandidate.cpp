@@ -395,11 +395,16 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         return demodTQ4fsc_line(ln);
     };
 
+    auto getMagRow = [&](int ln)->const float* {
+        if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
+        return demodIQMag4fsc_line(ln);
+    };
     struct RowRefs {
         int ln = -1;
         const double *comp = nullptr;
         const float *ti = nullptr;
         const float *tq = nullptr;
+        const float *mag = nullptr;
         bool haveLine = false;
     };
     auto rowRefs = [&](int ln, bool haveLine, bool wantIQ)->RowRefs {
@@ -409,6 +414,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         r.comp = haveLine ? getCompRow(ln) : nullptr;
         r.ti = (haveLine && wantIQ) ? getTiRow(ln) : nullptr;
         r.tq = (haveLine && wantIQ) ? getTqRow(ln) : nullptr;
+        r.mag = (haveLine && wantIQ) ? getMagRow(ln) : nullptr;
         return r;
     };
 
@@ -457,6 +463,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             return;
         }
 
+        const bool haveMagRow = (haveIQRow && r.mag != nullptr);
         for (int rel = 0; rel < width; ++rel) {
             const int rm1 = reflectCombRel(rel - 1, width);
             const int rp1 = reflectCombRel(rel + 1, width);
@@ -470,7 +477,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 CombTapIQ &iq = (*dstIQ)[rel];
                 iq.ti = (float)ti;
                 iq.tq = (float)tq;
-                iq.iqMag = std::hypot(ti, tq);
+                iq.iqMag = haveMagRow
+                    ? static_cast<double>(r.mag[rel])
+                    : std::hypot(ti, tq);
             }
         }
     };

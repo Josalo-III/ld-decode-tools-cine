@@ -679,6 +679,11 @@ private:
 	// between the line-local locked domain and the cross-line 4fsc domain.
 	std::vector<float> demodTI4fsc_flat;
 	std::vector<float> demodTQ4fsc_flat;
+	// Precomputed IQ magnitude: hypot(demodTI4fsc, demodTQ4fsc) per pixel.
+	// Filled at the end of buildPhaseCorrected1D so downstream consumers
+	// (buildCombTapLine, scoreFieldVsFrame) read a table lookup instead of
+	// recomputing std::hypot per layer per pixel.
+	std::vector<float> demodIQMag4fsc_flat;
 	// Preserved 4fsc IQ produced by buildPhaseCorrected1D().
 	// Frame B should read this earlier cache instead of depending on later
 	// repurposing of the shared demodTI4fsc/TQ4fsc working buffers.
@@ -721,6 +726,19 @@ private:
 		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY; carrier-model row.
 		std::vector<double> scratch_lineWorkB; // Field gate row; coherent carrier estimate (cHat) in produceY.
 		std::vector<double> scratch_lineWorkC; // Field B scalar row; tqAdjLocked in produceY; flattened row.
+	// FVF divergence cluster: per-pixel condition DATA, pooled once per line and
+	// consumed by the election (central management). Pure information — no
+	// decisions live here; the consumer acts. Per-line now; promote to a 3-deep
+	// ring when a 2D consumer needs the ±1 neighbours.
+	struct CombConditionEvidence {
+		double satIRE          = 0.0;  // IQ magnitude (saturation test)
+		double combDivergence  = 0.0;  // |fieldB-frameB| smoothed (IQ/comb domain)
+		double lumaDivergence  = 0.0;  // retracted-Y interfield diff (luma domain)
+		double contourNonLocal = 0.0;  // tap-contour: observation is more than local
+		double crossColorRisk  = 0.0;  // [0,1] luma-near-fsc cross-color (phase exception)
+	};
+	std::vector<CombConditionEvidence> scratch_fvf_evidence;
+
 	// FVF per-line scratch (avoid per-line allocations in scoreFieldVsFrame)
 	std::vector<int>    scratch_fvf_winner;
 	std::vector<int>    scratch_fvf_winner2;
@@ -1011,9 +1029,7 @@ private:
 	void scoreFieldVsFrame(
 		int line,
 		const CombTapLine &tapLine,
-		const double *fieldA,
 		const double *fieldB,
-		const double *fieldAGate,
 		const std::vector<double> &frameA,
 		const std::vector<double> *frameB,
 		double *outMixed,
@@ -1085,6 +1101,10 @@ private:
 	}
 	inline const float* demodTQ4fsc_line(int line) const {
 		return demodTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* demodIQMag4fsc_line(int line) const {
+		if (demodIQMag4fsc_flat.empty()) return nullptr;
+		return demodIQMag4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* locked1DTI4fsc_line(int line) {
 		return locked1DTI4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
