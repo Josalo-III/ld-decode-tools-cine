@@ -46,7 +46,37 @@ inline constexpr AttributionRules kDefaultAttributionRules = {};
 // parallax set.  The carrier model should come from the IQ component that is
 // common across those views; disagreement between views is attribution evidence,
 // not just a private decoder heuristic.
+struct CarrierResidualConsensus {
+    double carrierSample = 0.0;
+    double lo = 0.0;
+    double hi = 0.0;
+
+    double trust = 0.0;
+
+    // Conservative carrier-amplitude survivor derived from the residual
+    // complements.  This is an observation-side bound, not a replacement
+    // model: among carrier-compatible residual observations, it records the
+    // same-structure sample with the smallest absolute amplitude.  Larger
+    // carrier amplitudes require positive surviving evidence instead of only
+    // workprint agreement.
+    double minCompatibleCarrierSample = 0.0;
+    double minCompatibleAbsIRE = 0.0;
+    double minCompatibleSupport = 0.0;
+
+    double spreadIRE = 0.0;
+    double lumaVarianceIRE = 0.0;
+    double variableYIRE = 0.0;
+    double fitErrorIRE = 0.0;
+
+    double workprintSample = 0.0;
+    double workprintCorrectionIRE = 0.0;
+
+    bool valid = false;
+};
+
 struct FourViewCarrierView {
+    int apertureStart = 0;
+    double apertureCenter = 0.0;
     double yFloor = 0.0;
     double carrierSample = 0.0;
     double fittedSample = 0.0;
@@ -56,7 +86,42 @@ struct FourViewCarrierView {
     double remodErrorIRE = 0.0;
     double latticeRiskIRE = 0.0;
     double ySpanIRE = 0.0;
+    double membershipDeltaSample = 0.0;
+    double membershipDeltaIRE = 0.0;
+    double membershipSupport = 0.0;
+    double membershipLocalX = 0.0;
     double score = 0.0;
+};
+
+struct FourViewEvidenceView {
+    int apertureStart = 0;
+    float apertureCenter = 0.0f;
+    float yFloor = 0.0f;
+    float carrierSample = 0.0f;
+    float fittedSample = 0.0f;
+    float carrierI = 0.0f;
+    float carrierQ = 0.0f;
+    float sampleFitErrorIRE = 0.0f;
+    float remodErrorIRE = 0.0f;
+    float latticeRiskIRE = 0.0f;
+    float ySpanIRE = 0.0f;
+    // Membership-change harvesting.
+    //
+    // These are observations, not policy.  They describe how the legal
+    // carrier-cancelling luma floor moves as samples enter and leave adjacent
+    // 4fSC apertures.
+    float membershipDeltaSample = 0.0f;  // signed floor movement in samples
+    float membershipDeltaIRE = 0.0f;     // same observation in IRE
+    float membershipSupport = 0.0f;      // measurement quality only
+    float membershipLocalX = 0.0f;       // Y movement location relative to xi
+
+    float score = 0.0f;
+};
+
+struct FourViewPixelEvidence {
+    int viewCount = 0;
+    float rawSample = 0.0f;
+    FourViewEvidenceView views[4];
 };
 
 struct FourViewCarrierAttribution {
@@ -82,6 +147,16 @@ struct FourViewCarrierAttribution {
     double discResponseMagIRE = 0.0;
     double discResponseSupport = 0.0;
     double discResponseBlend = 0.0;
+    double residualTightenSample = 0.0;
+    double residualTightenSupport = 0.0;
+    double residualTightenGain = 1.0;
+    double residualTightenSpreadIRE = 0.0;
+    double residualTightenFitErrorIRE = 0.0;
+    CarrierResidualConsensus residualConsensus;
+    double movingResidualSample = 0.0;
+    double movingResidualFitErrorIRE = 0.0;
+    double movingResidualCoherence = 0.0;
+    double movingResidualPull = 0.0;
     double latticeRiskIRE = 0.0;
     double carrierScore = 0.0;
 };
@@ -148,6 +223,15 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
         }
     }
 
+    const auto exclusionPenalty = [&](int i) -> double {
+        const double localizer = std::exp(
+            -0.5 * (views[i].membershipLocalX * views[i].membershipLocalX) /
+            (1.35 * 1.35));
+        return std::fabs(views[i].membershipDeltaIRE) *
+               clamp01(views[i].membershipSupport) *
+               localizer;
+    };
+
     int best = 0;
     double bestCost = 1e300;
     for (int i = 0; i < out.viewCount; ++i) {
@@ -155,6 +239,7 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
         for (int j = 0; j < out.viewCount; ++j)
             cost += iqDist[i][j];
         cost += 0.35 * std::max(0.0, views[i].sampleFitErrorIRE);
+        cost += 0.10 * exclusionPenalty(i);
         cost += 0.05 * std::max(0.0, views[i].score);
         if (cost < bestCost) {
             bestCost = cost;
@@ -175,6 +260,7 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
             cost += std::fabs(views[i].carrierSample -
                               views[j].carrierSample) * invIreScale;
         cost += 0.25 * std::max(0.0, views[i].sampleFitErrorIRE);
+        cost += 0.08 * exclusionPenalty(i);
         cost += 0.03 * std::max(0.0, views[i].score);
         if (cost < sampleBestCost) {
             sampleBestCost = cost;
@@ -459,6 +545,15 @@ struct CombAttributionFacts {
     double carrierParallaxSpreadIRE = 0.0;
     double carrierParallaxCoherence = 0.0;
     double carrierParallaxLatticeRiskIRE = 0.0;
+    CarrierResidualConsensus carrierResidualConsensus;
+    double carrierResidualIRE = 0.0;
+    double carrierChromaFitIRE = 0.0;
+    double carrierChromaErrorIRE = 0.0;
+    double carrierChromaCoherence = 0.0;
+    double movingResidualSample = 0.0;
+    double movingResidualFitErrorIRE = 0.0;
+    double movingResidualCoherence = 0.0;
+    double movingResidualPull = 0.0;
     double sidebandSinResidualIRE = 0.0;
     double sidebandCosResidualIRE = 0.0;
     double sidebandAxisAsymmetry = 0.0;

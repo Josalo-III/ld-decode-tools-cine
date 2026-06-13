@@ -221,13 +221,6 @@ public:
             double FVF_SAT_FRAME_A_BONUS = 0.10; // Frame A bonus in high saturation (smaller: boundary caution)
             double FVF_SAT_FRAME_B_BONUS = 0.18; // Frame B bonus in high saturation when coherent
 
-            // Cross-domain penalty derived from a spatial neighbor estimate; guards ambiguous pixels
-            // where horizontal structure could alias the interfield or interframe comb.
-            double NEIGHBOR_EST_WEIGHT      = 0.60; // luma-domain neighbor consensus weight (IRE units) — sized to tip elections, not just decorate them
-            double NEIGHBOR_EST_SAT_MAX_IRE = 12.0; // disable neighbor estimate when local chroma exceeds this
-            double NEIGHBOR_EST_EDGE_MAX_IRE = 10.0; // disable when horizontal luma edge exceeds this
-            double NEIGHBOR_EST_FVF_MAX_IRE  = 4.0;  // only apply when the FVF diff itself is small / ambiguous
-
             // =========================================================================
             // FVF / Model interaction tuning
             // =========================================================================
@@ -243,7 +236,6 @@ public:
 
             // Multiplicative cost advantage for the model-domain candidate in its own regime.
             // < 1.0 → model candidate gets a cheaper score.
-            double FRAME_MODEL_BIAS = 0.90; // progressive: Frame A costs less
             double FIELD_MODEL_BIAS = 0.50; // interlace: Field A costs less
 
             // > 1.0 → Frame candidate costs slightly more when regime is clearly interlace.
@@ -781,6 +773,9 @@ private:
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;
 	std::vector<double> scratch_hpY;
+	std::vector<double> scratch_attrWideCarrier;
+	std::vector<double> scratch_attrBandYClaim;
+	std::vector<double> scratch_attrMembershipY;
 	std::vector<double> scratch_sinfit_mag;    // per-line |TRI/TRQ|
 	std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
 	std::vector<char> scratch_vdis_flag;

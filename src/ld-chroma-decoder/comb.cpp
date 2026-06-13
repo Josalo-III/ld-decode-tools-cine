@@ -161,6 +161,91 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     assert(configurationSet);
     assert(componentFrames.size() * 2 == (endIndex - startIndex));
 
+    enum StageIndex {
+        StagePhaseLocked,
+        StageCarrierRetracted,
+        StageConstrainedYWitness,
+        StagePhaseCorrected1D,
+        StageSplit2D,
+        StageCopy2DTo3D,
+        StageSplit3D,
+        StageSplitIQLocked,
+        StageDoCNR,
+        StageProduceY,
+        StageFilterIQLocked,
+        StageDoYNR,
+        StageTransformIQ,
+        StageCount
+    };
+    struct StageStat {
+        const char *name;
+        qint64 totalNs = 0;
+        qint64 calls = 0;
+    };
+    std::array<StageStat, StageCount> stageStats = {{
+        {"phaseLocked"},
+        {"buildCarrierRetracted"},
+        {"buildConstrainedYWitness"},
+        {"buildPhaseCorrected1D"},
+        {"split2D"},
+        {"copy2DTo3D"},
+        {"split3D"},
+        {"splitIQlocked"},
+        {"doCNR"},
+        {"produceY"},
+        {"filterIQLocked"},
+        {"doYNR"},
+        {"transformIQ"},
+    }};
+    const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
+    FrameBuffer::FvfInstrumentation fvfStatsTotal;
+    FrameBuffer::ProduceYInstrumentation produceYStatsTotal;
+    auto accumulateFvfStats = [&](const FrameBuffer::FvfInstrumentation &stats) {
+        for (int i = 0; i < 4; ++i) {
+            fvfStatsTotal.rawWinnerCounts[i] += stats.rawWinnerCounts[i];
+            fvfStatsTotal.finalWinnerCounts[i] += stats.finalWinnerCounts[i];
+        }
+        fvfStatsTotal.frameAHeadToHeadWins += stats.frameAHeadToHeadWins;
+        fvfStatsTotal.frameBHeadToHeadWins += stats.frameBHeadToHeadWins;
+        fvfStatsTotal.frameModelPixels += stats.frameModelPixels;
+        fvfStatsTotal.fieldModelPixels += stats.fieldModelPixels;
+        fvfStatsTotal.islandChangedPixels += stats.islandChangedPixels;
+        fvfStatsTotal.blockFieldCommitPixels += stats.blockFieldCommitPixels;
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                fvfStatsTotal.islandFlipPairs[r][c] += stats.islandFlipPairs[r][c];
+    };
+    auto accumulateProduceYStats = [&](const FrameBuffer::ProduceYInstrumentation &stats) {
+        produceYStatsTotal.pixels += stats.pixels;
+        produceYStatsTotal.attributionPixels += stats.attributionPixels;
+        produceYStatsTotal.residualBypassPixels += stats.residualBypassPixels;
+        produceYStatsTotal.noProductFallbackPixels += stats.noProductFallbackPixels;
+        produceYStatsTotal.alphaVetCalls += stats.alphaVetCalls;
+        produceYStatsTotal.alphaVetAdjustedCalls += stats.alphaVetAdjustedCalls;
+        produceYStatsTotal.alphaVetPixels += stats.alphaVetPixels;
+        produceYStatsTotal.alphaVetGateFailCalls += stats.alphaVetGateFailCalls;
+        produceYStatsTotal.alphaVetSubMagSum += stats.alphaVetSubMagSum;
+        produceYStatsTotal.alphaVetSubMagMax = std::max(produceYStatsTotal.alphaVetSubMagMax, stats.alphaVetSubMagMax);
+        produceYStatsTotal.alphaVetLutMagSum += stats.alphaVetLutMagSum;
+        produceYStatsTotal.alphaVetLutMagMax = std::max(produceYStatsTotal.alphaVetLutMagMax, stats.alphaVetLutMagMax);
+        produceYStatsTotal.retractedAvailablePixels += stats.retractedAvailablePixels;
+        produceYStatsTotal.retractedAppliedPixels += stats.retractedAppliedPixels;
+        produceYStatsTotal.residual3DPixels += stats.residual3DPixels;
+        produceYStatsTotal.alphaVetDeltaSum += stats.alphaVetDeltaSum;
+        produceYStatsTotal.retractedBlendSum += stats.retractedBlendSum;
+    };
+    auto measureStage = [&](StageIndex idx, auto &&fn) {
+        if (!stageTimers) {
+            fn();
+            return;
+        }
+        QElapsedTimer timer;
+        timer.start();
+        fn();
+        stageStats[idx].totalNs += timer.nsecsElapsed();
+        stageStats[idx].calls += 1;
+    };
+
     auto next     = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto current  = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
@@ -209,15 +294,20 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                              inputFields[fieldIndex + 3]);
 
             if (configuration.phaseCompensation) {
-                next->phaseLocked();
-                next->buildCarrierRetracted();
-                next->buildConstrainedYWitness();
-                next->buildPhaseCorrected1D();
+                measureStage(StagePhaseLocked, [&]() { next->phaseLocked(); });
+                measureStage(StageCarrierRetracted, [&]() { next->buildCarrierRetracted(); });
+                measureStage(StageConstrainedYWitness, [&]() { next->buildConstrainedYWitness(); });
+                measureStage(StagePhaseCorrected1D, [&]() { next->buildPhaseCorrected1D(); });
             } else {
                 next->split1D();
             }
 
-            next->split2D();
+            measureStage(StageSplit2D, [&]() { next->split2D(); });
+            if (stageTimers &&
+                configuration.twoDVariant ==
+                    Comb::Configuration::TwoDVariant::FieldVsFrame) {
+                accumulateFvfStats(next->getFvfInstrumentation());
+            }
         }
 
         if (fieldIndex < startIndex)
@@ -226,10 +316,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         const bool isStartUp = (fieldIndex < startIndex + 4);
 
         if (configuration.dimensions == 3) {
-            current->copy2DTo3D();
+            measureStage(StageCopy2DTo3D, [&]() { current->copy2DTo3D(); });
 
             if (!isStartUp)
-                current->split3D(*previous, *next);
+                measureStage(StageSplit3D, [&]() { current->split3D(*previous, *next); });
         }
 
         if (configuration.residualVideo3D) {
@@ -255,13 +345,18 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          * splitIQlocked() is the post-election demod of the selected comb.
          */
         if (configuration.phaseCompensation) {
-            current->splitIQlocked();
-            current->doCNR();
-            current->produceY();
-            current->filterIQLocked();
-            current->doYNR();
-            current->transformIQ(configuration.chromaGain,
-                                 configuration.chromaPhase);
+            measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
+            measureStage(StageDoCNR, [&]() { current->doCNR(); });
+            measureStage(StageProduceY, [&]() { current->produceY(); });
+            if (stageTimers) {
+                accumulateProduceYStats(current->getProduceYInstrumentation());
+            }
+            measureStage(StageFilterIQLocked, [&]() { current->filterIQLocked(); });
+            measureStage(StageDoYNR, [&]() { current->doYNR(); });
+            measureStage(StageTransformIQ, [&]() {
+                current->transformIQ(configuration.chromaGain,
+                                     configuration.chromaPhase);
+            });
         } else {
             current->splitIQ();
             current->adjustY();
@@ -365,6 +460,108 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
                 drawNext(labelBottom);
             }
+        }
+    }
+
+    if (stageTimers) {
+        QStringList parts;
+        for (const StageStat &stat : stageStats) {
+            if (stat.calls <= 0) continue;
+            const double avgMs = (static_cast<double>(stat.totalNs) / 1.0e6) /
+                                 static_cast<double>(stat.calls);
+            parts << QString("%1=%2ms (%3 calls)")
+                         .arg(stat.name)
+                         .arg(avgMs, 0, 'f', 3)
+                         .arg(stat.calls);
+        }
+        if (!parts.isEmpty()) {
+            qInfo().noquote() << QString("Locked stage timers: %1").arg(parts.join(", "));
+        }
+
+        const qint64 fvfPixels =
+            std::accumulate(fvfStatsTotal.finalWinnerCounts.begin(),
+                            fvfStatsTotal.finalWinnerCounts.end(), qint64{0});
+        if (fvfPixels > 0) {
+            qInfo().noquote() << QString(
+                "Locked FVF counters: raw(FA=%1,FB=%2,FRA=%3,FRB=%4) "
+                "final(FA=%5,FB=%6,FRA=%7,FRB=%8) "
+                "model(frame=%9,field=%10) frameHeadToHead(A=%11,B=%12) "
+                "cleanup(island=%13,blockField=%14)")
+                .arg(fvfStatsTotal.rawWinnerCounts[0])
+                .arg(fvfStatsTotal.rawWinnerCounts[1])
+                .arg(fvfStatsTotal.rawWinnerCounts[2])
+                .arg(fvfStatsTotal.rawWinnerCounts[3])
+                .arg(fvfStatsTotal.finalWinnerCounts[0])
+                .arg(fvfStatsTotal.finalWinnerCounts[1])
+                .arg(fvfStatsTotal.finalWinnerCounts[2])
+                .arg(fvfStatsTotal.finalWinnerCounts[3])
+                .arg(fvfStatsTotal.frameModelPixels)
+                .arg(fvfStatsTotal.fieldModelPixels)
+                .arg(fvfStatsTotal.frameAHeadToHeadWins)
+                .arg(fvfStatsTotal.frameBHeadToHeadWins)
+                .arg(fvfStatsTotal.islandChangedPixels)
+                .arg(fvfStatsTotal.blockFieldCommitPixels);
+
+            const auto &fp = fvfStatsTotal.islandFlipPairs;
+            qInfo().noquote() << QString(
+                "Locked FVF island flips [C->L] "
+                "FA(->FB=%1,->FRA=%2,->FRB=%3) FB(->FA=%4,->FRA=%5,->FRB=%6) "
+                "FRA(->FA=%7,->FB=%8,->FRB=%9) FRB(->FA=%10,->FB=%11,->FRA=%12)")
+                .arg(fp[0][1]).arg(fp[0][2]).arg(fp[0][3])
+                .arg(fp[1][0]).arg(fp[1][2]).arg(fp[1][3])
+                .arg(fp[2][0]).arg(fp[2][1]).arg(fp[2][3])
+                .arg(fp[3][0]).arg(fp[3][1]).arg(fp[3][2]);
+        }
+
+        if (produceYStatsTotal.pixels > 0) {
+            const double avgAlphaVetDelta = (produceYStatsTotal.alphaVetCalls > 0)
+                ? (produceYStatsTotal.alphaVetDeltaSum /
+                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
+                : 0.0;
+            const double avgRetractedBlend = (produceYStatsTotal.retractedAvailablePixels > 0)
+                ? (produceYStatsTotal.retractedBlendSum /
+                   static_cast<double>(produceYStatsTotal.retractedAvailablePixels))
+                : 0.0;
+            qInfo().noquote() << QString(
+                "Locked produceY counters: pixels=%1 attribution=%2 residualBypass=%3 "
+                "noProductFallback=%4 residual3D=%5 alphaVet(calls=%6,adjusted=%7,"
+                "pixels=%8,avgAbsDelta=%9) retracted(available=%10,applied=%11,avgBlend=%12)")
+                .arg(produceYStatsTotal.pixels)
+                .arg(produceYStatsTotal.attributionPixels)
+                .arg(produceYStatsTotal.residualBypassPixels)
+                .arg(produceYStatsTotal.noProductFallbackPixels)
+                .arg(produceYStatsTotal.residual3DPixels)
+                .arg(produceYStatsTotal.alphaVetCalls)
+                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
+                .arg(produceYStatsTotal.alphaVetPixels)
+                .arg(avgAlphaVetDelta, 0, 'f', 4)
+                .arg(produceYStatsTotal.retractedAvailablePixels)
+                .arg(produceYStatsTotal.retractedAppliedPixels)
+                .arg(avgRetractedBlend, 0, 'f', 4);
+
+            const double avgSubMag = (produceYStatsTotal.alphaVetCalls > 0)
+                ? (produceYStatsTotal.alphaVetSubMagSum /
+                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
+                : 0.0;
+            const double avgLutMag = (produceYStatsTotal.alphaVetCalls > 0)
+                ? (produceYStatsTotal.alphaVetLutMagSum /
+                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
+                : 0.0;
+            const qint64 alphaVetNoEffect =
+                produceYStatsTotal.alphaVetCalls -
+                produceYStatsTotal.alphaVetGateFailCalls -
+                produceYStatsTotal.alphaVetAdjustedCalls;
+            qInfo().noquote() << QString(
+                "Locked alphaVet diagnosis: calls=%1 gateFail=%2 noEffect=%3 adjusted=%4 "
+                "subMagIRE(avg=%5,max=%6) lutMagIRE(avg=%7,max=%8)")
+                .arg(produceYStatsTotal.alphaVetCalls)
+                .arg(produceYStatsTotal.alphaVetGateFailCalls)
+                .arg(alphaVetNoEffect)
+                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
+                .arg(avgSubMag, 0, 'f', 4)
+                .arg(produceYStatsTotal.alphaVetSubMagMax, 0, 'f', 4)
+                .arg(avgLutMag, 0, 'f', 4)
+                .arg(produceYStatsTotal.alphaVetLutMagMax, 0, 'f', 4);
         }
     }
 }
