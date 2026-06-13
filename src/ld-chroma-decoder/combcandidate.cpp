@@ -65,7 +65,7 @@ void Comb::FrameBuffer::computeVDISLine(int lineNumber)
                         return row[rel];
                     return 0.0;
                 }
-                return clpbuffer[0].pixel[ln][left + rel];
+                return bucketScalar1D_line(ln)[left + rel];
             };
             for (int rel = 0; rel < width; ++rel) {
                 double c = vdisSample(lineNumber, rel);
@@ -384,7 +384,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         if (configuration.phaseCompensation) {
             return locked1DSource_line(ln);
         }
-        return clpbuffer[0].pixel[ln] + left;
+        return bucketScalar1D_line(ln) + left;
     };
     auto getTiRow = [&](int ln)->const float* {
         if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
@@ -769,12 +769,6 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
 
     if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
-    qint64 dbgN = 0;
-    qint64 dbgCollapsedN = 0;
-    double dbgSumGate = 0.0;
-    double dbgSumAbsTc = 0.0;
-    double dbgSumAbsC = 0.0;
-
     for (int rel = 0; rel < width; ++rel) {
         const double C    = tapLine.tap0[rel].comp;
         const double Cup2 = tapLine.tapU2[rel].comp;
@@ -837,26 +831,10 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
         double gateA = std::max(wUp2, wDn2);
         gateA = std::clamp(gateA, 0.0, 1.0);
         if (outGate) outGate[rel] = gateA;
-
-        if (configuration.debugPhaseLegs) {
-            ++dbgN;
-            dbgSumGate += gateA;
-            dbgSumAbsTc += std::fabs(tc) * invIreScale;
-            dbgSumAbsC += std::fabs(C) * invIreScale;
-            if ((wUp2 + wDn2) < 0.10) ++dbgCollapsedN;
-        }
     }
 
-    if (configuration.debugPhaseLegs && dbgN > 0) {
-        const double invN = 1.0 / (double)dbgN;
-        qInfo().noquote() << QString("FieldAStats line=%1 n=%2 collapsed=%3 gate=%4 absTcIRE=%5 absCIRE=%6")
-            .arg(tapLine.ln0)
-            .arg(dbgN)
-            .arg(dbgCollapsedN)
-            .arg(dbgSumGate * invN, 0, 'f', 3)
-            .arg(dbgSumAbsTc * invN, 0, 'f', 3)
-            .arg(dbgSumAbsC * invN, 0, 'f', 3);
-    }
+    // (FieldAStats per-line logging removed: Field A is no longer in the
+    // election, and the per-line spam buried the active diagnostics.)
 }
 
 // Field B
@@ -1396,9 +1374,9 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
         return true;
     };
 
-    scratch_centerIQ.resize(width);
-    scratch_upIQ.resize(width);
-    scratch_dnIQ.resize(width);
+    if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
+    if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
+    if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
     for (int x = 0; x < width; ++x) {
         std::complex<double> z;
         if (demodPrecleanAt(line, x, z)) scratch_centerIQ[x] = z;
@@ -1485,9 +1463,9 @@ void Comb::FrameBuffer::computeFrameBDirectIQLine(
     const bool haveDnLine = (verticalAllowed && line + 1 <  last);
     const CombTapLine &reachTapLine = ensureCombTapLine(line);
 
-    scratch_centerIQ.resize(width);
-    scratch_upIQ.resize(width);
-    scratch_dnIQ.resize(width);
+    if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
+    if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
+    if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
     for (int x = 0; x < width; ++x) {
         std::complex<double> z;
         if (demodPrecleanAt(line, x, z))
@@ -1659,7 +1637,7 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     {
         result.sample = lockedRow[hh - left];
     } else {
-        result.sample = frameBuffer.clpbuffer[0].pixel[lineNumber][hh];
+        result.sample = frameBuffer.bucketScalar1D_line(lineNumber)[hh];
     }
 
     // --- Luma Penalty with Neighbor Shaping (Cross Pattern) ---

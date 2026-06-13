@@ -161,98 +161,16 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     assert(configurationSet);
     assert(componentFrames.size() * 2 == (endIndex - startIndex));
 
-    enum StageIndex {
-        StagePhaseLocked,
-        StageCarrierRetracted,
-        StageSplit2D,
-        StageCopy2DTo3D,
-        StageSplit3D,
-        StageSplitIQLocked,
-        StageDoCNR,
-        StageProduceY,
-        StageFilterIQLocked,
-        StageDoYNR,
-        StageTransformIQ,
-        StageCount
-    };
-    struct StageStat {
-        const char *name;
-        qint64 totalNs = 0;
-        qint64 calls = 0;
-    };
-    std::array<StageStat, StageCount> stageStats = {{
-        {"phaseLocked"},
-        {"buildCarrierRetracted"},
-        {"split2D"},
-        {"copy2DTo3D"},
-        {"split3D"},
-        {"splitIQlocked"},
-        {"doCNR"},
-        {"produceY"},
-        {"filterIQLocked"},
-        {"doYNR"},
-        {"transformIQ"},
-    }};
-    const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
-    FrameBuffer::FvfInstrumentation fvfStatsTotal;
-    FrameBuffer::ProduceYInstrumentation produceYStatsTotal;
-    auto accumulateFvfStats = [&](const FrameBuffer::FvfInstrumentation &stats) {
-        for (int i = 0; i < 4; ++i) {
-            fvfStatsTotal.rawWinnerCounts[i] += stats.rawWinnerCounts[i];
-            fvfStatsTotal.finalWinnerCounts[i] += stats.finalWinnerCounts[i];
-        }
-        fvfStatsTotal.frameAHeadToHeadWins += stats.frameAHeadToHeadWins;
-        fvfStatsTotal.frameBHeadToHeadWins += stats.frameBHeadToHeadWins;
-        fvfStatsTotal.frameModelPixels += stats.frameModelPixels;
-        fvfStatsTotal.fieldModelPixels += stats.fieldModelPixels;
-        fvfStatsTotal.islandChangedPixels += stats.islandChangedPixels;
-        fvfStatsTotal.blockFieldCommitPixels += stats.blockFieldCommitPixels;
-        for (int c = 0; c < 4; ++c)
-            for (int l = 0; l < 4; ++l)
-                fvfStatsTotal.islandFlipPairs[c][l] += stats.islandFlipPairs[c][l];
-    };
-    auto accumulateProduceYStats = [&](const FrameBuffer::ProduceYInstrumentation &stats) {
-        produceYStatsTotal.pixels += stats.pixels;
-        produceYStatsTotal.attributionPixels += stats.attributionPixels;
-        produceYStatsTotal.residualBypassPixels += stats.residualBypassPixels;
-        produceYStatsTotal.noProductFallbackPixels += stats.noProductFallbackPixels;
-        produceYStatsTotal.alphaVetCalls += stats.alphaVetCalls;
-        produceYStatsTotal.alphaVetAdjustedCalls += stats.alphaVetAdjustedCalls;
-        produceYStatsTotal.alphaVetPixels += stats.alphaVetPixels;
-        produceYStatsTotal.alphaVetGateFailCalls += stats.alphaVetGateFailCalls;
-        produceYStatsTotal.alphaVetSubMagSum += stats.alphaVetSubMagSum;
-        produceYStatsTotal.alphaVetSubMagMax =
-            std::max(produceYStatsTotal.alphaVetSubMagMax, stats.alphaVetSubMagMax);
-        produceYStatsTotal.alphaVetLutMagSum += stats.alphaVetLutMagSum;
-        produceYStatsTotal.alphaVetLutMagMax =
-            std::max(produceYStatsTotal.alphaVetLutMagMax, stats.alphaVetLutMagMax);
-        produceYStatsTotal.retractedAvailablePixels += stats.retractedAvailablePixels;
-        produceYStatsTotal.retractedAppliedPixels += stats.retractedAppliedPixels;
-        produceYStatsTotal.residual3DPixels += stats.residual3DPixels;
-        produceYStatsTotal.alphaVetDeltaSum += stats.alphaVetDeltaSum;
-        produceYStatsTotal.retractedBlendSum += stats.retractedBlendSum;
-    };
-    auto measureStage = [&](StageIndex idx, auto &&fn) {
-        if (!stageTimers) {
-            fn();
-            return;
-        }
-        QElapsedTimer timer;
-        timer.start();
-        fn();
-        stageStats[idx].totalNs += timer.nsecsElapsed();
-        stageStats[idx].calls += 1;
-    };
-
     auto next     = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto current  = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
 
-    const qint32 preStart = (configuration.dimensions == 3) ? (startIndex - 4)
-                                                            : (startIndex - 2);
+    const qint32 preStart = (configuration.dimensions == 3)
+        ? (startIndex - 4)
+        : (startIndex - 2);
 
     for (qint32 fieldIndex = preStart; fieldIndex < endIndex; fieldIndex += 2) {
-        // Rotate buffers
+        // Rotate buffers.
         {
             auto recycle = std::move(previous);
             previous = std::move(current);
@@ -260,90 +178,100 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             next     = std::move(recycle);
         }
 
-        // Preload "next" framebuffer. Guard against out-of-range indices; the caller
-        // is responsible for padding inputFields with blank frames at the boundaries.
-        bool canLoadNext = (fieldIndex + 3 < inputFields.size());
+        /*
+         * Preload the next framebuffer.
+         *
+         * Locked path order:
+         *
+         *   phaseLocked()
+         *       Builds burst grammar, baseY4/smoothY cache, and raw TRI/TRQ.
+         *
+         *   buildCarrierRetracted()
+         *       Builds four-view coarse evidence and carrier-side support.
+         *
+         *   buildConstrainedYWitness()
+         *       Builds yWitness and carrierWitness = raw - yWitness.
+         *
+         *   buildPhaseCorrected1D()
+         *       Builds locked1DSource from witness carrier generally, but uses
+         *       the independent combed carrier at compact-transfer pixels.
+         *
+         *   split2D()
+         *       Elects from that source without treating compact 1D transfer
+         *       as its own Field/Frame evidence.
+         */
+        const bool canLoadNext =
+            (fieldIndex + 2 >= 0) &&
+            (fieldIndex + 3 < inputFields.size());
 
-        if (canLoadNext && (fieldIndex + 2 >= 0)) {
-            next->loadFields(inputFields[fieldIndex + 2], inputFields[fieldIndex + 3]);
+        if (canLoadNext) {
+            next->loadFields(inputFields[fieldIndex + 2],
+                             inputFields[fieldIndex + 3]);
+
             if (configuration.phaseCompensation) {
-                // Locked path: the four-view carrier attribution model plus
-                // line-to-line cancellation
-                // replaces split1D's blind bandpass entirely.
-                //   phaseLocked        → burst grammar, baseY4, raw TRI/TRQ
-                //   buildCarrierRetracted → per-line carrier fit, flatFloor,
-                //                           combed carrier (alien-Y rejected)
-                //   split2D → buildPhaseCorrected1D demods the combed carrier
-                measureStage(StagePhaseLocked, [&]() { next->phaseLocked(); });
-                measureStage(StageCarrierRetracted, [&]() { next->buildCarrierRetracted(); });
+                next->phaseLocked();
+                next->buildCarrierRetracted();
+                next->buildConstrainedYWitness();
+                next->buildPhaseCorrected1D();
             } else {
-                // Bucket path: still needs the blind bandpass.
                 next->split1D();
             }
 
-            measureStage(StageSplit2D, [&]() { next->split2D(); });
-            if (stageTimers &&
-                configuration.twoDVariant ==
-                    Comb::Configuration::TwoDVariant::FieldVsFrame) {
-                accumulateFvfStats(next->getFvfInstrumentation());
-            }
+            next->split2D();
         }
 
         if (fieldIndex < startIndex)
             continue;
 
-        // 3D temporal stage (if requested)
-        bool isStartUp = (fieldIndex < startIndex + 4); 
+        const bool isStartUp = (fieldIndex < startIndex + 4);
+
         if (configuration.dimensions == 3) {
-            measureStage(StageCopy2DTo3D, [&]() { current->copy2DTo3D(); });
-        }
-        
-        if (configuration.dimensions == 3 && !isStartUp) {
-            // Now refine 3D buffer with temporal candidates where possible
-            measureStage(StageSplit3D, [&]() { current->split3D(*previous, *next); });
+            current->copy2DTo3D();
+
+            if (!isStartUp)
+                current->split3D(*previous, *next);
         }
 
-        // Wire up temporal context for Residual Y if enabled
         if (configuration.residualVideo3D) {
-        if (!isStartUp) {
-            current->prevFrameForVet = previous.get();
-            current->nextFrameForVet = next.get();
-        } else {
+            if (!isStartUp) {
+                current->prevFrameForVet = previous.get();
+                current->nextFrameForVet = next.get();
+            } else {
                 current->prevFrameForVet = nullptr;
                 current->nextFrameForVet = nullptr;
-                }
+            }
         }
+
         const qint32 frameIndex = (fieldIndex - startIndex) / 2;
         componentFrames[frameIndex].init(videoParameters);
         current->setComponentFrame(componentFrames[frameIndex]);
 
-        // Coherent Demod + Y pipeline
+        /*
+         * Output path.
+         *
+         * buildPhaseCorrected1D() is not here because it is a pre-election
+         * source builder.  It must run before split2D() on the preloaded frame.
+         *
+         * splitIQlocked() is the post-election demod of the selected comb.
+         */
         if (configuration.phaseCompensation) {
-            // 1) Carrier grammar + four-view carrier fit + line cancellation (pre-pass)
-            // 2) Combed-carrier demod for 1D, 2D scoring (via buildPhaseCorrected1D)
-            // 3) Full 2D/3D selection -> clpbuffer[dimensions-1]
-            // 4) Re-demod final selected comb and produce locked-product cache
-            measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
-            measureStage(StageDoCNR, [&]() { current->doCNR(); });
-            measureStage(StageProduceY, [&]() { current->produceY(); });
-            if (stageTimers) {
-                accumulateProduceYStats(current->getProduceYInstrumentation());
-            }
-            measureStage(StageFilterIQLocked, [&]() { current->filterIQLocked(); });
-            measureStage(StageDoYNR, [&]() { current->doYNR(); });
-            measureStage(StageTransformIQ, [&]() {
-                current->transformIQ(configuration.chromaGain, configuration.chromaPhase);
-            });
+            current->splitIQlocked();
+            current->doCNR();
+            current->produceY();
+            current->filterIQLocked();
+            current->doYNR();
+            current->transformIQ(configuration.chromaGain,
+                                 configuration.chromaPhase);
         } else {
             current->splitIQ();
             current->adjustY();
             current->filterIQ();
             current->doCNR();
             current->doYNR();
-            current->transformIQ(configuration.chromaGain, configuration.chromaPhase);
+            current->transformIQ(configuration.chromaGain,
+                                 configuration.chromaPhase);
         }
 
-        // 3D map overlay (IQ candidate map)
         if (configuration.dimensions == 3 && configuration.showMap)
             current->overlayMap(*previous, *next);
 
@@ -360,12 +288,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 cidTop  = inputFields[fieldIndex].field.cinemap.cadenceId;
                 editTop = inputFields[fieldIndex].field.cinemap.isEditBoundary;
             }
+
             if (fieldIndex + 1 < inputFields.size()) {
                 cidBottom = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
                 editBottom = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
             }
 
-            // Glyph metrics
             const int scale = 4;
             const int charW = 5 * scale;
             const int charH = 7 * scale;
@@ -378,46 +306,42 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             FrameCanvas::Colour fg = canvas.rgb(65535, 65535, 65535);
             FrameCanvas::Colour bg = canvas.rgb(0, 0, 0);
 
-            // Build the sequence of characters to display.
-            // Convention:
-            //   editTop    -> '/' leads  the frame:  /A  or /AB
-            //   editBottom -> '/' splits the frame:  A/B
-            //   video cadence sentinel       -> "i" (confirmed interlaced)
-            //   progressive cadence sentinel -> "p" (confirmed progressive)
-            //   unknown    -> cycle-position digit
-
-            // Determine display label for each field position.
-            // Returns a 1-char label: film letter, digit, 'i', or 'p'.
             auto fieldLabel = [&](int cid, int fallbackCyclePos) -> char {
-                if (cid == lddecode::kCadenceVideo) return 'i';
-                if (cid == lddecode::kCadenceProgressive) return 'p';
-                if (cadenceKnown(cid)) return cadenceFilmLetter(cid);
+                if (cid == lddecode::kCadenceVideo)
+                    return 'i';
+
+                if (cid == lddecode::kCadenceProgressive)
+                    return 'p';
+
+                if (cadenceKnown(cid))
+                    return cadenceFilmLetter(cid);
+
                 return static_cast<char>('0' + ((fallbackCyclePos % 5) + 1));
             };
 
             const int cyclePos = frameIndex;
-            const char labelTop    = fieldLabel(cidTop,    cyclePos);
+            const char labelTop    = fieldLabel(cidTop, cyclePos);
             const char labelBottom = fieldLabel(cidBottom, cyclePos);
 
-            // Determine whether the two fields show the same label (pure frame)
-            const bool pureFrame = (labelTop == labelBottom)
-                                && (cidTop >= lddecode::kCadenceProgressive)
-                                && (cidBottom >= lddecode::kCadenceProgressive)
-                                && !editTop && !editBottom; 
-
-            // Count characters needed: labels + optional slashes
-            // Sequence:
-            //   editTop:              '/' labelTop [labelBottom if mixed]
-            //   editBottom&&!editTop: labelTop '/' labelBottom  (mixed only)
-            //   neither:              labelTop [labelBottom if mixed]
-            // For pure frames the bottom label is suppressed.
+            const bool pureFrame =
+                (labelTop == labelBottom) &&
+                (cidTop >= lddecode::kCadenceProgressive) &&
+                (cidBottom >= lddecode::kCadenceProgressive) &&
+                !editTop &&
+                !editBottom;
 
             int numChars = 0;
-            if (editTop)                    numChars++; // leading '/'
-            numChars++;                                 // top label
+
+            if (editTop)
+                ++numChars; // leading '/'
+
+            ++numChars;     // top label
+
             if (!pureFrame) {
-                if (editBottom && !editTop) numChars++; // mid '/'
-                numChars++;                             // bottom label
+                if (editBottom && !editTop)
+                    ++numChars; // middle '/'
+
+                ++numChars;     // bottom label
             }
 
             const int totalW = pad + numChars * (charW + pad);
@@ -430,116 +354,18 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 xOff += charW + pad;
             };
 
-            if (editTop)    drawNext('/');
+            if (editTop)
+                drawNext('/');
+
             drawNext(labelTop);
+
             if (!pureFrame) {
-                if (editBottom && !editTop) drawNext('/');
+                if (editBottom && !editTop)
+                    drawNext('/');
+
                 drawNext(labelBottom);
             }
         }
-    }
-
-    if (stageTimers) {
-        QStringList parts;
-        for (const StageStat &stat : stageStats) {
-            if (stat.calls <= 0) continue;
-            const double avgMs = (static_cast<double>(stat.totalNs) / 1.0e6) /
-                                 static_cast<double>(stat.calls);
-            parts << QString("%1=%2ms (%3 calls)")
-                         .arg(stat.name)
-                         .arg(avgMs, 0, 'f', 3)
-                         .arg(stat.calls);
-        }
-        if (!parts.isEmpty()) {
-            qInfo().noquote() << QString("Locked stage timers: %1").arg(parts.join(", "));
-        }
-
-        const qint64 fvfPixels =
-            std::accumulate(fvfStatsTotal.finalWinnerCounts.begin(),
-                            fvfStatsTotal.finalWinnerCounts.end(), qint64{0});
-        if (fvfPixels > 0) {
-            qInfo().noquote() << QString(
-                "Locked FVF counters: raw(FA=%1,FB=%2,FRA=%3,FRB=%4) "
-                "final(FA=%5,FB=%6,FRA=%7,FRB=%8) "
-                "model(frame=%9,field=%10) frameHeadToHead(A=%11,B=%12) "
-                "cleanup(island=%13,blockField=%14)")
-                .arg(fvfStatsTotal.rawWinnerCounts[0])
-                .arg(fvfStatsTotal.rawWinnerCounts[1])
-                .arg(fvfStatsTotal.rawWinnerCounts[2])
-                .arg(fvfStatsTotal.rawWinnerCounts[3])
-                .arg(fvfStatsTotal.finalWinnerCounts[0])
-                .arg(fvfStatsTotal.finalWinnerCounts[1])
-                .arg(fvfStatsTotal.finalWinnerCounts[2])
-                .arg(fvfStatsTotal.finalWinnerCounts[3])
-                .arg(fvfStatsTotal.frameModelPixels)
-                .arg(fvfStatsTotal.fieldModelPixels)
-                .arg(fvfStatsTotal.frameAHeadToHeadWins)
-                .arg(fvfStatsTotal.frameBHeadToHeadWins)
-                .arg(fvfStatsTotal.islandChangedPixels)
-                .arg(fvfStatsTotal.blockFieldCommitPixels);
-
-            const auto &fp = fvfStatsTotal.islandFlipPairs;
-            qInfo().noquote() << QString(
-                "Locked FVF island flips [C->L] "
-                "FA(->FB=%1,->FRA=%2,->FRB=%3) FB(->FA=%4,->FRA=%5,->FRB=%6) "
-                "FRA(->FA=%7,->FB=%8,->FRB=%9) FRB(->FA=%10,->FB=%11,->FRA=%12)")
-                .arg(fp[0][1]).arg(fp[0][2]).arg(fp[0][3])
-                .arg(fp[1][0]).arg(fp[1][2]).arg(fp[1][3])
-                .arg(fp[2][0]).arg(fp[2][1]).arg(fp[2][3])
-                .arg(fp[3][0]).arg(fp[3][1]).arg(fp[3][2]);
-        }
-
-        if (produceYStatsTotal.pixels > 0) {
-            const double avgAlphaVetDelta = (produceYStatsTotal.alphaVetCalls > 0)
-                ? (produceYStatsTotal.alphaVetDeltaSum /
-                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
-                : 0.0;
-            const double avgRetractedBlend = (produceYStatsTotal.retractedAvailablePixels > 0)
-                ? (produceYStatsTotal.retractedBlendSum /
-                   static_cast<double>(produceYStatsTotal.retractedAvailablePixels))
-                : 0.0;
-            qInfo().noquote() << QString(
-                "Locked produceY counters: pixels=%1 attribution=%2 residualBypass=%3 "
-                "noProductFallback=%4 residual3D=%5 alphaVet(calls=%6,adjusted=%7,"
-                "pixels=%8,avgAbsDelta=%9) retracted(available=%10,applied=%11,avgBlend=%12)")
-                .arg(produceYStatsTotal.pixels)
-                .arg(produceYStatsTotal.attributionPixels)
-                .arg(produceYStatsTotal.residualBypassPixels)
-                .arg(produceYStatsTotal.noProductFallbackPixels)
-                .arg(produceYStatsTotal.residual3DPixels)
-                .arg(produceYStatsTotal.alphaVetCalls)
-                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
-                .arg(produceYStatsTotal.alphaVetPixels)
-                .arg(avgAlphaVetDelta, 0, 'f', 4)
-                .arg(produceYStatsTotal.retractedAvailablePixels)
-                .arg(produceYStatsTotal.retractedAppliedPixels)
-                .arg(avgRetractedBlend, 0, 'f', 4);
-
-            const double avgSubMag = (produceYStatsTotal.alphaVetCalls > 0)
-                ? (produceYStatsTotal.alphaVetSubMagSum /
-                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
-                : 0.0;
-            const double avgLutMag = (produceYStatsTotal.alphaVetCalls > 0)
-                ? (produceYStatsTotal.alphaVetLutMagSum /
-                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
-                : 0.0;
-            const qint64 alphaVetNoEffect =
-                produceYStatsTotal.alphaVetCalls -
-                produceYStatsTotal.alphaVetGateFailCalls -
-                produceYStatsTotal.alphaVetAdjustedCalls;
-            qInfo().noquote() << QString(
-                "Locked alphaVet diagnosis: calls=%1 gateFail=%2 noEffect=%3 adjusted=%4 "
-                "subMagIRE(avg=%5,max=%6) lutMagIRE(avg=%7,max=%8)")
-                .arg(produceYStatsTotal.alphaVetCalls)
-                .arg(produceYStatsTotal.alphaVetGateFailCalls)
-                .arg(alphaVetNoEffect)
-                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
-                .arg(avgSubMag, 0, 'f', 4)
-                .arg(produceYStatsTotal.alphaVetSubMagMax, 0, 'f', 4)
-                .arg(avgLutMag, 0, 'f', 4)
-                .arg(produceYStatsTotal.alphaVetLutMagMax, 0, 'f', 4);
-        }
-
     }
 }
 
@@ -630,6 +456,8 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_lineWorkC.assign(width, 0.0);
         scratch_outMixed.assign(width, 0.0);
         scratch_lateralLine.assign(width, 0.0);
+        scratch_envLine.assign(width, 0.0);
+        scratch_spanLine.assign(width, 0.0);
         // low-res luma (chroma cancelled fsc)        
         scratch_lumaBaseY4.assign(width, 0.0);
         scratch_lumaHiRaw.assign(width, 0.0);
@@ -879,13 +707,34 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
             a.coherence,
             std::clamp(f.carrierParallaxCoherence, 0.0, 1.0));
     }
+    if (f.carrierResidualIRE > 0.0) {
+        const double carrierResidualScale = (lineForwardErrorIRE > 0.0)
+            ? std::max(8.0, 2.0 * lineForwardErrorIRE)
+            : 8.0;
+        const double carrierResidualPenalty = std::clamp(
+            (f.carrierResidualIRE - std::max(1.0, 0.20 * maxChromaIRE)) /
+            carrierResidualScale,
+            0.0,
+            1.0);
+        a.coherence = std::clamp(
+            a.coherence * (1.0 - 0.35 * carrierResidualPenalty),
+            0.0,
+            1.0);
+    }
+    if (f.movingResidualCoherence > 0.0) {
+        a.coherence = std::min(
+            a.coherence,
+            std::clamp(f.movingResidualCoherence, 0.0, 1.0));
+    }
     a.agreement = 1.0 - std::clamp(f.frameFieldAgreementIRE / 6.0, 0.0, 1.0);
-    a.spreadPenalty = std::max(
+    a.spreadPenalty = std::max({
         std::clamp(f.candidateSpreadIRE / 10.0, 0.0, 1.0),
         std::clamp(f.carrierParallaxSpreadIRE /
                    std::max(4.0, 0.35 * maxChromaIRE + 1.0),
                    0.0,
-                   1.0));
+                   1.0),
+        std::clamp(f.movingResidualPull, 0.0, 1.0)
+    });
     const double carrierPrior = configuration.phaseCompensation
         ? std::clamp(a.carrierPrior, 0.0, 1.0)
         : 1.0;
@@ -955,7 +804,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double HEDGE_THRESH_IRE   = T.FIELD_LUMA_EDGE_THRESH_IRE;
     const double FIELD_DIVERGE_IRE  = 6.0;   // comb (IQ) divergence boundary
     const double LUMA_DIVERGE_IRE   = 6.0;   // luma divergence boundary (new knob)
-    const double CC_EXCEPTION       = 0.50;  // crossColorRisk above which IQ
+    const double IMPURITY_EXCEPTION = 0.50;  // carrierImpurity above which IQ
                                              // divergence is excused (luma must
                                              // still agree). New knob.
     const double SAT_REGIME_IRE     = 16.0;  // #20 saturation regime: IQ-mag
@@ -1050,8 +899,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const quint16 *rawRow = rawbuffer.data() +
         static_cast<size_t>(line) * static_cast<size_t>(videoParameters.fieldWidth);
 
-    // Cross-color risk row (phase-exception evidence). Frame-flat; may be null.
-    const float *ccRow = crossColorRisk_line(line);
+    // Carrier impurity row (phase-exception evidence). Frame-flat; may be null.
+    const float *impurityRow = carrierImpurity_line(line);
 
     // IQ magnitude pre-pass: one hypot per pixel, consumed by the saturation
     // test and #19's texture ladder.
@@ -1098,7 +947,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
 
             e.satIRE          = scratch_fvf_iqMag[rel] * invI;
-            e.crossColorRisk  = ccRow ? static_cast<double>(ccRow[rel]) : 0.0;
+            e.carrierImpurity = impurityRow ? static_cast<double>(impurityRow[rel]) : 0.0;
             e.contourNonLocal = (rel < (int)tapLine.contour.size())
                 ? std::clamp(tapLine.contour[rel].midOk * 0.5 *
                     (tapLine.contour[rel].upSideOk + tapLine.contour[rel].dnSideOk),
@@ -1144,12 +993,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         // DIVERGENCE BOUNDARY (both regimes) — consumes the pool. Interfield is
         // viable when LUMA agrees AND the comb (IQ) agrees OR its disagreement
-        // is cross-color (interfield will clean that). If luma also diverges,
-        // NO exception — that subset goes to produceY's cancellation.
+        // is carrier impurity (interfield will clean that). If luma also
+        // diverges, NO exception — that subset goes to produceY's cancellation.
         const bool lumaDiverges  = e.lumaDivergence >= LUMA_DIVERGE_IRE;
         const bool combDiverges  = e.combDivergence >= FIELD_DIVERGE_IRE;
-        const bool crossColorOK  = e.crossColorRisk >= CC_EXCEPTION;
-        const bool fieldsCoherent = !lumaDiverges && (!combDiverges || crossColorOK);
+        const bool impurityException = e.carrierImpurity >= IMPURITY_EXCEPTION;
+        const bool fieldsCoherent = !lumaDiverges &&
+            (!combDiverges || impurityException);
         if (!fieldsCoherent) {
             winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;
             continue;
@@ -2194,7 +2044,7 @@ void Comb::FrameBuffer::split2D()
             {
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = lockedRow[rel];
             } else {
-                const double *src1d = clpbuffer[0].pixel[line];
+                const double *src1d = bucketScalar1D_line(line);
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = src1d[left + rel];
             }
             if (writeWeights && line < (int)w2d_frame_weight.size())
@@ -2291,7 +2141,7 @@ void Comb::FrameBuffer::split2D()
         {
             const double *src1d = configuration.phaseCompensation
                                   ? nullptr
-                                  : clpbuffer[0].pixel[line];
+                                  : bucketScalar1D_line(line);
             if ((int)scratch_lateralLine.size() < width)
                 scratch_lateralLine.resize(width);
             if (configuration.phaseCompensation) {
@@ -2433,7 +2283,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             {
                 base1d = lockedRow[rel0];
             } else {
-                base1d = clpbuffer[0].pixel[line][h0];
+                base1d = bucketScalar1D_line(line)[h0];
             }
         
             if (bestIndex < CAND_PREV_FIELD) {
