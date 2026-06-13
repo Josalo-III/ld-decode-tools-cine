@@ -46,6 +46,72 @@ struct YSourceView {
     double *samples = nullptr;
 };
 
+struct CarrierImpurityEvidence {
+    double narrowMagIRE = 0.0;
+    double wideMagIRE = 0.0;
+    double phaseAgreement = 0.0;
+    double carrierCoherence = 0.0;
+    double carrierConflict = 0.0;
+    double lumaMembership = 0.0;
+};
+
+inline double smoothGate01(double t)
+{
+    t = std::clamp(t, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+inline double detectCarrierImpurity(const CarrierImpurityEvidence &e)
+{
+    if (e.narrowMagIRE <= 1.5 || e.wideMagIRE >= e.narrowMagIRE)
+        return 0.0;
+
+    const double excessFraction = std::clamp(
+        (e.narrowMagIRE - e.wideMagIRE) /
+            std::max(1.5, e.narrowMagIRE),
+        0.0,
+        1.0);
+
+    const double lumaSupport = std::max(
+        std::clamp(e.lumaMembership, 0.0, 1.0),
+        std::clamp(e.carrierConflict, 0.0, 1.0));
+
+    const double coherentChromaProtect =
+        std::clamp(e.phaseAgreement, 0.0, 1.0) *
+        std::clamp(e.carrierCoherence, 0.0, 1.0) *
+        (1.0 - std::clamp(e.carrierConflict, 0.0, 1.0));
+
+    // Magnitude disagreement is only the invitation. Luma-membership or
+    // carrier-model conflict must support it, while a coherent phase-matched
+    // carrier protects legitimate chroma envelope transitions.
+    const double classification = std::clamp(
+        0.20 + 0.80 * lumaSupport - 0.65 * coherentChromaProtect,
+        0.0,
+        1.0);
+
+    return excessFraction * classification;
+}
+
+inline double carrierImpurityTransferStrength(double impurity,
+                                              double lumaMembership)
+{
+    // Explicit detector-to-policy conversion. The detector does not state how
+    // much waveform to move; membership support controls that promotion.
+    return std::clamp(
+        impurity * (0.35 + 0.65 * std::clamp(lumaMembership, 0.0, 1.0)),
+        0.0,
+        0.85);
+}
+
+inline double applyCarrierImpurityToAlpha(double alpha,
+                                          double impurity,
+                                          double policyWeight)
+{
+    const double reduction = std::clamp(impurity, 0.0, 1.0) *
+                             std::clamp(policyWeight, 0.0, 1.0);
+    return alpha * (1.0 - reduction);
+}
+
 inline double sourceToWorkingSample(const YSourceView &source, int x)
 {
     if (!source.samples) return 0.0;
@@ -469,7 +535,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         auto carrierSourceAt = [&](int rel)->double {
             rel = std::clamp(rel, 0, width - 1);
 
-            // A compact transfer repairs yWitness only. Feeding its carrier
+            // A bounded compact repair changes yWitness only. Feeding its carrier
             // complement into the candidate family lets the 1D decision
             // certify itself through Field/Frame agreement.
             if (correctionMaskRow &&
@@ -1931,10 +1997,10 @@ void Comb::FrameBuffer::produceY()
             if (witnessValid) {
                 alphaEff = 1.0;
             } else if (impurityRow && impuritySuppressionWeight > 0.0) {
-                const double impurity =
-                    static_cast<double>(impurityRow[x]) * impuritySuppressionWeight;
-                if (impurity > 0.0)
-                    alphaEff *= (1.0 - impurity);
+                alphaEff = applyCarrierImpurityToAlpha(
+                    alphaEff,
+                    static_cast<double>(impurityRow[x]),
+                    impuritySuppressionWeight);
             }
 
             const int h = left + x;
@@ -1989,10 +2055,10 @@ void Comb::FrameBuffer::produceY()
             if (witnessValid) {
                 alphaEff = 1.0;
             } else if (impurityRow && impuritySuppressionWeight > 0.0) {
-                const double impurity =
-                    static_cast<double>(impurityRow[x]) * impuritySuppressionWeight;
-                if (impurity > 0.0)
-                    alphaEff *= (1.0 - impurity);
+                alphaEff = applyCarrierImpurityToAlpha(
+                    alphaEff,
+                    static_cast<double>(impurityRow[x]),
+                    impuritySuppressionWeight);
             }
 
             const int h = left + x;
@@ -3556,37 +3622,60 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                         }
                         membershipYIRE[xi] = lurchIRE;
 
-                        // The old cross-color detector used the one-sided
-                        // magnitude relation wide < narrow.  Keep that as the
-                        // measurement of carrier-band Y excess, but convert it
-                        // into a waveform component rather than a confidence flag.
-                        double excessFraction = 0.0;
-                        // Cross-color witness: widen detection so that the
-                        // narrow regime is more visible.  Lower the fit
-                        // magnitude threshold from 2.0 to 1.5 and reduce the
-                        // normalisation floor accordingly.  When the narrow
-                        // fit sees a materially larger carrier than the wide
-                        // coherent fit, interpret part of that difference as
-                        // luma trespass in the carrier band.
-                        if (fitMagIRE > 1.5 && wideMagIRE < fitMagIRE) {
-                            const double excessIRE = fitMagIRE - wideMagIRE;
-                            excessFraction = std::clamp(
-                                excessIRE / std::max(1.5, fitMagIRE),
-                                0.0, 1.0);
+                        const double membershipFraction =
+                            smoothGate01((lurchIRE - 0.50) / 4.0);
+
+                        double phaseAgreement = 0.0;
+                        double carrierCoherence = 0.0;
+                        double carrierConflict = 1.0;
+                        if (parallaxRow && parallaxRow[xi].valid) {
+                            const auto &p = parallaxRow[xi];
+                            const double narrowMag =
+                                std::hypot(p.commonI, p.commonQ);
+                            const double wideMag = std::hypot(wideI, wideQ);
+                            if (narrowMag > 1e-9 && wideMag > 1e-9) {
+                                phaseAgreement = std::clamp(
+                                    (p.commonI * wideI + p.commonQ * wideQ) /
+                                        (narrowMag * wideMag),
+                                    0.0,
+                                    1.0);
+                            }
+
+                            carrierCoherence =
+                                std::clamp(p.carrierCoherence, 0.0, 1.0);
+                            const double spreadConflict = std::clamp(
+                                p.carrierSpreadIRE /
+                                    std::max(3.0, 0.35 * p.commonMagIRE + 1.0),
+                                0.0,
+                                1.0);
+                            const double latticeConflict = std::clamp(
+                                p.latticeRiskIRE /
+                                    std::max(3.0, 0.35 * p.commonMagIRE + 1.0),
+                                0.0,
+                                1.0);
+                            const double fitConflict = smoothGate01(
+                                (p.sampleFitErrorIRE - 1.0) / 5.0);
+                            carrierConflict = std::max({
+                                spreadConflict,
+                                latticeConflict,
+                                fitConflict,
+                                1.0 - carrierCoherence
+                            });
                         }
 
-                        // Lurch does not invent a carrier-band Y component by
-                        // itself; it permits more of the measured wide-vs-narrow
-                        // component to be transferred in hard luma transitions.
-                        // Soften the gating by decreasing the lurch threshold
-                        // and scaling factor: begin transferring earlier when
-                        // lurch evidence is modest and allow a higher base
-                        // transfer rate.
-                        const double membershipFraction = smoothStep01((lurchIRE - 0.50) / 4.0);
-                        const double transferFraction = std::clamp(
-                            excessFraction * (0.50 + 0.50 * membershipFraction),
-                            0.0,
-                            0.95);
+                        const CarrierImpurityEvidence impurityEvidence {
+                            fitMagIRE,
+                            wideMagIRE,
+                            phaseAgreement,
+                            carrierCoherence,
+                            carrierConflict,
+                            membershipFraction
+                        };
+                        const double impurity =
+                            detectCarrierImpurity(impurityEvidence);
+                        const double transferFraction =
+                            carrierImpurityTransferStrength(
+                                impurity, membershipFraction);
 
                         double yClaim = (narrowSample - wideSample) * transferFraction;
 
@@ -3597,17 +3686,10 @@ void Comb::FrameBuffer::buildCarrierRetracted()
 
                         carrierBandYClaim[xi] = yClaim;
 
-                        // carrierImpurity is a detection channel, not a residual
-                        // accounting: the witness patch gates consume it to
-                        // decide 1D authority, so it must publish the full
-                        // measured excess.  The double-count with the transfer
-                        // above (produceY also suppresses alpha by this impurity)
-                        // is resolved at the consumption site — pixels the
-                        // witness claims via carrierCorrectionMask bypass the
-                        // alpha suppression entirely, and elsewhere the
-                        // over-suppression errs toward preserving luma, which
-                        // is the documented intent (cross_color_suppression.md).
-                        impurityRow[xi] = static_cast<float>(excessFraction);
+                        // Publish detector evidence, not the transferred
+                        // waveform amount. Consumers must choose their own
+                        // named policy conversion.
+                        impurityRow[xi] = static_cast<float>(impurity);
                     }
                 }
             }
@@ -3651,28 +3733,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                     p2.residualConsensus.workprintCorrectionIRE =
                         std::fabs(sample - carrierFit[xi]) * invIreScale;
                     parallaxRow[xi] = p2;
-                }
-
-                // At large luma transitions the fit tends to ring and smear into
-                // the luma domain.  Suppress these echoes by attenuating the
-                // carrier model when a coarse-Y jump is observed.  Compute a
-                // local luma jump from the refined Y scaffold (two- and four-
-                // sample differences) and apply a gate to reduce the sample
-                // magnitude.  The gate ramps from 0 at small jumps (<3 IRE)
-                // to 1 at very large jumps (>12 IRE).  A 60% attenuation at
-                // full gate reduces ringing but preserves narrow colour
-                // features.
-                {
-                    const int xm1 = (xi > 0) ? xi - 1 : 0;
-                    const int xp1 = (xi + 1 < width) ? xi + 1 : width - 1;
-                    const int xm2 = (xi > 1) ? xi - 2 : 0;
-                    const int xp2 = (xi + 2 < width) ? xi + 2 : width - 1;
-                    const double d1 = std::fabs(refinedY[xp1] - refinedY[xm1]);
-                    const double d2 = 0.75 * std::fabs(refinedY[xp2] - refinedY[xm2]);
-                    const double coarseJumpIRE = std::max(d1, d2) * invIreScale;
-                    const double jumpGate = smoothStep01((coarseJumpIRE - 3.0) / 9.0);
-                    const double atten = 1.0 - 0.60 * jumpGate;
-                    sample *= atten;
                 }
 
                 sample = std::clamp(sample, -maxCarrierSamples, maxCarrierSamples);

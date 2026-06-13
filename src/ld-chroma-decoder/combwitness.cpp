@@ -9,9 +9,9 @@
  * Implements buildConstrainedYWitness(), which assembles the initial witness
  * outputs from the evidence already collected by buildCarrierRetracted().
  *
- * Current state: candidate-election witness.  The stage removes impossible
- * luma candidates, lets retracted and split1D agreement take over directly,
- * otherwise elects the surviving candidate nearest the surviving-set center.
+ * Current state: constrained witness. The stage removes impossible luma
+ * candidates, sharpens the broad prior from aperture-membership evidence, and
+ * permits only a bounded compact-patch correction from the 1D witness.
  *
  * Conceptual mapping (see witness-migration.md):
  *   yWitness            ← constrained Y after survivor reconciliation
@@ -142,7 +142,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
      *   moving coarse    = broad luma prior
      *   four floor views = possible-value clamp
      *   lurch           = boundary sharpener inside the clamp
-     *   1D              = per-pixel authority inside compact saturated patches
+     *   1D              = bounded repair inside strongly certified compact patches
      *
      * The old carrier-side candidate election is intentionally absent.
      */
@@ -152,19 +152,17 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
     const double LURCH_DELTA_FULL_IRE  = 2.75;
 
     const double FLOOR_BASE_PAD_IRE  = 0.85;
-    const double FLOOR_RISK_PAD_IRE  = 2.75;
     const double FLOOR_LURCH_PAD_IRE = 2.75;
-    const double FLOOR_PATCH_PAD_IRE = 1.25;
-
-    const double ONE_D_FAST_CONTOUR_START_IRE = 1.25;
-    const double ONE_D_FAST_CONTOUR_FULL_IRE  = 3.50;
 
     const double PATCH_CHROMA_START_IRE = 1.25;
     const double PATCH_CHROMA_FULL_IRE  = 5.00;
     const double PATCH_FLOOR_TIGHT_IRE  = 5.50;
     const double PATCH_FLOOR_LOOSE_IRE  = 11.00;
-    const double PATCH_SPAN_START_PX    = 12.0;
-    const double PATCH_SPAN_FULL_PX     = 24.0;
+    const double PATCH_SPAN_START_PX    = 5.0;
+    const double PATCH_SPAN_FULL_PX     = 9.0;
+    const double PATCH_SELECT_GATE      = 0.72;
+    const double PATCH_MIN_DELTA_IRE    = 0.75;
+    const double PATCH_MAX_REPAIR_IRE   = 2.0;
 
     double *envScratch = scratch_envLine.data();
     double *spanScratch = scratch_spanLine.data();
@@ -189,7 +187,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
 
         // Strong-span coverage: contiguous env runs (>2.5 IRE, 4..24 px) are
         // patch-shaped clusters; coverage = fraction of the span's pixels
-        // that won patch authority.  Solid patches should be >75%; coverage
+        // that received bounded repair. Solid patches should be >75%; coverage
         // in the middle bins means selection flickers spatially across the
         // patch — itself a checkerboard generator.
         long long spans = 0;
@@ -294,7 +292,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
          * how long is the contiguous run of envelope energy containing this
          * pixel?  A compact patch is a short run; a wide chroma region (even
          * a low-saturation one) is a long run and is the coarse/comb paths'
-         * territory — per-pixel 1D authority must not fire there, including
+         * territory — compact 1D repair must not fire there, including
          * in the boundary bands where the wide-vs-narrow risk proxy lights
          * up.  Risk no longer participates in patch detection: it is a
          * compactness proxy that is wrong at the boundaries of real chroma,
@@ -350,8 +348,8 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
         /*
          * Same-phase 1D luma estimate.
          *
-         * This is the per-pixel authority for compact chroma patches.  It is
-         * intentionally not blended everywhere; it becomes a mode choice.
+         * This is compact-patch repair evidence. It is never a general luma
+         * source and is capped after the ordinary witness path completes.
          */
         auto split1DCandidateAt = [&](int x) -> double {
             int hm2 = left + x - 2;
@@ -426,7 +424,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                                               (double)view.sampleFitErrorIRE);
                 }
 
-                const double keepSlackIRE = 3.0 + 2.0 * risk;
+                const double keepSlackIRE = 3.0;
 
                 for (int v = 0; v < viewCount; ++v) {
                     const auto &view = evidence[xi].views[v];
@@ -515,7 +513,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
              *
              * |raw - coarse| dips to zero at carrier zero-crossings every two
              * samples.  Gating the patch detector on the instantaneous value
-             * made 1D authority flicker at carrier rate through a patch — the
+             * made 1D repair flicker at carrier rate through a patch — the
              * authority switch itself became a checkerboard generator.  A
              * 3-sample max envelope is flat across the cycle (on the exact
              * 4fSC grid the magnitudes run A,0,A,0).
@@ -543,10 +541,9 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             /*
              * Compact chroma patch detector:
              *
-             * A narrow saturated patch has high carrier/cross-color risk and
-             * high residual energy, but the four coarse floors may still form
-             * a reasonably tight legal fence.  That is the regime where the
-             * per-pixel 1D estimate should own the interior.
+             * A narrow saturated patch has high residual energy, while the
+             * four coarse floors may still form a tight legal fence. That is
+             * the only regime where the 1D estimate may offer bounded repair.
              */
             // Chroma evidence = envelope energy that also has a legal carrier
             // explanation.  Envelope alone re-admits the step residue at
@@ -589,7 +586,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
              * authority only where no legal carrier explanation exists.  A
              * patch abutting black is both a luma step and a chroma onset at
              * the same columns: the step verdict must yield to carrier
-             * legality, or the veto strips 1D authority from exactly the
+             * legality, or the veto strips repair from exactly the
              * patch that needs it.
              */
             const double patchVetoGate =
@@ -605,15 +602,13 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 1.0);
 
             /*
-             * The four coarse floors define possible Y.  Patch mode gets a
-             * little extra pad because the 1D source is the per-pixel authority
-             * and should not be falsely blocked by aperture center mismatch.
+             * The four coarse floors define possible Y. Compact detection does
+             * not widen this ordinary support path; it may only apply the
+             * bounded hard-feasible correction below.
              */
             const double floorPadIRE =
                 FLOOR_BASE_PAD_IRE
-              + FLOOR_RISK_PAD_IRE * risk
               + FLOOR_LURCH_PAD_IRE * lurchGate
-              + FLOOR_PATCH_PAD_IRE * compactPatchGate
               + 0.25 * maxYSpanIRE;
 
             /*
@@ -683,8 +678,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                     possibleBand = supportBand;
                     if (!possibleBand.valid()) {
                         possibleBand = floorBand;
-                        possibleBand.expand((4.0 + 4.0 * risk
-                                          + 2.0 * compactPatchGate) * ireToSamples);
+                        possibleBand.expand((4.0 + 4.0 * risk) * ireToSamples);
                     }
                 }
             }
@@ -694,8 +688,6 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             };
 
             const double y1DHard = hardClamp(oneDUnclamped);
-            const double y1DSoft = possibleBand.clamp(oneDUnclamped);
-
             /*
              * Primary broad prior, lurch-preconditioned.
              */
@@ -705,17 +697,13 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             /*
              * Lurch sharpening.
              *
-             * It remains the boundary sharpener, but compactPatchGate reduces
-             * the edge-push component so lurch does not over-shape the interior
-             * of a narrow saturated patch.  1D will own that interior below.
+             * Compact detection does not alter the ordinary boundary model.
+             * Any compact repair is applied after this path is complete.
              */
             double yLurch = yPrior;
             if (lurchDenominator > 1e-9 && lurchGate > 0.0) {
                 const double rawCorrection =
                     lurchNumerator / lurchDenominator;
-
-                const double boundaryGate =
-                    std::clamp(1.0 - 0.45 * compactPatchGate, 0.55, 1.0);
 
                 // The preconditioner consumed the same membership evidence
                 // upstream; where it fired, the prior is already sharp and a
@@ -723,7 +711,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 const double preconditionGate = 1.0 - sharpGate[xi];
 
                 const double lurchGain =
-                    (0.80 + 0.35 * lurchGate) * boundaryGate * preconditionGate;
+                    (0.80 + 0.35 * lurchGate) * preconditionGate;
 
                 const double maxCorrection =
                     (0.60 + 0.90 * lurchGate) *
@@ -735,8 +723,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                                       maxCorrection);
 
                 if (possibleBand.valid() &&
-                    lurchGate > 0.35 &&
-                    compactPatchGate < 0.75)
+                    lurchGate > 0.35)
                 {
                     const double bandCenter = possibleBand.center();
                     const double fromCenter = yLurch - bandCenter;
@@ -755,7 +742,6 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                             halfBand *
                             0.18 *
                             smoothStep01((lurchGate - 0.35) / 0.65) *
-                            (1.0 - compactPatchGate) *
                             preconditionGate;
 
                         if ((yLurch - bandCenter) * outward >= -1e-9)
@@ -796,51 +782,21 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             const double y1DPatchHard = hardClamp(y1DPatchCand);
 
             /*
-             * 1D authority.
+             * Compact repair.
              *
-             * This is no longer continuous detail injection.  There are two
-             * cases:
-             *
-             *   1. compact saturated patch:
-             *      1D is the per-pixel source and may directly take the pixel.
-             *
-             *   2. non-patch fast contour:
-             *      1D remains a rare binary substitute.
+             * The 1D candidate is never a general contour source. A strong
+             * compact verdict may move the completed witness toward the
+             * hard-feasible 1D candidate by at most PATCH_MAX_REPAIR_IRE.
              */
             const double oneDDeltaIRE =
                 std::fabs(y1DHard - yLurch) * invIreScale;
             const double patchDeltaIRE =
                 std::fabs(y1DPatchHard - yLurch) * invIreScale;
 
-            const double rawFscCurveIRE =
-                std::fabs(raw -
-                    0.5 * ((double)rawLine[left + xm2]
-                         + (double)rawLine[left + xp2])) * invIreScale;
-
-            const double smoothCurveIRE =
-                smoothY
-                    ? std::fabs(smoothY[xi] -
-                        0.5 * (smoothY[xm2] + smoothY[xp2])) * invIreScale
-                    : 0.0;
-
-            const double underModeledContourIRE =
-                rawFscCurveIRE - 0.65 * smoothCurveIRE;
-
-            const double fastContourGate = smoothStep01(
-                (std::max(oneDDeltaIRE, underModeledContourIRE)
-                    - ONE_D_FAST_CONTOUR_START_IRE) /
-                std::max(1e-9,
-                    ONE_D_FAST_CONTOUR_FULL_IRE - ONE_D_FAST_CONTOUR_START_IRE));
-
-            /*
-             * Patch authority is allowed to start earlier than the old 1D
-             * binary fallback.  Avoid a soft blend: use 1D as a mode when the
-             * patch detector is strong enough.  The small oneDDelta threshold
-             * prevents pointless source switching when both witnesses agree.
-             */
-            const bool patchSelect1D =
-                (compactPatchGate > 0.38) &&
-                (patchDeltaIRE > 0.20 || carrierResidIRE > PATCH_CHROMA_START_IRE);
+            const bool compactRepairEligible =
+                haveHardBand &&
+                compactPatchGate >= PATCH_SELECT_GATE &&
+                patchDeltaIRE >= PATCH_MIN_DELTA_IRE;
 
             if (patchDiagEnabled &&
                 carrierResidIRE > PATCH_CHROMA_START_IRE &&
@@ -848,7 +804,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 spanScratch[xi] <= PATCH_SPAN_FULL_PX)
             {
                 ++patchDiag.candidates;
-                if (patchSelect1D)
+                if (compactRepairEligible)
                     ++patchDiag.selected;
 
                 const double gateVals[6] = {
@@ -884,25 +840,22 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                     patchDiag.bSharp = sharpGate[xi];
                     patchDiag.bCompact = compactPatchGate;
                     patchDiag.bDeltaIRE = patchDeltaIRE;
-                    patchDiag.bSelected = patchSelect1D;
+                    patchDiag.bSelected = compactRepairEligible;
                 }
             }
 
-            const bool fastContourSelect1D =
-                (fastContourGate > 0.75) &&
-                (oneDDeltaIRE > 1.25);
-
             double yOut = yLurch;
-            bool oneDSelected = false;
             bool patchSelected = false;
 
-            if (patchSelect1D) {
-                yOut = y1DPatchHard;
-                oneDSelected = true;
+            if (compactRepairEligible) {
+                const double maxRepair =
+                    PATCH_MAX_REPAIR_IRE * ireToSamples * compactPatchGate;
+                yOut += std::clamp(
+                    y1DPatchHard - yLurch,
+                    -maxRepair,
+                    maxRepair);
+                yOut = hardClamp(yOut);
                 patchSelected = true;
-            } else if (fastContourSelect1D) {
-                yOut = y1DSoft;
-                oneDSelected = true;
             }
 
             yOut = patchSelected ? hardClamp(yOut) : possibleBand.clamp(yOut);
@@ -943,8 +896,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                     ambiguityNorm,
                     conflictNorm,
                     0.45 * lurchGate,
-                    patchSelected ? 0.12 : 0.0,
-                    (oneDSelected && !patchSelected) ? 0.20 : 0.0
+                    patchSelected ? 0.20 : 0.0
                 }),
                 0.0,
                 1.0);
@@ -956,44 +908,23 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 lurchGate *
                 (1.0 / (1.0 + maxMembershipDeltaIRE / 12.0));
 
-            const double patchConfidence =
-                patchSelected
-                    ? (0.60 + 0.40 * compactPatchGate)
-                    : 0.0;
-
-            const double oneDConfidence =
-                oneDSelected
-                    ? (patchSelected
-                        ? patchConfidence
-                        : (0.65 + 0.35 * std::clamp(fastContourGate, 0.0, 1.0)))
-                    : 0.0;
-
-            /*
-             * Do not punish patch-selected 1D as much for chroma risk.  Chroma
-             * risk is precisely why 1D became the authority there.
-             */
-            const double riskPenalty =
-                patchSelected
-                    ? (1.0 - 0.20 * risk)
-                    : (1.0 - 0.45 * risk);
-
-            const double ambiguityPenalty =
-                patchSelected
-                    ? (1.0 - 0.25 * ambiguityNorm)
-                    : (1.0 - 0.50 * ambiguityNorm);
+            const double riskPenalty = 1.0 - 0.45 * risk;
+            const double ambiguityPenalty = 1.0 - 0.50 * ambiguityNorm;
+            const double compactRepairPenalty =
+                patchSelected ? (1.0 - 0.25 * compactPatchGate) : 1.0;
 
             const double yConfidence = std::clamp(
-                std::max({yBaseConfidence, lurchConfidence, oneDConfidence})
+                std::max(yBaseConfidence, lurchConfidence)
                 * riskPenalty
                 * ambiguityPenalty
+                * compactRepairPenalty
                 * (1.0 - 0.35 * conflictNorm),
                 0.0,
                 1.0);
 
             const double carrierConfidence = std::clamp(
                 (double)linePlausibility
-                * (patchSelected ? (0.75 + 0.25 * compactPatchGate)
-                                 : (1.0 - 0.60 * risk))
+                * (1.0 - 0.60 * risk)
                 * (1.0 - 0.55 * ambiguityNorm)
                 * (1.0 - 0.35 * conflictNorm),
                 0.0,
@@ -1007,16 +938,11 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             ambig[xi]   = static_cast<float>(std::max(0.0, ambiguityIRE));
 
             /*
-             * Attribution event mask.  >0.5 records a binary local transfer
-             * between Y and carrier: the witness has overruled the coarse
-             * scaffold with the per-pixel 1D source.  Only patch authority
-             * makes that claim.  Fast-contour substitution is recorded below
-             * the threshold: it fires at luma contours, where a line-to-line
-             * inconsistent event must not pin produceY's subtraction alpha —
-             * that put colored speckle along vertical luma edges.
+             * Attribution event mask. >0.5 records the bounded compact
+             * transfer so candidate construction cannot use the repair's
+             * carrier complement to certify the same decision.
              */
-            corrMask[xi] = patchSelected ? 1.0f
-                         : (oneDSelected ? 0.4f : 0.0f);
+            corrMask[xi] = patchSelected ? 1.0f : 0.0f;
         }
 
         if (patchDiagEnabled) {
@@ -1160,9 +1086,23 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 const double n0 = static_cast<double>(neighborCw[xi]);
                 const double n1 = static_cast<double>(neighborCw[xj]);
 
+                // A vertical structure (vertical edge crossed at 90 deg) is a
+                // horizontal HF luma event whose 1D cross-color flips sign
+                // line-to-line while the luma itself is the SAME on adjacent
+                // lines.  In the carrier residual that alien is NON-INVERTING
+                // (c ~ +n), and 0.5(c - n) cancels it — but |c+n| alone reads
+                // c ~ +n as mismatch and backs off, so the comb could not
+                // cancel exactly this case.  min(|c+n|, |c-n|) also admits the
+                // non-inverting relation: inverting (c ~ -n) is real interline
+                // chroma the comb preserves; non-inverting is alien luma it
+                // cancels.  This does NOT reach horizontal details: lumaGate
+                // (unchanged below) still vetoes the risky large vertical
+                // reach where adjacent-line luma genuinely differs.
                 const double s0 = c0 + n0, s1 = c1 + n1;
+                const double d0 = c0 - n0, d1 = c1 - n1;
                 const double carrierMismatchIRE =
-                    std::sqrt(s0 * s0 + s1 * s1) * invIreScale;
+                    std::min(std::sqrt(s0 * s0 + s1 * s1),
+                             std::sqrt(d0 * d0 + d1 * d1)) * invIreScale;
                 const double carrierAmpIRE = 0.5 *
                     (envScratch[xi] +
                      std::sqrt(n0 * n0 + n1 * n1)) * invIreScale;

@@ -279,10 +279,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          *
          *   buildPhaseCorrected1D()
          *       Builds locked1DSource from witness carrier generally, but uses
-         *       the independent combed carrier at compact-transfer pixels.
+         *       the independent combed carrier at bounded compact-repair pixels.
          *
          *   split2D()
-         *       Elects from that source without treating compact 1D transfer
+         *       Elects from that source without treating compact 1D repair
          *       as its own Field/Frame evidence.
          */
         const bool canLoadNext =

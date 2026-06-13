@@ -355,13 +355,10 @@ public:
             double LS_REFIT_BRIGHT_SIDE_SOFT_IRE    = 0.5;  // bright-side membership begins this far above the local edge midpoint
             double LS_REFIT_BRIGHT_SIDE_HARD_IRE    = 3.0;  // bright-side membership is full this far above the local edge midpoint
 
-            // Cross-color suppression: wide-window LS detector identifies pixels
-            // where the four-view carrier estimate is contaminated by luma-near-fsc.
-            // The risk [0,1] is multiplied by this weight before being applied as a
-            // subtraction-alpha reduction in produceY.  1.0 = full detector strength
-            // (risk maps directly to alpha reduction).  0 = detector disabled.
-            // Values above 1.0 are not meaningful; the reduction is clamped at 1.0.
-            double CC_SUPPRESSION_WEIGHT = 1.0; // cross-color risk multiplier (0=off, 1=full)
+            // Cross-color suppression weight for the witness-absent fallback.
+            // carrierImpurity is detector evidence, so the fallback converts it
+            // to alpha policy explicitly instead of treating it as a residual.
+            double CC_SUPPRESSION_WEIGHT = 1.0; // carrier-impurity policy weight
         };
         Tunables tunables;
     };
@@ -812,11 +809,9 @@ private:
 	// constrained witness stage.
 	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat;
 	// Carrier impurity detector: per-pixel evidence [0,1] that the four-view
-	// carrier estimate is contaminated by luma-near-fsc. Computed by a sliding
-	// wide-window LS carrier fit (>=32 samples, ~8 carrier cycles) that has
-	// enough aperture to distinguish coherent carrier from incoherent
-	// luma-near-fsc. Where the wide-window carrier magnitude is materially
-	// lower than the four-view estimate, the carrier estimate is impure.
+	// carrier estimate is contaminated by luma-near-fsc. It combines
+	// narrow-vs-wide carrier excess with phase agreement, local carrier
+	// coherence, four-view conflict, and luma-membership evidence.
 	// Consumed by produceY and FVF as detector evidence, not as a residual plane.
 	std::vector<float> carrierImpurity_flat;
 	bool carrierRetractedValid = false;
