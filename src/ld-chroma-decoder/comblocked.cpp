@@ -817,7 +817,7 @@ void Comb::FrameBuffer::splitIQlocked()
         float *prodIRow = lockedProductI_line(line);
         float *prodQRow = lockedProductQ_line(line);
         const float *impRow = carrierImpurity_line(line);
-        const double ccWeight = std::clamp(T.CC_SUPPRESSION_WEIGHT, 0.0, 1.0);
+        const double ccWeight = std::max(0.0, T.CC_SUPPRESSION_WEIGHT);
 
         const LineAffine *lineAffine = nullptr;
         if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
@@ -851,7 +851,7 @@ void Comb::FrameBuffer::splitIQlocked()
             // Requires --no-residual-color so chroma comes from this product and
             // not from raw - Y (which would be rigidly complementary to luma).
             const double alphaEff =
-                1.0 - (impRow ? static_cast<double>(impRow[xi]) : 0.0) * ccWeight;
+                std::max(0.0, 1.0 - (impRow ? static_cast<double>(impRow[xi]) : 0.0) * ccWeight);
 
             const float prodI = (float)(ti * GI_PRODUCT * alphaEff);
             const float prodQ = (float)(tq * GQ_PRODUCT * alphaEff);
@@ -954,7 +954,7 @@ void Comb::FrameBuffer::filterIQLocked()
             // energy into luma -- coherent and residual modes now agree.
             const float *impRow = carrierImpurity_line(line);
             const double ccWeight =
-                std::clamp(configuration.tunables.CC_SUPPRESSION_WEIGHT, 0.0, 1.0);
+                std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
 
             double dc = (double)rawLine[left] - Yrow[left];
             constexpr double DC_ALPHA = 1.0 / 64.0;
@@ -965,7 +965,7 @@ void Comb::FrameBuffer::filterIQLocked()
                 const double chroma = chromaRaw - dc;
                 const int ph = carrierSampleClass(line, h);
                 const double alphaEff =
-                    1.0 - (impRow ? (double)impRow[i] : 0.0) * ccWeight;
+                    std::max(0.0, 1.0 - (impRow ? (double)impRow[i] : 0.0) * ccWeight);
                 scratch_preI[i] = (chroma * lutTi[ph]) * GI_PRODUCT * alphaEff;
                 scratch_preQ[i] = (chroma * lutTq[ph]) * GQ_PRODUCT * alphaEff;
             }

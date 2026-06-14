@@ -116,11 +116,10 @@ public:
             int    SINFIT_WIN_SAMPLES       = 16;  // samples per window; must be a multiple of 4 (one 4fsc period)
             double SINFIT_VET_THRESHOLD_IRE = 3.0; // per-sample fit residual above which that sample is rejected
 
-            // Cross-color suppression strength.  alphaEff = 1 - risk*weight is
-            // applied to the carrier demod (color) and the Y subtraction (luma)
-            // where the wide-window detector flags luma-near-fsc.  1.0 = full
-            // doc strength; dial toward ~0.7 if saturated compact color
-            // desaturates.  Clamped to [0,1] at read time.
+            // Cross-color suppression strength (--cross-color-return).
+            // alphaEff = max(0, 1 - gA*weight) applied to rendered chroma in
+            // both coherent and residual paths; Y subtraction always full.
+            // >1.0 drives harder suppression on ambiguous pixels.
             double CC_SUPPRESSION_WEIGHT    = 1.0;
 
             // =========================================================================

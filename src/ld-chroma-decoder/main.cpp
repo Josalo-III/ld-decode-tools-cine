@@ -321,6 +321,11 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "NTSC locked mode: log per-stage timing summaries"));
     parser.addOption(stageTimersOption);
 
+    QCommandLineOption crossColorReturnOption(QStringList() << "cross-color-return",
+                                    QCoreApplication::translate("main", "NTSC locked mode: Returns bandpass luma to Y, eliminating cross color effects and restoring high frequency luma detail. (default 1.0; values above 1.0 drive harder suppression on ambiguous pixels)"),
+                                    QCoreApplication::translate("main", "number"));
+    parser.addOption(crossColorReturnOption);
+
     QCommandLineOption noPAOption(QStringList() << "no-pa",
         QCoreApplication::translate("main", "Disable pulldown awareness - reverts to original 29.97 video process"));
     parser.addOption(noPAOption);
@@ -423,6 +428,15 @@ int main(int argc, char *argv[])
     }
     if (parser.isSet(stageTimersOption)) {
         combConfig.stageTimers = true;
+    }
+
+    if (parser.isSet(crossColorReturnOption)) {
+        const double v = parser.value(crossColorReturnOption).toDouble();
+        if (v < 0.0) {
+            qCritical("--cross-color-return must be >= 0");
+            return -1;
+        }
+        combConfig.tunables.CC_SUPPRESSION_WEIGHT = v;
     }
 
     if (cadenceConfig.noPA && cadenceConfig.setCadence != 0) {
