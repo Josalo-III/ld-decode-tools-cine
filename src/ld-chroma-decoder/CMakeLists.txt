@@ -10,7 +10,6 @@ add_library(lddecode-chroma STATIC
     comb.cpp
     combcandidate.cpp
     comblocked.cpp
-    combwitness.cpp
     componentframe.cpp
     framecanvas.cpp
     outputwriter.cpp

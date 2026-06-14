@@ -1629,8 +1629,8 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // 1D sample: locked path reads from locked1DSource_flat (combed carrier);
-    // bucket path reads from clpbuffer[0] (blind bandpass).
+    // 1D sample: locked path reads the phase-corrected blind bandpass;
+    // bucket path reads clpbuffer[0] directly.
     const double *lockedRow = frameBuffer.configuration.phaseCompensation
         ? frameBuffer.locked1DSource_line(lineNumber) : nullptr;
     if (lockedRow && (hh - left) >= 0 && (hh - left) < (right - left))

@@ -163,8 +163,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
     enum StageIndex {
         StagePhaseLocked,
-        StageCarrierRetracted,
-        StageConstrainedYWitness,
         StagePhaseCorrected1D,
         StageSplit2D,
         StageCopy2DTo3D,
@@ -184,8 +182,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     };
     std::array<StageStat, StageCount> stageStats = {{
         {"phaseLocked"},
-        {"buildCarrierRetracted"},
-        {"buildConstrainedYWitness"},
         {"buildPhaseCorrected1D"},
         {"split2D"},
         {"copy2DTo3D"},
@@ -199,7 +195,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     }};
     const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
     FrameBuffer::FvfInstrumentation fvfStatsTotal;
-    FrameBuffer::ProduceYInstrumentation produceYStatsTotal;
     auto accumulateFvfStats = [&](const FrameBuffer::FvfInstrumentation &stats) {
         for (int i = 0; i < 4; ++i) {
             fvfStatsTotal.rawWinnerCounts[i] += stats.rawWinnerCounts[i];
@@ -214,25 +209,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c)
                 fvfStatsTotal.islandFlipPairs[r][c] += stats.islandFlipPairs[r][c];
-    };
-    auto accumulateProduceYStats = [&](const FrameBuffer::ProduceYInstrumentation &stats) {
-        produceYStatsTotal.pixels += stats.pixels;
-        produceYStatsTotal.attributionPixels += stats.attributionPixels;
-        produceYStatsTotal.residualBypassPixels += stats.residualBypassPixels;
-        produceYStatsTotal.noProductFallbackPixels += stats.noProductFallbackPixels;
-        produceYStatsTotal.alphaVetCalls += stats.alphaVetCalls;
-        produceYStatsTotal.alphaVetAdjustedCalls += stats.alphaVetAdjustedCalls;
-        produceYStatsTotal.alphaVetPixels += stats.alphaVetPixels;
-        produceYStatsTotal.alphaVetGateFailCalls += stats.alphaVetGateFailCalls;
-        produceYStatsTotal.alphaVetSubMagSum += stats.alphaVetSubMagSum;
-        produceYStatsTotal.alphaVetSubMagMax = std::max(produceYStatsTotal.alphaVetSubMagMax, stats.alphaVetSubMagMax);
-        produceYStatsTotal.alphaVetLutMagSum += stats.alphaVetLutMagSum;
-        produceYStatsTotal.alphaVetLutMagMax = std::max(produceYStatsTotal.alphaVetLutMagMax, stats.alphaVetLutMagMax);
-        produceYStatsTotal.retractedAvailablePixels += stats.retractedAvailablePixels;
-        produceYStatsTotal.retractedAppliedPixels += stats.retractedAppliedPixels;
-        produceYStatsTotal.residual3DPixels += stats.residual3DPixels;
-        produceYStatsTotal.alphaVetDeltaSum += stats.alphaVetDeltaSum;
-        produceYStatsTotal.retractedBlendSum += stats.retractedBlendSum;
     };
     auto measureStage = [&](StageIndex idx, auto &&fn) {
         if (!stageTimers) {
@@ -263,28 +239,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             next     = std::move(recycle);
         }
 
-        /*
-         * Preload the next framebuffer.
-         *
-         * Locked path order:
-         *
-         *   phaseLocked()
-         *       Builds burst grammar, baseY4/smoothY cache, and raw TRI/TRQ.
-         *
-         *   buildCarrierRetracted()
-         *       Builds four-view coarse evidence and carrier-side support.
-         *
-         *   buildConstrainedYWitness()
-         *       Builds yWitness and carrierWitness = raw - yWitness.
-         *
-         *   buildPhaseCorrected1D()
-         *       Builds locked1DSource from witness carrier generally, but uses
-         *       the independent combed carrier at bounded compact-repair pixels.
-         *
-         *   split2D()
-         *       Elects from that source without treating compact 1D repair
-         *       as its own Field/Frame evidence.
-         */
         const bool canLoadNext =
             (fieldIndex + 2 >= 0) &&
             (fieldIndex + 3 < inputFields.size());
@@ -293,13 +247,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             next->loadFields(inputFields[fieldIndex + 2],
                              inputFields[fieldIndex + 3]);
 
+            next->split1D();
+
             if (configuration.phaseCompensation) {
                 measureStage(StagePhaseLocked, [&]() { next->phaseLocked(); });
-                measureStage(StageCarrierRetracted, [&]() { next->buildCarrierRetracted(); });
-                measureStage(StageConstrainedYWitness, [&]() { next->buildConstrainedYWitness(); });
                 measureStage(StagePhaseCorrected1D, [&]() { next->buildPhaseCorrected1D(); });
-            } else {
-                next->split1D();
             }
 
             measureStage(StageSplit2D, [&]() { next->split2D(); });
@@ -339,18 +291,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         /*
          * Output path.
          *
-         * buildPhaseCorrected1D() is not here because it is a pre-election
-         * source builder.  It must run before split2D() on the preloaded frame.
-         *
          * splitIQlocked() is the post-election demod of the selected comb.
          */
         if (configuration.phaseCompensation) {
             measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
             measureStage(StageDoCNR, [&]() { current->doCNR(); });
             measureStage(StageProduceY, [&]() { current->produceY(); });
-            if (stageTimers) {
-                accumulateProduceYStats(current->getProduceYInstrumentation());
-            }
             measureStage(StageFilterIQLocked, [&]() { current->filterIQLocked(); });
             measureStage(StageDoYNR, [&]() { current->doYNR(); });
             measureStage(StageTransformIQ, [&]() {
@@ -513,56 +459,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 .arg(fp[3][0]).arg(fp[3][1]).arg(fp[3][2]);
         }
 
-        if (produceYStatsTotal.pixels > 0) {
-            const double avgAlphaVetDelta = (produceYStatsTotal.alphaVetCalls > 0)
-                ? (produceYStatsTotal.alphaVetDeltaSum /
-                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
-                : 0.0;
-            const double avgRetractedBlend = (produceYStatsTotal.retractedAvailablePixels > 0)
-                ? (produceYStatsTotal.retractedBlendSum /
-                   static_cast<double>(produceYStatsTotal.retractedAvailablePixels))
-                : 0.0;
-            qInfo().noquote() << QString(
-                "Locked produceY counters: pixels=%1 attribution=%2 residualBypass=%3 "
-                "noProductFallback=%4 residual3D=%5 alphaVet(calls=%6,adjusted=%7,"
-                "pixels=%8,avgAbsDelta=%9) retracted(available=%10,applied=%11,avgBlend=%12)")
-                .arg(produceYStatsTotal.pixels)
-                .arg(produceYStatsTotal.attributionPixels)
-                .arg(produceYStatsTotal.residualBypassPixels)
-                .arg(produceYStatsTotal.noProductFallbackPixels)
-                .arg(produceYStatsTotal.residual3DPixels)
-                .arg(produceYStatsTotal.alphaVetCalls)
-                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
-                .arg(produceYStatsTotal.alphaVetPixels)
-                .arg(avgAlphaVetDelta, 0, 'f', 4)
-                .arg(produceYStatsTotal.retractedAvailablePixels)
-                .arg(produceYStatsTotal.retractedAppliedPixels)
-                .arg(avgRetractedBlend, 0, 'f', 4);
-
-            const double avgSubMag = (produceYStatsTotal.alphaVetCalls > 0)
-                ? (produceYStatsTotal.alphaVetSubMagSum /
-                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
-                : 0.0;
-            const double avgLutMag = (produceYStatsTotal.alphaVetCalls > 0)
-                ? (produceYStatsTotal.alphaVetLutMagSum /
-                   static_cast<double>(produceYStatsTotal.alphaVetCalls))
-                : 0.0;
-            const qint64 alphaVetNoEffect =
-                produceYStatsTotal.alphaVetCalls -
-                produceYStatsTotal.alphaVetGateFailCalls -
-                produceYStatsTotal.alphaVetAdjustedCalls;
-            qInfo().noquote() << QString(
-                "Locked alphaVet diagnosis: calls=%1 gateFail=%2 noEffect=%3 adjusted=%4 "
-                "subMagIRE(avg=%5,max=%6) lutMagIRE(avg=%7,max=%8)")
-                .arg(produceYStatsTotal.alphaVetCalls)
-                .arg(produceYStatsTotal.alphaVetGateFailCalls)
-                .arg(alphaVetNoEffect)
-                .arg(produceYStatsTotal.alphaVetAdjustedCalls)
-                .arg(avgSubMag, 0, 'f', 4)
-                .arg(produceYStatsTotal.alphaVetSubMagMax, 0, 'f', 4)
-                .arg(avgLutMag, 0, 'f', 4)
-                .arg(produceYStatsTotal.alphaVetLutMagMax, 0, 'f', 4);
-        }
     }
 }
 
@@ -653,8 +549,6 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_lineWorkC.assign(width, 0.0);
         scratch_outMixed.assign(width, 0.0);
         scratch_lateralLine.assign(width, 0.0);
-        scratch_envLine.assign(width, 0.0);
-        scratch_spanLine.assign(width, 0.0);
         // low-res luma (chroma cancelled fsc)        
         scratch_lumaBaseY4.assign(width, 0.0);
         scratch_lumaHiRaw.assign(width, 0.0);
@@ -687,14 +581,12 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             locked1DTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
-            carrierParallax_flat.assign(
-                size_t(demodLines) * demodWidth,
-                lddecode::FourViewCarrierAttribution{});
         }
         scratch_frameBDirectIQComposite.assign(width, 0.0);
         scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
@@ -770,8 +662,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 
 // 1D horizontal bandpass: isolates subcarrier energy by subtracting the average
 // of the samples two positions either side (a 2-tap comb at 2fsc), scaled by 0.5.
-// Bucket-path only; the locked path skips this and uses the LS combed carrier
-// from buildCarrierRetracted() instead.  Result written to clpbuffer[0].
+// Result written to clpbuffer[0].
 void Comb::FrameBuffer::split1D()
 {
     const int left      = videoParameters.activeVideoStart;
@@ -967,7 +858,7 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
 // FVF election v2. See docs/FVF_election_v2_design.md.
 //   veto -> divergence boundary -> saturation regime -> candidate election.
 //   Candidates: Field B, Frame A, Frame B (Field A retired). No notch; luma
-//   from retracted-view + raw-candidate implied Y. Saturation from IQ mag.
+//   from the cached base plus raw-candidate implied Y. Saturation from IQ mag.
 // ----------------------------------------------------------------------------
 void Comb::FrameBuffer::scoreFieldVsFrame(
     int line,
@@ -1001,9 +892,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double HEDGE_THRESH_IRE   = T.FIELD_LUMA_EDGE_THRESH_IRE;
     const double FIELD_DIVERGE_IRE  = 6.0;   // comb (IQ) divergence boundary
     const double LUMA_DIVERGE_IRE   = 6.0;   // luma divergence boundary (new knob)
-    const double IMPURITY_EXCEPTION = 0.50;  // carrierImpurity above which IQ
-                                             // divergence is excused (luma must
-                                             // still agree). New knob.
     const double SAT_REGIME_IRE     = 16.0;  // #20 saturation regime: IQ-mag
                                              // threshold above which -> Frame B.
                                              // Analogous to the prior #24 ramp
@@ -1033,8 +921,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // (Vertical-contrast measure removed: it belongs to the horizontal-edge /
     //  trust-reach regime — #8/#9/#10 — which is DEFERRED until we see output.
     //  The vertical edge here is line-perpendicular = hIRE.)
-    // (Notch luma helpers removed — no notch anywhere now; luma comes from the
-    //  retracted-view rows and raw−candidate implied Y.)
+    // (Notch luma helpers removed; luma comes from the cached base rows and
+    //  raw-candidate implied Y.)
 
     // Scratch output planes (reuse existing members). Winner uses 1/2/3 for
     // FieldB/FrameA/FrameB; 0 retired. Sized once per line. (scratch_fvf_satMap
@@ -1083,9 +971,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const AttributionEvidence *fvfAttrRow =
         (demodWidth == width) ? attributionEvidence_line(line) : nullptr;
 
-    // Retracted-view luma rows + raw row. ±1 lines are the ADJACENT FIELD, so
-    // the interfield Y diff is the LUMA divergence; raw−candidate is implied Y
-    // for #21 / the tiebreaker. Frame-flat, so ±1 reads for free.
+    // Cached luma rows + raw row. ±1 lines are the adjacent field, so their
+    // difference supplies the luma-divergence axis; raw-candidate is implied Y.
     const bool lumaCacheUsable =
         lockedLumaCacheValid && !lockedLumaBaseY4_flat.empty() && demodWidth == width;
     const double *lumaBaseRow = lumaCacheUsable ? lockedLumaBaseY4_line(line) : nullptr;
@@ -1095,9 +982,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                                     ? lockedLumaBaseY4_line(line + 1) : nullptr;
     const quint16 *rawRow = rawbuffer.data() +
         static_cast<size_t>(line) * static_cast<size_t>(videoParameters.fieldWidth);
-
-    // Carrier impurity row (phase-exception evidence). Frame-flat; may be null.
-    const float *impurityRow = carrierImpurity_line(line);
 
     // IQ magnitude pre-pass: one hypot per pixel, consumed by the saturation
     // test and #19's texture ladder.
@@ -1133,7 +1017,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             prevComb = comb;
             diffFVF[rel] = e.combDivergence;   // consumed by #2/#18, edge, #26/#27
 
-            // Luma divergence — retracted-Y interfield diff (±1 = adjacent field).
+            // Luma divergence between adjacent interleaved fields.
             if (lumaBaseRow) {
                 const double yC = lumaBaseRow[rel];
                 const double yU = lumaUpRow ? lumaUpRow[rel] : yC;
@@ -1144,7 +1028,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
 
             e.satIRE          = scratch_fvf_iqMag[rel] * invI;
-            e.carrierImpurity = impurityRow ? static_cast<double>(impurityRow[rel]) : 0.0;
             e.contourNonLocal = (rel < (int)tapLine.contour.size())
                 ? std::clamp(tapLine.contour[rel].midOk * 0.5 *
                     (tapLine.contour[rel].upSideOk + tapLine.contour[rel].dnSideOk),
@@ -1189,14 +1072,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         }
 
         // DIVERGENCE BOUNDARY (both regimes) — consumes the pool. Interfield is
-        // viable when LUMA agrees AND the comb (IQ) agrees OR its disagreement
-        // is carrier impurity (interfield will clean that). If luma also
-        // diverges, NO exception — that subset goes to produceY's cancellation.
+        // viable only when both cached luma and comb-domain evidence agree.
         const bool lumaDiverges  = e.lumaDivergence >= LUMA_DIVERGE_IRE;
         const bool combDiverges  = e.combDivergence >= FIELD_DIVERGE_IRE;
-        const bool impurityException = e.carrierImpurity >= IMPURITY_EXCEPTION;
-        const bool fieldsCoherent = !lumaDiverges &&
-            (!combDiverges || impurityException);
+        const bool fieldsCoherent = !lumaDiverges && !combDiverges;
         if (!fieldsCoherent) {
             winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;
             continue;
@@ -1339,7 +1218,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 (rel + (EDGE_GAP + EDGE_PROBE_FAR) < width) &&
                 (line >= firstLine && line < lastLine);
             if (canEval) {
-                // Source plateaus from the retracted-view luma (no notch);
+                // Source plateaus from cached base luma (no notch);
                 // fallback to the source line only if the cache is unavailable.
                 auto srcLuma = [&](int r)->double {
                     r = std::clamp(r, 0, width - 1);
@@ -1453,7 +1332,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 pickBestFrame(0.7f, 0.85f);          // frame convincingly beats field
             } else {
                 // Tiebreaker (no-notch): which candidate's implied Y
-                // (raw − candidate) sits closest to the retracted-view luma?
+                // (raw − candidate) sits closest to cached base luma?
                 // LAZY — only pixels reaching here pay for it.
                 const double yRef   = lumaBaseRow ? lumaBaseRow[rel] : L1;
                 const double rawHere = static_cast<double>(rawRow[left + rel]);
@@ -2227,18 +2106,12 @@ void Comb::FrameBuffer::split2D()
 
     if (width <= 0 || firstLine >= lastLine) return;
 
-    if (configuration.phaseCompensation) {
-        buildPhaseCorrected1D(); // writes locked-1D directly into locked1DSource_flat
-        reportPhaseLegStats("locked1d", 1, true);
-    }
-
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
         for (int line = firstLine; line < lastLine; ++line) {
             double *dst = clpbuffer[1].pixel[line];
             const double *lockedRow = configuration.phaseCompensation
                 ? locked1DSource_line(line) : nullptr;
-            if (lockedRow)
-            {
+            if (lockedRow) {
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = lockedRow[rel];
             } else {
                 const double *src1d = bucketScalar1D_line(line);
@@ -2578,19 +2451,6 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         const double ref2d = clpbuffer[1].pixel[lineNumber][h];
         const auto &T = configuration.tunables;
 
-        const float *curFloor = (carrierRetractedValid && !flatFloor_flat.empty()
-                                 && demodWidth > 0)
-                                ? flatFloor_line(lineNumber) : nullptr;
-
-        static constexpr int candLine[NUM_CANDIDATES] = {
-             0,  0,  // LEFT, RIGHT  (same line — skipped by s==this)
-             0,  0,  // UP, DOWN     (skipped by s==this)
-            -1,      // PREV_FIELD
-             1,      // NEXT_FIELD
-             0,      // PREV_FRAME
-             0,      // NEXT_FRAME
-        };
-
         for (int i = 0; i < NUM_CANDIDATES; ++i) {
             const FrameBuffer* s = src[i];
             if (!s || s == this || c[i].penalty >= 1000.0) continue;
@@ -2604,30 +2464,8 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
             } else if (dIRE <= T.deviationThreshold) {
                 delta = 0.0;
             } else {
-                double rawVeto = T.AGREEMENT_VETO_BASE
-                               + T.deviationPenalty * (dIRE - T.deviationThreshold);
-
-                double vetoScale = 1.0;
-                if (T.VETO_LUMA_GATE_ENABLE && curFloor) {
-                    int cLine = lineNumber + candLine[i];
-                    const float *srcFloor = s->carrierRetractedValid
-                        ? s->flatFloor_line(cLine) : nullptr;
-                    if (srcFloor) {
-                        double lumaD = std::fabs((double)curFloor[h]
-                                                 - (double)srcFloor[h])
-                                       * invIreScale;
-                        if (lumaD <= T.VETO_LUMA_STATIC_IRE) {
-                            vetoScale = 0.0;
-                        } else if (lumaD >= T.VETO_LUMA_MOTION_IRE) {
-                            vetoScale = 1.0;
-                        } else {
-                            vetoScale = (lumaD - T.VETO_LUMA_STATIC_IRE)
-                                      / (T.VETO_LUMA_MOTION_IRE
-                                         - T.VETO_LUMA_STATIC_IRE);
-                        }
-                    }
-                }
-                delta = rawVeto * vetoScale;
+                delta = T.AGREEMENT_VETO_BASE
+                      + T.deviationPenalty * (dIRE - T.deviationThreshold);
             }
             c[i].penalty += delta;
         }

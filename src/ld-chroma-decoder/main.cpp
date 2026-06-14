@@ -317,11 +317,6 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "NTSC locked mode: log carrier-fit residual statistics for diagnosing ordered column artifacts"));
     parser.addOption(debugPhaseLegsOption);
 
-    QCommandLineOption witnessDumpOption(QStringList() << "witness-dump",
-                                    QCoreApplication::translate("main", "NTSC locked mode: one-shot per-pixel witness dump for a window, format firstLine,lastLine,x0,x1 (frame lines, active-area x; max 32 lines x 64 px; requires --debug-phase-legs)"),
-                                    QCoreApplication::translate("main", "l0,l1,x0,x1"));
-    parser.addOption(witnessDumpOption);
-
     QCommandLineOption stageTimersOption(QStringList() << "stage-timers",
                                     QCoreApplication::translate("main", "NTSC locked mode: log per-stage timing summaries"));
     parser.addOption(stageTimersOption);
@@ -426,27 +421,6 @@ int main(int argc, char *argv[])
     if (parser.isSet(debugPhaseLegsOption)) {
         combConfig.debugPhaseLegs = true;
     }
-    if (parser.isSet(witnessDumpOption)) {
-        const QStringList dumpParts = parser.value(witnessDumpOption).split(',');
-        bool dumpOk = (dumpParts.size() == 4);
-        int dumpVals[4] = {0, 0, 0, 0};
-        for (int i = 0; dumpOk && i < 4; ++i) {
-            bool ok = false;
-            dumpVals[i] = dumpParts[i].trimmed().toInt(&ok);
-            dumpOk = ok;
-        }
-        if (!dumpOk) {
-            qCritical() << "--witness-dump requires firstLine,lastLine,x0,x1";
-            return -1;
-        }
-        combConfig.witnessDumpLine0 = dumpVals[0];
-        combConfig.witnessDumpLine1 = dumpVals[1];
-        combConfig.witnessDumpX0 = dumpVals[2];
-        combConfig.witnessDumpX1 = dumpVals[3];
-        if (!parser.isSet(debugPhaseLegsOption)) {
-            qWarning() << "--witness-dump has no effect without --debug-phase-legs";
-        }
-    }
     if (parser.isSet(stageTimersOption)) {
         combConfig.stageTimers = true;
     }
@@ -527,7 +501,6 @@ int main(int argc, char *argv[])
     if (bwMode) {
         palConfig.chromaGain = 0.0;
         combConfig.chromaGain = 0.0;
-        combConfig.outputDiagnosticY = true;
     }
 
     if (parser.isSet(showMapOption)) {
