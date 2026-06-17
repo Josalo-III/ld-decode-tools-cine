@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 
 // VDIS - Vertical Differential Isolation System.
@@ -241,10 +242,18 @@ static inline int reflectCombRel(int rel, int width)
 
 static inline double combKMetric(double cc, double symC, double cn, double symN)
 {
-    double k = 0.0;
-    k  = std::fabs(std::fabs(cc) - std::fabs(cn));
-    k += std::fabs(symC - symN);
-    k -= (std::fabs(cc) + std::fabs(cn)) * 0.10;
+    // |comp| carries a 2fsc (2-sample period) Nyquist ripple from the chroma
+    // subcarrier envelope: |comp[rel]| peaks anti-phase to symMag (the average
+    // of the rel±1 magnitudes). Comparing the raw rectified samples therefore
+    // injects that 2px ripple into the weight, modulating the vertical comb
+    // gain and producing the bevel zipper. Summing |comp| with its anti-phase
+    // neighbour-average yields a 2px-flat envelope magnitude (peak+trough ≈ A
+    // at every sample), so the disagreement/credit metric below is computed on
+    // a ripple-free magnitude.
+    const double magC = std::fabs(cc) + symC;
+    const double magN = std::fabs(cn) + symN;
+    double k = std::fabs(magC - magN);
+    k -= (magC + magN) * 0.10;
     return std::max(0.0, k);
 }
 
@@ -863,87 +872,268 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine, doubl
         return;
     }
 
+    static const int diagLine = []{
+        const char *s = std::getenv("CC_DIAG_LINE");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int diagC0 = []{
+        const char *s = std::getenv("CC_DIAG_C0");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int diagC1 = []{
+        const char *s = std::getenv("CC_DIAG_C1");
+        return s ? std::atoi(s) : -1;
+    }();
+
+    const bool wantDiag = (tapLine.cacheLine == diagLine &&
+                           diagC0 >= 0 && diagC1 >= diagC0);
+
+    const bool have2 = tapLine.haveU2 && tapLine.haveD2 &&
+                       (int)tapLine.tapU2.size() >= width &&
+                       (int)tapLine.tapD2.size() >= width &&
+                       (int)tapLine.pairU2.size() >= width &&
+                       (int)tapLine.pairD2.size() >= width;
+
+    const bool have1Guard = tapLine.haveU1 && tapLine.haveD1 &&
+                            (int)tapLine.tapU1.size() >= width &&
+                            (int)tapLine.tapD1.size() >= width;
+
     const bool have4 = tapLine.haveU4 && tapLine.haveD4 &&
-                        (int)tapLine.tapU4.size() >= width &&
-                        (int)tapLine.tapD4.size() >= width &&
-                        (int)tapLine.contour.size() >= width;
+                       (int)tapLine.tapU4.size() >= width &&
+                       (int)tapLine.tapD4.size() >= width &&
+                       (int)tapLine.contour.size() >= width;
 
-    for (int rel = 0; rel < width; ++rel) {
-        const double C   = tapLine.tap0[rel].comp;
-        double Cup = tapLine.tapU2[rel].comp;
-        double Cdn = tapLine.tapD2[rel].comp;
+    if (wantDiag) {
+        std::fprintf(stderr,
+                     "FIELDBDIAG line=%d lnU1=%d lnD1=%d lnU2=%d lnD2=%d cols=%d..%d have1Guard=%d have2=%d have4=%d\n",
+                     tapLine.cacheLine,
+                     tapLine.lnU1, tapLine.lnD1,
+                     tapLine.lnU2, tapLine.lnD2,
+                     diagC0, diagC1,
+                     have1Guard ? 1 : 0,
+                     have2 ? 1 : 0,
+                     have4 ? 1 : 0);
+    }
 
-        if (have4) {
-            const CombTapContour &curve = tapLine.contour[rel];
-            if (curve.upSideOk > 0.5 && curve.dnSideOk > 0.5) {
-                const double Cup4 = tapLine.tapU4[rel].comp;
-                const double Cdn4 = tapLine.tapD4[rel].comp;
-                auto refineNear = [](double nearS, double farS, double influence) {
-                    if (influence <= 0.0 || nearS == 0.0) return nearS;
-                    if ((nearS > 0.0) != (farS > 0.0)) return nearS;
-                    const double nearMag = std::fabs(nearS);
-                    const double farMag  = std::fabs(farS);
-                    return std::copysign(
-                        (nearMag + influence * farMag) / (1.0 + influence), nearS);
-                };
-                Cup = refineNear(Cup, Cup4, curve.upInfluence);
-                Cdn = refineNear(Cdn, Cdn4, curve.dnInfluence);
-            }
+    auto smoothGateLocal = [](double x, double soft, double hard)->double {
+        if (x <= soft) return 1.0;
+        if (x >= hard) return 0.0;
+        const double t = (x - soft) / std::max(1e-9, hard - soft);
+        return 1.0 - std::clamp(t, 0.0, 1.0);
+    };
+
+    auto sameSign = [](double a, double b)->bool {
+        if (std::fabs(a) < 1e-12 || std::fabs(b) < 1e-12) return false;
+        return (a > 0.0) == (b > 0.0);
+    };
+
+    // Anti-phase reach guard.
+    //
+    // .comp here is 1D-bandpassed chroma. Genuine chroma is anti-phase across
+    // same-field ±2 reaches. In-phase material is likely luma leak/cross-color
+    // trespass and should reduce Field B authority.
+    //
+    // This is not horizontal/lateral influence. It only looks at the local
+    // vertical pair relation over a short carrier-window neighborhood.
+    auto antiPhaseReach = [&](const std::vector<CombTapScalar> &nbr, int rel)->double {
+        double acc = 0.0, norm = 0.0;
+        for (int k = -2; k <= 2; ++k) {
+            const int r = std::clamp(rel + k, 0, width - 1);
+            const double a = tapLine.tap0[r].comp;
+            const double b = nbr[r].comp;
+            acc  += a * b;
+            norm += a * a + b * b;
         }
 
-        // Soft weights from pre-computed kRange magnitude agreement (same formula
-        // as Luma Wow). In locked mode the tap .comp values already come from
-        // locked1DSource_flat (phase-aligned), so the weight already encodes phase
-        // quality. A separate coherence multiplier is redundant and creates sharp
-        // drops at color-region edges that feed splitIQ checkerboards.
-        double wUp = tapLine.pairU2[rel].weight;
-        double wDn = tapLine.pairD2[rel].weight;
+        if (norm <= 1e-12) return 1.0;
 
-        double tc = 0.0;
+        const double c = 2.0 * acc / norm;
+        return 1.0 - std::clamp(c, 0.0, 1.0);
+    };
+
+    for (int rel = 0; rel < width; ++rel) {
+        const double C = tapLine.tap0[rel].comp;
+
+        // Fallback invariant:
+        // no legal Field B operation preserves the current scalar sample.
+        double tc = C;
+        const char *mode = "C";
+
+        if (!have2) {
+            outFieldLine[rel] = C;
+            continue;
+        }
+
+        // When Field B is being built under the Frame/FVF regime,
+        // buildCombTapLine() has vertical ±1 taps available. Use them only as
+        // a wave-off. They are not Field B comb taps.
+        //
+        // This protects Frame A / Frame B / FVF from receiving a smeared
+        // preclean source in fine-line or moving-diagonal regions where ±2
+        // same-field reasoning is underqualified.
+        bool fineWaveOff = false;
+        double fineSpanIRE = 0.0;
+        double fineCurvIRE = 0.0;
+
+        if (have1Guard) {
+            const double Cu1 = tapLine.tapU1[rel].comp;
+            const double Cd1 = tapLine.tapD1[rel].comp;
+
+            fineSpanIRE = std::max(std::fabs(C - Cu1),
+                                   std::fabs(C - Cd1)) * invIreScale;
+
+            fineCurvIRE = std::fabs(Cu1 - 2.0 * C + Cd1) * invIreScale;
+
+            // Conservative starting thresholds:
+            // - span catches immediate vertical discontinuity
+            // - curvature catches a narrow line/diagonal crossing around C
+            //
+            // Standalone Field B never sees this guard unless the caller is
+            // building frame taps.
+            fineWaveOff = (fineSpanIRE > 2.0 || fineCurvIRE > 3.0);
+        }
+
+        if (fineWaveOff) {
+            outFieldLine[rel] = C;
+
+            if (wantDiag) {
+                const int h = videoParameters.activeVideoStart + rel;
+                if (h >= diagC0 && h <= diagC1) {
+                    std::fprintf(stderr,
+                                 "  h=%d C=%.3f waveoff=1 fineSpanIRE=%.2f fineCurvIRE=%.2f tc=%.3f d=%.3f mode=C\n",
+                                 h, C, fineSpanIRE, fineCurvIRE, C, 0.0);
+                }
+            }
+
+            continue;
+        }
+
+        const double CupRaw = tapLine.tapU2[rel].comp;
+        const double CdnRaw = tapLine.tapD2[rel].comp;
+
+        double Cup = CupRaw;
+        double Cdn = CdnRaw;
+
+        // ±4 is not Field B reach. It may only clean the ±2 taps when the
+        // local same-field landscape is verified flat. In contour/fine-detail
+        // territory it must not become a repair path.
+        double flatGate = 0.0;
+        double cleanUpGate = 0.0;
+        double cleanDnGate = 0.0;
+
+        if (have4) {
+            const double Cup4 = tapLine.tapU4[rel].comp;
+            const double Cdn4 = tapLine.tapD4[rel].comp;
+
+            const double aC   = std::fabs(C);
+            const double aU2  = std::fabs(CupRaw);
+            const double aD2  = std::fabs(CdnRaw);
+            const double aU4  = std::fabs(Cup4);
+            const double aD4  = std::fabs(Cdn4);
+
+            const double maxA = std::max({aC, aU2, aD2, aU4, aD4});
+            const double minA = std::min({aC, aU2, aD2, aU4, aD4});
+
+            const double rangeIRE   = (maxA - minA) * invIreScale;
+            const double midCurvIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invIreScale;
+            const double upStepIRE  = std::fabs(aU4 - aU2) * invIreScale;
+            const double dnStepIRE  = std::fabs(aD4 - aD2) * invIreScale;
+            const double upNearIRE  = std::fabs(aU2 - aC)  * invIreScale;
+            const double dnNearIRE  = std::fabs(aD2 - aC)  * invIreScale;
+
+            // Strict flatness. This is deliberately stronger than
+            // "contour-compatible"; only flatness lets ±4 clean ±2.
+            const double rangeFlat = smoothGateLocal(rangeIRE,   1.5, 4.0);
+            const double curvFlat  = smoothGateLocal(midCurvIRE, 0.8, 2.5);
+            const double upFlat    = smoothGateLocal(std::max(upStepIRE, upNearIRE), 1.2, 3.5);
+            const double dnFlat    = smoothGateLocal(std::max(dnStepIRE, dnNearIRE), 1.2, 3.5);
+
+            flatGate = std::clamp(rangeFlat * curvFlat, 0.0, 1.0);
+            cleanUpGate = flatGate * upFlat;
+            cleanDnGate = flatGate * dnFlat;
+
+            auto cleanNearFromFar = [&](double nearS, double farS, double gate)->double {
+                if (gate <= 0.0) return nearS;
+                if (!sameSign(nearS, farS)) return nearS;
+
+                // Cleaning only. No long-reach replacement.
+                const double influence = 0.35 * std::clamp(gate, 0.0, 1.0);
+
+                const double nearMag = std::fabs(nearS);
+                const double farMag  = std::fabs(farS);
+                const double mag = (nearMag + influence * farMag) / (1.0 + influence);
+
+                return std::copysign(mag, nearS);
+            };
+
+            Cup = cleanNearFromFar(CupRaw, Cup4, cleanUpGate);
+            Cdn = cleanNearFromFar(CdnRaw, Cdn4, cleanDnGate);
+        }
+
+        // Old decisive Field B shape:
+        // use the precomputed ±2 pair weights and reach gates. Do not add
+        // same-line horizontal/lateral magnitude influence here; that can make
+        // a moving diagonal/fine-line crossing turn into repeated columns.
+        const double gUp = antiPhaseReach(tapLine.tapU2, rel);
+        const double gDn = antiPhaseReach(tapLine.tapD2, rel);
+
+        const double reachUp = std::clamp(tapLine.pairU2[rel].reachGate, 0.0, 1.0);
+        const double reachDn = std::clamp(tapLine.pairD2[rel].reachGate, 0.0, 1.0);
+
+        const double pairWUp = tapLine.pairU2[rel].weight;
+        const double pairWDn = tapLine.pairD2[rel].weight;
+
+        double wUp = pairWUp * reachUp * gUp;
+        double wDn = pairWDn * reachDn * gDn;
+
+        const double wUpPreCull = wUp;
+        const double wDnPreCull = wDn;
+
         if (wUp > 0.0 || wDn > 0.0) {
             if (wDn > 3.0 * wUp)      wUp = 0.0;
             else if (wUp > 3.0 * wDn) wDn = 0.0;
 
-            const double denom = wUp + wDn;
-            if (denom > 1e-9) {
-                double sc = 2.0 / denom;
-                if (sc < 1.0) sc = 1.0;
-                tc  = (C - Cup) * wUp * sc;
-                tc += (C - Cdn) * wDn * sc;
-                tc *= 0.25;
+            const bool useUp = (wUp > 1e-9);
+            const bool useDn = (wDn > 1e-9);
+
+            if (useUp && useDn) {
+                const double denom = wUp + wDn;
+                tc = 0.5 * (((C - Cup) * wUp + (C - Cdn) * wDn) / denom);
+                mode = "UD";
+            } else if (useUp) {
+                tc = 0.5 * (C - Cup);
+                mode = "U";
+            } else if (useDn) {
+                tc = 0.5 * (C - Cdn);
+                mode = "D";
             }
-        } else {
-            // Both neighbors dissimilar to center. If they agree with each other,
-            // their differences point the same direction — use their average.
-            const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
-            const double sumUD = std::fabs(Cup + Cdn);
-            if (dMag - std::fabs(sumUD * 0.2) <= 0.0)
-                tc = (2.0 * C - Cup - Cdn) * 0.25;
-            // else tc = 0.0 — luma pass-through fallback
         }
 
-        double maxPhysDelta = 0.0;
-        if (configuration.phaseCompensation &&
-            tapLine.haveIQ0 && tapLine.haveIQU2 && tapLine.haveIQD2)
-        {
-            double envClamp = 0.5 * tapLine.tap0IQ[rel].iqMag;
-            envClamp = std::max(envClamp, 0.5 * tapLine.tapU2IQ[rel].iqMag);
-            envClamp = std::max(envClamp, 0.5 * tapLine.tapD2IQ[rel].iqMag);
+        outFieldLine[rel] = tc;
 
-            const double diffUpIRE = tapLine.pairU2[rel].iqDiffIRE;
-            const double diffDnIRE = tapLine.pairD2[rel].iqDiffIRE;
-            double iqDeltaClamp = 0.0;
-            if (std::isfinite(diffUpIRE))
-                iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffUpIRE * irescale);
-            if (std::isfinite(diffDnIRE))
-                iqDeltaClamp = std::max(iqDeltaClamp, 0.325 * diffDnIRE * irescale);
-
-            const double envFloor = 0.35 * envClamp;
-            maxPhysDelta = std::min(envClamp, std::max(envFloor, iqDeltaClamp));
+        if (wantDiag) {
+            const int h = videoParameters.activeVideoStart + rel;
+            if (h >= diagC0 && h <= diagC1) {
+                std::fprintf(stderr,
+                             "  h=%d C=%.3f Cup=%.3f->%.3f Cdn=%.3f->%.3f"
+                             " w=(%.3f,%.3f) g=(%.3f,%.3f) wg0=(%.3f,%.3f) wg=(%.3f,%.3f)"
+                             " reach=(%.3f,%.3f) diffIRE=(%.2f,%.2f)"
+                             " have1=%d fine=(%.2f,%.2f) flat=%.3f clean=(%.3f,%.3f)"
+                             " tc=%.3f d=%.3f mode=%s\n",
+                             h, C, CupRaw, Cup, CdnRaw, Cdn,
+                             pairWUp, pairWDn,
+                             gUp, gDn,
+                             wUpPreCull, wDnPreCull,
+                             wUp, wDn,
+                             reachUp, reachDn,
+                             tapLine.pairU2[rel].diffIRE,
+                             tapLine.pairD2[rel].diffIRE,
+                             have1Guard ? 1 : 0,
+                             fineSpanIRE, fineCurvIRE,
+                             flatGate, cleanUpGate, cleanDnGate,
+                             tc, tc - C, mode);
+            }
         }
-        if (maxPhysDelta <= 0.0)
-            maxPhysDelta = std::max(std::fabs(C - Cup), std::fabs(C - Cdn)) * 0.65;
-        outFieldLine[rel] = std::clamp(tc, -maxPhysDelta, maxPhysDelta);
     }
 }
 
@@ -966,7 +1156,7 @@ static inline std::complex<double> applyColumnPhaseAlignment(
     const double dot = dotIQ(neighbor, center);
     const double cross = neighbor.real() * center.imag() - neighbor.imag() * center.real();
     double phase = std::atan2(cross, dot);
-    const double pMax = T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
+    const double pMax = T.FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG * M_PI / 180.0;
     phase = std::clamp(phase, -pMax, pMax);
 
     const double c = std::cos(phase);
@@ -1427,7 +1617,10 @@ void Comb::FrameBuffer::computeFrameBDirectIQLine(
     if (width <= 0 || line < first || line >= last) return;
     if (line >= demodLines || demodWidth <= 0) return;
 
-    // Preclean demod: Field B precleaned scalar → 4fsc grid IQ.
+    // Preclean demod: Field B precleaned scalar -> 4fsc grid IQ.
+    // The preclean is computed via computeSimpleFieldLine (the same function
+    // that produces the main Field B candidate), so it carries the anti-phase
+    // reach guard, authority blend, and combKMetric upgrades.
     auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
         if (ln < first || ln >= last) return false;
         const double *row = precleanLinePtr(ln, width);
@@ -1439,7 +1632,6 @@ void Comb::FrameBuffer::computeFrameBDirectIQLine(
         return true;
     };
 
-    // Locked1D fallback when preclean is unavailable for a line.
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;

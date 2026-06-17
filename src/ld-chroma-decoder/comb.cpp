@@ -294,6 +294,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          * splitIQlocked() is the post-election demod of the selected comb.
          */
         if (configuration.phaseCompensation) {
+            current->measurePostCombImpurity();
             measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
             measureStage(StageDoCNR, [&]() { current->doCNR(); });
             measureStage(StageProduceY, [&]() { current->produceY(); });
@@ -549,7 +550,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         scratch_lineWorkC.assign(width, 0.0);
         scratch_outMixed.assign(width, 0.0);
         scratch_lateralLine.assign(width, 0.0);
-        // low-res luma (chroma cancelled fsc)        
+        // low-res luma (chroma cancelled fsc)
         scratch_lumaBaseY4.assign(width, 0.0);
         scratch_lumaHiRaw.assign(width, 0.0);
         scratch_lumaSmooth.assign(width, 0.0);
@@ -581,6 +582,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             locked1DTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
@@ -940,17 +942,20 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     std::vector<double> &diffFVF  = scratch_fvf_diffFVF;
 
     // ==================================================================
-    // 1. PER-LINE: hard veto + trust regime  (computed ONCE, not per pixel)
+    // 1. PER-LINE: hard veto + regime fork  (computed ONCE, not per pixel)
     // ==================================================================
     //
     // #4 — Management owns the veto. Creation is external: read grammar +
     // cadence. carrierFrameVerticalAllowed(line) already folds in editSplit
-    // (grammar init takes !editSplit frame-wide). This is the ONLY veto.
+    // (grammar init takes !editSplit frame-wide). This is the ONLY absolute
+    // interfield veto. Candidate divergence is interpreted after the fork.
     const bool interfieldLegal = carrierFrameVerticalAllowed(line);
 
-    // Regime axis (design doc §2):
-    //   native  = cadenceId in {-2 video, -1 unknown}  -> trust = measured coherence
-    //   model   = cadenceId >= 0 (film) or -3 (29.97p)  -> trust = cadence metadata
+    // Regime axis:
+    //   native  = cadenceId in {-2 video, -1 unknown}
+    //             home model = Field B; interfield is foreign/speculative.
+    //   model   = cadenceId >= 0 (film) or -3 (29.97p)
+    //             home model = Frame B; intrafield Field B is foreign.
     const bool nativeRegime =
         (cadenceId == lddecode::kCadenceVideo) || (cadenceId == CADENCE_UNKNOWN);
     const bool modelRegime  = !nativeRegime;
@@ -1057,36 +1062,53 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         // ============================================================
         // TOP-LEVEL REGIME BRANCHES — central management acting on the pool.
-        //   1. veto (interfield illegal)                  -> Field B
-        //   2. divergence boundary (BOTH regimes)         -> Field B
-        //   3. #20 saturation regime (IQ mag), if viable  -> Frame B
-        //   else -> candidate score election
+        //
+        // This is the load-bearing fork.  The old rewrite accidentally bound
+        // "divergence -> Field B" before the regime fork.  That is only
+        // correct in native/interlaced footage.  In model/progressive footage,
+        // Frame B is the home model, so Field B pays for disagreement later in
+        // scoring instead of receiving a hard win here.
         // ============================================================
         int    idx   = 1;        // default Field B
         double val   = FB;
         float  shade = 0.35f;
 
         if (!interfieldLegal) {
-            winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;     // veto
-            continue;
-        }
-
-        // DIVERGENCE BOUNDARY (both regimes) — consumes the pool. Interfield is
-        // viable only when both cached luma and comb-domain evidence agree.
-        const bool lumaDiverges  = e.lumaDivergence >= LUMA_DIVERGE_IRE;
-        const bool combDiverges  = e.combDivergence >= FIELD_DIVERGE_IRE;
-        const bool fieldsCoherent = !lumaDiverges && !combDiverges;
-        if (!fieldsCoherent) {
             winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;
             continue;
         }
-        if (chromaMagIRE >= SAT_REGIME_IRE) {
-            // #20 SATURATION REGIME — among interfield-VIABLE positions only
-            // (the divergence boundary above already excluded the rest).
-            // Saturated -> Frame B outright; candidate-independent (no scoring).
-            // Replaces the old #20 score biases + #24 force + notch seed.
-            winner[rel] = 3; outVal[rel] = FRB; outShade[rel] = 0.85f;  // -> Frame B
-            continue;
+
+        const bool lumaDiverges = e.lumaDivergence >= LUMA_DIVERGE_IRE;
+        const bool combDiverges = e.combDivergence >= FIELD_DIVERGE_IRE;
+
+        if (nativeRegime) {
+            // Native/interlaced/unknown:
+            //   home = Field B.  Measured divergence means the frame candidates
+            //   are foreign/speculative at this pixel, so Field B wins before
+            //   scoring.  This is the pre-metadata behavior, but it lives only
+            //   inside the native arm of the fork.
+            if (lumaDiverges || combDiverges) {
+                winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;
+                continue;
+            }
+
+            // #20 saturation regime in native footage is still downstream of
+            // the native coherence weed: saturated but divergent interlaced
+            // pixels must not force interfield comb.
+            if (chromaMagIRE >= SAT_REGIME_IRE) {
+                winner[rel] = 3; outVal[rel] = FRB; outShade[rel] = 0.85f;
+                continue;
+            }
+        } else {
+            // Model/progressive/film:
+            //   home = Frame B.  Cadence metadata is the temporal authority.
+            //   Comb/luma divergence is not an interlace veto here; it is
+            //   evidence consumed by the regime-normalized model-distance
+            //   scoring below, where Field B pays for disagreeing with Frame B.
+            if (chromaMagIRE >= SAT_REGIME_IRE) {
+                winner[rel] = 3; outVal[rel] = FRB; outShade[rel] = 0.85f;
+                continue;
+            }
         }
 
         // ============================================================
@@ -1109,19 +1131,17 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             (chromaMagIRE - 6.0) / std::max(1.0, SAT_REGIME_IRE - 6.0), 0.0, 1.0);
         const double hIRE = horizEdgeIRE(rel);    // used by #6 + #21 + election
 
-        // ---- #2 / #18  cross-domain model distance (directional) ------
-        // ONE unit: measure (diff_candB_ire) + apply. This is now the
-        // load-bearing frame-sanity term (frameInsane retired). Direction
-        // flips by regime — the cross-domain candidate pays distance from
-        // the regime's trusted home model.
+        // ---- #2 / #18  regime-normalized model distance ---------------
+        // ONE unit: measure (diff_candB_ire) + apply.  The foreign side pays
+        // distance from the home model selected by the regime fork.
         {
             const double deadband = T.FVF_MODEL_PRIMARY_DEADBAND_IRE;
             const double pen = T.FVF_MODEL_PRIMARY_WEIGHT *
                                std::max(0.0, diff_candB_ire - deadband);
             if (modelRegime) {
-                scoreB   += pen;   // field pays distance from trusted Frame B
+                scoreB   += pen;   // Field B is foreign; Frame B is home.
             } else {
-                scoreR_A += pen;   // frames pay distance from trusted Field B
+                scoreR_A += pen;   // Frame candidates are foreign; Field B is home.
                 scoreR_B += pen;
             }
         }
@@ -1296,10 +1316,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         // ---- MODEL-REGIME-ONLY scoring (cadenceId >= 0 or -3) ----------
         if (modelRegime) {
-            // Metadata trust: frames compete on evidence. The cross-domain
-            // model-distance penalty (#2, shared block) is the SOLE policing
-            // of a divergent frame here — so its weight/deadband inherits
-            // frameInsane's retired job. No interlace penalty, no field bias.
+            // Metadata trust: Frame B is the home model.  There is no native
+            // interfield viability weed here; model-distance scoring above is
+            // the place where the foreign Field B candidate pays divergence.
+            // No interlace penalty, no field bias.
         }
 
         // ============================================================
@@ -1574,90 +1594,57 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
                                                             double *hiRaw,
                                                             double *lumaSmooth) const
 {
+    auto writeCenteredWindowMean = [&](int win, double *out) {
+        if (!out) return;
+        std::vector<double> prefix(width + 1, 0.0);
+        for (int x = 0; x < width; ++x)
+            prefix[x + 1] = prefix[x] + static_cast<double>(rawLine[left + x]);
+        for (int x = 0; x < width; ++x) {
+            const int a = std::clamp(x - win / 2, 0, width);
+            const int b = std::clamp(a + win, 0, width);
+            const double n = static_cast<double>(std::max(1, b - a));
+            out[x] = (prefix[b] - prefix[a]) / n;
+        }
+    };
+
     if (!rawLine || width <= 0)
         return;
 
     if (!baseY4 && !hiRaw && !lumaSmooth)
         return;
 
-    // Degenerate active widths should not happen in normal NTSC 4fSC use.
-    if (width < 4) {
-        double avg = 0.0;
+    // Per-sample coarse luma base: rolling, current-centred 4-sample mean.
+    // This replaces the old raster-aligned 4-pixel block average while keeping
+    // the existing buffer contract for downstream consumers.
+    const double *coarseBase = baseY4;
+    std::vector<double> coarseScratch;
+    if (baseY4) {
+        writeCenteredWindowMean(4, baseY4);
+    } else if (hiRaw) {
+        coarseScratch.assign(width, 0.0);
+        writeCenteredWindowMean(4, coarseScratch.data());
+        coarseBase = coarseScratch.data();
+    }
+
+    if (hiRaw && coarseBase) {
         for (int x = 0; x < width; ++x)
-            avg += (double)rawLine[left + x];
-        avg /= (double)width;
-
-        if (baseY4) {
-            for (int x = 0; x < width; ++x)
-                baseY4[x] = avg;
-        }
-        if (hiRaw) {
-            for (int x = 0; x < width; ++x)
-                hiRaw[x] = (double)rawLine[left + x] - avg;
-        }
-        if (lumaSmooth) {
-            for (int x = 0; x < width; ++x)
-                lumaSmooth[x] = avg;
-        }
-        return;
-    }
-
-    // First pass: hard 4fSC-cycle luma base and optional high-frequency residual.
-    // No temporary block vector; each block average is written directly.
-    int p = 0;
-    for (; p + 3 < width; p += 4) {
-        const double y =
-            0.25 * ((double)rawLine[left + p + 0] +
-                    (double)rawLine[left + p + 1] +
-                    (double)rawLine[left + p + 2] +
-                    (double)rawLine[left + p + 3]);
-
-        if (baseY4) {
-            baseY4[p + 0] = y;
-            baseY4[p + 1] = y;
-            baseY4[p + 2] = y;
-            baseY4[p + 3] = y;
-        }
-
-        if (hiRaw) {
-            hiRaw[p + 0] = (double)rawLine[left + p + 0] - y;
-            hiRaw[p + 1] = (double)rawLine[left + p + 1] - y;
-            hiRaw[p + 2] = (double)rawLine[left + p + 2] - y;
-            hiRaw[p + 3] = (double)rawLine[left + p + 3] - y;
-        }
-    }
-
-    // Tail: reuse final complete 4-sample window.
-    if (p < width) {
-        const int tb = std::max(0, width - 4);
-        const double y =
-            0.25 * ((double)rawLine[left + tb + 0] +
-                    (double)rawLine[left + tb + 1] +
-                    (double)rawLine[left + tb + 2] +
-                    (double)rawLine[left + tb + 3]);
-
-        for (int x = p; x < width; ++x) {
-            if (baseY4)
-                baseY4[x] = y;
-            if (hiRaw)
-                hiRaw[x] = (double)rawLine[left + x] - y;
-        }
+            hiRaw[x] = static_cast<double>(rawLine[left + x]) - coarseBase[x];
     }
 
     if (!lumaSmooth)
         return;
 
-    // lumaSmooth is the interpolated curve through 4-sample block centers.
-    // Reuse the baseY4 block means when available so we don't re-average the
-    // same 4-sample windows a second time just to build the smooth scaffold.
+    // lumaSmooth keeps the original block-centre scaffold used by the contour
+    // path. baseY4 now carries the moving coarse, so block anchors are
+    // recomputed directly from raw instead of reusing baseY4.
     auto blockAvg = [&](int block)->double {
         const int x0 = std::clamp(block * 4, 0, std::max(0, width - 4));
-        if (baseY4)
-            return baseY4[x0];
-        return 0.25 * ((double)rawLine[left + x0 + 0] +
-                       (double)rawLine[left + x0 + 1] +
-                       (double)rawLine[left + x0 + 2] +
-                       (double)rawLine[left + x0 + 3]);
+        const int x1 = std::min(width, x0 + 4);
+        double sum = 0.0;
+        for (int x = x0; x < x1; ++x)
+            sum += static_cast<double>(rawLine[left + x]);
+        const double n = static_cast<double>(std::max(1, x1 - x0));
+        return sum / n;
     };
 
     const int blockCount = (width + 3) / 4;
@@ -2532,6 +2519,31 @@ void Comb::FrameBuffer::splitIQ()
             Q[h] = sq;
         }
     }
+
+    // BUCKETDIAG: dump comb carrier, raw I/Q, Y at the problem location.
+    // Same env vars as CCDIAG: CC_DIAG_LINE, CC_DIAG_C0, CC_DIAG_C1.
+    {
+        static const int diagLine = qEnvironmentVariableIntValue("CC_DIAG_LINE");
+        static const int diagC0   = qEnvironmentVariableIntValue("CC_DIAG_C0");
+        static const int diagC1   = qEnvironmentVariableIntValue("CC_DIAG_C1");
+        if (diagLine > 0 && diagC0 > 0 && diagC1 > diagC0 &&
+            diagLine >= firstLine && diagLine < lastLine)
+        {
+            const int ln = diagLine;
+            const double *I = componentFrame->u(ln);
+            const double *Q = componentFrame->v(ln);
+            const double *Y = componentFrame->y(ln);
+            const int f = carrierLineFlip(ln);
+            fprintf(stderr, "BUCKETDIAG splitIQ line=%d flip=%d cols=%d..%d\n",
+                    ln, f, diagC0, diagC1);
+            for (int h = diagC0; h <= diagC1 && h < videoParameters.activeVideoEnd; ++h) {
+                double clp = clpbuffer[configuration.dimensions - 1].pixel[ln][h];
+                qint32 ph = carrierSampleClass(ln, h);
+                fprintf(stderr, "  h=%d ph=%d clp=%.3f I=%.3f Q=%.3f Y=%.1f\n",
+                        h, ph, clp, I[h], Q[h], Y[h]);
+            }
+        }
+    }
 }
 
 
@@ -2569,6 +2581,23 @@ void Comb::FrameBuffer::adjustY()
             Y[h] -= comp;
         }
     }
+
+    // BUCKETDIAG: Y after chroma subtraction
+    {
+        static const int diagLine = qEnvironmentVariableIntValue("CC_DIAG_LINE");
+        static const int diagC0   = qEnvironmentVariableIntValue("CC_DIAG_C0");
+        static const int diagC1   = qEnvironmentVariableIntValue("CC_DIAG_C1");
+        if (diagLine > 0 && diagC0 > 0 && diagC1 > diagC0 &&
+            diagLine >= firstLine && diagLine < lastLine)
+        {
+            const int ln = diagLine;
+            const double *Y = componentFrame->y(ln);
+            fprintf(stderr, "BUCKETDIAG adjustY line=%d cols=%d..%d\n", ln, diagC0, diagC1);
+            for (int h = diagC0; h <= diagC1 && h < right; ++h) {
+                fprintf(stderr, "  h=%d Y=%.3f\n", h, Y[h]);
+            }
+        }
+    }
 }
 
 // Bucket-path chroma low-pass filter: applies a symmetric FIR to the I and Q
@@ -2595,6 +2624,25 @@ void Comb::FrameBuffer::filterIQ()
         std::copy(temp, temp + width, I);
         iqFilter.apply(Q, temp, width);
         std::copy(temp, temp + width, Q);
+    }
+
+    // BUCKETDIAG: I/Q after low-pass filter
+    {
+        static const int diagLine = qEnvironmentVariableIntValue("CC_DIAG_LINE");
+        static const int diagC0   = qEnvironmentVariableIntValue("CC_DIAG_C0");
+        static const int diagC1   = qEnvironmentVariableIntValue("CC_DIAG_C1");
+        if (diagLine > 0 && diagC0 > 0 && diagC1 > diagC0 &&
+            diagLine >= firstLine && diagLine < lastLine)
+        {
+            const int ln = diagLine;
+            const double *I = componentFrame->u(ln) + startH;
+            const double *Q = componentFrame->v(ln) + startH;
+            fprintf(stderr, "BUCKETDIAG filterIQ line=%d cols=%d..%d\n", ln, diagC0, diagC1);
+            for (int h = diagC0; h <= diagC1 && h < startH + width; ++h) {
+                int rel = h - startH;
+                fprintf(stderr, "  h=%d I=%.3f Q=%.3f\n", h, I[rel], Q[rel]);
+            }
+        }
     }
 }
 

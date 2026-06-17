@@ -73,10 +73,24 @@ static QString metadataOutputPath(const CineDisc& disc, const QFileInfo& outputF
         : sourcePath;
 }
 
+static void markCinemapInUse(CineDisc& disc)
+{
+    auto& metadata = disc.getMetaData();
+    const int totalFields = metadata.getNumberOfFields();
+
+    for (int seqNo = 1; seqNo <= totalFields; ++seqNo) {
+        auto field = metadata.getField(seqNo);
+        field.cinemap.inUse = true;
+        metadata.updateField(field, seqNo);
+    }
+}
+
 static bool writeMetadata(CineDisc& disc,
                           const QFileInfo& outputFileInfo,
                           const char *failureMessage)
 {
+    markCinemapInUse(disc);
+
     const QString dbOutPath = metadataOutputPath(disc, outputFileInfo);
     if (!disc.getMetaData().write(dbOutPath)) {
         qWarning() << failureMessage;

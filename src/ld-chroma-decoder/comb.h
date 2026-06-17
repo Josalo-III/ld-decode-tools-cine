@@ -112,10 +112,6 @@ public:
             // =========================================================================
             // 1D / Lateral baseline
             // =========================================================================
-            // Sinusoidal fit used by the phaseLocked pre-clean of clpbuffer[0].
-            int    SINFIT_WIN_SAMPLES       = 16;  // samples per window; must be a multiple of 4 (one 4fsc period)
-            double SINFIT_VET_THRESHOLD_IRE = 3.0; // per-sample fit residual above which that sample is rejected
-
             // Cross-color suppression strength (--cross-color-return).
             // alphaEff = max(0, 1 - gA*weight) applied to rendered chroma in
             // both coherent and residual paths; Y subtraction always full.
@@ -236,37 +232,10 @@ public:
             double deviationThreshold          = 8.0; // start of veto region (IRE); shared with getBestY
             double deviationPenalty            = 3.3; // penalty slope beyond deviationThreshold (per IRE)
 
-            // Frame-level affine correction applied to locked-1D IQ before chroma subtraction.
-            // Corrects residual carrier phase/gain drift across the frame.
-            bool   Y_LOCAL_AFFINE_ENABLE = true;
-            double Y_LOCAL_MAX_PHASE_DEG = 14.0; // maximum phase correction the frame affine may apply
-            double Y_LOCAL_GAIN_MIN      = 0.90; // frame affine gain clamp lower bound
-            double Y_LOCAL_GAIN_MAX      = 1.10; // frame affine gain clamp upper bound
-            double Y_LOCAL_MAX_SHEAR     = 0.12; // maximum I/Q cross-coupling (shear) the frame affine may apply
-
-            // Per-line affine trim: refines the frame-level fit on a line-by-line basis.
-            bool   Y_LINE_AFFINE_TRIM_ENABLE     = true;
-            double Y_LINE_MAX_PHASE_DEG          = 10.0;  // maximum per-line phase adjustment
-            bool   Y_LINE_ALLOW_GAIN_ON_IQ       = false; // allow gain adjustment on IQ (vs phase-only trim)
-            double Y_LINE_GAIN_MIN               = 0.95;  // per-line gain clamp lower bound
-            double Y_LINE_GAIN_MAX               = 1.05;  // per-line gain clamp upper bound
-            double Y_LINE_MAX_SHEAR              = 0.08;  // maximum per-line shear
-            bool   Y_LINE_PHASE_ERROR_LUT_ENABLE = true;  // apply a LUT to correct known per-line carrier phase errors
-            double Y_LINE_PHASE_ERROR_MIN_CONF   = 0.50;  // minimum burst confidence for LUT correction to engage
-
             // 3D Residual Y selection
             bool   RESIDUAL_Y_ELECTION     = true; // true = winner-take-all; false = median-weighted blend
             double NEIGHBOR_SHAPE_STRENGTH = 0.5;  // how strongly spatial neighbor consensus pulls the 3D Y election
-
-            // Vet gate: screens residual Y candidates before they are applied.
-            bool   VET_ENABLE_RESIDUAL_Y = true;
-
-            // Chroma-profile correction: adjusts subtraction alpha when the carrier
-            // projection shows the comb over- or under-predicts the raw carrier.
-            // Confidence ramp: below MIN_SUB_CHROMA_IRE the projection is noise;
-            // at VET_ALPHA_FIT_FULL_IRE it is reliable enough to apply fully.
-            double VET_Y_CHROMA_LIKE_WEIGHT = 0.12; // weight of chroma-profile match on the subtraction alpha
-            double VET_ALPHA_FIT_FULL_IRE   = 12.0; // LUT-demod chroma magnitude where projection confidence reaches 1.0
+            double FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG = 10.0; // clamp for neighbor IQ column phase alignment in frame candidates
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
             // attribution evidence says it is luma-owned rather than chroma-owned.
@@ -291,12 +260,6 @@ public:
             // alien-Y amplitude at directional edges.
             // 1.0 = no boost; 2.0–3.0 = moderate-to-strong recovery.
             double LUMA_ICEBERG_RECOVERY = 2.5;
-
-            // Alignment check applied before residual Y to verify carrier coherence.
-            int    VET_ALIGN_WIN_SAMPLES   = 16;   // samples in the alignment correlation window
-            double VET_ALIGN_PHASE_MAX_DEG = 12.0; // maximum phase error the alignment correction may apply
-            double VET_ALIGN_MIN_RHO       = 0.75; // minimum burst correlation for alignment to be trusted
-            double VET_ALIGN_MAX_SHEAR     = 0.15; // maximum shear the alignment correction may apply
 
         };
         Tunables tunables;
@@ -393,9 +356,10 @@ public:
 	void split1D();
 	void buildPhaseCorrected1D();
 	void split2D();
-	void copy2DTo3D(); 
+	void copy2DTo3D();
 	void split3D(const FrameBuffer &previousFrame,
 				 const FrameBuffer &nextFrame);
+	void measurePostCombImpurity();
 
 	void setComponentFrame(ComponentFrame &_componentFrame) { componentFrame = &_componentFrame; }
 
@@ -569,10 +533,14 @@ private:
 	// Later stages may refine this cache, but they should not overwrite demodTI/TQ.
 	std::vector<float> lockedProductI_flat;
 	std::vector<float> lockedProductQ_flat;
-	// Wide-window cross-color risk [0,1] per pixel, published by
-	// buildPhaseCorrected1D() as a disqualification oracle.  It is evidence,
-	// not a carrier source: consumed as alpha suppression in splitIQlocked()
-	// (color) and produceY() (luma), never applied to the carrier itself.
+	// Composite carrier estimate emitted by splitIQlocked() (the aligned carrier
+	// remodulated to composite). produceY subtracts this from raw to form Y, so
+	// the carrier removed from luma is exactly the carrier rendered as colour.
+	std::vector<double> lockedCarrierComposite_flat;
+	// Wide-window cross-color risk [0,1] per pixel.  Initially written by
+	// buildPhaseCorrected1D() on the 1D bandpass, then overwritten by
+	// measurePostCombImpurity() on the elected comb source so the value
+	// reflects post-comb carrier, not per-field 1D.
 	std::vector<float> carrierImpurity_flat;
 	std::vector<double> scratch_lumaBaseY4;
 	std::vector<double> scratch_lumaHiRaw;
@@ -635,8 +603,6 @@ private:
 	std::vector<double> scratch_attrWideCarrier;
 	std::vector<double> scratch_attrBandYClaim;
 	std::vector<double> scratch_attrMembershipY;
-	std::vector<double> scratch_sinfit_mag;    // per-line |TRI/TRQ|
-	std::vector<double> scratch_sinfit_resmag; // per-line residual magnitude estimate
 	std::vector<char> scratch_vdis_flag;
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
@@ -988,6 +954,14 @@ private:
 	}
 	inline const float* lockedProductQ_line(int line) const {
 		return lockedProductQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline double* lockedCarrierComposite_line(int line) {
+		if (lockedCarrierComposite_flat.empty()) return nullptr;
+		return lockedCarrierComposite_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const double* lockedCarrierComposite_line(int line) const {
+		if (lockedCarrierComposite_flat.empty()) return nullptr;
+		return lockedCarrierComposite_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* carrierImpurity_line(int line) {
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;

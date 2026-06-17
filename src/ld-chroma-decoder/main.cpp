@@ -553,13 +553,11 @@ int main(int argc, char *argv[])
     // keeps residual Y but falls back to coherent color from splitIQlocked().
     if (combConfig.phaseCompensation) {
         combConfig.residualVideo = true;
-        combConfig.tunables.VET_ENABLE_RESIDUAL_Y = true;
         combConfig.residualColor = true;
     }
 
     if (parser.isSet(noResidualVideoOption)) {
         combConfig.residualVideo = false;
-        combConfig.tunables.VET_ENABLE_RESIDUAL_Y = false;
         combConfig.residualColor = false;
     }
 

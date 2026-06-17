@@ -24,8 +24,7 @@
 #include <mutex>
 #include <QtGlobal>
 
-// Locked-path pre-processing: burst detection, luma caching, raw composite
-// demodulation into TRI/TRQ, and the line affine used by the locked 1D path.
+// Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
 void Comb::FrameBuffer::phaseLocked()
 {
     if (!configuration.phaseCompensation)
@@ -106,248 +105,6 @@ void Comb::FrameBuffer::phaseLocked()
     }
 
     return;
-
-    // --- Pass 2: raw composite demod -> TRI/TRQ ---
-    {
-        const size_t triNeed = static_cast<size_t>(requiredLines) * static_cast<size_t>(width);
-        if (demodTRI_flat.size() < triNeed) {
-            demodTRI_flat.assign(triNeed, 0.0f);
-            demodTRQ_flat.assign(triNeed, 0.0f);
-        }
-
-        for (int line = firstLine; line < lastLine; ++line) {
-            const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
-            float *triRow          = demodTRI_line(line);
-            float *trqRow          = demodTRQ_line(line);
-            const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-            double lutTi[4], lutTq[4];
-            if (grammar && grammar->grammarLocked) {
-                for (int i = 0; i < 4; ++i) {
-                    lutTi[i] = (double)grammar->demodLUTTi[i];
-                    lutTq[i] = (double)grammar->demodLUTTq[i];
-                }
-            } else {
-                fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
-            }
-
-            double dc = (double)rawLine[left];
-            constexpr double DC_ALPHA = 1.0 / 64.0;
-
-            for (int xi = 0; xi < width; ++xi) {
-                const int h      = left + xi;
-                dc += DC_ALPHA * ((double)rawLine[h] - dc);
-                const double vraw = (double)rawLine[h] - dc;
-                const int ph = carrierSampleClass(line, h);
-                triRow[xi] = (float)(vraw * lutTi[ph]);
-                trqRow[xi] = (float)(vraw * lutTq[ph]);
-            }
-        }
-    }
-
-    // --- Pass 3: sinusoidal fit + affine solve ---
-    if ((int)scratch_sinfit_mag.size() < width)
-        scratch_sinfit_mag.resize(width, 0.0);
-    if ((int)scratch_sinfit_resmag.size() < width)
-        scratch_sinfit_resmag.resize(width, 0.0);
-
-    const int window = std::max(4, (T.SINFIT_WIN_SAMPLES / 4) * 4);
-    const int halfWindow = window / 2;
-    const bool writeAffine =
-        configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE;
-    constexpr double PHASE_ERROR_CAP = M_PI / 8.0;
-
-    for (int line = firstLine; line < lastLine; ++line) {
-        CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        if (!grammar || !grammar->grammarLocked)
-            continue;
-
-        const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
-        const float *triRow = demodTRI_line(line);
-        const float *trqRow = demodTRQ_line(line);
-        double *magRow = scratch_sinfit_mag.data();
-        double *resRow = scratch_sinfit_resmag.data();
-
-        for (int k = 0; k < width; ++k) {
-            const int h = left + k;
-            const double ri = static_cast<double>(triRow[k]);
-            const double rq = static_cast<double>(trqRow[k]);
-            const double magnitude = std::hypot(ri, rq);
-            magRow[k] = magnitude;
-            if (magnitude <= 1e-9) {
-                resRow[k] = 0.0;
-                continue;
-            }
-
-            const double fitted = remodLockedToShiftedComposite(
-                ri, rq, h, grammar->burstCos, grammar->burstSin,
-                spLUT_locked, cpLUT_locked);
-            const double residual =
-                static_cast<double>(rawLine[h]) - fitted;
-            double residualI = 0.0;
-            double residualQ = 0.0;
-            demod4fscFromComposite(residual, h, residualI, residualQ);
-            resRow[k] = std::hypot(residualI, residualQ);
-        }
-
-        const int windowSamples = std::min(width, window);
-        int firstSample = 0;
-        int lastSample = windowSamples - 1;
-        double sumAmp = 0.0;
-        double sumResidual = 0.0;
-        double sumI = 0.0;
-        double sumQ = 0.0;
-        auto addSample = [&](int k) {
-            sumAmp += magRow[k];
-            sumResidual += resRow[k];
-            sumI += static_cast<double>(triRow[k]);
-            sumQ += static_cast<double>(trqRow[k]);
-        };
-        auto removeSample = [&](int k) {
-            sumAmp -= magRow[k];
-            sumResidual -= resRow[k];
-            sumI -= static_cast<double>(triRow[k]);
-            sumQ -= static_cast<double>(trqRow[k]);
-        };
-        for (int k = firstSample; k <= lastSample; ++k)
-            addSample(k);
-
-        double STT[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
-        double SRT[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
-
-        for (int xi = 0; xi < width; ++xi) {
-            if (width > window) {
-                int wantedFirst = xi - halfWindow;
-                int wantedLast = xi + halfWindow - 1;
-                if (wantedFirst < 0) {
-                    wantedLast -= wantedFirst;
-                    wantedFirst = 0;
-                }
-                if (wantedLast >= width) {
-                    const int overflow = wantedLast - (width - 1);
-                    wantedLast -= overflow;
-                    wantedFirst = std::max(0, wantedFirst - overflow);
-                }
-                while (firstSample < wantedFirst)
-                    removeSample(firstSample++);
-                while (firstSample > wantedFirst)
-                    addSample(--firstSample);
-                while (lastSample < wantedLast)
-                    addSample(++lastSample);
-                while (lastSample > wantedLast)
-                    removeSample(lastSample--);
-            }
-
-            const double ri = static_cast<double>(triRow[xi]);
-            const double rq = static_cast<double>(trqRow[xi]);
-            const double ampEstimate =
-                sumAmp / static_cast<double>(windowSamples);
-            const double residualEstimate =
-                sumResidual / static_cast<double>(windowSamples);
-            const double meanI = sumI / static_cast<double>(windowSamples);
-            const double meanQ = sumQ / static_cast<double>(windowSamples);
-            const double meanMagnitude = std::hypot(meanI, meanQ);
-            const double coherence = (ampEstimate > 1e-9)
-                ? std::clamp(meanMagnitude / ampEstimate, 0.0, 1.0)
-                : 0.0;
-
-            const double sampleMagnitude = std::hypot(ri, rq);
-            double fitI = ri;
-            double fitQ = rq;
-            if (sampleMagnitude > 1e-9) {
-                fitI *= ampEstimate / sampleMagnitude;
-                fitQ *= ampEstimate / sampleMagnitude;
-            }
-            if (meanMagnitude > 1e-9) {
-                const double phaseI = meanI * ampEstimate / meanMagnitude;
-                const double phaseQ = meanQ * ampEstimate / meanMagnitude;
-                const double blend = coherence * coherence;
-                fitI += (phaseI - fitI) * blend;
-                fitQ += (phaseQ - fitQ) * blend;
-            }
-
-            const double ratio = (ampEstimate > 1e-9)
-                ? residualEstimate / ampEstimate
-                : 1.0;
-            const double vetScale =
-                std::max(0.25, T.SINFIT_VET_THRESHOLD_IRE);
-            const double normalized = ratio / vetScale;
-            const double weight =
-                (0.25 + 0.75 * coherence) /
-                (1.0 + normalized * normalized);
-            if (weight <= 1e-6)
-                continue;
-
-            STT[0][0] += weight * fitI * fitI;
-            STT[0][1] += weight * fitI * fitQ;
-            STT[1][0] += weight * fitI * fitQ;
-            STT[1][1] += weight * fitQ * fitQ;
-            SRT[0][0] += weight * ri * fitI;
-            SRT[0][1] += weight * ri * fitQ;
-            SRT[1][0] += weight * rq * fitI;
-            SRT[1][1] += weight * rq * fitQ;
-        }
-
-        double STTInverse[2][2];
-        if (!mat2_inv(STT, STTInverse))
-            continue;
-
-        double product[2][2];
-        double affine[2][2];
-        mat2_mul(SRT, STTInverse, product);
-        affine[0][0] = product[0][0];
-        affine[0][1] = product[0][1];
-        affine[1][0] = product[1][0];
-        affine[1][1] = product[1][1];
-
-        double rotation[2][2];
-        double stretch[2][2];
-        polar_decompose_2x2(affine, rotation, stretch);
-
-        const double measuredPhase =
-            std::atan2(rotation[1][0], rotation[0][0]);
-        grammar->phaseError = std::clamp(
-            measuredPhase, -PHASE_ERROR_CAP, PHASE_ERROR_CAP);
-        grammar->phaseScheduleConflict = std::clamp(
-            std::fabs(measuredPhase) / (M_PI / 4.0), 0.0, 1.0);
-        if (grammar->phaseScheduleConflict < 0.1) {
-            grammar->lineFlipAuthority =
-                lddecode::CarrierPhaseAuthority::BurstMeasured;
-        }
-
-        if (writeAffine) {
-            const double phaseMax =
-                T.Y_LINE_MAX_PHASE_DEG * M_PI / 180.0;
-            clamp_rotation_gain_shear(
-                rotation, stretch, phaseMax,
-                T.Y_LINE_ALLOW_GAIN_ON_IQ,
-                T.Y_LINE_GAIN_MIN, T.Y_LINE_GAIN_MAX,
-                T.Y_LINE_MAX_SHEAR);
-            grammar->affine.R[0][0] = rotation[0][0];
-            grammar->affine.R[0][1] = rotation[0][1];
-            grammar->affine.R[1][0] = rotation[1][0];
-            grammar->affine.R[1][1] = rotation[1][1];
-            grammar->affine.valid = true;
-        } else if (T.Y_LINE_PHASE_ERROR_LUT_ENABLE &&
-                   grammar->phaseConfidence >=
-                       T.Y_LINE_PHASE_ERROR_MIN_CONF)
-        {
-            const double phase = grammar->phaseError;
-            if (std::isfinite(phase) && std::fabs(phase) >= 1e-12) {
-                const double c = std::cos(phase);
-                const double s = std::sin(phase);
-                for (int i = 0; i < 4; ++i) {
-                    const double ti =
-                        static_cast<double>(grammar->demodLUTTi[i]);
-                    const double tq =
-                        static_cast<double>(grammar->demodLUTTq[i]);
-                    grammar->demodLUTTi[i] =
-                        static_cast<float>(c * ti - s * tq);
-                    grammar->demodLUTTq[i] =
-                        static_cast<float>(s * ti + c * tq);
-                }
-            }
-        }
-    }
 }
 
 // Demodulate the blind 1D bandpass through the locked carrier grammar, publish
@@ -764,6 +521,101 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     }
 }
 
+void Comb::FrameBuffer::measurePostCombImpurity()
+{
+    if (!configuration.phaseCompensation) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+
+    if (width <= 0 || firstLine >= lastLine) return;
+
+    constexpr int    kNarrowWin = 16;
+    constexpr int    kWideWin   = 32;
+    constexpr double kImpurityFloorIRE = 2.0;
+
+    static const double cosRef[4] = { 1.0, 0.0, -1.0, 0.0 };
+    static const double sinRef[4] = { 0.0, 1.0,  0.0, -1.0 };
+
+    auto clamp01 = [](double v) {
+        return std::clamp(v, 0.0, 1.0);
+    };
+
+    const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
+
+    static const int pcDiagLine = []{
+        const char *s = std::getenv("CC_DIAG_LINE"); return s ? std::atoi(s) : -1;
+    }();
+    static const int pcDiagC0 = []{
+        const char *s = std::getenv("CC_DIAG_C0"); return s ? std::atoi(s) : -1;
+    }();
+    static const int pcDiagC1 = []{
+        const char *s = std::getenv("CC_DIAG_C1"); return s ? std::atoi(s) : -1;
+    }();
+
+    std::vector<double> demI(width), demQ(width);
+    std::vector<double> preI(width + 1), preQ(width + 1);
+    std::vector<double> env(width), preEnv(width + 1);
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        const double *combLine = clpbuffer[srcBuf].pixel[line];
+        float *impurityRow = carrierImpurity_line(line);
+        if (!impurityRow) continue;
+
+        for (int rel = 0; rel < width; ++rel) {
+            const double s = combLine[left + rel];
+            const int p = carrierSampleClass(line, left + rel) & 3;
+            demI[rel] = s * cosRef[p];
+            demQ[rel] = s * sinRef[p];
+            const int relN = std::min(rel + 1, width - 1);
+            env[rel] = std::hypot(s, combLine[left + relN]);
+        }
+
+        preI[0] = 0.0;
+        preQ[0] = 0.0;
+        preEnv[0] = 0.0;
+        for (int rel = 0; rel < width; ++rel) {
+            preI[rel + 1] = preI[rel] + demI[rel];
+            preQ[rel + 1] = preQ[rel] + demQ[rel];
+            preEnv[rel + 1] = preEnv[rel] + env[rel];
+        }
+
+        for (int rel = 0; rel < width; ++rel) {
+            const int wa = std::clamp(rel - kWideWin / 2, 0, width);
+            const int wb = std::clamp(wa + kWideWin, 0, width);
+            const double wn = std::max(1, wb - wa);
+            const double ZwI = (preI[wb] - preI[wa]) / wn;
+            const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+
+            const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
+            const int nb = std::clamp(na + kNarrowWin, 0, width);
+            const double nn = std::max(1, nb - na);
+            const double narrowMag = ((preEnv[nb] - preEnv[na]) / nn) * invIreScale;
+
+            const double wideMag = 2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
+
+            double gA = 0.0;
+            if (narrowMag > kImpurityFloorIRE && wideMag < narrowMag) {
+                gA = clamp01(
+                    (narrowMag - wideMag) /
+                    std::max(kImpurityFloorIRE, narrowMag));
+            }
+
+            impurityRow[rel] = static_cast<float>(gA);
+
+            if (pcDiagLine >= 0 && line == pcDiagLine &&
+                rel >= pcDiagC0 && rel <= pcDiagC1) {
+                std::fprintf(stderr,
+                    "CCPOST line=%d col=%d srcBuf=%d narrow=%.2f wide=%.2f gA=%.3f\n",
+                    line, rel, srcBuf, narrowMag, wideMag, gA);
+            }
+        }
+    }
+}
+
 void Comb::FrameBuffer::splitIQlocked()
 {
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -780,7 +632,7 @@ void Comb::FrameBuffer::splitIQlocked()
         double Ce = 1.0, Se = 0.0;
         basisCoeffs(Ce, Se);
         for (int i = 0; i < 4; ++i) {
-            double sp, cp;
+            double sp = 0.0, cp = 0.0;
             shiftedBasis(i, Ce, Se, sp, cp);
             spLUT_locked[i] = sp;
             cpLUT_locked[i] = cp;
@@ -788,80 +640,136 @@ void Comb::FrameBuffer::splitIQlocked()
         basisLockedInit = true;
     }
 
-    if ((int)scratch_preI.size() < width) scratch_preI.resize(width, 0.0);
-    if ((int)scratch_preQ.size() < width) scratch_preQ.resize(width, 0.0);
+    auto ensureScratch = [&](std::vector<double> &v) {
+        if ((int)v.size() < width)
+            v.resize(width, 0.0);
+    };
 
-    // splitIQlocked owns the post-comb locked demod. It refreshes the stable
-    // selected-comb demod reference and seeds the downstream locked-product cache.
+    // These are consumed later by the locked IQ filter path.
+    ensureScratch(scratch_preI);
+    ensureScratch(scratch_preQ);
+
+    // Keep these sized because other recent versions of this function used them
+    // directly; this prevents stale/undersized scratch state from reappearing if
+    // small edits are made around this function.
+    ensureScratch(scratch_lineWorkA);
+    ensureScratch(scratch_lineWorkC);
+    ensureScratch(scratch_lineWorkD);
+    ensureScratch(scratch_yhp);
+    ensureScratch(scratch_yI);
+    ensureScratch(scratch_yQ);
+    ensureScratch(scratch_hpI);
+    ensureScratch(scratch_hpQ);
+    ensureScratch(scratch_hpY);
+    ensureScratch(scratch_outMixed);
+
+    auto finiteOrZero = [](double v) -> double {
+        return std::isfinite(v) ? v : 0.0;
+    };
+
+    const double ccWeight = std::max(0.0, T.CC_SUPPRESSION_WEIGHT);
+
     for (int line = firstLine; line < lastLine; ++line) {
         const double *src = clpbuffer[srcBuf].pixel[line];
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
+
         const double bcos = grammarLocked ? grammar->burstCos : 1.0;
         const double bsin = grammarLocked ? grammar->burstSin : 0.0;
-        double lutTi[4], lutTq[4];
+
+        double lutTi[4];
+        double lutTq[4];
+
         if (grammarLocked) {
             for (int i = 0; i < 4; ++i) {
-                lutTi[i] = (double)grammar->demodLUTTi[i];
-                lutTq[i] = (double)grammar->demodLUTTq[i];
+                lutTi[i] = finiteOrZero((double)grammar->demodLUTTi[i]);
+                lutTq[i] = finiteOrZero((double)grammar->demodLUTTq[i]);
             }
         } else {
             fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+            for (int i = 0; i < 4; ++i) {
+                lutTi[i] = finiteOrZero(lutTi[i]);
+                lutTq[i] = finiteOrZero(lutTq[i]);
+            }
         }
 
-        float *tiRow = demodTI_line(line);
-        float *tqRow = demodTQ_line(line);
-        float *ti4Row = demodTI4fsc_line(line);
-        float *tq4Row = demodTQ4fsc_line(line);
-        float *prodIRow = lockedProductI_line(line);
-        float *prodQRow = lockedProductQ_line(line);
+        // Remod coefficients for burst-locked IQ back into composite sample space.
+        //
+        // c = ti * 0.5 * (bcos*sp - bsin*cp)
+        //   + tq * 0.5 * (bsin*sp + bcos*cp)
+        double remodI[4];
+        double remodQ[4];
+
+        for (int ph = 0; ph < 4; ++ph) {
+            const double sp = spLUT_locked[ph];
+            const double cp = cpLUT_locked[ph];
+
+            remodI[ph] = finiteOrZero(0.5 * (bcos * sp - bsin * cp));
+            remodQ[ph] = finiteOrZero(0.5 * (bsin * sp + bcos * cp));
+        }
+
+        float  *tiRow       = demodTI_line(line);
+        float  *tqRow       = demodTQ_line(line);
+        float  *ti4Row      = demodTI4fsc_line(line);
+        float  *tq4Row      = demodTQ4fsc_line(line);
+        float  *prodIRow    = lockedProductI_line(line);
+        float  *prodQRow    = lockedProductQ_line(line);
+        double *carrierComp = lockedCarrierComposite_line(line);
+
         const float *impRow = carrierImpurity_line(line);
-        const double ccWeight = std::max(0.0, T.CC_SUPPRESSION_WEIGHT);
 
-        const LineAffine *lineAffine = nullptr;
-        if (configuration.residualVideo && T.Y_LINE_AFFINE_TRIM_ENABLE
-                && grammarLocked && grammar->affine.valid) {
-            lineAffine = &grammar->affine;
-        }
-        auto applyLineAffine = [&](double &ti, double &tq) {
-            if (!lineAffine) return;
-            const double ai = lineAffine->R[0][0] * ti + lineAffine->R[0][1] * tq;
-            const double aq = lineAffine->R[1][0] * ti + lineAffine->R[1][1] * tq;
-            ti = ai;
-            tq = aq;
-        };
+        if (prodIRow)    std::fill(prodIRow, prodIRow + width, 0.0f);
+        if (prodQRow)    std::fill(prodQRow, prodQRow + width, 0.0f);
+        if (carrierComp) std::fill(carrierComp, carrierComp + width, 0.0);
 
         for (int xi = 0; xi < width; ++xi) {
-            const int h = left + xi;
+            const int h  = left + xi;
             const int ph = carrierSampleClass(line, h);
-            double ti = src[h] * lutTi[ph];
-            double tq = src[h] * lutTq[ph];
-            applyLineAffine(ti, tq);
+
+            // Plain locked demod only.  No line affine, no local affine, no
+            // sliding-window carrier fit.  This function may suppress transfer,
+            // but it must not reshape the carrier that produceY subtracts.
+            const double ti = finiteOrZero(src[h] * lutTi[ph]);
+            const double tq = finiteOrZero(src[h] * lutTq[ph]);
 
             double ti4 = 0.0;
             double tq4 = 0.0;
             lockedTo4fsc(ti, tq, bcos, bsin, ti4, tq4);
 
-            // Cross-color alpha suppression on the COLOR products only.  This is
-            // the ONLY safe locus: it removes the aperture-contaminated fraction
-            // gA from chroma without touching the carrier subtracted from Y, so
-            // no carrier-band residual is left in luma (no checkerboard).  ti/tq/
-            // ti4/tq4 (the carrier model other consumers read) are left intact.
-            // Requires --no-residual-color so chroma comes from this product and
-            // not from raw - Y (which would be rigidly complementary to luma).
-            const double alphaEff =
-                std::max(0.0, 1.0 - (impRow ? static_cast<double>(impRow[xi]) : 0.0) * ccWeight);
+            ti4 = finiteOrZero(ti4);
+            tq4 = finiteOrZero(tq4);
 
-            const float prodI = (float)(ti * GI_PRODUCT * alphaEff);
-            const float prodQ = (float)(tq * GQ_PRODUCT * alphaEff);
-
-            if (tiRow) tiRow[xi] = (float)ti;
-            if (tqRow) tqRow[xi] = (float)tq;
+            if (tiRow)  tiRow[xi]  = (float)ti;
+            if (tqRow)  tqRow[xi]  = (float)tq;
             if (ti4Row) ti4Row[xi] = (float)ti4;
             if (tq4Row) tq4Row[xi] = (float)tq4;
+
+            const double plainCarrier =
+                finiteOrZero(ti * remodI[ph] + tq * remodQ[ph]);
+
+            // Critical geometry rule:
+            // produceY subtracts only the carrier in the original comb geometry.
+            // Do not feed it any local affine, fitted carrier, or vetter-shaped
+            // carrier.
+            if (carrierComp)
+                carrierComp[xi] = plainCarrier;
+
+            const double gA =
+                impRow ? std::clamp((double)impRow[xi], 0.0, 1.0) : 0.0;
+
+            const double ccAlpha =
+                std::clamp(1.0 - gA * ccWeight, 0.0, 1.0);
+
+            const double xferTi = finiteOrZero(ti * ccAlpha);
+            const double xferTq = finiteOrZero(tq * ccAlpha);
+
+            const float prodI = (float)finiteOrZero(xferTi * GI_PRODUCT);
+            const float prodQ = (float)finiteOrZero(xferTq * GQ_PRODUCT);
+
             if (prodIRow) prodIRow[xi] = prodI;
             if (prodQRow) prodQRow[xi] = prodQ;
+
             scratch_preI[xi] = prodI;
             scratch_preQ[xi] = prodQ;
         }
@@ -1025,21 +933,34 @@ void Comb::FrameBuffer::produceY()
 
     const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
+    const bool residualVideo = configuration.residualVideo;
 
+    // produceY is a pure consumer: it subtracts the composite carrier that
+    // splitIQlocked aligned and emitted. Where that carrier was drift-corrected
+    // to the raw carrier, only true carrier is removed and composite HF luma
+    // survives into Y. With --no-residual-video there is no aligned carrier, so
+    // fall back to full-strength subtraction of the selected comb scalar.
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
         const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
         double *Y = componentFrame->y(line);
         const double *clpLine = clpbuffer[srcBuf].pixel[line];
+        const double *carrierComp =
+            residualVideo ? lockedCarrierComposite_line(line) : nullptr;
 
-        // Full-strength subtraction of the corrected carrier.  Cross-color is
-        // corrected in the carrier source (buildPhaseCorrected1D); Y and chroma
-        // are therefore complementary products of the SAME corrected carrier at
-        // full strength.  Any per-pixel alpha here would leave (1-alpha)*carrier
-        // — a carrier-shaped remainder — in Y, which is the checkerboard.
-        for (int h = left; h < right; ++h) {
-            Y[h] = (double)rawLine[h] - clpLine[h];
+        if (carrierComp) {
+            for (int h = left; h < right; ++h) {
+                const double c = carrierComp[h - left];
+                Y[h] = std::isfinite(c)
+                    ? (double)rawLine[h] - c
+                    : (double)rawLine[h] - clpLine[h];
+            }
+        } else {
+            for (int h = left; h < right; ++h) {
+                const double c = clpLine[h];
+                Y[h] = std::isfinite(c) ? (double)rawLine[h] - c : (double)rawLine[h];
+            }
         }
 
         if (showMap) {
