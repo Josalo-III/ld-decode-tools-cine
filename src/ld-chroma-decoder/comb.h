@@ -133,19 +133,6 @@ public:
             double FIELD_LUMA_EDGE_THRESH_IRE = 18.0; // horizontal luma gradient above this suppresses vertical 2D comb
 
             // =========================================================================
-            // VDIS (Vertical Differential Isolation System)
-            // =========================================================================
-            // Conservative 2D fallback that reverts to 1D when carrier phase is incoherent
-            // across lines (edit cuts, TBC errors, head-switching noise). Off by default.
-            bool   VDIS_ENABLE             = false; // opt-in via --vdis
-            double VDIS_PHASE_THRESH_DEG   = 20.0;  // carrier phase difference across ±2 lines that triggers VDIS
-            double VDIS_MIN_CHROMA_IRE     = 5.0;   // minimum chroma amplitude for VDIS to be sensitive (below this, phase is noisy)
-            bool   VDIS_HARD_FALLBACK      = true;  // true → replace 2D with 1D; false → blend by VDIS_SUPPRESS_FACTOR
-            double VDIS_SUPPRESS_FACTOR    = 0.0;   // 2D output scale when soft fallback active (0 = full 1D, 1 = no change)
-            bool   VDIS_USE_PLUS1          = true;  // include ±1-line phase evidence alongside ±2/±4
-            double VDIS_1D_DIFF_THRESH_IRE = 2.0;   // escalate to hard fallback when |2D − 1D| exceeds this after VDIS fires
-
-            // =========================================================================
             // Frame comb on phase-corrected 1D
             // =========================================================================
             double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)

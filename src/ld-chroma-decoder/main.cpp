@@ -244,11 +244,6 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
-    QCommandLineOption vdisOption(QStringList() << "vdis",
-                                            QCoreApplication::translate("main", "NTSC: Enable VDIS (Vertical Differential Isolation System) " 
-                                            "This restricts the 2d section very substantially - for use when regular output exhibits artifacts near horizontal color boundaries"));
-    parser.addOption(vdisOption);
-
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
                                              QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
     parser.addOption(noResidualVideoOption);
@@ -542,10 +537,6 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(ntscPhaseCompOption)) {
         combConfig.phaseCompensation = true;
-    }
-
-    if (parser.isSet(vdisOption)) {
-        combConfig.tunables.VDIS_ENABLE = true;
     }
 
     // Residual video rollout: locked mode defaults to both residual Y and

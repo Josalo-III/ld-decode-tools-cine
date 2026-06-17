@@ -25,210 +25,7 @@
 #include <cstdlib>
 #include <limits>
 
-// VDIS - Vertical Differential Isolation System.
-// Reduces artifacts at horizontal boundaries between different regions.
-// We detect for strong vertical differentials in both chroma phase (IQ space)
-// and scalar magnitude between upper and lower samples in the field.
-// If checks fail, 1D only in FVF and 3D. Fields excluded from FVF if 2 fails.
-// This is the heavy-handed lathe when nothing else works and 1D is tempting
-void Comb::FrameBuffer::computeVDISLine(int lineNumber)
-{
-    const int first = videoParameters.firstActiveFrameLine;
-    const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-    if (width <= 0) return;
-
-    const auto &T = configuration.tunables;
-
-    // Ensure flag buffer is sized and cleared
-    if ((int)scratch_vdis_flag.size() < width) scratch_vdis_flag.resize(width, 0);
-    else std::fill(scratch_vdis_flag.begin(), scratch_vdis_flag.end(), 0);
-
-    // ----------------------------------------------------------------
-    // Scalar (2) leg: amplitude-based disagreement
-    // ----------------------------------------------------------------
-    const int up2 = lineNumber - 2;
-    const int dn2 = lineNumber + 2;
-    const bool haveUp2 = (up2 >= first && up2 < last);
-    const bool haveDn2 = (dn2 >= first && dn2 < last);
-
-    if (haveUp2 && haveDn2) {
-        const double th1d_ire = T.VDIS_1D_DIFF_THRESH_IRE;
-        const double th1d_s   = (th1d_ire > 0.0) ? th1d_ire * irescale : 0.0;
-
-        if (th1d_s > 0.0) {
-            auto vdisSample = [&](int ln, int rel)->double {
-                if (configuration.phaseCompensation) {
-                    const double *row = locked1DSource_line(ln);
-                    if (row && rel >= 0 && rel < width)
-                        return row[rel];
-                    return 0.0;
-                }
-                return bucketScalar1D_line(ln)[left + rel];
-            };
-            for (int rel = 0; rel < width; ++rel) {
-                double c = vdisSample(lineNumber, rel);
-                double u = vdisSample(up2, rel);
-                double d = vdisSample(dn2, rel);
-                double maxDiff = std::max(std::fabs(c - u), std::fabs(c - d));
-                if (maxDiff > th1d_s) {
-                    scratch_vdis_flag[rel] = 1;
-                }
-            }
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // IQ (1) leg: chroma phase disagreement (VDIS_USE_PLUS1)
-    // ----------------------------------------------------------------
-    if (T.VDIS_USE_PLUS1 &&
-        lineNumber >= first && lineNumber < last &&
-        lineNumber < demodLines && demodWidth > 0)
-    {
-        const int up1 = lineNumber - 1;
-        const int dn1 = lineNumber + 1;
-        const bool haveUp1 = (up1 >= 0 && up1 < demodLines);
-        const bool haveDn1 = (dn1 >= 0 && dn1 < demodLines);
-
-        if (haveUp1 || haveDn1) {
-            const float *ti0 = demodTI4fsc_line(lineNumber);
-            const float *tq0 = demodTQ4fsc_line(lineNumber);
-            const float *tiU = haveUp1 ? demodTI4fsc_line(up1) : nullptr;
-            const float *tqU = haveUp1 ? demodTQ4fsc_line(up1) : nullptr;
-            const float *tiD = haveDn1 ? demodTI4fsc_line(dn1) : nullptr;
-            const float *tqD = haveDn1 ? demodTQ4fsc_line(dn1) : nullptr;
-
-            const double minChroma = T.VDIS_MIN_CHROMA_IRE * irescale;
-            const double cosThresh = std::cos(T.VDIS_PHASE_THRESH_DEG * M_PI / 180.0);
-
-            const int W = std::min(width, demodWidth);
-            for (int rel = 0; rel < W; ++rel) {
-                double I0 = ti0[rel];
-                double Q0 = tq0[rel];
-                double m0 = std::hypot(I0, Q0);
-                if (m0 < minChroma) continue;
-
-                bool fire = false;
-
-                if (haveUp1) {
-                    double IU = tiU[rel], QU = tqU[rel];
-                    double mU = std::hypot(IU, QU);
-                    if (mU >= minChroma) {
-                        double dot = I0 * IU + Q0 * QU;
-                        double cosv = dot / (m0 * mU + 1e-12);
-                        if (cosv < cosThresh) fire = true;
-                    }
-                }
-                if (!fire && haveDn1) {
-                    double ID = tiD[rel], QD = tqD[rel];
-                    double mD = std::hypot(ID, QD);
-                    if (mD >= minChroma) {
-                        double dot = I0 * ID + Q0 * QD;
-                        double cosv = dot / (m0 * mD + 1e-12);
-                        if (cosv < cosThresh) fire = true;
-                    }
-                }
-
-                if (fire) scratch_vdis_flag[rel] = 1;
-            }
-        }
-    }
-}
 // -------------------------------------------------------------------------
-// Returns true if the consolidated VDIS mask has flagged position (lineNumber, h)
-// as a vertical differential isolation region. The mask is populated by
-// computeVDISLine and consolidated by consolidateVDISRegions during split2D.
-bool Comb::FrameBuffer::hasVDIS(int lineNumber, int h) const
-{
-    const int first = videoParameters.firstActiveFrameLine;
-    const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-
-    if (lineNumber < first || lineNumber >= last) return false;
-    if (h < left || h >= right) return false;
-
-    int rel = h - left;
-    if (lineNumber < 0 || lineNumber >= (int)vdisMask.size()) return false;
-    const auto &row = vdisMask[lineNumber];
-    if (rel < 0 || rel >= (int)row.size()) return false;
-    return row[rel] != 0;
-}
-
-// VDIS region consolidation
-//
-// Input:  vdisMask[line][rel] == 0/1 from computeVDISLine per-line flags.
-// Output: vdisMask is rewritten to:
-//   0 = no VDIS
-//   1 = soft VDIS region
-//   2 = hard VDIS region
-//
-// We use a small 3x3 neighbourhood count:
-//   vcount >= HARD_MIN  => strong cluster => hard VDIS (2)
-//   SOFT_MIN <=vcount< HARD_MIN => soft VDIS belt (1)
-//   vcount <= NOISE_MAX => isolated speck => cleared to 0
-//   else => keep original value.
-void Comb::FrameBuffer::consolidateVDISRegions(
-    std::vector<std::vector<char>> &vdisMask,
-    const LdDecodeMetaData::VideoParameters &vp)
-{
-    const int firstLine = vp.firstActiveFrameLine;
-    const int lastLine  = vp.lastActiveFrameLine;
-    const int left      = vp.activeVideoStart;
-    const int right     = vp.activeVideoEnd;
-    const int width     = right - left;
-
-    if (width <= 0) return;
-    if ((int)vdisMask.size() < lastLine) return;
-
-    // Thresholds; adjust as needed.
-    const int HARD_MIN  = 5;  // strong 3x3 cluster -> hard VDIS
-    const int SOFT_MIN  = 2;  // 2-4 neighbors   -> soft VDIS
-    const int NOISE_MAX = 1;  // <= 1 neighbor   -> noise
-
-    std::vector<std::vector<char>> outMask = vdisMask;
-
-    for (int line = firstLine; line < lastLine; ++line) {
-        if ((int)vdisMask[line].size() < width) continue;
-
-        for (int rel = 0; rel < width; ++rel) {
-            int vcount = 0;
-
-            // Count VDIS flags in 3x3 neighbourhood
-            for (int dy = -1; dy <= +1; ++dy) {
-                int ln = line + dy;
-                if (ln < firstLine || ln >= lastLine) continue;
-                if ((int)vdisMask[ln].size() < width) continue;
-                const auto &row = vdisMask[ln];
-
-                for (int dx = -1; dx <= +1; ++dx) {
-                    int rr = rel + dx;
-                    if (rr < 0 || rr >= width) continue;
-                    if (row[rr]) ++vcount;
-                }
-            }
-
-            char newVal = 0;
-
-            if (vcount >= HARD_MIN) {
-                newVal = 2; // hard region
-            } else if (vcount >= SOFT_MIN) {
-                newVal = 1; // soft belt
-            } else if (vcount <= NOISE_MAX) {
-                newVal = 0; // speck -> clear
-            } else {
-                // mid case: keep original (usually 1)
-                newVal = vdisMask[line][rel];
-            }
-
-            outMask[line][rel] = newVal;
-        }
-    }
-
-    vdisMask.swap(outMask);
-}
 
 // 2D section
 
@@ -806,16 +603,12 @@ void Comb::FrameBuffer::computeContourFieldLine(int lineNumber,
 
     if (configuration.phaseCompensation) {
         auto getRow = [&](int ln) -> const double* {
-            if (ln < 0 || ln >= (int)locked1DSource.size())
+            if (ln < first || ln >= last)
                 return nullptr;
-
-            const auto &row = locked1DSource[ln];
-            if ((int)row.size() < width)
-                return nullptr;
-
-            return row.data();
+    
+            return locked1DSource_line(ln);
         };
-
+    
         row0   = getRow(ln0);
         rowUp2 = getRow(lnUp2);
         rowDn2 = getRow(lnDn2);
@@ -828,7 +621,7 @@ void Comb::FrameBuffer::computeContourFieldLine(int lineNumber,
         rowUp4 = clpbuffer[0].pixel[lnUp4] + left;
         rowDn4 = clpbuffer[0].pixel[lnDn4] + left;
     }
-
+    
     if (!row0) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
         if (outGate) std::fill(outGate, outGate + width, 1.0f);
@@ -1216,8 +1009,8 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         return;
     }
 
-    // Preserve local source if vertical support rows are unavailable.
-    // This is not a new fallback regime; it only avoids synthetic zero.
+    // Missing vertical support rows: preserve the local 1D chroma estimate.
+    // This avoids synthetic zero chroma without changing normal Field B geometry.
     if (!rowUp2 || !rowDn2) {
         std::copy(row0, row0 + width, outFieldLine);
         return;
@@ -1227,6 +1020,38 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
+    const double invI   = this->invIreScale;
+
+    // Carrier-free luma-edge amount. This is used only as an authority/blend
+    // signal after the original vertical comb has been computed. It does not
+    // kill neighbor support.
+    const double LUMA_EDGE_LO_IRE = 4.5;
+    const double LUMA_EDGE_HI_IRE = 16.0;
+
+    auto edgeAmount = [&](double dIRE) -> double {
+        if (!std::isfinite(dIRE))
+            return 0.0;
+
+        double t = (dIRE - LUMA_EDGE_LO_IRE) /
+                   (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE);
+
+        return std::clamp(t, 0.0, 1.0);
+    };
+
+    // Saturated-gradient cede is deliberately partial. Full hard partner rejection
+    // caused the diagonal-line staircase by changing reach topology. This only
+    // reduces the finished Field B candidate's authority in marginal saturated
+    // edge zones.
+    const double SAT_CHROMA_LO_IRE = 5.0;
+    const double SAT_CHROMA_HI_IRE = 18.0;
+    const double MAX_EDGE_CEDE     = 0.70;
+
+    auto ramp = [](double v, double lo, double hi) -> double {
+        if (hi <= lo)
+            return (v >= hi) ? 1.0 : 0.0;
+
+        return std::clamp((v - lo) / (hi - lo), 0.0, 1.0);
+    };
 
     for (int rel = 0; rel < width; ++rel) {
         const int rm1 = (rel > 0) ? (rel - 1) : 0;
@@ -1245,8 +1070,8 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         const double Cdn_m1 = rowDn2[rm1];
         const double Cdn_p1 = rowDn2[rp1];
 
-        // Original symmetric lateral magnitude context. This is only a
-        // support/weighting context, not a competing reconstruction.
+        // Symmetric lateral magnitude context. This remains the original
+        // support/weight evidence for the vertical comb.
         const double symCur =
             0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
 
@@ -1276,8 +1101,21 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         wUp = std::clamp(wUp, 0.0, 1.0);
         wDn = std::clamp(wDn, 0.0, 1.0);
 
+        // Edge amounts are measured before any support cull, but they do not
+        // alter support. They only modulate the final vertical authority.
+        const double eUp =
+            (rel >= 0 && rel < (int)tapLine.pairU2.size())
+                ? edgeAmount(tapLine.pairU2[rel].lumaDiffIRE)
+                : 0.0;
+
+        const double eDn =
+            (rel >= 0 && rel < (int)tapLine.pairD2.size())
+                ? edgeAmount(tapLine.pairD2[rel].lumaDiffIRE)
+                : 0.0;
+
         double sc = 1.0;
         bool haveAnswer = false;
+        bool revivedUD = false;
 
         if (wUp > 0.0 || wDn > 0.0) {
             if (wDn > 3.0 * wUp)
@@ -1298,6 +1136,9 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                 wDn = 0.0;
             }
         } else {
+            // Original same-magnitude up/down revival. Do not suppress this
+            // with the luma-edge detector; suppressing it recreated the moving
+            // diagonal staircase.
             const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
             const double sumUD = std::fabs(Cup + Cdn);
 
@@ -1306,6 +1147,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                 wDn = 1.0;
                 sc = 1.0;
                 haveAnswer = true;
+                revivedUD = true;
             } else {
                 wUp = 0.0;
                 wDn = 0.0;
@@ -1318,9 +1160,90 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
             tc  = (C - Cup) * wUp * sc;
             tc += (C - Cdn) * wDn * sc;
             tc *= 0.25;
+
+            // Variable vertical-authority cede.
+            //
+            // Important: this does not remove either neighbor from the comb.
+            // It only blends the finished vertical candidate toward C when the
+            // answer is saturated, edge-adjacent, and marginal.
+            const double chromaIRE = std::fabs(C) * invI;
+            const double satT = ramp(chromaIRE,
+                                     SAT_CHROMA_LO_IRE,
+                                     SAT_CHROMA_HI_IRE);
+
+            const double bothEdgeT  = std::min(eUp, eDn);
+            const double oneEdgeT   = std::max(eUp, eDn) - bothEdgeT;
+
+            // Both-edge cases are stronger; one-edge cases get a weaker cede
+            // so a clean partner can still contribute without hard topology
+            // changes.
+            const double edgeT =
+                std::clamp(bothEdgeT + 0.35 * oneEdgeT, 0.0, 1.0);
+
+            const double supportSum = wUp + wDn;
+            const double maxW = std::max(wUp, wDn);
+            const double minW = std::min(wUp, wDn);
+
+            const double balance =
+                (maxW > 1e-9) ? (minW / maxW) : 0.0;
+                // Chroma-envelope discontinuity across the same-field vertical partners.
+                //
+                // This catches saturated color-boundary cases such as brown -> bright gold.
+                // It does not reject the partners; it only increases the final cede toward C
+                // when Field B is already in the saturated/edge/marginal regime.
+                const double dChromaUpIRE = std::fabs(std::fabs(C) - std::fabs(Cup)) * invI;
+                const double dChromaDnIRE = std::fabs(std::fabs(C) - std::fabs(Cdn)) * invI;
+                
+                const double chromaStepIRE =
+                    std::min(dChromaUpIRE, dChromaDnIRE);
+                
+                const double chromaWorstIRE =
+                    std::max(dChromaUpIRE, dChromaDnIRE);
+                
+                const double CHROMA_STEP_LO_IRE = 3.0;
+                const double CHROMA_STEP_HI_IRE = 12.0;
+                
+                const double CHROMA_WORST_LO_IRE = 6.0;
+                const double CHROMA_WORST_HI_IRE = 22.0;
+                
+                const double chromaStepT =
+                    ramp(chromaStepIRE, CHROMA_STEP_LO_IRE, CHROMA_STEP_HI_IRE);
+                
+                const double chromaWorstT =
+                    ramp(chromaWorstIRE, CHROMA_WORST_LO_IRE, CHROMA_WORST_HI_IRE);
+                
+                const double chromaBoundaryT =
+                    std::clamp(0.65 * chromaStepT + 0.35 * chromaWorstT, 0.0, 1.0);
+			// Marginality: low total support, strong one-sidedness, or revived
+            // up/down admission. This keeps strong clean Field B answers intact.
+            const double lowSupportT =
+                std::clamp((1.35 - supportSum) / 1.35, 0.0, 1.0);
+
+            const double imbalanceT =
+                std::clamp((0.55 - balance) / 0.55, 0.0, 1.0);
+
+            double marginalT = std::max(lowSupportT, imbalanceT);
+            
+            if (revivedUD)
+                marginalT = std::max(marginalT, 0.50);
+            
+            // Saturated color-boundary boost.
+            //
+            // Brown/gold title boundaries can have enough vertical support to avoid the
+            // normal low-support path while still alternating visibly. The chroma envelope
+            // disagreement makes that case marginal for Field B authority without changing
+            // vertical reach topology.
+            marginalT = std::max(marginalT, 0.75 * chromaBoundaryT);
+            
+            double cede =
+                MAX_EDGE_CEDE * satT * edgeT * marginalT;
+                
+            cede = std::clamp(cede, 0.0, MAX_EDGE_CEDE);
+
+            if (cede > 0.0)
+                tc = tc * (1.0 - cede) + C * cede;
         } else {
-            // Only true collapse becomes C.
-            // All normal and revived original paths above are unchanged.
+            // True no-answer collapse: cede to the local 1D chroma estimate.
             tc = C;
         }
 
@@ -1463,9 +1386,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     const double MAX_DELTA_IRE  = T.FRAME_IQ_RAW_MAX_DELTA_IRE;
     const double MIN_CHROMA_IRE = T.FRAME_CHROMA_MIN_IRE;
 
-    const double VDIS_IQ_THRESH_IRE  = std::max(4.0, T.VDIS_MIN_CHROMA_IRE);
-    const double VDIS_RAMP_RANGE_IRE = 4.0;
-
     // ------------------------------------------------------------
     // Build IQ vectors for center and 1 neighbors
     // ------------------------------------------------------------
@@ -1506,26 +1426,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             continue;
         }
 
-        // --- IQ-based VDIS gating (aligned space) ---
-        double vdisGate = 1.0;
-        double dUpDown_ire = 0.0;
-        if (haveUp && haveDn) {
-            dUpDown_ire = cmag(ZUpRaw - ZDnRaw) * invI;
-
-            if (T.VDIS_HARD_FALLBACK && dUpDown_ire > VDIS_IQ_THRESH_IRE) {
-                outFrameIQ[x] = Z0;
-                continue;
-            }
-
-            if (dUpDown_ire > VDIS_IQ_THRESH_IRE) {
-                double t = (dUpDown_ire - VDIS_IQ_THRESH_IRE) / VDIS_RAMP_RANGE_IRE;
-                t = std::clamp(t, 0.0, 1.0);
-                double suppress = T.VDIS_SUPPRESS_FACTOR;
-                vdisGate = 1.0 - (suppress * t);
-                if (vdisGate < 0.0) vdisGate = 0.0;
-            }
-        }
-
         // --- Boundary limits for horizontal edges between disparate vertical regions ---
         // Detect: Up and Down are different, and center is not safely "same material" as both.
         // Behavior:
@@ -1564,13 +1464,14 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         }
 
         if (haveUp && haveDn) {
-            const double dUp0_ire = cmag(ZUpRaw - Z0) * invI;
-            const double dDn0_ire = cmag(ZDnRaw - Z0) * invI;
+            const double dUp0_ire    = cmag(ZUpRaw - Z0) * invI;
+            const double dDn0_ire    = cmag(ZDnRaw - Z0) * invI;
+            const double dUpDown_ire = cmag(ZUpRaw - ZDnRaw) * invI;
 
-            const double EDGE_UD_IRE   = VDIS_IQ_THRESH_IRE; // reuse VDIS threshold as "disparate regions"
-            const double MATCH_IRE     = 3.5;                // "center matches this side"
-            const double BETWEEN_IRE   = 6.0;                // "center is far from this side"
-            const double TRANS_SUPPRESS = 0.35;              // how much to suppress in transition zone
+            const double MATCH_IRE      = 3.5;   // center matches this side
+            const double BETWEEN_IRE    = 6.0;   // center is far from this side
+            const double EDGE_UD_IRE    = 8.0;   // up/down are materially different
+            const double TRANS_SUPPRESS = 0.35;  // suppress transition-zone reach
 
             if (dUpDown_ire > EDGE_UD_IRE) {
                 if (dUp0_ire < MATCH_IRE && dDn0_ire > BETWEEN_IRE) {
@@ -1614,9 +1515,8 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         double deltaMagIRE = cmag(delta) * invI;
 
         double motionGate = 1.0; // placeholder for motion gating
-        const double gate = motionGate * vdisGate;
 
-        const double effMaxDeltaIRE = MAX_DELTA_IRE * gate;
+        const double effMaxDeltaIRE = MAX_DELTA_IRE * motionGate;
 
         // --- Existing clamp (pre-strength) ---
         if (deltaMagIRE > effMaxDeltaIRE && deltaMagIRE > 1e-9) {
@@ -1646,7 +1546,10 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         double disGate = 1.0;
         if (haveUp && haveDn) {
             const double dUD_ire = cmag(ZUpRaw - ZDnRaw) * invI;
-            double t = (dUD_ire - VDIS_IQ_THRESH_IRE) / VDIS_RAMP_RANGE_IRE;
+            const double DISAGREE_LO_IRE = 3.5;
+            const double DISAGREE_HI_IRE = 14.0;
+            double t = (dUD_ire - DISAGREE_LO_IRE) /
+                       (DISAGREE_HI_IRE - DISAGREE_LO_IRE);
             t = std::clamp(t, 0.0, 1.0);
             disGate = 1.0 - t;
         }
@@ -1660,7 +1563,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             COMB_STRENGTH_LO + (COMB_STRENGTH_HI - COMB_STRENGTH_LO) * strengthMix;
 
         // Provisional output (before optional under-comb correction)
-        std::complex<double> Zout = Z0 + (delta * localStrength * gate);
+        std::complex<double> Zout = Z0 + (delta * localStrength * motionGate);
 
         // --------------------------------------------------------
         // Optional one-sided "under-comb" booster
@@ -1891,59 +1794,202 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
-    const bool verticalAllowed = carrierFrameVerticalAllowed(line);
 
     outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
-    if (width <= 0 || line < first || line >= last) return;
-    if ((int)centerIQ.size() < width || (int)upIQ.size() < width || (int)dnIQ.size() < width) return;
+
+    if (width <= 0 || line < first || line >= last)
+        return;
+
+    if ((int)centerIQ.size() < width ||
+        (int)upIQ.size() < width ||
+        (int)dnIQ.size() < width)
+    {
+        return;
+    }
 
     const auto  &T    = configuration.tunables;
     const double invI = invIreScale;
-    const double COMB_STRENGTH   = std::max(0.0, T.FRAME_B_COMB_STRENGTH);
-    const double MIN_CHROMA_IRE  = T.FRAME_CHROMA_MIN_IRE;
-    const double VDIS_THRESH_IRE = std::max(4.0, T.VDIS_MIN_CHROMA_IRE);
-    const double VDIS_RAMP_IRE   = 4.0;
 
-    const bool haveUpLine = (verticalAllowed && line - 1 >= first);
-    const bool haveDnLine = (verticalAllowed && line + 1 <  last);
-    (void)reachTapLine;
+    const double COMB_STRENGTH  = std::max(0.0, T.FRAME_B_COMB_STRENGTH);
+    const double MIN_CHROMA_IRE = T.FRAME_CHROMA_MIN_IRE;
+
+    const bool verticalAllowed = carrierFrameVerticalAllowed(line);
+    const bool haveUpLine = verticalAllowed && (line - 1 >= first);
+    const bool haveDnLine = verticalAllowed && (line + 1 <  last);
+
+    auto corrAbs = [](const std::complex<double> &a,
+                      const std::complex<double> &b) -> double
+    {
+        const double ma = cmag(a);
+        const double mb = cmag(b);
+
+        if (ma <= 1e-12 || mb <= 1e-12)
+            return 0.0;
+
+        const double dot = a.real() * b.real() + a.imag() * b.imag();
+        return std::clamp(std::fabs(dot) / (ma * mb + 1e-12), 0.0, 1.0);
+    };
+
+    auto rampDown = [](double v, double lo, double hi) -> double {
+        if (hi <= lo)
+            return (v <= lo) ? 1.0 : 0.0;
+
+        double t = (v - lo) / (hi - lo);
+        t = std::clamp(t, 0.0, 1.0);
+
+        return 1.0 - t;
+    };
+
+    auto rampUp = [](double v, double lo, double hi) -> double {
+        if (hi <= lo)
+            return (v >= hi) ? 1.0 : 0.0;
+
+        double t = (v - lo) / (hi - lo);
+        return std::clamp(t, 0.0, 1.0);
+    };
+
+    // Temporary post-VDIS Frame B safety.
+    //
+    // These are deliberately local and conservative. They do not recreate VDIS;
+    // they only prevent Frame B from applying a full interfield correction when
+    // its two one-line neighbors disagree or when center/neighbor IQ is weakly
+    // related.
+    const double NBR_DISAGREE_LO_IRE = 4.0;
+    const double NBR_DISAGREE_HI_IRE = 14.0;
+
+    const double CENTER_DISAGREE_LO_IRE = 5.0;
+    const double CENTER_DISAGREE_HI_IRE = 18.0;
+
+    const double COH_LO = 0.45;
+    const double COH_HI = 0.82;
+
+    const double MAX_DELTA_IRE = 18.0;
 
     for (int x = 0; x < width; ++x) {
         const std::complex<double> Z0 = centerIQ[x];
         const std::complex<double> ZUp = upIQ[x];
         const std::complex<double> ZDn = dnIQ[x];
+
+        const double a0IRE = cmag(Z0) * invI;
+
         bool haveUp = haveUpLine && (cmag(ZUp) > 1e-9);
         bool haveDn = haveDnLine && (cmag(ZDn) > 1e-9);
 
-        if (cmag(Z0) * invI < MIN_CHROMA_IRE || (!haveUp && !haveDn)) {
+        if (a0IRE < MIN_CHROMA_IRE || (!haveUp && !haveDn)) {
             outFrameIQ[x] = Z0;
             continue;
         }
 
-        const std::complex<double> nbrAvg = (haveUp && haveDn) ? 0.5 * (ZUp + ZDn)
-                                          : haveUp             ? ZUp
-                                                               : ZDn;
+        double upReach = 1.0;
+        double dnReach = 1.0;
 
-        // Motion gate: suppress when neighbors disagree with each other.
-        double motionGate = 1.0;
+        if (reachTapLine &&
+            x < reachTapLine->width &&
+            x < (int)reachTapLine->pairU1.size() &&
+            x < (int)reachTapLine->pairD1.size())
+        {
+            upReach = std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0);
+            dnReach = std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0);
+        }
+
+        if (upReach <= 0.02)
+            haveUp = false;
+
+        if (dnReach <= 0.02)
+            haveDn = false;
+
+        if (!haveUp && !haveDn) {
+            outFrameIQ[x] = Z0;
+            continue;
+        }
+
+        const double dUp0IRE = haveUp ? (cmag(ZUp - Z0) * invI) : 1e9;
+        const double dDn0IRE = haveDn ? (cmag(ZDn - Z0) * invI) : 1e9;
+
+        double upWeight = 0.0;
+        double dnWeight = 0.0;
+
+        if (haveUp) {
+            const double coh = corrAbs(Z0, ZUp);
+            const double cohGate = rampUp(coh, COH_LO, COH_HI);
+            const double centerGate = rampDown(dUp0IRE,
+                                               CENTER_DISAGREE_LO_IRE,
+                                               CENTER_DISAGREE_HI_IRE);
+
+            upWeight = upReach * cohGate * centerGate;
+        }
+
+        if (haveDn) {
+            const double coh = corrAbs(Z0, ZDn);
+            const double cohGate = rampUp(coh, COH_LO, COH_HI);
+            const double centerGate = rampDown(dDn0IRE,
+                                               CENTER_DISAGREE_LO_IRE,
+                                               CENTER_DISAGREE_HI_IRE);
+
+            dnWeight = dnReach * cohGate * centerGate;
+        }
+
+        // If both neighbors exist but disagree with each other, reduce the
+        // total authority. Do not pick alternating winners line-by-line unless
+        // one side is clearly better.
+        double neighborAgreementGate = 1.0;
+
         if (haveUp && haveDn) {
-            const double nbrDiffIRE = cmag(ZUp - ZDn) * invI;
-            if (T.VDIS_HARD_FALLBACK && nbrDiffIRE > VDIS_THRESH_IRE) {
-                outFrameIQ[x] = Z0;
-                continue;
-            }
-            if (nbrDiffIRE > VDIS_THRESH_IRE) {
-                const double t = std::clamp(
-                    (nbrDiffIRE - VDIS_THRESH_IRE) / VDIS_RAMP_IRE, 0.0, 1.0);
-                motionGate = std::max(0.0, 1.0 - T.VDIS_SUPPRESS_FACTOR * t);
+            const double dUDIRE = cmag(ZUp - ZDn) * invI;
+
+            neighborAgreementGate = rampDown(dUDIRE,
+                                             NBR_DISAGREE_LO_IRE,
+                                             NBR_DISAGREE_HI_IRE);
+
+            const double better = std::max(upWeight, dnWeight);
+            const double worse  = std::min(upWeight, dnWeight);
+
+            if (better > 1e-9 && worse < 0.35 * better) {
+                if (upWeight < dnWeight)
+                    upWeight = 0.0;
+                else
+                    dnWeight = 0.0;
             }
         }
 
-        // Interfield difference extraction: delta is the component of center
-        // that differs from its interfield neighbors (the per-field error).
-        // Remove it from center, scaled by comb strength and motion gate.
+        const double wsum = upWeight + dnWeight;
+
+        if (wsum <= 1e-9) {
+            outFrameIQ[x] = Z0;
+            continue;
+        }
+
+        const std::complex<double> nbrAvg =
+            (ZUp * upWeight + ZDn * dnWeight) / wsum;
+
+        // Interfield correction proposal.
         const std::complex<double> delta = Z0 - nbrAvg;
-        outFrameIQ[x] = Z0 - delta * (0.5 * COMB_STRENGTH * motionGate);
+
+        double deltaIRE = cmag(delta) * invI;
+        std::complex<double> deltaClamped = delta;
+
+        if (deltaIRE > MAX_DELTA_IRE && deltaIRE > 1e-9) {
+            deltaClamped *= (MAX_DELTA_IRE / deltaIRE);
+            deltaIRE = MAX_DELTA_IRE;
+        }
+
+        // Render-safe authority:
+        // - local candidate evidence controls the correction
+        // - neighbor disagreement suppresses it
+        // - weak one-sided reach does not get full strength
+        const double evidenceGate =
+            std::clamp(0.5 * wsum, 0.0, 1.0);
+
+        const double localStrength =
+            COMB_STRENGTH * evidenceGate * neighborAgreementGate;
+
+        outFrameIQ[x] = Z0 - deltaClamped * (0.5 * localStrength);
+
+        if (!std::isfinite(outFrameIQ[x].real()) ||
+            !std::isfinite(outFrameIQ[x].imag()))
+        {
+            outFrameIQ[x] = Z0;
+        }
     }
 }
 
@@ -1989,6 +2035,10 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     const int right      = videoParameters.activeVideoEnd;
     const int fieldWidth = videoParameters.fieldWidth;
 
+    auto clampH = [&](int x) -> int {
+        return std::clamp(x, left, right - 1);
+    };
+
     // Bounds check
     if ((unsigned)(lineNumber - firstLine) >= (unsigned)(lastLine - firstLine) ||
         (unsigned)(refLineNumber - firstLine) >= (unsigned)(lastLine - firstLine)) {
@@ -2004,16 +2054,7 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // VDIS veto
-    auto clampH = [&](int idx)->int {
-        if (idx < left) return left;
-        if (idx >= right) return right - 1;
-        return idx;
-    };
     const int hh = clampH(h);
-    if (frameBuffer.hasVDIS(lineNumber, hh)) {
-        return result;
-    }
 
     // 1D sample: locked path reads the phase-corrected blind bandpass;
     // bucket path reads clpbuffer[0] directly.
