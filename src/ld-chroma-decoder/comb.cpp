@@ -567,6 +567,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         demodWidth = width;
         demodLines = lines + 1;
         carrierGrammar.assign(demodLines, CombCarrierGrammar{});
+        combReachIndex.bind(&carrierGrammar,
+                            videoParameters.firstActiveFrameLine,
+                            videoParameters.lastActiveFrameLine);
         if (wantLocked) {
             demodTI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             demodTQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
@@ -640,6 +643,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         firstFieldPhaseID,
         secondFieldPhaseID,
         !editSplit);
+    combReachIndex.bind(&carrierGrammar, first, last);
 
     lockedLumaCacheValid = false;
 }
@@ -1076,7 +1080,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double lumFB = getNotchLumaEven2(fieldB, rel, width);
         double lumFR = getNotchLumaEven2Vec(frameB2, rel);
 
-        // VDIS removed: no per-pixel hard/soft VDIS gating in FVF.
 
         double Cpm1 = sampleRawVert(line - 1, rel);
         double Cpp1 = sampleRawVert(line + 1, rel);
@@ -1096,8 +1099,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         // Management veto is consumed here, but its construction stays outside FVF.
         bool managementVeto = (cadenceId == -2);
 
-        // Interfield luma coherence removed: frame sanity now comes from
-        // existing model-distance / management checks, not a duplicate stack detector.
         bool b2VertCoherent = !managementVeto && !frameInsane;
         double targetModel = localUseFrameModel ? FR_s : FA_s;
 
@@ -1124,7 +1125,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double vIRE = vertContrastIRE(rel);
         double hIRE = horizEdgeIRE(rel);
 
-        // Tri-safety was only used by VDIS soft/hard gating; VDIS is removed here.
 
         FvfModelMetrics metrics;
         if (line >= 0 && line < (int)fvfMetrics.size() &&
@@ -1362,7 +1362,179 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
                 no_sharp_reward: ;
             }
-            // Luma-domain neighbor consensus removed in the pruning pass.
+            
+            // Attribution alignment scoring.
+            // Attribution alignment scoring.
+            //
+            // This is not checkerboard suppression. Checkerboards are pathologies to fix
+            // at their source. Here attribution only biases the candidate contest:
+            //   - chroma-claim evidence rewards candidates that align with chroma strength;
+            //   - luma-incursion / cross-color evidence penalizes candidates that depart
+            //     from the 1D rail in luma-claimed regions.
+            {
+                const AttributionEvidence *attrRow = attributionEvidence_line(line);
+            
+                if (attrRow) {
+                    const auto &facts = attrRow[rel].facts;
+                    const auto &ass   = attrRow[rel].assessment;
+            
+                    const double chromaClaim = std::clamp(ass.chromaClaim, 0.0, 1.0);
+                    const double lumaClaim   = std::clamp(ass.lumaClaim,   0.0, 1.0);
+                    const double uncertain   = std::clamp(ass.uncertainClaim, 0.0, 1.0);
+                    const double conflict    = std::clamp(ass.attributionConflict, 0.0, 1.0);
+            
+                    const double attrAuthority =
+                        std::clamp(1.0 - 0.65 * conflict - 0.35 * uncertain, 0.0, 1.0);
+            
+                    if (attrAuthority > 0.0) {
+                        const double aMag = std::fabs(FA) * invI;
+                        const double bMag = std::fabs(FB) * invI;
+                        const double rMag = std::fabs(FR) * invI;
+                        const double cMag = std::fabs(L1) * invI;
+            
+                        const double factA = std::max(0.0, facts.fieldAChromaIRE);
+                        const double factB = std::max(0.0, facts.fieldBChromaIRE);
+                        const double factR = std::max(0.0, facts.frameChromaIRE);
+                        const double factC = std::max(0.0, facts.locked1DChromaIRE);
+            
+                        const double maxFact =
+                            std::max(std::max(factA, factB), std::max(factR, factC));
+            
+                        // Chroma-claim alignment:
+                        // Reward candidates whose chroma magnitude agrees with the
+                        // attribution facts for that candidate family.
+                        if (chromaClaim > 0.0 && maxFact > 1e-9) {
+                            const double denomA = std::max(3.0, std::max(aMag, factA));
+                            const double denomB = std::max(3.0, std::max(bMag, factB));
+                            const double denomR = std::max(3.0, std::max(rMag, factR));
+            
+                            const double aAlign =
+                                1.0 - std::clamp(std::fabs(aMag - factA) / denomA, 0.0, 1.0);
+                            const double bAlign =
+                                1.0 - std::clamp(std::fabs(bMag - factB) / denomB, 0.0, 1.0);
+                            const double rAlign =
+                                1.0 - std::clamp(std::fabs(rMag - factR) / denomR, 0.0, 1.0);
+            
+                            const double chromaReward =
+                                0.12 * attrAuthority * chromaClaim;
+            
+                            scoreA *= (1.0 - chromaReward * aAlign);
+                            scoreB *= (1.0 - chromaReward * bAlign);
+                            scoreR *= (1.0 - chromaReward * rAlign);
+                        }
+            
+                        // Cross-color / luma-incursion pressure:
+                        // This is the detection side you asked about. It enters as a
+                        // luma-pressure term, not as checkerboard suppression.
+                        const double incursionFromFacts = std::clamp(
+                            std::max(facts.lumaIncursionRiskIRE,
+                                     facts.lumaExcursionIRE) / 12.0,
+                            0.0, 1.0);
+            
+                        const double parallaxPressure = std::clamp(
+                            std::max(facts.carrierParallaxLatticeRiskIRE,
+                                     facts.carrierParallaxYSpreadIRE) / 12.0,
+                            0.0, 1.0);
+            
+                        const double residualPressure = std::clamp(
+                            std::max(facts.residualFitErrorIRE,
+                                     ass.lumaResidual) / 12.0,
+                            0.0, 1.0);
+            
+                        const double crossColorPressure = std::clamp(
+                            std::max(incursionFromFacts,
+                                     std::max(parallaxPressure, residualPressure)),
+                            0.0, 1.0);
+            
+                        const double lumaPressure = std::clamp(
+                            std::max(lumaClaim,
+                                     std::max(ass.lumaRisk,
+                                              std::max(ass.lumaShapeContinuation,
+                                                       crossColorPressure))),
+                            0.0, 1.0);
+            
+                        if (lumaPressure > 0.0) {
+                            // Penalize candidates that move away from the 1D rail in a
+                            // luma-claimed / cross-color-claimed region.
+                            const double denom = std::max(3.0, cMag);
+            
+                            const double aTrespass =
+                                std::clamp(std::fabs(aMag - cMag) / denom, 0.0, 1.0);
+                            const double bTrespass =
+                                std::clamp(std::fabs(bMag - cMag) / denom, 0.0, 1.0);
+                            const double rTrespass =
+                                std::clamp(std::fabs(rMag - cMag) / denom, 0.0, 1.0);
+            
+                            const double lumaPenalty =
+                                0.16 * attrAuthority * lumaPressure;
+            
+                            scoreA *= (1.0 + lumaPenalty * aTrespass);
+                            scoreB *= (1.0 + lumaPenalty * bTrespass);
+                            scoreR *= (1.0 + lumaPenalty * rTrespass);
+                        }
+                    }
+                }
+            }
+            // ------------------------------------------------------------
+            // Immediate-neighbor anchor scoring.
+            //
+            // This is image-local neighbor shaping, not same-phase carrier
+            // smoothing.  It biases the election toward candidates that agree
+            // with the immediate local neighborhood before output is formed.
+            // The anchor is only a scoring reference; it is not an output
+            // plane and it does not replace the elected candidate.
+            // ------------------------------------------------------------
+            {
+                const int xm1 = std::max(0, rel - 1);
+                const int xp1 = std::min(width - 1, rel + 1);
+
+                const double aAnchor = 0.5 * (fieldAData[xm1] + fieldAData[xp1]);
+                const double bAnchor = 0.5 * (fieldB[xm1]     + fieldB[xp1]);
+                const double rAnchor = 0.5 * (frameB2[xm1]    + frameB2[xp1]);
+                const double cAnchor = 0.5 * (sample1D(xm1)   + sample1D(xp1));
+
+                const double sumAnchor = aAnchor + bAnchor + rAnchor + cAnchor;
+                const double minAnchor = std::min(std::min(aAnchor, bAnchor),
+                                                  std::min(rAnchor, cAnchor));
+                const double maxAnchor = std::max(std::max(aAnchor, bAnchor),
+                                                  std::max(rAnchor, cAnchor));
+
+                // Trimmed mean of the four local anchors.  This avoids making
+                // any single candidate plane self-certifying while remaining
+                // cheaper than a sort/median pass.
+                const double neighborAnchor = 0.5 * (sumAnchor - minAnchor - maxAnchor);
+
+                auto anchorPenalty = [](double dIRE) -> double {
+                    const double LO_IRE = 0.75;
+                    const double HI_IRE = 5.50;
+                    return std::clamp((dIRE - LO_IRE) /
+                                      (HI_IRE - LO_IRE), 0.0, 1.0);
+                };
+
+                // Do not let the anchor act like a blur across a strong local
+                // transition.  The transition-sharpness subsystem handles those
+                // cases; this anchor is for local selection stability/clarity.
+                const double localStepIRE = std::fabs(sample1D(xp1) - sample1D(xm1)) * invI;
+                double anchorAuthority = 1.0 -
+                    std::clamp((localStepIRE - 4.0) / (12.0 - 4.0), 0.0, 1.0);
+
+                // In strong saturation, keep some influence but do not let the
+                // anchor fight saturation policy.
+                anchorAuthority *= (1.0 - 0.35 * sat_t);
+
+                if (anchorAuthority > 0.0) {
+                    const double W_NEIGHBOR_ANCHOR = 0.10;
+                    const double wAnchor = W_NEIGHBOR_ANCHOR * anchorAuthority;
+
+                    const double dA = std::fabs(FA - neighborAnchor) * invI;
+                    const double dB = std::fabs(FB - neighborAnchor) * invI;
+                    const double dR = std::fabs(FR - neighborAnchor) * invI;
+
+                    scoreA *= (1.0 + wAnchor * anchorPenalty(dA));
+                    scoreB *= (1.0 + wAnchor * anchorPenalty(dB));
+                    scoreR *= (1.0 + wAnchor * anchorPenalty(dR));
+                }
+            }
 
             // When the fields disagree in interlace, use 1D as a soft reality
             // check to favor the field that is less likely to be alternating.

@@ -32,6 +32,7 @@
 #include "lddecodemetadata.h"
 #include "attributiondefs.h"
 #include "carriergrammar.h"
+#include "comb_reach_index.h"
 #include "combmath.h"
 #include "componentframe.h"
 #include "decoder.h"
@@ -419,6 +420,9 @@ private:
 		double coherence = 1.0;
 		double kScore = 0.0;
 		double weight = 1.0;
+		lddecode::CombReachReply scalarReach;
+		lddecode::CombReachReply iqReach;
+		double scalarReachGate = 1.0; // phase/source-frame legality for scalar reach operations
 		double reachGate = 1.0;       // shared IQ/contour limiter for this side's vertical reach
 		double iqReachGate = 1.0;     // locked-IQ material match limiter
 		double contourReachGate = 1.0;// scalar contour limiter (same-field reaches)
@@ -502,6 +506,7 @@ private:
 											 double *lumaSmooth) const;
 	ComponentFrame *componentFrame = nullptr;
 	std::vector<CombCarrierGrammar> carrierGrammar;
+	lddecode::CombReachIndex combReachIndex;
 
 	// Flat/contiguous buffers (lines x width)
 	// Line-local locked IQ after burst alignment and affine trim.
@@ -722,6 +727,16 @@ private:
 	inline double remodGrammarToComposite(int line, int h,
 	                                      double I, double Q) const {
 		return remodUnsignedBucketToComposite(line, h, I, Q);
+	}
+
+	inline lddecode::CombReachSourceFrame scalarReachSource() const {
+		return configuration.phaseCompensation
+			? lddecode::makeLockedCommonPhaseScalarReachSource()
+			: lddecode::makeBucketScalarReachSource();
+	}
+
+	inline lddecode::CombReachSourceFrame iqReachSource() const {
+		return lddecode::makeGrid4fscIQReachSource();
 	}
 		
 	CombTapLine scratch_tapLine;

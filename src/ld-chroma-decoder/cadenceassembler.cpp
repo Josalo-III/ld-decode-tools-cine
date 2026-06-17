@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 namespace {
 
@@ -75,6 +76,21 @@ namespace {
         if (v < 0.0) return 0;
         if (v > 65535.0) return 65535;
         return static_cast<quint16>(std::llround(v));
+    }
+
+    static inline QString pulldownRoleForCadenceId(int cid)
+    {
+        if (isDefinitionalRole(cid)) return QStringLiteral("definitional");
+        if (isSpareRole(cid)) return QStringLiteral("spare");
+        return QString();
+    }
+
+    static inline void stampForcedCadence(SourceField& field, int cadenceId)
+    {
+        field.field.cinemap.inUse = true;
+        field.field.cinemap.cadenceId = cadenceId;
+        field.field.cinemap.cadenceIndexPresumed = true;
+        field.field.cinemap.pulldownRole = pulldownRoleForCadenceId(cadenceId);
     }
     
     // Merge a doplGang A/C spare field into its definitional partner.
@@ -470,8 +486,11 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         return idx; // 0..9
     };
 
-    auto emitTelecine2 = [&](char label, SourceField&& f1, SourceField&& f2,
+    auto emitTelecine2 = [&](char label, SourceField&& f1, int cid1,
+                             SourceField&& f2, int cid2,
                              WorkItem::Expansion ex = WorkItem::Expansion::None) {
+        stampForcedCadence(f1, cid1);
+        stampForcedCadence(f2, cid2);
         bool swapped = orderPairForComb(f1, f2);
         WorkItem wi;
         wi.kind               = WorkItem::Kind::TelecineFrame;
@@ -508,12 +527,15 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         if (idx == 0) {
             if (window.size() < 2) break;
             auto [def, comp] = pop2();
+            stampForcedCadence(def, 0);
+            stampForcedCadence(comp, 1);
 
             WorkItem::Expansion ex = WorkItem::Expansion::None;
 
             // If the next slot is 2, consume it as A-spare (if present).
             if (!window.empty() && cycleIndex(forcedFieldIndex) == 2) {
                 SourceField spare = pop1();
+                stampForcedCadence(spare, 2);
                 if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
                     ex = WorkItem::Expansion::Trailing;
                 } else {
@@ -521,7 +543,7 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                 }
             }
 
-            emitTelecine2('A', std::move(def), std::move(comp), ex);
+            emitTelecine2('A', std::move(def), 0, std::move(comp), 1, ex);
             continue;
         }
 
@@ -535,7 +557,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         if (idx == 3) {
             if (window.size() < 2) break;
             auto [f3, f4] = pop2();
-            emitTelecine2('B', std::move(f3), std::move(f4), WorkItem::Expansion::None);
+            emitTelecine2('B', std::move(f3), 3, std::move(f4), 4,
+                          WorkItem::Expansion::None);
             continue;
         }
 
@@ -545,6 +568,9 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                 SourceField spare = pop1(); // 5
                 SourceField comp  = pop1(); // 6
                 SourceField def   = pop1(); // 7
+                stampForcedCadence(spare, 5);
+                stampForcedCadence(comp, 6);
+                stampForcedCadence(def, 7);
         
                 WorkItem::Expansion ex = WorkItem::Expansion::None;
                 if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
@@ -552,7 +578,7 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                 } else {
                     releaseToBaseline(std::move(spare));
                 }
-                emitTelecine2('C', std::move(comp), std::move(def), ex);
+                emitTelecine2('C', std::move(comp), 6, std::move(def), 7, ex);
                 continue;
             }
         
@@ -566,7 +592,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         if (idx == 6) {
             if (window.size() < 2) break;
             auto [comp, def] = pop2();
-            emitTelecine2('C', std::move(comp), std::move(def), WorkItem::Expansion::None);
+            emitTelecine2('C', std::move(comp), 6, std::move(def), 7,
+                          WorkItem::Expansion::None);
             continue;
         }
 
@@ -574,7 +601,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         if (idx == 8) {
             if (window.size() < 2) break;
             auto [f8, f9] = pop2();
-            emitTelecine2('D', std::move(f8), std::move(f9), WorkItem::Expansion::None);
+            emitTelecine2('D', std::move(f8), 8, std::move(f9), 9,
+                          WorkItem::Expansion::None);
             continue;
         }
 
@@ -597,24 +625,28 @@ void CadenceAssembler::processWindowForced(bool flushMode)
             if (idx == 0) {
                 if (window.size() < 2) break;
                 auto [def, comp] = pop2();
+                stampForcedCadence(def, 0);
+                stampForcedCadence(comp, 1);
 
                 WorkItem::Expansion ex = WorkItem::Expansion::None;
                 if (!window.empty() && cycleIndex(forcedFieldIndex) == 2) {
                     SourceField spare = pop1();
+                    stampForcedCadence(spare, 2);
                     if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
                         ex = WorkItem::Expansion::Trailing;
                     } else {
                         releaseToBaseline(std::move(spare));
                     }
                 }
-                emitTelecine2('A', std::move(def), std::move(comp), ex);
+                emitTelecine2('A', std::move(def), 0, std::move(comp), 1, ex);
                 continue;
             }
 
             if (idx == 3) {
                 if (window.size() < 2) break;
                 auto [f3, f4] = pop2();
-                emitTelecine2('B', std::move(f3), std::move(f4), WorkItem::Expansion::None);
+                emitTelecine2('B', std::move(f3), 3, std::move(f4), 4,
+                              WorkItem::Expansion::None);
                 continue;
             }
 
@@ -623,6 +655,9 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                     SourceField spare = pop1();
                     SourceField comp  = pop1();
                     SourceField def   = pop1();
+                    stampForcedCadence(spare, 5);
+                    stampForcedCadence(comp, 6);
+                    stampForcedCadence(def, 7);
             
                     WorkItem::Expansion ex = WorkItem::Expansion::None;
                     if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
@@ -630,7 +665,7 @@ void CadenceAssembler::processWindowForced(bool flushMode)
                     } else {
                         releaseToBaseline(std::move(spare));
                     }
-                    emitTelecine2('C', std::move(comp), std::move(def), ex);
+                    emitTelecine2('C', std::move(comp), 6, std::move(def), 7, ex);
                     continue;
                 }
                 // Incomplete triple at flush — release whatever's left
@@ -640,14 +675,16 @@ void CadenceAssembler::processWindowForced(bool flushMode)
             if (idx == 6) {
                 if (window.size() < 2) break;
                 auto [comp, def] = pop2();
-                emitTelecine2('C', std::move(comp), std::move(def), WorkItem::Expansion::None);
+                emitTelecine2('C', std::move(comp), 6, std::move(def), 7,
+                              WorkItem::Expansion::None);
                 continue;
             }
 
             if (idx == 8) {
                 if (window.size() < 2) break;
                 auto [f8, f9] = pop2();
-                emitTelecine2('D', std::move(f8), std::move(f9), WorkItem::Expansion::None);
+                emitTelecine2('D', std::move(f8), 8, std::move(f9), 9,
+                              WorkItem::Expansion::None);
                 continue;
             }
             while (!window.empty()) releaseToBaseline(pop1());

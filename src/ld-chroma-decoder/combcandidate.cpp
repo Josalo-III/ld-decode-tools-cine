@@ -308,6 +308,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
     const double invI = invIreScale;
+    const lddecode::CombReachSourceFrame scalarSource = scalarReachSource();
+    const lddecode::CombReachSourceFrame iqSource = iqReachSource();
 
     auto coherenceAt = [&](const std::vector<CombTapIQ> &nbrIQ, bool haveNbrIQ, int rel)->double {
         rel = std::clamp(rel, 0, width - 1);
@@ -325,6 +327,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     auto fillPair = [&](const std::vector<CombTapScalar> &nbr,
                         const std::vector<CombTapIQ> &nbrIQ,
                         const double *nbrLuma,
+                        int targetLine,
                         bool haveNbr,
                         bool haveNbrIQ,
                         std::vector<CombTapPair> &dst) {
@@ -337,6 +340,21 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         for (int rel = 0; rel < width; ++rel) {
             CombTapPair &p = dst[rel];
             p = CombTapPair();
+            const int h = left + rel;
+            p.scalarReach = combReachIndex.query({
+                lineNumber,
+                targetLine,
+                h,
+                h,
+                lddecode::CombReachUse::FieldScalarAverage,
+                scalarSource});
+            p.iqReach = combReachIndex.query({
+                lineNumber,
+                targetLine,
+                h,
+                h,
+                lddecode::CombReachUse::IQCompare,
+                iqSource});
             const CombTapScalar &c = tapLine.tap0[rel];
             const CombTapScalar &n = nbr[rel];
             if (haveNbr) {
@@ -367,12 +385,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     };
 
     if (wantFrame) {
-        fillPair(tapLine.tapU1, tapLine.tapU1IQ, lumaU1, tapLine.haveU1, tapLine.haveIQU1, tapLine.pairU1);
-        fillPair(tapLine.tapD1, tapLine.tapD1IQ, lumaD1, tapLine.haveD1, tapLine.haveIQD1, tapLine.pairD1);
+        fillPair(tapLine.tapU1, tapLine.tapU1IQ, lumaU1, tapLine.lnU1, tapLine.haveU1, tapLine.haveIQU1, tapLine.pairU1);
+        fillPair(tapLine.tapD1, tapLine.tapD1IQ, lumaD1, tapLine.lnD1, tapLine.haveD1, tapLine.haveIQD1, tapLine.pairD1);
     }
     if (wantFieldA || wantFieldB) {
-        fillPair(tapLine.tapU2, tapLine.tapU2IQ, lumaU2, tapLine.haveU2, tapLine.haveIQU2, tapLine.pairU2);
-        fillPair(tapLine.tapD2, tapLine.tapD2IQ, lumaD2, tapLine.haveD2, tapLine.haveIQD2, tapLine.pairD2);
+        fillPair(tapLine.tapU2, tapLine.tapU2IQ, lumaU2, tapLine.lnU2, tapLine.haveU2, tapLine.haveIQU2, tapLine.pairU2);
+        fillPair(tapLine.tapD2, tapLine.tapD2IQ, lumaD2, tapLine.lnD2, tapLine.haveD2, tapLine.haveIQD2, tapLine.pairD2);
     }
 
     auto sampleTapComp = [&](const std::vector<CombTapScalar> &tap, int rel)->double {
@@ -516,8 +534,19 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 dnContourGate = 0.25 + 0.75 * c.dnTrust;
             }
 
-            upPair[rel].iqReachGate = upGate;
-            dnPair[rel].iqReachGate = dnGate;
+            const double upScalarGate =
+                upPair[rel].scalarReach.allowScalarAverage ? 1.0 : 0.0;
+            const double dnScalarGate =
+                dnPair[rel].scalarReach.allowScalarAverage ? 1.0 : 0.0;
+            const double upIQGate =
+                upPair[rel].iqReach.allowIQCompare ? 1.0 : 0.0;
+            const double dnIQGate =
+                dnPair[rel].iqReach.allowIQCompare ? 1.0 : 0.0;
+
+            upPair[rel].scalarReachGate = upScalarGate;
+            dnPair[rel].scalarReachGate = dnScalarGate;
+            upPair[rel].iqReachGate = upGate * upIQGate;
+            dnPair[rel].iqReachGate = dnGate * dnIQGate;
             upPair[rel].contourReachGate = upContourGate;
             dnPair[rel].contourReachGate = dnContourGate;
             upPair[rel].reachGate = std::clamp(upGate * upContourGate, 0.0, 1.0);
@@ -871,8 +900,10 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
         const double Cup4 = tapLine.tapU4[rel].comp;
         const double Cdn4 = tapLine.tapD4[rel].comp;
 
-        const double reachUp2 = tapLine.pairU2[rel].reachGate;
-        const double reachDn2 = tapLine.pairD2[rel].reachGate;
+        const double reachUp2 = tapLine.pairU2[rel].reachGate *
+                                tapLine.pairU2[rel].scalarReachGate;
+        const double reachDn2 = tapLine.pairD2[rel].reachGate *
+                                tapLine.pairD2[rel].scalarReachGate;
         double wUp2 = tapLine.pairU2[rel].weight * reachUp2;
         double wDn2 = tapLine.pairD2[rel].weight * reachDn2;
         const CombTapContour &curve = tapLine.contour[rel];
@@ -1100,6 +1131,10 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
         wUp = std::clamp(wUp, 0.0, 1.0);
         wDn = std::clamp(wDn, 0.0, 1.0);
+        if (rel < (int)tapLine.pairU2.size())
+            wUp *= tapLine.pairU2[rel].scalarReachGate;
+        if (rel < (int)tapLine.pairD2.size())
+            wDn *= tapLine.pairD2[rel].scalarReachGate;
 
         // Edge amounts are measured before any support cull, but they do not
         // alter support. They only modulate the final vertical authority.
@@ -1143,11 +1178,15 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
             const double sumUD = std::fabs(Cup + Cdn);
 
             if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
-                wUp = 1.0;
-                wDn = 1.0;
+                wUp = (rel < (int)tapLine.pairU2.size())
+                    ? tapLine.pairU2[rel].scalarReachGate
+                    : 1.0;
+                wDn = (rel < (int)tapLine.pairD2.size())
+                    ? tapLine.pairD2[rel].scalarReachGate
+                    : 1.0;
                 sc = 1.0;
-                haveAnswer = true;
-                revivedUD = true;
+                haveAnswer = (wUp > 0.0 || wDn > 0.0);
+                revivedUD = haveAnswer;
             } else {
                 wUp = 0.0;
                 wDn = 0.0;
@@ -1450,8 +1489,10 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             x < (int)reachTapLine->pairU1.size() &&
             x < (int)reachTapLine->pairD1.size())
         {
-            sharedUpGate = std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0);
-            sharedDnGate = std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0);
+            sharedUpGate = std::clamp(reachTapLine->pairU1[x].iqReachGate *
+                                      reachTapLine->pairU1[x].contourReachGate, 0.0, 1.0);
+            sharedDnGate = std::clamp(reachTapLine->pairD1[x].iqReachGate *
+                                      reachTapLine->pairD1[x].contourReachGate, 0.0, 1.0);
             // Frame A should not dither between comb/no-comb on a straight
             // vertical column. Keep the limiter available for bends and
             // unrelated material, but force a minimum reach when contour
@@ -1888,8 +1929,10 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
             x < (int)reachTapLine->pairU1.size() &&
             x < (int)reachTapLine->pairD1.size())
         {
-            upReach = std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0);
-            dnReach = std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0);
+            upReach = std::clamp(reachTapLine->pairU1[x].iqReachGate *
+                                 reachTapLine->pairU1[x].contourReachGate, 0.0, 1.0);
+            dnReach = std::clamp(reachTapLine->pairD1[x].iqReachGate *
+                                 reachTapLine->pairD1[x].contourReachGate, 0.0, 1.0);
         }
 
         if (upReach <= 0.02)
@@ -2046,10 +2089,16 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // Phase check
-    const qint32 wantPhase = carrierOppositeSampleClass(refLineNumber, refH);
-    const qint32 havePhase = frameBuffer.carrierSignedSampleClass(lineNumber, h);
-    if (wantPhase != havePhase) {
+    const lddecode::CombReachReply phaseReach = combReachIndex.queryAgainst(
+        frameBuffer.combReachIndex,
+        {refLineNumber,
+         lineNumber,
+         refH,
+         h,
+         lddecode::CombReachUse::ScalarSignCompare,
+         lddecode::makeBucketScalarReachSource()});
+    if (!phaseReach.allowScalarSignCompare ||
+        phaseReach.carrierRelation != lddecode::CarrierPhaseRelation::Opposite) {
         result.penalty = 1000.0;
         return result;
     }

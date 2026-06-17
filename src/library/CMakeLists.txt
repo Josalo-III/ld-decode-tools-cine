@@ -1,4 +1,5 @@
 add_library(lddecode-library STATIC
+    tbc/comb_reach_index.cpp
     tbc/carriergrammar.cpp
     tbc/dropouts.cpp
     tbc/filters.cpp
