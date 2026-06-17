@@ -752,21 +752,314 @@ void Comb::FrameBuffer::computeContourFieldLine(int lineNumber,
                                           double *outFieldLine,
                                           double  *outGate)
 {
-    const int width = videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
 
-    if (width <= 0 || lineNumber < first || lineNumber >= last) {
-        if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
-        if (outGate)      std::fill(outGate,      outGate      + std::max(width, 0), 1.0f);
+    if (width <= 0 || !outFieldLine) {
+        if (outGate && width > 0)
+            std::fill(outGate, outGate + width, 1.0f);
         return;
     }
-    if (!outFieldLine) return;
 
-    if (outGate) std::fill(outGate, outGate + width, 1.0f);
+    if (lineNumber < first || lineNumber >= last) {
+        std::fill(outFieldLine, outFieldLine + width, 0.0);
+        if (outGate) std::fill(outGate, outGate + width, 1.0f);
+        return;
+    }
 
-    const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
-    computeContourFieldLine(tapLine, outFieldLine, outGate);
+    if (outGate)
+        std::fill(outGate, outGate + width, 1.0f);
+
+    auto clampSameFieldLine = [&](int ln) -> int {
+        // For intrafield sampling we must stay on the same field parity as lineNumber.
+        // Plain clamping can jump to the opposite field at the top/bottom edges.
+        const int parity = lineNumber & 1;
+
+        ln = std::clamp(ln, first, last - 1);
+
+        if ((ln & 1) != parity) {
+            // Prefer stepping inward rather than outward.
+            if (ln + 1 < last && ((ln + 1) & 1) == parity)
+                ln = ln + 1;
+            else if (ln - 1 >= first && ((ln - 1) & 1) == parity)
+                ln = ln - 1;
+        }
+
+        return ln;
+    };
+
+    const int ln0   = clampSameFieldLine(lineNumber);
+    const int lnUp2 = clampSameFieldLine(lineNumber - 2);
+    const int lnDn2 = clampSameFieldLine(lineNumber + 2);
+    const int lnUp4 = clampSameFieldLine(lineNumber - 4);
+    const int lnDn4 = clampSameFieldLine(lineNumber + 4);
+
+    const double *row0   = nullptr;
+    const double *rowUp2 = nullptr;
+    const double *rowDn2 = nullptr;
+    const double *rowUp4 = nullptr;
+    const double *rowDn4 = nullptr;
+
+    if (configuration.phaseCompensation) {
+        auto getRow = [&](int ln) -> const double* {
+            if (ln < 0 || ln >= (int)locked1DSource.size())
+                return nullptr;
+
+            const auto &row = locked1DSource[ln];
+            if ((int)row.size() < width)
+                return nullptr;
+
+            return row.data();
+        };
+
+        row0   = getRow(ln0);
+        rowUp2 = getRow(lnUp2);
+        rowDn2 = getRow(lnDn2);
+        rowUp4 = getRow(lnUp4);
+        rowDn4 = getRow(lnDn4);
+    } else {
+        row0   = clpbuffer[0].pixel[ln0]   + left;
+        rowUp2 = clpbuffer[0].pixel[lnUp2] + left;
+        rowDn2 = clpbuffer[0].pixel[lnDn2] + left;
+        rowUp4 = clpbuffer[0].pixel[lnUp4] + left;
+        rowDn4 = clpbuffer[0].pixel[lnDn4] + left;
+    }
+
+    if (!row0) {
+        std::fill(outFieldLine, outFieldLine + width, 0.0);
+        if (outGate) std::fill(outGate, outGate + width, 1.0f);
+        return;
+    }
+
+    // If any vertical support row is unavailable, preserve the local source.
+    // This only removes synthetic zero collapse; it does not create a new
+    // partial-comb behavior.
+    if (!rowUp2 || !rowDn2 || !rowUp4 || !rowDn4) {
+        std::copy(row0, row0 + width, outFieldLine);
+        if (outGate) std::fill(outGate, outGate + width, 0.0f);
+        return;
+    }
+
+    const auto  &T    = configuration.tunables;
+    const double invI = this->invIreScale;
+
+    // Phase relationship range, in source units.
+    const double kRange = T.FIELD_K_RANGE_IRE * irescale;
+    const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
+
+    // Luma-edge exclusion for far reach. This prevents reaching across
+    // disparate vertical regions.
+    const double EDGE_SOFT_IRE = 6.0;
+    const double EDGE_HARD_IRE = 14.0;
+
+    auto edgeGateAt = [&](int rel) -> double {
+        const int rm1 = (rel > 0) ? (rel - 1) : 0;
+        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
+
+        const double eIRE = std::fabs(row0[rp1] - row0[rm1]) * invI;
+
+        if (eIRE <= EDGE_SOFT_IRE) return 1.0;
+        if (eIRE >= EDGE_HARD_IRE) return 0.0;
+
+        double t = (eIRE - EDGE_SOFT_IRE) / (EDGE_HARD_IRE - EDGE_SOFT_IRE);
+        t = std::clamp(t, 0.0, 1.0);
+        return 1.0 - t;
+    };
+
+    auto phaseDiffMetric = [&](double C0,
+                               double sym0,
+                               double Cn,
+                               double symn) -> double
+    {
+        double k = 0.0;
+
+        k  = std::fabs(std::fabs(C0) - std::fabs(Cn));
+        k += std::fabs(sym0 - symn);
+
+        // Small bonus for strong signal; helps avoid weak/noisy toggles.
+        k -= (std::fabs(C0) + std::fabs(Cn)) * 0.10;
+
+        if (k < 0.0)
+            k = 0.0;
+
+        return k;
+    };
+
+    for (int h = left; h < right; ++h) {
+        const int rel = h - left;
+
+        const int rm1 = (rel > 0) ? (rel - 1) : 0;
+        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
+
+        // Center and symmetric lateral context.
+        const double C    = row0[rel];
+        const double C_m1 = row0[rm1];
+        const double C_p1 = row0[rp1];
+
+        const double symCur =
+            0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
+
+        // Near samples, ±2 same-field.
+        const double U2    = rowUp2[rel];
+        const double D2    = rowDn2[rel];
+        const double U2_m1 = rowUp2[rm1];
+        const double U2_p1 = rowUp2[rp1];
+        const double D2_m1 = rowDn2[rm1];
+        const double D2_p1 = rowDn2[rp1];
+
+        const double symU2 =
+            0.5 * (std::fabs(U2_m1) + std::fabs(U2_p1));
+
+        const double symD2 =
+            0.5 * (std::fabs(D2_m1) + std::fabs(D2_p1));
+
+        // Far samples, ±4 same-field.
+        const double U4    = rowUp4[rel];
+        const double D4    = rowDn4[rel];
+        const double U4_m1 = rowUp4[rm1];
+        const double U4_p1 = rowUp4[rp1];
+        const double D4_m1 = rowDn4[rm1];
+        const double D4_p1 = rowDn4[rp1];
+
+        const double symU4 =
+            0.5 * (std::fabs(U4_m1) + std::fabs(U4_p1));
+
+        const double symD4 =
+            0.5 * (std::fabs(D4_m1) + std::fabs(D4_p1));
+
+        // ------------------------------------------------------------
+        // Near weights, same original logic.
+        // ------------------------------------------------------------
+        const double kp2 = phaseDiffMetric(C, symCur, U2, symU2);
+        const double kn2 = phaseDiffMetric(C, symCur, D2, symD2);
+
+        double wUp2 = (kRange > 1e-9) ? (1.0 - kp2 * invK) : 1.0;
+        double wDn2 = (kRange > 1e-9) ? (1.0 - kn2 * invK) : 1.0;
+
+        wUp2 = std::clamp(wUp2, 0.0, 1.0);
+        wDn2 = std::clamp(wDn2, 0.0, 1.0);
+
+        double sc2 = 1.0;
+        bool haveNear = false;
+
+        if (wUp2 > 0.0 || wDn2 > 0.0) {
+            if (wDn2 > 3.0 * wUp2)
+                wUp2 = 0.0;
+            else if (wUp2 > 3.0 * wDn2)
+                wDn2 = 0.0;
+
+            const double denom = wUp2 + wDn2;
+
+            if (denom > 1e-9) {
+                sc2 = 2.0 / denom;
+                if (sc2 < 1.0)
+                    sc2 = 1.0;
+
+                haveNear = true;
+            } else {
+                wUp2 = 0.0;
+                wDn2 = 0.0;
+            }
+        } else {
+            // If up/down are similar to each other, allow both.
+            const double dMag  = std::fabs(std::fabs(U2) - std::fabs(D2));
+            const double sumUD = std::fabs(U2 + D2);
+
+            if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
+                wUp2 = 1.0;
+                wDn2 = 1.0;
+                sc2 = 1.0;
+                haveNear = true;
+            } else {
+                wUp2 = 0.0;
+                wDn2 = 0.0;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Far weights, same original logic: ramped by near confidence and
+        // horizontal edge gate.
+        // ------------------------------------------------------------
+        const double kp4 = phaseDiffMetric(C, symCur, U4, symU4);
+        const double kn4 = phaseDiffMetric(C, symCur, D4, symD4);
+
+        double wUp4 = (kRange > 1e-9) ? (1.0 - kp4 * invK) : 1.0;
+        double wDn4 = (kRange > 1e-9) ? (1.0 - kn4 * invK) : 1.0;
+
+        wUp4 = std::clamp(wUp4, 0.0, 1.0);
+        wDn4 = std::clamp(wDn4, 0.0, 1.0);
+
+        const double nearConfUp = wUp2;
+        const double nearConfDn = wDn2;
+
+        const double eGate = edgeGateAt(rel);
+
+        wUp4 *= nearConfUp * eGate;
+        wDn4 *= nearConfDn * eGate;
+
+        const double FAR_SCALE = 0.65;
+        wUp4 *= FAR_SCALE;
+        wDn4 *= FAR_SCALE;
+
+        // ------------------------------------------------------------
+        // Combine near and far components.
+        //
+        // Original behavior is preserved when any component exists.
+        // Only the true no-answer collapse is changed from zero to C.
+        // ------------------------------------------------------------
+        double tc = 0.0;
+        bool haveAnswer = false;
+
+        if (haveNear && (wUp2 > 0.0 || wDn2 > 0.0)) {
+            double t2  = (C - U2) * wUp2 * sc2;
+            t2        += (C - D2) * wDn2 * sc2;
+            t2        *= 0.25;
+
+            tc += t2;
+            haveAnswer = true;
+        }
+
+        if (wUp4 > 0.0 || wDn4 > 0.0) {
+            const double denom = wUp4 + wDn4;
+
+            if (denom > 1e-9) {
+                double sc4 = 2.0 / denom;
+                if (sc4 < 1.0)
+                    sc4 = 1.0;
+
+                double t4  = (C - U4) * wUp4 * sc4;
+                t4        += (C - D4) * wDn4 * sc4;
+                t4        *= 0.25;
+
+                tc += t4;
+                haveAnswer = true;
+            }
+        }
+
+        if (!haveAnswer)
+            tc = C;
+
+        if (!std::isfinite(tc))
+            tc = C;
+
+        outFieldLine[rel] = tc;
+
+        // Gate for scorer: how confident is A here?
+        // Use near confidence primarily, with far only if present.
+        double gateA = std::max(wUp2, wDn2);
+        gateA = std::max(gateA, 0.5 * std::max(wUp4, wDn4));
+        gateA = std::clamp(gateA, 0.0, 1.0);
+
+        if (!haveAnswer)
+            gateA = 0.0;
+
+        if (outGate)
+            outGate[rel] = (float)gateA;
+    }
 }
 
 void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
@@ -864,276 +1157,177 @@ void Comb::FrameBuffer::computeSimpleFieldLine(int lineNumber, double *outFieldL
     computeSimpleFieldLine(tapLine, outFieldLine);
 }
 
-void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine, double *outFieldLine)
+void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
+                                               double *outFieldLine)
 {
-    const int width = tapLine.width;
-    if (width <= 0 || !outFieldLine || (int)tapLine.tap0.size() < width) {
-        if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+
+    const int lineNumber = tapLine.cacheLine;
+
+    if (width <= 0 || !outFieldLine)
+        return;
+
+    if (lineNumber < first || lineNumber >= last) {
+        std::fill(outFieldLine, outFieldLine + width, 0.0);
         return;
     }
 
-    static const int diagLine = []{
-        const char *s = std::getenv("CC_DIAG_LINE");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int diagC0 = []{
-        const char *s = std::getenv("CC_DIAG_C0");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int diagC1 = []{
-        const char *s = std::getenv("CC_DIAG_C1");
-        return s ? std::atoi(s) : -1;
-    }();
+    auto clampSameFieldLine = [&](int ln) -> int {
+        const int parity = lineNumber & 1;
 
-    const bool wantDiag = (tapLine.cacheLine == diagLine &&
-                           diagC0 >= 0 && diagC1 >= diagC0);
+        ln = std::clamp(ln, first, last - 1);
 
-    const bool have2 = tapLine.haveU2 && tapLine.haveD2 &&
-                       (int)tapLine.tapU2.size() >= width &&
-                       (int)tapLine.tapD2.size() >= width &&
-                       (int)tapLine.pairU2.size() >= width &&
-                       (int)tapLine.pairD2.size() >= width;
+        if ((ln & 1) != parity) {
+            if (ln + 1 < last && ((ln + 1) & 1) == parity)
+                ln = ln + 1;
+            else if (ln - 1 >= first && ((ln - 1) & 1) == parity)
+                ln = ln - 1;
+        }
 
-    const bool have1Guard = tapLine.haveU1 && tapLine.haveD1 &&
-                            (int)tapLine.tapU1.size() >= width &&
-                            (int)tapLine.tapD1.size() >= width;
+        return ln;
+    };
 
-    const bool have4 = tapLine.haveU4 && tapLine.haveD4 &&
-                       (int)tapLine.tapU4.size() >= width &&
-                       (int)tapLine.tapD4.size() >= width &&
-                       (int)tapLine.contour.size() >= width;
+    const int ln0   = clampSameFieldLine(lineNumber);
+    const int lnUp2 = clampSameFieldLine(lineNumber - 2);
+    const int lnDn2 = clampSameFieldLine(lineNumber + 2);
 
-    if (wantDiag) {
-        std::fprintf(stderr,
-                     "FIELDBDIAG line=%d lnU1=%d lnD1=%d lnU2=%d lnD2=%d cols=%d..%d have1Guard=%d have2=%d have4=%d\n",
-                     tapLine.cacheLine,
-                     tapLine.lnU1, tapLine.lnD1,
-                     tapLine.lnU2, tapLine.lnD2,
-                     diagC0, diagC1,
-                     have1Guard ? 1 : 0,
-                     have2 ? 1 : 0,
-                     have4 ? 1 : 0);
+    auto getRow = [&](int ln) -> const double* {
+        if (ln < first || ln >= last)
+            return nullptr;
+
+        if (configuration.phaseCompensation)
+            return locked1DSource_line(ln);
+
+        const double *row = bucketScalar1D_line(ln);
+        return row ? (row + left) : nullptr;
+    };
+
+    const double *row0   = getRow(ln0);
+    const double *rowUp2 = getRow(lnUp2);
+    const double *rowDn2 = getRow(lnDn2);
+
+    if (!row0) {
+        std::fill(outFieldLine, outFieldLine + width, 0.0);
+        return;
     }
 
-    auto smoothGateLocal = [](double x, double soft, double hard)->double {
-        if (x <= soft) return 1.0;
-        if (x >= hard) return 0.0;
-        const double t = (x - soft) / std::max(1e-9, hard - soft);
-        return 1.0 - std::clamp(t, 0.0, 1.0);
-    };
+    // Preserve local source if vertical support rows are unavailable.
+    // This is not a new fallback regime; it only avoids synthetic zero.
+    if (!rowUp2 || !rowDn2) {
+        std::copy(row0, row0 + width, outFieldLine);
+        return;
+    }
 
-    auto sameSign = [](double a, double b)->bool {
-        if (std::fabs(a) < 1e-12 || std::fabs(b) < 1e-12) return false;
-        return (a > 0.0) == (b > 0.0);
-    };
+    const auto &T = configuration.tunables;
 
-    // Anti-phase reach guard.
-    //
-    // .comp here is 1D-bandpassed chroma. Genuine chroma is anti-phase across
-    // same-field ±2 reaches. In-phase material is likely luma leak/cross-color
-    // trespass and should reduce Field B authority.
-    //
-    // This is not horizontal/lateral influence. It only looks at the local
-    // vertical pair relation over a short carrier-window neighborhood.
-    auto antiPhaseReach = [&](const std::vector<CombTapScalar> &nbr, int rel)->double {
-        double acc = 0.0, norm = 0.0;
-        for (int k = -2; k <= 2; ++k) {
-            const int r = std::clamp(rel + k, 0, width - 1);
-            const double a = tapLine.tap0[r].comp;
-            const double b = nbr[r].comp;
-            acc  += a * b;
-            norm += a * a + b * b;
-        }
-
-        if (norm <= 1e-12) return 1.0;
-
-        const double c = 2.0 * acc / norm;
-        return 1.0 - std::clamp(c, 0.0, 1.0);
-    };
+    const double kRange = T.FIELD_K_RANGE_IRE * irescale;
+    const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
 
     for (int rel = 0; rel < width; ++rel) {
-        const double C = tapLine.tap0[rel].comp;
+        const int rm1 = (rel > 0) ? (rel - 1) : 0;
+        const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
 
-        // Fallback invariant:
-        // no legal Field B operation preserves the current scalar sample.
-        double tc = C;
-        const char *mode = "C";
+        const double C   = row0[rel];
+        const double Cup = rowUp2[rel];
+        const double Cdn = rowDn2[rel];
 
-        if (!have2) {
-            outFieldLine[rel] = C;
-            continue;
-        }
+        const double C_m1 = row0[rm1];
+        const double C_p1 = row0[rp1];
 
-        // When Field B is being built under the Frame/FVF regime,
-        // buildCombTapLine() has vertical ±1 taps available. Use them only as
-        // a wave-off. They are not Field B comb taps.
-        //
-        // This protects Frame A / Frame B / FVF from receiving a smeared
-        // preclean source in fine-line or moving-diagonal regions where ±2
-        // same-field reasoning is underqualified.
-        bool fineWaveOff = false;
-        double fineSpanIRE = 0.0;
-        double fineCurvIRE = 0.0;
+        const double Cup_m1 = rowUp2[rm1];
+        const double Cup_p1 = rowUp2[rp1];
 
-        if (have1Guard) {
-            const double Cu1 = tapLine.tapU1[rel].comp;
-            const double Cd1 = tapLine.tapD1[rel].comp;
+        const double Cdn_m1 = rowDn2[rm1];
+        const double Cdn_p1 = rowDn2[rp1];
 
-            fineSpanIRE = std::max(std::fabs(C - Cu1),
-                                   std::fabs(C - Cd1)) * invIreScale;
+        // Original symmetric lateral magnitude context. This is only a
+        // support/weighting context, not a competing reconstruction.
+        const double symCur =
+            0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
 
-            fineCurvIRE = std::fabs(Cu1 - 2.0 * C + Cd1) * invIreScale;
+        const double symUp =
+            0.5 * (std::fabs(Cup_m1) + std::fabs(Cup_p1));
 
-            // Conservative starting thresholds:
-            // - span catches immediate vertical discontinuity
-            // - curvature catches a narrow line/diagonal crossing around C
-            //
-            // Standalone Field B never sees this guard unless the caller is
-            // building frame taps.
-            fineWaveOff = (fineSpanIRE > 2.0 || fineCurvIRE > 3.0);
-        }
+        const double symDn =
+            0.5 * (std::fabs(Cdn_m1) + std::fabs(Cdn_p1));
 
-        if (fineWaveOff) {
-            outFieldLine[rel] = C;
+        double kp = 0.0;
+        double kn = 0.0;
 
-            if (wantDiag) {
-                const int h = videoParameters.activeVideoStart + rel;
-                if (h >= diagC0 && h <= diagC1) {
-                    std::fprintf(stderr,
-                                 "  h=%d C=%.3f waveoff=1 fineSpanIRE=%.2f fineCurvIRE=%.2f tc=%.3f d=%.3f mode=C\n",
-                                 h, C, fineSpanIRE, fineCurvIRE, C, 0.0);
-                }
-            }
+        kp  = std::fabs(std::fabs(C) - std::fabs(Cup));
+        kp += std::fabs(symCur - symUp);
+        kp -= (std::fabs(C) + std::fabs(Cup)) * 0.10;
 
-            continue;
-        }
+        kn  = std::fabs(std::fabs(C) - std::fabs(Cdn));
+        kn += std::fabs(symCur - symDn);
+        kn -= (std::fabs(C) + std::fabs(Cdn)) * 0.10;
 
-        const double CupRaw = tapLine.tapU2[rel].comp;
-        const double CdnRaw = tapLine.tapD2[rel].comp;
+        if (kp < 0.0) kp = 0.0;
+        if (kn < 0.0) kn = 0.0;
 
-        double Cup = CupRaw;
-        double Cdn = CdnRaw;
+        double wUp = (kRange > 1e-9) ? (1.0 - kp * invK) : 1.0;
+        double wDn = (kRange > 1e-9) ? (1.0 - kn * invK) : 1.0;
 
-        // ±4 is not Field B reach. It may only clean the ±2 taps when the
-        // local same-field landscape is verified flat. In contour/fine-detail
-        // territory it must not become a repair path.
-        double flatGate = 0.0;
-        double cleanUpGate = 0.0;
-        double cleanDnGate = 0.0;
+        wUp = std::clamp(wUp, 0.0, 1.0);
+        wDn = std::clamp(wDn, 0.0, 1.0);
 
-        if (have4) {
-            const double Cup4 = tapLine.tapU4[rel].comp;
-            const double Cdn4 = tapLine.tapD4[rel].comp;
-
-            const double aC   = std::fabs(C);
-            const double aU2  = std::fabs(CupRaw);
-            const double aD2  = std::fabs(CdnRaw);
-            const double aU4  = std::fabs(Cup4);
-            const double aD4  = std::fabs(Cdn4);
-
-            const double maxA = std::max({aC, aU2, aD2, aU4, aD4});
-            const double minA = std::min({aC, aU2, aD2, aU4, aD4});
-
-            const double rangeIRE   = (maxA - minA) * invIreScale;
-            const double midCurvIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invIreScale;
-            const double upStepIRE  = std::fabs(aU4 - aU2) * invIreScale;
-            const double dnStepIRE  = std::fabs(aD4 - aD2) * invIreScale;
-            const double upNearIRE  = std::fabs(aU2 - aC)  * invIreScale;
-            const double dnNearIRE  = std::fabs(aD2 - aC)  * invIreScale;
-
-            // Strict flatness. This is deliberately stronger than
-            // "contour-compatible"; only flatness lets ±4 clean ±2.
-            const double rangeFlat = smoothGateLocal(rangeIRE,   1.5, 4.0);
-            const double curvFlat  = smoothGateLocal(midCurvIRE, 0.8, 2.5);
-            const double upFlat    = smoothGateLocal(std::max(upStepIRE, upNearIRE), 1.2, 3.5);
-            const double dnFlat    = smoothGateLocal(std::max(dnStepIRE, dnNearIRE), 1.2, 3.5);
-
-            flatGate = std::clamp(rangeFlat * curvFlat, 0.0, 1.0);
-            cleanUpGate = flatGate * upFlat;
-            cleanDnGate = flatGate * dnFlat;
-
-            auto cleanNearFromFar = [&](double nearS, double farS, double gate)->double {
-                if (gate <= 0.0) return nearS;
-                if (!sameSign(nearS, farS)) return nearS;
-
-                // Cleaning only. No long-reach replacement.
-                const double influence = 0.35 * std::clamp(gate, 0.0, 1.0);
-
-                const double nearMag = std::fabs(nearS);
-                const double farMag  = std::fabs(farS);
-                const double mag = (nearMag + influence * farMag) / (1.0 + influence);
-
-                return std::copysign(mag, nearS);
-            };
-
-            Cup = cleanNearFromFar(CupRaw, Cup4, cleanUpGate);
-            Cdn = cleanNearFromFar(CdnRaw, Cdn4, cleanDnGate);
-        }
-
-        // Old decisive Field B shape:
-        // use the precomputed ±2 pair weights and reach gates. Do not add
-        // same-line horizontal/lateral magnitude influence here; that can make
-        // a moving diagonal/fine-line crossing turn into repeated columns.
-        const double gUp = antiPhaseReach(tapLine.tapU2, rel);
-        const double gDn = antiPhaseReach(tapLine.tapD2, rel);
-
-        const double reachUp = std::clamp(tapLine.pairU2[rel].reachGate, 0.0, 1.0);
-        const double reachDn = std::clamp(tapLine.pairD2[rel].reachGate, 0.0, 1.0);
-
-        const double pairWUp = tapLine.pairU2[rel].weight;
-        const double pairWDn = tapLine.pairD2[rel].weight;
-
-        double wUp = pairWUp * reachUp * gUp;
-        double wDn = pairWDn * reachDn * gDn;
-
-        const double wUpPreCull = wUp;
-        const double wDnPreCull = wDn;
+        double sc = 1.0;
+        bool haveAnswer = false;
 
         if (wUp > 0.0 || wDn > 0.0) {
-            if (wDn > 3.0 * wUp)      wUp = 0.0;
-            else if (wUp > 3.0 * wDn) wDn = 0.0;
+            if (wDn > 3.0 * wUp)
+                wUp = 0.0;
+            else if (wUp > 3.0 * wDn)
+                wDn = 0.0;
 
-            const bool useUp = (wUp > 1e-9);
-            const bool useDn = (wDn > 1e-9);
+            const double denom = wUp + wDn;
 
-            if (useUp && useDn) {
-                const double denom = wUp + wDn;
-                tc = 0.5 * (((C - Cup) * wUp + (C - Cdn) * wDn) / denom);
-                mode = "UD";
-            } else if (useUp) {
-                tc = 0.5 * (C - Cup);
-                mode = "U";
-            } else if (useDn) {
-                tc = 0.5 * (C - Cdn);
-                mode = "D";
+            if (denom > 1e-9) {
+                sc = 2.0 / denom;
+                if (sc < 1.0)
+                    sc = 1.0;
+
+                haveAnswer = true;
+            } else {
+                wUp = 0.0;
+                wDn = 0.0;
+            }
+        } else {
+            const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
+            const double sumUD = std::fabs(Cup + Cdn);
+
+            if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
+                wUp = 1.0;
+                wDn = 1.0;
+                sc = 1.0;
+                haveAnswer = true;
+            } else {
+                wUp = 0.0;
+                wDn = 0.0;
             }
         }
+
+        double tc = 0.0;
+
+        if (haveAnswer) {
+            tc  = (C - Cup) * wUp * sc;
+            tc += (C - Cdn) * wDn * sc;
+            tc *= 0.25;
+        } else {
+            // Only true collapse becomes C.
+            // All normal and revived original paths above are unchanged.
+            tc = C;
+        }
+
+        if (!std::isfinite(tc))
+            tc = C;
 
         outFieldLine[rel] = tc;
-
-        if (wantDiag) {
-            const int h = videoParameters.activeVideoStart + rel;
-            if (h >= diagC0 && h <= diagC1) {
-                std::fprintf(stderr,
-                             "  h=%d C=%.3f Cup=%.3f->%.3f Cdn=%.3f->%.3f"
-                             " w=(%.3f,%.3f) g=(%.3f,%.3f) wg0=(%.3f,%.3f) wg=(%.3f,%.3f)"
-                             " reach=(%.3f,%.3f) diffIRE=(%.2f,%.2f)"
-                             " have1=%d fine=(%.2f,%.2f) flat=%.3f clean=(%.3f,%.3f)"
-                             " tc=%.3f d=%.3f mode=%s\n",
-                             h, C, CupRaw, Cup, CdnRaw, Cdn,
-                             pairWUp, pairWDn,
-                             gUp, gDn,
-                             wUpPreCull, wDnPreCull,
-                             wUp, wDn,
-                             reachUp, reachDn,
-                             tapLine.pairU2[rel].diffIRE,
-                             tapLine.pairD2[rel].diffIRE,
-                             have1Guard ? 1 : 0,
-                             fineSpanIRE, fineCurvIRE,
-                             flatGate, cleanUpGate, cleanDnGate,
-                             tc, tc - C, mode);
-            }
-        }
     }
 }
 

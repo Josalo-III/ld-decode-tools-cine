@@ -862,566 +862,1080 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
 //   Candidates: Field B, Frame A, Frame B (Field A retired). No notch; luma
 //   from the cached base plus raw-candidate implied Y. Saturation from IQ mag.
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// FVF rollback election, current-buffer candidate version.
+//
+// Candidate roles:
+//   fieldA  = current contour/intrafield candidate  (scratch_lineWorkA)
+//   fieldB  = current simple/intrafield candidate   (scratch_lineWorkC)
+//   frameB  = current direct-IQ frame candidate     (scratch_frameBDirectIQComposite)
+//
+// This restores the older enhancer topology:
+//   - Field A / Field B / Frame B all remain live contestants.
+//   - Conditioning is scoring-only; emitted values are raw candidates.
+//   - Hard rules are narrow artifact guards, not general regime commands.
+//   - Saturation is handled as an anti-switching/protection condition.
+//   - Island/block cleanup must not rewrite saturated pixels.
+// ----------------------------------------------------------------------------
 void Comb::FrameBuffer::scoreFieldVsFrame(
     int line,
     const CombTapLine &tapLine,
-    const double *fieldB,                          // Field B candidate (only field now)
-    const std::vector<double> &frameA,             // Frame A candidate
-    const std::vector<double> *frameB,             // Frame B candidate (interfield model)
+    const double *fieldB,
+    const std::vector<double> &frameA,
+    const std::vector<double> *frameB,
     double *outMixed,
     bool writeWeights,
     const double *lateral1D,
     const std::vector<std::complex<double>> *frameIQ)
 {
-    // ------------------------------------------------------------------
-    // 0. Geometry, guards, tunables, source lines  (unchanged from current)
-    // ------------------------------------------------------------------
+    // In this rollback election, the existing "frameA" parameter is used as
+    // the Field A / contour-field candidate. This avoids changing the current
+    // buffer names and public function shape while restoring the older
+    // three-contestant FVF topology:
+    //
+    //   Field A = frameA vector parameter / scratch_lineWorkA
+    //   Field B = fieldB pointer / scratch_lineWorkC
+    //   Frame B = frameB vector pointer / scratch_frameBDirectIQComposite
+    //   1D      = lateral1D rail / fallback witness
+
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
     if (width <= 0) return;
-    if (!fieldB || (int)frameA.size() < width || !outMixed) return;
+    if (!fieldB || !frameB || !outMixed) return;
+    if ((int)frameA.size() < width || (int)frameB->size() < width) return;
 
-    const auto  &T    = configuration.tunables;
+    if (line >= 0 && line < (int)fvfMetrics.size() &&
+        (int)fvfMetrics[line].size() < width)
+    {
+        fvfMetrics[line].assign(width, FvfModelMetrics());
+    }
+
+    const auto &T = configuration.tunables;
     const double invI = this->invIreScale;
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
 
-    // Tunable thresholds (subset that survives; FA-only ones removed).
-    // VERT_THRESH (vertical contrast) lives with the deferred horizontal-edge
-    // / trust-reach regime (#8/#9/#10), not here.
-    const double HEDGE_THRESH_IRE   = T.FIELD_LUMA_EDGE_THRESH_IRE;
-    const double FIELD_DIVERGE_IRE  = 6.0;   // comb (IQ) divergence boundary
-    const double LUMA_DIVERGE_IRE   = 6.0;   // luma divergence boundary (new knob)
-    const double SAT_REGIME_IRE     = 16.0;  // #20 saturation regime: IQ-mag
-                                             // threshold above which -> Frame B.
-                                             // Analogous to the prior #24 ramp
-                                             // point (sat_t≈0.72); dial in later.
+    const int FIELD_BLOCK_SIZE = 4;
+
+    const double VERT_THRESH_IRE  = T.FIELD_VERT_DISAGREE_THRESH_IRE;
+    const double HEDGE_THRESH_IRE = T.FIELD_LUMA_EDGE_THRESH_IRE;
+
+    const double CHROMA_STRONG_IRE = 6.0;
+
+    const double FRAME_MAX_DIST_IRE = 4.0;
+    const double FIELD_DIVERGE_IRE  = 6.0;
+    const double FIELD_DISAGREE_IRE = 6.0;
+
     const double FVF_SMALL_DIFF_IRE =
         (T.FVF_SMALL_DIFF_IRE > 0.0) ? T.FVF_SMALL_DIFF_IRE : 3.0;
-    const int    FIELD_BLOCK_SIZE   = 4;     // #27 block-field commit (native)
-    const double FIELD_DISAGREE_IRE = 6.0;   // #27 per-block divergence threshold
 
-    auto clampLine = [&](int ln)->int {
-        return ln < firstLine ? firstLine : (ln >= lastLine ? lastLine - 1 : ln);
-    };
-    const double *srcLineM2 = clpbuffer[srcBufIndex].pixel[clampLine(line - 2)] + left;
-    const double *srcLineM1 = clpbuffer[srcBufIndex].pixel[clampLine(line - 1)] + left;
-    const double *srcLine0  = clpbuffer[srcBufIndex].pixel[clampLine(line)]     + left;
-    const double *srcLineP1 = clpbuffer[srcBufIndex].pixel[clampLine(line + 1)] + left;
-    const double *srcLineP2 = clpbuffer[srcBufIndex].pixel[clampLine(line + 2)] + left;
+    const double SAT_FALLBACK_START = 6.0;
+    const double SAT_FALLBACK_FULL  = 20.0;
 
-    auto sample1D = [&](int rel)->double {
-        int r = std::clamp(rel, 0, width - 1);
-        return lateral1D ? lateral1D[r] : srcLine0[r];
-    };
-    auto horizEdgeIRE = [&](int rel)->double {
-        return (rel >= 0 && rel < (int)tapLine.hLumaDeltaIRE.size())
-            ? tapLine.hLumaDeltaIRE[rel] : 0.0;
-    };
-    // (Vertical-contrast measure removed: it belongs to the horizontal-edge /
-    //  trust-reach regime — #8/#9/#10 — which is DEFERRED until we see output.
-    //  The vertical edge here is line-perpendicular = hIRE.)
-    // (Notch luma helpers removed; luma comes from the cached base rows and
-    //  raw-candidate implied Y.)
+    // Compatibility constants for the rollback election. These replace older
+    // tunable names that no longer exist in the current tree.
+    const double FRAME_MODEL_BIAS = 0.90;
 
-    // Scratch output planes (reuse existing members). Winner uses 1/2/3 for
-    // FieldB/FrameA/FrameB; 0 retired. Sized once per line. (scratch_fvf_satMap
-    // is no longer used — saturation is sourced from IQ magnitude.)
+    const double FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE =
+        T.FVF_SCALE_FINE_FRAME_B_BONUS;
+
+    const double FRAME_SCALE_BIAS_STRENGTH_INTERLACE =
+        0.5 * T.FVF_SCALE_FINE_FRAME_B_BONUS;
+
+    const double NEIGHBOR_EST_EDGE_MAX_IRE = 8.0;
+    const double NEIGHBOR_EST_FVF_MAX_IRE  = 6.0;
+    const double NEIGHBOR_EST_SAT_MAX_IRE  = 6.0;
+    const double NEIGHBOR_EST_WEIGHT       = 0.20;
+
+    const double ONE_D_NEAR_THRESH_IRE = 1.0;
+
+    auto clampRel = [&](int rel) -> int {
+        return std::clamp(rel, 0, width - 1);
+    };
+
+    auto clampLine = [&](int ln) -> int {
+        if (ln < firstLine) return firstLine;
+        if (ln >= lastLine) return lastLine - 1;
+        return ln;
+    };
+
+    const double *srcLine0 =
+        clpbuffer[srcBufIndex].pixel[clampLine(line)] + left;
+
+    auto sample1D = [&](int rel) -> double {
+        rel = clampRel(rel);
+        return lateral1D ? lateral1D[rel] : srcLine0[rel];
+    };
+
+    auto sampleRawVert = [&](int ln, int rel) -> double {
+        ln  = clampLine(ln);
+        rel = clampRel(rel);
+        return clpbuffer[srcBufIndex].pixel[ln][left + rel];
+    };
+
+    auto getNotchLuma = [&](const double *arr, int rel) -> double {
+        return getNotchLumaEven2(arr, clampRel(rel), width);
+    };
+
+    auto getNotchLumaVec = [&](const std::vector<double> &vec, int rel) -> double {
+        return getNotchLumaEven2Vec(vec, clampRel(rel));
+    };
+
+    auto notchScalar = [&](int ln, int rel) -> double {
+        rel = clampRel(rel);
+        const double l = sampleRawVert(ln, rel - 2);
+        const double r = sampleRawVert(ln, rel + 2);
+        return 0.5 * (l + r);
+    };
+
+    auto vertContrastIRE = [&](int rel) -> double {
+        const int upLine = line - 2;
+        const int dnLine = line + 2;
+        if (upLine < firstLine || dnLine >= lastLine) return 0.0;
+
+        rel = clampRel(rel);
+        const double up = clpbuffer[srcBufIndex].pixel[upLine][left + rel];
+        const double dn = clpbuffer[srcBufIndex].pixel[dnLine][left + rel];
+
+        return std::fabs(up - dn) * invI;
+    };
+
+    auto horizEdgeIRE = [&](int rel) -> double {
+        rel = clampRel(rel);
+
+        if (rel >= 0 && rel < (int)tapLine.hLumaDeltaIRE.size())
+            return tapLine.hLumaDeltaIRE[rel];
+
+        const int h   = left + rel;
+        const int hm1 = std::max(left, h - 1);
+        const int hp1 = std::min(right - 1, h + 1);
+
+        return std::fabs(clpbuffer[srcBufIndex].pixel[line][hp1] -
+                         clpbuffer[srcBufIndex].pixel[line][hm1]) * invI;
+    };
+
+    struct Cond1D {
+        double raw = 0.0;
+        double score = 0.0;
+        double outlierIRE = 0.0;
+    };
+
+    auto condSamePhasePtr = [&](const double *arr, int rel) -> Cond1D {
+        Cond1D c;
+        rel = clampRel(rel);
+
+        c.raw = arr[rel];
+
+        const int rm4 = clampRel(rel - 4);
+        const int rp4 = clampRel(rel + 4);
+
+        const double est = 0.5 * (arr[rm4] + arr[rp4]);
+
+        c.outlierIRE = std::fabs(c.raw - est) * invI;
+
+        const double OUTLIER_WARN_IRE = 3.0;
+        const double OUTLIER_FULL_IRE = 10.0;
+
+        double t = (c.outlierIRE - OUTLIER_WARN_IRE) /
+                   (OUTLIER_FULL_IRE - OUTLIER_WARN_IRE);
+
+        t = std::clamp(t, 0.0, 1.0);
+        t *= 0.5;
+
+        // Scoring-only conditioning. Output remains the raw candidate.
+        c.score = c.raw + (est - c.raw) * t;
+        return c;
+    };
+
+    auto condSamePhaseVec = [&](const std::vector<double> &vec, int rel) -> Cond1D {
+        Cond1D c;
+        rel = clampRel(rel);
+
+        c.raw = vec[rel];
+
+        const int rm4 = clampRel(rel - 4);
+        const int rp4 = clampRel(rel + 4);
+
+        const double est = 0.5 * (vec[rm4] + vec[rp4]);
+
+        c.outlierIRE = std::fabs(c.raw - est) * invI;
+
+        const double OUTLIER_WARN_IRE = 3.0;
+        const double OUTLIER_FULL_IRE = 10.0;
+
+        double t = (c.outlierIRE - OUTLIER_WARN_IRE) /
+                   (OUTLIER_FULL_IRE - OUTLIER_WARN_IRE);
+
+        t = std::clamp(t, 0.0, 1.0);
+        t *= 0.5;
+
+        // Scoring-only conditioning. Output remains the raw candidate.
+        c.score = c.raw + (est - c.raw) * t;
+        return c;
+    };
+
+    auto chromaMagAt = [&](int rel, double FA, double FB, double FR) -> double {
+        rel = clampRel(rel);
+
+        if (frameIQ && rel < (int)frameIQ->size()) {
+            const auto &z = (*frameIQ)[rel];
+            return std::hypot(z.real(), z.imag()) * invI;
+        }
+
+        return std::max({ std::fabs(FA), std::fabs(FB), std::fabs(FR) }) * invI;
+    };
+
     if ((int)scratch_fvf_winner.size() != width) {
         scratch_fvf_winner.assign(width, 1);
         scratch_fvf_winner2.assign(width, 1);
         scratch_fvf_outVal.assign(width, 0.0);
         scratch_fvf_outShade.assign(width, 0.35f);
         scratch_fvf_diffFVF.assign(width, 0.0);
+        scratch_fvf_satMap.assign(width, 0.0);
+    } else {
+        std::fill(scratch_fvf_winner.begin(), scratch_fvf_winner.end(), 1);
+        std::fill(scratch_fvf_winner2.begin(), scratch_fvf_winner2.end(), 1);
+        std::fill(scratch_fvf_outVal.begin(), scratch_fvf_outVal.end(), 0.0);
+        std::fill(scratch_fvf_outShade.begin(), scratch_fvf_outShade.end(), 0.35f);
+        std::fill(scratch_fvf_diffFVF.begin(), scratch_fvf_diffFVF.end(), 0.0);
+        std::fill(scratch_fvf_satMap.begin(), scratch_fvf_satMap.end(), 0.0);
     }
+
     std::vector<int>    &winner   = scratch_fvf_winner;
+    std::vector<int>    &winner2  = scratch_fvf_winner2;
     std::vector<double> &outVal   = scratch_fvf_outVal;
     std::vector<float>  &outShade = scratch_fvf_outShade;
     std::vector<double> &diffFVF  = scratch_fvf_diffFVF;
+    std::vector<double> &satMap   = scratch_fvf_satMap;
 
-    // ==================================================================
-    // 1. PER-LINE: hard veto + regime fork  (computed ONCE, not per pixel)
-    // ==================================================================
-    //
-    // #4 — Management owns the veto. Creation is external: read grammar +
-    // cadence. carrierFrameVerticalAllowed(line) already folds in editSplit
-    // (grammar init takes !editSplit frame-wide). This is the ONLY absolute
-    // interfield veto. Candidate divergence is interpreted after the fork.
-    const bool interfieldLegal = carrierFrameVerticalAllowed(line);
+    const bool useFrameModel = (cadenceId >= 0 || cadenceId == -3);
 
-    // Regime axis:
-    //   native  = cadenceId in {-2 video, -1 unknown}
-    //             home model = Field B; interfield is foreign/speculative.
-    //   model   = cadenceId >= 0 (film) or -3 (29.97p)
-    //             home model = Frame B; intrafield Field B is foreign.
-    const bool nativeRegime =
-        (cadenceId == lddecode::kCadenceVideo) || (cadenceId == CADENCE_UNKNOWN);
-    const bool modelRegime  = !nativeRegime;
+    double prevInterfieldIRE = 0.0;
+    double prevSatT = 0.0;
 
-    // ------------------------------------------------------------------
-    // 2. PER-LINE evidence harvest (consolidated)
-    // ------------------------------------------------------------------
-    // TODO(harvest): single pass producing, in one place:
-    //   * reach limiters + vertical contrast      (#10 + #6, FA-free)
-    //   * luma-domain contour trust                (#8, rebuilt on luma)
-    //   * grammar lattice comb-need per region     (#9, from carrierGrammar
-    //                                                spans: alternationCoherence
-    //                                                / samePhaseRecurrence —
-    //                                                NOT hardcoded ±2)
-    // These currently live scattered across buildCombTapLine / inline lambdas.
+    int fieldCountTotal = 0;
+    int frameCountTotal = 0;
 
-    // Attribution row (#12). Advisory claims; never a hard veto.
-    const AttributionEvidence *fvfAttrRow =
-        (demodWidth == width) ? attributionEvidence_line(line) : nullptr;
+    enum {
+        FVF_FIELD_A = 0,
+        FVF_FIELD_B = 1,
+        FVF_FRAME_B = 2,
+        FVF_1D      = -1
+    };
 
-    // Cached luma rows + raw row. ±1 lines are the adjacent field, so their
-    // difference supplies the luma-divergence axis; raw-candidate is implied Y.
-    const bool lumaCacheUsable =
-        lockedLumaCacheValid && !lockedLumaBaseY4_flat.empty() && demodWidth == width;
-    const double *lumaBaseRow = lumaCacheUsable ? lockedLumaBaseY4_line(line) : nullptr;
-    const double *lumaUpRow   = (lumaCacheUsable && line - 1 >= firstLine)
-                                    ? lockedLumaBaseY4_line(line - 1) : nullptr;
-    const double *lumaDnRow   = (lumaCacheUsable && line + 1 < lastLine)
-                                    ? lockedLumaBaseY4_line(line + 1) : nullptr;
-    const quint16 *rawRow = rawbuffer.data() +
-        static_cast<size_t>(line) * static_cast<size_t>(videoParameters.fieldWidth);
-
-    // IQ magnitude pre-pass: one hypot per pixel, consumed by the saturation
-    // test and #19's texture ladder.
-    if ((int)scratch_fvf_iqMag.size() != width)
-        scratch_fvf_iqMag.assign(width, 0.0);
-    if (frameIQ && (int)frameIQ->size() >= width) {
-        for (int r = 0; r < width; ++r) {
-            const auto &z = (*frameIQ)[r];
-            scratch_fvf_iqMag[r] = std::hypot(z.real(), z.imag());
-        }
-    }
-
-    // ==================================================================
-    // 2b. DIVERGENCE CLUSTER — GATHER (pool data only; no decisions).
-    // One per-line pass fills the condition evidence; the election below is
-    // the only thing that acts on it. combDivergence is laterally smoothed
-    // (anti-zipper: breaks 4fsc bucket-line alternation).
-    // ==================================================================
-    if ((int)scratch_fvf_evidence.size() != width)
-        scratch_fvf_evidence.assign(width, CombConditionEvidence());
-    {
-        double prevComb = 0.0;
-        for (int rel = 0; rel < width; ++rel) {
-            CombConditionEvidence &e = scratch_fvf_evidence[rel];
-
-            const double FBv  = fieldB[rel];
-            const double FRBv = (frameB && rel < (int)frameB->size())
-                                    ? (*frameB)[rel] : frameA[rel];
-
-            // IQ/comb divergence (smoothed) — the same samples the combs use.
-            const double comb = std::fabs(FBv - FRBv) * invI;
-            e.combDivergence = (rel > 0) ? 0.5 * (comb + prevComb) : comb;
-            prevComb = comb;
-            diffFVF[rel] = e.combDivergence;   // consumed by #2/#18, edge, #26/#27
-
-            // Luma divergence between adjacent interleaved fields.
-            if (lumaBaseRow) {
-                const double yC = lumaBaseRow[rel];
-                const double yU = lumaUpRow ? lumaUpRow[rel] : yC;
-                const double yD = lumaDnRow ? lumaDnRow[rel] : yC;
-                e.lumaDivergence = std::fabs(yC - 0.5 * (yU + yD)) * invI;
-            } else {
-                e.lumaDivergence = 0.0;
-            }
-
-            e.satIRE          = scratch_fvf_iqMag[rel] * invI;
-            e.contourNonLocal = (rel < (int)tapLine.contour.size())
-                ? std::clamp(tapLine.contour[rel].midOk * 0.5 *
-                    (tapLine.contour[rel].upSideOk + tapLine.contour[rel].dnSideOk),
-                    0.0, 1.0)
-                : 0.0;   // pooled for the (deferred) contour consumer
-        }
-    }
-
-    // ==================================================================
-    // 3. PER-PIXEL election
-    // ==================================================================
     for (int rel = 0; rel < width; ++rel) {
-        const int rm2 = std::max(0, rel - 2);
-        const int rp2 = std::min(width - 1, rel + 2);
+        const double FA = frameA[rel];
+        const double FB = fieldB[rel];
+        const double FR = (*frameB)[rel];
+        const double L1 = sample1D(rel);
 
-        // ---- candidate values (3 candidates) --------------------------
-        const double FB     = fieldB[rel];                       // Field B
-        const double FR     = frameA[rel];                       // Frame A
-        const double FRB    = (frameB && rel < (int)frameB->size())
-                                  ? (*frameB)[rel] : FR;         // Frame B
-        const double L1     = sample1D(rel);
+        const Cond1D FA_c = condSamePhaseVec(frameA, rel);
+        const Cond1D FB_c = condSamePhasePtr(fieldB, rel);
+        const Cond1D FR_c = condSamePhaseVec(*frameB, rel);
 
-        // ---- consume pooled condition data (gathered above) -----------
-        const CombConditionEvidence &e = scratch_fvf_evidence[rel];
-        const double diff_candB_ire = e.combDivergence;   // smoothed comb (IQ) divergence
-        const double chromaMagIRE   = e.satIRE;           // saturation test
+        const double FA_s = FA_c.score;
+        const double FB_s = FB_c.score;
+        const double FR_s = FR_c.score;
 
-        // ============================================================
-        // TOP-LEVEL REGIME BRANCHES — central management acting on the pool.
-        //
-        // This is the load-bearing fork.  The old rewrite accidentally bound
-        // "divergence -> Field B" before the regime fork.  That is only
-        // correct in native/interlaced footage.  In model/progressive footage,
-        // Frame B is the home model, so Field B pays for disagreement later in
-        // scoring instead of receiving a hard win here.
-        // ============================================================
-        int    idx   = 1;        // default Field B
-        double val   = FB;
-        float  shade = 0.35f;
+        const double lumFA = getNotchLumaVec(frameA, rel);
+        const double lumFB = getNotchLuma(fieldB, rel);
+        const double lumFR = getNotchLumaVec(*frameB, rel);
 
-        if (!interfieldLegal) {
-            winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;
-            continue;
+        int maskVal = 0;
+        if (line >= firstLine && line < lastLine &&
+            line < (int)vdisMask.size() &&
+            rel  < (int)vdisMask[line].size())
+        {
+            maskVal = vdisMask[line][rel];
         }
 
-        const bool lumaDiverges = e.lumaDivergence >= LUMA_DIVERGE_IRE;
-        const bool combDiverges = e.combDivergence >= FIELD_DIVERGE_IRE;
+        const bool vdisHard = (maskVal == 2);
+        const bool vdisSoft = (maskVal == 1);
 
-        if (nativeRegime) {
-            // Native/interlaced/unknown:
-            //   home = Field B.  Measured divergence means the frame candidates
-            //   are foreign/speculative at this pixel, so Field B wins before
-            //   scoring.  This is the pre-metadata behavior, but it lives only
-            //   inside the native arm of the fork.
-            if (lumaDiverges || combDiverges) {
-                winner[rel] = 1; outVal[rel] = FB; outShade[rel] = 0.35f;
-                continue;
-            }
+        const double frameLikeStack =
+            0.5 * (notchScalar(line - 1, rel) + notchScalar(line + 1, rel));
 
-            // #20 saturation regime in native footage is still downstream of
-            // the native coherence weed: saturated but divergent interlaced
-            // pixels must not force interfield comb.
-            if (chromaMagIRE >= SAT_REGIME_IRE) {
-                winner[rel] = 3; outVal[rel] = FRB; outShade[rel] = 0.85f;
-                continue;
-            }
+        const double fieldLikeStack =
+            0.5 * (notchScalar(line - 2, rel) + notchScalar(line + 2, rel));
+
+        const double diff_stack_ire =
+            std::fabs(frameLikeStack - fieldLikeStack) * invI;
+
+        const double diff_candA_ire =
+            std::fabs(lumFR - lumFA) * invI;
+
+        const double diff_candB_ire =
+            std::fabs(lumFR - lumFB) * invI;
+
+        const double diff_cand_ire =
+            std::min(diff_candA_ire, diff_candB_ire);
+
+        const double frameModelDistIRE =
+            useFrameModel ? diff_cand_ire : diff_candA_ire;
+
+        const bool frameInsane =
+            (frameModelDistIRE > FRAME_MAX_DIST_IRE);
+
+        const double interfield_luma_ire =
+            std::fabs(frameLikeStack - notchScalar(line, rel)) * invI;
+
+        const double smoothed_interfield_ire =
+            (rel > 0) ? 0.5 * (interfield_luma_ire + prevInterfieldIRE)
+                      : interfield_luma_ire;
+
+        prevInterfieldIRE = interfield_luma_ire;
+
+        const bool managementVeto =
+            (cadenceId == -2) || !carrierFrameVerticalAllowed(line);
+
+        const bool b2VertCoherent =
+            !managementVeto &&
+            (smoothed_interfield_ire < FIELD_DIVERGE_IRE) &&
+            !frameInsane;
+
+        const double diff_fvf_ire = diff_stack_ire;
+        diffFVF[rel] = diff_fvf_ire;
+
+        const double chromaMagIRE = chromaMagAt(rel, FA, FB, FR);
+        satMap[rel] = chromaMagIRE;
+
+        double sat_t = 0.0;
+        if (SAT_FALLBACK_FULL > SAT_FALLBACK_START) {
+            sat_t = std::clamp((chromaMagIRE - SAT_FALLBACK_START) /
+                               (SAT_FALLBACK_FULL - SAT_FALLBACK_START),
+                               0.0, 1.0);
         } else {
-            // Model/progressive/film:
-            //   home = Frame B.  Cadence metadata is the temporal authority.
-            //   Comb/luma divergence is not an interlace veto here; it is
-            //   evidence consumed by the regime-normalized model-distance
-            //   scoring below, where Field B pays for disagreeing with Frame B.
-            if (chromaMagIRE >= SAT_REGIME_IRE) {
-                winner[rel] = 3; outVal[rel] = FRB; outShade[rel] = 0.85f;
-                continue;
+            sat_t = (chromaMagIRE > SAT_FALLBACK_START) ? 1.0 : 0.0;
+        }
+
+        sat_t = (rel > 0) ? 0.5 * (sat_t + prevSatT) : sat_t;
+        prevSatT = sat_t;
+
+        const double vIRE = vertContrastIRE(rel);
+        const double hIRE = horizEdgeIRE(rel);
+
+        const double TRI_SAFE_IRE = 3.0;
+        const bool safeA = fvf_is_tri_safe(FA_s, L1, invI, TRI_SAFE_IRE);
+        const bool safeB = fvf_is_tri_safe(FB_s, L1, invI, TRI_SAFE_IRE);
+        const bool safeR = fvf_is_tri_safe(FR_s, L1, invI, TRI_SAFE_IRE);
+
+        FvfModelMetrics metrics;
+        if (line >= 0 && line < (int)fvfMetrics.size() &&
+            rel < (int)fvfMetrics[line].size())
+        {
+            metrics = fvfMetrics[line][rel];
+        }
+
+        metrics.chromaMagIRE = chromaMagIRE;
+        metrics.chromaBandEnergyIRE = chromaMagIRE;
+        metrics.verticalBoundaryIRE = hIRE;
+        metrics.horizontalBoundaryIRE = vIRE;
+        metrics.fieldFrameDivergenceIRE = diff_fvf_ire;
+        metrics.interfieldDistinctIRE = smoothed_interfield_ire;
+        metrics.frameToFieldModelIRE = diff_candA_ire;
+        metrics.frameToBestFieldIRE = diff_cand_ire;
+        metrics.frameModel = useFrameModel;
+        metrics.managementVeto = managementVeto;
+        metrics.frameVertCoherent = b2VertCoherent;
+        metrics.vdisSoft = vdisSoft;
+        metrics.vdisHard = vdisHard;
+
+        int idx = FVF_FIELD_B;
+        double val = FB;
+        float shade = 0.35f;
+
+        double scoreA = 0.0;
+        double scoreB = 0.0;
+        double scoreR = 0.0;
+
+        auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
+            if (vdisSoft) {
+                if (candIdx == FVF_FIELD_A && !safeA) return;
+                if (candIdx == FVF_FIELD_B && !safeB) return;
+                if (candIdx == FVF_FRAME_B && !safeR) return;
             }
-        }
 
-        // ============================================================
-        // 3a. CANDIDATE SCORING  (interfield in play, NOT saturated)
-        // Lower score = better. No scoreA (Field A retired).
-        // ============================================================
-        // ---- ADDITIVE FOUNDATION ------------------------------------
-        // The old saturated notch seed is GONE — the saturation REGIME above
-        // handles saturation outright, so we never reach here when saturated.
-        // The additive base is purely #2/#18 + #12; the multiplicative
-        // compartments (#19, #6, #21) scale it.
-        double scoreB   = 0.0;   // Field B
-        double scoreR_A = 0.0;   // Frame A
-        double scoreR_B = 0.0;   // Frame B
+            idx = candIdx;
+            val = candVal;
+            shade = candShade;
+        };
 
-        // sat_t: a GRADUAL ramp of IQ magnitude BELOW the regime threshold,
-        // consumed ONLY by #19's intrinsic ±4 color enhancement. (Above the
-        // threshold we are in the saturation regime and never score here.)
-        const double sat_t = std::clamp(
-            (chromaMagIRE - 6.0) / std::max(1.0, SAT_REGIME_IRE - 6.0), 0.0, 1.0);
-        const double hIRE = horizEdgeIRE(rel);    // used by #6 + #21 + election
+        if (vdisHard) {
+            double bestVal = L1;
+            int    bestIdx = FVF_1D;
+            float  bestSh  = 0.0f;
 
-        // ---- #2 / #18  regime-normalized model distance ---------------
-        // ONE unit: measure (diff_candB_ire) + apply.  The foreign side pays
-        // distance from the home model selected by the regime fork.
-        {
-            const double deadband = T.FVF_MODEL_PRIMARY_DEADBAND_IRE;
-            const double pen = T.FVF_MODEL_PRIMARY_WEIGHT *
-                               std::max(0.0, diff_candB_ire - deadband);
-            if (modelRegime) {
-                scoreB   += pen;   // Field B is foreign; Frame B is home.
-            } else {
-                scoreR_A += pen;   // Frame candidates are foreign; Field B is home.
-                scoreR_B += pen;
-            }
-        }
+            auto consider = [&](int candIdx,
+                                double candVal,
+                                bool safeCand,
+                                float candShade)
+            {
+                if (!safeCand) return;
 
-        // ---- #12  attribution ----------------------------------------
-        // Frames pay luma claim (residual reads as luma → interfield chroma
-        // suspect); field pays chroma claim (residual reads as chroma →
-        // intrafield suspect). #13 checkerFieldRisk block is NOT ported.
-        // checkerboardRisk / lumaIncursion are dropped — they only fed the
-        // retired #20 cross-color guard.
-        double attrLumaClaim = 0.0, attrChromaClaim = 0.0;
-        if (fvfAttrRow) {
-            attrLumaClaim   = std::clamp(fvfAttrRow[rel].assessment.lumaClaim, 0.0, 1.0);
-            attrChromaClaim = std::clamp(fvfAttrRow[rel].assessment.chromaClaim, 0.0, 1.0);
-            scoreR_A += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * attrLumaClaim;
-            scoreR_B += T.FVF_ATTRIBUTION_LUMA_WEIGHT   * attrLumaClaim;
-            scoreB   += T.FVF_ATTRIBUTION_CHROMA_WEIGHT * attrChromaClaim;
-        }
+                const double curDiff = std::fabs(bestVal - L1) * invI;
+                const double newDiff = std::fabs(candVal - L1) * invI;
 
-        // ---- #19  IQ texture scale ladder (self-contained) -----------
-        // fine → Frame B (interframe detail); coarse → Field B (±2/±4
-        // stability); dual-±4 → extra Field B. The ±4/coarse bonus is a
-        // PROVEN color-quality boost; its saturation scaling (satCoarseAmp)
-        // is intrinsic to the mechanism and lives HERE, at its texture origin
-        // — NOT in #20. Texture scale and the saturation regime are separate
-        // compartments that do not reach into each other. mid: denom-only.
-        // (iqCoherence is NOT computed here — coherence "trust" belongs to the
-        //  deferred #8 trust regime; its only consumers were the retired #20
-        //  guard and #24, and the pre-pass that fed it was removed.)
-        if (frameIQ && rel < (int)frameIQ->size()) {
-            const int rm1 = std::max(0, rel - 1), rp1 = std::min(width - 1, rel + 1);
-            const int rm4 = std::max(0, rel - 4), rp4 = std::min(width - 1, rel + 4);
-            const double m0  = scratch_fvf_iqMag[rel];
-            const double m_1 = scratch_fvf_iqMag[rm1], mp1 = scratch_fvf_iqMag[rp1];
-            const double m_2 = scratch_fvf_iqMag[rm2], mp2 = scratch_fvf_iqMag[rp2];
-            const double m_4 = scratch_fvf_iqMag[rm4], mp4 = scratch_fvf_iqMag[rp4];
-            const double fine   = std::fabs(m0 - 0.5 * (m_1 + mp1));
-            const double mid    = std::fabs(m0 - 0.5 * (m_2 + mp2));   // denom only
-            const double coarse = std::fabs(m0 - 0.5 * (m_4 + mp4));
-            const double denom  = fine + mid + coarse + 1e-9;
-            const double fineFrac   = fine   / denom;
-            const double coarseFrac = coarse / denom;
+                if (newDiff < curDiff) {
+                    bestVal = candVal;
+                    bestIdx = candIdx;
+                    bestSh  = candShade;
+                }
+            };
 
-            // ±4 reach color enhancement scales with saturation. sat_t is the
-            // #5 product; this consumption is intrinsic to the texture boost.
-            const double satCoarseAmp = 1.0 + 0.50 * sat_t;
+            consider(FVF_FIELD_A, FA, safeA, 0.25f);
+            consider(FVF_FIELD_B, FB, safeB, 0.35f);
+            consider(FVF_FRAME_B, FR, safeR, 0.80f);
 
-            scoreR_B *= (1.0 - T.FVF_SCALE_FINE_FRAME_B_BONUS   * fineFrac);
-            scoreB   *= (1.0 + 0.06 * fineFrac);
+            idx   = bestIdx;
+            val   = bestVal;
+            shade = bestSh;
+        } else {
+            double devA = 0.0;
+            double devB = 0.0;
+            double devR = 0.0;
 
-            scoreB   *= (1.0 - T.FVF_SCALE_COARSE_FIELD_A_BONUS * coarseFrac * satCoarseAmp);
-            scoreR_A *= (1.0 + 0.08 * coarseFrac * satCoarseAmp);
-            scoreR_B *= (1.0 + 0.04 * coarseFrac * satCoarseAmp);
+            if (T.FVF_SHAPE_STRENGTH > 0.0) {
+                const double targetModel = useFrameModel ? FR_s : FA_s;
 
-            const bool dual4Accepted =
-                tapLine.haveU4 && tapLine.haveD4 &&
-                rel < (int)tapLine.contour.size() &&
-                tapLine.contour[rel].upSideOk > 0.5 &&
-                tapLine.contour[rel].dnSideOk > 0.5;
-            if (dual4Accepted)
-                scoreB *= (1.0 - T.FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS *
-                                 coarseFrac * satCoarseAmp);
-        }
-
-        // ---- #6  vertical-edge Field-B penalty -----------------------
-        // A "vertical edge" is one the scanline crosses PERPENDICULARLY — a
-        // horizontal luma transition along the line (hIRE), not vertical
-        // contrast. A Field B penalty is enough here; a Frame A penalty goes
-        // back only if output later shows we need it. No "trust" — trust is the
-        // horizontal-edge (line-parallel) regime, deferred with #8/#9/#10.
-        {
-            const double hedge_t = std::clamp(
-                hIRE / std::max(HEDGE_THRESH_IRE, 1.0), 0.0, 1.0);
-            scoreB *= (1.0 + T.FVF_HEDGE_FIELD_B_PENALTY * hedge_t);
-        }
-
-        // #20 saturation regime is now a TOP-LEVEL branch (above), not a
-        // scoring block. The old field/frame sat biases, Frame B cross-color
-        // guard, notch seed, and #24 force are ALL gone — replaced by the
-        // global "saturated -> Frame B" branch. Nothing saturation-policy is
-        // scored here.
-
-        // ---- #21  transition sharpness reward (ported) ---------------
-        // Stable-step detection at horizontal edges; reward candidates that
-        // make a fast step and settle on both plateaus. A "free sharpen" with
-        // none of a filter's downsides. Ported verbatim minus the FA arm.
-        {
-            constexpr int EDGE_GAP = 2;
-            constexpr int EDGE_PROBE_NEAR = 2;
-            constexpr int EDGE_PROBE_FAR  = 8;
-            const bool canEval =
-                (hIRE >= 0.75 * HEDGE_THRESH_IRE) &&
-                (rel >= (EDGE_GAP + EDGE_PROBE_FAR)) &&
-                (rel + (EDGE_GAP + EDGE_PROBE_FAR) < width) &&
-                (line >= firstLine && line < lastLine);
-            if (canEval) {
-                // Source plateaus from cached base luma (no notch);
-                // fallback to the source line only if the cache is unavailable.
-                auto srcLuma = [&](int r)->double {
-                    r = std::clamp(r, 0, width - 1);
-                    return lumaBaseRow ? lumaBaseRow[r] : srcLine0[r];
+                auto getM = [&](int r) -> double {
+                    r = clampRel(r);
+                    return useFrameModel ? (*frameB)[r] : frameA[r];
                 };
-                const double lNear = srcLuma(rel - (EDGE_GAP + EDGE_PROBE_NEAR));
-                const double lFar  = srcLuma(rel - (EDGE_GAP + EDGE_PROBE_FAR));
-                const double rNear = srcLuma(rel + (EDGE_GAP + EDGE_PROBE_NEAR));
-                const double rFar  = srcLuma(rel + (EDGE_GAP + EDGE_PROBE_FAR));
-                const double stepIRE    = std::fabs(rNear - lNear) * invI;
-                const double lJitterIRE = std::fabs(lNear - lFar) * invI;
-                const double rJitterIRE = std::fabs(rNear - rFar) * invI;
-                const double EDGE_STEP_THRESH_IRE = std::max(2.0, 0.9 * HEDGE_THRESH_IRE);
-                const double EDGE_PLATEAU_JITTER_MAX_IRE = 1.2;
-                const bool stableStep =
-                    (stepIRE >= EDGE_STEP_THRESH_IRE) &&
-                    (lJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE) &&
-                    (rJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE);
-                if (stableStep) {
-                    const double lmeanIRE = lNear * invI;
-                    const double rmeanIRE = rNear * invI;
-                    // Candidate implied Y = raw − candidate (no notch — the
-                    // candidate already accounts for chroma, so the point
-                    // difference is luma).
-                    auto applySharpReward = [&](double &score,
-                                                const double *arr,
-                                                const std::vector<double> *vec) {
-                        const double cm2 = arr ? arr[rm2] : (*vec)[rm2];
-                        const double cp2 = arr ? arr[rp2] : (*vec)[rp2];
-                        const double m2 = static_cast<double>(rawRow[left + rm2]) - cm2;
-                        const double p2 = static_cast<double>(rawRow[left + rp2]) - cp2;
-                        const double candStepIRE = std::fabs(p2 - m2) * invI;
-                        const double settleL = std::fabs(m2 * invI - lmeanIRE);
-                        const double settleR = std::fabs(p2 * invI - rmeanIRE);
-                        const double SETTLE_MAX_IRE = 0.35 * stepIRE + 1.0;
-                        if (settleL > SETTLE_MAX_IRE || settleR > SETTLE_MAX_IRE) return;
-                        const double ratio = candStepIRE / std::max(1e-9, stepIRE);
-                        const double sharp = std::clamp((ratio - 0.70) / 0.30, 0.0, 1.0);
-                        const double stepStrength = std::clamp(
-                            (stepIRE - EDGE_STEP_THRESH_IRE) / 6.0, 0.0, 1.0);
-                        score *= (1.3 - T.FVF_TRANSITION_SHARPNESS_WEIGHT * sharp * stepStrength);
+
+                const double m_l = getM(rel - 1);
+                const double m_r = getM(rel + 1);
+                const double shapeModel = targetModel - 0.5 * (m_l + m_r);
+
+                auto shapeScore = [&](double c, double l, double r) -> double {
+                    const double shapeVal = c - 0.5 * (l + r);
+                    return std::fabs(shapeVal - shapeModel);
+                };
+
+                const int rm1 = clampRel(rel - 1);
+                const int rp1 = clampRel(rel + 1);
+
+                devA += shapeScore(FA_s, frameA[rm1], frameA[rp1]) *
+                        T.FVF_SHAPE_STRENGTH;
+
+                devB += shapeScore(FB_s, fieldB[rm1], fieldB[rp1]) *
+                        T.FVF_SHAPE_STRENGTH;
+
+                devR += shapeScore(FR_s, (*frameB)[rm1], (*frameB)[rp1]) *
+                        T.FVF_SHAPE_STRENGTH;
+            }
+
+            const double satScale =
+                std::clamp((chromaMagIRE - 2.0) / 8.0, 0.0, 1.0);
+
+            const double errA_notch = std::fabs(lumFA);
+            const double errB_notch = std::fabs(lumFB);
+            const double errR_notch = std::fabs(lumFR);
+
+            scoreA = (1.0 - satScale) * devA + satScale * errA_notch;
+            scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
+            scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
+
+            if (line >= 0 && line < (int)w2d_fieldA_gate.size() &&
+                rel < (int)w2d_fieldA_gate[line].size())
+            {
+                double gA = std::clamp(w2d_fieldA_gate[line][rel], 0.0, 1.0);
+
+                double gAm = gA;
+                double gAp = gA;
+
+                if (rel > 0)
+                    gAm = std::clamp(w2d_fieldA_gate[line][rel - 1], 0.0, 1.0);
+
+                if (rel + 1 < width)
+                    gAp = std::clamp(w2d_fieldA_gate[line][rel + 1], 0.0, 1.0);
+
+                const double gateAltA =
+                    std::fabs(gA - 0.5 * (gAm + gAp));
+
+                const double W_A_GATE     = 0.20;
+                const double W_A_GATE_ALT = 0.30;
+                const double W_B_HELP     = 0.18;
+
+                scoreA += W_A_GATE * (1.0 - gA);
+                scoreA += W_A_GATE_ALT * gateAltA;
+
+                double wantB = (1.0 - gA) + 1.5 * gateAltA;
+                wantB = std::clamp(wantB, 0.0, 1.0);
+
+                scoreB *= (1.0 - W_B_HELP * wantB);
+            }
+
+            if (useFrameModel) {
+                scoreA += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
+                scoreB += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
+
+                if (b2VertCoherent)
+                    scoreR *= FRAME_MODEL_BIAS;
+            } else {
+                const double closeFrameBonus =
+                    std::clamp(1.0 - (diff_candA_ire /
+                                      std::max(1e-9, FVF_SMALL_DIFF_IRE)),
+                               0.0, 1.0);
+
+                scoreA *= T.FIELD_MODEL_BIAS;
+
+                scoreR += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
+                scoreR *= T.FRAME_IN_INTERLACE_PENALTY;
+                scoreR *= (1.0 - 0.08 * closeFrameBonus);
+            }
+
+            if (frameIQ && rel < (int)frameIQ->size()) {
+                auto iqMag = [&](int r) -> double {
+                    r = clampRel(r);
+                    const auto &z = (*frameIQ)[r];
+                    return std::hypot(z.real(), z.imag());
+                };
+
+                const double fine =
+                    std::fabs(iqMag(rel) -
+                              0.5 * (iqMag(rel - 1) + iqMag(rel + 1)));
+
+                const double mid =
+                    std::fabs(iqMag(rel) -
+                              0.5 * (iqMag(rel - 2) + iqMag(rel + 2)));
+
+                const double coarse =
+                    std::fabs(iqMag(rel) -
+                              0.5 * (iqMag(rel - 4) + iqMag(rel + 4)));
+
+                const double denom = fine + mid + coarse + 1e-9;
+
+                const double fineFrac   = fine   / denom;
+                const double midFrac    = mid    / denom;
+                const double coarseFrac = coarse / denom;
+
+                metrics.iqFineFrac = fineFrac;
+                metrics.iqMidFrac = midFrac;
+                metrics.iqCoarseFrac = coarseFrac;
+                metrics.iqCoherence = 1.0 - std::clamp(coarseFrac, 0.0, 1.0);
+
+                const double frameScaleBiasStrength = useFrameModel
+                    ? FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE
+                    : FRAME_SCALE_BIAS_STRENGTH_INTERLACE;
+
+                const double FRAME_COARSE_CLAMP    = 0.60;
+                const double FIELD_SWITCH_STRENGTH = 0.10;
+
+                const bool fineDominant =
+                    (fineFrac > (midFrac + coarseFrac) + 0.10);
+
+                double frameBonus = frameScaleBiasStrength * fineFrac;
+                frameBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
+                frameBonus = std::clamp(frameBonus, 0.0, 0.35);
+
+                scoreR *= (1.0 - frameBonus);
+
+                if (!fineDominant) {
+                    const double bias =
+                        std::clamp(coarseFrac - midFrac, -1.0, 1.0);
+
+                    scoreA *= (1.0 - FIELD_SWITCH_STRENGTH * bias);
+                    scoreB *= (1.0 + FIELD_SWITCH_STRENGTH * bias);
+                }
+            }
+
+            if (sat_t > 0.0) {
+                const double SAT_FIELD_A_PEN = 0.06;
+                const double SAT_FIELD_B_PEN = 0.14;
+                const double SAT_FRAME_BONUS = 0.18;
+
+                scoreA *= (1.0 + SAT_FIELD_A_PEN * sat_t);
+                scoreB *= (1.0 + SAT_FIELD_B_PEN * sat_t);
+
+                if (b2VertCoherent)
+                    scoreR *= (1.0 - SAT_FRAME_BONUS * sat_t);
+            }
+
+            {
+                constexpr int EDGE_GAP = 2;
+                constexpr int EDGE_PROBE_NEAR = 2;
+                constexpr int EDGE_PROBE_FAR  = 6;
+
+                const bool canEval =
+                    (hIRE >= 0.75 * HEDGE_THRESH_IRE) &&
+                    (rel >= (EDGE_GAP + EDGE_PROBE_FAR)) &&
+                    (rel + (EDGE_GAP + EDGE_PROBE_FAR) < width) &&
+                    (line >= firstLine && line < lastLine);
+
+                if (canEval) {
+                    auto srcNotch = [&](int r) -> double {
+                        r = clampRel(r);
+                        return getNotchLumaEven2(srcLine0, r, width);
                     };
-                    applySharpReward(scoreB,   fieldB, nullptr);
-                    applySharpReward(scoreR_A, nullptr, &frameA);
-                    applySharpReward(scoreR_B, nullptr, frameB ? frameB : &frameA);
+
+                    const double lNear =
+                        srcNotch(rel - (EDGE_GAP + EDGE_PROBE_NEAR));
+                    const double lFar =
+                        srcNotch(rel - (EDGE_GAP + EDGE_PROBE_FAR));
+                    const double rNear =
+                        srcNotch(rel + (EDGE_GAP + EDGE_PROBE_NEAR));
+                    const double rFar =
+                        srcNotch(rel + (EDGE_GAP + EDGE_PROBE_FAR));
+
+                    const double stepIRE =
+                        std::fabs(rNear - lNear) * invI;
+
+                    const double lJitterIRE =
+                        std::fabs(lNear - lFar) * invI;
+
+                    const double rJitterIRE =
+                        std::fabs(rNear - rFar) * invI;
+
+                    const double EDGE_STEP_THRESH_IRE =
+                        std::max(2.0, 0.9 * HEDGE_THRESH_IRE);
+
+                    const double EDGE_PLATEAU_JITTER_MAX_IRE = 1.2;
+
+                    const bool stableStep =
+                        (stepIRE >= EDGE_STEP_THRESH_IRE) &&
+                        (lJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE) &&
+                        (rJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE);
+
+                    if (stableStep) {
+                        const int rm2 = clampRel(rel - 2);
+                        const int rp2 = clampRel(rel + 2);
+
+                        const double lmeanIRE = lNear * invI;
+                        const double rmeanIRE = rNear * invI;
+
+                        auto applySharpRewardPtr =
+                            [&](double &score, const double *arr)
+                        {
+                            const double m2 = getNotchLuma(arr, rm2);
+                            const double p2 = getNotchLuma(arr, rp2);
+
+                            const double candStepIRE =
+                                std::fabs(p2 - m2) * invI;
+
+                            const double settleL =
+                                std::fabs(m2 * invI - lmeanIRE);
+
+                            const double settleR =
+                                std::fabs(p2 * invI - rmeanIRE);
+
+                            const double SETTLE_MAX_IRE =
+                                0.35 * stepIRE + 1.0;
+
+                            if (settleL > SETTLE_MAX_IRE ||
+                                settleR > SETTLE_MAX_IRE)
+                            {
+                                return;
+                            }
+
+                            const double ratio =
+                                candStepIRE / std::max(1e-9, stepIRE);
+
+                            const double sharp =
+                                std::clamp((ratio - 0.70) / 0.30,
+                                           0.0, 1.0);
+
+                            const double stepStrength =
+                                std::clamp((stepIRE - EDGE_STEP_THRESH_IRE) /
+                                           6.0,
+                                           0.0, 1.0);
+
+                            const double W_EDGE_SHARP = 0.10;
+                            score *= (1.0 -
+                                      W_EDGE_SHARP * sharp * stepStrength);
+                        };
+
+                        auto applySharpRewardVec =
+                            [&](double &score,
+                                const std::vector<double> &vec)
+                        {
+                            const double m2 = getNotchLumaVec(vec, rm2);
+                            const double p2 = getNotchLumaVec(vec, rp2);
+
+                            const double candStepIRE =
+                                std::fabs(p2 - m2) * invI;
+
+                            const double settleL =
+                                std::fabs(m2 * invI - lmeanIRE);
+
+                            const double settleR =
+                                std::fabs(p2 * invI - rmeanIRE);
+
+                            const double SETTLE_MAX_IRE =
+                                0.35 * stepIRE + 1.0;
+
+                            if (settleL > SETTLE_MAX_IRE ||
+                                settleR > SETTLE_MAX_IRE)
+                            {
+                                return;
+                            }
+
+                            const double ratio =
+                                candStepIRE / std::max(1e-9, stepIRE);
+
+                            const double sharp =
+                                std::clamp((ratio - 0.70) / 0.30,
+                                           0.0, 1.0);
+
+                            const double stepStrength =
+                                std::clamp((stepIRE - EDGE_STEP_THRESH_IRE) /
+                                           6.0,
+                                           0.0, 1.0);
+
+                            const double W_EDGE_SHARP = 0.10;
+                            score *= (1.0 -
+                                      W_EDGE_SHARP * sharp * stepStrength);
+                        };
+
+                        applySharpRewardVec(scoreA, frameA);
+                        applySharpRewardPtr(scoreB, fieldB);
+                        applySharpRewardVec(scoreR, *frameB);
+                    }
+                }
+            }
+
+            if (hIRE < NEIGHBOR_EST_EDGE_MAX_IRE &&
+                diff_stack_ire < NEIGHBOR_EST_FVF_MAX_IRE &&
+                chromaMagIRE < NEIGHBOR_EST_SAT_MAX_IRE)
+            {
+                auto median3 = [&](double a, double b, double c) -> double {
+                    if (a > b) std::swap(a, b);
+                    if (b > c) std::swap(b, c);
+                    if (a > b) std::swap(a, b);
+                    return b;
+                };
+
+                const int rm2 = clampRel(rel - 2);
+                const int rp2 = clampRel(rel + 2);
+
+                const double estA2 =
+                    0.5 * (frameA[rm2] + frameA[rp2]);
+
+                const double estB2 =
+                    0.5 * (fieldB[rm2] + fieldB[rp2]);
+
+                const double estR2 =
+                    0.5 * ((*frameB)[rm2] + (*frameB)[rp2]);
+
+                double E = median3(estA2, estB2, estR2);
+
+                bool allowPm1 = true;
+                {
+                    const int rm1 = clampRel(rel - 1);
+                    const int rp1 = clampRel(rel + 1);
+
+                    const double altR =
+                        std::fabs((*frameB)[rm1] - (*frameB)[rp1]) * invI;
+
+                    if (altR > 6.0)
+                        allowPm1 = false;
+                }
+
+                if (allowPm1) {
+                    const int rm1 = clampRel(rel - 1);
+                    const int rp1 = clampRel(rel + 1);
+
+                    const double estA1 =
+                        0.5 * (frameA[rm1] + frameA[rp1]);
+
+                    const double estB1 =
+                        0.5 * (fieldB[rm1] + fieldB[rp1]);
+
+                    const double estR1 =
+                        0.5 * ((*frameB)[rm1] + (*frameB)[rp1]);
+
+                    const double E1 = median3(estA1, estB1, estR1);
+                    const double K_PM1 = 0.5;
+
+                    E = (E + K_PM1 * E1) / (1.0 + K_PM1);
+                }
+
+                scoreA += NEIGHBOR_EST_WEIGHT * std::fabs(FA_s - E) * invI;
+                scoreB += NEIGHBOR_EST_WEIGHT * std::fabs(FB_s - E) * invI;
+                scoreR += NEIGHBOR_EST_WEIGHT * std::fabs(FR_s - E) * invI;
+            }
+
+            if (!useFrameModel) {
+                const double ab_div_ire =
+                    std::fabs(lumFA - lumFB) * invI;
+
+                if (ab_div_ire > FIELD_DISAGREE_IRE) {
+                    const double dA1 =
+                        std::fabs(lumFA - L1) * invI;
+
+                    const double dB1 =
+                        std::fabs(lumFB - L1) * invI;
+
+                    const double realityBias =
+                        std::min(std::fabs(dA1 - dB1), 4.0);
+
+                    const double biasScale = 0.08 * realityBias;
+
+                    if (dA1 + ONE_D_NEAR_THRESH_IRE < dB1) {
+                        scoreA *= (1.0 - biasScale);
+                        scoreB *= (1.0 + biasScale);
+                    } else if (dB1 + ONE_D_NEAR_THRESH_IRE < dA1) {
+                        scoreB *= (1.0 - biasScale);
+                        scoreA *= (1.0 + biasScale);
+                    }
+                }
+            }
+
+            if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
+                const double dR1 = std::fabs(lumFR - L1) * invI;
+
+                if (dR1 <= 3.5 && diff_cand_ire <= 5.0 && !frameInsane) {
+                    pickCandidate(FVF_FRAME_B, FR, 0.75f);
+                } else {
+                    if (scoreA < scoreB)
+                        pickCandidate(FVF_FIELD_A, FA, 0.25f);
+                    else
+                        pickCandidate(FVF_FIELD_B, FB, 0.35f);
+                }
+            } else if (chromaMagIRE > CHROMA_STRONG_IRE &&
+                       vIRE > VERT_THRESH_IRE)
+            {
+                if (!managementVeto && !frameInsane)
+                    pickCandidate(FVF_FRAME_B, FR, 0.80f);
+                else {
+                    if (scoreA <= scoreB)
+                        pickCandidate(FVF_FIELD_A, FA, 0.25f);
+                    else
+                        pickCandidate(FVF_FIELD_B, FB, 0.35f);
+                }
+            } else {
+                if (b2VertCoherent) {
+                    pickCandidate(FVF_FRAME_B, FR, 0.80f);
+                } else if (!managementVeto &&
+                           !frameInsane &&
+                           scoreR + 1e-12 < scoreA * 0.85 &&
+                           scoreR + 1e-12 < scoreB * 0.85)
+                {
+                    pickCandidate(FVF_FRAME_B, FR, 0.80f);
+                } else if (scoreA < scoreB * 0.8) {
+                    pickCandidate(FVF_FIELD_A, FA, 0.25f);
+                } else {
+                    const double dB1 = std::fabs(lumFB - L1) * invI;
+                    const double dR1 = std::fabs(lumFR - L1) * invI;
+
+                    if (!managementVeto && !frameInsane && dR1 + 1.0 < dB1)
+                        pickCandidate(FVF_FRAME_B, FR, 0.75f);
+                    else
+                        pickCandidate(FVF_FIELD_B, FB, 0.35f);
+                }
+            }
+
+            if (!managementVeto &&
+                !frameInsane &&
+                diff_fvf_ire < FVF_SMALL_DIFF_IRE)
+            {
+                if ((!vdisSoft || safeR) &&
+                    (idx == FVF_FIELD_A || idx == FVF_FIELD_B))
+                {
+                    pickCandidate(FVF_FRAME_B, FR, 0.80f);
+                }
+            }
+
+            // Saturated-region no-switch closeout.
+            //
+            // This restores the old anti-chatter rule without blindly turning
+            // every saturated native/interlace pixel into Frame B.
+            if (chromaMagIRE > SAT_FALLBACK_START) {
+                if (useFrameModel && !managementVeto && !frameInsane) {
+                    idx = FVF_FRAME_B;
+                    val = FR;
+                    shade = 0.80f;
+                } else if (!useFrameModel &&
+                           idx == FVF_FRAME_B &&
+                           !managementVeto &&
+                           b2VertCoherent &&
+                           !frameInsane)
+                {
+                    idx = FVF_FRAME_B;
+                    val = FR;
+                    shade = 0.75f;
+                } else {
+                    idx = FVF_FIELD_B;
+                    val = FB;
+                    shade = 0.35f;
+                }
+            }
+
+            if (rel > 0) {
+                const int prevIdx = winner[rel - 1];
+
+                if (prevIdx >= FVF_FIELD_A &&
+                    prevIdx <= FVF_FRAME_B &&
+                    idx != prevIdx)
+                {
+                    const bool hystOk =
+                        !vdisHard &&
+                        (chromaMagIRE <= SAT_FALLBACK_START) &&
+                        !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) &&
+                        !((chromaMagIRE > CHROMA_STRONG_IRE) &&
+                          (vIRE > VERT_THRESH_IRE));
+
+                    if (hystOk) {
+                        auto candScore = [&](int c) -> double {
+                            switch (c) {
+                                case FVF_FIELD_A: return scoreA;
+                                case FVF_FIELD_B: return scoreB;
+                                case FVF_FRAME_B: return scoreR;
+                                default:          return 1e30;
+                            }
+                        };
+
+                        const bool prevSafe =
+                            !vdisSoft ||
+                            (prevIdx == FVF_FIELD_A ? safeA :
+                             prevIdx == FVF_FIELD_B ? safeB : safeR);
+
+                        if (prevSafe) {
+                            const double newS  = candScore(idx);
+                            const double prevS = candScore(prevIdx);
+
+                            const double HYST_ABS_GATE = 0.03;
+                            const double HYST_REL_GATE = 0.04;
+
+                            const bool convincinglyBetter =
+                                (newS + HYST_ABS_GATE < prevS) &&
+                                (newS < prevS * (1.0 - HYST_REL_GATE));
+
+                            if (!convincinglyBetter) {
+                                idx = prevIdx;
+
+                                if (idx == FVF_FIELD_A) {
+                                    val = FA;
+                                    shade = 0.25f;
+                                } else if (idx == FVF_FIELD_B) {
+                                    val = FB;
+                                    shade = 0.35f;
+                                } else {
+                                    val = FR;
+                                    shade = 0.80f;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // ---- DEFERRED to "the other side" (after we see output) ------
-        // #8/#9/#10 (contour/vertical-trust, lattice comb-need, reach) are the
-        // horizontal-edge / trust-reach regime — line-PARALLEL edges. NOT ported
-        // now; revisit once output is reviewed. (VDIS is gone; the divergence
-        // cluster will own the horizontal-line issue when that regime returns.)
+        winner[rel] = idx;
+        outVal[rel] = val;
+        outShade[rel] = shade;
 
-        // ---- NATIVE-REGIME-ONLY scoring (cadenceId in {-2,-1}) ---------
-        if (nativeRegime) {
-            // #23 small-diff frame reward — gated OUT under progressive. When
-            // field and frame agree closely, prefer the frame (more vertical
-            // resolution). Uses the comb-divergence comparator.
-            if (diff_candB_ire < FVF_SMALL_DIFF_IRE) {
-                const double close = 1.0 - std::clamp(
-                    diff_candB_ire / std::max(1e-9, FVF_SMALL_DIFF_IRE), 0.0, 1.0);
-                scoreR_A *= (1.0 - 0.12 * close);
-                scoreR_B *= (1.0 - 0.12 * close);
-            }
-            // Frames clear a higher bar in the native regime, where interfield
-            // is trusted on measured coherence rather than metadata.
-            scoreR_A *= T.FRAME_IN_INTERLACE_PENALTY;
-            scoreR_B *= T.FRAME_IN_INTERLACE_PENALTY;
-            // Native bias toward the field model (now Field B).
-            scoreB   *= T.FIELD_MODEL_BIAS;
-            // (#27 block-field commit is finalized after the loop, native only.)
+        if (idx == FVF_FRAME_B)
+            frameCountTotal++;
+        else if (idx == FVF_FIELD_A || idx == FVF_FIELD_B)
+            fieldCountTotal++;
+
+        metrics.winner = idx;
+
+        if (line >= 0 && line < (int)fvfMetrics.size() &&
+            rel < (int)fvfMetrics[line].size())
+        {
+            fvfMetrics[line][rel] = metrics;
         }
-
-        // ---- MODEL-REGIME-ONLY scoring (cadenceId >= 0 or -3) ----------
-        if (modelRegime) {
-            // Metadata trust: Frame B is the home model.  There is no native
-            // interfield viability weed here; model-distance scoring above is
-            // the place where the foreign Field B candidate pays divergence.
-            // No interlace penalty, no field bias.
-        }
-
-        // ============================================================
-        // 3b. ELECTION (#25) — 3-candidate cascade
-        // ============================================================
-        auto pick = [&](int candIdx, double candVal, float candShade) {
-            idx = candIdx; val = candVal; shade = candShade;
-        };
-        auto pickBestFrame = [&](float shA, float shB) {
-            if (scoreR_A <= scoreR_B) pick(2, FR,  shA);
-            else                      pick(3, FRB, shB);
-        };
-
-        // hIRE hoisted to the additive-foundation block (shared with #21).
-
-        // Cascade (saturation is no longer here — it is a top-level regime
-        // branch that already returned Frame B for saturated pixels):
-        //   1. strong horizontal edge — frames more reliable than interfield
-        //   2. general score comparison
-        if (hIRE > HEDGE_THRESH_IRE && diff_candB_ire > 5.0) {
-            // Strong luma edge.
-            if (scoreR_B <= scoreR_A && scoreR_B <= scoreB) pick(3, FRB, 0.85f);
-            else if (scoreR_A <= scoreB)                    pick(2, FR,  0.7f);
-            else                                            pick(1, FB,  0.35f);
-        } else {
-            const double bestFrame = std::min(scoreR_A, scoreR_B);
-            if (modelRegime && bestFrame <= scoreB) {
-                pickBestFrame(0.7f, 0.85f);          // metadata model wins ties
-            } else if (bestFrame + 1e-12 < scoreB * 0.85) {
-                pickBestFrame(0.7f, 0.85f);          // frame convincingly beats field
-            } else {
-                // Tiebreaker (no-notch): which candidate's implied Y
-                // (raw − candidate) sits closest to cached base luma?
-                // LAZY — only pixels reaching here pay for it.
-                const double yRef   = lumaBaseRow ? lumaBaseRow[rel] : L1;
-                const double rawHere = static_cast<double>(rawRow[left + rel]);
-                const double dFL = std::fabs((rawHere - FB)  - yRef) * invI;  // Field B
-                const double dRL = std::fabs((rawHere - FRB) - yRef) * invI;  // Frame B
-                if (dRL + 1.0 < dFL) pickBestFrame(0.7f, 0.85f);
-                else                 pick(1, FB, 0.35f);
-            }
-        }
-
-        (void)FIELD_BLOCK_SIZE;  // pending #27 block-field commit
-        winner[rel] = idx; outVal[rel] = val; outShade[rel] = shade;
     }
 
-    // ==================================================================
-    // 4. CLEANUP
-    // ==================================================================
-    // #26 Island cleanup — flip a single-pixel winner to match its neighbours
-    // when both sides agree, except in saturated / edge / divergent spots.
+    // Island cleanup: never touch saturation, strong edges, or high-divergence
+    // areas. This is intentionally a soft-region cleanup only.
     {
-        std::vector<int> &w2 = scratch_fvf_winner2;
-        std::copy(winner.begin(), winner.end(), w2.begin());
+        std::copy(winner.begin(), winner.end(), winner2.begin());
+
         const double EDGE_STOP_IRE = HEDGE_THRESH_IRE;
         const double DIFF_STOP_IRE = 6.0;
-        const double SAT_STOP_IRE  = 6.0;     // don't flip inside coloured areas
+
         bool changed = false;
+
         for (int rel = 1; rel < width - 1; ++rel) {
-            if (scratch_fvf_iqMag[rel] * invI > SAT_STOP_IRE) continue;
-            if (horizEdgeIRE(rel) > EDGE_STOP_IRE)            continue;
-            if (diffFVF[rel] > DIFF_STOP_IRE)                 continue;
-            const int L = winner[rel - 1], C = winner[rel], R = winner[rel + 1];
-            if (L == R && C != L) { w2[rel] = L; changed = true; }
+            if (satMap[rel] > SAT_FALLBACK_START) continue;
+            if (horizEdgeIRE(rel) > EDGE_STOP_IRE) continue;
+            if (diffFVF[rel] > DIFF_STOP_IRE) continue;
+
+            const int L = winner[rel - 1];
+            const int C = winner[rel];
+            const int R = winner[rel + 1];
+
+            if (L == R && C != L) {
+                winner2[rel] = L;
+                changed = true;
+            }
         }
+
         if (changed) {
-            winner.swap(w2);
+            winner.swap(winner2);
+
             for (int rel = 0; rel < width; ++rel) {
                 const int idx = winner[rel];
-                if      (idx == 1) { outVal[rel] = fieldB[rel]; outShade[rel] = 0.35f; }
-                else if (idx == 2) { outVal[rel] = frameA[rel]; outShade[rel] = 0.7f;  }
-                else               { outVal[rel] = frameB ? (*frameB)[rel] : frameA[rel];
-                                     outShade[rel] = 0.85f; }
+
+                if (idx == FVF_FIELD_A) {
+                    outVal[rel] = frameA[rel];
+                    outShade[rel] = 0.25f;
+                } else if (idx == FVF_FIELD_B) {
+                    outVal[rel] = fieldB[rel];
+                    outShade[rel] = 0.35f;
+                } else if (idx == FVF_FRAME_B) {
+                    outVal[rel] = (*frameB)[rel];
+                    outShade[rel] = 0.80f;
+                } else {
+                    outVal[rel] = sample1D(rel);
+                    outShade[rel] = 0.0f;
+                }
             }
         }
     }
 
-    // #27 Block-field commit — NATIVE regime only. Where fields dominate the
-    // line and a block's divergence is high, commit the whole block to Field B
-    // to de-risk interfield teeth. (Field A retired -> the commit is Field B.)
+    // Native block-field commit. This is saturation-protected, and diffFVF is
+    // already IRE, so do not multiply by invI again.
+    if (!useFrameModel &&
+        fieldCountTotal > frameCountTotal * 2 &&
+        fieldCountTotal > 0)
     {
-        int fieldCount = 0, frameCount = 0;
-        for (int rel = 0; rel < width; ++rel) {
-            const int idx = winner[rel];
-            if      (idx == 2 || idx == 3) frameCount++;
-            else if (idx == 1)             fieldCount++;
-        }
-        if (nativeRegime && fieldCount > frameCount * 2 && fieldCount > 0) {
-            for (int b = 0; b < width; b += FIELD_BLOCK_SIZE) {
-                const int e = std::min(width, b + FIELD_BLOCK_SIZE);
-                double blockDivergence = 0.0;
-                for (int r = b; r < e; ++r) blockDivergence += diffFVF[r];
-                blockDivergence /= (e - b);
-                if (blockDivergence > FIELD_DISAGREE_IRE) {
-                    int cntField = 0, cntFrame = 0;
+        for (int b = 0; b < width; b += FIELD_BLOCK_SIZE) {
+            const int e = std::min(width, b + FIELD_BLOCK_SIZE);
+
+            bool blockSaturated = false;
+            for (int r = b; r < e; ++r) {
+                if (satMap[r] > SAT_FALLBACK_START) {
+                    blockSaturated = true;
+                    break;
+                }
+            }
+            if (blockSaturated) continue;
+
+            double blockDivergenceIRE = 0.0;
+            for (int r = b; r < e; ++r)
+                blockDivergenceIRE += diffFVF[r];
+
+            blockDivergenceIRE /= std::max(1, e - b);
+
+            if (blockDivergenceIRE > FIELD_DISAGREE_IRE) {
+                int cntA = 0;
+                int cntB = 0;
+                int cntF = 0;
+
+                for (int r = b; r < e; ++r) {
+                    if      (winner[r] == FVF_FIELD_A) cntA++;
+                    else if (winner[r] == FVF_FIELD_B) cntB++;
+                    else if (winner[r] == FVF_FRAME_B) cntF++;
+                }
+
+                if (cntF > 0 && (cntA + cntB) > cntF * 2) {
+                    const int blockIdx =
+                        (cntA >= cntB) ? FVF_FIELD_A : FVF_FIELD_B;
+
                     for (int r = b; r < e; ++r) {
-                        if (winner[r] == 1) cntField++; else cntFrame++;
-                    }
-                    if (cntFrame > 0 && cntField > 0) {       // mixed block
-                        for (int r = b; r < e; ++r) {
-                            winner[r] = 1; outVal[r] = fieldB[r]; outShade[r] = 0.35f;
+                        winner[r] = blockIdx;
+
+                        if (blockIdx == FVF_FIELD_A) {
+                            outVal[r] = frameA[r];
+                            outShade[r] = 0.25f;
+                        } else {
+                            outVal[r] = fieldB[r];
+                            outShade[r] = 0.35f;
                         }
                     }
                 }
@@ -1429,32 +1943,30 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         }
     }
 
-    // ==================================================================
-    // 5. Emit — elected scalar to outMixed (+ diagnostics).
-    // ==================================================================
     for (int rel = 0; rel < width; ++rel) {
-        outMixed[rel] = outVal[rel];
+        double v = outVal[rel];
+
+        if (!std::isfinite(v))
+            v = fieldB[rel];
+
+        outMixed[rel] = v;
+
         if (line >= 0 && line < (int)fvfMetrics.size() &&
             rel < (int)fvfMetrics[line].size())
+        {
             fvfMetrics[line][rel].winner = winner[rel];
-        if (writeWeights && line >= 0 && line < (int)w2d_frame_weight.size()) {
+        }
+
+        if (writeWeights &&
+            line >= 0 &&
+            line < (int)w2d_frame_weight.size() &&
+            rel < (int)w2d_frame_weight[line].size())
+        {
             float w = outShade[rel];
             if (!std::isfinite(w)) w = 0.0f;
             w2d_frame_weight[line][rel] = w;
         }
     }
-    // (fvfInstrumentation counters omitted in the scaffold — re-add at
-    //  integration if --debug-phase-legs diagnostics are wanted.)
-
-    // ==================================================================
-    // RETIRED / RELOCATED / LEGACY (must NOT reappear here)
-    //   removed:   #1 stack-avg, #11 shape, #13 checker, #14 no-comb-no-win,
-    //              #15 rolling, #16 FA fast-commit, #17 FA gate, #22 neighbor,
-    //              Field A candidate + computeContourFieldLine + fieldAGate
-    //   relocated: #5 chroma-mag/sat ramp -> instrumentation outside FVF
-    //   legacy:    #7 horizontal-edge Frame-B reward -> bucket / 1D backdoor
-    //              only (--two-d-variant FVF, no --ntsc-phase-comp)
-    // ==================================================================
 }
 
 void Comb::FrameBuffer::collectCombAttributionEvidence(
@@ -2280,14 +2792,14 @@ void Comb::FrameBuffer::split2D()
                 scoreFieldVsFrame(
                     line,
                     tapLine,
-                    scratch_lineWorkC.data(),
-                    scratch_frameAAdaptiveIQComposite,
-                    &scratch_frameBDirectIQComposite,
+                    scratch_lineWorkC.data(),                 // Field B / simple field
+                    scratch_lineWorkA,                        // Field A / contour field
+                    &scratch_frameBDirectIQComposite,         // Frame B / direct IQ composite
                     scratch_outMixed.data(),
                     writeWeights,
                     scratch_lateralLine.data(),
                     &frameIQ);
-
+                                        
                 for (int rel = 0; rel < width; ++rel) {
                     double vMixed = scratch_outMixed[rel];
 

@@ -852,16 +852,16 @@ private:
 	// Field-vs-Frame elects scalar bandpass candidates. IQ evidence can inform
 	// the scores, but IQ-derived candidates must be remodulated before entry.
 	void scoreFieldVsFrame(
-		int line,
-		const CombTapLine &tapLine,
-		const double *fieldB,
-		const std::vector<double> &frameA,
-		const std::vector<double> *frameB,
-		double *outMixed,
-		bool writeWeights,
-		const double *lateral1D,
-		const std::vector<std::complex<double>> *frameIQ = nullptr);
-
+	    int line,
+	    const CombTapLine &tapLine,
+	    const double *fieldB,
+	    const std::vector<double> &fieldA,
+	    const std::vector<double> *frameB,
+	    double *outMixed,
+	    bool writeWeights,
+	    const double *lateral1D,
+	    const std::vector<std::complex<double>> *frameIQ = nullptr);
+	    
 	static inline bool fvf_is_tri_safe(double candVal,
 									   double L1,
 									   double invIreScale,
