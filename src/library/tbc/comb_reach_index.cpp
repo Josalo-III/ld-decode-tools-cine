@@ -116,7 +116,7 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
     if (!request.source.scalarCarrier)
         return blockedReply(request, "not-scalar-carrier");
 
-    if (request.source.commonRemodulatedPhase) {
+    if (request.source.polarity == CombReachPolarity::CommonPhase) {
         reply.verdict = CombReachVerdict::CommonPhaseOnly;
         reply.fastPath = true;
         reply.allowScalarAverage = true;
@@ -128,11 +128,13 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
     if (reply.carrierRelation == CarrierPhaseRelation::Same ||
         reply.carrierRelation == CarrierPhaseRelation::Opposite)
     {
+        const bool polarityPreserved =
+            request.source.polarity == CombReachPolarity::Preserved;
         reply.verdict = CombReachVerdict::Green;
         reply.fastPath = true;
         reply.allowScalarAverage = true;
-        reply.allowScalarCancel = request.source.physicalPolarityPreserved;
-        reply.allowScalarSignCompare = request.source.physicalPolarityPreserved;
+        reply.allowScalarCancel = polarityPreserved;
+        reply.allowScalarSignCompare = polarityPreserved;
         reply.allowScalarMagnitudeCompare = true;
         reply.tag = "carrier-relation";
         return reply;
@@ -217,7 +219,7 @@ CombReachSourceFrame makeRawCompositeReachSource()
     CombReachSourceFrame source;
     source.kind = CombReachSourceKind::RawCompositeScalar;
     source.signFrame = CarrierSignFrame::UnsignedBucket;
-    source.physicalPolarityPreserved = true;
+    source.polarity = CombReachPolarity::Preserved;
     source.scalarCarrier = true;
     source.tag = "raw-composite";
     return source;
@@ -228,7 +230,7 @@ CombReachSourceFrame makeBucketScalarReachSource()
     CombReachSourceFrame source;
     source.kind = CombReachSourceKind::Bucket1DScalar;
     source.signFrame = CarrierSignFrame::UnsignedBucket;
-    source.physicalPolarityPreserved = true;
+    source.polarity = CombReachPolarity::Preserved;
     source.scalarCarrier = true;
     source.tag = "bucket-1d-scalar";
     return source;
@@ -239,8 +241,7 @@ CombReachSourceFrame makeLockedCommonPhaseScalarReachSource()
     CombReachSourceFrame source;
     source.kind = CombReachSourceKind::LockedCommonPhaseScalar;
     source.signFrame = CarrierSignFrame::Grid4fsc;
-    source.commonRemodulatedPhase = true;
-    source.physicalPolarityPreserved = false;
+    source.polarity = CombReachPolarity::CommonPhase;
     source.scalarCarrier = true;
     source.tag = "locked-common-phase-scalar";
     return source;
@@ -251,7 +252,7 @@ CombReachSourceFrame makeGrid4fscIQReachSource()
     CombReachSourceFrame source;
     source.kind = CombReachSourceKind::Grid4fscIQ;
     source.signFrame = CarrierSignFrame::Grid4fsc;
-    source.physicalPolarityPreserved = true;
+    source.polarity = CombReachPolarity::Preserved;
     source.iqCarrier = true;
     source.tag = "grid-4fsc-iq";
     return source;

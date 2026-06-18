@@ -2143,6 +2143,57 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         }
     }
 
+    // Leading-edge geometry probe (debug only). For a few upper-third lines,
+    // find the strongest horizontal luma step (where 1D cross-color is born)
+    // and print the *vertical* IQ phase relationship there. This answers the
+    // one thing the aggregate can't: at a real leading edge, is the center
+    // anti-phase to its interfield neighbors (sd<0, midpoint/null target) or
+    // co-directional under a tint (sd~+1, neighbor-common target)?
+    {
+        auto sdot = [&](const std::complex<double> &a,
+                        const std::complex<double> &b) -> double {
+            const double ma = std::hypot(a.real(), a.imag());
+            const double mb = std::hypot(b.real(), b.imag());
+            if (ma <= 1e-9 || mb <= 1e-9) return 0.0;
+            return (a.real() * b.real() + a.imag() * b.imag()) / (ma * mb);
+        };
+        const int probeLo = firstLine + (lastLine - firstLine) / 6;
+        const int probeHi = firstLine + (lastLine - firstLine) / 3;
+        const int probeStep = std::max(1, (probeHi - probeLo) / 10);
+        for (int line = probeLo; line < probeHi && line < demodLines; line += probeStep) {
+            if (line - 2 < firstLine || line + 2 >= lastLine) continue;
+            int bestRel = -1;
+            double bestH = 0.0;
+            for (int rel = 8; rel < width - 8; ++rel) {
+                const double hLuma =
+                    std::fabs(sampleRow(line, rel) - sampleRow(line, rel - 4)) * invI;
+                const std::complex<double> zc = sampleIQ(line, rel);
+                const double m = std::hypot(zc.real(), zc.imag()) * invI;
+                if (hLuma > bestH && m > 4.0) { bestH = hLuma; bestRel = rel; }
+            }
+            if (bestRel < 0 || bestH < 6.0) continue;
+            const int rel = bestRel;
+            const std::complex<double> z0  = sampleIQ(line, rel);
+            const std::complex<double> zu1 = sampleIQ(line - 1, rel);
+            const std::complex<double> zd1 = sampleIQ(line + 1, rel);
+            const std::complex<double> zu2 = sampleIQ(line - 2, rel);
+            const std::complex<double> common1 = 0.5 * (zu1 + zd1);
+            const double cDelta1 =
+                std::hypot((z0 - common1).real(), (z0 - common1).imag()) * invI;
+            qInfo().noquote() << QString(
+                "EdgeProbe line=%1 rel=%2 hLuma=%3 |Z0|=%4 z0=%5/%6 "
+                "sd(z0,u1)=%7 sd(u1,d1)=%8 sd(z0,u2)=%9 cDelta1=%10")
+                .arg(line).arg(rel)
+                .arg(bestH, 0, 'f', 1)
+                .arg(std::hypot(z0.real(), z0.imag()) * invI, 0, 'f', 2)
+                .arg(z0.real() * invI, 0, 'f', 2).arg(z0.imag() * invI, 0, 'f', 2)
+                .arg(sdot(z0, zu1), 0, 'f', 2)
+                .arg(sdot(zu1, zd1), 0, 'f', 2)
+                .arg(sdot(z0, zu2), 0, 'f', 2)
+                .arg(cDelta1, 0, 'f', 2);
+        }
+    }
+
     QString msg = QString("PhaseLegStats %1 cadence=%2 fieldPhase=%3/%4")
         .arg(label)
         .arg(cadenceId)

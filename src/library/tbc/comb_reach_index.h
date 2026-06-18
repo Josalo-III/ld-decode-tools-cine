@@ -46,11 +46,21 @@ enum class CombReachSourceKind {
     Unknown
 };
 
+// Whether a source still carries physical carrier polarity.  This is one state,
+// not two independent flags: a common-phase (remodulated) source has by
+// definition erased its polarity, so the illegal "common phase yet polarity
+// preserved" combination is unrepresentable.  Sign-based reach (cancel,
+// sign-compare) is legal only for Preserved.
+enum class CombReachPolarity {
+    None,         // no polarity semantics (carrier-free Y, detector, default)
+    Preserved,    // physical carrier polarity intact
+    CommonPhase   // remodulated to common phase; polarity erased
+};
+
 struct CombReachSourceFrame {
     CombReachSourceKind kind = CombReachSourceKind::Unknown;
     CarrierSignFrame signFrame = CarrierSignFrame::UnsignedBucket;
-    bool commonRemodulatedPhase = false;
-    bool physicalPolarityPreserved = false;
+    CombReachPolarity polarity = CombReachPolarity::None;
     bool scalarCarrier = false;
     bool iqCarrier = false;
     bool carrierFree = false;

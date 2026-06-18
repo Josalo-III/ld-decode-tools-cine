@@ -32,6 +32,7 @@
 #include "lddecodemetadata.h"
 #include "attributiondefs.h"
 #include "carriergrammar.h"
+#include "comb_content_reach.h"
 #include "comb_reach_index.h"
 #include "combmath.h"
 #include "componentframe.h"
@@ -420,12 +421,10 @@ private:
 		double coherence = 1.0;
 		double kScore = 0.0;
 		double weight = 1.0;
-		lddecode::CombReachReply scalarReach;
-		lddecode::CombReachReply iqReach;
-		double scalarReachGate = 1.0; // phase/source-frame legality for scalar reach operations
-		double reachGate = 1.0;       // shared IQ/contour limiter for this side's vertical reach
-		double iqReachGate = 1.0;     // locked-IQ material match limiter
-		double contourReachGate = 1.0;// scalar contour limiter (same-field reaches)
+		lddecode::CombReachReply reach;
+		double reachLegalGate = 1.0;  // binary legality from reach index for this rung
+		double contourReachGate = 1.0;// contour-evidence limiter
+		double reachGate = 1.0;       // combined: material * contour * legal
 	};
 
 	struct CombTapContour {
@@ -488,7 +487,9 @@ private:
 		std::vector<CombTapPair> pairD1;
 		std::vector<CombTapPair> pairU2;
 		std::vector<CombTapPair> pairD2;
+		std::vector<CombContentReach::Reply> fieldContent;
 		std::vector<CombTapContour> contour;
+		std::vector<CombContentReach::MovingCoarseContour> movingCoarseContour;
 		std::vector<double> hLumaDeltaIRE;
 	};
 	enum CombTapBuild : unsigned {
@@ -819,13 +820,16 @@ private:
 									std::vector<std::complex<double>> &outFrameIQ,
 									const std::vector<float> *tiOverride = nullptr,
 									const std::vector<float> *tqOverride = nullptr);
-	void computeFrameBDirectIQFromPreparedVectors(int line,
-									const std::vector<std::complex<double>> &centerIQ,
-									const std::vector<std::complex<double>> &upIQ,
-									const std::vector<std::complex<double>> &dnIQ,
-									std::vector<std::complex<double>> &outFrameIQ,
-									const CombTapLine *reachTapLine = nullptr);
-		void computeFrameIQFromPreparedVectors(int line,
+	void computeFrameBDirectIQFromPreparedVectors(
+	    int line,
+	    const std::vector<std::complex<double>> &centerIQ,
+	    const std::vector<std::complex<double>> &upIQ,
+	    const std::vector<std::complex<double>> &dnIQ,
+	    std::vector<std::complex<double>> &outFrameIQ,
+	    const CombTapLine *reachTapLine = nullptr);
+	    
+	    
+	void computeFrameIQFromPreparedVectors(int line,
 											   const std::vector<std::complex<double>> &centerIQ,
 											   std::vector<std::complex<double>> &upIQ,
 											   std::vector<std::complex<double>> &dnIQ,
