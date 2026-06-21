@@ -887,6 +887,17 @@ void Comb::FrameBuffer::filterIQLocked()
             }
         }
 
+        constexpr double lockedPreRot =
+            LOCKED_CHROMA_PREFILTER_ROT_DEG * M_PI / 180.0;
+        const double preC = std::cos(lockedPreRot);
+        const double preS = std::sin(lockedPreRot);
+        for (int i = 0; i < width; ++i) {
+            const double ti = scratch_preI[i];
+            const double tq = scratch_preQ[i];
+            scratch_preI[i] = ti * preC - tq * preS;
+            scratch_preQ[i] = ti * preS + tq * preC;
+        }
+
         double *preIext = scratch_preI_ext.data();
         double *preQext = scratch_preQ_ext.data();
         const double leftI = (width > 0) ? scratch_preI[0] : 0.0;

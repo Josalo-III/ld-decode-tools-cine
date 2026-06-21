@@ -39,6 +39,14 @@ inline constexpr double CAL_LO_ROT_DEG = 0.0;
 inline constexpr double GI_PRODUCT = 1.0;
 inline constexpr double GQ_PRODUCT = 0.9;
 
+// Locked-path hue basis split.  The total locked IQ->UV rotation is preserved,
+// but the locked-specific correction is applied before the axis-specific FIRs
+// so the final output step can keep the canonical 33 degree IQ->UV rotation.
+inline constexpr double LOCKED_CHROMA_TOTAL_ROT_DEG = 70.0;
+inline constexpr double LOCKED_CHROMA_OUTPUT_ROT_DEG = 33.0;
+inline constexpr double LOCKED_CHROMA_PREFILTER_ROT_DEG =
+    LOCKED_CHROMA_TOTAL_ROT_DEG - LOCKED_CHROMA_OUTPUT_ROT_DEG;
+
 // Per-bucket carrier-excursion gain.  Indexed by carrierSampleClass & 3.
 // Set to 1.0 (neutral): per-bucket magnitude asymmetry was shown to be
 // scene-dependent and does not track the visible checkerboard artifact.

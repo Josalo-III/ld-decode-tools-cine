@@ -2161,7 +2161,9 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
 
     auto sampleIQ = [&](int line, int rel)->std::complex<double> {
         const int h = left + std::clamp(rel, 0, width - 1);
-        const int ph = carrierSampleClass(line, h);
+        const int ph = useLockedSource
+            ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), h)
+            : carrierSampleClass(line, h);
         double ti = 0.0;
         double tq = 0.0;
 
@@ -2184,7 +2186,7 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
 
     auto sampleLockedIQ = [&](int line, int rel)->std::complex<double> {
         const int h = left + std::clamp(rel, 0, width - 1);
-        const int ph = carrierSampleClass(line, h);
+        const int ph = carrierGrammarSignedSampleClass(carrierGrammarLine(line), h);
         double ti = 0.0;
         double tq = 0.0;
 
@@ -2224,7 +2226,9 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         }
 
         for (int rel = 4; rel < width - 4; ++rel) {
-            const int phase = carrierSampleClass(line, left + rel);
+            const int phase = useLockedSource
+                ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), left + rel)
+                : carrierSampleClass(line, left + rel);
             const std::complex<double> z  = sampleIQ(line, rel);
             const std::complex<double> zm = sampleIQ(line, rel - 4);
             const std::complex<double> zp = sampleIQ(line, rel + 4);
@@ -3259,16 +3263,14 @@ void Comb::FrameBuffer::doYNR()
 
 // Final chroma rotation and gain: rotates the I/Q plane by chromaPhase degrees
 // and scales by chromaGain, converting from the internal demod basis to the
-// standard Y'UV colour axes. The two paths use different base rotation angles
-// because they produce I/Q in different reference frames: the locked path
-// (splitIQlocked / filterIQLocked) produces chroma aligned to the burst-locked
-// LO (base 70), while the bucket path (splitIQ / filterIQ) produces chroma
-// aligned to the 4fsc sampling grid (base 33).
+// standard Y'UV colour axes. The locked path now applies the front half of its
+// base hue rotation before filterIQLocked() so the axis-specific FIRs see the
+// expected orientation; the output half here preserves the same total hue.
 void Comb::FrameBuffer::transformIQ(double chromaGain, double chromaPhase)
 {
     if (configuration.phaseCompensation) {
-        constexpr double BASE_LOCKED = 70.0;
-        const double theta = (BASE_LOCKED + chromaPhase) * M_PI / 180.0;
+        const double theta =
+            (LOCKED_CHROMA_OUTPUT_ROT_DEG + chromaPhase) * M_PI / 180.0;
         const double c = std::cos(theta);
         const double s = std::sin(theta);
 
