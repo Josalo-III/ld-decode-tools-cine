@@ -162,11 +162,14 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     assert(componentFrames.size() * 2 == (endIndex - startIndex));
 
     enum StageIndex {
+        StageLoadFields,
+        StageSplit1D,
         StagePhaseLocked,
         StagePhaseCorrected1D,
         StageSplit2D,
         StageCopy2DTo3D,
         StageSplit3D,
+        StagePostCombImpurity,
         StageSplitIQLocked,
         StageDoCNR,
         StageProduceY,
@@ -181,11 +184,14 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         qint64 calls = 0;
     };
     std::array<StageStat, StageCount> stageStats = {{
+        {"loadFields"},
+        {"split1D"},
         {"phaseLocked"},
         {"buildPhaseCorrected1D"},
         {"split2D"},
         {"copy2DTo3D"},
         {"split3D"},
+        {"measurePostCombImpurity"},
         {"splitIQlocked"},
         {"doCNR"},
         {"produceY"},
@@ -194,7 +200,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         {"transformIQ"},
     }};
     const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
+    QElapsedTimer decodeTimer;
+    if (stageTimers) decodeTimer.start();
     FrameBuffer::FvfInstrumentation fvfStatsTotal;
+    FrameBuffer::Split2DInstrumentation split2DStatsTotal;
+    FrameBuffer::TapBuildInstrumentation tapBuildStatsTotal;
     auto accumulateFvfStats = [&](const FrameBuffer::FvfInstrumentation &stats) {
         for (int i = 0; i < 4; ++i) {
             fvfStatsTotal.rawWinnerCounts[i] += stats.rawWinnerCounts[i];
@@ -209,6 +219,20 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c)
                 fvfStatsTotal.islandFlipPairs[r][c] += stats.islandFlipPairs[r][c];
+    };
+    auto accumulateSplit2DStats = [&](const FrameBuffer::Split2DInstrumentation &stats) {
+        for (int i = 0; i < FrameBuffer::Split2DTimerCount; ++i) {
+            split2DStatsTotal.totalNs[i] += stats.totalNs[i];
+            split2DStatsTotal.calls[i] += stats.calls[i];
+        }
+        split2DStatsTotal.lines += stats.lines;
+    };
+    auto accumulateTapBuildStats = [&](const FrameBuffer::TapBuildInstrumentation &stats) {
+        for (int i = 0; i < FrameBuffer::TapBuildTimerCount; ++i) {
+            tapBuildStatsTotal.totalNs[i] += stats.totalNs[i];
+            tapBuildStatsTotal.calls[i] += stats.calls[i];
+        }
+        tapBuildStatsTotal.lines += stats.lines;
     };
     auto measureStage = [&](StageIndex idx, auto &&fn) {
         if (!stageTimers) {
@@ -244,10 +268,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (fieldIndex + 3 < inputFields.size());
 
         if (canLoadNext) {
-            next->loadFields(inputFields[fieldIndex + 2],
-                             inputFields[fieldIndex + 3]);
+            measureStage(StageLoadFields, [&]() {
+                next->loadFields(inputFields[fieldIndex + 2],
+                                 inputFields[fieldIndex + 3]);
+            });
 
-            next->split1D();
+            measureStage(StageSplit1D, [&]() { next->split1D(); });
 
             if (configuration.phaseCompensation) {
                 measureStage(StagePhaseLocked, [&]() { next->phaseLocked(); });
@@ -255,6 +281,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             }
 
             measureStage(StageSplit2D, [&]() { next->split2D(); });
+            if (stageTimers) {
+                accumulateSplit2DStats(next->getSplit2DInstrumentation());
+                accumulateTapBuildStats(next->getTapBuildInstrumentation());
+            }
             if (stageTimers &&
                 configuration.twoDVariant ==
                     Comb::Configuration::TwoDVariant::FieldVsFrame) {
@@ -294,7 +324,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          * splitIQlocked() is the post-election demod of the selected comb.
          */
         if (configuration.phaseCompensation) {
-            current->measurePostCombImpurity();
+            measureStage(StagePostCombImpurity, [&]() { current->measurePostCombImpurity(); });
             measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
             measureStage(StageDoCNR, [&]() { current->doCNR(); });
             measureStage(StageProduceY, [&]() { current->produceY(); });
@@ -314,7 +344,9 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                                  configuration.chromaPhase);
         }
 
-        if (configuration.dimensions == 3 && configuration.showMap)
+        if (configuration.showMap &&
+            (configuration.dimensions == 3 ||
+             configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple))
             current->overlayMap(*previous, *next);
 
         // --- Visual Debug Overlays: Cadence / Film vs Video ------------------------
@@ -412,17 +444,117 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
     if (stageTimers) {
         QStringList parts;
+        qint64 measuredNs = 0;
+        const qint64 wallNs = decodeTimer.nsecsElapsed();
         for (const StageStat &stat : stageStats) {
             if (stat.calls <= 0) continue;
+            measuredNs += stat.totalNs;
             const double avgMs = (static_cast<double>(stat.totalNs) / 1.0e6) /
                                  static_cast<double>(stat.calls);
-            parts << QString("%1=%2ms (%3 calls)")
+            const double totalMs = static_cast<double>(stat.totalNs) / 1.0e6;
+            const double pct = (wallNs > 0)
+                ? (100.0 * static_cast<double>(stat.totalNs) / static_cast<double>(wallNs))
+                : 0.0;
+            parts << QString("%1=%2ms avg/%3ms total/%4% (%5 calls)")
                          .arg(stat.name)
                          .arg(avgMs, 0, 'f', 3)
+                         .arg(totalMs, 0, 'f', 3)
+                         .arg(pct, 0, 'f', 1)
                          .arg(stat.calls);
         }
         if (!parts.isEmpty()) {
             qInfo().noquote() << QString("Locked stage timers: %1").arg(parts.join(", "));
+        }
+        const qint64 unaccountedNs = std::max<qint64>(0, wallNs - measuredNs);
+        const double wallMs = static_cast<double>(wallNs) / 1.0e6;
+        const double measuredMs = static_cast<double>(measuredNs) / 1.0e6;
+        const double unaccountedMs = static_cast<double>(unaccountedNs) / 1.0e6;
+        const double measuredPct = (wallNs > 0)
+            ? (100.0 * static_cast<double>(measuredNs) / static_cast<double>(wallNs))
+            : 0.0;
+        qInfo().noquote() << QString("Locked stage coverage: wall=%1ms measured=%2ms unaccounted=%3ms measured=%4%")
+                                 .arg(wallMs, 0, 'f', 3)
+                                 .arg(measuredMs, 0, 'f', 3)
+                                 .arg(unaccountedMs, 0, 'f', 3)
+                                 .arg(measuredPct, 0, 'f', 1);
+
+        if (split2DStatsTotal.lines > 0) {
+            static const char *split2DNames[FrameBuffer::Split2DTimerCount] = {
+                "tapLine",
+                "fieldB",
+                "precleanCurrent",
+                "precleanLookaheadTap",
+                "precleanLookaheadFieldB",
+                "precleanLookaheadGate",
+                "fieldA",
+                "lateral",
+                "frameA",
+                "frameB",
+                "attribution",
+                "selection",
+                "debugPhaseLegs",
+            };
+            QStringList splitParts;
+            const qint64 split2DStageNs = stageStats[StageSplit2D].totalNs;
+            for (int i = 0; i < FrameBuffer::Split2DTimerCount; ++i) {
+                const qint64 calls = split2DStatsTotal.calls[i];
+                if (calls <= 0) continue;
+                const qint64 totalNs = split2DStatsTotal.totalNs[i];
+                const double totalMs = static_cast<double>(totalNs) / 1.0e6;
+                const double avgMs = totalMs / static_cast<double>(calls);
+                const double pct = (split2DStageNs > 0)
+                    ? (100.0 * static_cast<double>(totalNs) /
+                       static_cast<double>(split2DStageNs))
+                    : 0.0;
+                splitParts << QString("%1=%2ms avg/%3ms total/%4% (%5 calls)")
+                                  .arg(split2DNames[i])
+                                  .arg(avgMs, 0, 'f', 3)
+                                  .arg(totalMs, 0, 'f', 3)
+                                  .arg(pct, 0, 'f', 1)
+                                  .arg(calls);
+            }
+            if (!splitParts.isEmpty()) {
+                qInfo().noquote() << QString("Locked split2D timers: lines=%1, %2")
+                                         .arg(split2DStatsTotal.lines)
+                                         .arg(splitParts.join(", "));
+            }
+        }
+
+        if (tapBuildStatsTotal.lines > 0) {
+            static const char *tapBuildNames[FrameBuffer::TapBuildTimerCount] = {
+                "setup",
+                "fillTaps",
+                "framePairs",
+                "contourPairs",
+                "hLuma",
+                "contour",
+                "frameLimiters",
+                "fieldLimiters",
+            };
+            QStringList tapParts;
+            const qint64 split2DStageNs = stageStats[StageSplit2D].totalNs;
+            for (int i = 0; i < FrameBuffer::TapBuildTimerCount; ++i) {
+                const qint64 calls = tapBuildStatsTotal.calls[i];
+                if (calls <= 0) continue;
+                const qint64 totalNs = tapBuildStatsTotal.totalNs[i];
+                const double totalMs = static_cast<double>(totalNs) / 1.0e6;
+                const double avgMs = totalMs / static_cast<double>(calls);
+                const double pct = (split2DStageNs > 0)
+                    ? (100.0 * static_cast<double>(totalNs) /
+                       static_cast<double>(split2DStageNs))
+                    : 0.0;
+                tapParts << QString("%1=%2ms avg/%3ms total/%4% (%5 calls)")
+                                .arg(tapBuildNames[i])
+                                .arg(avgMs, 0, 'f', 3)
+                                .arg(totalMs, 0, 'f', 3)
+                                .arg(pct, 0, 'f', 1)
+                                .arg(calls);
+            }
+            if (!tapParts.isEmpty()) {
+                qInfo().noquote() << QString("Locked tap-build timers: lines=%1, %2")
+                                         .arg(tapBuildStatsTotal.lines)
+                                         .arg(tapParts.join(", "));
+            }
         }
 
         const qint64 fvfPixels =
@@ -511,6 +643,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         // 2D score blending visualization (only written when showMap is true)
         if (wantMap) {
             w2d_frame_weight.assign(lines, std::vector<float>(width, 0.0f));
+            fieldBDecisionReason_flat.assign(size_t(lines + 1) * size_t(width), FieldBReasonNone);
         }
         // FVF-only data and scratch.
         if (wantFvf) {
@@ -1051,19 +1184,38 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         return c;
     };
 
+    // Pre-compute |frameIQ[r]| once per pixel.  The hot pixel loop reads this
+    // magnitude up to 9 times per pixel (rel, rel±1, rel±2, rel±4 in the
+    // fine/mid/coarse band split), so caching it cuts ~6.6M hypot calls per
+    // frame down to ~width per line.
+    const bool haveFrameIQForMag = frameIQ && !frameIQ->empty();
+    const int frameIQN = haveFrameIQForMag ? (int)frameIQ->size() : 0;
+    if ((int)scratch_fvf_iqMag.size() != width)
+        scratch_fvf_iqMag.resize(width);
+    if (haveFrameIQForMag) {
+        const int n = std::min(width, frameIQN);
+        for (int r = 0; r < n; ++r) {
+            const auto &z = (*frameIQ)[r];
+            scratch_fvf_iqMag[r] = std::hypot(z.real(), z.imag());
+        }
+        // If frameIQ is shorter than width, replicate the last valid mag for
+        // tail entries — matches the original lambda's std::clamp(r,0,width-1)
+        // behaviour against the inner index.
+        for (int r = n; r < width; ++r)
+            scratch_fvf_iqMag[r] = (n > 0) ? scratch_fvf_iqMag[n - 1] : 0.0;
+    } else {
+        std::fill(scratch_fvf_iqMag.begin(), scratch_fvf_iqMag.begin() + width, 0.0);
+    }
+
     for (int rel = 0; rel < width; ++rel) {
         double FA = fieldA[rel];
         double FB = fieldB[rel];
         double FR = frameB2[rel];
         double L1 = sample1D(rel);
 
-        double satFR_demod = 0.0;
-        if (frameIQ && rel < (int)frameIQ->size()) {
-            std::complex<double> z = (*frameIQ)[rel];
-            satFR_demod = std::abs(z);
-        } else {
-            satFR_demod = std::fabs(FR);
-        }
+        const double satFR_demod = (haveFrameIQForMag && rel < frameIQN)
+            ? scratch_fvf_iqMag[rel]
+            : std::fabs(FR);
 
         const Cond1D FA_c = condSamePhase(fieldAData, rel);
         const Cond1D FB_c = condSamePhase(fieldB, rel);
@@ -1221,19 +1373,18 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 scoreR *= (1.0 - 0.08 * closeFrameBonus);
             }
 
-            if (frameIQ && rel < (int)frameIQ->size()) {
-                auto iqMag = [&](int r)->double {
-                    r = std::clamp(r, 0, width - 1);
-                    const auto &z = (*frameIQ)[r];
-                    return std::hypot(z.real(), z.imag());
+            if (haveFrameIQForMag && rel < frameIQN) {
+                // Pre-computed magnitudes from scratch_fvf_iqMag; index clamped
+                // to [0, width-1] as the original lambda did.
+                const double *iqMagArr = scratch_fvf_iqMag.data();
+                auto mag = [&](int r) -> double {
+                    return iqMagArr[std::clamp(r, 0, width - 1)];
                 };
 
-                const double fine = std::fabs(iqMag(rel) -
-                                              0.5 * (iqMag(rel - 1) + iqMag(rel + 1)));
-                const double mid  = std::fabs(iqMag(rel) -
-                                              0.5 * (iqMag(rel - 2) + iqMag(rel + 2)));
-                const double coarse = std::fabs(iqMag(rel) -
-                                                0.5 * (iqMag(rel - 4) + iqMag(rel + 4)));
+                const double mRel = mag(rel);
+                const double fine   = std::fabs(mRel - 0.5 * (mag(rel - 1) + mag(rel + 1)));
+                const double mid    = std::fabs(mRel - 0.5 * (mag(rel - 2) + mag(rel + 2)));
+                const double coarse = std::fabs(mRel - 0.5 * (mag(rel - 4) + mag(rel + 4)));
 
                 const double denom = fine + mid + coarse + 1e-9;
                 const double fineFrac   = fine   / denom;
@@ -1764,38 +1915,47 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
         return frameScalar[std::clamp(r, 0, (int)frameScalar.size() - 1)];
     };
 
-    auto frameCoherence = [&](int r) -> double {
-        if (!frameIQ || frameIQ->empty())
-            return 0.0;
+    // Pre-compute |frameIQ[r]| magnitudes once, then derive coherence from
+    // additions instead of redundant hypot calls.  Old path: 4 hypot/pixel in
+    // coherence + 1 in the main loop = 5×width.  New path: 1 for the mag
+    // pre-pass + 1 for the vector-sum magnitude = 2×width; main loop reuses
+    // the pre-computed mag for frameChromaIRE (0 additional).
+    const bool haveFrameIQ = frameIQ && !frameIQ->empty();
+    const int iqN = haveFrameIQ ? (int)frameIQ->size() : 0;
 
-        const int n = (int)frameIQ->size();
-        r = std::clamp(r, 0, n - 1);
-
-        std::complex<double> sum = {0.0, 0.0};
-        double magSum = 0.0;
-
-        for (int off : {-2, 0, 2}) {
-            const auto &z = (*frameIQ)[std::clamp(r + off, 0, n - 1)];
-            sum += z;
-            magSum += std::hypot(z.real(), z.imag());
+    if ((int)scratch_coe_frameIQMag.size() != width)
+        scratch_coe_frameIQMag.resize(width);
+    if (haveFrameIQ) {
+        for (int r = 0; r < width; ++r) {
+            const int ri = std::clamp(r, 0, iqN - 1);
+            const auto &z = (*frameIQ)[ri];
+            scratch_coe_frameIQMag[r] = std::hypot(z.real(), z.imag());
         }
+    } else {
+        std::fill(scratch_coe_frameIQMag.begin(),
+                  scratch_coe_frameIQMag.begin() + width, 0.0);
+    }
 
-        return (magSum > 1e-9)
-            ? std::clamp(std::hypot(sum.real(), sum.imag()) / magSum, 0.0, 1.0)
-            : 0.0;
-    };
-
-    // IQ coherence pre-pass: evaluate frameCoherence() once per pixel into a
-    // flat array rather than 758× in the hot loop.  The line-level mean gates
-    // per-sample values — a globally incoherent line cannot inflate isolated
-    // samples (hot-loop disconnection principle): coherence is a line property,
-    // not a pixel property, and should be established before the hot loop runs.
+    // IQ coherence pre-pass: line-level mean gates per-sample values — a
+    // globally incoherent line cannot inflate isolated samples.
     if ((int)scratch_coe_coherence.size() != width)
-        scratch_coe_coherence.assign(width, 0.0);
+        scratch_coe_coherence.resize(width);
+    std::fill(scratch_coe_coherence.begin(), scratch_coe_coherence.begin() + width, 0.0);
     double lineMeanFrameCoherence = 0.0;
-    for (int r = 0; r < width; ++r) {
-        scratch_coe_coherence[r]  = frameCoherence(r);  // 0.0 when !frameIQ
-        lineMeanFrameCoherence   += scratch_coe_coherence[r];
+    if (haveFrameIQ) {
+        for (int r = 0; r < width; ++r) {
+            const int rm2 = std::clamp(r - 2, 0, iqN - 1);
+            const int rr  = std::clamp(r,     0, iqN - 1);
+            const int rp2 = std::clamp(r + 2, 0, iqN - 1);
+            const double magSum = scratch_coe_frameIQMag[std::clamp(r - 2, 0, width - 1)]
+                                + scratch_coe_frameIQMag[r]
+                                + scratch_coe_frameIQMag[std::clamp(r + 2, 0, width - 1)];
+            const std::complex<double> sum = (*frameIQ)[rm2] + (*frameIQ)[rr] + (*frameIQ)[rp2];
+            scratch_coe_coherence[r] = (magSum > 1e-9)
+                ? std::clamp(std::hypot(sum.real(), sum.imag()) / magSum, 0.0, 1.0)
+                : 0.0;
+            lineMeanFrameCoherence += scratch_coe_coherence[r];
+        }
     }
     if (width > 0) lineMeanFrameCoherence /= static_cast<double>(width);
 
@@ -1810,8 +1970,8 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
         f.fieldAChromaIRE = std::fabs(fa) * invIreScale;
         f.fieldBChromaIRE = std::fabs(fb) * invIreScale;
 
-        f.frameChromaIRE = (frameIQ && rel < (int)frameIQ->size())
-            ? std::hypot((*frameIQ)[rel].real(), (*frameIQ)[rel].imag()) * invIreScale
+        f.frameChromaIRE = haveFrameIQ
+            ? scratch_coe_frameIQMag[rel] * invIreScale
             : (haveFrameScalar ? std::fabs(fr) * invIreScale : 0.0);
 
         const double lo = haveFrameScalar ? std::min({fa, fb, fr}) : std::min(fa, fb);
@@ -1831,28 +1991,18 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
 
     }
 
-    // Refresh carrier prior from the finalized line grammar verdict before finalize.
-    // Once the forward projection is available, it becomes the canonical carrier
-    // plausibility signal for every pixel on the line.
+    // Carrier prior + finalize in a single pass over the row.
     const CombCarrierGrammar *lineGrammar = carrierGrammarLine(line);
     const double lineCarrierPrior = carrierPlausibility(lineGrammar);
-    for (int rel = 0; rel < width; ++rel)
-        row[rel].assessment.carrierPrior = lineCarrierPrior;
-
-    // Extract the line-level forward model error from the grammar (only when
-    // the carrier projection was successfully computed on a locked line).
-    // 0.0 signals "not available" and causes finalizeAttributionClaims() to fall
-    // back to its hard-coded denominators — behaviour is identical to before.
     const double lineForwardErrorIRE = (lineGrammar && lineGrammar->projectionValid)
         ? lineGrammar->meanForwardErrorIRE
         : 0.0;
 
-    // Final attribution needs cross-path evidence plus a same-phase continuity
-    // check, not just the local 1D residual snapshot.
     for (int rel = 0; rel < width; ++rel) {
         const int rm4 = std::max(0, rel - 4);
         const int rp4 = std::min(width - 1, rel + 4);
         AttributionEvidence &e = row[rel];
+        e.assessment.carrierPrior = lineCarrierPrior;
         const AttributionFacts &leftFacts = row[rm4].facts;
         const AttributionFacts &rightFacts = row[rp4].facts;
         const double leftBaseIRE = std::max(leftFacts.bandpassMidIRE,
@@ -2406,9 +2556,24 @@ void Comb::FrameBuffer::split2D()
 {
     const bool writeWeights = configuration.showMap;
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
+    const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
+    if (stageTimers) {
+        split2DInstrumentation.reset();
+        tapBuildInstrumentation.reset();
+    }
     if (configuration.stageTimers && wantFvf) {
         fvfInstrumentation.reset();
     }
+    auto measureSplit2D = [&](Split2DTimerIndex idx, auto &&fn) {
+        if (!stageTimers) {
+            fn();
+            return;
+        }
+        QElapsedTimer timer;
+        timer.start();
+        fn();
+        split2DInstrumentation.add(idx, timer.nsecsElapsed());
+    };
     const bool needFrameACompute = configuration.phaseCompensation &&
         (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
          wantFvf);
@@ -2476,42 +2641,71 @@ void Comb::FrameBuffer::split2D()
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
+        if (stageTimers) ++split2DInstrumentation.lines;
 
-        ensureCombTapLine(line);
+        measureSplit2D(Split2DTapLine, [&]() { ensureCombTapLine(line); });
         const CombTapLine &tapLine = tapLineCache[precleanRingSlot(line)];
 
-        if (needFrameIQCompute) {
-            auto ensureFieldBPrecleanLine = [&](int ln) {
-                if (ln < firstLine || ln >= lastLine) return;
-                if (havePrecleanLine(ln, width)) return;
-                double *preclean = precleanLinePtrMutable(ln, width);
-                computeSimpleFieldLine(ensureCombTapLine(ln), preclean);
+        auto ensureFieldBPrecleanLine = [&](int ln) {
+            if (ln < firstLine || ln >= lastLine) return;
+            if (havePrecleanLine(ln, width)) return;
+            double *preclean = nullptr;
+            const CombTapLine *precleanTapLine = nullptr;
+            measureSplit2D(Split2DPrecleanLookaheadTap, [&]() {
+                preclean = precleanLinePtrMutable(ln, width);
+                precleanTapLine = &ensureCombTapLine(ln);
+            });
+            measureSplit2D(Split2DPrecleanLookaheadFieldB, [&]() {
+                computeSimpleFieldLine(*precleanTapLine,
+                                       preclean,
+                                       writeWeights ? fieldBDecisionReason_line(ln) : nullptr);
+            });
+            measureSplit2D(Split2DPrecleanLookaheadGate, [&]() {
                 double *gate = precleanGateLinePtrMutable(ln, width);
                 std::fill(gate, gate + width, 1.0);
-            };
+            });
+        };
+
+        measureSplit2D(Split2DFieldB, [&]() {
+            if (combTapBuildFlags_ & TapBuildFieldB) {
+                const double *fieldBPreclean = precleanLinePtr(line, width);
+                if (fieldBPreclean) {
+                    std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
+                } else {
+                    computeSimpleFieldLine(tapLine,
+                                           scratch_lineWorkC.data(),
+                                           writeWeights ? fieldBDecisionReason_line(line) : nullptr);
+                }
+            } else {
+                std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
+            }
+        });
+
+        measureSplit2D(Split2DPrecleanCurrent, [&]() {
+            if (needFrameIQCompute) {
+                // Frame B should always see the same C line that split2D produced,
+                // even when Field B's +/-2 reach cedes to the local center value.
+                double *preclean = precleanLinePtrMutable(line, width);
+                std::copy(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, preclean);
+                double *gate = precleanGateLinePtrMutable(line, width);
+                std::fill(gate, gate + width, 1.0);
+            }
+        });
+        if (needFrameIQCompute) {
             ensureFieldBPrecleanLine(line - 1);
-            ensureFieldBPrecleanLine(line);
             ensureFieldBPrecleanLine(line + 1);
         }
 
-        if (combTapBuildFlags_ & TapBuildFieldB) {
-            const double *fieldBPreclean = precleanLinePtr(line, width);
-            if (fieldBPreclean) {
-                std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
+        measureSplit2D(Split2DFieldA, [&]() {
+            if (combTapBuildFlags_ & TapBuildFieldA) {
+                computeContourFieldLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
             } else {
-                computeSimpleFieldLine(tapLine, scratch_lineWorkC.data());
+                std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
+                std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
             }
-        } else {
-            std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
-        }
-        if (combTapBuildFlags_ & TapBuildFieldA) {
-            computeContourFieldLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
-        } else {
-            std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
-            std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
-        }
+        });
 
-        {
+        measureSplit2D(Split2DLateral, [&]() {
             const double *src1d = configuration.phaseCompensation
                                   ? nullptr
                                   : bucketScalar1D_line(line);
@@ -2529,94 +2723,110 @@ void Comb::FrameBuffer::split2D()
                 for (int rel = 0; rel < width; ++rel)
                     scratch_lateralLine[rel] = src1d[left + rel];
             }
-        }
+        });
 
-        if (needFrameACompute) {
-            computeFrameAAdaptiveIQLine(line, frameAIQ);
-            if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
-                scratch_frameAAdaptiveIQComposite.resize(width);
-            for (int rel = 0; rel < width; ++rel) {
-                const int h = left + rel;
-                if (rel < (int)frameAIQ.size()) {
-                    const auto &Z = frameAIQ[rel];
-                    scratch_frameAAdaptiveIQComposite[rel] = remod4fscToCompositePhase(Z.real(), Z.imag(), carrierSampleClass(line, h));
-                } else {
-                    scratch_frameAAdaptiveIQComposite[rel] = 0.0;
+        measureSplit2D(Split2DFrameA, [&]() {
+            if (needFrameACompute) {
+                computeFrameAAdaptiveIQLine(line, frameAIQ);
+                if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
+                    scratch_frameAAdaptiveIQComposite.resize(width);
+                // Symmetric round-trip with Frame A's signed demod: remod back
+                // through the signed phase so the composite scalar lands in
+                // the physical frame produceY's `raw - clpLine` consumes.
+                for (int rel = 0; rel < width; ++rel) {
+                    const int h = left + rel;
+                    if (rel < (int)frameAIQ.size()) {
+                        const auto &Z = frameAIQ[rel];
+                        const int phase = configuration.phaseCompensation
+                            ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), h)
+                            : h;
+                        scratch_frameAAdaptiveIQComposite[rel] = remod4fscToCompositePhase(Z.real(), Z.imag(), phase);
+                    } else {
+                        scratch_frameAAdaptiveIQComposite[rel] = 0.0;
+                    }
                 }
             }
-        }
+        });
 
-        if (needFrameBCompute) {
-            computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
-            if ((int)scratch_frameBDirectIQComposite.size() < width)
-                scratch_frameBDirectIQComposite.resize(width);
-        }
+        measureSplit2D(Split2DFrameB, [&]() {
+            if (needFrameBCompute) {
+                computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
+                if ((int)scratch_frameBDirectIQComposite.size() < width)
+                    scratch_frameBDirectIQComposite.resize(width);
+            }
+        });
 
         const std::vector<double> &frameAttrScalar =
             needFrameBCompute ? scratch_frameBDirectIQComposite : scratch_frameAAdaptiveIQComposite;
         const std::vector<std::complex<double>> *frameAttrIQ =
             needFrameBCompute ? &frameIQ : (needFrameACompute ? &frameAIQ : nullptr);
-        collectCombAttributionEvidence(
-            line,
-            scratch_lineWorkA.data(),
-            scratch_lineWorkC.data(),
-            needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
-            frameAttrIQ);
+        measureSplit2D(Split2DAttribution, [&]() {
+            collectCombAttributionEvidence(
+                line,
+                scratch_lineWorkA.data(),
+                scratch_lineWorkC.data(),
+                needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
+                frameAttrIQ);
+        });
 
         double *dst = clpbuffer[1].pixel[line];
         auto emitSelected = [&](int rel, double v) {
             dst[left + rel] = v;
         };
 
-        if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldAContour) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkA[rel]);
-            if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
-        }
-        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkC[rel]);
-            if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.35f);
-        }
-        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ && configuration.phaseCompensation) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameAAdaptiveIQComposite[rel]);
-            if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.8f);
-        }
-        else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ && configuration.phaseCompensation) {
-            for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameBDirectIQComposite[rel]);
-            if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.85f);
-        }
-        else {
-            if (!configuration.phaseCompensation) {
-                for (int rel = 0; rel < width; ++rel) {
-                    dst[left + rel] = scratch_lineWorkC[rel];
-                    if (writeWeights && line < (int)w2d_frame_weight.size()) {
-                        w2d_frame_weight[line][rel] = 0.35f; 
+        measureSplit2D(Split2DSelection, [&]() {
+            if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldAContour) {
+                for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkA[rel]);
+                if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
+            }
+            else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple) {
+                for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkC[rel]);
+                if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.35f);
+            }
+            else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ && configuration.phaseCompensation) {
+                for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameAAdaptiveIQComposite[rel]);
+                if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.8f);
+            }
+            else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ && configuration.phaseCompensation) {
+                for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_frameBDirectIQComposite[rel]);
+                if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.85f);
+            }
+            else {
+                if (!configuration.phaseCompensation) {
+                    for (int rel = 0; rel < width; ++rel) {
+                        dst[left + rel] = scratch_lineWorkC[rel];
+                        if (writeWeights && line < (int)w2d_frame_weight.size()) {
+                            w2d_frame_weight[line][rel] = 0.35f;
+                        }
+                    }
+                } else {
+                    scoreFieldVsFrame(
+                        line,
+                        tapLine,
+                        scratch_lineWorkC.data(),                 // Field B / simple field
+                        scratch_lineWorkA,                        // Field A / contour field
+                        &scratch_frameBDirectIQComposite,         // Frame B / direct IQ composite
+                        scratch_outMixed.data(),
+                        writeWeights,
+                        scratch_lateralLine.data(),
+                        &frameIQ);
+
+                    for (int rel = 0; rel < width; ++rel) {
+                        double vMixed = scratch_outMixed[rel];
+
+                        // Keep only the numeric-sanity fallback:
+                        if (!std::isfinite(vMixed)) vMixed = scratch_lineWorkC[rel];
+
+                        emitSelected(rel, vMixed);
                     }
                 }
-            } else {
-                scoreFieldVsFrame(
-                    line,
-                    tapLine,
-                    scratch_lineWorkC.data(),                 // Field B / simple field
-                    scratch_lineWorkA,                        // Field A / contour field
-                    &scratch_frameBDirectIQComposite,         // Frame B / direct IQ composite
-                    scratch_outMixed.data(),
-                    writeWeights,
-                    scratch_lateralLine.data(),
-                    &frameIQ);
-                                        
-                for (int rel = 0; rel < width; ++rel) {
-                    double vMixed = scratch_outMixed[rel];
-
-                    // Keep only the numeric-sanity fallback:
-                    if (!std::isfinite(vMixed)) vMixed = scratch_lineWorkC[rel];
-
-                    emitSelected(rel, vMixed);
-                }
-                }
-        }
+            }
+        });
     }
 
-    reportPhaseLegStats("2d-final", 1, false);
+    measureSplit2D(Split2DDebugPhaseLegs, [&]() {
+        reportPhaseLegStats("2d-final", 1, false);
+    });
 }
 
 // 3D temporal adaptive
@@ -3119,6 +3329,50 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
     if (!componentFrame) return;
 
     FrameCanvas canvas(*componentFrame, videoParameters);
+
+    if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple &&
+        !fieldBDecisionReason_flat.empty())
+    {
+        struct ReasonShade {
+            quint16 y;
+            quint16 u;
+            quint16 v;
+        };
+        const std::array<ReasonShade, 8> reasonShades = {{
+            {32768, 32768, 32768}, // none
+            {49152, 26214, 39321}, // blend: cyan
+            {45875, 25000, 56500}, // boundary up: blue
+            {45875, 40500, 16000}, // boundary down: orange
+            {52428, 20000, 47000}, // boundary cede: teal
+            {42598, 30000, 52000}, // coarse revive: green
+            {39321, 52000, 28000}, // scalar revive: red
+            {26214, 32768, 32768}  // center / no answer: neutral dark
+        }};
+
+        const int firstLine = videoParameters.firstActiveFrameLine;
+        const int lastLine  = videoParameters.lastActiveFrameLine;
+        const int left      = videoParameters.activeVideoStart;
+        const int right     = videoParameters.activeVideoEnd;
+
+        for (int line = firstLine; line < lastLine; ++line) {
+            double *Y = componentFrame->y(line);
+            double *U = componentFrame->u(line);
+            double *V = componentFrame->v(line);
+            const std::uint8_t *reasonRow = fieldBDecisionReason_line(line);
+            if (!reasonRow) continue;
+
+            for (int h = left; h < right; ++h) {
+                const std::uint8_t reason = std::min<std::uint8_t>(
+                    reasonRow[h - left],
+                    static_cast<std::uint8_t>(reasonShades.size() - 1));
+                const ReasonShade &shade = reasonShades[reason];
+                Y[h] = shade.y;
+                U[h] = shade.u;
+                V[h] = shade.v;
+            }
+        }
+        return;
+    }
 
     FrameCanvas::Colour shades[NUM_CANDIDATES];
     for (int i = 0; i < NUM_CANDIDATES; ++i) {

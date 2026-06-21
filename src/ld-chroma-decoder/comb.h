@@ -56,6 +56,7 @@ public:
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
         bool   debugPhaseLegs = false; // Log per-(h&3) locked-demod residual stats.
+        bool   debugFieldBDecisions = false; // Log Field B decision summaries and phase-bucket breakdowns.
         bool   stageTimers = false; // Log per-stage timing summaries for the locked NTSC path.
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
@@ -329,6 +330,73 @@ public:
         }
     };
 
+    enum Split2DTimerIndex {
+        Split2DTapLine,
+        Split2DFieldB,
+        Split2DPrecleanCurrent,
+        Split2DPrecleanLookaheadTap,
+        Split2DPrecleanLookaheadFieldB,
+        Split2DPrecleanLookaheadGate,
+        Split2DFieldA,
+        Split2DLateral,
+        Split2DFrameA,
+        Split2DFrameB,
+        Split2DAttribution,
+        Split2DSelection,
+        Split2DDebugPhaseLegs,
+        Split2DTimerCount
+    };
+
+    struct Split2DInstrumentation {
+        std::array<qint64, Split2DTimerCount> totalNs = {};
+        std::array<qint64, Split2DTimerCount> calls = {};
+        qint64 lines = 0;
+
+        void reset()
+        {
+            totalNs.fill(0);
+            calls.fill(0);
+            lines = 0;
+        }
+
+        void add(Split2DTimerIndex idx, qint64 ns)
+        {
+            totalNs[idx] += ns;
+            calls[idx] += 1;
+        }
+    };
+
+    enum TapBuildTimerIndex {
+        TapBuildSetup,
+        TapBuildFillTaps,
+        TapBuildFramePairs,
+        TapBuildContourPairs,
+        TapBuildHLuma,
+        TapBuildContour,
+        TapBuildFrameLimiters,
+        TapBuildFieldLimiters,
+        TapBuildTimerCount
+    };
+
+    struct TapBuildInstrumentation {
+        std::array<qint64, TapBuildTimerCount> totalNs = {};
+        std::array<qint64, TapBuildTimerCount> calls = {};
+        qint64 lines = 0;
+
+        void reset()
+        {
+            totalNs.fill(0);
+            calls.fill(0);
+            lines = 0;
+        }
+
+        void add(TapBuildTimerIndex idx, qint64 ns)
+        {
+            totalNs[idx] += ns;
+            calls[idx] += 1;
+        }
+    };
+
 	// Signal attribution evidence, collected before election. This is not a
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
@@ -369,6 +437,8 @@ public:
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
     const FvfInstrumentation &getFvfInstrumentation() const { return fvfInstrumentation; }
+    const Split2DInstrumentation &getSplit2DInstrumentation() const { return split2DInstrumentation; }
+    const TapBuildInstrumentation &getTapBuildInstrumentation() const { return tapBuildInstrumentation; }
 
 	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
 	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
@@ -408,23 +478,12 @@ private:
 		double symMag = 0.0;
 	};
 
-	struct CombTapIQ {
-		float ti = 0.0f;
-		float tq = 0.0f;
-		double iqMag = 0.0;
-	};
-
 	struct CombTapPair {
 		double diffIRE = std::numeric_limits<double>::infinity();
-		double iqDiffIRE = std::numeric_limits<double>::infinity();
-		double lumaDiffIRE = std::numeric_limits<double>::infinity();
-		double coherence = 1.0;
 		double kScore = 0.0;
 		double weight = 1.0;
-		lddecode::CombReachReply reach;
 		double reachLegalGate = 1.0;  // binary legality from reach index for this rung
-		double contourReachGate = 1.0;// contour-evidence limiter
-		double reachGate = 1.0;       // combined: material * contour * legal
+		double reachGate = 1.0;       // contour-trust * legality
 	};
 
 	struct CombTapContour {
@@ -440,6 +499,17 @@ private:
 		double dnTrust = 0.0;
 		double upInfluence = 0.0;
 		double dnInfluence = 0.0;
+	};
+
+	enum FieldBDecisionReason : std::uint8_t {
+		FieldBReasonNone = 0,
+		FieldBReasonBlend = 1,
+		FieldBReasonBoundaryUp = 2,
+		FieldBReasonBoundaryDown = 3,
+		FieldBReasonBoundaryCede = 4,
+		FieldBReasonReviveCoarse = 5,
+		FieldBReasonReviveScalar = 6,
+		FieldBReasonCenter = 7
 	};
 
 	// Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
@@ -462,13 +532,6 @@ private:
 		bool haveD2 = false;
 		bool haveU4 = false;
 		bool haveD4 = false;
-		bool haveIQ0 = false;
-		bool haveIQU1 = false;
-		bool haveIQD1 = false;
-		bool haveIQU2 = false;
-		bool haveIQD2 = false;
-		bool haveIQU4 = false;
-		bool haveIQD4 = false;
 		std::vector<CombTapScalar> tap0;
 		std::vector<CombTapScalar> tapU1;
 		std::vector<CombTapScalar> tapD1;
@@ -476,20 +539,15 @@ private:
 		std::vector<CombTapScalar> tapD2;
 		std::vector<CombTapScalar> tapU4;
 		std::vector<CombTapScalar> tapD4;
-		std::vector<CombTapIQ> tap0IQ;
-		std::vector<CombTapIQ> tapU1IQ;
-		std::vector<CombTapIQ> tapD1IQ;
-		std::vector<CombTapIQ> tapU2IQ;
-		std::vector<CombTapIQ> tapD2IQ;
-		std::vector<CombTapIQ> tapU4IQ;
-		std::vector<CombTapIQ> tapD4IQ;
 		std::vector<CombTapPair> pairU1;
 		std::vector<CombTapPair> pairD1;
 		std::vector<CombTapPair> pairU2;
 		std::vector<CombTapPair> pairD2;
-		std::vector<CombContentReach::Reply> fieldContent;
 		std::vector<CombTapContour> contour;
 		std::vector<CombContentReach::MovingCoarseContour> movingCoarseContour;
+		std::vector<double> coarse0IRE;
+		std::vector<double> coarseU2IRE;
+		std::vector<double> coarseD2IRE;
 		std::vector<double> hLumaDeltaIRE;
 	};
 	enum CombTapBuild : unsigned {
@@ -588,7 +646,8 @@ private:
 	std::vector<double> scratch_fvf_diffFVF;
 	std::vector<double> scratch_fvf_satMap;
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
-	std::vector<double> scratch_coe_coherence; // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
+	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
+	std::vector<double> scratch_coe_frameIQMag; // pre-computed |frameIQ[r]| magnitudes (collectCombAttributionEvidence)
 		std::vector<double> scratch_lineWorkD; // Generic per-line filter scratch.
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;
@@ -598,14 +657,48 @@ private:
 	std::vector<double> scratch_attrMembershipY;
 	std::vector<char> scratch_vdis_flag;
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
+	std::vector<std::uint8_t> fieldBDecisionReason_flat;
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
-		std::vector<double> locked1DSource_flat; // 1D locked scalar export used by 2D/3D and diagnostics.
+		//
+		// WARNING: locked1DSource_flat is a scalar that lives under the
+		// LockedCommonPhaseScalar reach-source label.  That label has been a
+		// repeated source of bugs and confusion:
+		//
+		//  - The label declares a *cross-line interpretation convention*
+		//    (Grid4fsc / common phase), not a physical sign-stripping.  The
+		//    stored scalar is approximately bandpass(raw) * 0.994, so within a
+		//    line it preserves raw carrier orientation.
+		//  - But a per-sample DEMOD of this scalar with an unsigned sample
+		//    class does NOT yield Grid4fscIQ — it yields IQ that inherits raw
+		//    signs.  For interfield (±1) cancels in IQ that means real chroma
+		//    appears anti-phased, the combine flips it, and alien Y is
+		//    preserved instead of cancelled.  This produced the 2fsc luma
+		//    checker in Frame B's locked path.
+		//  - The "polarity is gone by construction" framing in the buffer-flow
+		//    doc has misled multiple agents (and the author) into either
+		//    distrusting legitimate intrafield scalar combs or trusting
+		//    interfield IQ combs that were actually wrong.
+		//
+		// Rules for new code:
+		//  1. Prefer locked1DTI4fsc/TQ4fsc (Grid4fscIQ, physicalPolarityPreserved)
+		//     for any operation that needs polarity.
+		//  2. If a scalar must be demodded for interfield IQ use, demod with
+		//     carrierGrammarSignedSampleClass (lineFlip folded into the phase)
+		//     to land in Grid4fscIQ.  Unsigned demod here is almost always wrong.
+		//  3. Intrafield (±2 same-field) scalar combs on this buffer are
+		//     legitimate: same-field neighbors share lineFlip.
+		//  4. Cross-line scalar averaging or magnitude compare is the only
+		//     reach use the type system blesses for this source.  That is
+		//     intentional and minimal — do not widen it without scrutiny.
+		std::vector<double> locked1DSource_flat;
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
 
     FvfInstrumentation fvfInstrumentation;
+    Split2DInstrumentation split2DInstrumentation;
+    TapBuildInstrumentation tapBuildInstrumentation;
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
 	}
@@ -649,6 +742,18 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    attributionEvidence_flat.empty()) return nullptr;
 		return attributionEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline std::uint8_t *fieldBDecisionReason_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    fieldBDecisionReason_flat.empty()) return nullptr;
+		return fieldBDecisionReason_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const std::uint8_t *fieldBDecisionReason_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    fieldBDecisionReason_flat.empty()) return nullptr;
+		return fieldBDecisionReason_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	inline CombCarrierGrammar *carrierGrammarLine(int line) {
@@ -808,8 +913,12 @@ private:
 						  double *outFieldLine,
 						  double  *outGate);
 
-	void computeSimpleFieldLine(int lineNumber, double *outFieldLine);
-	void computeSimpleFieldLine(const CombTapLine &tapLine, double *outFieldLine);
+	void computeSimpleFieldLine(int lineNumber,
+						  double *outFieldLine,
+						  std::uint8_t *outReasonLine = nullptr);
+	void computeSimpleFieldLine(const CombTapLine &tapLine,
+						  double *outFieldLine,
+						  std::uint8_t *outReasonLine = nullptr);
 
 	void computeFrameAAdaptiveIQLine(int line,
 									std::vector<std::complex<double>> &outFrameIQ);

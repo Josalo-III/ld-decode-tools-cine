@@ -236,6 +236,22 @@ CombReachSourceFrame makeBucketScalarReachSource()
     return source;
 }
 
+// WARNING: the LockedCommonPhaseScalar source kind labels a scalar buffer
+// (locked1DSource) whose cross-line semantics are Grid4fsc but whose physical
+// per-sample value is just bandpass(raw) * remodScale.  The "polarity is gone
+// by construction" interpretation has been a repeated burden:
+//
+//  - It does NOT mean the scalar is physically polarity-stripped.  It means
+//    that DEMODDING it with an unsigned phase yields IQ in a frame that
+//    interfield combs misinterpret.  For correct interfield behavior, demod
+//    with carrierGrammarSignedSampleClass to land in Grid4fscIQ, or read
+//    locked1DTI4fsc/TQ4fsc (already polarity-preserving) directly.
+//  - It does NOT mean intrafield (±2 same-field) scalar operations are
+//    compromised — those are physically sound.
+//
+// New sites should prefer Grid4fscIQ (IQ caches) over re-deriving IQ from
+// this scalar.  Phase normalization for cross-line comparison convenience has
+// cost more than it has bought; do not widen its use without scrutiny.
 CombReachSourceFrame makeLockedCommonPhaseScalarReachSource()
 {
     CombReachSourceFrame source;

@@ -149,6 +149,22 @@ InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double minChromaIRE,
                                               double lumaEdgeFit);
 
+// Fast overload: caller supplies pre-computed IRE-domain magnitudes to avoid
+// recomputing ~12 sqrt/hypot calls per pixel inside the function.
+InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
+                                              double centerQ,
+                                              double upI,
+                                              double upQ,
+                                              double downI,
+                                              double downQ,
+                                              bool hasUp,
+                                              bool hasDown,
+                                              double minChromaIRE,
+                                              double lumaEdgeFit,
+                                              double centerMagIRE,
+                                              double upMagIRE,
+                                              double downMagIRE);
+
 // Confidence in [0,1] that the center IQ is alien chroma phase-displaced from
 // the common carrier of its two agreeing neighbors.  This is the vector-cancel
 // companion to interfieldIQReachFloor's scalar floor: a consumer that has the

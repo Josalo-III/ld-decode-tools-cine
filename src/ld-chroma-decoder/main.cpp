@@ -312,6 +312,10 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "NTSC locked mode: log carrier-fit residual statistics for diagnosing ordered column artifacts"));
     parser.addOption(debugPhaseLegsOption);
 
+    QCommandLineOption debugFieldBDecisionsOption(QStringList() << "debug-fieldb-decisions",
+                                    QCoreApplication::translate("main", "NTSC locked mode: log Field B decision summaries with per-phase-bucket breakdowns"));
+    parser.addOption(debugFieldBDecisionsOption);
+
     QCommandLineOption stageTimersOption(QStringList() << "stage-timers",
                                     QCoreApplication::translate("main", "NTSC locked mode: log per-stage timing summaries"));
     parser.addOption(stageTimersOption);
@@ -420,6 +424,9 @@ int main(int argc, char *argv[])
     }
     if (parser.isSet(debugPhaseLegsOption)) {
         combConfig.debugPhaseLegs = true;
+    }
+    if (parser.isSet(debugFieldBDecisionsOption)) {
+        combConfig.debugFieldBDecisions = true;
     }
     if (parser.isSet(stageTimersOption)) {
         combConfig.stageTimers = true;
@@ -641,9 +648,10 @@ int main(int argc, char *argv[])
         decoderName = "pal2d";
     }
     
-    // Require ntsc3d if the map overlay is selected
-    if (combConfig.showMap && decoderName != "ntsc3d") {
-        qCritical() << "Can only show adaptive filter map with the ntsc3d decoder";
+    // Field B reason overlays can be shown in ntsc2d; the adaptive candidate
+    // map still rides the same switch for ntsc3d.
+    if (combConfig.showMap && decoderName != "ntsc3d" && decoderName != "ntsc2d") {
+        qCritical() << "Can only show comb diagnostic maps with the ntsc2d/ntsc3d decoders";
         return -1;
     }
 

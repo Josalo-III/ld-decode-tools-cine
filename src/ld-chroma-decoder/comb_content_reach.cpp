@@ -316,6 +316,117 @@ InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
     return out;
 }
 
+// Fast overload: caller passes pre-computed IRE-domain magnitudes to avoid
+// recomputing the ~12 sqrt/hypot calls the original version performs internally.
+// Inlines interfieldAlienCancelStrength using the shared neighbor-common and
+// centerDelta values, hoisting them out of both sub-computations.
+InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
+                                              double centerQ,
+                                              double upI,
+                                              double upQ,
+                                              double downI,
+                                              double downQ,
+                                              bool hasUp,
+                                              bool hasDown,
+                                              double minChromaIRE,
+                                              double columnSupport,
+                                              double centerMagIRE,
+                                              double upMagIRE,
+                                              double downMagIRE)
+{
+    InterfieldIQReachFloor out;
+
+    const double minChroma = std::max(0.0, minChromaIRE);
+    const double residualMinIRE = 1.25;
+
+    // oppositeIQFit with pre-computed magnitudes — no sqrt.
+    auto oppFitFast = [&](double cI, double cQ, double cMag,
+                          double sI, double sQ, double sMag) -> double {
+        if (cMag < minChroma || sMag < minChroma) return 0.0;
+        const double sdot = (cMag > 1e-12 && sMag > 1e-12)
+            ? std::clamp(dotIQ(cI, cQ, sI, sQ) / (cMag * sMag), -1.0, 1.0)
+            : 0.0;
+        const double antiPhase  = ramp(-sdot, 0.55, 0.92);
+        const double magFit     = magnitudeRatioGate(cMag, sMag);
+        const double chromaFit  = ramp(std::min(cMag, sMag), minChroma, minChroma + 6.0);
+        return clamp01(antiPhase * magFit * chromaFit);
+    };
+
+    const double upRawCancel = hasUp
+        ? oppFitFast(centerI, centerQ, centerMagIRE, upI, upQ, upMagIRE)
+        : 0.0;
+
+    const double downRawCancel = hasDown
+        ? oppFitFast(centerI, centerQ, centerMagIRE, downI, downQ, downMagIRE)
+        : 0.0;
+
+    double twoSidedResidualCancel = 0.0;
+    double mixedLeakage = 0.0;
+
+    if (hasUp && hasDown) {
+        const double mc = centerMagIRE;
+        const double mu = upMagIRE;
+        const double md = downMagIRE;
+
+        // Neighbor correlation without sqrt: pre-computed mu and md.
+        const double dotUD  = dotIQ(upI, upQ, downI, downQ);
+        const double sdotUD = (mu > 1e-12 && md > 1e-12) ? dotUD / (mu * md) : 0.0;
+        const double neighborAgree = ramp(sdotUD, 0.45, 0.82);
+
+        const double neighborCommonI = 0.5 * (upI + downI);
+        const double neighborCommonQ = 0.5 * (upQ + downQ);
+        const double centerDelta =
+            magIQ(centerI - neighborCommonI, centerQ - neighborCommonQ);
+
+        // twoSidedResidualCancel (from base interfieldIQReachFloor)
+        {
+            const double residualPresent =
+                ramp(0.5 * centerDelta, residualMinIRE, residualMinIRE + 5.0);
+            const double chromaPresent =
+                ramp(std::min({mc, mu, md}), minChroma, minChroma + 3.0);
+            const double residualColumnSupport = ramp(columnSupport, 0.18, 0.75);
+            twoSidedResidualCancel =
+                neighborAgree * residualPresent * chromaPresent * residualColumnSupport;
+        }
+
+        // interfieldAlienCancelStrength inlined with shared vars
+        if (mc >= minChroma && mu >= minChroma && md >= minChroma) {
+            const double centerDisplaced = ramp(centerDelta, 5.0, 18.0);
+            const double commonMag = magIQ(neighborCommonI, neighborCommonQ);
+            const double chromaPresent =
+                ramp(std::min({mc, mu, md, commonMag}), minChroma, minChroma + 3.0);
+            const double verticalColumnSupport = 0.25 + 0.75 * clamp01(columnSupport);
+            const double commonCarrierFit =
+                neighborAgree * centerDisplaced * chromaPresent * verticalColumnSupport;
+
+            const double residualIRE     = 0.5 * centerDelta;
+            const double residualPresent = ramp(residualIRE, 1.25, 6.25);
+            const double residualChromaPresent =
+                ramp(std::min({mc, mu, md}), minChroma, minChroma + 3.0);
+            const double residualColumnSupport = ramp(columnSupport, 0.18, 0.75);
+            const double residualTintCancel =
+                neighborAgree * residualPresent * residualChromaPresent * residualColumnSupport;
+            mixedLeakage = clamp01(std::max(commonCarrierFit, residualTintCancel));
+        }
+    }
+
+    const double upCancel   = std::max(upRawCancel,   0.90 * twoSidedResidualCancel);
+    const double downCancel = std::max(downRawCancel, 0.90 * twoSidedResidualCancel);
+
+    double pairedCancel = 0.0;
+    if (hasUp && hasDown) {
+        pairedCancel = std::sqrt(std::clamp(upCancel * downCancel, 0.0, 1.0));
+    } else {
+        pairedCancel = 0.72 * std::max(upCancel, downCancel);
+    }
+
+    const double cleanup = clamp01(std::max(pairedCancel, mixedLeakage));
+    out.up    = clamp01(std::max(upCancel,   0.75 * mixedLeakage));
+    out.down  = clamp01(std::max(downCancel, 0.75 * mixedLeakage));
+    out.cleanup = cleanup;
+    return out;
+}
+
 MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,
                                                 double up2Coarse,
                                                 double down2Coarse,

@@ -20,9 +20,11 @@
 #include "comb.h"
 #include "combmath.h"
 
+#include <QElapsedTimer>
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <array>
 #include <limits>
 
 // -------------------------------------------------------------------------
@@ -103,6 +105,22 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     tapLine.width = std::max(0, width);
     if (width <= 0 || lineNumber < first || lineNumber >= last) return;
 
+    const bool tapTimers = configuration.stageTimers && configuration.phaseCompensation;
+    if (tapTimers)
+        ++tapBuildInstrumentation.lines;
+    auto measureTapBuild = [&](TapBuildTimerIndex idx, auto &&fn) {
+        if (!tapTimers) {
+            fn();
+            return;
+        }
+        QElapsedTimer timer;
+        timer.start();
+        fn();
+        tapBuildInstrumentation.add(idx, timer.nsecsElapsed());
+    };
+    QElapsedTimer setupTimer;
+    if (tapTimers) setupTimer.start();
+
     tapLine.cacheLine = lineNumber;
     tapLine.width = width;
 
@@ -141,105 +159,67 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     tapLine.haveU4 = wantContour && (tapLine.lnU4 >= first && tapLine.lnU4 < last);
     tapLine.haveD4 = wantContour && (tapLine.lnD4 >= first && tapLine.lnD4 < last);
 
-    tapLine.haveIQ0 = false;
-    tapLine.haveIQU1 = false;
-    tapLine.haveIQD1 = false;
-    tapLine.haveIQU2 = false;
-    tapLine.haveIQD2 = false;
-    tapLine.haveIQU4 = false;
-    tapLine.haveIQD4 = false;
-
     auto ensureWidth = [&](auto &v) {
         if ((int)v.size() != width) v.resize(width);
     };
+
     ensureWidth(tapLine.tap0);
+
     if (wantFrame) {
         ensureWidth(tapLine.tapU1);
         ensureWidth(tapLine.tapD1);
         ensureWidth(tapLine.pairU1);
         ensureWidth(tapLine.pairD1);
     }
+
     if (wantContour) {
         ensureWidth(tapLine.tapU2);
         ensureWidth(tapLine.tapD2);
         ensureWidth(tapLine.pairU2);
         ensureWidth(tapLine.pairD2);
     }
-    if (wantFieldB) {
-        ensureWidth(tapLine.fieldContent);
-    }
+
     if (wantContour) {
         ensureWidth(tapLine.tapU4);
         ensureWidth(tapLine.tapD4);
         ensureWidth(tapLine.contour);
         ensureWidth(tapLine.movingCoarseContour);
+        ensureWidth(tapLine.coarse0IRE);
+        ensureWidth(tapLine.coarseU2IRE);
+        ensureWidth(tapLine.coarseD2IRE);
     }
+
     if (wantFieldB || wantFrame)
         ensureWidth(tapLine.hLumaDeltaIRE);
 
-    const bool wantIQ = configuration.phaseCompensation;
-    if (wantIQ) {
-        ensureWidth(tapLine.tap0IQ);
-        if (wantFrame) {
-            ensureWidth(tapLine.tapU1IQ);
-            ensureWidth(tapLine.tapD1IQ);
-        }
-        if (wantContour) {
-            ensureWidth(tapLine.tapU2IQ);
-            ensureWidth(tapLine.tapD2IQ);
-        }
-        if (wantContour) {
-            ensureWidth(tapLine.tapU4IQ);
-            ensureWidth(tapLine.tapD4IQ);
-        }
-    }
-
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
-        if (configuration.phaseCompensation) {
+        if (configuration.phaseCompensation)
             return locked1DSource_line(ln);
-        }
         return bucketScalar1D_line(ln) + left;
     };
-    auto getTiRow = [&](int ln)->const float* {
-        if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
-        return demodTI4fsc_line(ln);
-    };
-    auto getTqRow = [&](int ln)->const float* {
-        if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
-        return demodTQ4fsc_line(ln);
-    };
 
-    auto getMagRow = [&](int ln)->const float* {
-        if (!configuration.phaseCompensation || ln < 0 || ln >= demodLines || demodWidth <= 0) return nullptr;
-        return demodIQMag4fsc_line(ln);
-    };
     struct RowRefs {
         int ln = -1;
         const double *comp = nullptr;
-        const float *ti = nullptr;
-        const float *tq = nullptr;
-        const float *mag = nullptr;
         bool haveLine = false;
     };
-    auto rowRefs = [&](int ln, bool haveLine, bool wantIQ)->RowRefs {
+
+    auto rowRefs = [&](int ln, bool haveLine)->RowRefs {
         RowRefs r;
         r.ln = ln;
         r.haveLine = haveLine;
         r.comp = haveLine ? getCompRow(ln) : nullptr;
-        r.ti = (haveLine && wantIQ) ? getTiRow(ln) : nullptr;
-        r.tq = (haveLine && wantIQ) ? getTqRow(ln) : nullptr;
-        r.mag = (haveLine && wantIQ) ? getMagRow(ln) : nullptr;
         return r;
     };
 
-    RowRefs r0  = rowRefs(tapLine.ln0,  true,            wantIQ);
-    RowRefs rU1 = rowRefs(tapLine.lnU1, tapLine.haveU1,  wantIQ && wantFrame);
-    RowRefs rD1 = rowRefs(tapLine.lnD1, tapLine.haveD1,  wantIQ && wantFrame);
-    RowRefs rU2 = rowRefs(tapLine.lnU2, tapLine.haveU2,  wantIQ && wantContour);
-    RowRefs rD2 = rowRefs(tapLine.lnD2, tapLine.haveD2,  wantIQ && wantContour);
-    RowRefs rU4 = rowRefs(tapLine.lnU4, tapLine.haveU4,  wantIQ && wantContour);
-    RowRefs rD4 = rowRefs(tapLine.lnD4, tapLine.haveD4,  wantIQ && wantContour);
+    RowRefs r0  = rowRefs(tapLine.ln0,  true);
+    RowRefs rU1 = rowRefs(tapLine.lnU1, tapLine.haveU1);
+    RowRefs rD1 = rowRefs(tapLine.lnD1, tapLine.haveD1);
+    RowRefs rU2 = rowRefs(tapLine.lnU2, tapLine.haveU2);
+    RowRefs rD2 = rowRefs(tapLine.lnD2, tapLine.haveD2);
+    RowRefs rU4 = rowRefs(tapLine.lnU4, tapLine.haveU4);
+    RowRefs rD4 = rowRefs(tapLine.lnD4, tapLine.haveD4);
 
     auto getLumaRow = [&](int ln)->const double* {
         if (!configuration.phaseCompensation ||
@@ -252,95 +232,94 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
         return lockedLumaSmooth_line(ln);
     };
+
     const double *luma0  = getLumaRow(tapLine.ln0);
-    const double *lumaU1 = getLumaRow(tapLine.lnU1);
-    const double *lumaD1 = getLumaRow(tapLine.lnD1);
     const double *lumaU2 = getLumaRow(tapLine.lnU2);
     const double *lumaD2 = getLumaRow(tapLine.lnD2);
     const double *lumaU4 = getLumaRow(tapLine.lnU4);
     const double *lumaD4 = getLumaRow(tapLine.lnD4);
 
     auto fillTap = [&](const RowRefs &r,
-                       std::vector<CombTapScalar> &dst,
-                       std::vector<CombTapIQ> *dstIQ,
-                       bool &haveIQDst) {
-        const bool haveComp = (r.comp != nullptr);
-        const bool haveIQRow = (dstIQ != nullptr &&
-                                r.ti != nullptr &&
-                                r.tq != nullptr &&
-                                demodWidth >= width);
-        haveIQDst = haveIQRow;
-
-        if (!haveComp) {
-            for (int rel = 0; rel < width; ++rel) {
+                       std::vector<CombTapScalar> &dst) {
+        if (r.comp == nullptr) {
+            for (int rel = 0; rel < width; ++rel)
                 dst[rel] = CombTapScalar();
-                if (dstIQ)
-                    (*dstIQ)[rel] = CombTapIQ();
-            }
             return;
         }
 
-        const bool haveMagRow = (haveIQRow && r.mag != nullptr);
         for (int rel = 0; rel < width; ++rel) {
             const int rm1 = reflectCombRel(rel - 1, width);
             const int rp1 = reflectCombRel(rel + 1, width);
+
             CombTapScalar &s = dst[rel];
             s.comp = r.comp[rel];
             s.symMag = 0.5 * (std::fabs(r.comp[rm1]) + std::fabs(r.comp[rp1]));
-
-            if (haveIQRow) {
-                const double ti = r.ti[rel];
-                const double tq = r.tq[rel];
-                CombTapIQ &iq = (*dstIQ)[rel];
-                iq.ti = (float)ti;
-                iq.tq = (float)tq;
-                iq.iqMag = haveMagRow
-                    ? static_cast<double>(r.mag[rel])
-                    : std::hypot(ti, tq);
-            }
         }
     };
 
-    fillTap(r0, tapLine.tap0, wantIQ ? &tapLine.tap0IQ : nullptr, tapLine.haveIQ0);
-    if (wantFrame) {
-        fillTap(rU1, tapLine.tapU1, wantIQ ? &tapLine.tapU1IQ : nullptr, tapLine.haveIQU1);
-        fillTap(rD1, tapLine.tapD1, wantIQ ? &tapLine.tapD1IQ : nullptr, tapLine.haveIQD1);
-    }
-    if (wantContour) {
-        fillTap(rU2, tapLine.tapU2, wantIQ ? &tapLine.tapU2IQ : nullptr, tapLine.haveIQU2);
-        fillTap(rD2, tapLine.tapD2, wantIQ ? &tapLine.tapD2IQ : nullptr, tapLine.haveIQD2);
-    }
-    if (wantContour) {
-        fillTap(rU4, tapLine.tapU4, wantIQ ? &tapLine.tapU4IQ : nullptr, tapLine.haveIQU4);
-        fillTap(rD4, tapLine.tapD4, wantIQ ? &tapLine.tapD4IQ : nullptr, tapLine.haveIQD4);
-    }
+    if (tapTimers)
+        tapBuildInstrumentation.add(TapBuildSetup, setupTimer.nsecsElapsed());
+
+    measureTapBuild(TapBuildFillTaps, [&]() {
+        fillTap(r0, tapLine.tap0);
+
+        if (wantFrame) {
+            fillTap(rU1, tapLine.tapU1);
+            fillTap(rD1, tapLine.tapD1);
+        }
+
+        if (wantContour) {
+            fillTap(rU2, tapLine.tapU2);
+            fillTap(rD2, tapLine.tapD2);
+            fillTap(rU4, tapLine.tapU4);
+            fillTap(rD4, tapLine.tapD4);
+        }
+    });
 
     const auto &T = configuration.tunables;
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
     const double invI = invIreScale;
+
     const lddecode::CombReachSourceFrame scalarSource = scalarReachSource();
     const lddecode::CombReachSourceFrame iqSource = iqReachSource();
 
-    auto coherenceAt = [&](const std::vector<CombTapIQ> &nbrIQ, bool haveNbrIQ, int rel)->double {
-        rel = std::clamp(rel, 0, width - 1);
-        if (!tapLine.haveIQ0 || !haveNbrIQ) return 1.0;
-        const CombTapIQ &c = tapLine.tap0IQ[rel];
-        const CombTapIQ &n = nbrIQ[rel];
-        if (c.iqMag * invI < 2.5 || n.iqMag * invI < 2.5) return 1.0;
-        const double corr = ((double)c.ti * (double)n.ti + (double)c.tq * (double)n.tq) /
-                            (c.iqMag * n.iqMag + 1e-12);
-        return std::clamp((corr - 0.55) / (0.85 - 0.55), 0.0, 1.0);
+    auto legalGateForReachUse = [](const lddecode::CombReachReply &reach,
+                                   lddecode::CombReachUse reachUse)->double {
+        switch (reachUse) {
+        case lddecode::CombReachUse::FieldScalarAverage:
+        case lddecode::CombReachUse::FrameScalarAverage:
+            return reach.allowScalarAverage ? 1.0 : 0.0;
+
+        case lddecode::CombReachUse::FieldScalarCancel:
+        case lddecode::CombReachUse::FrameScalarCancel:
+            return reach.allowScalarCancel ? 1.0 : 0.0;
+
+        case lddecode::CombReachUse::ScalarSignCompare:
+            return reach.allowScalarSignCompare ? 1.0 : 0.0;
+
+        case lddecode::CombReachUse::ScalarMagnitudeCompare:
+            return reach.allowScalarMagnitudeCompare ? 1.0 : 0.0;
+
+        case lddecode::CombReachUse::IQCompare:
+            return reach.allowIQCompare ? 1.0 : 0.0;
+
+        case lddecode::CombReachUse::IQAverage:
+            return reach.allowIQAverage ? 1.0 : 0.0;
+
+        case lddecode::CombReachUse::IQCancel:
+            return reach.allowIQCancel ? 1.0 : 0.0;
+        }
+
+        return 0.0;
     };
 
-    // Pair and contour fields are evidence, not decisions: candidates consume
-    // them differently so Field A/B and Frame A/B keep their distinct behavior.
+    // carrierGrammarSignedPhaseRelation uses (h + phase0 + flip) & 3 for both
+    // center and target with the same h, so h cancels — the reply is identical
+    // for every pixel on this line pair. Hoisted once per call.
     auto fillPair = [&](const std::vector<CombTapScalar> &nbr,
-                        const std::vector<CombTapIQ> &nbrIQ,
-                        const double *nbrLuma,
                         int targetLine,
                         bool haveNbr,
-                        bool haveNbrIQ,
                         std::vector<CombTapPair> &dst,
                         const lddecode::CombReachSourceFrame &reachSource,
                         lddecode::CombReachUse reachUse) {
@@ -350,351 +329,260 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             return;
         }
 
+        const double lineReachLegalGate = legalGateForReachUse(
+            combReachIndex.query({lineNumber, targetLine, left, left, reachUse, reachSource}),
+            reachUse);
+
+        const bool needScalarWeight =
+            (reachUse != lddecode::CombReachUse::IQCancel);
+
+        if (!needScalarWeight) {
+            for (int rel = 0; rel < width; ++rel) {
+                CombTapPair &p = dst[rel];
+                p = CombTapPair();
+                p.reachLegalGate = lineReachLegalGate;
+            }
+            return;
+        }
+
         for (int rel = 0; rel < width; ++rel) {
             CombTapPair &p = dst[rel];
             p = CombTapPair();
-            const int h = left + rel;
-            p.reach = combReachIndex.query({
-                lineNumber,
-                targetLine,
-                h,
-                h,
-                reachUse,
-                reachSource});
-            switch (reachUse) {
-            case lddecode::CombReachUse::IQCompare:
-            case lddecode::CombReachUse::IQAverage:
-            case lddecode::CombReachUse::IQCancel:
-                p.reachLegalGate = p.reach.allowIQCompare ? 1.0 : 0.0;
-                break;
-            default:
-                p.reachLegalGate = p.reach.allowScalarAverage ? 1.0 : 0.0;
-                break;
-            }
+            p.reachLegalGate = lineReachLegalGate;
+
             const CombTapScalar &c = tapLine.tap0[rel];
             const CombTapScalar &n = nbr[rel];
-            if (haveNbr) {
-                p.diffIRE = std::fabs(c.comp - n.comp) * invI;
-                p.kScore = combKMetric(c.comp, c.symMag, n.comp, n.symMag);
-                p.weight = (kRange > 1e-9) ? (1.0 - p.kScore * invK) : 1.0;
-                p.weight = std::clamp(p.weight, 0.0, 1.0);
-            }
-            if (tapLine.haveIQ0 && haveNbrIQ) {
-                const CombTapIQ &ciq = tapLine.tap0IQ[rel];
-                const CombTapIQ &niq = nbrIQ[rel];
-                p.iqDiffIRE = std::hypot((double)ciq.ti - (double)niq.ti,
-                                         (double)ciq.tq - (double)niq.tq) * invI;
-            }
-            if (luma0 && nbrLuma) {
-                p.lumaDiffIRE = std::fabs(luma0[rel] - nbrLuma[rel]) * invI;
-            }
-            if (configuration.phaseCompensation && haveNbrIQ) {
-                const int relL = std::clamp(rel - 4, 0, width - 1);
-                const int relR = std::clamp(rel + 4, 0, width - 1);
-                p.coherence = (width >= 9)
-                    ? std::min({coherenceAt(nbrIQ, haveNbrIQ, relL),
-                                coherenceAt(nbrIQ, haveNbrIQ, rel),
-                                coherenceAt(nbrIQ, haveNbrIQ, relR)})
-                    : coherenceAt(nbrIQ, haveNbrIQ, rel);
-            }
+            p.diffIRE = std::fabs(c.comp - n.comp) * invI;
+            p.kScore = combKMetric(c.comp, c.symMag, n.comp, n.symMag);
+            p.weight = (kRange > 1e-9) ? (1.0 - p.kScore * invK) : 1.0;
+            p.weight = std::clamp(p.weight, 0.0, 1.0);
         }
     };
 
-    if (wantFrame) {
-        fillPair(tapLine.tapU1, tapLine.tapU1IQ, lumaU1, tapLine.lnU1, tapLine.haveU1, tapLine.haveIQU1, tapLine.pairU1,
-                 iqSource, lddecode::CombReachUse::IQCompare);
-        fillPair(tapLine.tapD1, tapLine.tapD1IQ, lumaD1, tapLine.lnD1, tapLine.haveD1, tapLine.haveIQD1, tapLine.pairD1,
-                 iqSource, lddecode::CombReachUse::IQCompare);
-    }
-    if (wantContour) {
-        fillPair(tapLine.tapU2, tapLine.tapU2IQ, lumaU2, tapLine.lnU2, tapLine.haveU2, tapLine.haveIQU2, tapLine.pairU2,
-                 scalarSource, lddecode::CombReachUse::FieldScalarAverage);
-        fillPair(tapLine.tapD2, tapLine.tapD2IQ, lumaD2, tapLine.lnD2, tapLine.haveD2, tapLine.haveIQD2, tapLine.pairD2,
-                 scalarSource, lddecode::CombReachUse::FieldScalarAverage);
-    }
+    measureTapBuild(TapBuildFramePairs, [&]() {
+        if (wantFrame) {
+            fillPair(tapLine.tapU1,
+                     tapLine.lnU1,
+                     tapLine.haveU1,
+                     tapLine.pairU1,
+                     iqSource,
+                     lddecode::CombReachUse::IQCancel);
+
+            fillPair(tapLine.tapD1,
+                     tapLine.lnD1,
+                     tapLine.haveD1,
+                     tapLine.pairD1,
+                     iqSource,
+                     lddecode::CombReachUse::IQCancel);
+        }
+    });
+
+    measureTapBuild(TapBuildContourPairs, [&]() {
+        if (wantContour) {
+            fillPair(tapLine.tapU2,
+                     tapLine.lnU2,
+                     tapLine.haveU2,
+                     tapLine.pairU2,
+                     scalarSource,
+                     lddecode::CombReachUse::FieldScalarAverage);
+
+            fillPair(tapLine.tapD2,
+                     tapLine.lnD2,
+                     tapLine.haveD2,
+                     tapLine.pairD2,
+                     scalarSource,
+                     lddecode::CombReachUse::FieldScalarAverage);
+        }
+    });
 
     auto sampleTapComp = [&](const std::vector<CombTapScalar> &tap, int rel)->double {
         rel = std::clamp(rel, 0, width - 1);
         return tap[rel].comp;
     };
+
     auto notchTap = [&](const std::vector<CombTapScalar> &tap, int rel)->double {
         if (rel < 2) rel = 2;
         if (rel > width - 3) rel = width - 3;
         return 0.5 * (sampleTapComp(tap, rel - 2) + sampleTapComp(tap, rel + 2));
     };
 
+    measureTapBuild(TapBuildHLuma, [&]() {
     if (wantFieldB || wantFrame) {
         for (int rel = 0; rel < width; ++rel) {
-        if (configuration.phaseCompensation) {
-            if (width >= 5) {
-                const double lumL = notchTap(tapLine.tap0, rel - 1);
-                const double lumR = notchTap(tapLine.tap0, rel + 1);
-                tapLine.hLumaDeltaIRE[rel] = std::fabs(lumR - lumL) * invI;
+            if (configuration.phaseCompensation) {
+                if (width >= 5) {
+                    const double lumL = notchTap(tapLine.tap0, rel - 1);
+                    const double lumR = notchTap(tapLine.tap0, rel + 1);
+                    tapLine.hLumaDeltaIRE[rel] = std::fabs(lumR - lumL) * invI;
+                } else {
+                    tapLine.hLumaDeltaIRE[rel] = 0.0;
+                }
             } else {
-                tapLine.hLumaDeltaIRE[rel] = 0.0;
+                const int rm1 = std::clamp(rel - 1, 0, width - 1);
+                const int rp1 = std::clamp(rel + 1, 0, width - 1);
+                tapLine.hLumaDeltaIRE[rel] =
+                    std::fabs(tapLine.tap0[rp1].comp - tapLine.tap0[rm1].comp) * invI;
             }
-        } else {
-            const int rm1 = std::clamp(rel - 1, 0, width - 1);
-            const int rp1 = std::clamp(rel + 1, 0, width - 1);
-            tapLine.hLumaDeltaIRE[rel] = std::fabs(tapLine.tap0[rp1].comp - tapLine.tap0[rm1].comp) * invI;
-        }
+
         }
     }
+    });
 
+    measureTapBuild(TapBuildContour, [&]() {
     if (wantContour) {
+        // Hoist tunables and data() pointers out of the hot loop.  Reading 11
+        // vectors per pixel via std::vector<T>::operator[] generates redundant
+        // address math; raw pointers + cached tunables let the loop become a
+        // tight straight-line block.
+        const double soft = T.FIELD_CONTOUR_SOFT_IRE;
+        const double hard = T.FIELD_CONTOUR_HARD_IRE;
+        const double simStart = T.FIELD_CONTOUR_SIM_START;
+        const double simFull  = T.FIELD_CONTOUR_SIM_FULL;
+        const double farInf   = T.FIELD_CONTOUR_FAR_INFLUENCE;
+        const bool kValid = (kRange > 1e-9);
+        const bool hasLuma = (luma0 && lumaU2 && lumaD2 && lumaU4 && lumaD4);
+        const bool haveU2 = tapLine.haveU2;
+        const bool haveD2 = tapLine.haveD2;
+        const bool haveU4 = tapLine.haveU4;
+        const bool haveD4 = tapLine.haveD4;
+
+        const CombTapScalar *t0  = tapLine.tap0.data();
+        const CombTapScalar *tU2 = tapLine.tapU2.data();
+        const CombTapScalar *tD2 = tapLine.tapD2.data();
+        const CombTapScalar *tU4 = tapLine.tapU4.data();
+        const CombTapScalar *tD4 = tapLine.tapD4.data();
+        const CombTapPair   *pU2 = tapLine.pairU2.data();
+        const CombTapPair   *pD2 = tapLine.pairD2.data();
+        CombTapContour      *outContour = tapLine.contour.data();
+        CombContentReach::MovingCoarseContour *outMCC = tapLine.movingCoarseContour.data();
+        double *outCoarse0 = tapLine.coarse0IRE.data();
+        double *outCoarseU2 = tapLine.coarseU2IRE.data();
+        double *outCoarseD2 = tapLine.coarseD2IRE.data();
+
         for (int rel = 0; rel < width; ++rel) {
-        CombTapContour c;
-        auto curveMag = [&](const std::vector<CombTapScalar> &tap)->double {
-            return std::fabs(tap[rel].comp);
-        };
-        const double aC  = curveMag(tapLine.tap0);
-        const double aU2 = curveMag(tapLine.tapU2);
-        const double aD2 = curveMag(tapLine.tapD2);
-        const double aU4 = curveMag(tapLine.tapU4);
-        const double aD4 = curveMag(tapLine.tapD4);
+            const CombTapScalar &sC  = t0[rel];
+            const CombTapScalar &sU2 = tU2[rel];
+            const CombTapScalar &sD2 = tD2[rel];
+            const CombTapScalar &sU4 = tU4[rel];
+            const CombTapScalar &sD4 = tD4[rel];
 
-        c.curvMidIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invI;
-        c.midOk = combSmoothGate(c.curvMidIRE, T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
+            const double aC  = std::fabs(sC.comp);
+            const double aU2 = std::fabs(sU2.comp);
+            const double aD2 = std::fabs(sD2.comp);
+            const double aU4 = std::fabs(sU4.comp);
+            const double aD4 = std::fabs(sD4.comp);
 
-        const double u4Pred = 2.0 * aU2 - aC;
-        const double d4Pred = 2.0 * aD2 - aC;
-        c.upResIRE = std::fabs(aU4 - u4Pred) * invI;
-        c.dnResIRE = std::fabs(aD4 - d4Pred) * invI;
-        c.upSideOk = combSmoothGate(c.upResIRE, T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
-        c.dnSideOk = combSmoothGate(c.dnResIRE, T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
+            CombTapContour c;
+            c.curvMidIRE = std::fabs(aU2 - 2.0 * aC + aD2) * invI;
+            c.midOk = combSmoothGate(c.curvMidIRE, soft, hard);
 
-        const double upK = combKMetric(tapLine.tapU2[rel].comp, tapLine.tapU2[rel].symMag,
-                                       tapLine.tapU4[rel].comp, tapLine.tapU4[rel].symMag);
-        const double dnK = combKMetric(tapLine.tapD2[rel].comp, tapLine.tapD2[rel].symMag,
-                                       tapLine.tapD4[rel].comp, tapLine.tapD4[rel].symMag);
-        c.upSim = (tapLine.pairU2[rel].weight > 0.0)
-            ? std::clamp((kRange > 1e-9) ? (1.0 - upK * invK) : 1.0, 0.0, 1.0)
-            : 0.0;
-        c.dnSim = (tapLine.pairD2[rel].weight > 0.0)
-            ? std::clamp((kRange > 1e-9) ? (1.0 - dnK * invK) : 1.0, 0.0, 1.0)
-            : 0.0;
-        c.upTrust = c.midOk * c.upSideOk;
-        c.dnTrust = c.midOk * c.dnSideOk;
-        c.upInfluence = T.FIELD_CONTOUR_FAR_INFLUENCE * c.upTrust *
-                         combSimilarityFactor(c.upSim, T.FIELD_CONTOUR_SIM_START, T.FIELD_CONTOUR_SIM_FULL);
-        c.dnInfluence = T.FIELD_CONTOUR_FAR_INFLUENCE * c.dnTrust *
-                         combSimilarityFactor(c.dnSim, T.FIELD_CONTOUR_SIM_START, T.FIELD_CONTOUR_SIM_FULL);
-        tapLine.contour[rel] = c;
+            const double u4Pred = 2.0 * aU2 - aC;
+            const double d4Pred = 2.0 * aD2 - aC;
 
-        tapLine.movingCoarseContour[rel] =
-            (luma0 && lumaU2 && lumaD2 && lumaU4 && lumaD4)
+            c.upResIRE = std::fabs(aU4 - u4Pred) * invI;
+            c.dnResIRE = std::fabs(aD4 - d4Pred) * invI;
+            c.upSideOk = combSmoothGate(c.upResIRE, soft, hard);
+            c.dnSideOk = combSmoothGate(c.dnResIRE, soft, hard);
+
+            const double upK = combKMetric(sU2.comp, sU2.symMag, sU4.comp, sU4.symMag);
+            const double dnK = combKMetric(sD2.comp, sD2.symMag, sD4.comp, sD4.symMag);
+
+            c.upSim = (pU2[rel].weight > 0.0)
+                ? std::clamp(kValid ? (1.0 - upK * invK) : 1.0, 0.0, 1.0)
+                : 0.0;
+            c.dnSim = (pD2[rel].weight > 0.0)
+                ? std::clamp(kValid ? (1.0 - dnK * invK) : 1.0, 0.0, 1.0)
+                : 0.0;
+
+            c.upTrust = c.midOk * c.upSideOk;
+            c.dnTrust = c.midOk * c.dnSideOk;
+
+            c.upInfluence = farInf * c.upTrust *
+                            combSimilarityFactor(c.upSim, simStart, simFull);
+            c.dnInfluence = farInf * c.dnTrust *
+                            combSimilarityFactor(c.dnSim, simStart, simFull);
+
+            outContour[rel] = c;
+
+            outCoarse0[rel] = luma0 ? (luma0[rel] * invI) : 0.0;
+            outCoarseU2[rel] = lumaU2 ? (lumaU2[rel] * invI) : outCoarse0[rel];
+            outCoarseD2[rel] = lumaD2 ? (lumaD2[rel] * invI) : outCoarse0[rel];
+
+            outMCC[rel] = hasLuma
                 ? CombContentReach::evaluateMovingCoarseContour(
                     luma0[rel] * invI,
                     lumaU2[rel] * invI,
                     lumaD2[rel] * invI,
                     lumaU4[rel] * invI,
                     lumaD4[rel] * invI,
-                    tapLine.haveU2,
-                    tapLine.haveD2,
-                    tapLine.haveU4,
-                    tapLine.haveD4,
-                    T.FIELD_CONTOUR_SOFT_IRE,
-                    T.FIELD_CONTOUR_HARD_IRE)
+                    haveU2, haveD2, haveU4, haveD4,
+                    soft, hard)
                 : CombContentReach::MovingCoarseContour();
         }
     }
+    });
 
-    if (wantFieldB) {
-        for (int rel = 0; rel < width; ++rel) {
-            CombContentReach::Query query;
-            query.frameLine = lineNumber;
-            query.x = left + rel;
-            query.lockedPath = configuration.phaseCompensation;
-            query.hasIQ = tapLine.haveIQ0 && tapLine.haveIQU2 && tapLine.haveIQD2;
-            query.hasMovingCoarse =
-                (luma0 != nullptr) &&
-                (lumaU2 != nullptr) &&
-                (lumaD2 != nullptr);
-            query.chromaIRE = query.hasIQ
-                ? (tapLine.tap0IQ[rel].iqMag * invI)
-                : (std::fabs(tapLine.tap0[rel].comp) * invI);
-
-            query.centerScalar = tapLine.tap0[rel].comp * invI;
-            query.up2Scalar = tapLine.tapU2[rel].comp * invI;
-            query.down2Scalar = tapLine.tapD2[rel].comp * invI;
-            query.up4Scalar = tapLine.tapU4[rel].comp * invI;
-            query.down4Scalar = tapLine.tapD4[rel].comp * invI;
-
-            query.hasUp2 = tapLine.haveU2;
-            query.hasDown2 = tapLine.haveD2;
-            query.hasUp4 = tapLine.haveU4;
-            query.hasDown4 = tapLine.haveD4;
-
-            query.up2LumaDiffIRE = std::isfinite(tapLine.pairU2[rel].lumaDiffIRE)
-                ? tapLine.pairU2[rel].lumaDiffIRE
-                : 0.0;
-            query.down2LumaDiffIRE = std::isfinite(tapLine.pairD2[rel].lumaDiffIRE)
-                ? tapLine.pairD2[rel].lumaDiffIRE
-                : 0.0;
-
-            if (query.hasIQ) {
-                query.centerI = tapLine.tap0IQ[rel].ti * invI;
-                query.centerQ = tapLine.tap0IQ[rel].tq * invI;
-                query.up2I = tapLine.tapU2IQ[rel].ti * invI;
-                query.up2Q = tapLine.tapU2IQ[rel].tq * invI;
-                query.down2I = tapLine.tapD2IQ[rel].ti * invI;
-                query.down2Q = tapLine.tapD2IQ[rel].tq * invI;
-            }
-
-            if (query.hasMovingCoarse) {
-                query.centerCoarse = luma0[rel] * invI;
-                query.up2Coarse = lumaU2[rel] * invI;
-                query.down2Coarse = lumaD2[rel] * invI;
-                query.up4Coarse = lumaU4 ? (lumaU4[rel] * invI) : query.up2Coarse;
-                query.down4Coarse = lumaD4 ? (lumaD4[rel] * invI) : query.down2Coarse;
-            }
-            query.upCoherence = tapLine.pairU2[rel].coherence;
-            query.downCoherence = tapLine.pairD2[rel].coherence;
-
-            tapLine.fieldContent[rel] = CombContentReach::evaluate(query);
-        }
-    }
-
-    auto applyReachLimiters = [&](std::vector<CombTapPair> &upPair,
-                                  std::vector<CombTapPair> &dnPair,
-                                  bool haveUp,
-                                  bool haveDn,
-                                  bool haveUpIQ,
-                                  bool haveDnIQ,
-                                  const std::vector<CombTapIQ> &upIQ,
-                                  const std::vector<CombTapIQ> &dnIQ,
-                                  bool useContour,
-                                  bool allowInterfieldIQException) {
+    // reachGate composition policy:
+    //
+    //   Frame ±1 (Frame B):  reachGate = reachLegalGate.
+    //     Frame B is deliberately the over-combing path: legal partner ->
+    //     comb at full strength.  No per-pixel contour or IQ-floor modulation,
+    //     which previously fed per-pixel jitter into Frame B's output and read
+    //     as alternating dark pixels in saturated regions.
+    //
+    //   Field ±2 (Field A / Field B / preclean):  reachGate = mc * reachLegalGate.
+    //     The intrafield combs need actual reach limiting around vertical
+    //     content boundaries.  Source: movingCoarseContour exclusively.  When
+    //     mc.valid -> 0.25 + 0.75 * trust; otherwise gate = 1.0 (deterministic
+    //     fall-through, not a fallback to a second confidence stream).
+    auto applyFrameReachLegalOnly = [&](std::vector<CombTapPair> &upPair,
+                                        std::vector<CombTapPair> &dnPair,
+                                        bool haveUp,
+                                        bool haveDn) {
         if (!haveUp || !haveDn || (int)upPair.size() < width || (int)dnPair.size() < width)
             return;
-
         for (int rel = 0; rel < width; ++rel) {
-            double upGate = 1.0;
-            double dnGate = 1.0;
-            double contourStraight = 0.0;
-            if (useContour && rel < (int)tapLine.contour.size()) {
-                const CombTapContour &c = tapLine.contour[rel];
-                const double contourTrust = std::clamp(
-                    c.midOk * 0.5 * (c.upSideOk + c.dnSideOk), 0.0, 1.0);
-                const double contourCurvNorm = std::clamp(
-                    c.curvMidIRE / std::max(1.0, T.FIELD_CONTOUR_HARD_IRE), 0.0, 1.0);
-                const double tapContourStraight = std::clamp(
-                    0.70 * contourTrust + 0.30 * (1.0 - contourCurvNorm), 0.0, 1.0);
-                contourStraight = tapContourStraight;
-                if (rel < (int)tapLine.movingCoarseContour.size() &&
-                    tapLine.movingCoarseContour[rel].valid)
-                {
-                    contourStraight = tapLine.movingCoarseContour[rel].straightness;
-                }
-            }
-            const double contourBend = useContour ? (1.0 - contourStraight) : 1.0;
-
-            if (configuration.phaseCompensation && tapLine.haveIQ0 && haveUpIQ && haveDnIQ) {
-                const double m0  = tapLine.tap0IQ[rel].iqMag * invI;
-                const double mUp = upIQ[rel].iqMag * invI;
-                const double mDn = dnIQ[rel].iqMag * invI;
-                const double satHi = std::max({m0, mUp, mDn});
-                const double satLo = std::min(mUp, mDn);
-                const double satGate = std::clamp((satHi - 6.0) / 12.0, 0.0, 1.0);
-                const double oneSideGate = std::clamp((3.5 - satLo) / 3.5, 0.0, 1.0);
-                const double asym = std::fabs(mUp - mDn) / std::max(std::max(mUp, mDn), 1e-6);
-                const double dUp0 = std::fabs(mUp - m0);
-                const double dDn0 = std::fabs(mDn - m0);
-                const double matchGap = std::fabs(dUp0 - dDn0) /
-                    std::max(std::max({m0, mUp, mDn}), 1.0);
-                const double inhibit = std::clamp(
-                    satGate * (0.60 * oneSideGate + 0.40 * asym) *
-                    (0.55 + 0.45 * matchGap) *
-                    (0.15 + 0.85 * contourBend),
-                    0.0, 1.0);
-
-                if (dUp0 <= dDn0) dnGate *= (1.0 - inhibit);
-                else              upGate *= (1.0 - inhibit);
-
-                auto materialGate = [&](const CombTapPair &p)->double {
-                    if (!std::isfinite(p.lumaDiffIRE) || !std::isfinite(p.iqDiffIRE))
-                        return 1.0;
-                    const double lumaT = std::clamp((p.lumaDiffIRE - 3.0) / 9.0, 0.0, 1.0);
-                    const double iqT = std::clamp((p.iqDiffIRE - 3.0) / 9.0, 0.0, 1.0);
-                    const double incoherentT = std::clamp((0.90 - p.coherence) / 0.55, 0.0, 1.0);
-                    const double bothDifferent = lumaT * std::max(iqT, incoherentT);
-                    const double gatedByBend = bothDifferent * contourBend;
-                    return 1.0 - std::clamp(gatedByBend, 0.0, 0.95);
-                };
-                upGate *= materialGate(upPair[rel]);
-                dnGate *= materialGate(dnPair[rel]);
-            }
-
-            if (allowInterfieldIQException &&
-                configuration.phaseCompensation &&
-                tapLine.haveIQ0 &&
-                haveUpIQ &&
-                haveDnIQ &&
-                rel < (int)tapLine.tap0IQ.size() &&
-                rel < (int)upIQ.size() &&
-                rel < (int)dnIQ.size())
-            {
-                double lumaEdgeFit = 0.0;
-                if (rel < (int)tapLine.hLumaDeltaIRE.size()) {
-                    lumaEdgeFit = std::clamp(
-                        (tapLine.hLumaDeltaIRE[rel] - 6.0) / 12.0,
-                        0.0,
-                        1.0);
-                }
-
-                const double columnSupport = std::clamp(
-                    0.45 * lumaEdgeFit + 0.55 * contourStraight,
-                    0.0,
-                    1.0);
-
-                const CombContentReach::InterfieldIQReachFloor reachFloor =
-                    CombContentReach::interfieldIQReachFloor(
-                        tapLine.tap0IQ[rel].ti * invI,
-                        tapLine.tap0IQ[rel].tq * invI,
-                        upIQ[rel].ti * invI,
-                        upIQ[rel].tq * invI,
-                        dnIQ[rel].ti * invI,
-                        dnIQ[rel].tq * invI,
-                        haveUp,
-                        haveDn,
-                        2.0,
-                        columnSupport);
-
-                upGate = std::max(upGate, reachFloor.up);
-                dnGate = std::max(dnGate, reachFloor.down);
-            }
-
-            double upContourGate = 1.0;
-            double dnContourGate = 1.0;
-            if (useContour && rel < (int)tapLine.contour.size()) {
-                const CombTapContour &c = tapLine.contour[rel];
-                upContourGate = 0.25 + 0.75 * c.upTrust;
-                dnContourGate = 0.25 + 0.75 * c.dnTrust;
-            }
-
-            upPair[rel].contourReachGate = upContourGate;
-            dnPair[rel].contourReachGate = dnContourGate;
-            upPair[rel].reachGate = std::clamp(upGate * upContourGate * upPair[rel].reachLegalGate, 0.0, 1.0);
-            dnPair[rel].reachGate = std::clamp(dnGate * dnContourGate * dnPair[rel].reachLegalGate, 0.0, 1.0);
+            upPair[rel].reachGate = upPair[rel].reachLegalGate;
+            dnPair[rel].reachGate = dnPair[rel].reachLegalGate;
         }
     };
 
-    if (wantFrame) {
-        applyReachLimiters(tapLine.pairU1, tapLine.pairD1,
-                           tapLine.haveU1, tapLine.haveD1,
-                           tapLine.haveIQU1, tapLine.haveIQD1,
-                           tapLine.tapU1IQ, tapLine.tapD1IQ,
-                           true,
-                           true);
-    }
-    if (wantFieldA || wantFieldB) {
-        applyReachLimiters(tapLine.pairU2, tapLine.pairD2,
-                           tapLine.haveU2, tapLine.haveD2,
-                           tapLine.haveIQU2, tapLine.haveIQD2,
-                           tapLine.tapU2IQ, tapLine.tapD2IQ,
-                           wantFieldA,
-                           false);
-    }
+    auto applyFieldReachWithMovingCoarse = [&](std::vector<CombTapPair> &upPair,
+                                               std::vector<CombTapPair> &dnPair,
+                                               bool haveUp,
+                                               bool haveDn) {
+        if (!haveUp || !haveDn || (int)upPair.size() < width || (int)dnPair.size() < width)
+            return;
+        for (int rel = 0; rel < width; ++rel) {
+            double upContourGate = 1.0;
+            double dnContourGate = 1.0;
+            if (rel < (int)tapLine.movingCoarseContour.size() &&
+                tapLine.movingCoarseContour[rel].valid)
+            {
+                const auto &mc = tapLine.movingCoarseContour[rel];
+                upContourGate = 0.25 + 0.75 * std::clamp(mc.upTrust, 0.0, 1.0);
+                dnContourGate = 0.25 + 0.75 * std::clamp(mc.downTrust, 0.0, 1.0);
+            }
+            upPair[rel].reachGate = std::clamp(
+                upContourGate * upPair[rel].reachLegalGate, 0.0, 1.0);
+            dnPair[rel].reachGate = std::clamp(
+                dnContourGate * dnPair[rel].reachLegalGate, 0.0, 1.0);
+        }
+    };
+
+    measureTapBuild(TapBuildFrameLimiters, [&]() {
+        if (wantFrame) {
+            applyFrameReachLegalOnly(tapLine.pairU1, tapLine.pairD1,
+                                     tapLine.haveU1, tapLine.haveD1);
+        }
+    });
+
+    measureTapBuild(TapBuildFieldLimiters, [&]() {
+        if (wantFieldA || wantFieldB) {
+            applyFieldReachWithMovingCoarse(tapLine.pairU2, tapLine.pairD2,
+                                            tapLine.haveU2, tapLine.haveD2);
+        }
+    });
 
     tapLine.builtFlags = flags;
 }
@@ -1075,7 +963,12 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
             double t2  = ((C - Cup2Adj) * wUp2 * sc2);
             t2        += ((C - Cdn2Adj) * wDn2 * sc2);
             tc        += 0.25 * t2;
+        } else {
+            tc = C;
         }
+
+        if (!std::isfinite(tc))
+            tc = C;
 
         outFieldLine[rel] = tc;
 
@@ -1091,7 +984,9 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
 // Field B
 // Simplified Field comb as a FrameBuffer member:
 // - uses only 2 vertical neighbours
-void Comb::FrameBuffer::computeSimpleFieldLine(int lineNumber, double *outFieldLine)
+void Comb::FrameBuffer::computeSimpleFieldLine(int lineNumber,
+                                               double *outFieldLine,
+                                               std::uint8_t *outReasonLine)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
@@ -1099,15 +994,17 @@ void Comb::FrameBuffer::computeSimpleFieldLine(int lineNumber, double *outFieldL
 
     if (width <= 0 || lineNumber < first || lineNumber >= last || !outFieldLine) {
         if (outFieldLine) std::fill(outFieldLine, outFieldLine + std::max(width, 0), 0.0);
+        if (outReasonLine) std::fill(outReasonLine, outReasonLine + std::max(width, 0), FieldBReasonNone);
         return;
     }
 
     const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
-    computeSimpleFieldLine(tapLine, outFieldLine);
+    computeSimpleFieldLine(tapLine, outFieldLine, outReasonLine);
 }
 
 void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
-                                               double *outFieldLine)
+                                               double *outFieldLine,
+                                               std::uint8_t *outReasonLine)
 {
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
@@ -1123,6 +1020,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
     if (lineNumber < first || lineNumber >= last) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
+        if (outReasonLine) std::fill(outReasonLine, outReasonLine + width, FieldBReasonNone);
         return;
     }
 
@@ -1162,6 +1060,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
     if (!row0) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
+        if (outReasonLine) std::fill(outReasonLine, outReasonLine + width, FieldBReasonNone);
         return;
     }
 
@@ -1169,6 +1068,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
     // This avoids synthetic zero chroma without changing normal Field B geometry.
     if (!rowUp2 || !rowDn2) {
         std::copy(row0, row0 + width, outFieldLine);
+        if (outReasonLine) std::fill(outReasonLine, outReasonLine + width, FieldBReasonCenter);
         return;
     }
 
@@ -1176,8 +1076,55 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
+    const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
+    const bool emitDecisionLog =
+        configuration.debugFieldBDecisions && configuration.phaseCompensation;
+    const int probeLo = first + (last - first) / 6;
+    const int probeHi = first + (last - first) / 3;
+    const int probeStep = std::max(1, (probeHi - probeLo) / 10);
+    const bool lineIsProbe = emitDecisionLog &&
+                             (lineNumber >= probeLo &&
+                              lineNumber < probeHi &&
+                              ((lineNumber - probeLo) % probeStep) == 0);
+    std::array<int, 9> reasonCounts{};
+    std::array<std::array<int, 4>, 9> bucketReasonCounts{};
+    std::array<double, 4> blendCountByBucket{};
+    std::array<double, 4> blendSumWUpByBucket{};
+    std::array<double, 4> blendSumWDnByBucket{};
+    std::array<double, 4> blendSumPullUpByBucket{};
+    std::array<double, 4> blendSumPullDnByBucket{};
+    std::array<double, 4> blendSumOutDeltaByBucket{};
+    double sumAbsChromaIRE = 0.0;
+    double sumHEdgeIRE = 0.0;
+    double sumVerticalContrastIRE = 0.0;
+    int metricCount = 0;
+    auto softenDominantWeights = [](double &wA, double &wB) {
+        if (wA <= 0.0 || wB <= 0.0)
+            return;
+
+        const double strong = std::max(wA, wB);
+        const double weak = std::min(wA, wB);
+        if (strong <= 1e-9)
+            return;
+
+        const double balance = weak / strong;
+        const double minBalance = 1.0 / 3.0;
+        if (balance >= minBalance)
+            return;
+
+        // Field B zippering is driven more by abrupt side dropouts than by
+        // genuinely one-sided evidence. Lift the weaker side toward the 3:1
+        // floor instead of zeroing it so saturation fallback can cede smoothly.
+        const double liftedWeak = strong * (minBalance + (1.0 - minBalance) * balance);
+
+        if (wA >= wB)
+            wB = liftedWeak;
+        else
+            wA = liftedWeak;
+    };
 
     for (int rel = 0; rel < width; ++rel) {
+        std::uint8_t reason = FieldBReasonNone;
         const int rm1 = (rel > 0) ? (rel - 1) : 0;
         const int rp1 = (rel + 1 < width) ? (rel + 1) : (width - 1);
 
@@ -1194,8 +1141,6 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         const double Cdn_m1 = rowDn2[rm1];
         const double Cdn_p1 = rowDn2[rp1];
 
-        // Symmetric lateral magnitude context. This remains the original
-        // support/weight evidence for the vertical comb.
         const double symCur =
             0.5 * (std::fabs(C_m1) + std::fabs(C_p1));
 
@@ -1205,57 +1150,174 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         const double symDn =
             0.5 * (std::fabs(Cdn_m1) + std::fabs(Cdn_p1));
 
-        double kp = 0.0;
-        double kn = 0.0;
+        // Phase-flat chroma envelopes.  At 4fsc the center sample sits on one
+        // carrier axis and its two horizontal neighbours on the orthogonal axis
+        // (C_p1 = -C_m1), so hypot(on-axis, orthogonal-axis) = sqrt(I^2+Q^2),
+        // independent of carrier phase.  Building the election from envelopes
+        // instead of |C| removes the 2-pixel carrier-rate oscillation that made
+        // the comb engage/disengage in alternating blocks (the zipper).  Hue/
+        // phase legality is NOT measured here — that stays with reachGate below.
+        const double envC  = std::hypot(C,   symCur);
+        const double envUp = std::hypot(Cup, symUp);
+        const double envDn = std::hypot(Cdn, symDn);
 
-        kp  = std::fabs(std::fabs(C) - std::fabs(Cup));
-        kp += std::fabs(symCur - symUp);
-        kp -= (std::fabs(C) + std::fabs(Cup)) * 0.10;
-
-        kn  = std::fabs(std::fabs(C) - std::fabs(Cdn));
-        kn += std::fabs(symCur - symDn);
-        kn -= (std::fabs(C) + std::fabs(Cdn)) * 0.10;
+        double kp = std::fabs(envC - envUp) - 0.10 * (envC + envUp);
+        double kn = std::fabs(envC - envDn) - 0.10 * (envC + envDn);
 
         if (kp < 0.0) kp = 0.0;
         if (kn < 0.0) kn = 0.0;
 
-        double wUp = (kRange > 1e-9) ? (1.0 - kp * invK) : 1.0;
-        double wDn = (kRange > 1e-9) ? (1.0 - kn * invK) : 1.0;
+        const double hEdgeForSat =
+            (rel < (int)tapLine.hLumaDeltaIRE.size())
+                ? std::clamp(
+                    (tapLine.hLumaDeltaIRE[rel] - 0.35 * hEdgeThreshIRE) /
+                    (0.65 * hEdgeThreshIRE),
+                    0.0,
+                    1.0)
+                : 0.0;
+        const double chromaT = std::clamp(
+            (envC * invIreScale - 2.0) / 8.0, 0.0, 1.0);
+
+        if (chromaT > 0.0 &&
+            rel < (int)tapLine.coarse0IRE.size() &&
+            rel < (int)tapLine.coarseU2IRE.size() &&
+            rel < (int)tapLine.coarseD2IRE.size())
+        {
+            const double lc = tapLine.coarse0IRE[rel] * irescale;
+            const double lu = tapLine.coarseU2IRE[rel] * irescale;
+            const double ld = tapLine.coarseD2IRE[rel] * irescale;
+            double lumaKp = std::fabs(lc - lu);
+            double lumaKn = std::fabs(lc - ld);
+            lumaKp = std::max(lumaKp - (lc + lu) * 0.10, 0.0);
+            lumaKn = std::max(lumaKn - (lc + ld) * 0.10, 0.0);
+            kp = kp * (1.0 - chromaT) + lumaKp * chromaT;
+            kn = kn * (1.0 - chromaT) + lumaKn * chromaT;
+        }
+
+        const double satRelax = chromaT * (1.0 - 0.55 * hEdgeForSat);
+        const double effectiveKRange = kRange * (1.0 + 0.75 * satRelax);
+        const double localInvK =
+            (effectiveKRange > 1e-9) ? (1.0 / effectiveKRange) : 0.0;
+
+        double wUp = (effectiveKRange > 1e-9) ? (1.0 - kp * localInvK) : 1.0;
+        double wDn = (effectiveKRange > 1e-9) ? (1.0 - kn * localInvK) : 1.0;
 
         wUp = std::clamp(wUp, 0.0, 1.0);
         wDn = std::clamp(wDn, 0.0, 1.0);
-        const CombContentReach::Reply *content =
-            (rel < (int)tapLine.fieldContent.size()) ? &tapLine.fieldContent[rel] : nullptr;
+
         if (rel < (int)tapLine.pairU2.size())
-            wUp *= tapLine.pairU2[rel].reachLegalGate;
+            wUp *= tapLine.pairU2[rel].reachGate;
         if (rel < (int)tapLine.pairD2.size())
-            wDn *= tapLine.pairD2[rel].reachLegalGate;
-        if (content) {
-            const double topologyT = std::clamp(
-                std::max(content->centerIsIntermediate, content->bevelOrOutlineStrength),
+            wDn *= tapLine.pairD2[rel].reachGate;
+
+        double lumaEdgeUp = 0.0;
+        double lumaEdgeDn = 0.0;
+        if (rel < (int)tapLine.coarse0IRE.size() &&
+            rel < (int)tapLine.coarseU2IRE.size() &&
+            rel < (int)tapLine.coarseD2IRE.size())
+        {
+            const double LUMA_EDGE_LO_IRE = 6.0;
+            const double LUMA_EDGE_HI_IRE = 20.0;
+            const double dUpIRE = std::fabs(
+                tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]);
+            const double dDnIRE = std::fabs(
+                tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]);
+            lumaEdgeUp = std::clamp(
+                (dUpIRE - LUMA_EDGE_LO_IRE) /
+                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
                 0.0, 1.0);
-            const double authorityBlend = 0.20 + 0.80 * topologyT;
-            const double upGate =
-                (1.0 - authorityBlend) + authorityBlend * content->up.reachAuthority;
-            const double dnGate =
-                (1.0 - authorityBlend) + authorityBlend * content->down.reachAuthority;
-            wUp *= upGate;
-            wDn *= dnGate;
-            if (content->preferUp && content->oneSidedAuthority > 0.35)
-                wDn *= std::max(0.0, 1.0 - 0.85 * content->oneSidedAuthority);
-            if (content->preferDown && content->oneSidedAuthority > 0.35)
-                wUp *= std::max(0.0, 1.0 - 0.85 * content->oneSidedAuthority);
+            lumaEdgeDn = std::clamp(
+                (dDnIRE - LUMA_EDGE_LO_IRE) /
+                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
+                0.0, 1.0);
+            wUp *= (1.0 - lumaEdgeUp);
+            wDn *= (1.0 - lumaEdgeDn);
+        }
+
+        double boundaryCede = 0.0;
+        if (rel < (int)tapLine.pairU2.size() &&
+            rel < (int)tapLine.pairD2.size() &&
+            rel < (int)tapLine.hLumaDeltaIRE.size())
+        {
+            const double hEdge = std::clamp(
+                (tapLine.hLumaDeltaIRE[rel] - 0.45 * hEdgeThreshIRE) /
+                (0.55 * hEdgeThreshIRE),
+                0.0,
+                1.0);
+
+            if (hEdge > 0.0) {
+                const double dUp0IRE = tapLine.pairU2[rel].diffIRE;
+                const double dDn0IRE = tapLine.pairD2[rel].diffIRE;
+                const double scalarUpDn = std::fabs(Cup - Cdn) * invIreScale;
+                const double lumaUpDn =
+                    (rel < (int)tapLine.coarseU2IRE.size() &&
+                     rel < (int)tapLine.coarseD2IRE.size())
+                        ? std::fabs(tapLine.coarseU2IRE[rel] - tapLine.coarseD2IRE[rel])
+                        : scalarUpDn;
+                const double dUpDnIRE =
+                    scalarUpDn * (1.0 - chromaT) + lumaUpDn * chromaT;
+                const double diffGapIRE = std::fabs(dUp0IRE - dDn0IRE);
+                const double bestDiffIRE = std::min(dUp0IRE, dDn0IRE);
+                const double worstDiffIRE = std::max(dUp0IRE, dDn0IRE);
+                const double diffRatio =
+                    (worstDiffIRE > 1e-9) ? (bestDiffIRE / worstDiffIRE) : 1.0;
+                const double kBest = std::min(kp, kn);
+                const double kWorst = std::max(kp, kn);
+                const double kRatio =
+                    (kWorst > 1e-9) ? (kBest / kWorst) : 1.0;
+
+                const double matchIRE = 3.5;
+                const double betweenIRE = 6.0;
+                const double edgeUdIRE = 8.0;
+
+                if (dUpDnIRE > edgeUdIRE) {
+                    const bool preferUp = (dUp0IRE <= dDn0IRE);
+                    const bool hardPreferUp =
+                        preferUp &&
+                        ((dUp0IRE < matchIRE && dDn0IRE > betweenIRE) ||
+                         (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
+                         (bestDiffIRE < 5.0 && kRatio < 0.45));
+                    const bool hardPreferDn =
+                        !preferUp &&
+                        ((dDn0IRE < matchIRE && dUp0IRE > betweenIRE) ||
+                         (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
+                         (bestDiffIRE < 5.0 && kRatio < 0.45));
+
+                    if (hardPreferUp) {
+                        wDn = 0.0;
+                        wUp = std::max(wUp, 0.40 + 0.60 * hEdge);
+                        reason = FieldBReasonBoundaryUp;
+                    } else if (hardPreferDn) {
+                        wUp = 0.0;
+                        wDn = std::max(wDn, 0.40 + 0.60 * hEdge);
+                        reason = FieldBReasonBoundaryDown;
+                    } else {
+                        const double sideGap = diffGapIRE;
+                        const double sideGapT =
+                            std::clamp((sideGap - 1.0) / 4.0, 0.0, 1.0);
+                        const double cedeT =
+                            std::clamp((std::min(dUp0IRE, dDn0IRE) - 3.0) / 6.0,
+                                       0.0,
+                                       1.0);
+
+                        if (preferUp)
+                            wDn *= std::max(0.0, 1.0 - 0.85 * hEdge * (0.35 + 0.65 * sideGapT));
+                        else
+                            wUp *= std::max(0.0, 1.0 - 0.85 * hEdge * (0.35 + 0.65 * sideGapT));
+
+                        boundaryCede = std::max(boundaryCede, 0.70 * hEdge * cedeT);
+                        if (boundaryCede > 0.0 && reason == FieldBReasonNone)
+                            reason = FieldBReasonBoundaryCede;
+                    }
+                }
+            }
         }
 
         double sc = 1.0;
         bool haveAnswer = false;
-        bool revivedUD = false;
 
         if (wUp > 0.0 || wDn > 0.0) {
-            if (wDn > 3.0 * wUp)
-                wUp = 0.0;
-            else if (wUp > 3.0 * wDn)
-                wDn = 0.0;
+            softenDominantWeights(wUp, wDn);
 
             const double denom = wUp + wDn;
 
@@ -1270,34 +1332,68 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                 wDn = 0.0;
             }
         } else {
-            // Original same-magnitude up/down revival. Do not suppress this
-            // with the luma-edge detector; suppressing it recreated the moving
-            // diagonal staircase.
-            const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
-            const double sumUD = std::fabs(Cup + Cdn);
+            double reviveStrength = 0.0;
+            double reviveUp = 0.0;
+            double reviveDn = 0.0;
 
-            if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
-                wUp = (rel < (int)tapLine.pairU2.size())
-                    ? tapLine.pairU2[rel].reachLegalGate
+            if (rel < (int)tapLine.movingCoarseContour.size() &&
+                tapLine.movingCoarseContour[rel].valid &&
+                rel < (int)tapLine.coarse0IRE.size() &&
+                rel < (int)tapLine.coarseU2IRE.size() &&
+                rel < (int)tapLine.coarseD2IRE.size())
+            {
+                const auto &mc = tapLine.movingCoarseContour[rel];
+                const double coarseCenter = tapLine.coarse0IRE[rel];
+                const double coarseUp = tapLine.coarseU2IRE[rel];
+                const double coarseDn = tapLine.coarseD2IRE[rel];
+                const double dUpCoarse = std::fabs(coarseCenter - coarseUp);
+                const double dDnCoarse = std::fabs(coarseCenter - coarseDn);
+                const double denom = dUpCoarse + dDnCoarse;
+                const double coarseBalance =
+                    (denom > 1e-9)
+                        ? (1.0 - std::fabs(dUpCoarse - dDnCoarse) / denom)
+                        : 1.0;
+                const double coarseStraight =
+                    std::clamp(mc.straightness, 0.0, 1.0);
+                const double coarseCurvFit =
+                    std::clamp(1.0 - mc.curvMidIRE / 8.0, 0.0, 1.0);
+
+                reviveStrength =
+                    coarseBalance *
+                    (0.60 * coarseStraight + 0.40 * coarseCurvFit);
+
+                reviveUp =
+                    ((rel < (int)tapLine.pairU2.size())
+                         ? tapLine.pairU2[rel].reachGate
+                         : 1.0) *
+                    (0.35 + 0.65 * std::clamp(mc.upTrust, 0.0, 1.0));
+                reviveDn =
+                    ((rel < (int)tapLine.pairD2.size())
+                         ? tapLine.pairD2[rel].reachGate
+                         : 1.0) *
+                    (0.35 + 0.65 * std::clamp(mc.downTrust, 0.0, 1.0));
+            } else {
+                const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
+                const double sumUD = std::fabs(Cup + Cdn);
+                reviveStrength = (dMag - std::fabs(sumUD * 0.2) <= 0.0) ? 1.0 : 0.0;
+                reviveUp = (rel < (int)tapLine.pairU2.size())
+                    ? tapLine.pairU2[rel].reachGate
                     : 1.0;
-                wDn = (rel < (int)tapLine.pairD2.size())
-                    ? tapLine.pairD2[rel].reachLegalGate
+                reviveDn = (rel < (int)tapLine.pairD2.size())
+                    ? tapLine.pairD2[rel].reachGate
                     : 1.0;
-                if (content) {
-                    const double topologyT = std::clamp(
-                        std::max(content->centerIsIntermediate, content->bevelOrOutlineStrength),
-                        0.0, 1.0);
-                    const double authorityBlend = 0.20 + 0.80 * topologyT;
-                    wUp *= (1.0 - authorityBlend) + authorityBlend * content->up.reachAuthority;
-                    wDn *= (1.0 - authorityBlend) + authorityBlend * content->down.reachAuthority;
-                    if (!content->allowSymmetricReach && topologyT > 0.45) {
-                        wUp = 0.0;
-                        wDn = 0.0;
-                    }
-                }
+            }
+
+            if (reviveStrength > 0.0) {
+                wUp = reviveUp * reviveStrength;
+                wDn = reviveDn * reviveStrength;
                 sc = 1.0;
                 haveAnswer = (wUp > 0.0 || wDn > 0.0);
-                revivedUD = haveAnswer;
+                if (haveAnswer)
+                    reason = (rel < (int)tapLine.movingCoarseContour.size() &&
+                              tapLine.movingCoarseContour[rel].valid)
+                        ? FieldBReasonReviveCoarse
+                        : FieldBReasonReviveScalar;
             } else {
                 wUp = 0.0;
                 wDn = 0.0;
@@ -1307,36 +1403,121 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         double tc = 0.0;
 
         if (haveAnswer) {
+            const double lumaEdgeCede = std::min(lumaEdgeUp, lumaEdgeDn);
+            const double totalCede = std::max(boundaryCede, lumaEdgeCede);
+
+            // Field B is a same-field ±2 scalar comb on locked1DSource. Cede
+            // toward C only on real contour breaks (boundary or coarse luma
+            // edge), per the doctrine "chroma may only sharpen a break, never
+            // originate one."  A saturation-magnitude cede was removed: it
+            // fired inside uniform saturated chroma columns and mixed the
+            // modulated locked1DSource into the comb output per pixel, which
+            // produced the 2fsc luma checkerboard after produceY's carrier
+            // subtraction.
             tc  = (C - Cup) * wUp * sc;
             tc += (C - Cdn) * wDn * sc;
             tc *= 0.25;
-            if (content) {
-                double cede = std::max(
-                    0.0,
-                    content->centerFallbackAuthority -
-                    0.35 * content->symmetricAverageAuthority);
-                if (revivedUD)
-                    cede = std::max(cede, 0.55 * content->centerIsIntermediate);
-                if (content->preferCenterFallback &&
-                    content->centerIsIntermediate > 0.45)
-                {
-                    cede = std::max(cede, 0.60);
-                }
-                if (content->iqAuthority < 0.25 && content->contourAuthority < 0.50)
-                    cede = std::min(cede, 0.35);
-                cede = std::clamp(cede, 0.0, 0.85);
-                if (cede > 0.0)
-                    tc = tc * (1.0 - cede) + C * cede;
+            if (totalCede > 0.0) {
+                tc = tc * (1.0 - totalCede) + C * totalCede;
+                if (reason == FieldBReasonNone)
+                    reason = FieldBReasonBoundaryCede;
+            } else if (reason == FieldBReasonNone) {
+                reason = FieldBReasonBlend;
             }
         } else {
-            // True no-answer collapse: cede to the local 1D chroma estimate.
             tc = C;
+            reason = FieldBReasonCenter;
         }
 
         if (!std::isfinite(tc))
             tc = C;
 
         outFieldLine[rel] = tc;
+        if (outReasonLine)
+            outReasonLine[rel] = reason;
+        if (lineIsProbe) {
+            const int reasonIdx = std::clamp<int>(reason, 0, reasonCounts.size() - 1);
+            const int bucket = carrierSampleClass(lineNumber, left + rel) & 3;
+            ++reasonCounts[reasonIdx];
+            ++bucketReasonCounts[reasonIdx][bucket];
+            sumAbsChromaIRE += std::fabs(C) * invIreScale;
+            sumHEdgeIRE += (rel < (int)tapLine.hLumaDeltaIRE.size())
+                ? tapLine.hLumaDeltaIRE[rel]
+                : 0.0;
+            sumVerticalContrastIRE += std::fabs(Cup - Cdn) * invIreScale;
+            if (reason == FieldBReasonBlend) {
+                const double pullUp = (C - Cup) * wUp * sc * 0.25;
+                const double pullDn = (C - Cdn) * wDn * sc * 0.25;
+                blendCountByBucket[bucket] += 1.0;
+                blendSumWUpByBucket[bucket] += wUp;
+                blendSumWDnByBucket[bucket] += wDn;
+                blendSumPullUpByBucket[bucket] += pullUp;
+                blendSumPullDnByBucket[bucket] += pullDn;
+                blendSumOutDeltaByBucket[bucket] += (tc - C);
+            }
+            ++metricCount;
+        }
+    }
+
+    if (lineIsProbe && metricCount > 0) {
+        auto fmtReason = [&](FieldBDecisionReason r, const char *label)->QString {
+            const int idx = std::clamp<int>(r, 0, reasonCounts.size() - 1);
+            return QString("%1=%2[b0:%3 b1:%4 b2:%5 b3:%6]")
+                .arg(label)
+                .arg(reasonCounts[idx])
+                .arg(bucketReasonCounts[idx][0])
+                .arg(bucketReasonCounts[idx][1])
+                .arg(bucketReasonCounts[idx][2])
+                .arg(bucketReasonCounts[idx][3]);
+        };
+
+        qInfo().noquote() << QString(
+            "FieldBDecision line=%1 avg|C|=%2 avgHEdge=%3 avgV=%4 %5 %6 %7 %8 %9 %10 %11")
+            .arg(lineNumber)
+            .arg(sumAbsChromaIRE / metricCount, 0, 'f', 2)
+            .arg(sumHEdgeIRE / metricCount, 0, 'f', 2)
+            .arg(sumVerticalContrastIRE / metricCount, 0, 'f', 2)
+            .arg(fmtReason(FieldBReasonBlend, "blend"))
+            .arg(fmtReason(FieldBReasonBoundaryUp, "bUp"))
+            .arg(fmtReason(FieldBReasonBoundaryDown, "bDn"))
+            .arg(fmtReason(FieldBReasonBoundaryCede, "bCede"))
+            .arg(fmtReason(FieldBReasonReviveCoarse, "revCoarse"))
+            .arg(fmtReason(FieldBReasonReviveScalar, "revScalar"))
+            .arg(fmtReason(FieldBReasonCenter, "center"));
+
+        auto avgBucket = [&](const std::array<double, 4> &sum, int bucket)->double {
+            return (blendCountByBucket[bucket] > 1e-9) ? (sum[bucket] / blendCountByBucket[bucket]) : 0.0;
+        };
+        qInfo().noquote() << QString(
+            "FieldBBlend line=%1 b0(n=%2,wUp=%3,wDn=%4,pU=%5,pD=%6,dOut=%7) "
+            "b1(n=%8,wUp=%9,wDn=%10,pU=%11,pD=%12,dOut=%13) "
+            "b2(n=%14,wUp=%15,wDn=%16,pU=%17,pD=%18,dOut=%19) "
+            "b3(n=%20,wUp=%21,wDn=%22,pU=%23,pD=%24,dOut=%25)")
+            .arg(lineNumber)
+            .arg(blendCountByBucket[0], 0, 'f', 0)
+            .arg(avgBucket(blendSumWUpByBucket, 0), 0, 'f', 3)
+            .arg(avgBucket(blendSumWDnByBucket, 0), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullUpByBucket, 0), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullDnByBucket, 0), 0, 'f', 3)
+            .arg(avgBucket(blendSumOutDeltaByBucket, 0), 0, 'f', 3)
+            .arg(blendCountByBucket[1], 0, 'f', 0)
+            .arg(avgBucket(blendSumWUpByBucket, 1), 0, 'f', 3)
+            .arg(avgBucket(blendSumWDnByBucket, 1), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullUpByBucket, 1), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullDnByBucket, 1), 0, 'f', 3)
+            .arg(avgBucket(blendSumOutDeltaByBucket, 1), 0, 'f', 3)
+            .arg(blendCountByBucket[2], 0, 'f', 0)
+            .arg(avgBucket(blendSumWUpByBucket, 2), 0, 'f', 3)
+            .arg(avgBucket(blendSumWDnByBucket, 2), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullUpByBucket, 2), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullDnByBucket, 2), 0, 'f', 3)
+            .arg(avgBucket(blendSumOutDeltaByBucket, 2), 0, 'f', 3)
+            .arg(blendCountByBucket[3], 0, 'f', 0)
+            .arg(avgBucket(blendSumWUpByBucket, 3), 0, 'f', 3)
+            .arg(avgBucket(blendSumWDnByBucket, 3), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullUpByBucket, 3), 0, 'f', 3)
+            .arg(avgBucket(blendSumPullDnByBucket, 3), 0, 'f', 3)
+            .arg(avgBucket(blendSumOutDeltaByBucket, 3), 0, 'f', 3);
     }
 }
 
@@ -1477,6 +1658,8 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     // ------------------------------------------------------------
     if ((int)centerIQ.size() < width || (int)upIQ.size() < width || (int)dnIQ.size() < width) return;
 
+    std::copy(centerIQ.begin(), centerIQ.begin() + width, outFrameIQ.begin());
+
     // Frame A's alignment is intentionally column-local. A line/global affine
     // can learn from adjacent material and push that error into the current
     // column; vertical combing should not borrow lateral context here.
@@ -1484,6 +1667,23 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         upIQ[x] = applyColumnPhaseAlignment(centerIQ[x], upIQ[x], invI, MIN_CHROMA_IRE, T);
         dnIQ[x] = applyColumnPhaseAlignment(centerIQ[x], dnIQ[x], invI, MIN_CHROMA_IRE, T);
     }
+
+    // Frame B's own (interfield, +/-1) vertical column guard. It must be
+    // measured across the adjacent opposite-field lines, NOT borrowed from the
+    // same-field +/-2/+/-4 contour the Field B path uses. Chroma-cancelled luma
+    // (lockedLumaSmooth) at line-1/line/line+1 gives a +/-1-native column read
+    // below; null pointers (cache invalid / edge lines) leave columnStraight 0,
+    // making the alien-cancel inert there.
+    auto lumaSmoothRow = [&](int ln)->const double* {
+        if (!configuration.phaseCompensation || !lockedLumaCacheValid ||
+            lockedLumaSmooth_flat.empty() || demodWidth < width ||
+            ln < first || ln >= last || ln >= demodLines)
+            return nullptr;
+        return lockedLumaSmooth_line(ln);
+    };
+    const double *luma1Up = lumaSmoothRow(line - 1);
+    const double *luma1C  = lumaSmoothRow(line);
+    const double *luma1Dn = lumaSmoothRow(line + 1);
 
     // ------------------------------------------------------------
     // Combine (soft signed contributions + boundary-aware asymmetry)
@@ -1520,39 +1720,25 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         bool useUp = haveUp;
         bool useDn = haveDn;
         double boundaryWeightScale = 1.0;
-        double sharedUpGate = 1.0;
-        double sharedDnGate = 1.0;
+        // +/-1-native column support: low chroma-cancelled-luma curvature across
+        // line-1/line/line+1 == a smooth interfield column. A horizontal edge
+        // (top of a glyph) curves sharply here, so support falls and the
+        // alien-cancel backs off, instead of trusting the same-field contour
+        // which describes a different (+/-2) geometry.
         double columnStraight = 0.0;
-        if (reachTapLine && x < (int)reachTapLine->contour.size()) {
-            const CombTapContour &c = reachTapLine->contour[x];
-            const double contourTrust = std::clamp(
-                c.midOk * 0.5 * (c.upSideOk + c.dnSideOk), 0.0, 1.0);
-            const double contourCurvNorm = std::clamp(
-                c.curvMidIRE / std::max(1.0, T.FIELD_CONTOUR_HARD_IRE), 0.0, 1.0);
-            columnStraight = std::clamp(
-                0.70 * contourTrust + 0.30 * (1.0 - contourCurvNorm), 0.0, 1.0);
-            if (x < (int)reachTapLine->movingCoarseContour.size() &&
-                reachTapLine->movingCoarseContour[x].valid)
-            {
-                columnStraight = reachTapLine->movingCoarseContour[x].straightness;
-            }
+        if (luma1Up && luma1C && luma1Dn) {
+            const double curv1 =
+                std::fabs(luma1Up[x] - 2.0 * luma1C[x] + luma1Dn[x]) * invI;
+            columnStraight = combSmoothGate(curv1,
+                                            T.FIELD_CONTOUR_SOFT_IRE,
+                                            T.FIELD_CONTOUR_HARD_IRE);
         }
-        if (reachTapLine && x < reachTapLine->width &&
-            x < (int)reachTapLine->pairU1.size() &&
-            x < (int)reachTapLine->pairD1.size())
-        {
-            sharedUpGate = reachTapLine->pairU1[x].reachGate;
-            sharedDnGate = reachTapLine->pairD1[x].reachGate;
-            // Frame A should not dither between comb/no-comb on a straight
-            // vertical column. Keep the limiter available for bends and
-            // unrelated material, but force a minimum reach when contour
-            // evidence says the column is coherent.
-            const double straightFloor = 0.72 * columnStraight;
-            sharedUpGate = std::max(sharedUpGate, straightFloor);
-            sharedDnGate = std::max(sharedDnGate, straightFloor);
-            if (sharedUpGate <= 0.02) useUp = false;
-            if (sharedDnGate <= 0.02) useDn = false;
-        }
+        // NOTE: the interfield contribution is gated only by the boundary/
+        // transition suppression (below) and the disGate/clamp downstream -
+        // matching the reference comb. The reach-limiter throttle (pairU1/
+        // pairD1 reachGate) was a layer added on top that stood the interfield
+        // comb down at exactly the saturated edges it exists to clean; it is
+        // deliberately not applied.
 
         if (haveUp && haveDn) {
             const double dUp0_ire    = cmag(ZUpRaw - Z0) * invI;
@@ -1584,7 +1770,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         double wsum = 1.0;
 
         if (useUp) {
-            const double sideScale = boundaryWeightScale * sharedUpGate;
+            const double sideScale = boundaryWeightScale;
             const double w = softAlignWeight(Z0, ZUpRaw) * sideScale;
             if (w > 0.0) {
                 Zsum += softAlignContrib(Z0, ZUpRaw) * sideScale;
@@ -1592,7 +1778,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             }
         }
         if (useDn) {
-            const double sideScale = boundaryWeightScale * sharedDnGate;
+            const double sideScale = boundaryWeightScale;
             const double w = softAlignWeight(Z0, ZDnRaw) * sideScale;
             if (w > 0.0) {
                 Zsum += softAlignContrib(Z0, ZDnRaw) * sideScale;
@@ -1620,7 +1806,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         // Use strong comb only when coherence is high AND vertical neighbors agree.
         // --------------------------------------------------------
         const double COMB_STRENGTH_HI = COMB_STRENGTH;
-        const double COMB_STRENGTH_LO = std::min(0.5, COMB_STRENGTH_HI);
+        const double COMB_STRENGTH_LO = std::min(0.8, COMB_STRENGTH_HI);
 
         // Coherence vs center (signed corr magnitude) for allowed neighbors
         double coh = 0.0;
@@ -1797,10 +1983,12 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
     const float *tqUp_raw = (verticalAllowed && line - 1 >= first) ? tqLine(line - 1) : nullptr;
     const float *tiDn_raw = (verticalAllowed && line + 1 <  last)  ? tiLine(line + 1) : nullptr;
     const float *tqDn_raw = (verticalAllowed && line + 1 <  last)  ? tqLine(line + 1) : nullptr;
-    if (!ti0_raw || !tq0_raw) return;
 
-    // Preclean demod helper: demod precleanRing[ln][x] -> canonical 4fsc bucket IQ.
-    // This is the *only* demod used for the preclean path (no shared demod buffers).
+    // Preclean demod helper: demod precleanRing[ln][x] -> Grid4fscIQ.
+    // Frame A is an interfield ±1 IQ comb; it needs polarity.  In locked
+    // mode the unsigned phase yields IQ that inherits raw signs and the
+    // combine flips real chroma.  Sign-class folds lineFlip into the phase
+    // (Grid4fscIQ convention) — see the warning at locked1DSource_flat.
     auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
         if (ln < first || ln >= last) return false;
         const double *row = precleanLinePtr(ln, width);
@@ -1808,7 +1996,26 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
         const int h = left + x;
         const double c = row[x];
         double i4fsc = 0.0, q4fsc = 0.0;
-        demod4fscFromComposite(c, h, i4fsc, q4fsc);
+        const int phase = configuration.phaseCompensation
+            ? carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h)
+            : h;
+        demod4fscFromComposite(c, phase, i4fsc, q4fsc);
+        Z = std::complex<double>(i4fsc, q4fsc);
+        return true;
+    };
+
+    auto demodCenterScalarAt = [&](int ln, int x, std::complex<double> &Z)->bool {
+        if (ln < first || ln >= last) return false;
+        const double *row = configuration.phaseCompensation
+            ? locked1DSource_line(ln)
+            : bucketScalar1D_line(ln);
+        if (!row) return false;
+        const int h = left + x;
+        double i4fsc = 0.0, q4fsc = 0.0;
+        const int phase = configuration.phaseCompensation
+            ? carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h)
+            : h;
+        demod4fscFromComposite(row[x], phase, i4fsc, q4fsc);
         Z = std::complex<double>(i4fsc, q4fsc);
         return true;
     };
@@ -1819,12 +2026,15 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
     for (int x = 0; x < width; ++x) {
         std::complex<double> z;
         if (demodPrecleanAt(line, x, z)) scratch_centerIQ[x] = z;
-        else scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+        else if (ti0_raw && tq0_raw) scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+        else if (demodCenterScalarAt(line, x, z)) scratch_centerIQ[x] = z;
+        else scratch_centerIQ[x] = std::complex<double>(0.0, 0.0);
 
         if (verticalAllowed && demodPrecleanAt(line - 1, x, z)) {
             scratch_upIQ[x] = z;
         } else {
             if (tiUp_raw && tqUp_raw) z = std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x]);
+            else if (verticalAllowed && demodCenterScalarAt(line - 1, x, z)) {}
             else z = std::complex<double>(0.0, 0.0);
             scratch_upIQ[x] = z;
         }
@@ -1833,6 +2043,7 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
             scratch_dnIQ[x] = z;
         } else {
             if (tiDn_raw && tqDn_raw) z = std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x]);
+            else if (verticalAllowed && demodCenterScalarAt(line + 1, x, z)) {}
             else z = std::complex<double>(0.0, 0.0);
             scratch_dnIQ[x] = z;
         }
@@ -1866,17 +2077,30 @@ void Comb::FrameBuffer::computeFrameBDirectIQLine(
     if (width <= 0 || line < first || line >= last) return;
     if (line >= demodLines || demodWidth <= 0) return;
 
-    // Preclean demod: Field B precleaned scalar -> 4fsc grid IQ.
-    // The preclean is computed via computeSimpleFieldLine (the same function
-    // that produces the main Field B candidate), so it carries the anti-phase
-    // reach guard, authority blend, and combKMetric upgrades.
+    // Preclean stays scalar (Field B is crisper that way).  The demod here
+    // must put the result in Grid4fscIQ — a polarity-preserving frame — so
+    // that Frame B's interfield combine cancels alien Y and preserves real
+    // chroma.  Using the unsigned sample class would produce "canonical 4fsc
+    // demod of a LockedCommonPhaseScalar," which inherits the polarity
+    // erasure: real chroma comes out anti-phased between fields and the
+    // combine flips it, while alien Y comes out co-phased and gets preserved
+    // — exactly backwards.  carrierGrammarSignedSampleClass folds lineFlip
+    // into the phase (phase + 2 mod 4 == negate both IQ components), which is
+    // the lineFlip step that locked1DSource publication left out by
+    // construction.
     auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
         if (ln < first || ln >= last) return false;
         const double *row = precleanLinePtr(ln, width);
         if (!row) return false;
         const int h = left + x;
+        int phase;
+        if (configuration.phaseCompensation) {
+            phase = carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h);
+        } else {
+            phase = h;
+        }
         double i4fsc = 0.0, q4fsc = 0.0;
-        demod4fscFromComposite(row[x], h, i4fsc, q4fsc);
+        demod4fscFromComposite(row[x], phase, i4fsc, q4fsc);
         Z = std::complex<double>(i4fsc, q4fsc);
         return true;
     };
@@ -1988,11 +2212,6 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
             dnReach = haveDnLine
                 ? std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0)
                 : 0.0;
-        } else {
-            // Mechanical fallback only.  Real policy should come from the
-            // ±1 reach system when reachTapLine is available.
-            upReach = haveUpLine ? 1.0 : 0.0;
-            dnReach = haveDnLine ? 1.0 : 0.0;
         }
 
         if (upReach <= 0.0 && dnReach <= 0.0) {
@@ -2025,6 +2244,11 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
 
         std::complex<double> delta = target - Z0;
 
+        // Bound the per-pixel swing so that an intermediate `target` cannot
+        // pull real chroma toward zero in saturated regions.  Without this,
+        // per-pixel reachGate variation (movingCoarseContour.valid vs contour
+        // trust) modulates the 0.5x average and produces alternating dark
+        // pixels in saturated areas.  See FRAME_IQ_RAW_MAX_DELTA_IRE.
         const double deltaIRE = cmag(delta) * invIreScale;
         if (maxDeltaIRE > 0.0 && deltaIRE > maxDeltaIRE && deltaIRE > 1e-9)
             delta *= (maxDeltaIRE / deltaIRE);
@@ -2043,6 +2267,7 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
             outFrameIQ[x] = Z0;
         }
     }
+
 }
 
 void Comb::FrameBuffer::computeFrameBDirectIQCompositeLine(
@@ -2063,10 +2288,20 @@ void Comb::FrameBuffer::computeFrameBDirectIQCompositeLine(
 
     computeFrameBDirectIQLine(line, outFrameIQ);
 
+    // Symmetric round-trip with the demod: Frame B's input was demodded with
+    // carrierGrammarSignedSampleClass (Grid4fscIQ in), so the remod here must
+    // also be signed to land back in the physical composite frame that
+    // produceY's `raw - clpLine` subtraction expects.  Using the unsigned
+    // sample class would leave clpLine in a lineFlip-stripped convention and
+    // mis-cancel the chroma in produceY → checkerboard with flipped polarity
+    // rather than no checkerboard.
     for (int x = 0; x < width; ++x) {
         const int h = left + x;
         const auto &z = outFrameIQ[x];
-        outFrameScalar[x] = remod4fscToCompositePhase(z.real(), z.imag(), carrierSampleClass(line, h));
+        const int phase = configuration.phaseCompensation
+            ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), h)
+            : h;
+        outFrameScalar[x] = remod4fscToCompositePhase(z.real(), z.imag(), phase);
     }
 }
 
