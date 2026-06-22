@@ -225,13 +225,13 @@ public:
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
             // attribution evidence says it is luma-origin rather than chroma-origin.
             bool   VET_ATTRIBUTION_ENABLE            = true;
-            double VET_ATTRIBUTION_LUMA_WEIGHT       = 0.75; // blend strength for lumaClaim -> Y reassignment (0=off, 1=full)
+            double VET_ATTRIBUTION_LUMA_WEIGHT       = 0.85; // blend strength for lumaClaim -> Y reassignment (0=off, 1=full)
             double VET_ATTRIBUTION_CHROMA_WEIGHT     = 0.75; // blend strength for chromaClaim -> chroma retention
             double VET_ATTRIBUTION_CONFLICT_SUPPRESS = 0.65; // attenuate attribution adjustment when luma and chroma claims both high
-            double VET_ATTRIBUTION_BRIGHT_START_IRE  = 55.0; // begin bowing out of attribution reassignment above this luma level
-            double VET_ATTRIBUTION_BRIGHT_FULL_IRE   = 80.0; // fully disable attribution reassignment by this luma level
-            double VET_ATTRIBUTION_SAT_START_IRE     = 8.0; // begin bowing out when local chroma reaches this amplitude
-            double VET_ATTRIBUTION_SAT_FULL_IRE      = 20.0; // fully disable attribution reassignment by this chroma amplitude
+            double VET_ATTRIBUTION_BRIGHT_START_IRE  = 75.0; // begin bowing out of attribution reassignment above this luma level
+            double VET_ATTRIBUTION_BRIGHT_FULL_IRE   = 85.0; // fully disable attribution reassignment by this luma level
+            double VET_ATTRIBUTION_SAT_START_IRE     = 12.0; // begin bowing out when local chroma reaches this amplitude
+            double VET_ATTRIBUTION_SAT_FULL_IRE      = 60.0; // fully disable attribution reassignment by this chroma amplitude
 
             // FVF attribution: attribution evidence adjusts field vs frame penalty before election.
             double FVF_ATTRIBUTION_LUMA_WEIGHT   = 0.14; // lumaClaim -> added to frame scores (field is safer when luma-owned)
@@ -244,7 +244,7 @@ public:
             // Iceberg recovery: compensates for smooth-luma cancellation underestimating
             // alien-Y amplitude at directional edges.
             // 1.0 = no boost; 2.0–3.0 = moderate-to-strong recovery.
-            double LUMA_ICEBERG_RECOVERY = 2.5;
+            double LUMA_ICEBERG_RECOVERY = 2.6;
 
         };
         Tunables tunables;

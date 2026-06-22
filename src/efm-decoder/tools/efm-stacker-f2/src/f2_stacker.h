@@ -41,23 +41,46 @@ public:
     bool process(const QVector<QString> &inputFilenames, const QString &outputFilename);
 
 private:
+    struct SourceState
+    {
+        ReaderF2Section *reader{nullptr};
+        F2Section currentSection;
+        qint64 nextSectionNumber{0};
+        qint32 lastReadAddress{-1};
+        bool hasCurrentSection{false};
+        bool endOfFile{false};
+        quint64 invalidMetadataSections{0};
+        quint64 duplicateSections{0};
+        quint64 replacedDuplicateSections{0};
+        quint64 outOfOrderSections{0};
+    };
+
     QVector<ReaderF2Section*> m_inputFiles;
     WriterF2Section m_outputFile;
 
-    F2Section stackSections(const QVector<F2Section> &sections);
-    F2Frame stackFrames(QVector<F2Frame> &f2Frames);
+    bool readNextValidSection(SourceState &sourceState, qint32 minimumAddress = -1);
+    quint32 sectionScore(const F2Section &section) const;
+    quint32 sectionDifference(const F2Section &firstSection, const F2Section &secondSection) const;
+    bool isPaddingSection(const F2Section &section) const;
+    bool isFlatSection(const F2Section &section) const;
+    F2Section stackSections(const QVector<F2Section> &sections, const QVector<int> &sourceIndexes);
+    F2Frame stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &sourceIndexes);
 
     // Statistics
     quint64 m_noValidValueForByte;
 
     quint64 m_validValueForByte;
     quint64 m_usedMostCommonValue;
+    quint64 m_tiedValueForByte;
 
     quint64 m_errorFreeFrames;
     quint64 m_errorFrames;
     quint64 m_paddedFrames;
+    quint64 m_flatSections;
+    quint64 m_divergentSections;
 
     QVector<quint64> m_sourceDifferences;
+    QVector<quint64> m_sourceMissingSections;
 };
 
 #endif // F2_STACKER_H

@@ -25,13 +25,18 @@
 #include "f2_stacker.h"
 #include "tbc/logging.h"
 
+#include <QHash>
+#include <QSet>
+
 F2Stacker::F2Stacker() :
     m_noValidValueForByte(0),
     m_validValueForByte(0),
     m_usedMostCommonValue(0),
+    m_tiedValueForByte(0),
     m_errorFreeFrames(0),
     m_errorFrames(0),
-    m_paddedFrames(0)
+    m_paddedFrames(0),
+    m_flatSections(0)
 {}
 
 bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &outputFilename)
@@ -39,6 +44,8 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
     // Prepare the source differences statistics
     m_sourceDifferences.resize(inputFilenames.size());
     m_sourceDifferences.fill(0);
+    m_sourceMissingSections.resize(inputFilenames.size());
+    m_sourceMissingSections.fill(0);
 
     // Start by opening all the input F2 section files
     for (int index = 0; index < inputFilenames.size(); index++) {
@@ -52,38 +59,24 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
         tbcDebugStream() << "Opened input file" << inputFilenames[index];
     }
 
-    // Figure out the time range covered by the input files
-    // Note: This is assuming that the input files are in chronological order...
-    QVector<SectionTime> m_startTimes;
-    QVector<SectionTime> m_endTimes;
+    QVector<SourceState> sourceStates;
+    sourceStates.resize(m_inputFiles.size());
 
-    qInfo() << "Scanning input files to get time range of data from each...";
+    qInfo() << "Preparing input sources...";
     for (int inputFileIdx = 0; inputFileIdx < m_inputFiles.size(); inputFileIdx++) {
-        m_inputFiles[inputFileIdx]->seekToSection(0);
-        SectionTime startTime = m_inputFiles[inputFileIdx]->read().metadata.absoluteSectionTime();
-        m_inputFiles[inputFileIdx]->seekToSection(m_inputFiles[inputFileIdx]->size() - 1);
-        SectionTime endTime = m_inputFiles[inputFileIdx]->read().metadata.absoluteSectionTime();
-        m_startTimes.append(startTime);
-        m_endTimes.append(endTime);
-        
-        // Seek back to the start of the file
-        m_inputFiles[inputFileIdx]->seekToSection(0);
-        qInfo().noquote() << "Input File" << inputFilenames[inputFileIdx] << "- Start:" << startTime.toString() << "- End:" << endTime.toString();
-    }
+        sourceStates[inputFileIdx].reader = m_inputFiles[inputFileIdx];
+        sourceStates[inputFileIdx].reader->seekToSection(0);
+        if (!readNextValidSection(sourceStates[inputFileIdx])) {
+            qCritical() << "F2Stacker::process() - Input file" << inputFilenames[inputFileIdx]
+                        << "does not contain any sections with valid metadata";
+            return false;
+        }
 
-    // The start time (for the stacking) is the earliest start time of all the input files
-    // The end time (for the stacking) is the latest end time of all the input files
-    SectionTime stackStartTime(59,59,74);
-    SectionTime stackEndTime(0,0,0);
-    for (int index = 0; index < m_startTimes.size(); index++) {
-        if (m_startTimes[index] < stackStartTime) {
-            stackStartTime = m_startTimes[index];
-        }
-        if (m_endTimes[index] > stackEndTime) {
-            stackEndTime = m_endTimes[index];
-        }
+        qInfo().noquote() << "Input File" << inputFilenames[inputFileIdx]
+                          << "- First valid section:"
+                          << sourceStates[inputFileIdx].currentSection.metadata.absoluteSectionTime().toString()
+                          << "- Total sections:" << m_inputFiles[inputFileIdx]->size();
     }
-    qInfo().noquote() << "Stacking Start Time:" << stackStartTime.toString() << "End Time:" << stackEndTime.toString();
 
     // Open the output file
     if (!m_outputFile.open(outputFilename)) {
@@ -91,34 +84,90 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
         return false;
     }
 
-    // Process
-    for (int address = stackStartTime.frames(); address <= stackEndTime.frames(); address++) {
-        // Make a list of the input files that have data for this frame
-        QVector<ReaderF2Section*> inputReaderList;
-        for (int inputFileIdx = 0; inputFileIdx < m_inputFiles.size(); inputFileIdx++) {
-            if (m_startTimes[inputFileIdx].frames() <= address && m_endTimes[inputFileIdx].frames() >= address) {
-                inputReaderList.append(m_inputFiles[inputFileIdx]);
+    qint32 stackStartAddress = -1;
+    qint32 stackEndAddress = -1;
+    quint64 sectionsStacked = 0;
+
+    // Process sources in timestamp order.  Each source is read forward once; missing
+    // or duplicate sections affect only that source rather than shifting later votes.
+    while (true) {
+        qint32 address = -1;
+        for (int sourceIndex = 0; sourceIndex < sourceStates.size(); sourceIndex++) {
+            if (!sourceStates[sourceIndex].hasCurrentSection) {
+                continue;
+            }
+
+            qint32 sourceAddress =
+                    sourceStates[sourceIndex].currentSection.metadata.absoluteSectionTime().frames();
+            if (address < 0 || sourceAddress < address) {
+                address = sourceAddress;
             }
         }
 
-        QVector<F2Section> sectionList;
-        for (int inputFileIdx = 0; inputFileIdx < inputReaderList.size(); inputFileIdx++) {
-            sectionList.append(inputReaderList[inputFileIdx]->read());
+        if (address < 0) {
+            break;
         }
 
-        tbcDebugStream().noquote() << "F2Stacker::process() - Stacking section" << sectionList.at(0).metadata.absoluteSectionTime().toString();
+        if (stackStartAddress < 0) {
+            stackStartAddress = address;
+        }
+        stackEndAddress = address;
 
-        F2Section stackedF2Section = stackSections(sectionList);
+        QVector<F2Section> sectionList;
+        QVector<int> sectionSourceIndexes;
+
+        for (int sourceIndex = 0; sourceIndex < sourceStates.size(); sourceIndex++) {
+            SourceState &sourceState = sourceStates[sourceIndex];
+            if (!sourceState.hasCurrentSection) {
+                continue;
+            }
+
+            qint32 sourceAddress = sourceState.currentSection.metadata.absoluteSectionTime().frames();
+            if (sourceAddress > address) {
+                m_sourceMissingSections[sourceIndex]++;
+                continue;
+            }
+
+            F2Section bestSection = sourceState.currentSection;
+            quint32 bestScore = sectionScore(bestSection);
+            while (readNextValidSection(sourceState, address)) {
+                qint32 nextAddress =
+                        sourceState.currentSection.metadata.absoluteSectionTime().frames();
+                if (nextAddress != address) {
+                    break;
+                }
+
+                sourceState.duplicateSections++;
+                quint32 nextScore = sectionScore(sourceState.currentSection);
+                if (nextScore < bestScore) {
+                    bestSection = sourceState.currentSection;
+                    bestScore = nextScore;
+                    sourceState.replacedDuplicateSections++;
+                }
+            }
+
+            sectionList.append(bestSection);
+            sectionSourceIndexes.append(sourceIndex);
+        }
+
+        if (sectionList.isEmpty()) {
+            qCritical().noquote() << "F2Stacker::process() - No sources available for section"
+                                  << SectionTime(address).toString();
+            return false;
+        }
+
+        tbcDebugStream().noquote() << "F2Stacker::process() - Stacking section" << SectionTime(address).toString();
+
+        F2Section stackedF2Section = stackSections(sectionList, sectionSourceIndexes);
 
         // Write the output F2 Section
         m_outputFile.write(stackedF2Section);
+        sectionsStacked++;
 
         // Every 2500 Sections, show progress
-        if (address % 2500 == 0) {
-            float percentageComplete = (static_cast<float>(address) - static_cast<float>(stackStartTime.frames())) *
-                100.0 / (static_cast<float>(stackEndTime.frames()) - static_cast<float>(stackStartTime.frames()));
-            qInfo().noquote().nospace() << "Processed " << address << " sections of " << (stackEndTime.frames() - stackStartTime.frames() + 1)
-                << " " << QString::number(percentageComplete, 'f', 2) << "%";
+        if (sectionsStacked % 2500 == 0) {
+            qInfo().noquote().nospace() << "Processed " << sectionsStacked
+                << " sections, current section " << SectionTime(address).toString();
         }
     }
 
@@ -134,43 +183,167 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
 
     // Statistics
     qInfo() << "Stacking results:";
-    qInfo().noquote() << "  Sections stacked:" << stackEndTime.frames() - stackStartTime.frames() + 1;
-    qInfo().noquote() << "  Frames stacked:" << (stackEndTime.frames() - stackStartTime.frames() + 1) * 98;
+    qInfo().noquote() << "  Start time:" << SectionTime(stackStartAddress).toString();
+    qInfo().noquote() << "  End time:" << SectionTime(stackEndAddress).toString();
+    qInfo().noquote() << "  Sections stacked:" << sectionsStacked;
+    qInfo().noquote() << "  Frames stacked:" << sectionsStacked * 98;
     qInfo().noquote() << "";
     qInfo().noquote() << "  Error free frames:" << m_errorFreeFrames;
     qInfo().noquote() << "  Error frames:" << m_errorFrames;
     qInfo().noquote().nospace() << "  Padded frames: " << m_paddedFrames << " (" << m_paddedFrames / 98 << " sections)";
+    qInfo().noquote() << "  Flat source sections excluded:" << m_flatSections;
     qInfo().noquote() << "  Total frames:" << m_errorFreeFrames + m_errorFrames + m_paddedFrames;
     qInfo().noquote() << "";
     qInfo().noquote() << "  Valid bytes common to all sources:" << m_validValueForByte;
     qInfo().noquote() << "  Valid bytes that differed in value between sources:" << m_usedMostCommonValue;
+    qInfo().noquote() << "  Tied valid byte values marked as errors:" << m_tiedValueForByte;
     qInfo().noquote() << "  Invalid byte in all sources:" << m_noValidValueForByte;
     qInfo().noquote() << "";
     qInfo().noquote() << "  Source differences:";
-    qInfo().noquote() << "    Source 0" << inputFilenames[0];
-    for (int sourceIndex = 1; sourceIndex < m_sourceDifferences.size(); sourceIndex++) {
+    for (int sourceIndex = 0; sourceIndex < m_sourceDifferences.size(); sourceIndex++) {
         qInfo().noquote() << "    Source" << sourceIndex << inputFilenames[sourceIndex] << ":" << m_sourceDifferences[sourceIndex];
+    }
+    qInfo().noquote() << "";
+    qInfo().noquote() << "  Source missing sections:";
+    for (int sourceIndex = 0; sourceIndex < m_sourceMissingSections.size(); sourceIndex++) {
+        qInfo().noquote() << "    Source" << sourceIndex << inputFilenames[sourceIndex] << ":" << m_sourceMissingSections[sourceIndex];
+    }
+    qInfo().noquote() << "";
+    qInfo().noquote() << "  Source irregularities:";
+    for (int sourceIndex = 0; sourceIndex < sourceStates.size(); sourceIndex++) {
+        qInfo().noquote() << "    Source" << sourceIndex << inputFilenames[sourceIndex]
+                          << "- Invalid metadata:" << sourceStates[sourceIndex].invalidMetadataSections
+                          << "- Duplicates:" << sourceStates[sourceIndex].duplicateSections
+                          << "- Replaced duplicates:" << sourceStates[sourceIndex].replacedDuplicateSections
+                          << "- Out of order:" << sourceStates[sourceIndex].outOfOrderSections;
     }
 
     return true;
 }
 
-F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections)
+bool F2Stacker::readNextValidSection(SourceState &sourceState, qint32 minimumAddress)
+{
+    while (sourceState.nextSectionNumber < sourceState.reader->size()) {
+        F2Section section = sourceState.reader->read();
+        sourceState.nextSectionNumber++;
+
+        if (!section.metadata.isValid()) {
+            sourceState.invalidMetadataSections++;
+            continue;
+        }
+
+        qint32 address = section.metadata.absoluteSectionTime().frames();
+        if (minimumAddress >= 0 && address < minimumAddress) {
+            sourceState.outOfOrderSections++;
+            continue;
+        }
+        if (sourceState.lastReadAddress >= 0 && address < sourceState.lastReadAddress) {
+            sourceState.outOfOrderSections++;
+            if (minimumAddress >= 0 && address <= minimumAddress) {
+                continue;
+            }
+        }
+        sourceState.lastReadAddress = address;
+        sourceState.currentSection = section;
+        sourceState.hasCurrentSection = true;
+        return true;
+    }
+
+    sourceState.hasCurrentSection = false;
+    sourceState.endOfFile = true;
+    return false;
+}
+
+quint32 F2Stacker::sectionScore(const F2Section &section) const
+{
+    quint32 score = 0;
+
+    if (section.metadata.isRepaired()) {
+        score += 100000;
+    }
+
+    for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
+        const F2Frame frame = section.frame(frameIndex);
+        score += frame.errorData().count(true);
+        score += frame.paddedData().count(true);
+    }
+
+    if (isFlatSection(section)) {
+        score += 100000;
+    }
+
+    return score;
+}
+
+bool F2Stacker::isPaddingSection(const F2Section &section) const
+{
+    for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
+        if (section.frame(frameIndex).paddedData().contains(false)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool F2Stacker::isFlatSection(const F2Section &section) const
+{
+    QHash<quint8, int> byteCounts;
+    QSet<QByteArray> uniqueFrames;
+    int totalBytes = 0;
+
+    for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
+        const F2Frame frame = section.frame(frameIndex);
+        const QVector<quint8> data = frame.data();
+        QByteArray frameBytes;
+        frameBytes.reserve(data.size());
+
+        for (int byteIndex = 0; byteIndex < data.size(); byteIndex++) {
+            byteCounts[data[byteIndex]]++;
+            frameBytes.append(static_cast<char>(data[byteIndex]));
+            totalBytes++;
+        }
+
+        uniqueFrames.insert(frameBytes);
+    }
+
+    int dominantByteCount = 0;
+    for (auto it = byteCounts.begin(); it != byteCounts.end(); ++it) {
+        if (it.value() > dominantByteCount) {
+            dominantByteCount = it.value();
+        }
+    }
+
+    const int repeatedFrames = 98 - uniqueFrames.size();
+    if (totalBytes == 0) {
+        return true;
+    }
+
+    // A real F2 section, even for quiet audio, should have plenty of byte and
+    // frame variation because parity and interleaving are still present.  This
+    // catches collapsed/flat captures that arrive with clean-looking flags.
+    return byteCounts.size() <= 8 ||
+           repeatedFrames >= 80 ||
+           dominantByteCount > (totalBytes * 85 / 100);
+}
+
+F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const QVector<int> &sourceIndexes)
 {
     F2Section stackedSection;
     SectionMetadata stackedMetadata;
-    
-    // Pick the first section from the list with valid metadata
+
+    // Pick the first section from the list with valid, unrepaired metadata.
     bool gotValidMetadata = false;
     for (int sectionIndex = 0; sectionIndex < f2Sections.size(); sectionIndex++) {
-        if (f2Sections[sectionIndex].metadata.isValid() && !f2Sections[sectionIndex].metadata.isRepaired()) {
+        if (f2Sections[sectionIndex].metadata.isValid() &&
+            !f2Sections[sectionIndex].metadata.isRepaired()) {
             stackedMetadata = f2Sections[sectionIndex].metadata;
             gotValidMetadata = true;
             break;
         }
     }
 
-    // If we didn't get anything valid, try again and include repaired metadata
+    // If we didn't get anything valid, try again and include repaired metadata.
     if (!gotValidMetadata) {
         for (int sectionIndex = 0; sectionIndex < f2Sections.size(); sectionIndex++) {
             if (f2Sections[sectionIndex].metadata.isValid()) {
@@ -185,44 +358,52 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections)
         qFatal("F2Stacker::stackSections - No valid metadata found in the input sections");
     }
 
-    // Check if the section's frames contain only padding rather than valid data
-    // and Remove any sections that are just padding
+    // Remove sections that are entirely padding.
     QVector<F2Section> validF2Sections;
+    QVector<int> validSourceIndexes;
     for (int sectionIndex = 0; sectionIndex < f2Sections.size(); sectionIndex++) {
-        bool isPadding = true;
-        for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-            if (f2Sections[sectionIndex].frame(frameIndex).paddedData().contains(false)) {
-                isPadding = false;
-                break;
-            }
-        }
-
-        if (isPadding) {
-            tbcDebugStream().noquote() << "F2Stacker::stackSections - Section" << sectionIndex << "is just padding";
+        if (isPaddingSection(f2Sections[sectionIndex])) {
+            tbcDebugStream().noquote()
+                << "F2Stacker::stackSections - Section" << sectionIndex
+                << "is just padding";
+        } else if (isFlatSection(f2Sections[sectionIndex])) {
+            tbcDebugStream().noquote()
+                << "F2Stacker::stackSections - Section" << sectionIndex
+                << "is flat data";
+            m_flatSections++;
         } else {
             validF2Sections.append(f2Sections[sectionIndex]);
+            validSourceIndexes.append(sourceIndexes[sectionIndex]);
         }
     }
 
-    // Do we have at least 2 sections to stack?
-    if (validF2Sections.size() < 2) {
-        // Just pass through the first padded section
+    if (validF2Sections.isEmpty()) {
+        // All candidate sections are padding. Preserve the first candidate section.
         stackedSection = f2Sections[0];
         m_paddedFrames += 98;
-    } else {
-        // Each section contains 98 F2Frames
+    } else if (validF2Sections.size() == 1) {
+        // Exactly one source has real data for this section. Pass it through.
+        stackedSection = validF2Sections[0];
+
         for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-            // Make a list of the frames to stack
+            if (stackedSection.frame(frameIndex).errorData().contains(1)) {
+                m_errorFrames++;
+            } else {
+                m_errorFreeFrames++;
+            }
+        }
+    } else {
+        // Each section contains 98 F2Frames.
+        for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
             QVector<F2Frame> frameList;
+
             for (int sectionIndex = 0; sectionIndex < validF2Sections.size(); sectionIndex++) {
                 frameList.append(validF2Sections[sectionIndex].frame(frameIndex));
             }
 
-            // Stack the frames
-            F2Frame stackedFrame = stackFrames(frameList);
+            F2Frame stackedFrame = stackFrames(frameList, validSourceIndexes);
             stackedSection.pushFrame(stackedFrame);
 
-            // Does the stacked frame have any errors?
             if (stackedFrame.errorData().contains(1)) {
                 m_errorFrames++;
             } else {
@@ -235,7 +416,7 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections)
     return stackedSection;
 }
 
-F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames)
+F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &sourceIndexes)
 {
     F2Frame stackedFrame;
 
@@ -267,9 +448,8 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames)
                 }
             }
 
-            // If all valid bytes are the same, use that value or, if there are only
-            // two sources, use the value from the first source
-            if (allBytesSame || validBytes.size() == 2) {
+            // If all valid bytes are the same, use that value.
+            if (allBytesSame) {
                 stackedFrameData.append(validBytes.at(0));
                 stackedFrameErrorData.append(false);
                 m_validValueForByte++;
@@ -282,27 +462,42 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames)
                     byteCounts[validBytes.at(byteIndex)]++;
                 }
 
-                // Find the most common byte value
+                // Find the most common byte value.  If there is a tie, keep the
+                // byte marked as an erasure instead of blessing an arbitrary source.
                 int maxCount = 0;
+                int tiedMaxCount = 0;
                 quint8 mostCommonByte = 0;
                 for (auto it = byteCounts.begin(); it != byteCounts.end(); ++it) {
                     if (it.value() > maxCount) {
                         maxCount = it.value();
                         mostCommonByte = it.key();
+                        tiedMaxCount = 1;
+                    } else if (it.value() == maxCount) {
+                        tiedMaxCount++;
                     }
                 }
-                m_usedMostCommonValue++;
 
                 QString validBytesString;
                 for (int byteIndex = 0; byteIndex < validBytes.size(); byteIndex++) {
                     validBytesString.append(QString("%1 ").arg(validBytes.at(byteIndex), 2, 16, QChar('0')).toUpper());
                 }
                 QString mostCommonByteString = QString("%1").arg(mostCommonByte, 2, 16, QChar('0')).toUpper();
-                tbcDebugStream().noquote() << "F2Stacker::stackFrames - Valid byte values differ - using"
-                    << mostCommonByteString << "from" << validBytesString;
 
-                stackedFrameData.append(mostCommonByte);
-                stackedFrameErrorData.append(false);                
+                if (tiedMaxCount > 1) {
+                    tbcDebugStream().noquote()
+                        << "F2Stacker::stackFrames - Valid byte values tie - marking byte as error from"
+                        << validBytesString;
+                    stackedFrameData.append(validBytes.at(0));
+                    stackedFrameErrorData.append(true);
+                    m_tiedValueForByte++;
+                } else {
+                    tbcDebugStream().noquote() << "F2Stacker::stackFrames - Valid byte values differ - using"
+                        << mostCommonByteString << "from" << validBytesString;
+
+                    stackedFrameData.append(mostCommonByte);
+                    stackedFrameErrorData.append(false);
+                    m_usedMostCommonValue++;
+                }
             }
         }
 
@@ -310,7 +505,7 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames)
         quint8 expectedValue = f2Frames.at(0).data().at(byteIndex);
         for (int sourceIndex = 0; sourceIndex < f2Frames.size(); sourceIndex++) {
             if (f2Frames.at(sourceIndex).data().at(byteIndex) != expectedValue) {
-                m_sourceDifferences[sourceIndex]++;
+                m_sourceDifferences[sourceIndexes[sourceIndex]]++;
             }
         }
     }

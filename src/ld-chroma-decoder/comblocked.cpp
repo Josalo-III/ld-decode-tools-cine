@@ -945,12 +945,22 @@ void Comb::FrameBuffer::produceY()
     const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
     const bool residualVideo = configuration.residualVideo;
+    const bool use3DY = configuration.residualVideo3D
+                       && prevFrameForVet != nullptr
+                       && nextFrameForVet != nullptr;
 
     // produceY is a pure consumer: it subtracts the composite carrier that
     // splitIQlocked aligned and emitted. Where that carrier was drift-corrected
     // to the raw carrier, only true carrier is removed and composite HF luma
     // survives into Y. With --no-residual-video there is no aligned carrier, so
     // fall back to full-strength subtraction of the selected comb scalar.
+    //
+    // When --residual-video-3d is on (and prev/next frames are available), the
+    // 3D Y election owns the per-pixel output: getBestY votes between the
+    // current 2D residual (raw - clpLine) and its temporal neighbors. This is
+    // a separate feature from residual-Y carrier correction -- election runs
+    // on the baseline 2D residual so temporal candidates are comparable across
+    // frames, independent of any current-frame carrier reshape.
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
@@ -960,7 +970,16 @@ void Comb::FrameBuffer::produceY()
         const double *carrierComp =
             residualVideo ? lockedCarrierComposite_line(line) : nullptr;
 
-        if (carrierComp) {
+        if (use3DY) {
+            for (int h = left; h < right; ++h) {
+                const double c = clpLine[h];
+                const double y2D = std::isfinite(c)
+                    ? (double)rawLine[h] - c
+                    : (double)rawLine[h];
+                Y[h] = getBestY(line, h, y2D,
+                                *prevFrameForVet, *nextFrameForVet);
+            }
+        } else if (carrierComp) {
             for (int h = left; h < right; ++h) {
                 const double c = carrierComp[h - left];
                 Y[h] = std::isfinite(c)
