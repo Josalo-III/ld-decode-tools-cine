@@ -604,10 +604,19 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             // (anti-phase, magnitude ratio) are scale-invariant and still work,
             // so the floor over-fires rather than failing. Fix is `*= invI` on
             // the demod outputs, then re-tune — left for the dedicated Frame B day.
+            // Fast overload: supplying pre-computed magnitudes saves ~12
+            // hypots/pixel that the slow overload recomputes internally.
+            // Magnitudes are in the same composite-domain units as cI/cQ etc.
+            // (matching the slow overload's internal scaling — see the
+            // KNOWN ISSUE note above).
+            const double cMag = std::hypot(cI, cQ);
+            const double uMag = std::hypot(uI, uQ);
+            const double dMag = std::hypot(dI, dQ);
             const CombContentReach::InterfieldIQReachFloor floor =
                 CombContentReach::interfieldIQReachFloor(
                     cI, cQ, uI, uQ, dI, dQ,
-                    true, true, minChromaIRE, 1.0);
+                    true, true, minChromaIRE, 1.0,
+                    cMag, uMag, dMag);
 
             double upGate = std::max(upPair[rel].reachLegalGate, floor.up);
             double dnGate = std::max(dnPair[rel].reachLegalGate, floor.down);
@@ -1685,12 +1694,29 @@ static inline std::complex<double> applyColumnPhaseAlignment(
 
     const double dot = dotIQ(neighbor, center);
     const double cross = neighbor.real() * center.imag() - neighbor.imag() * center.real();
-    double phase = std::atan2(cross, dot);
     const double pMax = T.FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG * M_PI / 180.0;
-    phase = std::clamp(phase, -pMax, pMax);
 
-    const double c = std::cos(phase);
-    const double s = std::sin(phase);
+    // The rotation we want is by phase = atan2(cross, dot).  When the clamp
+    // doesn't bind, cos(phase) = dot/h and sin(phase) = cross/h where
+    // h = hypot(dot, cross) — so one hypot replaces atan2 + cos + sin.
+    // The clamp binds iff |phase| > pMax, equivalent to
+    //   dot < 0  (phase in second/third quadrant, always > pMax for pMax<90°)
+    //   or  |cross| > dot * tan(pMax).
+    // Only then do we fall back to atan2+cos+sin to honor the clamp.
+    const double tanPMax = std::tan(pMax);
+    double c, s;
+    if (dot > 0.0 && std::fabs(cross) <= dot * tanPMax) {
+        const double h = std::hypot(dot, cross);
+        if (h <= 1e-18) return neighbor;
+        c = dot / h;
+        s = cross / h;
+    } else {
+        double phase = std::atan2(cross, dot);
+        phase = std::clamp(phase, -pMax, pMax);
+        c = std::cos(phase);
+        s = std::sin(phase);
+    }
+
     return std::complex<double>(
         c * neighbor.real() - s * neighbor.imag(),
         s * neighbor.real() + c * neighbor.imag());
@@ -1738,24 +1764,29 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         return demodTQ4fsc_line(ln);
     };
 
-    // Signed correlation in [-1..1]
-    auto corrSigned = [&](const std::complex<double> &a, const std::complex<double> &b)->double {
-        const double ma = cmag(a);
-        const double mb = cmag(b);
+    // Signed correlation in [-1..1].  Caller supplies pre-computed magnitudes
+    // to avoid recomputing hypot per call site.
+    auto corrSignedMags = [&](const std::complex<double> &a,
+                              const std::complex<double> &b,
+                              double ma, double mb)->double {
         if (ma <= 1e-12 || mb <= 1e-12) return 0.0;
         return dotIQ(a, b) / (ma*mb + 1e-12);
     };
 
-    // ------------------------------------------------------------
-    // Helper: soft signed contribution
-    // ------------------------------------------------------------
-    auto softAlignContrib = [&](const std::complex<double> &Z0,
-                                const std::complex<double> &Zn)->std::complex<double>
+    // Soft signed contribution and its weight, computed together so the shared
+    // (c, ac, w) calculation is not run twice per neighbor.  Magnitudes are
+    // supplied by the caller (precomputed once per pixel).
+    auto softAlignBoth = [&](const std::complex<double> &Z0,
+                             const std::complex<double> &Zn,
+                             double a0, double an,
+                             std::complex<double> &contribOut,
+                             double &weightOut)
     {
-        const double a0 = cmag(Z0);
-        const double an = cmag(Zn);
-        if (a0 <= 1e-12 || an <= 1e-12) return {0.0, 0.0};
-
+        if (a0 <= 1e-12 || an <= 1e-12) {
+            contribOut = {0.0, 0.0};
+            weightOut  = 0.0;
+            return;
+        }
         const double c  = dotIQ(Z0, Zn) / (a0*an + 1e-12); // signed corr [-1..1]
         const double ac = std::fabs(c);
 
@@ -1769,30 +1800,8 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         w = wFloor + (1.0 - wFloor) * w;
 
         const double s = (c >= 0.0) ? 1.0 : -1.0;
-        return (Zn * (w * s));
-    };
-
-    // Companion: compute the same weight used by softAlignContrib (so we can do weighted averaging)
-    auto softAlignWeight = [&](const std::complex<double> &Z0,
-                               const std::complex<double> &Zn)->double
-    {
-        const double a0 = cmag(Z0);
-        const double an = cmag(Zn);
-        if (a0 <= 1e-12 || an <= 1e-12) return 0.0;
-
-        const double c  = dotIQ(Z0, Zn) / (a0*an + 1e-12);
-        const double ac = std::fabs(c);
-
-        const double t0 = 0.55;
-        const double t1 = 0.85;
-
-        double w = (ac - t0) / (t1 - t0);
-        w = std::clamp(w, 0.0, 1.0);
-
-        const double wFloor = 0.15;
-        w = wFloor + (1.0 - wFloor) * w;
-
-        return w;
+        contribOut = Zn * (w * s);
+        weightOut  = w;
     };
 
     const double COMB_STRENGTH  = std::max(0.0, T.FRAME_COMB_STRENGTH);
@@ -1886,10 +1895,14 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         // comb down at exactly the saturated edges it exists to clean; it is
         // deliberately not applied.
 
+        // Cache dUpDown_ire — reused below for the disagree gate (saves one
+        // hypot per pixel on the haveUp && haveDn path).
+        double dUpDown_ire = -1.0;
+
         if (haveUp && haveDn) {
-            const double dUp0_ire    = cmag(ZUpRaw - Z0) * invI;
-            const double dDn0_ire    = cmag(ZDnRaw - Z0) * invI;
-            const double dUpDown_ire = cmag(ZUpRaw - ZDnRaw) * invI;
+            const double dUp0_ire = cmag(ZUpRaw - Z0) * invI;
+            const double dDn0_ire = cmag(ZDnRaw - Z0) * invI;
+            dUpDown_ire           = cmag(ZUpRaw - ZDnRaw) * invI;
 
             const double MATCH_IRE      = 3.5;   // center matches this side
             const double BETWEEN_IRE    = 6.0;   // center is far from this side
@@ -1912,22 +1925,28 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         }
 
         // Combine neighbors with soft signed contributions, using *weighted* averaging (no integer dilution).
+        // softAlignBoth returns contribution and weight together so the
+        // shared correlation calc isn't repeated per side.
         std::complex<double> Zsum = Z0;
         double wsum = 1.0;
 
         if (useUp) {
-            const double sideScale = boundaryWeightScale;
-            const double w = softAlignWeight(Z0, ZUpRaw) * sideScale;
+            std::complex<double> contrib;
+            double w;
+            softAlignBoth(Z0, ZUpRaw, a0, aUp, contrib, w);
+            w *= boundaryWeightScale;
             if (w > 0.0) {
-                Zsum += softAlignContrib(Z0, ZUpRaw) * sideScale;
+                Zsum += contrib * boundaryWeightScale;
                 wsum += w;
             }
         }
         if (useDn) {
-            const double sideScale = boundaryWeightScale;
-            const double w = softAlignWeight(Z0, ZDnRaw) * sideScale;
+            std::complex<double> contrib;
+            double w;
+            softAlignBoth(Z0, ZDnRaw, a0, aDn, contrib, w);
+            w *= boundaryWeightScale;
             if (w > 0.0) {
-                Zsum += softAlignContrib(Z0, ZDnRaw) * sideScale;
+                Zsum += contrib * boundaryWeightScale;
                 wsum += w;
             }
         }
@@ -1954,10 +1973,11 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         const double COMB_STRENGTH_HI = COMB_STRENGTH;
         const double COMB_STRENGTH_LO = std::min(0.8, COMB_STRENGTH_HI);
 
-        // Coherence vs center (signed corr magnitude) for allowed neighbors
+        // Coherence vs center (signed corr magnitude) for allowed neighbors.
+        // Use cached magnitudes — corrSignedMags takes them directly.
         double coh = 0.0;
-        if (useUp) coh = std::max(coh, std::fabs(corrSigned(Z0, ZUpRaw)));
-        if (useDn) coh = std::max(coh, std::fabs(corrSigned(Z0, ZDnRaw)));
+        if (useUp) coh = std::max(coh, std::fabs(corrSignedMags(Z0, ZUpRaw, a0, aUp)));
+        if (useDn) coh = std::max(coh, std::fabs(corrSignedMags(Z0, ZDnRaw, a0, aDn)));
 
         // Map coherence -> [0..1]
         const double COH_T0 = 0.55;
@@ -1965,10 +1985,14 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         double cohGate = (coh - COH_T0) / (COH_T1 - COH_T0);
         cohGate = std::clamp(cohGate, 0.0, 1.0);
 
-        // Vertical agreement gate (1 when Up/Dn agree; 0 when they disagree strongly)
+        // Vertical agreement gate (1 when Up/Dn agree; 0 when they disagree strongly).
+        // Reuse dUpDown_ire if it was computed in the boundary block above;
+        // otherwise compute it once here.
         double disGate = 1.0;
         if (haveUp && haveDn) {
-            const double dUD_ire = cmag(ZUpRaw - ZDnRaw) * invI;
+            const double dUD_ire = (dUpDown_ire >= 0.0)
+                                   ? dUpDown_ire
+                                   : (cmag(ZUpRaw - ZDnRaw) * invI);
             const double DISAGREE_LO_IRE = 3.5;
             const double DISAGREE_HI_IRE = 14.0;
             double t = (dUD_ire - DISAGREE_LO_IRE) /
@@ -2070,8 +2094,10 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             if (cancelStrength > 0.0) {
                 const std::complex<double> neighborCommon =
                     0.5 * (ZUpRaw + ZDnRaw);
-            
-                const double sdCenterCommon = corrSigned(Z0, neighborCommon);
+
+                const double aNc = cmag(neighborCommon);
+                const double sdCenterCommon =
+                    corrSignedMags(Z0, neighborCommon, a0, aNc);
             
                 // Co-directional tinted case:
                 // real chroma biases center and neighbors into the same hue direction.
