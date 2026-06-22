@@ -28,6 +28,8 @@
 #include <QHash>
 #include <QSet>
 
+#include <limits>
+
 F2Stacker::F2Stacker() :
     m_noValidValueForByte(0),
     m_validValueForByte(0),
@@ -36,7 +38,8 @@ F2Stacker::F2Stacker() :
     m_errorFreeFrames(0),
     m_errorFrames(0),
     m_paddedFrames(0),
-    m_flatSections(0)
+    m_flatSections(0),
+    m_divergentSections(0)
 {}
 
 bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &outputFilename)
@@ -192,6 +195,7 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
     qInfo().noquote() << "  Error frames:" << m_errorFrames;
     qInfo().noquote().nospace() << "  Padded frames: " << m_paddedFrames << " (" << m_paddedFrames / 98 << " sections)";
     qInfo().noquote() << "  Flat source sections excluded:" << m_flatSections;
+    qInfo().noquote() << "  Divergent source sections excluded:" << m_divergentSections;
     qInfo().noquote() << "  Total frames:" << m_errorFreeFrames + m_errorFrames + m_paddedFrames;
     qInfo().noquote() << "";
     qInfo().noquote() << "  Valid bytes common to all sources:" << m_validValueForByte;
@@ -263,9 +267,9 @@ quint32 F2Stacker::sectionScore(const F2Section &section) const
     }
 
     for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-        const F2Frame frame = section.frame(frameIndex);
-        score += frame.errorData().count(true);
-        score += frame.paddedData().count(true);
+        const F2Frame &frame = section.frameRef(frameIndex);
+        score += frame.rawErrorData().count(true);
+        score += frame.rawPaddedData().count(true);
     }
 
     if (isFlatSection(section)) {
@@ -275,10 +279,30 @@ quint32 F2Stacker::sectionScore(const F2Section &section) const
     return score;
 }
 
+quint32 F2Stacker::sectionDifference(const F2Section &firstSection, const F2Section &secondSection) const
+{
+    quint32 differences = 0;
+
+    for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
+        const F2Frame &firstFrame = firstSection.frameRef(frameIndex);
+        const F2Frame &secondFrame = secondSection.frameRef(frameIndex);
+        const QVector<quint8> &firstData = firstFrame.rawData();
+        const QVector<quint8> &secondData = secondFrame.rawData();
+
+        for (int byteIndex = 0; byteIndex < 32; byteIndex++) {
+            if (firstData[byteIndex] != secondData[byteIndex]) {
+                differences++;
+            }
+        }
+    }
+
+    return differences;
+}
+
 bool F2Stacker::isPaddingSection(const F2Section &section) const
 {
     for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-        if (section.frame(frameIndex).paddedData().contains(false)) {
+        if (section.frameRef(frameIndex).rawPaddedData().contains(false)) {
             return false;
         }
     }
@@ -293,8 +317,8 @@ bool F2Stacker::isFlatSection(const F2Section &section) const
     int totalBytes = 0;
 
     for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-        const F2Frame frame = section.frame(frameIndex);
-        const QVector<quint8> data = frame.data();
+        const F2Frame &frame = section.frameRef(frameIndex);
+        const QVector<quint8> &data = frame.rawData();
         QByteArray frameBytes;
         frameBytes.reserve(data.size());
 
@@ -381,24 +405,101 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const Q
         // All candidate sections are padding. Preserve the first candidate section.
         stackedSection = f2Sections[0];
         m_paddedFrames += 98;
+        m_previousClusterSourceIndexes.clear();
     } else if (validF2Sections.size() == 1) {
         // Exactly one source has real data for this section. Pass it through.
-        stackedSection = validF2Sections[0];
+            stackedSection = validF2Sections[0];
+            m_previousClusterSourceIndexes.clear();
+            m_previousClusterSourceIndexes.append(validSourceIndexes[0]);
 
-        for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-            if (stackedSection.frame(frameIndex).errorData().contains(1)) {
+            for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
+            if (stackedSection.frameRef(frameIndex).rawErrorData().contains(1)) {
                 m_errorFrames++;
             } else {
                 m_errorFreeFrames++;
             }
         }
     } else {
+        QVector<int> bestClusterIndexes;
+        quint64 bestClusterScore = std::numeric_limits<quint64>::max();
+        quint64 bestClusterDifferences = std::numeric_limits<quint64>::max();
+        int bestClusterPreviousOverlap = -1;
+        const quint32 sameSectionDifferenceThreshold = 128;
+
+        for (int seedIndex = 0; seedIndex < validF2Sections.size(); seedIndex++) {
+            QVector<int> clusterIndexes;
+            quint64 clusterScore = 0;
+            quint64 clusterDifferences = 0;
+            int clusterPreviousOverlap = 0;
+
+            for (int candidateIndex = 0; candidateIndex < validF2Sections.size(); candidateIndex++) {
+                const quint32 differences =
+                    sectionDifference(validF2Sections[seedIndex], validF2Sections[candidateIndex]);
+                if (differences <= sameSectionDifferenceThreshold) {
+                    clusterIndexes.append(candidateIndex);
+                    clusterScore += sectionScore(validF2Sections[candidateIndex]);
+                    clusterDifferences += differences;
+                    if (m_previousClusterSourceIndexes.contains(validSourceIndexes[candidateIndex])) {
+                        clusterPreviousOverlap++;
+                    }
+                }
+            }
+
+            if (clusterIndexes.size() > bestClusterIndexes.size() ||
+                (clusterIndexes.size() == bestClusterIndexes.size() &&
+                 clusterPreviousOverlap > bestClusterPreviousOverlap) ||
+                (clusterIndexes.size() == bestClusterIndexes.size() &&
+                 clusterPreviousOverlap == bestClusterPreviousOverlap &&
+                 clusterScore < bestClusterScore) ||
+                (clusterIndexes.size() == bestClusterIndexes.size() &&
+                 clusterPreviousOverlap == bestClusterPreviousOverlap &&
+                 clusterScore == bestClusterScore &&
+                 clusterDifferences < bestClusterDifferences)) {
+                bestClusterIndexes = clusterIndexes;
+                bestClusterScore = clusterScore;
+                bestClusterDifferences = clusterDifferences;
+                bestClusterPreviousOverlap = clusterPreviousOverlap;
+            }
+        }
+
+        if (!bestClusterIndexes.isEmpty() && bestClusterIndexes.size() < validF2Sections.size()) {
+            QVector<F2Section> clusteredF2Sections;
+            QVector<int> clusteredSourceIndexes;
+
+            for (int clusterIndex = 0; clusterIndex < bestClusterIndexes.size(); clusterIndex++) {
+                const int sectionIndex = bestClusterIndexes[clusterIndex];
+                clusteredF2Sections.append(validF2Sections[sectionIndex]);
+                clusteredSourceIndexes.append(validSourceIndexes[sectionIndex]);
+            }
+
+            m_divergentSections += validF2Sections.size() - clusteredF2Sections.size();
+            validF2Sections = clusteredF2Sections;
+            validSourceIndexes = clusteredSourceIndexes;
+        }
+        m_previousClusterSourceIndexes = validSourceIndexes;
+
+        if (validF2Sections.size() == 1) {
+            stackedSection = validF2Sections[0];
+
+            for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
+                if (stackedSection.frameRef(frameIndex).rawErrorData().contains(1)) {
+                    m_errorFrames++;
+                } else {
+                    m_errorFreeFrames++;
+                }
+            }
+
+            stackedSection.metadata = stackedMetadata;
+            return stackedSection;
+        }
+
         // Each section contains 98 F2Frames.
         for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
             QVector<F2Frame> frameList;
+            frameList.reserve(validF2Sections.size());
 
             for (int sectionIndex = 0; sectionIndex < validF2Sections.size(); sectionIndex++) {
-                frameList.append(validF2Sections[sectionIndex].frame(frameIndex));
+                frameList.append(validF2Sections[sectionIndex].frameRef(frameIndex));
             }
 
             F2Frame stackedFrame = stackFrames(frameList, validSourceIndexes);
@@ -423,18 +524,23 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &s
     // Process one byte at a time
     QVector<quint8> stackedFrameData;
     QVector<bool> stackedFrameErrorData;
+    stackedFrameData.reserve(32);
+    stackedFrameErrorData.reserve(32);
     for (int byteIndex = 0; byteIndex < 32; byteIndex++) {
         // Make a list of the bytes to stack (i.e. those without error flags)
         QVector<quint8> validBytes;
+        validBytes.reserve(f2Frames.size());
         for (int listIndex = 0; listIndex < f2Frames.size(); ++listIndex) {
-            if (f2Frames.at(listIndex).errorData().at(byteIndex) == false) {
-                validBytes.append(f2Frames.at(listIndex).data().at(byteIndex));
+            const F2Frame &frame = f2Frames.at(listIndex);
+            const QVector<bool> &errorData = frame.rawErrorData();
+            if (errorData[byteIndex] == false) {
+                validBytes.append(frame.rawData()[byteIndex]);
             }
         }
 
         if (validBytes.size() == 0) {
             // All bytes are errors - can't correct
-            stackedFrameData.append(f2Frames.at(0).data().at(byteIndex));
+            stackedFrameData.append(f2Frames.at(0).rawData()[byteIndex]);
             stackedFrameErrorData.append(true);
             tbcDebugStream() << "F2Stacker::stackFrames - No valid byte value for index" << byteIndex;
             m_noValidValueForByte++;
@@ -502,9 +608,9 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &s
         }
 
         // Update the source differences statistics for this byte
-        quint8 expectedValue = f2Frames.at(0).data().at(byteIndex);
+        quint8 expectedValue = f2Frames.at(0).rawData()[byteIndex];
         for (int sourceIndex = 0; sourceIndex < f2Frames.size(); sourceIndex++) {
-            if (f2Frames.at(sourceIndex).data().at(byteIndex) != expectedValue) {
+            if (f2Frames.at(sourceIndex).rawData()[byteIndex] != expectedValue) {
                 m_sourceDifferences[sourceIndexes[sourceIndex]]++;
             }
         }

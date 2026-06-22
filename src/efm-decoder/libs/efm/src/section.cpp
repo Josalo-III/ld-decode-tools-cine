@@ -45,6 +45,14 @@ F2Frame F2Section::frame(qint32 index) const
     return m_frames.at(index);
 }
 
+const F2Frame &F2Section::frameRef(qint32 index) const
+{
+    if (index >= m_frames.size() || index < 0) {
+        qFatal("F2Section::frameRef - Index %d out of range", index);
+    }
+    return m_frames.at(index);
+}
+
 void F2Section::setFrame(qint32 index, const F2Frame &inFrame)
 {
     if (index >= m_frames.size() || index < 0) {

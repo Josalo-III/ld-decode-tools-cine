@@ -39,13 +39,16 @@ public:
 
     virtual void setData(const QVector<quint8> &data);
     virtual QVector<quint8> data() const;
+    const QVector<quint8> &rawData() const { return m_frameData; }
 
     virtual void setErrorData(const QVector<bool> &errorData);
     virtual QVector<bool> errorData() const;
+    const QVector<bool> &rawErrorData() const { return m_frameErrorData; }
     virtual quint32 countErrors() const;
 
     virtual void setPaddedData(const QVector<bool> &errorData);
     virtual QVector<bool> paddedData() const;
+    const QVector<bool> &rawPaddedData() const { return m_framePaddedData; }
     virtual quint32 countPadded() const;
 
     bool isFull() const;

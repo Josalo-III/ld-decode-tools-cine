@@ -37,6 +37,7 @@ public:
     F2Section();
     void pushFrame(const F2Frame &inFrame);
     F2Frame frame(int index) const;
+    const F2Frame &frameRef(int index) const;
     void setFrame(int index, const F2Frame &inFrame);
     bool isComplete() const;
     void clear();

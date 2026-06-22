@@ -57,6 +57,7 @@ private:
 
     QVector<ReaderF2Section*> m_inputFiles;
     WriterF2Section m_outputFile;
+    QVector<int> m_previousClusterSourceIndexes;
 
     bool readNextValidSection(SourceState &sourceState, qint32 minimumAddress = -1);
     quint32 sectionScore(const F2Section &section) const;
