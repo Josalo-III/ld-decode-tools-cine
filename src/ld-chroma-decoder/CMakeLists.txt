@@ -7,9 +7,10 @@ add_library(lddecode-chroma STATIC
 	decoder.cpp
 	decoderpool.cpp
 	cadenceassembler.cpp
+    carriergrammar.cpp
     comb.cpp
     combcandidate.cpp
-    comb_content_reach.cpp
+    combreach.cpp
     comblocked.cpp
     componentframe.cpp
     framecanvas.cpp

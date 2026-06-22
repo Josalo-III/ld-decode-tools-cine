@@ -1,15 +1,248 @@
 /******************************************************************************
- * comb_content_reach.cpp
- * ld-chroma-decoder shared image-content reach authority
+ * combreach.cpp
+ * ld-chroma-decoder comb reach system
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * See combreach.h for the two-arm split (lddecode reach legality /
+ * CombContentReach image-content authority).
  ******************************************************************************/
 
-#include "comb_content_reach.h"
+#include "combreach.h"
 
 #include <algorithm>
 #include <cmath>
 
+// ===========================================================================
+// Carrier-grammar reach legality translator
+// ===========================================================================
+namespace lddecode {
+
+namespace {
+
+CombReachReply blockedReply(const CombReachRequest &request, const char *tag)
+{
+    CombReachReply reply;
+    reply.verdict = CombReachVerdict::Blocked;
+    reply.centerFrame = request.source.signFrame;
+    reply.targetFrame = request.source.signFrame;
+    reply.tag = tag;
+    return reply;
+}
+
+CombReachReply unknownReply(const CombReachRequest &request, const char *tag)
+{
+    CombReachReply reply;
+    reply.verdict = CombReachVerdict::Unknown;
+    reply.centerFrame = request.source.signFrame;
+    reply.targetFrame = request.source.signFrame;
+    reply.tag = tag;
+    return reply;
+}
+
+double grammarAuthority(const CarrierGrammarState *center,
+                        const CarrierGrammarState *target)
+{
+    if (!center || !target)
+        return 0.0;
+
+    auto lineAuthority = [](const CarrierGrammarState *grammar) -> double {
+        double base = grammar->grammarLocked
+            ? std::clamp(grammar->phaseConfidence, 0.0, 1.0)
+            : 0.65;
+        base *= 1.0 - 0.5 * std::clamp(grammar->phaseScheduleConflict, 0.0, 1.0);
+        return std::clamp(base, 0.0, 1.0);
+    };
+
+    return std::min(lineAuthority(center), lineAuthority(target));
+}
+
+bool scalarUse(CombReachUse use)
+{
+    return use == CombReachUse::FieldScalarAverage ||
+           use == CombReachUse::FieldScalarCancel ||
+           use == CombReachUse::FrameScalarAverage ||
+           use == CombReachUse::FrameScalarCancel ||
+           use == CombReachUse::ScalarSignCompare ||
+           use == CombReachUse::ScalarMagnitudeCompare;
+}
+
+bool iqUse(CombReachUse use)
+{
+    return use == CombReachUse::IQCompare ||
+           use == CombReachUse::IQAverage ||
+           use == CombReachUse::IQCancel;
+}
+
+CombReachReply queryGrammarPair(const CombReachRequest &request,
+                                const CarrierGrammarState *center,
+                                const CarrierGrammarState *target)
+{
+    if (!center || !target)
+        return unknownReply(request, "missing-grammar");
+
+    if (request.source.carrierFree)
+        return blockedReply(request, "carrier-free-y");
+
+    if (request.source.kind == CombReachSourceKind::Detector)
+        return blockedReply(request, "detector-not-waveform");
+
+    CombReachReply reply;
+    reply.valid = true;
+    reply.centerFrame = request.source.signFrame;
+    reply.targetFrame = request.source.signFrame;
+    reply.authority = grammarAuthority(center, target);
+    reply.carrierRelation = carrierGrammarSignedPhaseRelation(
+        center,
+        request.centerH,
+        target,
+        request.targetH);
+
+    if (iqUse(request.use)) {
+        if (!request.source.iqCarrier) {
+            reply.verdict = CombReachVerdict::PriorOnly;
+            reply.tag = "scalar-not-iq";
+            return reply;
+        }
+
+        reply.verdict = CombReachVerdict::Green;
+        reply.fastPath = true;
+        reply.allowIQCompare = true;
+        reply.allowIQAverage = true;
+        reply.allowIQCancel =
+            request.use != CombReachUse::IQCancel ||
+            reply.carrierRelation == CarrierPhaseRelation::Same ||
+            reply.carrierRelation == CarrierPhaseRelation::Opposite;
+        reply.tag = "iq-carrier";
+        return reply;
+    }
+
+    if (!scalarUse(request.use))
+        return unknownReply(request, "unknown-use");
+
+    if (!request.source.scalarCarrier)
+        return blockedReply(request, "not-scalar-carrier");
+
+    if (request.source.polarity == CombReachPolarity::CommonPhase) {
+        reply.verdict = CombReachVerdict::CommonPhaseOnly;
+        reply.fastPath = true;
+        reply.allowScalarAverage = true;
+        reply.allowScalarMagnitudeCompare = true;
+        reply.tag = "locked-common-phase-scalar";
+        return reply;
+    }
+
+    if (reply.carrierRelation == CarrierPhaseRelation::Same ||
+        reply.carrierRelation == CarrierPhaseRelation::Opposite)
+    {
+        const bool polarityPreserved =
+            request.source.polarity == CombReachPolarity::Preserved;
+        reply.verdict = CombReachVerdict::Green;
+        reply.fastPath = true;
+        reply.allowScalarAverage = true;
+        reply.allowScalarCancel = polarityPreserved;
+        reply.allowScalarSignCompare = polarityPreserved;
+        reply.allowScalarMagnitudeCompare = true;
+        reply.tag = "carrier-relation";
+        return reply;
+    }
+
+    reply.verdict = CombReachVerdict::Blocked;
+    reply.tag = "phase-relation-other";
+    return reply;
+}
+
+} // namespace
+
+void CombReachIndex::bind(const std::vector<CarrierGrammarState> *grammar,
+                          int firstActiveLine,
+                          int lastActiveLine)
+{
+    grammar_ = grammar;
+    firstActiveLine_ = firstActiveLine;
+    lastActiveLine_ = lastActiveLine;
+}
+
+const CarrierGrammarState *CombReachIndex::grammarLine(int line) const
+{
+    if (!grammar_ || line < firstActiveLine_ || line >= lastActiveLine_)
+        return nullptr;
+    if (line < 0 || line >= static_cast<int>(grammar_->size()))
+        return nullptr;
+    return &(*grammar_)[line];
+}
+
+CombReachReply CombReachIndex::query(const CombReachRequest &request) const
+{
+    const CarrierGrammarState *center = grammarLine(request.centerLine);
+    const CarrierGrammarState *target = grammarLine(request.targetLine);
+
+    return queryGrammarPair(request, center, target);
+}
+
+CombReachReply CombReachIndex::queryAgainst(const CombReachIndex &targetIndex,
+                                            const CombReachRequest &request) const
+{
+    const CarrierGrammarState *center = grammarLine(request.centerLine);
+    const CarrierGrammarState *target = targetIndex.grammarLine(request.targetLine);
+
+    return queryGrammarPair(request, center, target);
+}
+
+CombReachSourceFrame makeBucketScalarReachSource()
+{
+    CombReachSourceFrame source;
+    source.kind = CombReachSourceKind::Bucket1DScalar;
+    source.signFrame = CarrierSignFrame::UnsignedBucket;
+    source.polarity = CombReachPolarity::Preserved;
+    source.scalarCarrier = true;
+    source.tag = "bucket-1d-scalar";
+    return source;
+}
+
+// WARNING: the LockedCommonPhaseScalar source kind labels a scalar buffer
+// (locked1DSource) whose cross-line semantics are Grid4fsc but whose physical
+// per-sample value is just bandpass(raw) * remodScale.  The "polarity is gone
+// by construction" interpretation has been a repeated burden:
+//
+//  - It does NOT mean the scalar is physically polarity-stripped.  It means
+//    that DEMODDING it with an unsigned phase yields IQ in a frame that
+//    interfield combs misinterpret.  For correct interfield behavior, demod
+//    with carrierGrammarSignedSampleClass to land in Grid4fscIQ, or read
+//    locked1DTI4fsc/TQ4fsc (already polarity-preserving) directly.
+//  - It does NOT mean intrafield (±2 same-field) scalar operations are
+//    compromised — those are physically sound.
+//
+// New sites should prefer Grid4fscIQ (IQ caches) over re-deriving IQ from
+// this scalar.  Phase normalization for cross-line comparison convenience has
+// cost more than it has bought; do not widen its use without scrutiny.
+CombReachSourceFrame makeLockedCommonPhaseScalarReachSource()
+{
+    CombReachSourceFrame source;
+    source.kind = CombReachSourceKind::LockedCommonPhaseScalar;
+    source.signFrame = CarrierSignFrame::Grid4fsc;
+    source.polarity = CombReachPolarity::CommonPhase;
+    source.scalarCarrier = true;
+    source.tag = "locked-common-phase-scalar";
+    return source;
+}
+
+CombReachSourceFrame makeGrid4fscIQReachSource()
+{
+    CombReachSourceFrame source;
+    source.kind = CombReachSourceKind::Grid4fscIQ;
+    source.signFrame = CarrierSignFrame::Grid4fsc;
+    source.polarity = CombReachPolarity::Preserved;
+    source.iqCarrier = true;
+    source.tag = "grid-4fsc-iq";
+    return source;
+}
+
+} // namespace lddecode
+
+// ===========================================================================
+// Image-content reach authority
+// ===========================================================================
 namespace CombContentReach {
 
 namespace {
@@ -29,18 +262,6 @@ double ramp(double v, double lo, double hi)
 double smoothGate(double valueIRE, double softIRE, double hardIRE)
 {
     return 1.0 - ramp(valueIRE, softIRE, hardIRE);
-}
-
-double similarityFromDiff(double diffIRE, double clearIRE, double farIRE)
-{
-    if (!std::isfinite(diffIRE))
-        return 0.0;
-    return 1.0 - ramp(diffIRE, clearIRE, farIRE);
-}
-
-double mag(double i, double q)
-{
-    return std::hypot(i, q);
 }
 
 double dotIQ(double ai, double aq, double bi, double bq)
@@ -86,85 +307,6 @@ double oppositeIQFit(double centerI, double centerQ,
     const double magFit = magnitudeRatioGate(mc, ms);
     const double chromaFit = ramp(std::min(mc, ms), minChromaIRE, minChromaIRE + 6.0);
     return clamp01(antiPhase * magFit * chromaFit);
-}
-
-void fillSide(Side &side,
-              double iqAuthority,
-              double scalarAuthority,
-              double contourAuthority,
-              double centerScalar,
-              double sideScalar,
-              double farScalar,
-              bool hasFar,
-              double lumaDiffIRE,
-              double centerI,
-              double centerQ,
-              double sideI,
-              double sideQ,
-              bool hasIQ,
-              double coherence,
-              double centerCoarse,
-              double sideCoarse,
-              double farCoarse,
-              bool hasCoarse,
-              bool hasFarCoarse)
-{
-    side.scalarDiffIRE = std::fabs(centerScalar - sideScalar);
-    side.scalarSimilarity = similarityFromDiff(side.scalarDiffIRE, 2.5, 14.0);
-
-    side.iqCoherence = clamp01(coherence);
-    if (hasIQ) {
-        side.iqDistanceIRE = std::hypot(centerI - sideI, centerQ - sideQ);
-        side.iqSimilarity = similarityFromDiff(side.iqDistanceIRE, 2.0, 10.0);
-        side.iqSimilarity *= 0.65 + 0.35 * side.iqCoherence;
-    } else {
-        side.iqDistanceIRE = 0.0;
-        side.iqSimilarity = 1.0;
-    }
-
-    if (hasCoarse) {
-        side.contourDistanceIRE = std::fabs(centerCoarse - sideCoarse);
-        side.contourSimilarity = similarityFromDiff(side.contourDistanceIRE, 2.0, 10.0);
-    } else {
-        side.contourDistanceIRE = 0.0;
-        side.contourSimilarity = 1.0;
-    }
-
-    if (hasCoarse && hasFarCoarse && hasFar) {
-        const double predicted = 2.0 * sideCoarse - centerCoarse;
-        const double continuationDiff = std::fabs(farCoarse - predicted);
-        side.contourContinuation = similarityFromDiff(continuationDiff, 3.0, 12.0);
-    } else {
-        side.contourContinuation = side.contourSimilarity;
-    }
-
-    side.materialSimilarity =
-        iqAuthority * side.iqSimilarity +
-        scalarAuthority * side.scalarSimilarity;
-
-    const double contourBlend =
-        0.55 * side.contourSimilarity +
-        0.45 * side.contourContinuation;
-    side.sameMaterial = clamp01(
-        (1.0 - contourAuthority) * side.materialSimilarity +
-        contourAuthority * (0.85 * side.materialSimilarity + 0.15 * contourBlend));
-
-    side.iqSame = side.iqSimilarity >= 0.60;
-    side.scalarSame = side.scalarSimilarity >= 0.60;
-    side.contourSame = contourBlend >= 0.60;
-
-    const double lumaEdge = ramp(lumaDiffIRE, 4.5, 16.0);
-    const double contentMismatch = 1.0 - side.sameMaterial;
-    const double edgePenalty = lumaEdge * contentMismatch;
-
-    side.reachAuthority = clamp01(
-        side.sameMaterial *
-        (1.0 - 0.25 * edgePenalty) *
-        (0.70 + 0.30 * side.contourContinuation));
-
-    side.cancellationAuthority = clamp01(
-        side.reachAuthority *
-        (0.55 + 0.45 * side.scalarSimilarity));
 }
 
 } // namespace
@@ -467,150 +609,6 @@ MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,
         0.70 * contourTrust + 0.30 * (1.0 - contourCurvNorm));
 
     return out;
-}
-
-Reply evaluate(const Query &query)
-{
-    Reply reply;
-
-    reply.iqMagnitudeIRE = query.hasIQ
-        ? mag(query.centerI, query.centerQ)
-        : std::fabs(query.chromaIRE);
-    reply.iqAuthority = query.hasIQ
-        ? ramp(reply.iqMagnitudeIRE, 2.0, 8.0)
-        : 0.0;
-    reply.scalarAuthority = 1.0 - reply.iqAuthority;
-    reply.contourAuthority = query.hasMovingCoarse ? 1.0 : 0.0;
-
-    fillSide(reply.up,
-             reply.iqAuthority,
-             reply.scalarAuthority,
-             reply.contourAuthority,
-             query.centerScalar,
-             query.up2Scalar,
-             query.up4Scalar,
-             query.hasUp4,
-             query.up2LumaDiffIRE,
-             query.centerI,
-             query.centerQ,
-             query.up2I,
-             query.up2Q,
-             query.hasIQ && query.hasUp2,
-             query.upCoherence,
-             query.centerCoarse,
-             query.up2Coarse,
-             query.up4Coarse,
-             query.hasMovingCoarse && query.hasUp2,
-             query.hasMovingCoarse && query.hasUp4);
-
-    fillSide(reply.down,
-             reply.iqAuthority,
-             reply.scalarAuthority,
-             reply.contourAuthority,
-             query.centerScalar,
-             query.down2Scalar,
-             query.down4Scalar,
-             query.hasDown4,
-             query.down2LumaDiffIRE,
-             query.centerI,
-             query.centerQ,
-             query.down2I,
-             query.down2Q,
-             query.hasIQ && query.hasDown2,
-             query.downCoherence,
-             query.centerCoarse,
-             query.down2Coarse,
-             query.down4Coarse,
-             query.hasMovingCoarse && query.hasDown2,
-             query.hasMovingCoarse && query.hasDown4);
-
-    reply.upDownMaterialDifference =
-        std::fabs(reply.up.sameMaterial - reply.down.sameMaterial);
-    reply.upDownContourDifference =
-        std::fabs(reply.up.contourContinuation - reply.down.contourContinuation);
-
-    reply.transitionStrength = clamp01(
-        1.0 - 0.5 * (reply.up.sameMaterial + reply.down.sameMaterial));
-    reply.oneSidedness = clamp01(reply.upDownMaterialDifference);
-
-    const double bestSide = std::max(reply.up.sameMaterial, reply.down.sameMaterial);
-    const double balanced = 1.0 - reply.oneSidedness;
-    const double bothDifferent = clamp01(
-        1.0 - std::max(reply.up.sameMaterial, reply.down.sameMaterial));
-    reply.centerIsIntermediate = clamp01(
-        reply.transitionStrength *
-        bothDifferent *
-        balanced *
-        (0.60 + 0.40 * (0.5 * (reply.up.contourContinuation +
-                                reply.down.contourContinuation))));
-
-    reply.bevelOrOutlineStrength = clamp01(
-        reply.centerIsIntermediate *
-        0.5 * (reply.up.contourContinuation + reply.down.contourContinuation));
-
-    const double lowEvidence =
-        (1.0 - reply.contourAuthority) *
-        (1.0 - std::max(reply.iqAuthority, reply.scalarAuthority * 0.85));
-    reply.ambiguity = clamp01(
-        balanced *
-        (1.0 - bestSide) *
-        (0.35 + 0.65 * reply.transitionStrength));
-
-    reply.symmetricAverageAuthority = clamp01(
-        std::min(reply.up.reachAuthority, reply.down.reachAuthority) *
-        (1.0 - 0.45 * reply.oneSidedness) *
-        (1.0 - 0.45 * reply.centerIsIntermediate));
-
-    reply.oneSidedAuthority = clamp01(
-        std::max(reply.up.reachAuthority, reply.down.reachAuthority) *
-        reply.oneSidedness *
-        (0.50 + 0.50 * reply.transitionStrength));
-
-    reply.centerFallbackAuthority = clamp01(std::max({
-        0.85 * reply.centerIsIntermediate,
-        0.50 * reply.bevelOrOutlineStrength,
-        0.45 * reply.ambiguity,
-        0.25 * lowEvidence}));
-
-    reply.allowSymmetricReach =
-        reply.symmetricAverageAuthority >= 0.16 &&
-        reply.centerFallbackAuthority < 0.88;
-
-    reply.preferUp =
-        (reply.up.reachAuthority > reply.down.reachAuthority + 0.12) &&
-        (reply.up.sameMaterial > 0.42);
-    reply.preferDown =
-        (reply.down.reachAuthority > reply.up.reachAuthority + 0.12) &&
-        (reply.down.sameMaterial > 0.42);
-    reply.preferCenterFallback =
-        (reply.centerFallbackAuthority >=
-         std::max(reply.symmetricAverageAuthority, reply.oneSidedAuthority) + 0.18) &&
-        (reply.centerIsIntermediate > 0.45 ||
-         reply.bevelOrOutlineStrength > 0.55);
-
-    reply.up.selectedSide = reply.preferUp;
-    reply.down.selectedSide = reply.preferDown;
-    reply.up.suppressedSide = reply.preferDown;
-    reply.down.suppressedSide = reply.preferUp;
-
-    if (lowEvidence >= 0.75) {
-        reply.verdict = Verdict::LowEvidence;
-    } else if (reply.centerIsIntermediate >= 0.72) {
-        reply.verdict = Verdict::IntermediateZone;
-    } else if (reply.bevelOrOutlineStrength >= 0.60) {
-        reply.verdict = Verdict::BevelOrOutline;
-    } else if (reply.centerFallbackAuthority >= 0.72 &&
-               reply.transitionStrength >= 0.55) {
-        reply.verdict = Verdict::ClearTransition;
-    } else if (reply.preferUp || reply.preferDown) {
-        reply.verdict = Verdict::OneSidedContinuation;
-    } else if (reply.ambiguity >= 0.60) {
-        reply.verdict = Verdict::Ambiguous;
-    } else {
-        reply.verdict = Verdict::SmoothContinuation;
-    }
-
-    return reply;
 }
 
 } // namespace CombContentReach

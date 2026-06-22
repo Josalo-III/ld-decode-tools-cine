@@ -524,26 +524,118 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     // reachGate composition policy:
     //
-    //   Frame ±1 (Frame B):  reachGate = reachLegalGate.
-    //     Frame B is deliberately the over-combing path: legal partner ->
-    //     comb at full strength.  No per-pixel contour or IQ-floor modulation,
-    //     which previously fed per-pixel jitter into Frame B's output and read
-    //     as alternating dark pixels in saturated regions.
+    //   Frame ±1 (Frame B):  reachGate = bevelGate * max(reachLegalGate, interfieldIQReachFloor).
+    //     Frame B is deliberately the over-combing path.  Legality establishes
+    //     the baseline; the IQ floor only RAISES reach at counterpart sites
+    //     where the IQ evidence shows the center is alien chroma — on real
+    //     vertical chroma columns oppositeIQFit collapses to 0 and the floor
+    //     adds nothing.  bevelGate then throttles reach where the close-
+    //     focused (±1/±2 luma) coarse contour shows a curvature break AND
+    //     chroma is present — the ±1 zipper guard for bevels.  Low-chroma
+    //     regions are essentially inert (chromaWeight → 0).
     //
     //   Field ±2 (Field A / Field B / preclean):  reachGate = mc * reachLegalGate.
     //     The intrafield combs need actual reach limiting around vertical
     //     content boundaries.  Source: movingCoarseContour exclusively.  When
     //     mc.valid -> 0.25 + 0.75 * trust; otherwise gate = 1.0 (deterministic
     //     fall-through, not a fallback to a second confidence stream).
-    auto applyFrameReachLegalOnly = [&](std::vector<CombTapPair> &upPair,
+    auto applyFrameReachWithIQFloor = [&](std::vector<CombTapPair> &upPair,
                                         std::vector<CombTapPair> &dnPair,
                                         bool haveUp,
                                         bool haveDn) {
         if (!haveUp || !haveDn || (int)upPair.size() < width || (int)dnPair.size() < width)
             return;
+
+        // Demod the ±1 comp taps to Grid4fscIQ on the fly so we can layer
+        // interfieldIQReachFloor on top of legality.  The floor only RAISES
+        // reachGate at sites where the IQ evidence shows center is alien
+        // chroma (anti-phase counterpart) or displaced from neighbor-common;
+        // on real vertical chroma columns oppositeIQFit collapses to 0 and
+        // the floor adds nothing.  columnSupport = 1.0 by design: saturated-
+        // area checkers do not sit on horizontal luma edges and the floor's
+        // internal gates already discriminate.  See
+        // project_frameb_comb_must_run.
+        const double minChromaIRE = std::max(0.0, T.FRAME_CHROMA_MIN_IRE);
+        const bool locked = configuration.phaseCompensation;
+
+        auto demodAt = [&](const CombTapScalar &s, int ln, int h,
+                           double &iOut, double &qOut) {
+            const int phase = locked
+                ? carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h)
+                : h;
+            demod4fscFromComposite(s.comp, phase, iOut, qOut);
+        };
+
+        // Close-focused coarse contour for the ±1 bevel zipper guard.
+        // movingCoarseContour evaluates straightness over ±2/±4; reuse the
+        // same evaluator with ±1/±2 luma so the test fires on the actual
+        // partners Frame B reaches into.  Chroma magnitude weights the
+        // penalty: low-chroma areas don't zipper regardless, so the throttle
+        // is essentially inert there.
+        const double *frameLuma0  = (lockedLumaCacheValid && !lockedLumaSmooth_flat.empty() && demodWidth >= width)
+                                    ? lockedLumaSmooth_line(tapLine.ln0)  : nullptr;
+        const double *frameLumaU1 = (frameLuma0 && tapLine.lnU1 >= 0 && tapLine.lnU1 < demodLines)
+                                    ? lockedLumaSmooth_line(tapLine.lnU1) : nullptr;
+        const double *frameLumaD1 = (frameLuma0 && tapLine.lnD1 >= 0 && tapLine.lnD1 < demodLines)
+                                    ? lockedLumaSmooth_line(tapLine.lnD1) : nullptr;
+        const double *frameLumaU2 = (frameLuma0 && tapLine.lnU2 >= 0 && tapLine.lnU2 < demodLines)
+                                    ? lockedLumaSmooth_line(tapLine.lnU2) : nullptr;
+        const double *frameLumaD2 = (frameLuma0 && tapLine.lnD2 >= 0 && tapLine.lnD2 < demodLines)
+                                    ? lockedLumaSmooth_line(tapLine.lnD2) : nullptr;
+        const bool haveCloseLuma = frameLuma0 && frameLumaU1 && frameLumaD1
+                                   && frameLumaU2 && frameLumaD2;
+        const double soft = T.FIELD_CONTOUR_SOFT_IRE;
+        const double hard = T.FIELD_CONTOUR_HARD_IRE;
+        const double bevelPenalty = std::clamp(T.FRAME_B_BEVEL_REACH_PENALTY, 0.0, 1.0);
+
         for (int rel = 0; rel < width; ++rel) {
-            upPair[rel].reachGate = upPair[rel].reachLegalGate;
-            dnPair[rel].reachGate = dnPair[rel].reachLegalGate;
+            const int h = left + rel;
+            double cI, cQ, uI, uQ, dI, dQ;
+            demodAt(tapLine.tap0[rel],  tapLine.ln0,  h, cI, cQ);
+            demodAt(tapLine.tapU1[rel], tapLine.lnU1, h, uI, uQ);
+            demodAt(tapLine.tapD1[rel], tapLine.lnD1, h, dI, dQ);
+
+            // KNOWN ISSUE (deferred to Frame B's pass — see comb-reach
+            // archeology note 2026-06-21): cI..dQ are raw composite-domain
+            // (demod4fscFromComposite is unscaled), but interfieldIQReachFloor
+            // thresholds minChromaIRE / residualMinIRE in IRE. The Frame A site
+            // and the bevel/contour calls below scale by invI; this one does
+            // not, so the floor's chroma-presence gates saturate. Phase terms
+            // (anti-phase, magnitude ratio) are scale-invariant and still work,
+            // so the floor over-fires rather than failing. Fix is `*= invI` on
+            // the demod outputs, then re-tune — left for the dedicated Frame B day.
+            const CombContentReach::InterfieldIQReachFloor floor =
+                CombContentReach::interfieldIQReachFloor(
+                    cI, cQ, uI, uQ, dI, dQ,
+                    true, true, minChromaIRE, 1.0);
+
+            double upGate = std::max(upPair[rel].reachLegalGate, floor.up);
+            double dnGate = std::max(dnPair[rel].reachLegalGate, floor.down);
+
+            if (haveCloseLuma && bevelPenalty > 0.0) {
+                const auto mcNear = CombContentReach::evaluateMovingCoarseContour(
+                    frameLuma0[rel]  * invI,
+                    frameLumaU1[rel] * invI, frameLumaD1[rel] * invI,
+                    frameLumaU2[rel] * invI, frameLumaD2[rel] * invI,
+                    true, true, true, true,
+                    soft, hard);
+
+                if (mcNear.valid) {
+                    const double envC =
+                        std::hypot(tapLine.tap0[rel].comp, tapLine.tap0[rel].symMag);
+                    const double chromaWeight =
+                        std::clamp((envC * invI - 2.0) / 8.0, 0.0, 1.0);
+                    const double bevelGate =
+                        std::clamp(1.0 - bevelPenalty * chromaWeight *
+                                   (1.0 - std::clamp(mcNear.straightness, 0.0, 1.0)),
+                                   0.0, 1.0);
+                    upGate *= bevelGate;
+                    dnGate *= bevelGate;
+                }
+            }
+
+            upPair[rel].reachGate = std::clamp(upGate, 0.0, 1.0);
+            dnPair[rel].reachGate = std::clamp(dnGate, 0.0, 1.0);
         }
     };
 
@@ -553,6 +645,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                                                bool haveDn) {
         if (!haveUp || !haveDn || (int)upPair.size() < width || (int)dnPair.size() < width)
             return;
+        const double edgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
         for (int rel = 0; rel < width; ++rel) {
             double upContourGate = 1.0;
             double dnContourGate = 1.0;
@@ -562,6 +655,33 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 const auto &mc = tapLine.movingCoarseContour[rel];
                 upContourGate = 0.25 + 0.75 * std::clamp(mc.upTrust, 0.0, 1.0);
                 dnContourGate = 0.25 + 0.75 * std::clamp(mc.downTrust, 0.0, 1.0);
+
+                if (rel < (int)tapLine.hLumaDeltaIRE.size()) {
+                    const double envC =
+                        std::hypot(tapLine.tap0[rel].comp, tapLine.tap0[rel].symMag);
+                    const double chromaT =
+                        std::clamp((envC * invI - 2.0) / 8.0, 0.0, 1.0);
+                    const double hEdge =
+                        std::clamp(
+                            (tapLine.hLumaDeltaIRE[rel] - 0.30 * edgeThreshIRE) /
+                            (0.70 * edgeThreshIRE),
+                            0.0, 1.0);
+                    const double sideBalance =
+                        1.0 - std::fabs(
+                            std::clamp(mc.upTrust, 0.0, 1.0) -
+                            std::clamp(mc.downTrust, 0.0, 1.0));
+                    const double bevelRisk =
+                        chromaT *
+                        hEdge *
+                        (1.0 - std::clamp(mc.straightness, 0.0, 1.0)) *
+                        (0.35 + 0.65 * std::clamp(sideBalance, 0.0, 1.0));
+                    const double bevelGate =
+                        std::clamp(
+                            1.0 - T.FIELD_B_BEVEL_REACH_PENALTY * bevelRisk,
+                            0.0, 1.0);
+                    upContourGate *= bevelGate;
+                    dnContourGate *= bevelGate;
+                }
             }
             upPair[rel].reachGate = std::clamp(
                 upContourGate * upPair[rel].reachLegalGate, 0.0, 1.0);
@@ -572,7 +692,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     measureTapBuild(TapBuildFrameLimiters, [&]() {
         if (wantFrame) {
-            applyFrameReachLegalOnly(tapLine.pairU1, tapLine.pairD1,
+            applyFrameReachWithIQFloor(tapLine.pairU1, tapLine.pairD1,
                                      tapLine.haveU1, tapLine.haveD1);
         }
     });
@@ -1311,6 +1431,32 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                     }
                 }
             }
+        }
+
+        if (rel < (int)tapLine.movingCoarseContour.size() &&
+            tapLine.movingCoarseContour[rel].valid &&
+            rel < (int)tapLine.hLumaDeltaIRE.size())
+        {
+            const auto &mc = tapLine.movingCoarseContour[rel];
+            const double hEdge =
+                std::clamp(
+                    (tapLine.hLumaDeltaIRE[rel] - 0.30 * hEdgeThreshIRE) /
+                    (0.70 * hEdgeThreshIRE),
+                    0.0, 1.0);
+            const double sideBalance =
+                1.0 - std::fabs(
+                    std::clamp(mc.upTrust, 0.0, 1.0) -
+                    std::clamp(mc.downTrust, 0.0, 1.0));
+            const double bevelRisk =
+                chromaT *
+                hEdge *
+                (1.0 - std::clamp(mc.straightness, 0.0, 1.0)) *
+                (0.35 + 0.65 * std::clamp(sideBalance, 0.0, 1.0));
+            const double bevelCede =
+                std::clamp(T.FIELD_B_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
+            boundaryCede = std::max(boundaryCede, bevelCede);
+            if (bevelCede > 0.0 && reason == FieldBReasonNone)
+                reason = FieldBReasonBoundaryCede;
         }
 
         double sc = 1.0;
@@ -2059,7 +2205,8 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
 // Unlike Frame A, this intentionally does not phase-align the neighbors before
 // averaging; that plainness is part of what keeps Frame B from inheriting
 // Frame A's saturated-edge alternation failure mode.
-// Gate: suppress when the two neighbors disagree with each other (motion).
+// Reach is consumed from pairU1/pairD1.reachGate (legality + interfield IQ
+// floor); the combine itself is unconditional when reach is non-zero.
 void Comb::FrameBuffer::computeFrameBDirectIQLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ,
@@ -2195,6 +2342,15 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
     const bool haveUpLine = verticalAllowed && (line - 1 >= first);
     const bool haveDnLine = verticalAllowed && (line + 1 < last);
 
+    // Plain ±1 interfield comb.  Per project_frameb_comb_must_run: when a
+    // legal partner exists this MUST run — never gate to bare center via
+    // confidence correlations.  Checker suppression belongs in the reach
+    // floor (interfieldIQReachFloor in applyFrameReachWithIQFloor), which raises
+    // pairU1/pairD1.reachGate at counterpart sites; here we simply consume
+    // those gates.  Geometry: pull = 0.5 * combStrength * reachAuthority,
+    // so when both reaches are 1 the output is the 3-tap interfield average
+    // (Z0 + target)/2 — anti-phase alien cancels to zero, same-phase real
+    // chroma (delta≈0) is unchanged.
     for (int x = 0; x < width; ++x) {
         const std::complex<double> Z0 = centerIQ[x];
 
@@ -2221,19 +2377,13 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
 
         const std::complex<double> ZUp = upIQ[x];
         const std::complex<double> ZDn = dnIQ[x];
+        const bool haveUp = upReach > 0.0 && cmag(ZUp) > 1e-9;
+        const bool haveDn = dnReach > 0.0 && cmag(ZDn) > 1e-9;
 
         double wsum = 0.0;
         std::complex<double> target(0.0, 0.0);
-
-        if (upReach > 0.0 && cmag(ZUp) > 1e-9) {
-            target += ZUp * upReach;
-            wsum += upReach;
-        }
-
-        if (dnReach > 0.0 && cmag(ZDn) > 1e-9) {
-            target += ZDn * dnReach;
-            wsum += dnReach;
-        }
+        if (haveUp) { target += ZUp * upReach; wsum += upReach; }
+        if (haveDn) { target += ZDn * dnReach; wsum += dnReach; }
 
         if (wsum <= 1e-12) {
             outFrameIQ[x] = Z0;
@@ -2241,23 +2391,21 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
         }
 
         target /= wsum;
-
         std::complex<double> delta = target - Z0;
 
-        // Bound the per-pixel swing so that an intermediate `target` cannot
-        // pull real chroma toward zero in saturated regions.  Without this,
-        // per-pixel reachGate variation (movingCoarseContour.valid vs contour
-        // trust) modulates the 0.5x average and produces alternating dark
-        // pixels in saturated areas.  See FRAME_IQ_RAW_MAX_DELTA_IRE.
+        // Bound the per-pixel swing.  Flat cap (no two-sided-reach relax):
+        // bevels are exactly the sites where both reaches go high AND the
+        // cross-bevel delta is large, and at those sites the unclamped pull
+        // produces the 2-pixel zipper.  The reach throttle in
+        // applyFrameReachWithIQFloor is what cancels the bevel pull at its
+        // source; this cap is the second line of defence against any
+        // pathological intermediate target the throttle leaves through.
         const double deltaIRE = cmag(delta) * invIreScale;
         if (maxDeltaIRE > 0.0 && deltaIRE > maxDeltaIRE && deltaIRE > 1e-9)
             delta *= (maxDeltaIRE / deltaIRE);
 
-        const double reachAuthority =
-            std::clamp(wsum / 2.0, 0.0, 1.0);
-
-        const double pull =
-            std::clamp(combStrength * reachAuthority, 0.0, 1.0);
+        const double reachAuthority = std::clamp(wsum / 2.0, 0.0, 1.0);
+        const double pull = std::clamp(0.5 * combStrength * reachAuthority, 0.0, 1.0);
 
         outFrameIQ[x] = Z0 + delta * pull;
 
@@ -2267,7 +2415,6 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
             outFrameIQ[x] = Z0;
         }
     }
-
 }
 
 void Comb::FrameBuffer::computeFrameBDirectIQCompositeLine(
@@ -2333,6 +2480,15 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
+    // Source is Bucket (polarity Preserved) on purpose, NOT a mislabel: this is
+    // a cross-frame ScalarSignCompare, and only a polarity-preserved source
+    // returns allowScalarSignCompare. Re-tagging this LockedCommonPhaseScalar —
+    // as an earlier note suggested — would yield the CommonPhaseOnly verdict,
+    // drop allowScalarSignCompare, and reject every temporal candidate (penalty
+    // 1000), disabling 3D entirely. The actual polarity guard here is the
+    // carrierLineFlip gate at the getBestCandidate call site. Honest expression
+    // of "grammar phase-relation sign-compare on a common-phase scalar is legal"
+    // is deferred to the future consolidated reach system.
     const lddecode::CombReachReply phaseReach = combReachIndex.queryAgainst(
         frameBuffer.combReachIndex,
         {refLineNumber,

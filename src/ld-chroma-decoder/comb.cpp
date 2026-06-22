@@ -714,8 +714,6 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-            demodTRI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-            demodTRQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});

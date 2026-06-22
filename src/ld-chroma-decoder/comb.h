@@ -32,8 +32,7 @@
 #include "lddecodemetadata.h"
 #include "attributiondefs.h"
 #include "carriergrammar.h"
-#include "comb_content_reach.h"
-#include "comb_reach_index.h"
+#include "combreach.h"
 #include "combmath.h"
 #include "componentframe.h"
 #include "decoder.h"
@@ -134,21 +133,17 @@ public:
             double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0; // suppress 2D field output when ±2 line pair disagrees beyond this
 
             double FIELD_LUMA_EDGE_THRESH_IRE = 18.0; // horizontal luma gradient above this suppresses vertical 2D comb
+            double FIELD_B_BEVEL_REACH_PENALTY = 0.45; // extra Field B reach damping in high-chroma bevels near luma edges
+            double FIELD_B_BEVEL_CEDE_STRENGTH = 0.15; // extra Field B center cede in high-chroma bevels near luma edges
 
             // =========================================================================
             // Frame comb on phase-corrected 1D
             // =========================================================================
             double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
-            double FRAME_B_COMB_STRENGTH      = 1.00;  // same for Frame B's direct interframe path
-            double FRAME_CHROMA_MIN_IRE       = 2.5;   // minimum chroma amplitude to engage the frame IQ path
-            double FRAME_IQ_RAW_MAX_DELTA_IRE = 8.0;   // max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
-            double FRAME_B_LEAK_NEG_CORR_START = 0.30; // signed corr negativity where Frame B starts treating vertical alternation as leakage
-            double FRAME_B_LEAK_NEG_CORR_FULL  = 0.70; // signed corr negativity where leakage confidence is full
-            double FRAME_B_LEAK_NEIGHBOR_AGREE_START = 0.20; // Up/Dn signed corr where leakage support begins
-            double FRAME_B_LEAK_NEIGHBOR_AGREE_FULL  = 0.70; // Up/Dn signed corr where leakage support is full
-            double FRAME_B_LEAK_CENTER_DELTA_START_IRE = 1.5; // |center - avg(Up,Dn)| where symmetric cleanup starts to look worthwhile
-            double FRAME_B_LEAK_CENTER_DELTA_FULL_IRE  = 5.5; // |center - avg(Up,Dn)| where symmetric cleanup confidence is full
-            double FRAME_B_LEAK_STRENGTH_BOOST = 0.45; // extra push toward full comb strength when leakage is likely
+            double FRAME_B_COMB_STRENGTH      = 1.00;  // for Frame B's direct interframe path
+            double FRAME_CHROMA_MIN_IRE       = 1.5;   // minimum chroma amplitude to engage the frame IQ path
+            double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;   // max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
+            double FRAME_B_BEVEL_REACH_PENALTY = 1.0; // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -175,7 +170,7 @@ public:
             // Edge-regime biasing for the 4-member election.
             double FVF_VERT_FIELD_A_PENALTY  = 0.16; // Field A penalty under vertical contrast (±2 comb produces crosstalk)
             double FVF_VERT_FRAME_A_BONUS    = 0.16; // Frame A (precleaned) bonus under vertical contrast (unaffected by vertical luma)
-            double FVF_HEDGE_FIELD_B_PENALTY = 0.18; // Field B penalty at horizontal luma edges (zipper risk)
+            double FVF_HEDGE_FIELD_B_PENALTY = 0.0; // Field B penalty at horizontal luma edges (zipper risk)
             double FVF_HEDGE_FRAME_B_BONUS   = 0.18; // Frame B bonus at horizontal luma edges (interframe is stable there)
 
             // Transition sharpness reward strength.
@@ -183,9 +178,9 @@ public:
 
             // Saturation regime biasing.
             double FVF_SAT_FIELD_A_PEN   = 0.06; // Field A penalty in high saturation
-            double FVF_SAT_FIELD_B_PEN   = 0.24; // Field B penalty in high saturation (higher: zipper risk)
+            double FVF_SAT_FIELD_B_PEN   = 0.14; // Field B penalty in high saturation (higher: zipper risk)
             double FVF_SAT_FRAME_A_BONUS = 0.10; // Frame A bonus in high saturation (smaller: boundary caution)
-            double FVF_SAT_FRAME_B_BONUS = 0.18; // Frame B bonus in high saturation when coherent
+            double FVF_SAT_FRAME_B_BONUS = 0.12; // Frame B bonus in high saturation when coherent
 
             // =========================================================================
             // FVF / Model interaction tuning
@@ -228,7 +223,7 @@ public:
             double FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG = 10.0; // clamp for neighbor IQ column phase alignment in frame candidates
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
-            // attribution evidence says it is luma-owned rather than chroma-owned.
+            // attribution evidence says it is luma-origin rather than chroma-origin.
             bool   VET_ATTRIBUTION_ENABLE            = true;
             double VET_ATTRIBUTION_LUMA_WEIGHT       = 0.75; // blend strength for lumaClaim -> Y reassignment (0=off, 1=full)
             double VET_ATTRIBUTION_CHROMA_WEIGHT     = 0.75; // blend strength for chromaClaim -> chroma retention
@@ -603,8 +598,6 @@ private:
 	std::array<int, 3> precleanRingLine = { -1, -1, -1 };
 		std::vector<double> scratch_frameAAdaptiveIQComposite; // Frame A IQ candidate remodulated to composite.
 		std::vector<double> scratch_frameBDirectIQComposite;   // Frame B IQ candidate remodulated to composite.
-		std::vector<float> demodTRI_flat;
-		std::vector<float> demodTRQ_flat;
 		std::vector<double> scratch_preI;          // Unscaled pre-FIR I row (per-line).
 		std::vector<double> scratch_preQ;          // Unscaled pre-FIR Q row (per-line).
 		std::vector<double> scratch_preI_ext;      // Edge-extended I row for FIR.
@@ -1083,20 +1076,6 @@ private:
 	}
 	inline const float* carrierImpurity_line(int line) const {
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-
-	// Raw-composite demod accessors
-	inline float* demodTRI_line(int line) {
-		return demodTRI_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline float* demodTRQ_line(int line) {
-		return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline const float* demodTRI_line(int line) const {
-		return demodTRI_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline const float* demodTRQ_line(int line) const {
-		return demodTRQ_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).
