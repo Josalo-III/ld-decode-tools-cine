@@ -804,9 +804,6 @@ private:
 	void invalidateCombTapCache();
 	const CombTapLine &ensureCombTapLine(int lineNumber);
 	void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
-	void computeContourFieldLine(int lineNumber,
-						  double *outFieldLine,
-						  double  *outGate);
 	void computeContourFieldLine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  double  *outGate);
