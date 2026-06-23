@@ -435,6 +435,8 @@ private:
 		std::vector<CombTapScalar> tapD2;
 		std::vector<CombTapScalar> tapU4;
 		std::vector<CombTapScalar> tapD4;
+		std::vector<double> centerEnvelope;
+		std::vector<double> centerChromaT;
 		std::vector<CombTapPair> pairU1;
 		std::vector<CombTapPair> pairD1;
 		std::vector<CombTapPair> pairU2;
@@ -775,20 +777,20 @@ private:
 		return precleanGateRing[s].data();
 	}
 
-	inline double *precleanLinePtrMutable(int lineNumber, int width)
-	{
-		const int s = precleanRingSlot(lineNumber);
-		if ((int)precleanRing[s].size() < width) precleanRing[s].assign(width, 0.0);
-		precleanRingLine[s] = lineNumber;
-		return precleanRing[s].data();
-	}
+		inline double *precleanLinePtrMutable(int lineNumber, int width)
+		{
+			const int s = precleanRingSlot(lineNumber);
+			if ((int)precleanRing[s].size() < width) precleanRing[s].resize(width);
+			precleanRingLine[s] = lineNumber;
+			return precleanRing[s].data();
+		}
 
-	inline double *precleanGateLinePtrMutable(int lineNumber, int width)
-	{
-		const int s = precleanRingSlot(lineNumber);
-		if ((int)precleanGateRing[s].size() < width) precleanGateRing[s].assign(width, 1.0);
-		return precleanGateRing[s].data();
-	}
+		inline double *precleanGateLinePtrMutable(int lineNumber, int width)
+		{
+			const int s = precleanRingSlot(lineNumber);
+			if ((int)precleanGateRing[s].size() < width) precleanGateRing[s].resize(width);
+			return precleanGateRing[s].data();
+		}
 
 	// Small helpers declared here; definitions provided after the class (in this header).
 	// Per-run 4fsc shifted basis LUT for locked path (phaseCompensation=true)

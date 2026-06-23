@@ -2031,8 +2031,6 @@ void Comb::FrameBuffer::split2D()
 
         if (needFrameBCompute) {
             computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
-            if ((int)scratch_frameBDirectIQComposite.size() < width)
-                scratch_frameBDirectIQComposite.resize(width);
         }
 
         const std::vector<double> &frameAttrScalar =
