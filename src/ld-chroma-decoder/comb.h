@@ -555,6 +555,7 @@ private:
 	std::vector<double> scratch_attrWideCarrier;
 	std::vector<double> scratch_attrBandYClaim;
 	std::vector<double> scratch_attrMembershipY;
+	std::vector<double> scratch_impulseExempt;
 	std::vector<char> scratch_vdis_flag;
 	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;

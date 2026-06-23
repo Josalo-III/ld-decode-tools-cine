@@ -1360,6 +1360,39 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
             // ------------------------------------------------------------
+            // Impulse scoring.
+            //
+            // Isolated narrow luma peaks (stars in black sky) produce false
+            // chroma in the field combs because 1D reads the sub-carrier-
+            // period spike as carrier. The frame comb cancels the error via
+            // interfield differencing (the spike is stationary, so the
+            // temporal difference nulls it). Reward low chroma magnitude at
+            // impulse sites (any candidate that stays near zero is right)
+            // and give Frame a slight bonus since its mechanism is correct.
+            // ------------------------------------------------------------
+            {
+                const double impulseT =
+                    (attrRow && rel < width)
+                        ? std::clamp(attrRow[rel].facts.lumaImpulseRisk, 0.0, 1.0)
+                        : 0.0;
+
+                if (impulseT > 0.0) {
+                    const double aM = std::fabs(FA) * invI;
+                    const double bM = std::fabs(FB) * invI;
+                    const double rM = std::fabs(FR) * invI;
+                    const double IMPULSE_CHROMA_PEN = 0.14;
+                    const double chromaPen = IMPULSE_CHROMA_PEN * impulseT;
+                    scoreA *= (1.0 + chromaPen * std::clamp(aM / 4.0, 0.0, 1.0));
+                    scoreB *= (1.0 + chromaPen * std::clamp(bM / 4.0, 0.0, 1.0));
+                    scoreR *= (1.0 + chromaPen * std::clamp(rM / 4.0, 0.0, 1.0));
+
+                    if (!frameInsane && !managementVeto) {
+                        const double IMPULSE_FRAME_BONUS = 0.10;
+                        scoreR *= (1.0 - IMPULSE_FRAME_BONUS * impulseT);
+                    }
+                }
+            }
+            // ------------------------------------------------------------
             // Immediate-neighbor anchor scoring.
             //
             // This is image-local neighbor shaping, not same-phase carrier
@@ -1736,6 +1769,11 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
 
         scratch_attrWideCarrier[rel] = std::max(f.bandpassMidIRE, f.bandpassCoarseIRE);
         scratch_attrBandYClaim[rel] = f.lumaExcursionIRE;
+
+        f.lumaImpulseRisk =
+            (rel < (int)scratch_impulseExempt.size())
+                ? scratch_impulseExempt[rel]
+                : 0.0;
 
     }
 

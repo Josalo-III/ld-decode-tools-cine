@@ -558,6 +558,8 @@ struct CombAttributionFacts {
     double sidebandCosResidualIRE = 0.0;
     double sidebandAxisAsymmetry = 0.0;
     double sidebandCurvatureCoherence = 0.0;
+
+    double lumaImpulseRisk = 0.0;
 };
 
 struct CombAttributionAssessment {

@@ -579,6 +579,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         const double hard = T.FIELD_CONTOUR_HARD_IRE;
         const double bevelPenalty = std::clamp(T.FRAME_B_BEVEL_REACH_PENALTY, 0.0, 1.0);
 
+        if ((int)scratch_impulseExempt.size() < width)
+            scratch_impulseExempt.resize(width);
+        std::fill(scratch_impulseExempt.begin(),
+                  scratch_impulseExempt.begin() + width, 0.0);
+
         for (int rel = 0; rel < width; ++rel) {
             double cI, cQ, uI, uQ, dI, dQ;
             carrierGrammarDemodSignedCompositeTo4fsc(
@@ -610,6 +615,27 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             double upGate = std::max(upPair[rel].reachLegalGate, floor.up);
             double dnGate = std::max(dnPair[rel].reachLegalGate, floor.down);
 
+            double impulseExempt = 0.0;
+            if (frameLuma0) {
+                const int l2 = std::max(0, rel - 2);
+                const int r2 = std::min(width - 1, rel + 2);
+                const double cIRE_luma = frameLuma0[rel] * invI;
+                const double lIRE_luma = frameLuma0[l2] * invI;
+                const double rIRE_luma = frameLuma0[r2] * invI;
+                const double surround = 0.5 * (lIRE_luma + rIRE_luma);
+                const double peakIRE = std::fabs(cIRE_luma - surround);
+                const double flanksAgree = std::fabs(lIRE_luma - rIRE_luma);
+                const double IMPULSE_LO_IRE = 5.0;
+                const double IMPULSE_HI_IRE = 15.0;
+                if (flanksAgree < 4.0) {
+                    impulseExempt = std::clamp(
+                        (peakIRE - IMPULSE_LO_IRE) /
+                        (IMPULSE_HI_IRE - IMPULSE_LO_IRE),
+                        0.0, 1.0);
+                }
+                scratch_impulseExempt[rel] = impulseExempt;
+            }
+
             if (haveCloseLuma && bevelPenalty > 0.0) {
                 const auto mcNear = CombContentReach::evaluateMovingCoarseContour(
                     frameLuma0[rel]  * invI,
@@ -630,8 +656,10 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         std::clamp(1.0 - bevelPenalty * chromaWeight *
                                    (1.0 - std::clamp(mcNear.straightness, 0.0, 1.0)),
                                    0.0, 1.0);
-                    upGate *= bevelGate;
-                    dnGate *= bevelGate;
+                    const double effectiveGate =
+                        bevelGate + (1.0 - bevelGate) * impulseExempt;
+                    upGate *= effectiveGate;
+                    dnGate *= effectiveGate;
                 }
             }
 
@@ -1081,6 +1109,80 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
             wDn2 *= (1.0 - eDn);
         }
 
+        double boundaryCede = 0.0;
+        if (rel < (int)tapLine.pairU2.size() &&
+            rel < (int)tapLine.pairD2.size() &&
+            rel < (int)tapLine.hLumaDeltaIRE.size())
+        {
+            const double hEdge = std::clamp(
+                (tapLine.hLumaDeltaIRE[rel] - 0.45 * hEdgeThreshIRE) /
+                (0.55 * hEdgeThreshIRE),
+                0.0,
+                1.0);
+
+            if (hEdge > 0.0) {
+                const double dUp0IRE = tapLine.pairU2[rel].diffIRE;
+                const double dDn0IRE = tapLine.pairD2[rel].diffIRE;
+                const double scalarUpDn = std::fabs(Cup2 - Cdn2) * invI;
+                const double lumaUpDn =
+                    (rel < (int)tapLine.coarseU2IRE.size() &&
+                     rel < (int)tapLine.coarseD2IRE.size())
+                        ? std::fabs(tapLine.coarseU2IRE[rel] - tapLine.coarseD2IRE[rel])
+                        : scalarUpDn;
+                const double dUpDnIRE =
+                    scalarUpDn * (1.0 - chromaT) + lumaUpDn * chromaT;
+                const double diffGapIRE = std::fabs(dUp0IRE - dDn0IRE);
+                const double bestDiffIRE = std::min(dUp0IRE, dDn0IRE);
+                const double worstDiffIRE = std::max(dUp0IRE, dDn0IRE);
+                const double diffRatio =
+                    (worstDiffIRE > 1e-9) ? (bestDiffIRE / worstDiffIRE) : 1.0;
+                const double wBest = std::min(tapLine.pairU2[rel].weight,
+                                              tapLine.pairD2[rel].weight);
+                const double wWorst = std::max(tapLine.pairU2[rel].weight,
+                                               tapLine.pairD2[rel].weight);
+                const double wRatio =
+                    (wWorst > 1e-9) ? (wBest / wWorst) : 1.0;
+
+                const double matchIRE = 3.5;
+                const double betweenIRE = 6.0;
+                const double edgeUdIRE = 8.0;
+
+                if (dUpDnIRE > edgeUdIRE) {
+                    const bool preferUp = (dUp0IRE <= dDn0IRE);
+                    const bool hardPreferUp =
+                        preferUp &&
+                        ((dUp0IRE < matchIRE && dDn0IRE > betweenIRE) ||
+                         (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
+                         (bestDiffIRE < 5.0 && wRatio < 0.45));
+                    const bool hardPreferDn =
+                        !preferUp &&
+                        ((dDn0IRE < matchIRE && dUp0IRE > betweenIRE) ||
+                         (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
+                         (bestDiffIRE < 5.0 && wRatio < 0.45));
+
+                    if (hardPreferUp) {
+                        wDn2 = 0.0;
+                        wUp2 = std::max(wUp2, 0.40 + 0.60 * hEdge);
+                    } else if (hardPreferDn) {
+                        wUp2 = 0.0;
+                        wDn2 = std::max(wDn2, 0.40 + 0.60 * hEdge);
+                    } else {
+                        const double sideGapT =
+                            std::clamp((diffGapIRE - 1.0) / 4.0, 0.0, 1.0);
+                        const double cedeT =
+                            std::clamp((bestDiffIRE - 3.0) / 6.0, 0.0, 1.0);
+
+                        if (preferUp)
+                            wDn2 *= std::max(0.0, 1.0 - 0.85 * hEdge * (0.35 + 0.65 * sideGapT));
+                        else
+                            wUp2 *= std::max(0.0, 1.0 - 0.85 * hEdge * (0.35 + 0.65 * sideGapT));
+
+                        boundaryCede = std::max(boundaryCede, 0.70 * hEdge * cedeT);
+                    }
+                }
+            }
+        }
+
         double sc2 = 1.0;
         if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
             if (wDn2 > 3.0 * wUp2)      wUp2 = 0.0;
@@ -1161,7 +1263,7 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
                     std::clamp(T.FIELD_B_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
             }
 
-            const double totalCede = std::max(lumaEdgeCede, bevelCede);
+            const double totalCede = std::max({lumaEdgeCede, bevelCede, boundaryCede});
             if (totalCede > 0.0)
                 tc = tc * (1.0 - totalCede) + C * totalCede;
         }
