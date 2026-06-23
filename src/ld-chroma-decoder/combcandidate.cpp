@@ -555,7 +555,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         // area checkers do not sit on horizontal luma edges and the floor's
         // internal gates already discriminate.  See
         // project_frameb_comb_must_run.
-        const double minChromaIRE = std::max(0.0, T.FRAME_CHROMA_MIN_IRE);
+        const double minChromaIRE = std::max(0.0, T.FRAME_B_CHROMA_MIN_IRE);
         auto phaseCursor = [&](int ln) {
             return carrierGrammarSignedSampleCursor(
                 configuration.phaseCompensation ? carrierGrammarLine(ln) : nullptr,
@@ -596,26 +596,22 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             carrierGrammarDemodSignedCompositeTo4fsc(
                 phaseDCursor, tapLine.tapD1[rel].comp, dI, dQ);
 
-            // KNOWN ISSUE (deferred to Frame B's pass — see comb-reach
-            // archeology note 2026-06-21): cI..dQ are raw composite-domain
-            // (demod4fscFromComposite is unscaled), but interfieldIQReachFloor
-            // thresholds minChromaIRE / residualMinIRE in IRE. The Frame A site
-            // and the bevel/contour calls below scale by invI; this one does
-            // not, so the floor's chroma-presence gates saturate. Phase terms
-            // (anti-phase, magnitude ratio) are scale-invariant and still work,
-            // so the floor over-fires rather than failing. Fix is `*= invI` on
-            // the demod outputs, then re-tune — left for the dedicated Frame B day.
+            // Frame B's reach-floor inputs are IRE-domain signed IQ to match
+            // the reach-floor contract (IRE thresholds in, IRE thresholds out).
+            const double cIf = cI * invI;
+            const double cQf = cQ * invI;
+            const double uIf = uI * invI;
+            const double uQf = uQ * invI;
+            const double dIf = dI * invI;
+            const double dQf = dQ * invI;
             // Fast overload: supplying pre-computed magnitudes saves ~12
             // hypots/pixel that the slow overload recomputes internally.
-            // Magnitudes are in the same composite-domain units as cI/cQ etc.
-            // (matching the slow overload's internal scaling — see the
-            // KNOWN ISSUE note above).
-            const double cMag = std::hypot(cI, cQ);
-            const double uMag = std::hypot(uI, uQ);
-            const double dMag = std::hypot(dI, dQ);
+            const double cMag = std::hypot(cIf, cQf);
+            const double uMag = std::hypot(uIf, uQf);
+            const double dMag = std::hypot(dIf, dQf);
             const CombContentReach::InterfieldIQReachFloor floor =
                 CombContentReach::interfieldIQReachFloor(
-                    cI, cQ, uI, uQ, dI, dQ,
+                    cIf, cQf, uIf, uQf, dIf, dQf,
                     true, true, minChromaIRE, 1.0,
                     cMag, uMag, dMag);
 
@@ -2365,8 +2361,7 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
     const double combStrength =
         std::clamp(std::max(0.0, T.FRAME_B_COMB_STRENGTH), 0.0, 1.0);
 
-    const double maxDeltaIRE =
-        std::max(0.0, T.FRAME_IQ_RAW_MAX_DELTA_IRE);
+    const double maxDeltaIRE = std::max(0.0, T.FRAME_B_RAW_MAX_DELTA_IRE);
 
     const bool verticalAllowed = carrierFrameVerticalAllowed(line);
     const bool haveUpLine = verticalAllowed && (line - 1 >= first);

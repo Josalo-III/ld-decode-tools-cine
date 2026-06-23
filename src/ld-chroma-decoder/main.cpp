@@ -276,7 +276,7 @@ int main(int argc, char *argv[])
     QCommandLineOption twoDVariantOption(
         QStringList() << QCoreApplication::translate("main", "two-d-variant"),
         QCoreApplication::translate("main",
-            "2D comb variant: line | field-a-contour | field-b-simple | frame-a-adaptive-iq | frame-b-direct-iq | fvf (default)"),
+            "2D comb variant: line | field-a-contour | field-b-simple | frame-a-adaptive-iq | frame-b-direct-iq | frame-c-direct-iq | fvf (default)"),
         QCoreApplication::translate("main", "variant"),
         QCoreApplication::translate("main", "fvf"));
     parser.addOption(twoDVariantOption);
@@ -459,7 +459,9 @@ int main(int argc, char *argv[])
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ;
     } else if (v == "frame-b-direct-iq" || v == "direct-frame-iq" ||
                v == "locked-frame-iq" || v == "frameb" || v == "frame-b" || v == "frame-b-preclean" ||
-               v == "frame-raw" || v == "raw-frame") {
+               v == "frame-raw" || v == "raw-frame" ||
+               v == "frame-c-direct-iq" || v == "framec" || v == "frame-c" ||
+               v == "proper-frame-iq" || v == "proper-frame-b" || v == "frame-b-proper") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameBDirectIQ;
     } else if (v == "frame") {
         // Backward-compat: historically "frame" was ambiguous / repurposed in experiments.

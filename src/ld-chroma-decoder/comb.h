@@ -85,7 +85,7 @@ public:
             FieldAContour,    // Field A: contour-aware same-field +/-2 comb with +/-4 support
             FieldBSimple,     // Field B: direct same-field +/-2 comb
             FrameAAdaptiveIQ, // Frame A: column-phase-aligned adaptive interframe IQ comb
-            FrameBDirectIQ,   // Frame B: direct interframe IQ comb without neighbor phase alignment
+            FrameBDirectIQ,   // Frame B: direct interframe IQ comb with IRE-domain reach-floor inputs
             FieldVsFrame      // FVF (Default)
         };
         TwoDVariant twoDVariant = FieldVsFrame;
@@ -140,10 +140,12 @@ public:
             // Frame comb on phase-corrected 1D
             // =========================================================================
             double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
-            double FRAME_B_COMB_STRENGTH      = 1.00;  // for Frame B's direct interframe path
-            double FRAME_CHROMA_MIN_IRE       = 1.5;   // minimum chroma amplitude to engage the frame IQ path
-            double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;   // max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
-            double FRAME_B_BEVEL_REACH_PENALTY = 1.0; // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
+            double FRAME_CHROMA_MIN_IRE       = 1.5;   // Frame A minimum chroma amplitude to engage the frame IQ path
+            double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
+            double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B center detent: 0.5 * combStrength * reachAuthority pull
+            double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
+            double FRAME_B_RAW_MAX_DELTA_IRE   = 12.0; // Frame B IRE-domain direct-IQ delta cap
+            double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -639,6 +641,10 @@ private:
 	std::vector<double> scratch_fvf_diffFVF;
 	std::vector<double> scratch_fvf_satMap;
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
+	std::vector<double> scratch_fvf_notchFieldA; // per-line Field A notch-luma pre-pass
+	std::vector<double> scratch_fvf_notchFieldB; // per-line Field B notch-luma pre-pass
+	std::vector<double> scratch_fvf_notchFrame;  // per-line Frame B notch-luma pre-pass
+	std::vector<double> scratch_fvf_notchSource; // per-line source notch-luma pre-pass
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
 	std::vector<double> scratch_coe_frameIQMag; // pre-computed |frameIQ[r]| magnitudes (collectCombAttributionEvidence)
 		std::vector<double> scratch_lineWorkD; // Generic per-line filter scratch.
@@ -929,8 +935,7 @@ private:
 	    const std::vector<std::complex<double>> &dnIQ,
 	    std::vector<std::complex<double>> &outFrameIQ,
 	    const CombTapLine *reachTapLine = nullptr);
-	    
-	    
+
 	void computeFrameIQFromPreparedVectors(int line,
 											   const std::vector<std::complex<double>> &centerIQ,
 											   std::vector<std::complex<double>> &upIQ,

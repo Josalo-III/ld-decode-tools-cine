@@ -991,7 +991,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
-    (void)tapLine;
 
     if (width <= 0) return;
     if (!fieldB || !frameB || (int)fieldA.size() < width ||
@@ -1045,67 +1044,32 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // Below this FVF candidate difference, candidates are close enough that frame is preferred (IRE)
     const double FVF_SMALL_DIFF_IRE = (T.FVF_SMALL_DIFF_IRE > 0.0) ? T.FVF_SMALL_DIFF_IRE : 3.0;
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
+    const AttributionEvidence *attrRow = attributionEvidence_line(line);
+    const double *attrAuthorityRow =
+        ((int)scratch_attrMembershipY.size() >= width)
+            ? scratch_attrMembershipY.data()
+            : nullptr;
+    const double *sample1DRow = lateral1D
+        ? lateral1D
+        : (clpbuffer[srcBufIndex].pixel[line] + left);
+    const int up1Line = std::clamp(line - 1, firstLine, lastLine - 1);
+    const int dn1Line = std::clamp(line + 1, firstLine, lastLine - 1);
+    const int up2Line = std::clamp(line - 2, firstLine, lastLine - 1);
+    const int dn2Line = std::clamp(line + 2, firstLine, lastLine - 1);
+    const bool haveVert2 = (line - 2 >= firstLine) && (line + 2 < lastLine);
+    const double *srcLine = clpbuffer[srcBufIndex].pixel[line] + left;
+    const double *srcUp1 = clpbuffer[srcBufIndex].pixel[up1Line] + left;
+    const double *srcDn1 = clpbuffer[srcBufIndex].pixel[dn1Line] + left;
+    const double *srcUp2 = clpbuffer[srcBufIndex].pixel[up2Line] + left;
+    const double *srcDn2 = clpbuffer[srcBufIndex].pixel[dn2Line] + left;
 
     auto sample1D = [&](int rel)->double {
-        if (lateral1D) {
-            int r = std::clamp(rel, 0, width - 1);
-            return lateral1D[r];
-        } else {
-            int h = left + std::clamp(rel, 0, width - 1);
-            return clpbuffer[srcBufIndex].pixel[line][h];
-        }
-    };
-    auto sampleRawVert = [&](int ln, int rel)->double {
-        if (ln < firstLine) ln = firstLine;
-        if (ln >= lastLine) ln = lastLine - 1;
-        rel = std::clamp(rel, 0, width - 1);
-        int h = left + rel;
-        return clpbuffer[srcBufIndex].pixel[ln][h];
-    };
-    auto getNotchLuma = [&](const double* arr, int rel) -> double {
-        if (rel < 2) return arr[rel];
-        if (rel >= width - 2) return arr[rel];
-        double c = arr[rel], l = arr[rel - 2], r = arr[rel + 2];
-        return 0.25 * (l + 2.0 * c + r);
-    };
-    auto getNotchLumaVec = [&](const std::vector<double>& vec, int rel) -> double {
-        if (rel < 2) return vec[rel];
-        if (rel >= width - 2) return vec[rel];
-        double c = vec[rel], l = vec[rel - 2], r = vec[rel + 2];
-        return 0.25 * (l + 2.0 * c + r);
-    };
-    auto notchScalar = [&](int ln, int r) -> double {
-        double c  = sampleRawVert(ln, r);
-        double l  = sampleRawVert(ln, r - 2);
-        double rv = sampleRawVert(ln, r + 2);
-        return 0.25 * (l + 2.0 * c + rv);
+        return sample1DRow[std::clamp(rel, 0, width - 1)];
     };
     auto vertContrastIRE = [&](int rel)->double {
-        int upLine = line - 2, dnLine = line + 2;
-        if (upLine < firstLine || dnLine >= lastLine) return 0.0;
-        int h = left + rel;
-        double up = clpbuffer[srcBufIndex].pixel[upLine][h];
-        double dn = clpbuffer[srcBufIndex].pixel[dnLine][h];
-        return std::fabs(up - dn) * invI;
-    };
-    auto horizEdgeIRE = [&](int rel)->double {
-        int h = left + rel;
-        int hm1 = std::max(left, h - 1);
-        int hp1 = std::min(right - 1, h + 1);
-        double cL = clpbuffer[srcBufIndex].pixel[line][hm1];
-        double cR = clpbuffer[srcBufIndex].pixel[line][hp1];
-        return std::fabs(cR - cL) * invI;
-    };
-    auto vCoherenceErrFrameIRE = [&](int rel, double FR)->double {
-        const int h = left + rel;
-        auto sampleLine = [&](int ln)->double {
-            int l = std::clamp(ln, firstLine, lastLine - 1);
-            return clpbuffer[srcBufIndex].pixel[l][h];
-        };
-        double Cup = sampleLine(line - 1);
-        double C0  = sampleLine(line);
-        double Cdn = sampleLine(line + 1);
-        return 0.5 * (std::fabs(Cup - FR) + std::fabs(Cdn - FR)) * invI;
+        if (!haveVert2) return 0.0;
+        rel = std::clamp(rel, 0, width - 1);
+        return std::fabs(srcUp2[rel] - srcDn2[rel]) * invI;
     };
 
     if ((int)scratch_fvf_winner.size() != width) {
@@ -1122,12 +1086,24 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         std::fill(scratch_fvf_diffFVF.begin(), scratch_fvf_diffFVF.end(), 0.0);
         std::fill(scratch_fvf_satMap.begin(), scratch_fvf_satMap.end(), 0.0);
     }
+    if ((int)scratch_fvf_notchFieldA.size() != width)
+        scratch_fvf_notchFieldA.resize(width);
+    if ((int)scratch_fvf_notchFieldB.size() != width)
+        scratch_fvf_notchFieldB.resize(width);
+    if ((int)scratch_fvf_notchFrame.size() != width)
+        scratch_fvf_notchFrame.resize(width);
+    if ((int)scratch_fvf_notchSource.size() != width)
+        scratch_fvf_notchSource.resize(width);
 
     std::vector<int>    &winner   = scratch_fvf_winner;
     std::vector<double> &outVal   = scratch_fvf_outVal;
     std::vector<float>  &outShade = scratch_fvf_outShade;
     std::vector<double> &diffFVF  = scratch_fvf_diffFVF;
     std::vector<double> &satMap   = scratch_fvf_satMap;
+    std::vector<double> &notchFieldA = scratch_fvf_notchFieldA;
+    std::vector<double> &notchFieldB = scratch_fvf_notchFieldB;
+    std::vector<double> &notchFrame  = scratch_fvf_notchFrame;
+    std::vector<double> &notchSource = scratch_fvf_notchSource;
     int fieldCountTotal = 0, frameCountTotal = 0;
 
     const double SAT_FALLBACK_START = 6.0;
@@ -1205,6 +1181,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         std::fill(scratch_fvf_iqMag.begin(), scratch_fvf_iqMag.begin() + width, 0.0);
     }
 
+    for (int r = 0; r < width; ++r) {
+        notchFieldA[r] = getNotchLumaEven2(fieldAData, r, width);
+        notchFieldB[r] = getNotchLumaEven2(fieldB, r, width);
+        notchFrame[r] = getNotchLumaEven2Vec(frameB2, r);
+        notchSource[r] = getNotchLumaEven2(srcLine, r, width);
+    }
+
     for (int rel = 0; rel < width; ++rel) {
         double FA = fieldA[rel];
         double FB = fieldB[rel];
@@ -1226,15 +1209,15 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         // Luma proxies: prefer the pure even-offset notch (±2 average), which is
         // less sensitive to single-pixel spikes than a [1,2,1] that includes center.
-        double lumFA = getNotchLumaEven2(fieldAData, rel, width);
-        double lumFB = getNotchLumaEven2(fieldB, rel, width);
-        double lumFR = getNotchLumaEven2Vec(frameB2, rel);
+        double lumFA = notchFieldA[rel];
+        double lumFB = notchFieldB[rel];
+        double lumFR = notchFrame[rel];
 
 
-        double Cpm1 = sampleRawVert(line - 1, rel);
-        double Cpp1 = sampleRawVert(line + 1, rel);
-        double Cpm2 = sampleRawVert(line - 2, rel);
-        double Cpp2 = sampleRawVert(line + 2, rel);
+        double Cpm1 = srcUp1[rel];
+        double Cpp1 = srcDn1[rel];
+        double Cpm2 = srcUp2[rel];
+        double Cpp2 = srcDn2[rel];
 
         double frameLikeStack = 0.5 * (Cpm1 + Cpp1);
         double fieldLikeStack = 0.5 * (Cpm2 + Cpp2);
@@ -1273,7 +1256,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         prev_sat_t = sat_t;
 
         double vIRE = vertContrastIRE(rel);
-        double hIRE = horizEdgeIRE(rel);
+        double hIRE = (rel < (int)tapLine.hLumaDeltaIRE.size())
+            ? tapLine.hLumaDeltaIRE[rel]
+            : 0.0;
 
 
         FvfModelMetrics metrics;
@@ -1452,10 +1437,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     (line >= firstLine && line < lastLine);
 
                 if (canEval) {
-                    const double *srcLine = clpbuffer[srcBufIndex].pixel[line] + left;
                     auto srcNotch = [&](int r)->double {
-                        r = std::clamp(r, 0, width - 1);
-                        return getNotchLumaEven2(srcLine, r, width);
+                        return notchSource[std::clamp(r, 0, width - 1)];
                     };
 
                     const double lNear = srcNotch(rel - (EDGE_GAP + EDGE_PROBE_NEAR));
@@ -1487,8 +1470,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                                                 const double *arr,
                                                 const std::vector<double> *vec)
                     {
-                        const double m2 = arr ? getNotchLuma(arr, rm2) : getNotchLumaVec(*vec, rm2);
-                        const double p2 = arr ? getNotchLuma(arr, rp2) : getNotchLumaVec(*vec, rp2);
+                        const double *notch = arr
+                            ? (arr == fieldAData ? notchFieldA.data() : notchFieldB.data())
+                            : notchFrame.data();
+                        const double m2 = notch[rm2];
+                        const double p2 = notch[rp2];
                         const double candStepIRE = std::fabs(p2 - m2) * invI;
 
                         // Reward only if candidate has plausibly settled to the two plateaus.
@@ -1521,21 +1507,22 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             //   - luma-incursion / cross-color evidence penalizes candidates that depart
             //     from the 1D rail in luma-claimed regions.
             {
-                const AttributionEvidence *attrRow = attributionEvidence_line(line);
-            
                 if (attrRow) {
                     const auto &facts = attrRow[rel].facts;
                     const auto &ass   = attrRow[rel].assessment;
-            
-                    const double chromaClaim = std::clamp(ass.chromaClaim, 0.0, 1.0);
-                    const double lumaClaim   = std::clamp(ass.lumaClaim,   0.0, 1.0);
-                    const double uncertain   = std::clamp(ass.uncertainClaim, 0.0, 1.0);
-                    const double conflict    = std::clamp(ass.attributionConflict, 0.0, 1.0);
-            
-                    const double attrAuthority =
-                        std::clamp(1.0 - 0.65 * conflict - 0.35 * uncertain, 0.0, 1.0);
-            
+
+                    const double attrAuthority = attrAuthorityRow
+                        ? attrAuthorityRow[rel]
+                        : std::clamp(
+                            1.0 -
+                                0.65 * std::clamp(ass.attributionConflict, 0.0, 1.0) -
+                                0.35 * std::clamp(ass.uncertainClaim, 0.0, 1.0),
+                            0.0,
+                            1.0);
+
                     if (attrAuthority > 0.0) {
+                        const double chromaClaim = std::clamp(ass.chromaClaim, 0.0, 1.0);
+                        const double lumaClaim   = std::clamp(ass.lumaClaim,   0.0, 1.0);
                         const double aMag = std::fabs(FA) * invI;
                         const double bMag = std::fabs(FB) * invI;
                         const double rMag = std::fabs(FR) * invI;
@@ -1819,7 +1806,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         for (int rel = 1; rel < width - 1; ++rel) {
             if (satMap[rel] > SAT_FALLBACK_START) continue;
-            if (horizEdgeIRE(rel) > EDGE_STOP_IRE) continue;
+            const double hEdgeIRE = (rel < (int)tapLine.hLumaDeltaIRE.size())
+                ? tapLine.hLumaDeltaIRE[rel]
+                : 0.0;
+            if (hEdgeIRE > EDGE_STOP_IRE) continue;
             if (diffFVF[rel] > DIFF_STOP_IRE) continue;
 
             int L = winner[rel - 1];
@@ -1908,10 +1898,9 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
         return;
 
     const bool haveFrameScalar = !frameScalar.empty();
-
-    auto sampleFrameScalar = [&](int r) -> double {
-        return frameScalar[std::clamp(r, 0, (int)frameScalar.size() - 1)];
-    };
+    const double *frameScalarData = haveFrameScalar ? frameScalar.data() : nullptr;
+    const bool frameScalarWideEnough =
+        haveFrameScalar && (int)frameScalar.size() >= width;
 
     // Pre-compute |frameIQ[r]| magnitudes once, then derive coherence from
     // additions instead of redundant hypot calls.  Old path: 4 hypot/pixel in
@@ -1920,15 +1909,26 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
     // the pre-computed mag for frameChromaIRE (0 additional).
     const bool haveFrameIQ = frameIQ && !frameIQ->empty();
     const int iqN = haveFrameIQ ? (int)frameIQ->size() : 0;
+    const std::complex<double> *frameIQData = haveFrameIQ ? frameIQ->data() : nullptr;
 
     if ((int)scratch_coe_frameIQMag.size() != width)
         scratch_coe_frameIQMag.resize(width);
+    if ((int)scratch_attrWideCarrier.size() != width)
+        scratch_attrWideCarrier.resize(width);
+    if ((int)scratch_attrBandYClaim.size() != width)
+        scratch_attrBandYClaim.resize(width);
+    if ((int)scratch_attrMembershipY.size() != width)
+        scratch_attrMembershipY.resize(width);
     if (haveFrameIQ) {
-        for (int r = 0; r < width; ++r) {
-            const int ri = std::clamp(r, 0, iqN - 1);
-            const auto &z = (*frameIQ)[ri];
+        const int n = std::min(width, iqN);
+        for (int r = 0; r < n; ++r) {
+            const auto &z = frameIQData[r];
             scratch_coe_frameIQMag[r] = std::hypot(z.real(), z.imag());
         }
+        const double tailMag = (n > 0) ? scratch_coe_frameIQMag[n - 1] : 0.0;
+        std::fill(scratch_coe_frameIQMag.begin() + n,
+                  scratch_coe_frameIQMag.begin() + width,
+                  tailMag);
     } else {
         std::fill(scratch_coe_frameIQMag.begin(),
                   scratch_coe_frameIQMag.begin() + width, 0.0);
@@ -1948,7 +1948,8 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
             const double magSum = scratch_coe_frameIQMag[std::clamp(r - 2, 0, width - 1)]
                                 + scratch_coe_frameIQMag[r]
                                 + scratch_coe_frameIQMag[std::clamp(r + 2, 0, width - 1)];
-            const std::complex<double> sum = (*frameIQ)[rm2] + (*frameIQ)[rr] + (*frameIQ)[rp2];
+            const std::complex<double> sum =
+                frameIQData[rm2] + frameIQData[rr] + frameIQData[rp2];
             scratch_coe_coherence[r] = (magSum > 1e-9)
                 ? std::clamp(std::hypot(sum.real(), sum.imag()) / magSum, 0.0, 1.0)
                 : 0.0;
@@ -1963,7 +1964,11 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
 
         const double fa = fieldA[rel];
         const double fb = fieldB[rel];
-        const double fr = haveFrameScalar ? sampleFrameScalar(rel) : 0.0;
+        const double fr = frameScalarWideEnough
+            ? frameScalarData[rel]
+            : (haveFrameScalar
+                ? frameScalarData[std::clamp(rel, 0, (int)frameScalar.size() - 1)]
+                : 0.0);
 
         f.fieldAChromaIRE = std::fabs(fa) * invIreScale;
         f.fieldBChromaIRE = std::fabs(fb) * invIreScale;
@@ -1987,6 +1992,9 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
         f.frameIQCoherence = scratch_coe_coherence[rel]
                              * (0.3 + 0.7 * lineMeanFrameCoherence);
 
+        scratch_attrWideCarrier[rel] = std::max(f.bandpassMidIRE, f.bandpassCoarseIRE);
+        scratch_attrBandYClaim[rel] = f.lumaExcursionIRE;
+
     }
 
     // Carrier prior + finalize in a single pass over the row.
@@ -2001,18 +2009,18 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
         const int rp4 = std::min(width - 1, rel + 4);
         AttributionEvidence &e = row[rel];
         e.assessment.carrierPrior = lineCarrierPrior;
-        const AttributionFacts &leftFacts = row[rm4].facts;
-        const AttributionFacts &rightFacts = row[rp4].facts;
-        const double leftBaseIRE = std::max(leftFacts.bandpassMidIRE,
-                                            leftFacts.bandpassCoarseIRE);
-        const double rightBaseIRE = std::max(rightFacts.bandpassMidIRE,
-                                             rightFacts.bandpassCoarseIRE);
 
         finalizeAttributionClaims(
             e,
-            0.5 * (leftFacts.lumaExcursionIRE + rightFacts.lumaExcursionIRE),
-            0.5 * (leftBaseIRE + rightBaseIRE),
+            0.5 * (scratch_attrBandYClaim[rm4] + scratch_attrBandYClaim[rp4]),
+            0.5 * (scratch_attrWideCarrier[rm4] + scratch_attrWideCarrier[rp4]),
             lineForwardErrorIRE);
+        scratch_attrMembershipY[rel] = std::clamp(
+            1.0 -
+                0.65 * e.assessment.attributionConflict -
+                0.35 * e.assessment.uncertainClaim,
+            0.0,
+            1.0);
     }
 }
 
