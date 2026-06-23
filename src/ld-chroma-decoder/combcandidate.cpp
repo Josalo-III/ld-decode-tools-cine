@@ -556,15 +556,14 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         // internal gates already discriminate.  See
         // project_frameb_comb_must_run.
         const double minChromaIRE = std::max(0.0, T.FRAME_CHROMA_MIN_IRE);
-        const bool locked = configuration.phaseCompensation;
-
-        auto demodAt = [&](const CombTapScalar &s, int ln, int h,
-                           double &iOut, double &qOut) {
-            const int phase = locked
-                ? carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h)
-                : h;
-            demod4fscFromComposite(s.comp, phase, iOut, qOut);
+        auto phaseCursor = [&](int ln) {
+            return carrierGrammarSignedSampleCursor(
+                configuration.phaseCompensation ? carrierGrammarLine(ln) : nullptr,
+                left);
         };
+        auto phase0Cursor = phaseCursor(tapLine.ln0);
+        auto phaseUCursor = phaseCursor(tapLine.lnU1);
+        auto phaseDCursor = phaseCursor(tapLine.lnD1);
 
         // Close-focused coarse contour for the ±1 bevel zipper guard.
         // movingCoarseContour evaluates straightness over ±2/±4; reuse the
@@ -589,11 +588,13 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         const double bevelPenalty = std::clamp(T.FRAME_B_BEVEL_REACH_PENALTY, 0.0, 1.0);
 
         for (int rel = 0; rel < width; ++rel) {
-            const int h = left + rel;
             double cI, cQ, uI, uQ, dI, dQ;
-            demodAt(tapLine.tap0[rel],  tapLine.ln0,  h, cI, cQ);
-            demodAt(tapLine.tapU1[rel], tapLine.lnU1, h, uI, uQ);
-            demodAt(tapLine.tapD1[rel], tapLine.lnD1, h, dI, dQ);
+            carrierGrammarDemodSignedCompositeTo4fsc(
+                phase0Cursor, tapLine.tap0[rel].comp, cI, cQ);
+            carrierGrammarDemodSignedCompositeTo4fsc(
+                phaseUCursor, tapLine.tapU1[rel].comp, uI, uQ);
+            carrierGrammarDemodSignedCompositeTo4fsc(
+                phaseDCursor, tapLine.tapD1[rel].comp, dI, dQ);
 
             // KNOWN ISSUE (deferred to Frame B's pass — see comb-reach
             // archeology note 2026-06-21): cI..dQ are raw composite-domain
@@ -1677,6 +1678,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 }
 
 static inline double cmag(const std::complex<double> &z) { return std::hypot(z.real(), z.imag()); }
+static inline double cmag2(const std::complex<double> &z) { return z.real() * z.real() + z.imag() * z.imag(); }
 static inline double dotIQ(const std::complex<double> &a, const std::complex<double> &b) { return a.real()*b.real() + a.imag()*b.imag(); }
 
 static inline std::complex<double> applyColumnPhaseAlignment(
@@ -2156,68 +2158,71 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
     const float *tiDn_raw = (verticalAllowed && line + 1 <  last)  ? tiLine(line + 1) : nullptr;
     const float *tqDn_raw = (verticalAllowed && line + 1 <  last)  ? tqLine(line + 1) : nullptr;
 
-    // Preclean demod helper: demod precleanRing[ln][x] -> Grid4fscIQ.
-    // Frame A is an interfield ±1 IQ comb; it needs polarity.  In locked
-    // mode the unsigned phase yields IQ that inherits raw signs and the
-    // combine flips real chroma.  Sign-class folds lineFlip into the phase
-    // (Grid4fscIQ convention) — see the warning at locked1DSource_flat.
-    auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
-        if (ln < first || ln >= last) return false;
-        const double *row = precleanLinePtr(ln, width);
-        if (!row) return false;
-        const int h = left + x;
-        const double c = row[x];
-        double i4fsc = 0.0, q4fsc = 0.0;
-        const int phase = configuration.phaseCompensation
-            ? carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h)
-            : h;
-        demod4fscFromComposite(c, phase, i4fsc, q4fsc);
-        Z = std::complex<double>(i4fsc, q4fsc);
-        return true;
-    };
-
-    auto demodCenterScalarAt = [&](int ln, int x, std::complex<double> &Z)->bool {
-        if (ln < first || ln >= last) return false;
-        const double *row = configuration.phaseCompensation
+    auto scalarLine = [&](int ln)->const double* {
+        if (ln < first || ln >= last) return nullptr;
+        return configuration.phaseCompensation
             ? locked1DSource_line(ln)
             : bucketScalar1D_line(ln);
-        if (!row) return false;
-        const int h = left + x;
-        double i4fsc = 0.0, q4fsc = 0.0;
-        const int phase = configuration.phaseCompensation
-            ? carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h)
-            : h;
-        demod4fscFromComposite(row[x], phase, i4fsc, q4fsc);
-        Z = std::complex<double>(i4fsc, q4fsc);
-        return true;
     };
+
+    const double *preclean0  = precleanLinePtr(line, width);
+    const double *precleanUp = verticalAllowed ? precleanLinePtr(line - 1, width) : nullptr;
+    const double *precleanDn = verticalAllowed ? precleanLinePtr(line + 1, width) : nullptr;
+
+    const double *scalar0  = scalarLine(line);
+    const double *scalarUp = verticalAllowed ? scalarLine(line - 1) : nullptr;
+    const double *scalarDn = verticalAllowed ? scalarLine(line + 1) : nullptr;
+
+    auto phaseCursor = [&](int ln) {
+        return carrierGrammarSignedSampleCursor(
+            configuration.phaseCompensation ? carrierGrammarLine(ln) : nullptr,
+            left);
+    };
+    auto preclean0Cursor  = phaseCursor(line);
+    auto precleanUpCursor = phaseCursor(line - 1);
+    auto precleanDnCursor = phaseCursor(line + 1);
+    auto scalar0Cursor    = phaseCursor(line);
+    auto scalarUpCursor   = phaseCursor(line - 1);
+    auto scalarDnCursor   = phaseCursor(line + 1);
 
     if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
     if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
     if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
     for (int x = 0; x < width; ++x) {
-        std::complex<double> z;
-        if (demodPrecleanAt(line, x, z)) scratch_centerIQ[x] = z;
-        else if (ti0_raw && tq0_raw) scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
-        else if (demodCenterScalarAt(line, x, z)) scratch_centerIQ[x] = z;
+        if (preclean0)
+            scratch_centerIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(preclean0Cursor, preclean0[x]);
+        else if (ti0_raw && tq0_raw)
+            scratch_centerIQ[x] = std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+        else if (scalar0)
+            scratch_centerIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(scalar0Cursor, scalar0[x]);
         else scratch_centerIQ[x] = std::complex<double>(0.0, 0.0);
 
-        if (verticalAllowed && demodPrecleanAt(line - 1, x, z)) {
-            scratch_upIQ[x] = z;
+        if (precleanUp) {
+            scratch_upIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(precleanUpCursor, precleanUp[x]);
         } else {
-            if (tiUp_raw && tqUp_raw) z = std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x]);
-            else if (verticalAllowed && demodCenterScalarAt(line - 1, x, z)) {}
-            else z = std::complex<double>(0.0, 0.0);
-            scratch_upIQ[x] = z;
+            if (tiUp_raw && tqUp_raw)
+                scratch_upIQ[x] = std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x]);
+            else if (scalarUp)
+                scratch_upIQ[x] =
+                    carrierGrammarDemodSignedCompositeTo4fsc(scalarUpCursor, scalarUp[x]);
+            else
+                scratch_upIQ[x] = std::complex<double>(0.0, 0.0);
         }
 
-        if (verticalAllowed && demodPrecleanAt(line + 1, x, z)) {
-            scratch_dnIQ[x] = z;
+        if (precleanDn) {
+            scratch_dnIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(precleanDnCursor, precleanDn[x]);
         } else {
-            if (tiDn_raw && tqDn_raw) z = std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x]);
-            else if (verticalAllowed && demodCenterScalarAt(line + 1, x, z)) {}
-            else z = std::complex<double>(0.0, 0.0);
-            scratch_dnIQ[x] = z;
+            if (tiDn_raw && tqDn_raw)
+                scratch_dnIQ[x] = std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x]);
+            else if (scalarDn)
+                scratch_dnIQ[x] =
+                    carrierGrammarDemodSignedCompositeTo4fsc(scalarDnCursor, scalarDn[x]);
+            else
+                scratch_dnIQ[x] = std::complex<double>(0.0, 0.0);
         }
     }
 
@@ -2261,23 +2266,6 @@ void Comb::FrameBuffer::computeFrameBDirectIQLine(
     // into the phase (phase + 2 mod 4 == negate both IQ components), which is
     // the lineFlip step that locked1DSource publication left out by
     // construction.
-    auto demodPrecleanAt = [&](int ln, int x, std::complex<double> &Z)->bool {
-        if (ln < first || ln >= last) return false;
-        const double *row = precleanLinePtr(ln, width);
-        if (!row) return false;
-        const int h = left + x;
-        int phase;
-        if (configuration.phaseCompensation) {
-            phase = carrierGrammarSignedSampleClass(carrierGrammarLine(ln), h);
-        } else {
-            phase = h;
-        }
-        double i4fsc = 0.0, q4fsc = 0.0;
-        demod4fscFromComposite(row[x], phase, i4fsc, q4fsc);
-        Z = std::complex<double>(i4fsc, q4fsc);
-        return true;
-    };
-
     auto tiLine = [&](int ln)->const float* {
         if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
             return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
@@ -2301,25 +2289,41 @@ void Comb::FrameBuffer::computeFrameBDirectIQLine(
     const bool haveDnLine = (verticalAllowed && line + 1 <  last);
     const CombTapLine &reachTapLine = ensureCombTapLine(line);
 
+    const double *preclean0  = precleanLinePtr(line, width);
+    const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
+    const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
+
+    auto phaseCursor = [&](int ln) {
+        return carrierGrammarSignedSampleCursor(
+            configuration.phaseCompensation ? carrierGrammarLine(ln) : nullptr,
+            left);
+    };
+
+    auto phase0Cursor  = phaseCursor(line);
+    auto phaseUpCursor = phaseCursor(haveUpLine ? line - 1 : line);
+    auto phaseDnCursor = phaseCursor(haveDnLine ? line + 1 : line);
+
     if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
     if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
     if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
     for (int x = 0; x < width; ++x) {
-        std::complex<double> z;
-        if (demodPrecleanAt(line, x, z))
-            scratch_centerIQ[x] = z;
+        if (preclean0)
+            scratch_centerIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(phase0Cursor, preclean0[x]);
         else
             scratch_centerIQ[x] = { (double)ti0_raw[x], (double)tq0_raw[x] };
 
-        if (haveUpLine && demodPrecleanAt(line - 1, x, z))
-            scratch_upIQ[x] = z;
+        if (precleanUp)
+            scratch_upIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(phaseUpCursor, precleanUp[x]);
         else if (tiUp_raw && tqUp_raw)
             scratch_upIQ[x] = { (double)tiUp_raw[x], (double)tqUp_raw[x] };
         else
             scratch_upIQ[x] = { 0.0, 0.0 };
 
-        if (haveDnLine && demodPrecleanAt(line + 1, x, z))
-            scratch_dnIQ[x] = z;
+        if (precleanDn)
+            scratch_dnIQ[x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(phaseDnCursor, precleanDn[x]);
         else if (tiDn_raw && tqDn_raw)
             scratch_dnIQ[x] = { (double)tiDn_raw[x], (double)tqDn_raw[x] };
         else
@@ -2403,8 +2407,8 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
 
         const std::complex<double> ZUp = upIQ[x];
         const std::complex<double> ZDn = dnIQ[x];
-        const bool haveUp = upReach > 0.0 && cmag(ZUp) > 1e-9;
-        const bool haveDn = dnReach > 0.0 && cmag(ZDn) > 1e-9;
+        const bool haveUp = upReach > 0.0 && cmag2(ZUp) > 1e-18;
+        const bool haveDn = dnReach > 0.0 && cmag2(ZDn) > 1e-18;
 
         double wsum = 0.0;
         std::complex<double> target(0.0, 0.0);
@@ -2468,13 +2472,14 @@ void Comb::FrameBuffer::computeFrameBDirectIQCompositeLine(
     // sample class would leave clpLine in a lineFlip-stripped convention and
     // mis-cancel the chroma in produceY → checkerboard with flipped polarity
     // rather than no checkerboard.
+    auto phaseCursor = carrierGrammarSignedSampleCursor(
+        configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
+        left);
+
     for (int x = 0; x < width; ++x) {
-        const int h = left + x;
         const auto &z = outFrameIQ[x];
-        const int phase = configuration.phaseCompensation
-            ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), h)
-            : h;
-        outFrameScalar[x] = remod4fscToCompositePhase(z.real(), z.imag(), phase);
+        outFrameScalar[x] =
+            carrierGrammarRemodSigned4fscToComposite(phaseCursor, z.real(), z.imag());
     }
 }
 

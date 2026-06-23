@@ -13,6 +13,7 @@
 #pragma once
 
 #include <array>
+#include <complex>
 #include <vector>
 
 #include "combmath.h"
@@ -91,6 +92,10 @@ struct CarrierGrammarCompositeRemodCursor {
     double lineScale = 1.0;
 };
 
+struct CarrierGrammarSignedSampleCursor {
+    int phase = 0;
+};
+
 struct CarrierGrammarState {
     // Identity and schedule context.
     int  line                    = 0;
@@ -166,6 +171,71 @@ inline int carrierGrammarSignedSampleClass(const CarrierGrammarState &grammar, i
     return carrierGrammarSignedSampleClass(&grammar, h);
 }
 
+inline int carrierGrammarSignedSampleClassBase(const CarrierGrammarState *grammar,
+                                               int firstH)
+{
+    int phase0 = grammar ? grammar->samplePhase0 : 0;
+    if (grammar && grammar->lineFlip < 0)
+        phase0 += 2;
+    return (firstH + phase0) & 3;
+}
+
+inline int carrierGrammarSignedSampleClassBase(const CarrierGrammarState &grammar,
+                                               int firstH)
+{
+    return carrierGrammarSignedSampleClassBase(&grammar, firstH);
+}
+
+inline CarrierGrammarSignedSampleCursor carrierGrammarSignedSampleCursor(
+    const CarrierGrammarState *grammar,
+    int firstH)
+{
+    CarrierGrammarSignedSampleCursor cursor;
+    cursor.phase = carrierGrammarSignedSampleClassBase(grammar, firstH);
+    return cursor;
+}
+
+inline int carrierGrammarAdvanceSignedSampleCursor(CarrierGrammarSignedSampleCursor &cursor)
+{
+    const int phase = cursor.phase;
+    cursor.phase = (cursor.phase + 1) & 3;
+    return phase;
+}
+
+inline void carrierGrammarDemodSignedCompositeTo4fsc(
+    CarrierGrammarSignedSampleCursor &cursor,
+    double composite,
+    double &i4fsc,
+    double &q4fsc)
+{
+    demod4fscFromComposite(
+        composite,
+        carrierGrammarAdvanceSignedSampleCursor(cursor),
+        i4fsc,
+        q4fsc);
+}
+
+inline std::complex<double> carrierGrammarDemodSignedCompositeTo4fsc(
+    CarrierGrammarSignedSampleCursor &cursor,
+    double composite)
+{
+    double i4fsc = 0.0;
+    double q4fsc = 0.0;
+    carrierGrammarDemodSignedCompositeTo4fsc(cursor, composite, i4fsc, q4fsc);
+    return { i4fsc, q4fsc };
+}
+
+inline double carrierGrammarRemodSigned4fscToComposite(
+    CarrierGrammarSignedSampleCursor &cursor,
+    double i4fsc,
+    double q4fsc)
+{
+    return remod4fscToCompositePhase(
+        i4fsc,
+        q4fsc,
+        carrierGrammarAdvanceSignedSampleCursor(cursor));
+}
+
 inline int carrierGrammarOppositeSampleClass(const CarrierGrammarState *grammar, int h)
 {
     return (carrierGrammarSignedSampleClass(grammar, h) + 2) & 3;
@@ -208,6 +278,22 @@ inline bool carrierGrammarLockedDemodCoefficients(
         return false;
 
     out.phase = carrierGrammarSampleClass(grammar, h);
+    out.ti = static_cast<double>(grammar->demodLUTTi[out.phase]);
+    out.tq = static_cast<double>(grammar->demodLUTTq[out.phase]);
+    out.valid = true;
+    return true;
+}
+
+inline bool carrierGrammarLockedSignedDemodCoefficients(
+    const CarrierGrammarState *grammar,
+    CarrierGrammarSignedSampleCursor &cursor,
+    CarrierGrammarDemodCoefficients &out)
+{
+    out = {};
+    if (!grammar || !grammar->grammarLocked)
+        return false;
+
+    out.phase = carrierGrammarAdvanceSignedSampleCursor(cursor);
     out.ti = static_cast<double>(grammar->demodLUTTi[out.phase]);
     out.tq = static_cast<double>(grammar->demodLUTTq[out.phase]);
     out.valid = true;

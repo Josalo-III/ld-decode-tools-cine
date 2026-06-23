@@ -2159,50 +2159,42 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
 
     auto sampleIQ = [&](int line, int rel)->std::complex<double> {
         const int h = left + std::clamp(rel, 0, width - 1);
-        const int ph = useLockedSource
-            ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), h)
-            : carrierSampleClass(line, h);
-        double ti = 0.0;
-        double tq = 0.0;
-
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        const bool grammarLocked = grammar && grammar->grammarLocked;
-        if (grammarLocked)
+        const double c = sampleRow(line, rel);
+        lddecode::CarrierGrammarDemodCoefficients coeff;
+        lddecode::CarrierGrammarSignedSampleCursor signedCursor =
+            carrierGrammarSignedSampleCursor(grammar, h);
+        if (useLockedSource &&
+            carrierGrammarLockedSignedDemodCoefficients(grammar, signedCursor, coeff))
         {
-            ti = (double)grammar->demodLUTTi[ph];
-            tq = (double)grammar->demodLUTTq[ph];
-        } else {
-            double lutTi[4], lutTq[4];
-            fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
-            ti = lutTi[ph];
-            tq = lutTq[ph];
+            return { c * coeff.ti, c * coeff.tq };
         }
 
-        const double c = sampleRow(line, rel);
+        const int ph = useLockedSource
+            ? carrierGrammarAdvanceSignedSampleCursor(signedCursor)
+            : carrierSampleClass(line, h);
+        double lutTi[4], lutTq[4];
+        fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        const double ti = lutTi[ph];
+        const double tq = lutTq[ph];
         return { c * ti, c * tq };
     };
 
     auto sampleLockedIQ = [&](int line, int rel)->std::complex<double> {
         const int h = left + std::clamp(rel, 0, width - 1);
-        const int ph = carrierGrammarSignedSampleClass(carrierGrammarLine(line), h);
-        double ti = 0.0;
-        double tq = 0.0;
-
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        if (grammar && grammar->grammarLocked)
-        {
-            ti = (double)grammar->demodLUTTi[ph];
-            tq = (double)grammar->demodLUTTq[ph];
-        } else {
+        lddecode::CarrierGrammarSignedSampleCursor signedCursor =
+            carrierGrammarSignedSampleCursor(grammar, h);
+        lddecode::CarrierGrammarDemodCoefficients coeff;
+        if (!carrierGrammarLockedSignedDemodCoefficients(grammar, signedCursor, coeff))
             return {0.0, 0.0};
-        }
 
         const double *row = locked1DSource_line(line);
         if (!row)
             return {0.0, 0.0};
 
         const double c = row[std::clamp(rel, 0, width - 1)];
-        return { c * ti, c * tq };
+        return { c * coeff.ti, c * coeff.tq };
     };
 
     auto lockedScalar = [&](int line, int rel)->double {
@@ -2224,8 +2216,10 @@ void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, 
         }
 
         for (int rel = 4; rel < width - 4; ++rel) {
+            lddecode::CarrierGrammarSignedSampleCursor signedCursor =
+                carrierGrammarSignedSampleCursor(carrierGrammarLine(line), left + rel);
             const int phase = useLockedSource
-                ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), left + rel)
+                ? carrierGrammarAdvanceSignedSampleCursor(signedCursor)
                 : carrierSampleClass(line, left + rel);
             const std::complex<double> z  = sampleIQ(line, rel);
             const std::complex<double> zm = sampleIQ(line, rel - 4);
@@ -2735,14 +2729,14 @@ void Comb::FrameBuffer::split2D()
                 // Symmetric round-trip with Frame A's signed demod: remod back
                 // through the signed phase so the composite scalar lands in
                 // the physical frame produceY's `raw - clpLine` consumes.
+                auto phaseCursor = carrierGrammarSignedSampleCursor(
+                    configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
+                    left);
                 for (int rel = 0; rel < width; ++rel) {
-                    const int h = left + rel;
                     if (rel < (int)frameAIQ.size()) {
                         const auto &Z = frameAIQ[rel];
-                        const int phase = configuration.phaseCompensation
-                            ? carrierGrammarSignedSampleClass(carrierGrammarLine(line), h)
-                            : h;
-                        scratch_frameAAdaptiveIQComposite[rel] = remod4fscToCompositePhase(Z.real(), Z.imag(), phase);
+                        scratch_frameAAdaptiveIQComposite[rel] =
+                            carrierGrammarRemodSigned4fscToComposite(phaseCursor, Z.real(), Z.imag());
                     } else {
                         scratch_frameAAdaptiveIQComposite[rel] = 0.0;
                     }
