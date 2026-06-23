@@ -20,7 +20,6 @@
 #include "comb.h"
 #include "combmath.h"
 
-#include <QElapsedTimer>
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
@@ -104,22 +103,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     tapLine.width = std::max(0, width);
     if (width <= 0 || lineNumber < first || lineNumber >= last) return;
-
-    const bool tapTimers = configuration.stageTimers && configuration.phaseCompensation;
-    if (tapTimers)
-        ++tapBuildInstrumentation.lines;
-    auto measureTapBuild = [&](TapBuildTimerIndex idx, auto &&fn) {
-        if (!tapTimers) {
-            fn();
-            return;
-        }
-        QElapsedTimer timer;
-        timer.start();
-        fn();
-        tapBuildInstrumentation.add(idx, timer.nsecsElapsed());
-    };
-    QElapsedTimer setupTimer;
-    if (tapTimers) setupTimer.start();
 
     tapLine.cacheLine = lineNumber;
     tapLine.width = width;
@@ -257,10 +240,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     };
 
-    if (tapTimers)
-        tapBuildInstrumentation.add(TapBuildSetup, setupTimer.nsecsElapsed());
-
-    measureTapBuild(TapBuildFillTaps, [&]() {
+    {
         fillTap(r0, tapLine.tap0);
 
         if (wantFrame) {
@@ -274,13 +254,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             fillTap(rU4, tapLine.tapU4);
             fillTap(rD4, tapLine.tapD4);
         }
-    });
+    }
 
     const auto &T = configuration.tunables;
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
     const double invI = invIreScale;
-
     const lddecode::CombReachSourceFrame scalarSource = scalarReachSource();
     const lddecode::CombReachSourceFrame iqSource = iqReachSource();
 
@@ -359,7 +338,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     };
 
-    measureTapBuild(TapBuildFramePairs, [&]() {
+    {
         if (wantFrame) {
             fillPair(tapLine.tapU1,
                      tapLine.lnU1,
@@ -375,9 +354,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                      iqSource,
                      lddecode::CombReachUse::IQCancel);
         }
-    });
+    }
 
-    measureTapBuild(TapBuildContourPairs, [&]() {
+    {
         if (wantContour) {
             fillPair(tapLine.tapU2,
                      tapLine.lnU2,
@@ -393,7 +372,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                      scalarSource,
                      lddecode::CombReachUse::FieldScalarAverage);
         }
-    });
+    }
 
     auto sampleTapComp = [&](const std::vector<CombTapScalar> &tap, int rel)->double {
         rel = std::clamp(rel, 0, width - 1);
@@ -406,7 +385,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         return 0.5 * (sampleTapComp(tap, rel - 2) + sampleTapComp(tap, rel + 2));
     };
 
-    measureTapBuild(TapBuildHLuma, [&]() {
+    {
     if (wantFieldB || wantFrame) {
         for (int rel = 0; rel < width; ++rel) {
             if (configuration.phaseCompensation) {
@@ -426,9 +405,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
         }
     }
-    });
+    }
 
-    measureTapBuild(TapBuildContour, [&]() {
+    {
     if (wantContour) {
         // Hoist tunables and data() pointers out of the hot loop.  Reading 11
         // vectors per pixel via std::vector<T>::operator[] generates redundant
@@ -520,7 +499,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 : CombContentReach::MovingCoarseContour();
         }
     }
-    });
+    }
 
     // reachGate composition policy:
     //
@@ -627,10 +606,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                     soft, hard);
 
                 if (mcNear.valid) {
-                    const double envC =
-                        std::hypot(tapLine.tap0[rel].comp, tapLine.tap0[rel].symMag);
                     const double chromaWeight =
-                        std::clamp((envC * invI - 2.0) / 8.0, 0.0, 1.0);
+                        std::clamp(
+                            (std::hypot(tapLine.tap0[rel].comp,
+                                        tapLine.tap0[rel].symMag) * invI - 2.0) / 8.0,
+                            0.0, 1.0);
                     const double bevelGate =
                         std::clamp(1.0 - bevelPenalty * chromaWeight *
                                    (1.0 - std::clamp(mcNear.straightness, 0.0, 1.0)),
@@ -663,10 +643,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 dnContourGate = 0.25 + 0.75 * std::clamp(mc.downTrust, 0.0, 1.0);
 
                 if (rel < (int)tapLine.hLumaDeltaIRE.size()) {
-                    const double envC =
-                        std::hypot(tapLine.tap0[rel].comp, tapLine.tap0[rel].symMag);
                     const double chromaT =
-                        std::clamp((envC * invI - 2.0) / 8.0, 0.0, 1.0);
+                        std::clamp(
+                            (std::hypot(tapLine.tap0[rel].comp,
+                                        tapLine.tap0[rel].symMag) * invI - 2.0) / 8.0,
+                            0.0, 1.0);
                     const double hEdge =
                         std::clamp(
                             (tapLine.hLumaDeltaIRE[rel] - 0.30 * edgeThreshIRE) /
@@ -696,24 +677,24 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     };
 
-    measureTapBuild(TapBuildFrameLimiters, [&]() {
+    {
         if (wantFrame) {
             applyFrameReachWithIQFloor(tapLine.pairU1, tapLine.pairD1,
                                      tapLine.haveU1, tapLine.haveD1);
         }
-    });
+    }
 
-    measureTapBuild(TapBuildFieldLimiters, [&]() {
+    {
         if (wantFieldA || wantFieldB) {
             applyFieldReachWithMovingCoarse(tapLine.pairU2, tapLine.pairD2,
                                             tapLine.haveU2, tapLine.haveD2);
         }
-    });
+    }
 
     tapLine.builtFlags = flags;
 }
 
-// Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically 
+// Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically
 // influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
 void Comb::FrameBuffer::computeContourFieldLine(int lineNumber,
                                           double *outFieldLine,
@@ -775,10 +756,10 @@ void Comb::FrameBuffer::computeContourFieldLine(int lineNumber,
         auto getRow = [&](int ln) -> const double* {
             if (ln < first || ln >= last)
                 return nullptr;
-    
+
             return locked1DSource_line(ln);
         };
-    
+
         row0   = getRow(ln0);
         rowUp2 = getRow(lnUp2);
         rowDn2 = getRow(lnDn2);
@@ -791,7 +772,7 @@ void Comb::FrameBuffer::computeContourFieldLine(int lineNumber,
         rowUp4 = clpbuffer[0].pixel[lnUp4] + left;
         rowDn4 = clpbuffer[0].pixel[lnDn4] + left;
     }
-    
+
     if (!row0) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
         if (outGate) std::fill(outGate, outGate + width, 1.0f);
@@ -1203,27 +1184,6 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
     const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
-    const bool emitDecisionLog =
-        configuration.debugFieldBDecisions && configuration.phaseCompensation;
-    const int probeLo = first + (last - first) / 6;
-    const int probeHi = first + (last - first) / 3;
-    const int probeStep = std::max(1, (probeHi - probeLo) / 10);
-    const bool lineIsProbe = emitDecisionLog &&
-                             (lineNumber >= probeLo &&
-                              lineNumber < probeHi &&
-                              ((lineNumber - probeLo) % probeStep) == 0);
-    std::array<int, 9> reasonCounts{};
-    std::array<std::array<int, 4>, 9> bucketReasonCounts{};
-    std::array<double, 4> blendCountByBucket{};
-    std::array<double, 4> blendSumWUpByBucket{};
-    std::array<double, 4> blendSumWDnByBucket{};
-    std::array<double, 4> blendSumPullUpByBucket{};
-    std::array<double, 4> blendSumPullDnByBucket{};
-    std::array<double, 4> blendSumOutDeltaByBucket{};
-    double sumAbsChromaIRE = 0.0;
-    double sumHEdgeIRE = 0.0;
-    double sumVerticalContrastIRE = 0.0;
-    int metricCount = 0;
     auto softenDominantWeights = [](double &wA, double &wB) {
         if (wA <= 0.0 || wB <= 0.0)
             return;
@@ -1587,89 +1547,6 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         outFieldLine[rel] = tc;
         if (outReasonLine)
             outReasonLine[rel] = reason;
-        if (lineIsProbe) {
-            const int reasonIdx = std::clamp<int>(reason, 0, reasonCounts.size() - 1);
-            const int bucket = carrierSampleClass(lineNumber, left + rel) & 3;
-            ++reasonCounts[reasonIdx];
-            ++bucketReasonCounts[reasonIdx][bucket];
-            sumAbsChromaIRE += std::fabs(C) * invIreScale;
-            sumHEdgeIRE += (rel < (int)tapLine.hLumaDeltaIRE.size())
-                ? tapLine.hLumaDeltaIRE[rel]
-                : 0.0;
-            sumVerticalContrastIRE += std::fabs(Cup - Cdn) * invIreScale;
-            if (reason == FieldBReasonBlend) {
-                const double pullUp = (C - Cup) * wUp * sc * 0.25;
-                const double pullDn = (C - Cdn) * wDn * sc * 0.25;
-                blendCountByBucket[bucket] += 1.0;
-                blendSumWUpByBucket[bucket] += wUp;
-                blendSumWDnByBucket[bucket] += wDn;
-                blendSumPullUpByBucket[bucket] += pullUp;
-                blendSumPullDnByBucket[bucket] += pullDn;
-                blendSumOutDeltaByBucket[bucket] += (tc - C);
-            }
-            ++metricCount;
-        }
-    }
-
-    if (lineIsProbe && metricCount > 0) {
-        auto fmtReason = [&](FieldBDecisionReason r, const char *label)->QString {
-            const int idx = std::clamp<int>(r, 0, reasonCounts.size() - 1);
-            return QString("%1=%2[b0:%3 b1:%4 b2:%5 b3:%6]")
-                .arg(label)
-                .arg(reasonCounts[idx])
-                .arg(bucketReasonCounts[idx][0])
-                .arg(bucketReasonCounts[idx][1])
-                .arg(bucketReasonCounts[idx][2])
-                .arg(bucketReasonCounts[idx][3]);
-        };
-
-        qInfo().noquote() << QString(
-            "FieldBDecision line=%1 avg|C|=%2 avgHEdge=%3 avgV=%4 %5 %6 %7 %8 %9 %10 %11")
-            .arg(lineNumber)
-            .arg(sumAbsChromaIRE / metricCount, 0, 'f', 2)
-            .arg(sumHEdgeIRE / metricCount, 0, 'f', 2)
-            .arg(sumVerticalContrastIRE / metricCount, 0, 'f', 2)
-            .arg(fmtReason(FieldBReasonBlend, "blend"))
-            .arg(fmtReason(FieldBReasonBoundaryUp, "bUp"))
-            .arg(fmtReason(FieldBReasonBoundaryDown, "bDn"))
-            .arg(fmtReason(FieldBReasonBoundaryCede, "bCede"))
-            .arg(fmtReason(FieldBReasonReviveCoarse, "revCoarse"))
-            .arg(fmtReason(FieldBReasonReviveScalar, "revScalar"))
-            .arg(fmtReason(FieldBReasonCenter, "center"));
-
-        auto avgBucket = [&](const std::array<double, 4> &sum, int bucket)->double {
-            return (blendCountByBucket[bucket] > 1e-9) ? (sum[bucket] / blendCountByBucket[bucket]) : 0.0;
-        };
-        qInfo().noquote() << QString(
-            "FieldBBlend line=%1 b0(n=%2,wUp=%3,wDn=%4,pU=%5,pD=%6,dOut=%7) "
-            "b1(n=%8,wUp=%9,wDn=%10,pU=%11,pD=%12,dOut=%13) "
-            "b2(n=%14,wUp=%15,wDn=%16,pU=%17,pD=%18,dOut=%19) "
-            "b3(n=%20,wUp=%21,wDn=%22,pU=%23,pD=%24,dOut=%25)")
-            .arg(lineNumber)
-            .arg(blendCountByBucket[0], 0, 'f', 0)
-            .arg(avgBucket(blendSumWUpByBucket, 0), 0, 'f', 3)
-            .arg(avgBucket(blendSumWDnByBucket, 0), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullUpByBucket, 0), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullDnByBucket, 0), 0, 'f', 3)
-            .arg(avgBucket(blendSumOutDeltaByBucket, 0), 0, 'f', 3)
-            .arg(blendCountByBucket[1], 0, 'f', 0)
-            .arg(avgBucket(blendSumWUpByBucket, 1), 0, 'f', 3)
-            .arg(avgBucket(blendSumWDnByBucket, 1), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullUpByBucket, 1), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullDnByBucket, 1), 0, 'f', 3)
-            .arg(avgBucket(blendSumOutDeltaByBucket, 1), 0, 'f', 3)
-            .arg(blendCountByBucket[2], 0, 'f', 0)
-            .arg(avgBucket(blendSumWUpByBucket, 2), 0, 'f', 3)
-            .arg(avgBucket(blendSumWDnByBucket, 2), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullUpByBucket, 2), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullDnByBucket, 2), 0, 'f', 3)
-            .arg(avgBucket(blendSumOutDeltaByBucket, 2), 0, 'f', 3)
-            .arg(blendCountByBucket[3], 0, 'f', 0)
-            .arg(avgBucket(blendSumWUpByBucket, 3), 0, 'f', 3)
-            .arg(avgBucket(blendSumWDnByBucket, 3), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullUpByBucket, 3), 0, 'f', 3)
-            .arg(avgBucket(blendSumPullDnByBucket, 3), 0, 'f', 3)
-            .arg(avgBucket(blendSumOutDeltaByBucket, 3), 0, 'f', 3);
     }
 }
 
@@ -2096,7 +1973,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
                 const double aNc = cmag(neighborCommon);
                 const double sdCenterCommon =
                     corrSignedMags(Z0, neighborCommon, a0, aNc);
-            
+
                 // Co-directional tinted case:
                 // real chroma biases center and neighbors into the same hue direction.
                 // The error is an amplitude/offset displacement from the stable neighbor
@@ -2107,17 +1984,17 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
                 // midpoint/null target to avoid swapping the alternation phase.
                 const double coDirectional =
                     std::clamp((sdCenterCommon - 0.35) / 0.50, 0.0, 1.0);
-            
+
                 const std::complex<double> nullTarget =
                     0.5 * (Z0 + neighborCommon);
-            
+
                 const std::complex<double> target =
                     nullTarget * (1.0 - coDirectional) +
                     neighborCommon * coDirectional;
-            
+
                 const double targetStrength =
                     cancelStrength * (0.70 + 0.30 * coDirectional);
-            
+
                 Zout = Zout * (1.0 - targetStrength) +
                        target * targetStrength;
             }

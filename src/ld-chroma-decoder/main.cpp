@@ -308,18 +308,6 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
     parser.addOption(debugCadenceOption);
 
-    QCommandLineOption debugPhaseLegsOption(QStringList() << "debug-phase-legs",
-                                    QCoreApplication::translate("main", "NTSC locked mode: log carrier-fit residual statistics for diagnosing ordered column artifacts"));
-    parser.addOption(debugPhaseLegsOption);
-
-    QCommandLineOption debugFieldBDecisionsOption(QStringList() << "debug-fieldb-decisions",
-                                    QCoreApplication::translate("main", "NTSC locked mode: log Field B decision summaries with per-phase-bucket breakdowns"));
-    parser.addOption(debugFieldBDecisionsOption);
-
-    QCommandLineOption stageTimersOption(QStringList() << "stage-timers",
-                                    QCoreApplication::translate("main", "NTSC locked mode: log per-stage timing summaries"));
-    parser.addOption(stageTimersOption);
-
     QCommandLineOption crossColorReturnOption(QStringList() << "cross-color-return",
                                     QCoreApplication::translate("main", "NTSC locked mode: Returns bandpass luma to Y, eliminating cross color effects and restoring high frequency luma detail. (default 1.0; values above 1.0 drive harder suppression on ambiguous pixels)"),
                                     QCoreApplication::translate("main", "number"));
@@ -421,15 +409,6 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(debugCadenceOption)) {
         combConfig.debugCadence = true;
-    }
-    if (parser.isSet(debugPhaseLegsOption)) {
-        combConfig.debugPhaseLegs = true;
-    }
-    if (parser.isSet(debugFieldBDecisionsOption)) {
-        combConfig.debugFieldBDecisions = true;
-    }
-    if (parser.isSet(stageTimersOption)) {
-        combConfig.stageTimers = true;
     }
 
     if (parser.isSet(crossColorReturnOption)) {

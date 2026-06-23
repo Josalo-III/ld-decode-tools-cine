@@ -54,9 +54,6 @@ public:
         bool   adaptive    = true; // If true, the 3D adaptive candidate selection is used.
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
-        bool   debugPhaseLegs = false; // Log per-(h&3) locked-demod residual stats.
-        bool   debugFieldBDecisions = false; // Log Field B decision summaries and phase-bucket breakdowns.
-        bool   stageTimers = false; // Log per-stage timing summaries for the locked NTSC path.
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
@@ -299,101 +296,6 @@ public:
 		int winner = 1;
 	};
 
-    struct FvfInstrumentation {
-        std::array<qint64, 4> rawWinnerCounts = {0, 0, 0, 0};
-        std::array<qint64, 4> finalWinnerCounts = {0, 0, 0, 0};
-        qint64 frameAHeadToHeadWins = 0;
-        qint64 frameBHeadToHeadWins = 0;
-        qint64 frameModelPixels = 0;
-        qint64 fieldModelPixels = 0;
-        qint64 islandChangedPixels = 0;
-        qint64 blockFieldCommitPixels = 0;
-        // Island flips bucketed by [center loser C][agreed neighbor L]; tells us
-        // whether cleanup is correcting Frame/Frame disagreement or Field/Frame
-        // noise. Diagonal is unused (a flip requires C != L).
-        std::array<std::array<qint64, 4>, 4> islandFlipPairs = {};
-
-        void reset()
-        {
-            rawWinnerCounts = {0, 0, 0, 0};
-            finalWinnerCounts = {0, 0, 0, 0};
-            frameAHeadToHeadWins = 0;
-            frameBHeadToHeadWins = 0;
-            frameModelPixels = 0;
-            fieldModelPixels = 0;
-            islandChangedPixels = 0;
-            blockFieldCommitPixels = 0;
-            for (auto &row : islandFlipPairs) row = {0, 0, 0, 0};
-        }
-    };
-
-    enum Split2DTimerIndex {
-        Split2DTapLine,
-        Split2DFieldB,
-        Split2DPrecleanCurrent,
-        Split2DPrecleanLookaheadTap,
-        Split2DPrecleanLookaheadFieldB,
-        Split2DPrecleanLookaheadGate,
-        Split2DFieldA,
-        Split2DLateral,
-        Split2DFrameA,
-        Split2DFrameB,
-        Split2DAttribution,
-        Split2DSelection,
-        Split2DDebugPhaseLegs,
-        Split2DTimerCount
-    };
-
-    struct Split2DInstrumentation {
-        std::array<qint64, Split2DTimerCount> totalNs = {};
-        std::array<qint64, Split2DTimerCount> calls = {};
-        qint64 lines = 0;
-
-        void reset()
-        {
-            totalNs.fill(0);
-            calls.fill(0);
-            lines = 0;
-        }
-
-        void add(Split2DTimerIndex idx, qint64 ns)
-        {
-            totalNs[idx] += ns;
-            calls[idx] += 1;
-        }
-    };
-
-    enum TapBuildTimerIndex {
-        TapBuildSetup,
-        TapBuildFillTaps,
-        TapBuildFramePairs,
-        TapBuildContourPairs,
-        TapBuildHLuma,
-        TapBuildContour,
-        TapBuildFrameLimiters,
-        TapBuildFieldLimiters,
-        TapBuildTimerCount
-    };
-
-    struct TapBuildInstrumentation {
-        std::array<qint64, TapBuildTimerCount> totalNs = {};
-        std::array<qint64, TapBuildTimerCount> calls = {};
-        qint64 lines = 0;
-
-        void reset()
-        {
-            totalNs.fill(0);
-            calls.fill(0);
-            lines = 0;
-        }
-
-        void add(TapBuildTimerIndex idx, qint64 ns)
-        {
-            totalNs[idx] += ns;
-            calls[idx] += 1;
-        }
-    };
-
 	// Signal attribution evidence, collected before election. This is not a
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
@@ -433,9 +335,6 @@ public:
 					const FrameBuffer &nextFrame);
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
-    const FvfInstrumentation &getFvfInstrumentation() const { return fvfInstrumentation; }
-    const Split2DInstrumentation &getSplit2DInstrumentation() const { return split2DInstrumentation; }
-    const TapBuildInstrumentation &getTapBuildInstrumentation() const { return tapBuildInstrumentation; }
 
 	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
 	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
@@ -695,9 +594,6 @@ private:
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
 
-    FvfInstrumentation fvfInstrumentation;
-    Split2DInstrumentation split2DInstrumentation;
-    TapBuildInstrumentation tapBuildInstrumentation;
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
 	}
@@ -955,7 +851,6 @@ private:
 								 double neighborLumaMeanIRE = -1.0,
 								 double neighborBaseMeanIRE = -1.0,
 								 double lineForwardErrorIRE = 0.0) const;
-	void reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const;
 	// Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
 	// into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.
 	void computeVDISLine(int lineNumber);

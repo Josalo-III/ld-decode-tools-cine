@@ -19,7 +19,6 @@
 #include "deemp.h"
 #include "firfilter.h"
 
-#include <QElapsedTimer>
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -161,91 +160,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     assert(configurationSet);
     assert(componentFrames.size() * 2 == (endIndex - startIndex));
 
-    enum StageIndex {
-        StageLoadFields,
-        StageSplit1D,
-        StagePhaseLocked,
-        StagePhaseCorrected1D,
-        StageSplit2D,
-        StageCopy2DTo3D,
-        StageSplit3D,
-        StagePostCombImpurity,
-        StageSplitIQLocked,
-        StageDoCNR,
-        StageProduceY,
-        StageFilterIQLocked,
-        StageDoYNR,
-        StageTransformIQ,
-        StageCount
-    };
-    struct StageStat {
-        const char *name;
-        qint64 totalNs = 0;
-        qint64 calls = 0;
-    };
-    std::array<StageStat, StageCount> stageStats = {{
-        {"loadFields"},
-        {"split1D"},
-        {"phaseLocked"},
-        {"buildPhaseCorrected1D"},
-        {"split2D"},
-        {"copy2DTo3D"},
-        {"split3D"},
-        {"measurePostCombImpurity"},
-        {"splitIQlocked"},
-        {"doCNR"},
-        {"produceY"},
-        {"filterIQLocked"},
-        {"doYNR"},
-        {"transformIQ"},
-    }};
-    const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
-    QElapsedTimer decodeTimer;
-    if (stageTimers) decodeTimer.start();
-    FrameBuffer::FvfInstrumentation fvfStatsTotal;
-    FrameBuffer::Split2DInstrumentation split2DStatsTotal;
-    FrameBuffer::TapBuildInstrumentation tapBuildStatsTotal;
-    auto accumulateFvfStats = [&](const FrameBuffer::FvfInstrumentation &stats) {
-        for (int i = 0; i < 4; ++i) {
-            fvfStatsTotal.rawWinnerCounts[i] += stats.rawWinnerCounts[i];
-            fvfStatsTotal.finalWinnerCounts[i] += stats.finalWinnerCounts[i];
-        }
-        fvfStatsTotal.frameAHeadToHeadWins += stats.frameAHeadToHeadWins;
-        fvfStatsTotal.frameBHeadToHeadWins += stats.frameBHeadToHeadWins;
-        fvfStatsTotal.frameModelPixels += stats.frameModelPixels;
-        fvfStatsTotal.fieldModelPixels += stats.fieldModelPixels;
-        fvfStatsTotal.islandChangedPixels += stats.islandChangedPixels;
-        fvfStatsTotal.blockFieldCommitPixels += stats.blockFieldCommitPixels;
-        for (int r = 0; r < 4; ++r)
-            for (int c = 0; c < 4; ++c)
-                fvfStatsTotal.islandFlipPairs[r][c] += stats.islandFlipPairs[r][c];
-    };
-    auto accumulateSplit2DStats = [&](const FrameBuffer::Split2DInstrumentation &stats) {
-        for (int i = 0; i < FrameBuffer::Split2DTimerCount; ++i) {
-            split2DStatsTotal.totalNs[i] += stats.totalNs[i];
-            split2DStatsTotal.calls[i] += stats.calls[i];
-        }
-        split2DStatsTotal.lines += stats.lines;
-    };
-    auto accumulateTapBuildStats = [&](const FrameBuffer::TapBuildInstrumentation &stats) {
-        for (int i = 0; i < FrameBuffer::TapBuildTimerCount; ++i) {
-            tapBuildStatsTotal.totalNs[i] += stats.totalNs[i];
-            tapBuildStatsTotal.calls[i] += stats.calls[i];
-        }
-        tapBuildStatsTotal.lines += stats.lines;
-    };
-    auto measureStage = [&](StageIndex idx, auto &&fn) {
-        if (!stageTimers) {
-            fn();
-            return;
-        }
-        QElapsedTimer timer;
-        timer.start();
-        fn();
-        stageStats[idx].totalNs += timer.nsecsElapsed();
-        stageStats[idx].calls += 1;
-    };
-
     auto next     = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto current  = std::make_unique<FrameBuffer>(videoParameters, configuration);
     auto previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
@@ -268,28 +182,17 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (fieldIndex + 3 < inputFields.size());
 
         if (canLoadNext) {
-            measureStage(StageLoadFields, [&]() {
-                next->loadFields(inputFields[fieldIndex + 2],
-                                 inputFields[fieldIndex + 3]);
-            });
+            next->loadFields(inputFields[fieldIndex + 2],
+                             inputFields[fieldIndex + 3]);
 
-            measureStage(StageSplit1D, [&]() { next->split1D(); });
+            next->split1D();
 
             if (configuration.phaseCompensation) {
-                measureStage(StagePhaseLocked, [&]() { next->phaseLocked(); });
-                measureStage(StagePhaseCorrected1D, [&]() { next->buildPhaseCorrected1D(); });
+                next->phaseLocked();
+                next->buildPhaseCorrected1D();
             }
 
-            measureStage(StageSplit2D, [&]() { next->split2D(); });
-            if (stageTimers) {
-                accumulateSplit2DStats(next->getSplit2DInstrumentation());
-                accumulateTapBuildStats(next->getTapBuildInstrumentation());
-            }
-            if (stageTimers &&
-                configuration.twoDVariant ==
-                    Comb::Configuration::TwoDVariant::FieldVsFrame) {
-                accumulateFvfStats(next->getFvfInstrumentation());
-            }
+            next->split2D();
         }
 
         if (fieldIndex < startIndex)
@@ -298,10 +201,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         const bool isStartUp = (fieldIndex < startIndex + 4);
 
         if (configuration.dimensions == 3) {
-            measureStage(StageCopy2DTo3D, [&]() { current->copy2DTo3D(); });
+            current->copy2DTo3D();
 
             if (!isStartUp)
-                measureStage(StageSplit3D, [&]() { current->split3D(*previous, *next); });
+                current->split3D(*previous, *next);
         }
 
         if (configuration.residualVideo3D) {
@@ -324,16 +227,14 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          * splitIQlocked() is the post-election demod of the selected comb.
          */
         if (configuration.phaseCompensation) {
-            measureStage(StagePostCombImpurity, [&]() { current->measurePostCombImpurity(); });
-            measureStage(StageSplitIQLocked, [&]() { current->splitIQlocked(); });
-            measureStage(StageDoCNR, [&]() { current->doCNR(); });
-            measureStage(StageProduceY, [&]() { current->produceY(); });
-            measureStage(StageFilterIQLocked, [&]() { current->filterIQLocked(); });
-            measureStage(StageDoYNR, [&]() { current->doYNR(); });
-            measureStage(StageTransformIQ, [&]() {
-                current->transformIQ(configuration.chromaGain,
-                                     configuration.chromaPhase);
-            });
+            current->measurePostCombImpurity();
+            current->splitIQlocked();
+            current->doCNR();
+            current->produceY();
+            current->filterIQLocked();
+            current->doYNR();
+            current->transformIQ(configuration.chromaGain,
+                                 configuration.chromaPhase);
         } else {
             current->splitIQ();
             current->adjustY();
@@ -440,158 +341,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 drawNext(labelBottom);
             }
         }
-    }
-
-    if (stageTimers) {
-        QStringList parts;
-        qint64 measuredNs = 0;
-        const qint64 wallNs = decodeTimer.nsecsElapsed();
-        for (const StageStat &stat : stageStats) {
-            if (stat.calls <= 0) continue;
-            measuredNs += stat.totalNs;
-            const double avgMs = (static_cast<double>(stat.totalNs) / 1.0e6) /
-                                 static_cast<double>(stat.calls);
-            const double totalMs = static_cast<double>(stat.totalNs) / 1.0e6;
-            const double pct = (wallNs > 0)
-                ? (100.0 * static_cast<double>(stat.totalNs) / static_cast<double>(wallNs))
-                : 0.0;
-            parts << QString("%1=%2ms avg/%3ms total/%4% (%5 calls)")
-                         .arg(stat.name)
-                         .arg(avgMs, 0, 'f', 3)
-                         .arg(totalMs, 0, 'f', 3)
-                         .arg(pct, 0, 'f', 1)
-                         .arg(stat.calls);
-        }
-        if (!parts.isEmpty()) {
-            qInfo().noquote() << QString("Locked stage timers: %1").arg(parts.join(", "));
-        }
-        const qint64 unaccountedNs = std::max<qint64>(0, wallNs - measuredNs);
-        const double wallMs = static_cast<double>(wallNs) / 1.0e6;
-        const double measuredMs = static_cast<double>(measuredNs) / 1.0e6;
-        const double unaccountedMs = static_cast<double>(unaccountedNs) / 1.0e6;
-        const double measuredPct = (wallNs > 0)
-            ? (100.0 * static_cast<double>(measuredNs) / static_cast<double>(wallNs))
-            : 0.0;
-        qInfo().noquote() << QString("Locked stage coverage: wall=%1ms measured=%2ms unaccounted=%3ms measured=%4%")
-                                 .arg(wallMs, 0, 'f', 3)
-                                 .arg(measuredMs, 0, 'f', 3)
-                                 .arg(unaccountedMs, 0, 'f', 3)
-                                 .arg(measuredPct, 0, 'f', 1);
-
-        if (split2DStatsTotal.lines > 0) {
-            static const char *split2DNames[FrameBuffer::Split2DTimerCount] = {
-                "tapLine",
-                "fieldB",
-                "precleanCurrent",
-                "precleanLookaheadTap",
-                "precleanLookaheadFieldB",
-                "precleanLookaheadGate",
-                "fieldA",
-                "lateral",
-                "frameA",
-                "frameB",
-                "attribution",
-                "selection",
-                "debugPhaseLegs",
-            };
-            QStringList splitParts;
-            const qint64 split2DStageNs = stageStats[StageSplit2D].totalNs;
-            for (int i = 0; i < FrameBuffer::Split2DTimerCount; ++i) {
-                const qint64 calls = split2DStatsTotal.calls[i];
-                if (calls <= 0) continue;
-                const qint64 totalNs = split2DStatsTotal.totalNs[i];
-                const double totalMs = static_cast<double>(totalNs) / 1.0e6;
-                const double avgMs = totalMs / static_cast<double>(calls);
-                const double pct = (split2DStageNs > 0)
-                    ? (100.0 * static_cast<double>(totalNs) /
-                       static_cast<double>(split2DStageNs))
-                    : 0.0;
-                splitParts << QString("%1=%2ms avg/%3ms total/%4% (%5 calls)")
-                                  .arg(split2DNames[i])
-                                  .arg(avgMs, 0, 'f', 3)
-                                  .arg(totalMs, 0, 'f', 3)
-                                  .arg(pct, 0, 'f', 1)
-                                  .arg(calls);
-            }
-            if (!splitParts.isEmpty()) {
-                qInfo().noquote() << QString("Locked split2D timers: lines=%1, %2")
-                                         .arg(split2DStatsTotal.lines)
-                                         .arg(splitParts.join(", "));
-            }
-        }
-
-        if (tapBuildStatsTotal.lines > 0) {
-            static const char *tapBuildNames[FrameBuffer::TapBuildTimerCount] = {
-                "setup",
-                "fillTaps",
-                "framePairs",
-                "contourPairs",
-                "hLuma",
-                "contour",
-                "frameLimiters",
-                "fieldLimiters",
-            };
-            QStringList tapParts;
-            const qint64 split2DStageNs = stageStats[StageSplit2D].totalNs;
-            for (int i = 0; i < FrameBuffer::TapBuildTimerCount; ++i) {
-                const qint64 calls = tapBuildStatsTotal.calls[i];
-                if (calls <= 0) continue;
-                const qint64 totalNs = tapBuildStatsTotal.totalNs[i];
-                const double totalMs = static_cast<double>(totalNs) / 1.0e6;
-                const double avgMs = totalMs / static_cast<double>(calls);
-                const double pct = (split2DStageNs > 0)
-                    ? (100.0 * static_cast<double>(totalNs) /
-                       static_cast<double>(split2DStageNs))
-                    : 0.0;
-                tapParts << QString("%1=%2ms avg/%3ms total/%4% (%5 calls)")
-                                .arg(tapBuildNames[i])
-                                .arg(avgMs, 0, 'f', 3)
-                                .arg(totalMs, 0, 'f', 3)
-                                .arg(pct, 0, 'f', 1)
-                                .arg(calls);
-            }
-            if (!tapParts.isEmpty()) {
-                qInfo().noquote() << QString("Locked tap-build timers: lines=%1, %2")
-                                         .arg(tapBuildStatsTotal.lines)
-                                         .arg(tapParts.join(", "));
-            }
-        }
-
-        const qint64 fvfPixels =
-            std::accumulate(fvfStatsTotal.finalWinnerCounts.begin(),
-                            fvfStatsTotal.finalWinnerCounts.end(), qint64{0});
-        if (fvfPixels > 0) {
-            qInfo().noquote() << QString(
-                "Locked FVF counters: raw(FA=%1,FB=%2,FRA=%3,FRB=%4) "
-                "final(FA=%5,FB=%6,FRA=%7,FRB=%8) "
-                "model(frame=%9,field=%10) frameHeadToHead(A=%11,B=%12) "
-                "cleanup(island=%13,blockField=%14)")
-                .arg(fvfStatsTotal.rawWinnerCounts[0])
-                .arg(fvfStatsTotal.rawWinnerCounts[1])
-                .arg(fvfStatsTotal.rawWinnerCounts[2])
-                .arg(fvfStatsTotal.rawWinnerCounts[3])
-                .arg(fvfStatsTotal.finalWinnerCounts[0])
-                .arg(fvfStatsTotal.finalWinnerCounts[1])
-                .arg(fvfStatsTotal.finalWinnerCounts[2])
-                .arg(fvfStatsTotal.finalWinnerCounts[3])
-                .arg(fvfStatsTotal.frameModelPixels)
-                .arg(fvfStatsTotal.fieldModelPixels)
-                .arg(fvfStatsTotal.frameAHeadToHeadWins)
-                .arg(fvfStatsTotal.frameBHeadToHeadWins)
-                .arg(fvfStatsTotal.islandChangedPixels)
-                .arg(fvfStatsTotal.blockFieldCommitPixels);
-
-            const auto &fp = fvfStatsTotal.islandFlipPairs;
-            qInfo().noquote() << QString(
-                "Locked FVF island flips [C->L] "
-                "FA(->FB=%1,->FRA=%2,->FRB=%3) FB(->FA=%4,->FRA=%5,->FRB=%6) "
-                "FRA(->FA=%7,->FB=%8,->FRB=%9) FRB(->FA=%10,->FB=%11,->FRA=%12)")
-                .arg(fp[0][1]).arg(fp[0][2]).arg(fp[0][3])
-                .arg(fp[1][0]).arg(fp[1][2]).arg(fp[1][3])
-                .arg(fp[2][0]).arg(fp[2][1]).arg(fp[2][3])
-                .arg(fp[3][0]).arg(fp[3][1]).arg(fp[3][2]);
-        }
-
     }
 }
 
@@ -2118,466 +1867,12 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
     for (int x = tailStart; x < width; ++x)
         lumaSmooth[x] = yLast;
 }
-//diagnostic tool for comb development 
-void Comb::FrameBuffer::reportPhaseLegStats(const char *label, int srcBufIndex, bool useLockedSource) const
-{
-    if (!configuration.debugPhaseLegs || !configuration.phaseCompensation)
-        return;
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int width     = right - left;
-
-    if (width <= 8 || firstLine >= lastLine)
-        return;
-
-    struct LegStats {
-        qint64 n = 0;
-        double sumI = 0.0;
-        double sumQ = 0.0;
-        double sumAbsRes = 0.0;
-        double sumSqRes = 0.0;
-        qint64 edgeN = 0;
-        double sumEdgeBias = 0.0;
-        double sumAbsEdgeBias = 0.0;
-        double sumBaseShift = 0.0;
-        double sumAbsBaseShift = 0.0;
-    };
-
-    std::array<LegStats, 4> legs;
-    std::complex<double> adjFieldCross = {0.0, 0.0};
-    std::complex<double> sameFieldCross = {0.0, 0.0};
-    qint64 adjFieldN = 0;
-    qint64 sameFieldN = 0;
-
-    auto sampleRow = [&](int line, int rel)->double {
-        rel = std::clamp(rel, 0, width - 1);
-        if (useLockedSource) {
-            const double *row = locked1DSource_line(line);
-            if (!row)
-                return 0.0;
-            return row[rel];
-        }
-
-        const int h = left + rel;
-        return clpbuffer[srcBufIndex].pixel[line][h];
-    };
-
-    auto sampleIQ = [&](int line, int rel)->std::complex<double> {
-        const int h = left + std::clamp(rel, 0, width - 1);
-        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        const double c = sampleRow(line, rel);
-        lddecode::CarrierGrammarDemodCoefficients coeff;
-        lddecode::CarrierGrammarSignedSampleCursor signedCursor =
-            carrierGrammarSignedSampleCursor(grammar, h);
-        if (useLockedSource &&
-            carrierGrammarLockedSignedDemodCoefficients(grammar, signedCursor, coeff))
-        {
-            return { c * coeff.ti, c * coeff.tq };
-        }
-
-        const int ph = useLockedSource
-            ? carrierGrammarAdvanceSignedSampleCursor(signedCursor)
-            : carrierSampleClass(line, h);
-        double lutTi[4], lutTq[4];
-        fusedDemodLUT(1.0, 0.0, spLUT_locked, cpLUT_locked, lutTi, lutTq);
-        const double ti = lutTi[ph];
-        const double tq = lutTq[ph];
-        return { c * ti, c * tq };
-    };
-
-    auto sampleLockedIQ = [&](int line, int rel)->std::complex<double> {
-        const int h = left + std::clamp(rel, 0, width - 1);
-        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        lddecode::CarrierGrammarSignedSampleCursor signedCursor =
-            carrierGrammarSignedSampleCursor(grammar, h);
-        lddecode::CarrierGrammarDemodCoefficients coeff;
-        if (!carrierGrammarLockedSignedDemodCoefficients(grammar, signedCursor, coeff))
-            return {0.0, 0.0};
-
-        const double *row = locked1DSource_line(line);
-        if (!row)
-            return {0.0, 0.0};
-
-        const double c = row[std::clamp(rel, 0, width - 1)];
-        return { c * coeff.ti, c * coeff.tq };
-    };
-
-    auto lockedScalar = [&](int line, int rel)->double {
-        const double *row = locked1DSource_line(line);
-        if (!row)
-            return 0.0;
-        return row[std::clamp(rel, 0, width - 1)];
-    };
-
-    const double invI = invIreScale;
-
-    for (int line = firstLine; line < lastLine; ++line) {
-        if (line >= demodLines)
-            continue;
-
-        if (useLockedSource) {
-            if (!locked1DSource_line(line))
-                continue;
-        }
-
-        for (int rel = 4; rel < width - 4; ++rel) {
-            lddecode::CarrierGrammarSignedSampleCursor signedCursor =
-                carrierGrammarSignedSampleCursor(carrierGrammarLine(line), left + rel);
-            const int phase = useLockedSource
-                ? carrierGrammarAdvanceSignedSampleCursor(signedCursor)
-                : carrierSampleClass(line, left + rel);
-            const std::complex<double> z  = sampleIQ(line, rel);
-            const std::complex<double> zm = sampleIQ(line, rel - 4);
-            const std::complex<double> zp = sampleIQ(line, rel + 4);
-            const std::complex<double> r  = z - 0.5 * (zm + zp);
-            const double resIRE = std::hypot(r.real(), r.imag()) * invI;
-
-            LegStats &s = legs[phase];
-            ++s.n;
-            s.sumI += z.real() * invI;
-            s.sumQ += z.imag() * invI;
-            s.sumAbsRes += resIRE;
-            s.sumSqRes += resIRE * resIRE;
-
-            auto addPhaseCross = [&](int otherLine,
-                                     std::complex<double> &sumCross,
-                                     qint64 &count)
-            {
-                if (otherLine < firstLine || otherLine >= lastLine)
-                    return;
-                const std::complex<double> zo = sampleIQ(otherLine, rel);
-                const double m0 = std::hypot(z.real(), z.imag()) * invI;
-                const double mo = std::hypot(zo.real(), zo.imag()) * invI;
-                constexpr double PHASE_COMPARE_MIN_IRE = 4.0;
-                if (m0 < PHASE_COMPARE_MIN_IRE || mo < PHASE_COMPARE_MIN_IRE)
-                    return;
-                const double norm = 1.0 / (std::hypot(z.real(), z.imag()) *
-                                           std::hypot(zo.real(), zo.imag()));
-                sumCross += zo * std::conj(z) * norm;
-                ++count;
-            };
-            addPhaseCross(line + 1, adjFieldCross, adjFieldN);
-            addPhaseCross(line + 2, sameFieldCross, sameFieldN);
-
-            if (!useLockedSource && line > firstLine && line + 1 < lastLine &&
-                locked1DSource_line(line - 1) && locked1DSource_line(line + 1))
-            {
-                const double vEdgeIRE = std::max(
-                    std::fabs(lockedScalar(line, rel) - lockedScalar(line - 1, rel)),
-                    std::fabs(lockedScalar(line, rel) - lockedScalar(line + 1, rel))) * invI;
-                constexpr double EDGE_GATE_IRE = 4.0;
-                if (vEdgeIRE >= EDGE_GATE_IRE) {
-                    const std::complex<double> z0 = sampleLockedIQ(line, rel);
-                    const std::complex<double> zu = sampleLockedIQ(line - 1, rel);
-                    const std::complex<double> zd = sampleLockedIQ(line + 1, rel);
-                    const std::complex<double> edgeDir = zu - zd;
-                    const double edgeMagSq = edgeDir.real() * edgeDir.real() +
-                                             edgeDir.imag() * edgeDir.imag();
-                    if (edgeMagSq <= 1e-12)
-                        continue;
-
-                    const double dUp = std::hypot((z - zu).real(), (z - zu).imag()) * invI;
-                    const double dDn = std::hypot((z - zd).real(), (z - zd).imag()) * invI;
-                    const double signedBias = dDn - dUp; // >0 means closer to upper line.
-                    const std::complex<double> fromBase = z - z0;
-                    const double signedBaseShift =
-                        ((fromBase.real() * edgeDir.real()) +
-                         (fromBase.imag() * edgeDir.imag())) /
-                        std::sqrt(edgeMagSq) * invI; // >0 means 2D moved upward from 1D.
-                    ++s.edgeN;
-                    s.sumEdgeBias += signedBias;
-                    s.sumAbsEdgeBias += std::fabs(signedBias);
-                    s.sumBaseShift += signedBaseShift;
-                    s.sumAbsBaseShift += std::fabs(signedBaseShift);
-                }
-            }
-        }
-    }
-
-    // Leading-edge geometry probe (debug only). For a few upper-third lines,
-    // find the strongest horizontal luma step (where 1D cross-color is born)
-    // and print the *vertical* IQ phase relationship there. This answers the
-    // one thing the aggregate can't: at a real leading edge, is the center
-    // anti-phase to its interfield neighbors (sd<0, midpoint/null target) or
-    // co-directional under a tint (sd~+1, neighbor-common target)?
-    {
-        auto sdot = [&](const std::complex<double> &a,
-                        const std::complex<double> &b) -> double {
-            const double ma = std::hypot(a.real(), a.imag());
-            const double mb = std::hypot(b.real(), b.imag());
-            if (ma <= 1e-9 || mb <= 1e-9) return 0.0;
-            return (a.real() * b.real() + a.imag() * b.imag()) / (ma * mb);
-        };
-        const int probeLo = firstLine + (lastLine - firstLine) / 6;
-        const int probeHi = firstLine + (lastLine - firstLine) / 3;
-        const int probeStep = std::max(1, (probeHi - probeLo) / 10);
-        for (int line = probeLo; line < probeHi && line < demodLines; line += probeStep) {
-            if (line - 2 < firstLine || line + 2 >= lastLine) continue;
-            int bestRel = -1;
-            double bestH = 0.0;
-            for (int rel = 8; rel < width - 8; ++rel) {
-                const double hLuma =
-                    std::fabs(sampleRow(line, rel) - sampleRow(line, rel - 4)) * invI;
-                const std::complex<double> zc = sampleIQ(line, rel);
-                const double m = std::hypot(zc.real(), zc.imag()) * invI;
-                if (hLuma > bestH && m > 4.0) { bestH = hLuma; bestRel = rel; }
-            }
-            if (bestRel < 0 || bestH < 6.0) continue;
-            const int rel = bestRel;
-            const std::complex<double> z0  = sampleIQ(line, rel);
-            const std::complex<double> zu1 = sampleIQ(line - 1, rel);
-            const std::complex<double> zd1 = sampleIQ(line + 1, rel);
-            const std::complex<double> zu2 = sampleIQ(line - 2, rel);
-            const std::complex<double> common1 = 0.5 * (zu1 + zd1);
-            const double cDelta1 =
-                std::hypot((z0 - common1).real(), (z0 - common1).imag()) * invI;
-            qInfo().noquote() << QString(
-                "EdgeProbe line=%1 rel=%2 hLuma=%3 |Z0|=%4 z0=%5/%6 "
-                "sd(z0,u1)=%7 sd(u1,d1)=%8 sd(z0,u2)=%9 cDelta1=%10")
-                .arg(line).arg(rel)
-                .arg(bestH, 0, 'f', 1)
-                .arg(std::hypot(z0.real(), z0.imag()) * invI, 0, 'f', 2)
-                .arg(z0.real() * invI, 0, 'f', 2).arg(z0.imag() * invI, 0, 'f', 2)
-                .arg(sdot(z0, zu1), 0, 'f', 2)
-                .arg(sdot(zu1, zd1), 0, 'f', 2)
-                .arg(sdot(z0, zu2), 0, 'f', 2)
-                .arg(cDelta1, 0, 'f', 2);
-        }
-    }
-
-    QString msg = QString("PhaseLegStats %1 cadence=%2 fieldPhase=%3/%4")
-        .arg(label)
-        .arg(cadenceId)
-        .arg(firstFieldPhaseID)
-        .arg(secondFieldPhaseID);
-
-    for (int phase = 0; phase < 4; ++phase) {
-        const LegStats &s = legs[phase];
-        if (s.n <= 0) {
-            msg += QString(" p%1(n=0)").arg(phase);
-            continue;
-        }
-
-        const double invN = 1.0 / (double)s.n;
-        const double meanI = s.sumI * invN;
-        const double meanQ = s.sumQ * invN;
-        const double meanAbs = s.sumAbsRes * invN;
-        const double rms = std::sqrt(s.sumSqRes * invN);
-
-        msg += QString(" p%1(n=%2,meanIQ=%3/%4,resAbs=%5,resRms=%6)")
-            .arg(phase)
-            .arg(s.n)
-            .arg(meanI, 0, 'f', 3)
-            .arg(meanQ, 0, 'f', 3)
-            .arg(meanAbs, 0, 'f', 3)
-            .arg(rms, 0, 'f', 3);
-    }
-
-    auto meanComplex = [](const LegStats &s)->std::complex<double> {
-        if (s.n <= 0) return {0.0, 0.0};
-        const double invN = 1.0 / (double)s.n;
-        return {s.sumI * invN, s.sumQ * invN};
-    };
-    auto meanAbsRes = [](const LegStats &s)->double {
-        return (s.n > 0) ? (s.sumAbsRes / (double)s.n) : 0.0;
-    };
-    auto meanEdgeBias = [](const LegStats &s)->double {
-        return (s.edgeN > 0) ? (s.sumEdgeBias / (double)s.edgeN) : 0.0;
-    };
-    auto meanAbsEdgeBias = [](const LegStats &s)->double {
-        return (s.edgeN > 0) ? (s.sumAbsEdgeBias / (double)s.edgeN) : 0.0;
-    };
-    auto meanBaseShift = [](const LegStats &s)->double {
-        return (s.edgeN > 0) ? (s.sumBaseShift / (double)s.edgeN) : 0.0;
-    };
-    auto meanAbsBaseShift = [](const LegStats &s)->double {
-        return (s.edgeN > 0) ? (s.sumAbsBaseShift / (double)s.edgeN) : 0.0;
-    };
-
-    const std::complex<double> oddMean  = 0.5 * (meanComplex(legs[1]) + meanComplex(legs[3]));
-    const std::complex<double> evenMean = 0.5 * (meanComplex(legs[0]) + meanComplex(legs[2]));
-    const double oddRes  = 0.5 * (meanAbsRes(legs[1]) + meanAbsRes(legs[3]));
-    const double evenRes = 0.5 * (meanAbsRes(legs[0]) + meanAbsRes(legs[2]));
-    const std::complex<double> oddEvenDelta = oddMean - evenMean;
-
-    const std::complex<double> lowPairMean  = 0.5 * (meanComplex(legs[0]) + meanComplex(legs[1]));
-    const std::complex<double> highPairMean = 0.5 * (meanComplex(legs[2]) + meanComplex(legs[3]));
-    const double lowPairRes  = 0.5 * (meanAbsRes(legs[0]) + meanAbsRes(legs[1]));
-    const double highPairRes = 0.5 * (meanAbsRes(legs[2]) + meanAbsRes(legs[3]));
-    const std::complex<double> lowHighDelta = lowPairMean - highPairMean;
-
-    msg += QString(" oddEven(dIQ=%1/%2,dMag=%3,dRes=%4)")
-        .arg(oddEvenDelta.real(), 0, 'f', 3)
-        .arg(oddEvenDelta.imag(), 0, 'f', 3)
-        .arg(std::hypot(oddEvenDelta.real(), oddEvenDelta.imag()), 0, 'f', 3)
-        .arg(oddRes - evenRes, 0, 'f', 3);
-
-    msg += QString(" lowHigh(dIQ=%1/%2,dMag=%3,dRes=%4)")
-        .arg(lowHighDelta.real(), 0, 'f', 3)
-        .arg(lowHighDelta.imag(), 0, 'f', 3)
-        .arg(std::hypot(lowHighDelta.real(), lowHighDelta.imag()), 0, 'f', 3)
-        .arg(lowPairRes - highPairRes, 0, 'f', 3);
-
-    auto phaseDeg = [](std::complex<double> z)->double {
-        return std::atan2(z.imag(), z.real()) * 180.0 / M_PI;
-    };
-    auto coherence = [](std::complex<double> z)->double {
-        return std::min(1.0, std::hypot(z.real(), z.imag()));
-    };
-    const std::complex<double> adjMean =
-        (adjFieldN > 0) ? (adjFieldCross / (double)adjFieldN) : std::complex<double>{0.0, 0.0};
-    const std::complex<double> sameMean =
-        (sameFieldN > 0) ? (sameFieldCross / (double)sameFieldN) : std::complex<double>{0.0, 0.0};
-    msg += QString(" fieldPhaseIQ(adjN=%1,adjDeg=%2,adjCoh=%3,sameN=%4,sameDeg=%5,sameCoh=%6)")
-        .arg(adjFieldN)
-        .arg(phaseDeg(adjMean), 0, 'f', 2)
-        .arg(coherence(adjMean), 0, 'f', 3)
-        .arg(sameFieldN)
-        .arg(phaseDeg(sameMean), 0, 'f', 2)
-        .arg(coherence(sameMean), 0, 'f', 3);
-
-    qint64 attrN = 0;
-    double sumLumaClaim = 0.0;
-    double sumChromaClaim = 0.0;
-    double sumUncertainClaim = 0.0;
-    double sumLumaIncursion = 0.0;
-    double sumCandidateSpread = 0.0;
-    double sumFrameCoherence = 0.0;
-    double sumCarrierScale = 0.0;
-    double sumCarrierConfidence = 0.0;
-    double sumCarrierPlausibility = 0.0;
-    double sumCarrierPhaseErrorAbs = 0.0;
-    double sumPhaseScheduleConflict = 0.0;
-    int scheduleConflictLines = 0;
-    for (int line = firstLine; line < lastLine; ++line) {
-        const AttributionEvidence *row = attributionEvidence_line(line);
-        if (!row)
-            continue;
-        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
-        const double lineCarrierScale = grammar ? grammar->carrierScale : 0.0;
-        const double lineCarrierConf  = grammar ? std::clamp(grammar->phaseConfidence, 0.0, 1.0) : 0.0;
-        const double lineCarrierPlausibility = carrierPlausibility(grammar);
-        const double lineCarrierPhase = grammar ? grammar->phaseError : 0.0;
-        const double lineConflict = grammar ? grammar->phaseScheduleConflict : 0.0;
-        if (lineConflict > 0.0) ++scheduleConflictLines;
-        for (int rel = 0; rel < width; ++rel) {
-            const AttributionEvidence &e = row[rel];
-            ++attrN;
-            sumLumaClaim += e.assessment.lumaClaim;
-            sumChromaClaim += e.assessment.chromaClaim;
-            sumUncertainClaim += e.assessment.uncertainClaim;
-            sumLumaIncursion += e.facts.lumaIncursionRiskIRE;
-            sumCandidateSpread += e.facts.candidateSpreadIRE;
-            sumFrameCoherence += e.facts.frameIQCoherence;
-            sumCarrierScale += lineCarrierScale;
-            sumCarrierConfidence += lineCarrierConf;
-            sumCarrierPlausibility += lineCarrierPlausibility;
-            sumCarrierPhaseErrorAbs += std::fabs(lineCarrierPhase);
-            sumPhaseScheduleConflict += lineConflict;
-        }
-    }
-    if (attrN > 0) {
-        const double invAttrN = 1.0 / (double)attrN;
-        msg += QString(" attribution(n=%1,luma=%2,chroma=%3,uncertain=%4,incur=%5,spread=%6,frameCoh=%7,carScale=%8,carConf=%9,carPlaus=%10,carPhaseAbsDeg=%11,schedConf=%12,schedConfLines=%13)")
-            .arg(attrN)
-            .arg(sumLumaClaim * invAttrN, 0, 'f', 3)
-            .arg(sumChromaClaim * invAttrN, 0, 'f', 3)
-            .arg(sumUncertainClaim * invAttrN, 0, 'f', 3)
-            .arg(sumLumaIncursion * invAttrN, 0, 'f', 3)
-            .arg(sumCandidateSpread * invAttrN, 0, 'f', 3)
-            .arg(sumFrameCoherence * invAttrN, 0, 'f', 3)
-            .arg(sumCarrierScale * invAttrN, 0, 'f', 3)
-            .arg(sumCarrierConfidence * invAttrN, 0, 'f', 3)
-            .arg(sumCarrierPlausibility * invAttrN, 0, 'f', 3)
-            .arg(sumCarrierPhaseErrorAbs * invAttrN * 180.0 / M_PI, 0, 'f', 3)
-            .arg(sumPhaseScheduleConflict * invAttrN, 0, 'f', 3)
-            .arg(scheduleConflictLines);
-    }
-
-    const qint64 oddEdgeN = legs[1].edgeN + legs[3].edgeN;
-    const qint64 evenEdgeN = legs[0].edgeN + legs[2].edgeN;
-    const double oddEdgeBias = (oddEdgeN > 0)
-        ? ((legs[1].sumEdgeBias + legs[3].sumEdgeBias) / (double)oddEdgeN)
-        : 0.0;
-    const double evenEdgeBias = (evenEdgeN > 0)
-        ? ((legs[0].sumEdgeBias + legs[2].sumEdgeBias) / (double)evenEdgeN)
-        : 0.0;
-    const double oddAbsEdgeBias = (oddEdgeN > 0)
-        ? ((legs[1].sumAbsEdgeBias + legs[3].sumAbsEdgeBias) / (double)oddEdgeN)
-        : 0.0;
-    const double evenAbsEdgeBias = (evenEdgeN > 0)
-        ? ((legs[0].sumAbsEdgeBias + legs[2].sumAbsEdgeBias) / (double)evenEdgeN)
-        : 0.0;
-    const double oddBaseShift = (oddEdgeN > 0)
-        ? ((legs[1].sumBaseShift + legs[3].sumBaseShift) / (double)oddEdgeN)
-        : 0.0;
-    const double evenBaseShift = (evenEdgeN > 0)
-        ? ((legs[0].sumBaseShift + legs[2].sumBaseShift) / (double)evenEdgeN)
-        : 0.0;
-    const double oddAbsBaseShift = (oddEdgeN > 0)
-        ? ((legs[1].sumAbsBaseShift + legs[3].sumAbsBaseShift) / (double)oddEdgeN)
-        : 0.0;
-    const double evenAbsBaseShift = (evenEdgeN > 0)
-        ? ((legs[0].sumAbsBaseShift + legs[2].sumAbsBaseShift) / (double)evenEdgeN)
-        : 0.0;
-
-    msg += QString(" edgeZip(oddN=%1,evenN=%2,oddPull=%3,evenPull=%4,pullDelta=%5,absPull=%6/%7,oddShift=%8,evenShift=%9,shiftDelta=%10,absShift=%11/%12)")
-        .arg(oddEdgeN)
-        .arg(evenEdgeN)
-        .arg(oddEdgeBias, 0, 'f', 3)
-        .arg(evenEdgeBias, 0, 'f', 3)
-        .arg(oddEdgeBias - evenEdgeBias, 0, 'f', 3)
-        .arg(oddAbsEdgeBias, 0, 'f', 3)
-        .arg(evenAbsEdgeBias, 0, 'f', 3)
-        .arg(oddBaseShift, 0, 'f', 3)
-        .arg(evenBaseShift, 0, 'f', 3)
-        .arg(oddBaseShift - evenBaseShift, 0, 'f', 3)
-        .arg(oddAbsBaseShift, 0, 'f', 3)
-        .arg(evenAbsBaseShift, 0, 'f', 3);
-
-    for (int phase = 0; phase < 4; ++phase) {
-        if (legs[phase].edgeN <= 0)
-            continue;
-
-        msg += QString(" ep%1(n=%2,pull=%3,absPull=%4,shift=%5,absShift=%6)")
-            .arg(phase)
-            .arg(legs[phase].edgeN)
-            .arg(meanEdgeBias(legs[phase]), 0, 'f', 3)
-            .arg(meanAbsEdgeBias(legs[phase]), 0, 'f', 3)
-            .arg(meanBaseShift(legs[phase]), 0, 'f', 3)
-            .arg(meanAbsBaseShift(legs[phase]), 0, 'f', 3);
-    }
-
-    qInfo().noquote() << msg;
-}
-
 
 // split2D dispatcher
 void Comb::FrameBuffer::split2D()
 {
     const bool writeWeights = configuration.showMap;
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
-    const bool stageTimers = configuration.stageTimers && configuration.phaseCompensation;
-    if (stageTimers) {
-        split2DInstrumentation.reset();
-        tapBuildInstrumentation.reset();
-    }
-    if (configuration.stageTimers && wantFvf) {
-        fvfInstrumentation.reset();
-    }
-    auto measureSplit2D = [&](Split2DTimerIndex idx, auto &&fn) {
-        if (!stageTimers) {
-            fn();
-            return;
-        }
-        QElapsedTimer timer;
-        timer.start();
-        fn();
-        split2DInstrumentation.add(idx, timer.nsecsElapsed());
-    };
     const bool needFrameACompute = configuration.phaseCompensation &&
         (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
          wantFvf);
@@ -2608,7 +1903,6 @@ void Comb::FrameBuffer::split2D()
             if (writeWeights && line < (int)w2d_frame_weight.size())
                 std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
         }
-        reportPhaseLegStats("2d-final", 1, false);
         return;
     }
 
@@ -2645,71 +1939,56 @@ void Comb::FrameBuffer::split2D()
 
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
-        if (stageTimers) ++split2DInstrumentation.lines;
 
-        measureSplit2D(Split2DTapLine, [&]() { ensureCombTapLine(line); });
+        ensureCombTapLine(line);
         const CombTapLine &tapLine = tapLineCache[precleanRingSlot(line)];
 
         auto ensureFieldBPrecleanLine = [&](int ln) {
             if (ln < firstLine || ln >= lastLine) return;
             if (havePrecleanLine(ln, width)) return;
-            double *preclean = nullptr;
-            const CombTapLine *precleanTapLine = nullptr;
-            measureSplit2D(Split2DPrecleanLookaheadTap, [&]() {
-                preclean = precleanLinePtrMutable(ln, width);
-                precleanTapLine = &ensureCombTapLine(ln);
-            });
-            measureSplit2D(Split2DPrecleanLookaheadFieldB, [&]() {
-                computeSimpleFieldLine(*precleanTapLine,
-                                       preclean,
-                                       writeWeights ? fieldBDecisionReason_line(ln) : nullptr);
-            });
-            measureSplit2D(Split2DPrecleanLookaheadGate, [&]() {
-                double *gate = precleanGateLinePtrMutable(ln, width);
-                std::fill(gate, gate + width, 1.0);
-            });
+            double *preclean = precleanLinePtrMutable(ln, width);
+            const CombTapLine *precleanTapLine = &ensureCombTapLine(ln);
+            computeSimpleFieldLine(*precleanTapLine,
+                                   preclean,
+                                   writeWeights ? fieldBDecisionReason_line(ln) : nullptr);
+            double *gate = precleanGateLinePtrMutable(ln, width);
+            std::fill(gate, gate + width, 1.0);
         };
 
-        measureSplit2D(Split2DFieldB, [&]() {
-            if (combTapBuildFlags_ & TapBuildFieldB) {
-                const double *fieldBPreclean = precleanLinePtr(line, width);
-                if (fieldBPreclean) {
-                    std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
-                } else {
-                    computeSimpleFieldLine(tapLine,
-                                           scratch_lineWorkC.data(),
-                                           writeWeights ? fieldBDecisionReason_line(line) : nullptr);
-                }
+        if (combTapBuildFlags_ & TapBuildFieldB) {
+            const double *fieldBPreclean = precleanLinePtr(line, width);
+            if (fieldBPreclean) {
+                std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
             } else {
-                std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
+                computeSimpleFieldLine(tapLine,
+                                       scratch_lineWorkC.data(),
+                                       writeWeights ? fieldBDecisionReason_line(line) : nullptr);
             }
-        });
+        } else {
+            std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
+        }
 
-        measureSplit2D(Split2DPrecleanCurrent, [&]() {
-            if (needFrameIQCompute) {
-                // Frame B should always see the same C line that split2D produced,
-                // even when Field B's +/-2 reach cedes to the local center value.
-                double *preclean = precleanLinePtrMutable(line, width);
-                std::copy(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, preclean);
-                double *gate = precleanGateLinePtrMutable(line, width);
-                std::fill(gate, gate + width, 1.0);
-            }
-        });
+        if (needFrameIQCompute) {
+            // Frame B should always see the same C line that split2D produced,
+            // even when Field B's +/-2 reach cedes to the local center value.
+            double *preclean = precleanLinePtrMutable(line, width);
+            std::copy(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, preclean);
+            double *gate = precleanGateLinePtrMutable(line, width);
+            std::fill(gate, gate + width, 1.0);
+        }
         if (needFrameIQCompute) {
             ensureFieldBPrecleanLine(line - 1);
             ensureFieldBPrecleanLine(line + 1);
         }
 
-        measureSplit2D(Split2DFieldA, [&]() {
-            if (combTapBuildFlags_ & TapBuildFieldA) {
-                computeContourFieldLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
-            } else {
-                std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
-                std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
-            }
-        });
+        if (combTapBuildFlags_ & TapBuildFieldA) {
+            computeContourFieldLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
+        } else {
+            std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
+            std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
+        }
 
-        measureSplit2D(Split2DLateral, [&]() {
+        {
             const double *src1d = configuration.phaseCompensation
                                   ? nullptr
                                   : bucketScalar1D_line(line);
@@ -2727,58 +2006,52 @@ void Comb::FrameBuffer::split2D()
                 for (int rel = 0; rel < width; ++rel)
                     scratch_lateralLine[rel] = src1d[left + rel];
             }
-        });
+        }
 
-        measureSplit2D(Split2DFrameA, [&]() {
-            if (needFrameACompute) {
-                computeFrameAAdaptiveIQLine(line, frameAIQ);
-                if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
-                    scratch_frameAAdaptiveIQComposite.resize(width);
-                // Symmetric round-trip with Frame A's signed demod: remod back
-                // through the signed phase so the composite scalar lands in
-                // the physical frame produceY's `raw - clpLine` consumes.
-                auto phaseCursor = carrierGrammarSignedSampleCursor(
-                    configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
-                    left);
-                for (int rel = 0; rel < width; ++rel) {
-                    if (rel < (int)frameAIQ.size()) {
-                        const auto &Z = frameAIQ[rel];
-                        scratch_frameAAdaptiveIQComposite[rel] =
-                            carrierGrammarRemodSigned4fscToComposite(phaseCursor, Z.real(), Z.imag());
-                    } else {
-                        scratch_frameAAdaptiveIQComposite[rel] = 0.0;
-                    }
+        if (needFrameACompute) {
+            computeFrameAAdaptiveIQLine(line, frameAIQ);
+            if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
+                scratch_frameAAdaptiveIQComposite.resize(width);
+            // Symmetric round-trip with Frame A's signed demod: remod back
+            // through the signed phase so the composite scalar lands in
+            // the physical frame produceY's `raw - clpLine` consumes.
+            auto phaseCursor = carrierGrammarSignedSampleCursor(
+                configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
+                left);
+            for (int rel = 0; rel < width; ++rel) {
+                if (rel < (int)frameAIQ.size()) {
+                    const auto &Z = frameAIQ[rel];
+                    scratch_frameAAdaptiveIQComposite[rel] =
+                        carrierGrammarRemodSigned4fscToComposite(phaseCursor, Z.real(), Z.imag());
+                } else {
+                    scratch_frameAAdaptiveIQComposite[rel] = 0.0;
                 }
             }
-        });
+        }
 
-        measureSplit2D(Split2DFrameB, [&]() {
-            if (needFrameBCompute) {
-                computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
-                if ((int)scratch_frameBDirectIQComposite.size() < width)
-                    scratch_frameBDirectIQComposite.resize(width);
-            }
-        });
+        if (needFrameBCompute) {
+            computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
+            if ((int)scratch_frameBDirectIQComposite.size() < width)
+                scratch_frameBDirectIQComposite.resize(width);
+        }
 
         const std::vector<double> &frameAttrScalar =
             needFrameBCompute ? scratch_frameBDirectIQComposite : scratch_frameAAdaptiveIQComposite;
         const std::vector<std::complex<double>> *frameAttrIQ =
             needFrameBCompute ? &frameIQ : (needFrameACompute ? &frameAIQ : nullptr);
-        measureSplit2D(Split2DAttribution, [&]() {
-            collectCombAttributionEvidence(
-                line,
-                scratch_lineWorkA.data(),
-                scratch_lineWorkC.data(),
-                needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
-                frameAttrIQ);
-        });
+        collectCombAttributionEvidence(
+            line,
+            scratch_lineWorkA.data(),
+            scratch_lineWorkC.data(),
+            needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
+            frameAttrIQ);
 
         double *dst = clpbuffer[1].pixel[line];
         auto emitSelected = [&](int rel, double v) {
             dst[left + rel] = v;
         };
 
-        measureSplit2D(Split2DSelection, [&]() {
+        {
             if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldAContour) {
                 for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkA[rel]);
                 if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
@@ -2825,12 +2098,8 @@ void Comb::FrameBuffer::split2D()
                     }
                 }
             }
-        });
+        }
     }
-
-    measureSplit2D(Split2DDebugPhaseLegs, [&]() {
-        reportPhaseLegStats("2d-final", 1, false);
-    });
 }
 
 // 3D temporal adaptive
