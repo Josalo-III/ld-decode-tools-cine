@@ -1015,6 +1015,10 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
 
     if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
+    const auto  &T   = configuration.tunables;
+    const double invI = invIreScale;
+    const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
+
     for (int rel = 0; rel < width; ++rel) {
         const double C    = tapLine.tap0[rel].comp;
         const double Cup2 = tapLine.tapU2[rel].comp;
@@ -1027,6 +1031,36 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
         double wUp2 = tapLine.pairU2[rel].weight * reachUp2;
         double wDn2 = tapLine.pairD2[rel].weight * reachDn2;
         const CombTapContour &curve = tapLine.contour[rel];
+
+        // Per-side coarse-luma-edge facts, cribbed from Field B. eUp/eDn rise
+        // where the center crosses a horizontal luma step on that side; chromaT
+        // weights the bevel cede by chroma presence.
+        const double chromaT =
+            std::clamp((std::hypot(C, tapLine.tap0[rel].symMag) * invI - 2.0) / 8.0,
+                       0.0, 1.0);
+        double eUp = 0.0, eDn = 0.0;
+        if (rel < (int)tapLine.coarse0IRE.size() &&
+            rel < (int)tapLine.coarseU2IRE.size() &&
+            rel < (int)tapLine.coarseD2IRE.size())
+        {
+            const double LUMA_EDGE_LO_IRE = 6.0;
+            const double LUMA_EDGE_HI_IRE = 20.0;
+            const double dUpIRE = std::fabs(
+                tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]);
+            const double dDnIRE = std::fabs(
+                tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]);
+            eUp = std::clamp(
+                (dUpIRE - LUMA_EDGE_LO_IRE) /
+                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE), 0.0, 1.0);
+            eDn = std::clamp(
+                (dDnIRE - LUMA_EDGE_LO_IRE) /
+                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE), 0.0, 1.0);
+            // Back the vertical comb off the side that crosses a luma edge.
+            // This is the one-sided-bevel handler; the min()-based cede below
+            // only catches the both-sides case.
+            wUp2 *= (1.0 - eUp);
+            wDn2 *= (1.0 - eDn);
+        }
 
         double sc2 = 1.0;
         if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
@@ -1066,12 +1100,51 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
         const double Cdn2Adj = refineNearWithFar(Cdn2, Cdn4, curve.dnInfluence);
 
         double tc = 0.0;
-        if (wUp2 > 0.0 || wDn2 > 0.0) {
+        const bool combed = (wUp2 > 0.0 || wDn2 > 0.0);
+        if (combed) {
             double t2  = ((C - Cup2Adj) * wUp2 * sc2);
             t2        += ((C - Cdn2Adj) * wDn2 * sc2);
             tc        += 0.25 * t2;
         } else {
             tc = C;
+        }
+
+        // Zipper defense cribbed from Field B (computeSimpleFieldLine): the
+        // bevel zipper is vertical combing across a horizontal luma edge. After
+        // the per-side weight suppression above, cede the comb back toward the
+        // local center C across both-sided coarse-luma edges and non-straight
+        // bevels, weighted by chroma presence — "chroma may only sharpen a
+        // break, never originate one." Field A already inherits the bevel REACH
+        // throttle through pairU2/pairD2.reachGate; these are the additional
+        // luma-edge defenses Field B needed on top of it.
+        if (combed) {
+            const double lumaEdgeCede = std::min(eUp, eDn);
+
+            double bevelCede = 0.0;
+            if (rel < (int)tapLine.movingCoarseContour.size() &&
+                tapLine.movingCoarseContour[rel].valid &&
+                rel < (int)tapLine.hLumaDeltaIRE.size())
+            {
+                const auto &mc = tapLine.movingCoarseContour[rel];
+                const double hEdge = std::clamp(
+                    (tapLine.hLumaDeltaIRE[rel] - 0.30 * hEdgeThreshIRE) /
+                    (0.70 * hEdgeThreshIRE), 0.0, 1.0);
+                const double sideBalance =
+                    1.0 - std::fabs(
+                        std::clamp(mc.upTrust, 0.0, 1.0) -
+                        std::clamp(mc.downTrust, 0.0, 1.0));
+                const double bevelRisk =
+                    chromaT *
+                    hEdge *
+                    (1.0 - std::clamp(mc.straightness, 0.0, 1.0)) *
+                    (0.35 + 0.65 * std::clamp(sideBalance, 0.0, 1.0));
+                bevelCede =
+                    std::clamp(T.FIELD_B_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
+            }
+
+            const double totalCede = std::max(lumaEdgeCede, bevelCede);
+            if (totalCede > 0.0)
+                tc = tc * (1.0 - totalCede) + C * totalCede;
         }
 
         if (!std::isfinite(tc))
@@ -1682,7 +1755,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     const double COMB_STRENGTH  = std::max(0.0, T.FRAME_COMB_STRENGTH);
     const double MAX_DELTA_IRE  = T.FRAME_IQ_RAW_MAX_DELTA_IRE;
     const double MIN_CHROMA_IRE = T.FRAME_CHROMA_MIN_IRE;
-
     // ------------------------------------------------------------
     // Build IQ vectors for center and 1 neighbors
     // ------------------------------------------------------------
@@ -1763,12 +1835,22 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
                                             T.FIELD_CONTOUR_SOFT_IRE,
                                             T.FIELD_CONTOUR_HARD_IRE);
         }
-        // NOTE: the interfield contribution is gated only by the boundary/
-        // transition suppression (below) and the disGate/clamp downstream -
-        // matching the reference comb. The reach-limiter throttle (pairU1/
-        // pairD1 reachGate) was a layer added on top that stood the interfield
-        // comb down at exactly the saturated edges it exists to clean; it is
-        // deliberately not applied.
+        // Bevel reach throttle, cribbed from Frame B. The ±1 reachGate
+        // (pairU1/pairD1, built by applyFrameReachWithIQFloor) now carries the
+        // moving-coarse bevel throttle in IRE units — the same gate that keeps
+        // Frame B zipper-free. Frame A previously ignored it because the OLD
+        // composite-domain gate over-fired and stood the comb down at the
+        // saturated edges it exists to clean; in the IRE domain it discriminates
+        // properly, so it is applied per-side to the interfield contributions
+        // below (exactly as Field B applies pairU2/pairD2.reachGate).
+        const double reachUp1 =
+            (reachTapLine && x < (int)reachTapLine->pairU1.size())
+                ? std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0)
+                : 1.0;
+        const double reachDn1 =
+            (reachTapLine && x < (int)reachTapLine->pairD1.size())
+                ? std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0)
+                : 1.0;
 
         // Cache dUpDown_ire — reused below for the disagree gate (saves one
         // hypot per pixel on the haveUp && haveDn path).
@@ -1809,9 +1891,10 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             std::complex<double> contrib;
             double w;
             softAlignBoth(Z0, ZUpRaw, a0, aUp, contrib, w);
-            w *= boundaryWeightScale;
+            const double sideScale = boundaryWeightScale * reachUp1;
+            w *= sideScale;
             if (w > 0.0) {
-                Zsum += contrib * boundaryWeightScale;
+                Zsum += contrib * sideScale;
                 wsum += w;
             }
         }
@@ -1819,9 +1902,10 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             std::complex<double> contrib;
             double w;
             softAlignBoth(Z0, ZDnRaw, a0, aDn, contrib, w);
-            w *= boundaryWeightScale;
+            const double sideScale = boundaryWeightScale * reachDn1;
+            w *= sideScale;
             if (w > 0.0) {
-                Zsum += contrib * boundaryWeightScale;
+                Zsum += contrib * sideScale;
                 wsum += w;
             }
         }
@@ -1992,8 +2076,16 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
                     nullTarget * (1.0 - coDirectional) +
                     neighborCommon * coDirectional;
 
+                // Bevel reach throttle (cribbed from Frame B): the alien-cancel
+                // pull is an interfield reach across ±1, so it must obey the
+                // same bevel gate as the comb above. columnSupport can stay high
+                // across a horizontal luma edge that also grazes vertical detail
+                // (its lumaEdgeFit term keys on horizontal luma delta); the ±1
+                // reachGate carries the moving-coarse bevel throttle that backs
+                // the pull off the actual edge.
+                const double bevelReach = std::min(reachUp1, reachDn1);
                 const double targetStrength =
-                    cancelStrength * (0.70 + 0.30 * coDirectional);
+                    cancelStrength * (0.70 + 0.30 * coDirectional) * bevelReach;
 
                 Zout = Zout * (1.0 - targetStrength) +
                        target * targetStrength;
