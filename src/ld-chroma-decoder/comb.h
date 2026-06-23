@@ -860,13 +860,15 @@ private:
 	static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
 									   const LdDecodeMetaData::VideoParameters &vp);
 	
-	// Field-vs-Frame elects scalar bandpass candidates. IQ evidence can inform
-	// the scores, but IQ-derived candidates must be remodulated before entry.
+	// Field-vs-Frame elects scalar bandpass candidates. Candidate A is the
+	// same-regime buddy: Field A in interlace, Frame A in progressive.
+	// IQ evidence can inform the scores, but IQ-derived candidates must be
+	// remodulated before entry.
 	void scoreFieldVsFrame(
 	    int line,
 	    const CombTapLine &tapLine,
+	    const std::vector<double> &candidateA,
 	    const double *fieldB,
-	    const std::vector<double> &fieldA,
 	    const std::vector<double> *frameB,
 	    double *outMixed,
 	    bool writeWeights,

@@ -729,8 +729,8 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
 void Comb::FrameBuffer::scoreFieldVsFrame(
     int line,
     const CombTapLine &tapLine,
+    const std::vector<double> &candidateA,
     const double *fieldB,
-    const std::vector<double> &fieldA,
     const std::vector<double> *frameB,
     double *outMixed,
     bool writeWeights,
@@ -742,12 +742,12 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int width = right - left;
 
     if (width <= 0) return;
-    if (!fieldB || !frameB || (int)fieldA.size() < width ||
+    if (!fieldB || !frameB || (int)candidateA.size() < width ||
         (int)frameB->size() < width || !outMixed)
         return;
 
     const std::vector<double> &frameB2 = *frameB;
-    const double *fieldAData = fieldA.data();
+    const double *candidateAData = candidateA.data();
     if (line >= 0 && line < (int)fvfMetrics.size() &&
         (int)fvfMetrics[line].size() < width)
     {
@@ -849,7 +849,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     std::vector<float>  &outShade = scratch_fvf_outShade;
     std::vector<double> &diffFVF  = scratch_fvf_diffFVF;
     std::vector<double> &satMap   = scratch_fvf_satMap;
-    std::vector<double> &notchFieldA = scratch_fvf_notchFieldA;
+    std::vector<double> &notchCandidateA = scratch_fvf_notchFieldA;
     std::vector<double> &notchFieldB = scratch_fvf_notchFieldB;
     std::vector<double> &notchFrame  = scratch_fvf_notchFrame;
     std::vector<double> &notchSource = scratch_fvf_notchSource;
@@ -860,7 +860,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     double prev_sat_t = 0.0;
 
     // Core Logic of Field Vs Frame
-    // when the footage is progressive we prefer interfield comb
+    // Progressive uses the frame regime; interlace uses the field regime.
     bool useFrameModel = (cadenceId >= 0 || cadenceId == -3);
     bool localUseFrameModel = useFrameModel;
 
@@ -931,14 +931,14 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     }
 
     for (int r = 0; r < width; ++r) {
-        notchFieldA[r] = getNotchLumaEven2(fieldAData, r, width);
+        notchCandidateA[r] = getNotchLumaEven2(candidateAData, r, width);
         notchFieldB[r] = getNotchLumaEven2(fieldB, r, width);
         notchFrame[r] = getNotchLumaEven2Vec(frameB2, r);
         notchSource[r] = getNotchLumaEven2(srcLine, r, width);
     }
 
     for (int rel = 0; rel < width; ++rel) {
-        double FA = fieldA[rel];
+        double FA = candidateA[rel];
         double FB = fieldB[rel];
         double FR = frameB2[rel];
         double L1 = sample1D(rel);
@@ -947,7 +947,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             ? scratch_fvf_iqMag[rel]
             : std::fabs(FR);
 
-        const Cond1D FA_c = condSamePhase(fieldAData, rel);
+        const Cond1D FA_c = condSamePhase(candidateAData, rel);
         const Cond1D FB_c = condSamePhase(fieldB, rel);
         const Cond1D FR_c = condSamePhaseVec(frameB2, rel);
 
@@ -958,7 +958,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         // Luma proxies: prefer the pure even-offset notch (±2 average), which is
         // less sensitive to single-pixel spikes than a [1,2,1] that includes center.
-        double lumFA = notchFieldA[rel];
+        double lumFA = notchCandidateA[rel];
         double lumFB = notchFieldB[rel];
         double lumFR = notchFrame[rel];
 
@@ -1057,8 +1057,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     return std::fabs(shapeVal - shapeModel);
                 };
 
-                double FA_l = fieldA[std::clamp(rel - 1, 0, width - 1)];
-                double FA_r = fieldA[std::clamp(rel + 1, 0, width - 1)];
+                double FA_l = candidateA[std::clamp(rel - 1, 0, width - 1)];
+                double FA_r = candidateA[std::clamp(rel + 1, 0, width - 1)];
                 double FB_l = fieldB[std::clamp(rel - 1, 0, width - 1)];
                 double FB_r = fieldB[std::clamp(rel + 1, 0, width - 1)];
                 double FR_l = frameB2[std::clamp(rel - 1, 0, width - 1)];
@@ -1079,12 +1079,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
             scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
 
-            // Field-A gate / special cleanup removed. Candidate A remains scored
-            // by the general candidate machinery only.
+            // Candidate-A special gating is removed. The same-regime buddy
+            // competes through the general candidate machinery only.
 
             // ------------------------------------------------------------
             // Model-aware regime scoring.
-            // Progressive protects Frame and only measures Field B against it.
+            // Progressive protects the frame regime: Frame A participates,
+            // and only Field B is measured against the Frame B model.
             // Interlace treats Field B as the model, lets Field A participate
             // on its own image-shaping merits, and gives Frame B only a small
             // score bump when it is very close to Field B.
@@ -1219,7 +1220,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                                                 const std::vector<double> *vec)
                     {
                         const double *notch = arr
-                            ? (arr == fieldAData ? notchFieldA.data() : notchFieldB.data())
+                            ? (arr == candidateAData ? notchCandidateA.data() : notchFieldB.data())
                             : notchFrame.data();
                         const double m2 = notch[rm2];
                         const double p2 = notch[rp2];
@@ -1239,7 +1240,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                         score *= (1.0 - W_EDGE_SHARP * sharp * stepStrength);
                     };
 
-                    applySharpReward(scoreA, fieldAData, nullptr);
+                    applySharpReward(scoreA, candidateAData, nullptr);
                     applySharpReward(scoreB, fieldB, nullptr);
                     applySharpReward(scoreR, nullptr, &frameB2);
                 }
@@ -1405,7 +1406,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const int xm1 = std::max(0, rel - 1);
                 const int xp1 = std::min(width - 1, rel + 1);
 
-                const double aAnchor = 0.5 * (fieldAData[xm1] + fieldAData[xp1]);
+                const double aAnchor = 0.5 * (candidateAData[xm1] + candidateAData[xp1]);
                 const double bAnchor = 0.5 * (fieldB[xm1]     + fieldB[xp1]);
                 const double rAnchor = 0.5 * (frameB2[xm1]    + frameB2[xp1]);
                 const double cAnchor = 0.5 * (sample1D(xm1)   + sample1D(xp1));
@@ -1601,7 +1602,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             winner.swap(w2);
             for (int rel = 0; rel < width; ++rel) {
                 int idx = winner[rel];
-                if      (idx == 0) { outVal[rel] = fieldA[rel];  outShade[rel] = 0.25f; }
+                if      (idx == 0) { outVal[rel] = candidateA[rel]; outShade[rel] = 0.25f; }
                 else if (idx == 1) { outVal[rel] = fieldB[rel];  outShade[rel] = 0.35f; }
                 else               { outVal[rel] = frameB2[rel]; outShade[rel] = 0.8f;  }
             }
@@ -1630,7 +1631,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     int blockIdx = (cntA >= cntB) ? 0 : 1;
                     for (int r = b; r < e; ++r) {
                         winner[r] = blockIdx;
-                        if (blockIdx == 0) { outVal[r] = fieldA[r]; outShade[r] = 0.25f; }
+                        if (blockIdx == 0) { outVal[r] = candidateA[r]; outShade[r] = 0.25f; }
                         else               { outVal[r] = fieldB[r]; outShade[r] = 0.35f; }
                     }
                 }
@@ -1904,8 +1905,11 @@ void Comb::FrameBuffer::split2D()
 {
     const bool writeWeights = configuration.showMap;
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
+    const bool fvfUseFrameModel = wantFvf && configuration.phaseCompensation &&
+        (cadenceId >= 0 || cadenceId == -3);
     const bool needFrameACompute = configuration.phaseCompensation &&
-        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ);
+        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
+         fvfUseFrameModel);
     const bool needFrameBCompute = configuration.phaseCompensation &&
         (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ ||
          wantFvf);
@@ -1956,6 +1960,11 @@ void Comb::FrameBuffer::split2D()
             break;
         case V::FrameBDirectIQ:
             combTapBuildFlags_ = TapBuildFrame | TapBuildFieldB;
+            break;
+        case V::FieldVsFrame:
+            combTapBuildFlags_ = fvfUseFrameModel
+                ? (TapBuildFrame | TapBuildFieldB)
+                : TapBuildAll;
             break;
         default:
             combTapBuildFlags_ = TapBuildAll;
@@ -2067,9 +2076,13 @@ void Comb::FrameBuffer::split2D()
             needFrameBCompute ? scratch_frameBDirectIQComposite : scratch_frameAAdaptiveIQComposite;
         const std::vector<std::complex<double>> *frameAttrIQ =
             needFrameBCompute ? &frameIQ : (needFrameACompute ? &frameAIQ : nullptr);
+        const double *candidateAForAttr =
+            (wantFvf && fvfUseFrameModel && (int)scratch_frameAAdaptiveIQComposite.size() >= width)
+                ? scratch_frameAAdaptiveIQComposite.data()
+                : scratch_lineWorkA.data();
         collectCombAttributionEvidence(
             line,
-            scratch_lineWorkA.data(),
+            candidateAForAttr,
             scratch_lineWorkC.data(),
             needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
             frameAttrIQ);
@@ -2108,8 +2121,10 @@ void Comb::FrameBuffer::split2D()
                     scoreFieldVsFrame(
                         line,
                         tapLine,
+                        (wantFvf && fvfUseFrameModel)
+                            ? scratch_frameAAdaptiveIQComposite   // Frame A in the frame regime
+                            : scratch_lineWorkA,                  // Field A in the interlace regime
                         scratch_lineWorkC.data(),                 // Field B / simple field
-                        scratch_lineWorkA,                        // Field A / contour field
                         &scratch_frameBDirectIQComposite,         // Frame B / direct IQ composite
                         scratch_outMixed.data(),
                         writeWeights,
