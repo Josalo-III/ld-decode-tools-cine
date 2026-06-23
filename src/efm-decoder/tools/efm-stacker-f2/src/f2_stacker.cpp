@@ -28,7 +28,12 @@
 #include <QHash>
 #include <QSet>
 
+#include <array>
 #include <limits>
+
+namespace {
+constexpr int kMaxStackSources = 32;
+}
 
 F2Stacker::F2Stacker() :
     m_noValidValueForByte(0),
@@ -117,7 +122,11 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
         stackEndAddress = address;
 
         QVector<F2Section> sectionList;
+        QVector<SectionAnalysis> sectionAnalyses;
         QVector<int> sectionSourceIndexes;
+        sectionList.reserve(sourceStates.size());
+        sectionAnalyses.reserve(sourceStates.size());
+        sectionSourceIndexes.reserve(sourceStates.size());
 
         for (int sourceIndex = 0; sourceIndex < sourceStates.size(); sourceIndex++) {
             SourceState &sourceState = sourceStates[sourceIndex];
@@ -132,7 +141,7 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
             }
 
             F2Section bestSection = sourceState.currentSection;
-            quint32 bestScore = sectionScore(bestSection);
+            SectionAnalysis bestAnalysis = sourceState.currentAnalysis;
             while (readNextValidSection(sourceState, address)) {
                 qint32 nextAddress =
                         sourceState.currentSection.metadata.absoluteSectionTime().frames();
@@ -141,15 +150,15 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
                 }
 
                 sourceState.duplicateSections++;
-                quint32 nextScore = sectionScore(sourceState.currentSection);
-                if (nextScore < bestScore) {
+                if (sourceState.currentAnalysis.score < bestAnalysis.score) {
                     bestSection = sourceState.currentSection;
-                    bestScore = nextScore;
+                    bestAnalysis = sourceState.currentAnalysis;
                     sourceState.replacedDuplicateSections++;
                 }
             }
 
             sectionList.append(bestSection);
+            sectionAnalyses.append(bestAnalysis);
             sectionSourceIndexes.append(sourceIndex);
         }
 
@@ -161,7 +170,7 @@ bool F2Stacker::process(const QVector<QString> &inputFilenames, const QString &o
 
         tbcDebugStream().noquote() << "F2Stacker::process() - Stacking section" << SectionTime(address).toString();
 
-        F2Section stackedF2Section = stackSections(sectionList, sectionSourceIndexes);
+        F2Section stackedF2Section = stackSections(sectionList, sectionAnalyses, sectionSourceIndexes);
 
         // Write the output F2 Section
         m_outputFile.write(stackedF2Section);
@@ -249,6 +258,7 @@ bool F2Stacker::readNextValidSection(SourceState &sourceState, qint32 minimumAdd
         }
         sourceState.lastReadAddress = address;
         sourceState.currentSection = section;
+        sourceState.currentAnalysis = analyzeSection(sourceState.currentSection);
         sourceState.hasCurrentSection = true;
         return true;
     }
@@ -258,25 +268,60 @@ bool F2Stacker::readNextValidSection(SourceState &sourceState, qint32 minimumAdd
     return false;
 }
 
-quint32 F2Stacker::sectionScore(const F2Section &section) const
+F2Stacker::SectionAnalysis F2Stacker::analyzeSection(const F2Section &section) const
 {
-    quint32 score = 0;
+    SectionAnalysis analysis;
+    analysis.isPadding = true;
+    QHash<quint8, int> byteCounts;
+    QSet<QByteArray> uniqueFrames;
+    int totalBytes = 0;
+    int dominantByteCount = 0;
 
     if (section.metadata.isRepaired()) {
-        score += 100000;
+        analysis.score += 100000;
     }
 
     for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
         const F2Frame &frame = section.frameRef(frameIndex);
-        score += frame.rawErrorData().count(true);
-        score += frame.rawPaddedData().count(true);
+        const QVector<bool> &errorData = frame.rawErrorData();
+        const QVector<bool> &paddedData = frame.rawPaddedData();
+        const QVector<quint8> &data = frame.rawData();
+        QByteArray frameBytes;
+        frameBytes.reserve(data.size());
+
+        analysis.score += errorData.count(true);
+        analysis.score += paddedData.count(true);
+
+        if (paddedData.contains(false)) {
+            analysis.isPadding = false;
+        }
+
+        for (int byteIndex = 0; byteIndex < data.size(); byteIndex++) {
+            byteCounts[data[byteIndex]]++;
+            frameBytes.append(static_cast<char>(data[byteIndex]));
+            totalBytes++;
+        }
+
+        uniqueFrames.insert(frameBytes);
     }
 
-    if (isFlatSection(section)) {
-        score += 100000;
+    for (auto it = byteCounts.begin(); it != byteCounts.end(); ++it) {
+        if (it.value() > dominantByteCount) {
+            dominantByteCount = it.value();
+        }
     }
 
-    return score;
+    const int repeatedFrames = 98 - uniqueFrames.size();
+    analysis.isFlat = totalBytes == 0 ||
+                      byteCounts.size() <= 8 ||
+                      repeatedFrames >= 80 ||
+                      dominantByteCount > (totalBytes * 85 / 100);
+
+    if (analysis.isFlat) {
+        analysis.score += 100000;
+    }
+
+    return analysis;
 }
 
 quint32 F2Stacker::sectionDifference(const F2Section &firstSection, const F2Section &secondSection) const
@@ -299,59 +344,9 @@ quint32 F2Stacker::sectionDifference(const F2Section &firstSection, const F2Sect
     return differences;
 }
 
-bool F2Stacker::isPaddingSection(const F2Section &section) const
-{
-    for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-        if (section.frameRef(frameIndex).rawPaddedData().contains(false)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool F2Stacker::isFlatSection(const F2Section &section) const
-{
-    QHash<quint8, int> byteCounts;
-    QSet<QByteArray> uniqueFrames;
-    int totalBytes = 0;
-
-    for (int frameIndex = 0; frameIndex < 98; frameIndex++) {
-        const F2Frame &frame = section.frameRef(frameIndex);
-        const QVector<quint8> &data = frame.rawData();
-        QByteArray frameBytes;
-        frameBytes.reserve(data.size());
-
-        for (int byteIndex = 0; byteIndex < data.size(); byteIndex++) {
-            byteCounts[data[byteIndex]]++;
-            frameBytes.append(static_cast<char>(data[byteIndex]));
-            totalBytes++;
-        }
-
-        uniqueFrames.insert(frameBytes);
-    }
-
-    int dominantByteCount = 0;
-    for (auto it = byteCounts.begin(); it != byteCounts.end(); ++it) {
-        if (it.value() > dominantByteCount) {
-            dominantByteCount = it.value();
-        }
-    }
-
-    const int repeatedFrames = 98 - uniqueFrames.size();
-    if (totalBytes == 0) {
-        return true;
-    }
-
-    // A real F2 section, even for quiet audio, should have plenty of byte and
-    // frame variation because parity and interleaving are still present.  This
-    // catches collapsed/flat captures that arrive with clean-looking flags.
-    return byteCounts.size() <= 8 ||
-           repeatedFrames >= 80 ||
-           dominantByteCount > (totalBytes * 85 / 100);
-}
-
-F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const QVector<int> &sourceIndexes)
+F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections,
+                                   const QVector<SectionAnalysis> &sectionAnalyses,
+                                   const QVector<int> &sourceIndexes)
 {
     F2Section stackedSection;
     SectionMetadata stackedMetadata;
@@ -384,19 +379,21 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const Q
 
     // Remove sections that are entirely padding.
     QVector<F2Section> validF2Sections;
+    QVector<SectionAnalysis> validSectionAnalyses;
     QVector<int> validSourceIndexes;
     for (int sectionIndex = 0; sectionIndex < f2Sections.size(); sectionIndex++) {
-        if (isPaddingSection(f2Sections[sectionIndex])) {
+        if (sectionAnalyses[sectionIndex].isPadding) {
             tbcDebugStream().noquote()
                 << "F2Stacker::stackSections - Section" << sectionIndex
                 << "is just padding";
-        } else if (isFlatSection(f2Sections[sectionIndex])) {
+        } else if (sectionAnalyses[sectionIndex].isFlat) {
             tbcDebugStream().noquote()
                 << "F2Stacker::stackSections - Section" << sectionIndex
                 << "is flat data";
             m_flatSections++;
         } else {
             validF2Sections.append(f2Sections[sectionIndex]);
+            validSectionAnalyses.append(sectionAnalyses[sectionIndex]);
             validSourceIndexes.append(sourceIndexes[sectionIndex]);
         }
     }
@@ -425,19 +422,33 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const Q
         quint64 bestClusterDifferences = std::numeric_limits<quint64>::max();
         int bestClusterPreviousOverlap = -1;
         const quint32 sameSectionDifferenceThreshold = 128;
+        const int validSectionCount = validF2Sections.size();
+        QVector<quint32> sectionDifferences;
+        sectionDifferences.resize(validSectionCount * validSectionCount);
 
-        for (int seedIndex = 0; seedIndex < validF2Sections.size(); seedIndex++) {
+        for (int firstIndex = 0; firstIndex < validSectionCount; firstIndex++) {
+            sectionDifferences[(firstIndex * validSectionCount) + firstIndex] = 0;
+            for (int secondIndex = firstIndex + 1; secondIndex < validSectionCount; secondIndex++) {
+                const quint32 differences =
+                    sectionDifference(validF2Sections[firstIndex], validF2Sections[secondIndex]);
+                sectionDifferences[(firstIndex * validSectionCount) + secondIndex] = differences;
+                sectionDifferences[(secondIndex * validSectionCount) + firstIndex] = differences;
+            }
+        }
+
+        for (int seedIndex = 0; seedIndex < validSectionCount; seedIndex++) {
             QVector<int> clusterIndexes;
+            clusterIndexes.reserve(validSectionCount);
             quint64 clusterScore = 0;
             quint64 clusterDifferences = 0;
             int clusterPreviousOverlap = 0;
 
-            for (int candidateIndex = 0; candidateIndex < validF2Sections.size(); candidateIndex++) {
+            for (int candidateIndex = 0; candidateIndex < validSectionCount; candidateIndex++) {
                 const quint32 differences =
-                    sectionDifference(validF2Sections[seedIndex], validF2Sections[candidateIndex]);
+                    sectionDifferences[(seedIndex * validSectionCount) + candidateIndex];
                 if (differences <= sameSectionDifferenceThreshold) {
                     clusterIndexes.append(candidateIndex);
-                    clusterScore += sectionScore(validF2Sections[candidateIndex]);
+                    clusterScore += validSectionAnalyses[candidateIndex].score;
                     clusterDifferences += differences;
                     if (m_previousClusterSourceIndexes.contains(validSourceIndexes[candidateIndex])) {
                         clusterPreviousOverlap++;
@@ -464,16 +475,19 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const Q
 
         if (!bestClusterIndexes.isEmpty() && bestClusterIndexes.size() < validF2Sections.size()) {
             QVector<F2Section> clusteredF2Sections;
+            QVector<SectionAnalysis> clusteredSectionAnalyses;
             QVector<int> clusteredSourceIndexes;
 
             for (int clusterIndex = 0; clusterIndex < bestClusterIndexes.size(); clusterIndex++) {
                 const int sectionIndex = bestClusterIndexes[clusterIndex];
                 clusteredF2Sections.append(validF2Sections[sectionIndex]);
+                clusteredSectionAnalyses.append(validSectionAnalyses[sectionIndex]);
                 clusteredSourceIndexes.append(validSourceIndexes[sectionIndex]);
             }
 
             m_divergentSections += validF2Sections.size() - clusteredF2Sections.size();
             validF2Sections = clusteredF2Sections;
+            validSectionAnalyses = clusteredSectionAnalyses;
             validSourceIndexes = clusteredSourceIndexes;
         }
         m_previousClusterSourceIndexes = validSourceIndexes;
@@ -520,6 +534,12 @@ F2Section F2Stacker::stackSections(const QVector<F2Section> &f2Sections, const Q
 F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &sourceIndexes)
 {
     F2Frame stackedFrame;
+    const int frameCount = f2Frames.size();
+    if (frameCount > kMaxStackSources) {
+        qFatal("F2Stacker::stackFrames - Too many input frames (%d > %d)",
+               frameCount,
+               kMaxStackSources);
+    }
 
     // Process one byte at a time
     QVector<quint8> stackedFrameData;
@@ -527,65 +547,61 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &s
     stackedFrameData.reserve(32);
     stackedFrameErrorData.reserve(32);
     for (int byteIndex = 0; byteIndex < 32; byteIndex++) {
-        // Make a list of the bytes to stack (i.e. those without error flags)
-        QVector<quint8> validBytes;
-        validBytes.reserve(f2Frames.size());
+        std::array<quint8, kMaxStackSources> validBytes{};
+        int validByteCount = 0;
+        bool allBytesSame = true;
+        quint8 firstValidByte = 0;
+        std::array<int, 256> byteCounts{};
+
         for (int listIndex = 0; listIndex < f2Frames.size(); ++listIndex) {
             const F2Frame &frame = f2Frames.at(listIndex);
             const QVector<bool> &errorData = frame.rawErrorData();
             if (errorData[byteIndex] == false) {
-                validBytes.append(frame.rawData()[byteIndex]);
+                const quint8 byteValue = frame.rawData()[byteIndex];
+                if (validByteCount == 0) {
+                    firstValidByte = byteValue;
+                } else if (byteValue != firstValidByte) {
+                    allBytesSame = false;
+                }
+
+                validBytes[validByteCount] = byteValue;
+                validByteCount++;
+                byteCounts[byteValue]++;
             }
         }
 
-        if (validBytes.size() == 0) {
+        if (validByteCount == 0) {
             // All bytes are errors - can't correct
             stackedFrameData.append(f2Frames.at(0).rawData()[byteIndex]);
             stackedFrameErrorData.append(true);
             tbcDebugStream() << "F2Stacker::stackFrames - No valid byte value for index" << byteIndex;
             m_noValidValueForByte++;
         } else {
-            // Are all the valid bytes the same value?
-            bool allBytesSame = true;
-            for (int byteIndex = 1; byteIndex < validBytes.size(); byteIndex++) {
-                if (validBytes.at(byteIndex) != validBytes.at(0)) {
-                    allBytesSame = false;
-                    continue;
-                }
-            }
-
             // If all valid bytes are the same, use that value.
             if (allBytesSame) {
-                stackedFrameData.append(validBytes.at(0));
+                stackedFrameData.append(firstValidByte);
                 stackedFrameErrorData.append(false);
                 m_validValueForByte++;
                 continue;
             } else {
-                // If all valid bytes aren't the same, calculate the most common
-                // byte value from the available valid bytes and use that value
-                QHash<quint8, int> byteCounts;
-                for (int byteIndex = 0; byteIndex < validBytes.size(); byteIndex++) {
-                    byteCounts[validBytes.at(byteIndex)]++;
-                }
-
                 // Find the most common byte value.  If there is a tie, keep the
                 // byte marked as an erasure instead of blessing an arbitrary source.
                 int maxCount = 0;
                 int tiedMaxCount = 0;
                 quint8 mostCommonByte = 0;
-                for (auto it = byteCounts.begin(); it != byteCounts.end(); ++it) {
-                    if (it.value() > maxCount) {
-                        maxCount = it.value();
-                        mostCommonByte = it.key();
+                for (int value = 0; value < 256; value++) {
+                    if (byteCounts[value] > maxCount) {
+                        maxCount = byteCounts[value];
+                        mostCommonByte = static_cast<quint8>(value);
                         tiedMaxCount = 1;
-                    } else if (it.value() == maxCount) {
+                    } else if (byteCounts[value] == maxCount && maxCount > 0) {
                         tiedMaxCount++;
                     }
                 }
 
                 QString validBytesString;
-                for (int byteIndex = 0; byteIndex < validBytes.size(); byteIndex++) {
-                    validBytesString.append(QString("%1 ").arg(validBytes.at(byteIndex), 2, 16, QChar('0')).toUpper());
+                for (int validIndex = 0; validIndex < validByteCount; validIndex++) {
+                    validBytesString.append(QString("%1 ").arg(validBytes[validIndex], 2, 16, QChar('0')).toUpper());
                 }
                 QString mostCommonByteString = QString("%1").arg(mostCommonByte, 2, 16, QChar('0')).toUpper();
 
@@ -593,7 +609,7 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &s
                     tbcDebugStream().noquote()
                         << "F2Stacker::stackFrames - Valid byte values tie - marking byte as error from"
                         << validBytesString;
-                    stackedFrameData.append(validBytes.at(0));
+                    stackedFrameData.append(firstValidByte);
                     stackedFrameErrorData.append(true);
                     m_tiedValueForByte++;
                 } else {
@@ -609,7 +625,7 @@ F2Frame F2Stacker::stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &s
 
         // Update the source differences statistics for this byte
         quint8 expectedValue = f2Frames.at(0).rawData()[byteIndex];
-        for (int sourceIndex = 0; sourceIndex < f2Frames.size(); sourceIndex++) {
+        for (int sourceIndex = 0; sourceIndex < frameCount; sourceIndex++) {
             if (f2Frames.at(sourceIndex).rawData()[byteIndex] != expectedValue) {
                 m_sourceDifferences[sourceIndexes[sourceIndex]]++;
             }

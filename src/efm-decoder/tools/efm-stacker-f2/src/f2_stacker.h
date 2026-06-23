@@ -41,10 +41,18 @@ public:
     bool process(const QVector<QString> &inputFilenames, const QString &outputFilename);
 
 private:
+    struct SectionAnalysis
+    {
+        quint32 score{0};
+        bool isPadding{false};
+        bool isFlat{false};
+    };
+
     struct SourceState
     {
         ReaderF2Section *reader{nullptr};
         F2Section currentSection;
+        SectionAnalysis currentAnalysis;
         qint64 nextSectionNumber{0};
         qint32 lastReadAddress{-1};
         bool hasCurrentSection{false};
@@ -60,11 +68,11 @@ private:
     QVector<int> m_previousClusterSourceIndexes;
 
     bool readNextValidSection(SourceState &sourceState, qint32 minimumAddress = -1);
-    quint32 sectionScore(const F2Section &section) const;
+    SectionAnalysis analyzeSection(const F2Section &section) const;
     quint32 sectionDifference(const F2Section &firstSection, const F2Section &secondSection) const;
-    bool isPaddingSection(const F2Section &section) const;
-    bool isFlatSection(const F2Section &section) const;
-    F2Section stackSections(const QVector<F2Section> &sections, const QVector<int> &sourceIndexes);
+    F2Section stackSections(const QVector<F2Section> &sections,
+                            const QVector<SectionAnalysis> &sectionAnalyses,
+                            const QVector<int> &sourceIndexes);
     F2Frame stackFrames(QVector<F2Frame> &f2Frames, const QVector<int> &sourceIndexes);
 
     // Statistics
