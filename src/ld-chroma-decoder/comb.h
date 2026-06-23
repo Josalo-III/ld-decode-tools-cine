@@ -841,9 +841,7 @@ private:
 											   std::vector<std::complex<double>> &dnIQ,
 											   std::vector<std::complex<double>> &outFrameIQ,
 											   const std::vector<float> *tiOverride,
-											   const std::vector<float> *tqOverride,
-											   const CombTapLine *reachTapLine = nullptr,
-											   bool allowSymmetricLeakCancel = false);
+											   const std::vector<float> *tqOverride);
 	void collectCombAttributionEvidence(int line,
 									   const double *fieldA,
 									   const double *fieldB,

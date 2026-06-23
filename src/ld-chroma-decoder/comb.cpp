@@ -1956,7 +1956,7 @@ void Comb::FrameBuffer::split2D()
             combTapBuildFlags_ = TapBuildFieldB;
             break;
         case V::FrameAAdaptiveIQ:
-            combTapBuildFlags_ = TapBuildFrame | TapBuildFieldA | TapBuildFieldB;
+            combTapBuildFlags_ = TapBuildFrame | TapBuildFieldB;
             break;
         case V::FrameBDirectIQ:
             combTapBuildFlags_ = TapBuildFrame | TapBuildFieldB;

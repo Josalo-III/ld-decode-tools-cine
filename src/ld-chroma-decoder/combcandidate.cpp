@@ -1758,17 +1758,13 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     std::vector<std::complex<double>> &dnIQ,
     std::vector<std::complex<double>> &outFrameIQ,
     const std::vector<float> *tiOverride,
-    const std::vector<float> *tqOverride,
-    const CombTapLine *reachTapLine,
-    bool allowSymmetricLeakCancel)
+    const std::vector<float> *tqOverride)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
-
-    (void)allowSymmetricLeakCancel;
 
     if (width <= 0) {
         outFrameIQ.clear();
@@ -1874,23 +1870,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         dnIQ[x] = applyColumnPhaseAlignment(centerIQ[x], dnIQ[x], invI, phaseAlignLimits);
     }
 
-    // Frame B's own (interfield, +/-1) vertical column guard. It must be
-    // measured across the adjacent opposite-field lines, NOT borrowed from the
-    // same-field +/-2/+/-4 contour the Field B path uses. Chroma-cancelled luma
-    // (lockedLumaSmooth) at line-1/line/line+1 gives a +/-1-native column read
-    // below; null pointers (cache invalid / edge lines) leave columnStraight 0,
-    // making the alien-cancel inert there.
-    auto lumaSmoothRow = [&](int ln)->const double* {
-        if (!configuration.phaseCompensation || !lockedLumaCacheValid ||
-            lockedLumaSmooth_flat.empty() || demodWidth < width ||
-            ln < first || ln >= last || ln >= demodLines)
-            return nullptr;
-        return lockedLumaSmooth_line(ln);
-    };
-    const double *luma1Up = lumaSmoothRow(line - 1);
-    const double *luma1C  = lumaSmoothRow(line);
-    const double *luma1Dn = lumaSmoothRow(line + 1);
-
     // ------------------------------------------------------------
     // Combine (soft signed contributions + boundary-aware asymmetry)
     // ------------------------------------------------------------
@@ -1926,35 +1905,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         bool useUp = haveUp;
         bool useDn = haveDn;
         double boundaryWeightScale = 1.0;
-        // +/-1-native column support: low chroma-cancelled-luma curvature across
-        // line-1/line/line+1 == a smooth interfield column. A horizontal edge
-        // (top of a glyph) curves sharply here, so support falls and the
-        // alien-cancel backs off, instead of trusting the same-field contour
-        // which describes a different (+/-2) geometry.
-        double columnStraight = 0.0;
-        if (luma1Up && luma1C && luma1Dn) {
-            const double curv1 =
-                std::fabs(luma1Up[x] - 2.0 * luma1C[x] + luma1Dn[x]) * invI;
-            columnStraight = combSmoothGate(curv1,
-                                            T.FIELD_CONTOUR_SOFT_IRE,
-                                            T.FIELD_CONTOUR_HARD_IRE);
-        }
-        // Bevel reach throttle, cribbed from Frame B. The ±1 reachGate
-        // (pairU1/pairD1, built by applyFrameReachWithIQFloor) now carries the
-        // moving-coarse bevel throttle in IRE units — the same gate that keeps
-        // Frame B zipper-free. Frame A previously ignored it because the OLD
-        // composite-domain gate over-fired and stood the comb down at the
-        // saturated edges it exists to clean; in the IRE domain it discriminates
-        // properly, so it is applied per-side to the interfield contributions
-        // below (exactly as Field B applies pairU2/pairD2.reachGate).
-        const double reachUp1 =
-            (reachTapLine && x < (int)reachTapLine->pairU1.size())
-                ? std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0)
-                : 1.0;
-        const double reachDn1 =
-            (reachTapLine && x < (int)reachTapLine->pairD1.size())
-                ? std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0)
-                : 1.0;
 
         // Cache dUpDown_ire — reused below for the disagree gate (saves one
         // hypot per pixel on the haveUp && haveDn path).
@@ -1995,7 +1945,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             std::complex<double> contrib;
             double w;
             softAlignBoth(Z0, ZUpRaw, a0, aUp, contrib, w);
-            const double sideScale = boundaryWeightScale * reachUp1;
+            const double sideScale = boundaryWeightScale;
             w *= sideScale;
             if (w > 0.0) {
                 Zsum += contrib * sideScale;
@@ -2006,7 +1956,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             std::complex<double> contrib;
             double w;
             softAlignBoth(Z0, ZDnRaw, a0, aDn, contrib, w);
-            const double sideScale = boundaryWeightScale * reachDn1;
+            const double sideScale = boundaryWeightScale;
             w *= sideScale;
             if (w > 0.0) {
                 Zsum += contrib * sideScale;
@@ -2125,77 +2075,6 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             }
         }
 
-        // Interfield alien-chroma cancel, vector form.
-        //
-        // Where the center IQ is the lone phase-displaced intruder on a
-        // coherent vertical column, the sign-aligned average above reinforces
-        // it instead of cancelling it (softAlignContrib flips an anti-phase
-        // neighbor before adding). Pull the center toward the agreeing
-        // neighbors' common carrier by the displacement confidence instead, so
-        // only the alien displacement is removed and the shared real chroma is
-        // preserved. Strength is 0 unless the neighbors agree, the center is
-        // displaced from them, and the column is supported, so this is inert on
-        // ordinary chroma and genuine transitions.
-        if (haveUp && haveDn) {
-            double columnSupport = columnStraight;
-            if (reachTapLine && x < (int)reachTapLine->hLumaDeltaIRE.size()) {
-                const double lumaEdgeFit = std::clamp(
-                    (reachTapLine->hLumaDeltaIRE[x] - 6.0) / 12.0, 0.0, 1.0);
-                columnSupport = std::clamp(
-                    0.45 * lumaEdgeFit + 0.55 * columnStraight, 0.0, 1.0);
-            }
-
-            const double cancelStrength =
-                CombContentReach::interfieldAlienCancelStrength(
-                    Z0.real() * invI, Z0.imag() * invI,
-                    ZUpRaw.real() * invI, ZUpRaw.imag() * invI,
-                    ZDnRaw.real() * invI, ZDnRaw.imag() * invI,
-                    true, true,
-                    2.0,
-                    columnSupport);
-
-            if (cancelStrength > 0.0) {
-                const std::complex<double> neighborCommon =
-                    0.5 * (ZUpRaw + ZDnRaw);
-
-                const double aNc = cmag(neighborCommon);
-                const double sdCenterCommon =
-                    corrSignedMags(Z0, neighborCommon, a0, aNc);
-
-                // Co-directional tinted case:
-                // real chroma biases center and neighbors into the same hue direction.
-                // The error is an amplitude/offset displacement from the stable neighbor
-                // carrier, so the correct target is the neighbor common itself.
-                //
-                // Anti-phase case:
-                // center and neighbor common are opposite phases.  Pull only toward the
-                // midpoint/null target to avoid swapping the alternation phase.
-                const double coDirectional =
-                    std::clamp((sdCenterCommon - 0.35) / 0.50, 0.0, 1.0);
-
-                const std::complex<double> nullTarget =
-                    0.5 * (Z0 + neighborCommon);
-
-                const std::complex<double> target =
-                    nullTarget * (1.0 - coDirectional) +
-                    neighborCommon * coDirectional;
-
-                // Bevel reach throttle (cribbed from Frame B): the alien-cancel
-                // pull is an interfield reach across ±1, so it must obey the
-                // same bevel gate as the comb above. columnSupport can stay high
-                // across a horizontal luma edge that also grazes vertical detail
-                // (its lumaEdgeFit term keys on horizontal luma delta); the ±1
-                // reachGate carries the moving-coarse bevel throttle that backs
-                // the pull off the actual edge.
-                const double bevelReach = std::min(reachUp1, reachDn1);
-                const double targetStrength =
-                    cancelStrength * (0.70 + 0.30 * coDirectional) * bevelReach;
-
-                Zout = Zout * (1.0 - targetStrength) +
-                       target * targetStrength;
-            }
-		}
-
         outFrameIQ[x] = Zout;
     }
 }
@@ -2308,10 +2187,8 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
         }
     }
 
-    const CombTapLine &reachTapLine = ensureCombTapLine(line);
     computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
-                                      outFrameIQ, tiOverride, tqOverride,
-                                      &reachTapLine);
+                                      outFrameIQ, tiOverride, tqOverride);
 }
 // Frame B: direct interframe IQ comb.
 // Sources from the Field B preclean ring, with locked-1D IQ as fallback.
