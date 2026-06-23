@@ -185,18 +185,18 @@ public:
             // FVF / Model interaction tuning
             // =========================================================================
             // Penalty for a candidate being far from the regime model
-            // (Frame A in progressive; Field A in interlace). Larger → more model dominance.
+            // (Frame B in progressive; Field B in interlace). Larger → more model dominance.
             double FVF_MODEL_PRIMARY_WEIGHT = 0.33;
             // Cross-domain candidates pay model-distance only past this deadband
             // (IRE).  Inside the deadband the cross-domain comb is considered
-            // model-equivalent — lets Field A through on flat, low-contrast
-            // regions (e.g. black of space) where Field A's coarse-scale bonus
-            // should actually surface.
+            // model-equivalent — lets the opposite-regime candidate through on
+            // flat, low-contrast regions where image-shaping heuristics should
+            // still be allowed to surface.
             double FVF_MODEL_PRIMARY_DEADBAND_IRE = 2.0;
 
             // Multiplicative cost advantage for the model-domain candidate in its own regime.
             // < 1.0 → model candidate gets a cheaper score.
-            double FIELD_MODEL_BIAS = 0.50; // interlace: Field A costs less
+            double FIELD_MODEL_BIAS = 0.50; // interlace: Field B costs less
 
             // > 1.0 → Frame candidate costs slightly more when regime is clearly interlace.
             double FRAME_IN_INTERLACE_PENALTY = 1.10;
@@ -277,8 +277,8 @@ public:
 		double horizontalBoundaryIRE = 0.0; // vertical gradient: scanline runs along/grazes an edge
 		double fieldFrameDivergenceIRE = 0.0;
 		double interfieldDistinctIRE = 0.0;
-		double frameToFieldModelIRE = 0.0;  // interlace regime: |Frame - FieldA(model)|
-		double frameToBestFieldIRE = 0.0;   // progressive regime: |Frame - min(FieldA,FieldB)|
+		double frameToFieldModelIRE = 0.0;  // interlace regime: |FrameB - FieldB(model)|
+		double frameToBestFieldIRE = 0.0;   // progressive regime: |FrameB - FieldB(candidate)|
 
 		double iqFineFrac = 0.0;
 		double iqMidFrac = 0.0;

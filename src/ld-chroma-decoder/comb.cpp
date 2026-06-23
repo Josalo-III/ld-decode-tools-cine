@@ -974,15 +974,15 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         double diff_candA_ire = std::fabs(lumFR - lumFA) * invI;
         double diff_candB_ire = std::fabs(lumFR - lumFB) * invI;
-        double diff_cand_ire  = std::min(diff_candA_ire, diff_candB_ire);
-        double frameModelDistIRE = localUseFrameModel ? diff_cand_ire : diff_candA_ire;
+        double frameFieldCandidateDistIRE = diff_candB_ire;
+        double frameModelDistIRE = frameFieldCandidateDistIRE;
         bool frameInsane = (frameModelDistIRE > FRAME_MAX_DIST_IRE);
     
         // Management veto is consumed here, but its construction stays outside FVF.
         bool managementVeto = (cadenceId == -2);
 
         bool b2VertCoherent = !managementVeto && !frameInsane;
-        double targetModel = localUseFrameModel ? FR_s : FA_s;
+        double targetModel = localUseFrameModel ? FR_s : FB_s;
 
         double diff_fvf_ire = diff_stack_ire;
         diffFVF[rel] = diff_fvf_ire;
@@ -1022,8 +1022,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         metrics.horizontalBoundaryIRE = vIRE;
         metrics.fieldFrameDivergenceIRE = diff_fvf_ire;
         metrics.interfieldDistinctIRE = 0.0;
-        metrics.frameToFieldModelIRE = diff_candA_ire;
-        metrics.frameToBestFieldIRE = diff_cand_ire;
+        metrics.frameToFieldModelIRE = diff_candB_ire;
+        metrics.frameToBestFieldIRE = frameFieldCandidateDistIRE;
         metrics.frameModel = localUseFrameModel;
         metrics.managementVeto = managementVeto;
         metrics.frameVertCoherent = b2VertCoherent;
@@ -1046,7 +1046,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     if (localUseFrameModel)
                         return frameB2[std::clamp(r, 0, width - 1)];
                     else
-                        return fieldA[std::clamp(r, 0, width - 1)];
+                        return fieldB[std::clamp(r, 0, width - 1)];
                 };
                 double m_l = getM(rel - 1);
                 double m_r = getM(rel + 1);
@@ -1084,23 +1084,22 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
             // ------------------------------------------------------------
             // Model-aware regime scoring.
-            // Progressive protects Frame and scores fields by their deviation
-            // from the frame model. Interlace treats Field A as the model,
-            // lets A/B compete, and only gives Frame a small bonus when it is
-            // very close to the field model.
+            // Progressive protects Frame and only measures Field B against it.
+            // Interlace treats Field B as the model, lets Field A participate
+            // on its own image-shaping merits, and gives Frame B only a small
+            // score bump when it is very close to Field B.
             // ------------------------------------------------------------
             if (localUseFrameModel) {
-                scoreA += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
                 scoreB += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
                 if (!managementVeto && b2VertCoherent) {
                     scoreR *= FRAME_MODEL_BIAS_LOCAL;
                 }
             } else {
                 const double closeFrameBonus = std::clamp(
-                    1.0 - (diff_candA_ire / std::max(1e-9, T.FVF_SMALL_DIFF_IRE)),
+                    1.0 - (diff_candB_ire / std::max(1e-9, T.FVF_SMALL_DIFF_IRE)),
                     0.0, 1.0);
-                scoreA *= T.FIELD_MODEL_BIAS;
-                scoreR += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candA_ire;
+                scoreB *= T.FIELD_MODEL_BIAS;
+                scoreR += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
                 scoreR *= T.FRAME_IN_INTERLACE_PENALTY;
                 scoreR *= (1.0 - 0.08 * closeFrameBonus);
             }
@@ -1448,7 +1447,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
             if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
                 double dF1 = std::fabs(lumFR - L1) * invI;
-                if (dF1 <= 3.5 && diff_cand_ire <= 5.0 && !frameInsane)
+                if (dF1 <= 3.5 && frameFieldCandidateDistIRE <= 5.0 && !frameInsane)
                     pickCandidate(2, FR, 0.75f);
                 else {
                     if (scoreA < scoreB) pickCandidate(0, FA, 0.25f);
@@ -1464,7 +1463,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     else                  pickCandidate(1, FB, 0.35f);
                 }
             } else {
-                if (b2VertCoherent)
+                if (localUseFrameModel && b2VertCoherent)
                     pickCandidate(2, FR, 0.8f);
                 else if (scoreR + 1e-12 < scoreA * 0.85 &&
                          scoreR + 1e-12 < scoreB * 0.85)
@@ -1481,12 +1480,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
-
-            // Small-diff frame reward is native/interlace-only.
-            if (!localUseFrameModel && diff_fvf_ire < FVF_SMALL_DIFF_IRE) {
-                if (idx == 0 || idx == 1)
-                    pickCandidate(2, FR, 0.8f);
-            }
 
             // Subtle hysteresis (switch veto) in soft regions
             if (rel > 0) {
@@ -1874,8 +1867,7 @@ void Comb::FrameBuffer::split2D()
     const bool writeWeights = configuration.showMap;
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
     const bool needFrameACompute = configuration.phaseCompensation &&
-        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
-         wantFvf);
+        (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ);
     const bool needFrameBCompute = configuration.phaseCompensation &&
         (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameBDirectIQ ||
          wantFvf);
