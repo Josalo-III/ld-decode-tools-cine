@@ -864,16 +864,19 @@ void Comb::FrameBuffer::filterIQLocked()
             const double ccWeight =
                 std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
 
-            double dc = (double)rawLine[left] - Yrow[left];
-            constexpr double DC_ALPHA = 1.0 / 64.0;
             for (int i = 0; i < width; ++i) {
                 const int h = left + i;
-                const double chromaRaw = (double)rawLine[h] - Yrow[h];
-                dc += DC_ALPHA * (chromaRaw - dc);
-                const double chroma = chromaRaw - dc;
+            
+                // Residual-colour mode derives chroma from the same carrier residual
+                // that produceY left behind: raw - Y.  Do not apply an additional local
+                // DC follower here; that gives residual colour a different low-frequency
+                // convention from the luma it is derived from.
+                const double chroma = (double)rawLine[h] - Yrow[h];
+            
                 const int ph = carrierSampleClass(line, h);
                 const double alphaEff =
                     std::max(0.0, 1.0 - (impRow ? (double)impRow[i] : 0.0) * ccWeight);
+            
                 scratch_preI[i] = (chroma * lutTi[ph]) * GI_PRODUCT * alphaEff;
                 scratch_preQ[i] = (chroma * lutTq[ph]) * GQ_PRODUCT * alphaEff;
             }
