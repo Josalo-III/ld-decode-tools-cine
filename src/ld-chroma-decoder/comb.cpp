@@ -1359,52 +1359,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     }
                 }
             }
-            // ------------------------------------------------------------
-            // Impulse scoring.
-            //
-            // Isolated narrow luma peaks (stars in black sky) produce false
-            // chroma in the field combs because 1D reads the sub-carrier-
-            // period spike as carrier. The frame comb can cancel the error via
-            // interfield differencing. Reward low chroma magnitude at
-            // impulse sites (any candidate that stays near zero is right)
-            // and give Frame a slight bonus since its mechanism is correct.
-            // ------------------------------------------------------------
-            {
-                const double impulseT =
-                    (attrRow && rel < width)
-                        ? std::clamp(attrRow[rel].facts.lumaImpulseRisk, 0.0, 1.0)
-                        : 0.0;
-            
-                if (impulseT > 0.0) {
-                    const double aM = std::fabs(FA) * invI;
-                    const double bM = std::fabs(FB) * invI;
-                    const double rM = std::fabs(FR) * invI;
-            
-                    const double minM = std::min({aM, bM, rM});
-            
-                    constexpr double IMPULSE_RELATIVE_IQ_PEN = 0.85;
-                    constexpr double IMPULSE_RESIDUE_PEN     = 0.20;
-                    constexpr double IMPULSE_FRAME_BONUS     = 0.06;
-            
-                    auto impulsePenalty = [&](double m) {
-                        const double aboveBest = std::clamp((m - minM) / 3.0, 0.0, 1.0);
-                        const double residue   = std::clamp(m / 5.0, 0.0, 1.0);
-            
-                        return 1.0 + impulseT * (
-                            IMPULSE_RELATIVE_IQ_PEN * aboveBest +
-                            IMPULSE_RESIDUE_PEN     * residue
-                        );
-                    };
-            
-                    scoreA *= impulsePenalty(aM);
-                    scoreB *= impulsePenalty(bM);
-                    scoreR *= impulsePenalty(rM);
-            
-                    if (!frameInsane && !managementVeto && rM <= minM + 0.25) {
-                        scoreR *= (1.0 - IMPULSE_FRAME_BONUS * impulseT);
-                    }
-                }
-            }
+
 			// ------------------------------------------------------------
             // Immediate-neighbor anchor scoring.
             //
@@ -1463,6 +1418,52 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     scoreA *= (1.0 + wAnchor * anchorPenalty(dA));
                     scoreB *= (1.0 + wAnchor * anchorPenalty(dB));
                     scoreR *= (1.0 + wAnchor * anchorPenalty(dR));
+                }
+            }
+            // ------------------------------------------------------------
+            // Impulse scoring.
+            //
+            // Isolated narrow luma peaks (stars in black sky) produce false
+            // chroma in the field combs because 1D reads the sub-carrier-
+            // period spike as carrier. The frame comb can cancel the error via
+            // interfield differencing. Reward low chroma magnitude at
+            // impulse sites (any candidate that stays near zero is right)
+            // and give Frame a slight bonus since its mechanism is correct.
+            // ------------------------------------------------------------
+            {
+                const double impulseT =
+                    (attrRow && rel < width)
+                        ? std::clamp(attrRow[rel].facts.lumaImpulseRisk, 0.0, 1.0)
+                        : 0.0;
+            
+                if (impulseT > 0.0) {
+                    const double aM = std::fabs(FA) * invI;
+                    const double bM = std::fabs(FB) * invI;
+                    const double rM = std::fabs(FR) * invI;
+            
+                    const double minM = std::min({aM, bM, rM});
+            
+                    constexpr double IMPULSE_RELATIVE_IQ_PEN = 0.85;
+                    constexpr double IMPULSE_RESIDUE_PEN     = 0.20;
+                    constexpr double IMPULSE_FRAME_BONUS     = 0.06;
+            
+                    auto impulsePenalty = [&](double m) {
+                        const double aboveBest = std::clamp((m - minM) / 3.0, 0.0, 1.0);
+                        const double residue   = std::clamp(m / 5.0, 0.0, 1.0);
+            
+                        return 1.0 + impulseT * (
+                            IMPULSE_RELATIVE_IQ_PEN * aboveBest +
+                            IMPULSE_RESIDUE_PEN     * residue
+                        );
+                    };
+            
+                    scoreA *= impulsePenalty(aM);
+                    scoreB *= impulsePenalty(bM);
+                    scoreR *= impulsePenalty(rM);
+            
+                    if (!frameInsane && !managementVeto && rM <= minM + 0.25) {
+                        scoreR *= (1.0 - IMPULSE_FRAME_BONUS * impulseT);
+                    }
                 }
             }
 
