@@ -172,8 +172,10 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.coarseD2IRE);
     }
 
-    if (wantFieldB || wantFrame)
+    if (wantFieldB || wantFrame) {
         ensureWidth(tapLine.hLumaDeltaIRE);
+        ensureWidth(tapLine.irrationalChroma);
+    }
 
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
@@ -420,6 +422,51 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     }
     }
 
+    if (wantFieldB || wantFrame) {
+        const int kSupport = 3;
+        const double chromaFloor = 0.15;
+        const double dropFraction = 0.25;
+        const double lumaEdgeFloor = 4.0;
+        for (int rel = 0; rel < width; ++rel) {
+            const double cHere = tapLine.centerChromaT[rel];
+            if (cHere < chromaFloor) {
+                tapLine.irrationalChroma[rel] = 0.0;
+                continue;
+            }
+            const double threshold = dropFraction * cHere;
+            double minLeft = cHere;
+            double minRight = cHere;
+            for (int k = 2; k <= kSupport; ++k) {
+                if (rel - k >= 0)
+                    minLeft = std::min(minLeft, tapLine.centerChromaT[rel - k]);
+                if (rel + k < width)
+                    minRight = std::min(minRight, tapLine.centerChromaT[rel + k]);
+            }
+            const bool shortSupport =
+                (minLeft < threshold) && (minRight < threshold);
+
+            if (!shortSupport) {
+                tapLine.irrationalChroma[rel] = 0.0;
+                continue;
+            }
+
+            const double hEdgeHere = tapLine.hLumaDeltaIRE[rel];
+            double maxLumaWide = hEdgeHere;
+            for (int k = 2; k <= kSupport; ++k) {
+                if (rel - k >= 0)
+                    maxLumaWide = std::max(maxLumaWide,
+                                           tapLine.hLumaDeltaIRE[rel - k]);
+                if (rel + k < width)
+                    maxLumaWide = std::max(maxLumaWide,
+                                           tapLine.hLumaDeltaIRE[rel + k]);
+            }
+            const bool lumaDriven = (maxLumaWide > lumaEdgeFloor);
+
+            tapLine.irrationalChroma[rel] =
+                (shortSupport && lumaDriven) ? cHere : 0.0;
+        }
+    }
+
     {
     if (wantContour) {
         // Hoist tunables and data() pointers out of the hot loop.  Reading 11
@@ -578,6 +625,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         const double soft = T.FIELD_CONTOUR_SOFT_IRE;
         const double hard = T.FIELD_CONTOUR_HARD_IRE;
         const double bevelPenalty = std::clamp(T.FRAME_B_BEVEL_REACH_PENALTY, 0.0, 1.0);
+        const double satPenalty  = std::clamp(T.FRAME_BEVEL_SAT_PENALTY, 0.0, 1.0);
+        const double xColPenalty = std::clamp(T.FRAME_BEVEL_XCOL_PENALTY, 0.0, 1.0);
+        const double xColThreshIRE = std::max(1.0, T.FRAME_LUMA_EDGE_THRESH_IRE);
 
         if ((int)scratch_impulseExempt.size() < width)
             scratch_impulseExempt.resize(width);
@@ -652,12 +702,40 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 	                                (std::hypot(tapLine.tap0[rel].comp,
 	                                            tapLine.tap0[rel].symMag) * invI - 2.0) / 8.0,
 	                                0.0, 1.0);
-                    const double bevelGate =
-                        std::clamp(1.0 - bevelPenalty * chromaWeight *
-                                   (1.0 - std::clamp(mcNear.straightness, 0.0, 1.0)),
+                    const double curvature =
+                        1.0 - std::clamp(mcNear.straightness, 0.0, 1.0);
+                    double bevelGate =
+                        std::clamp(1.0 - bevelPenalty * chromaWeight * curvature,
                                    0.0, 1.0);
+                    // Saturation penalty: the linear bevel gate doesn't pull
+                    // hard enough at intermediate chroma because chromaWeight
+                    // ramps slowly (10 IRE to saturate).  Squaring chroma and
+                    // curvature makes the penalty bite harder where it matters
+                    // — high saturation on a non-straight edge — without
+                    // touching low-chroma or straight regions.
+                    if (satPenalty > 0.0) {
+                        const double satBite = satPenalty *
+                            chromaWeight * chromaWeight *
+                            curvature * curvature;
+                        bevelGate *= std::clamp(1.0 - satBite, 0.0, 1.0);
+                    }
+                    const double irr =
+                        (rel < (int)tapLine.irrationalChroma.size())
+                            ? tapLine.irrationalChroma[rel] : 0.0;
+                    if (xColPenalty > 0.0 && irr <= 0.0 &&
+                        rel < (int)tapLine.hLumaDeltaIRE.size()) {
+                        const double hEdge = std::clamp(
+                            (tapLine.hLumaDeltaIRE[rel] - 0.30 * xColThreshIRE) /
+                            (0.70 * xColThreshIRE),
+                            0.0, 1.0);
+                        const double xColorRisk =
+                            chromaWeight * hEdge * curvature;
+                        bevelGate *= std::clamp(
+                            1.0 - xColPenalty * xColorRisk, 0.0, 1.0);
+                    }
+                    const double frameExempt = std::max(impulseExempt, irr);
                     const double effectiveGate =
-                        bevelGate + (1.0 - bevelGate) * impulseExempt;
+                        bevelGate + (1.0 - bevelGate) * frameExempt;
                     upGate *= effectiveGate;
                     dnGate *= effectiveGate;
                 }
@@ -713,6 +791,14 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             0.0, 1.0);
                     upContourGate *= bevelGate;
                     dnContourGate *= bevelGate;
+                }
+            }
+            if (rel < (int)tapLine.irrationalChroma.size()) {
+                const double irr = tapLine.irrationalChroma[rel];
+                if (irr > 0.0) {
+                    const double suppress = std::clamp(1.0 - irr, 0.0, 1.0);
+                    upContourGate *= suppress;
+                    dnContourGate *= suppress;
                 }
             }
             upPair[rel].reachGate = std::clamp(
@@ -1448,8 +1534,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     std::vector<std::complex<double>> &upIQ,
     std::vector<std::complex<double>> &dnIQ,
     std::vector<std::complex<double>> &outFrameIQ,
-    const std::vector<float> *tiOverride,
-    const std::vector<float> *tqOverride)
+    const CombTapLine *reachTapLine)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
@@ -1478,20 +1563,9 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     const auto  &T    = configuration.tunables;
     const double invI = invIreScale;
 
-    auto tiLine = [&](int ln)->const float* {
-        if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
-            return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        const float *cached = locked1DTI4fsc_line(ln);
-        if (!locked1DTI4fsc_flat.empty()) return cached;
-        return demodTI4fsc_line(ln);
-    };
-    auto tqLine = [&](int ln)->const float* {
-        if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
-            return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        const float *cached = locked1DTQ4fsc_line(ln);
-        if (!locked1DTQ4fsc_flat.empty()) return cached;
-        return demodTQ4fsc_line(ln);
-    };
+    const bool verticalAllowed = carrierFrameVerticalAllowed(line);
+    const bool haveUpLine = verticalAllowed && (line - 1 >= first);
+    const bool haveDnLine = verticalAllowed && (line + 1 <  last);
 
     // Signed correlation in [-1..1].  Caller supplies pre-computed magnitudes
     // to avoid recomputing hypot per call site.
@@ -1525,8 +1599,9 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         double w = (ac - t0) / (t1 - t0);
         w = std::clamp(w, 0.0, 1.0);
 
-        const double wFloor = 0.15;
-        w = wFloor + (1.0 - wFloor) * w;
+        // No floor: if correlation is below the ramp start, the neighbor
+        // does not contribute.  Edge safety is reach's job; a wFloor here
+        // leaks badly-correlated material through throttled-but-nonzero reach.
 
         const double s = (c >= 0.0) ? 1.0 : -1.0;
         contribOut = Zn * (w * s);
@@ -1580,55 +1655,69 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         const double aUp = cmag(ZUpRaw);
         const double aDn = cmag(ZDnRaw);
 
-        const bool haveUp = (aUp > 1e-9);
-        const bool haveDn = (aDn > 1e-9);
+        // Reach contract, shared with Frame B (consumed exactly as in
+        // computeFrameBDirectIQFromPreparedVectors).  pairU1/pairD1.reachGate
+        // already carries legality, the interfield IQ floor, and the bevel/
+        // zipper throttle (composed in applyFrameReachWithIQFloor), so the
+        // zipper defense Frame A used to hand-roll here — transition side-
+        // picking, TRANS_SUPPRESS, up/down disagreement backoff — is gone:
+        // duplicating reach is what made it mushy.  Hard zero-reach refusal:
+        // a side with reachGate 0 does not contribute; both 0 emits center.
+        double upReach = 0.0;
+        double dnReach = 0.0;
+        if (reachTapLine &&
+            x < (int)reachTapLine->pairU1.size() &&
+            x < (int)reachTapLine->pairD1.size())
+        {
+            upReach = haveUpLine
+                ? std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0)
+                : 0.0;
+            dnReach = haveDnLine
+                ? std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0)
+                : 0.0;
+        }
 
-        if (!haveUp && !haveDn) {
+        const bool useUp = (upReach > 0.0) && (aUp > 1e-9);
+        const bool useDn = (dnReach > 0.0) && (aDn > 1e-9);
+
+        if (!useUp && !useDn) {
             outFrameIQ[x] = Z0;
             continue;
         }
 
-        // --- Boundary limits for horizontal edges between disparate vertical regions ---
-        // Detect: Up and Down are different, and center is not safely "same material" as both.
-        // Behavior:
-        //  - If center matches one side clearly -> pick that side.
-        //  - If center is "between" (transition) -> avoid reaching (use only better side, but suppress its weight).
-        bool useUp = haveUp;
-        bool useDn = haveDn;
-        double boundaryWeightScale = 1.0;
+        // Per-side signed correlation, hoisted for reuse by both the phase-
+        // protection block and cohGate below.
+        const double corrUp = useUp
+            ? std::fabs(corrSignedMags(Z0, ZUpRaw, a0, aUp)) : 0.0;
+        const double corrDn = useDn
+            ? std::fabs(corrSignedMags(Z0, ZDnRaw, a0, aDn)) : 0.0;
 
-        // Cache dUpDown_ire — reused below for the disagree gate (saves one
-        // hypot per pixel on the haveUp && haveDn path).
-        double dUpDown_ire = -1.0;
+        // Phase protection: when center and one neighbor agree on phase,
+        // the other neighbor must not rotate the hue.  Project the
+        // disagreeing neighbor onto center's phase axis so it can still
+        // contribute amplitude (luma-slope influence) but not alter hue.
+        // The threshold for "agrees" is the cohGate pass point — the same
+        // correlation that fully passes the adaptive-strength gate.
+        {
+            const double agreeThresh = std::clamp(T.FRAME_IQ_COH_PASS_CORR, 0.0, 1.0);
+            const bool upAgrees = useUp && (corrUp >= agreeThresh);
+            const bool dnAgrees = useDn && (corrDn >= agreeThresh);
+            const double a0sq = a0 * a0;
 
-        if (haveUp && haveDn) {
-            const double dUp0_ire = cmag(ZUpRaw - Z0) * invI;
-            const double dDn0_ire = cmag(ZDnRaw - Z0) * invI;
-            dUpDown_ire           = cmag(ZUpRaw - ZDnRaw) * invI;
-
-            const double MATCH_IRE      = 3.5;   // center matches this side
-            const double BETWEEN_IRE    = 6.0;   // center is far from this side
-            const double EDGE_UD_IRE    = 8.0;   // up/down are materially different
-            const double TRANS_SUPPRESS = 0.35;  // suppress transition-zone reach
-
-            if (dUpDown_ire > EDGE_UD_IRE) {
-                if (dUp0_ire < MATCH_IRE && dDn0_ire > BETWEEN_IRE) {
-                    useUp = true;  useDn = false;
-                } else if (dDn0_ire < MATCH_IRE && dUp0_ire > BETWEEN_IRE) {
-                    useDn = true;  useUp = false;
-                } else {
-                    // Transition/boundary pixel: don't reach across.
-                    // Pick the nearer side, but suppress contribution so we don't smear or inject edge-locked crawl.
-                    if (dUp0_ire <= dDn0_ire) { useUp = true; useDn = false; }
-                    else                      { useDn = true; useUp = false; }
-                    boundaryWeightScale = TRANS_SUPPRESS;
-                }
+            if (upAgrees && !dnAgrees && useDn && a0sq > 1e-18) {
+                const double proj = dotIQ(ZDnRaw, Z0) / a0sq;
+                ZDnRaw = Z0 * proj;
+            } else if (dnAgrees && !upAgrees && useUp && a0sq > 1e-18) {
+                const double proj = dotIQ(ZUpRaw, Z0) / a0sq;
+                ZUpRaw = Z0 * proj;
             }
         }
 
-        // Combine neighbors with soft signed contributions, using *weighted* averaging (no integer dilution).
-        // softAlignBoth returns contribution and weight together so the
-        // shared correlation calc isn't repeated per side.
+        // Combine neighbors with soft signed contributions, weighted by reach
+        // (no integer dilution).  softAlignBoth returns contribution and weight
+        // together so the shared correlation calc isn't repeated per side; the
+        // reach gate scales both, so a throttled side pulls less without any
+        // separate boundary heuristic.
         std::complex<double> Zsum = Z0;
         double wsum = 1.0;
 
@@ -1636,10 +1725,9 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             std::complex<double> contrib;
             double w;
             softAlignBoth(Z0, ZUpRaw, a0, aUp, contrib, w);
-            const double sideScale = boundaryWeightScale;
-            w *= sideScale;
+            w *= upReach;
             if (w > 0.0) {
-                Zsum += contrib * sideScale;
+                Zsum += contrib * upReach;
                 wsum += w;
             }
         }
@@ -1647,10 +1735,9 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
             std::complex<double> contrib;
             double w;
             softAlignBoth(Z0, ZDnRaw, a0, aDn, contrib, w);
-            const double sideScale = boundaryWeightScale;
-            w *= sideScale;
+            w *= dnReach;
             if (w > 0.0) {
-                Zsum += contrib * sideScale;
+                Zsum += contrib * dnReach;
                 wsum += w;
             }
         }
@@ -1658,115 +1745,39 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         std::complex<double> Zframe = Zsum / wsum;
 
         std::complex<double> delta = Zframe - Z0;
-        double deltaMagIRE = cmag(delta) * invI;
+        const double deltaMagIRE = cmag(delta) * invI;
 
-        double motionGate = 1.0; // placeholder for motion gating
-
-        const double effMaxDeltaIRE = MAX_DELTA_IRE * motionGate;
-
-        // --- Existing clamp (pre-strength) ---
-        if (deltaMagIRE > effMaxDeltaIRE && deltaMagIRE > 1e-9) {
-            delta *= (effMaxDeltaIRE / deltaMagIRE);
-            deltaMagIRE = effMaxDeltaIRE;
-        }
+        if (MAX_DELTA_IRE > 0.0 && deltaMagIRE > MAX_DELTA_IRE && deltaMagIRE > 1e-9)
+            delta *= (MAX_DELTA_IRE / deltaMagIRE);
 
         // --------------------------------------------------------
-        // Adaptive comb strength: 0.5 .. COMB_STRENGTH
-        // Use strong comb only when coherence is high AND vertical neighbors agree.
+        // Adaptive comb strength: COMB_STRENGTH_LO .. COMB_STRENGTH.
+        // This is Frame A's signature — the strength tracks signed center/
+        // neighbor correlation.  The old vertical-disagreement backoff (disGate)
+        // and gamma=2 selectivity are removed: cross-boundary safety is reach's
+        // job now, and squaring softened the mid-correlation comb.  cohGate
+        // ramps to a full-firm pass at FRAME_IQ_COH_PASS_CORR (the knob), so the
+        // floor stays firm (LO = 0.8) and correlation only modulates the top.
         // --------------------------------------------------------
         const double COMB_STRENGTH_HI = COMB_STRENGTH;
         const double COMB_STRENGTH_LO = std::min(0.8, COMB_STRENGTH_HI);
 
-        // Coherence vs center (signed corr magnitude) for allowed neighbors.
-        // Use cached magnitudes — corrSignedMags takes them directly.
-        double coh = 0.0;
-        if (useUp) coh = std::max(coh, std::fabs(corrSignedMags(Z0, ZUpRaw, a0, aUp)));
-        if (useDn) coh = std::max(coh, std::fabs(corrSignedMags(Z0, ZDnRaw, a0, aDn)));
+        // Coherence: reuse the hoisted per-side correlations.
+        const double coh = std::max(corrUp, corrDn);
 
-        // Map coherence -> [0..1]
-        const double COH_T0 = 0.55;
-        const double COH_T1 = 0.85;
-        double cohGate = (coh - COH_T0) / (COH_T1 - COH_T0);
+        // Map coherence -> [0..1].  cohPass is the correlation required to pass
+        // cohGate fully; the ramp starts a fixed 0.30 below it.
+        const double cohPass  = std::clamp(T.FRAME_IQ_COH_PASS_CORR, 0.0, 1.0);
+        const double cohStart = std::max(0.0, cohPass - 0.30);
+        double cohGate = (cohPass > cohStart)
+            ? (coh - cohStart) / (cohPass - cohStart)
+            : (coh >= cohPass ? 1.0 : 0.0);
         cohGate = std::clamp(cohGate, 0.0, 1.0);
 
-        // Vertical agreement gate (1 when Up/Dn agree; 0 when they disagree strongly).
-        // Reuse dUpDown_ire if it was computed in the boundary block above;
-        // otherwise compute it once here.
-        double disGate = 1.0;
-        if (haveUp && haveDn) {
-            const double dUD_ire = (dUpDown_ire >= 0.0)
-                                   ? dUpDown_ire
-                                   : (cmag(ZUpRaw - ZDnRaw) * invI);
-            const double DISAGREE_LO_IRE = 3.5;
-            const double DISAGREE_HI_IRE = 14.0;
-            double t = (dUD_ire - DISAGREE_LO_IRE) /
-                       (DISAGREE_HI_IRE - DISAGREE_LO_IRE);
-            t = std::clamp(t, 0.0, 1.0);
-            disGate = 1.0 - t;
-        }
-
-        double strengthMix = cohGate * disGate;
-
-        // Make it a bit more selective without hard switching
-        strengthMix = strengthMix * strengthMix; // gamma=2
-
         double localStrength =
-            COMB_STRENGTH_LO + (COMB_STRENGTH_HI - COMB_STRENGTH_LO) * strengthMix;
+            COMB_STRENGTH_LO + (COMB_STRENGTH_HI - COMB_STRENGTH_LO) * cohGate;
 
-        // Provisional output (before optional under-comb correction)
-        std::complex<double> Zout = Z0 + (delta * localStrength * motionGate);
-
-        // --------------------------------------------------------
-        // Optional one-sided "under-comb" booster
-        // With adaptive strength, you may want this OFF initially.
-        // If you keep it ON, it should boost relative to localStrength, not COMB_STRENGTH.
-        // --------------------------------------------------------
-        if (false)  // flip to true only if needed
-        {
-            double targetIRE = 0.0;
-
-            if (useUp && !useDn) {
-                targetIRE = cmag(ZUpRaw - Z0) * invI;
-            }
-            else if (useDn && !useUp) {
-                targetIRE = cmag(ZDnRaw - Z0) * invI;
-            }
-            else if (useUp && useDn) {
-                const double tU = cmag(ZUpRaw - Z0) * invI;
-                const double tD = cmag(ZDnRaw - Z0) * invI;
-                targetIRE = std::min(tU, tD);
-            }
-
-            const double TARGET_FRAC = 0.60;
-            targetIRE *= TARGET_FRAC;
-
-            const double TARGET_MIN_IRE = 1.0;
-            if (targetIRE > TARGET_MIN_IRE) {
-                std::complex<double> dOut = Zout - Z0;
-                double actualIRE = cmag(dOut) * invI;
-
-                if (actualIRE + 1e-9 < targetIRE) {
-                    double boost = targetIRE / (actualIRE + 1e-9);
-
-                    const double BOOST_MAX = 1.35;
-                    boost = std::clamp(boost, 1.0, BOOST_MAX);
-
-                    std::complex<double> dBoost = dOut * boost;
-
-                    // Reapply max-delta safety AFTER boost (output space)
-                    double dBoostIRE = cmag(dBoost) * invI;
-                    double effMaxOutIRE = effMaxDeltaIRE * localStrength;
-
-                    if (dBoostIRE > effMaxOutIRE && dBoostIRE > 1e-9) {
-                        dBoost *= (effMaxOutIRE / dBoostIRE);
-                    }
-
-                    Zout = Z0 + dBoost;
-                }
-            }
-        }
-
-        outFrameIQ[x] = Zout;
+        outFrameIQ[x] = Z0 + (delta * localStrength);
     }
 }
 // Frame A: adaptive interframe IQ comb fed by the Field B preclean ring.
@@ -1798,8 +1809,14 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
 	        return;
 	    }
 
-    const std::vector<float> *tiOverride = nullptr;
-    const std::vector<float> *tqOverride = nullptr;
+    // Frame A is a client of the same reach contract as Frame B: the per-pixel
+    // pairU1/pairD1.reachGate (legality + interfield IQ floor + bevel/zipper
+    // throttle, all composed in applyFrameReachWithIQFloor) is what makes
+    // zippers structurally impossible, so Frame A no longer needs — and must not
+    // duplicate — its own boundary suppression.  The tap line is already built
+    // with TapBuildFrame in this flow; ensure is a cache hit here.
+    const CombTapLine &reachTapLine = ensureCombTapLine(line);
+
     auto tiLine = [&](int ln)->const float* { return demodTI4fsc_line(ln); };
     auto tqLine = [&](int ln)->const float* { return demodTQ4fsc_line(ln); };
 
@@ -1879,7 +1896,7 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
     }
 
     computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
-                                      outFrameIQ, tiOverride, tqOverride);
+                                      outFrameIQ, &reachTapLine);
 }
 // Frame B: direct interframe IQ comb.
 // Sources from the Field B preclean ring, with locked-1D IQ as fallback.

@@ -139,10 +139,14 @@ public:
             double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
             double FRAME_CHROMA_MIN_IRE       = 1.5;   // Frame A minimum chroma amplitude to engage the frame IQ path
             double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
+            double FRAME_IQ_COH_PASS_CORR     = 0.85;  // Frame A signed center/neighbor correlation at which cohGate fully passes (firm comb); ramp starts 0.30 below
             double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B center detent: 0.5 * combStrength * reachAuthority pull
             double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
             double FRAME_B_RAW_MAX_DELTA_IRE   = 12.0; // Frame B IRE-domain direct-IQ delta cap
             double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
+            double FRAME_BEVEL_SAT_PENALTY     = 0.70; // extra reach penalty at saturated non-straight edges; squared chroma tightening on the bevel gate (0 = off, 1 = aggressive)
+            double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // horizontal luma gradient for Frame ±1 cross-color gate; higher than Field's 18 because ±1 partners are closer (one TV line) and more resilient
+            double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // cross-color reach throttle on Frame ±1: chromaWeight × hEdge × curvature (0 = off)
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -447,6 +451,7 @@ private:
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
 		std::vector<double> hLumaDeltaIRE;
+		std::vector<double> irrationalChroma;
 	};
 	enum CombTapBuild : unsigned {
 		TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta
@@ -837,8 +842,7 @@ private:
 											   std::vector<std::complex<double>> &upIQ,
 											   std::vector<std::complex<double>> &dnIQ,
 											   std::vector<std::complex<double>> &outFrameIQ,
-											   const std::vector<float> *tiOverride,
-											   const std::vector<float> *tqOverride);
+											   const CombTapLine *reachTapLine = nullptr);
 	void collectCombAttributionEvidence(int line,
 									   const double *fieldA,
 									   const double *fieldB,

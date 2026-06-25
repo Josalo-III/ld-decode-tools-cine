@@ -1141,7 +1141,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
                 if (!fineDominant) {
                     const double bias = std::clamp(coarseFrac - midFrac, -1.0, 1.0);
-                    scoreA *= (1.0 - FIELD_SWITCH_STRENGTH * bias);
                     scoreB *= (1.0 + FIELD_SWITCH_STRENGTH * bias);
                 }
             }
@@ -1153,14 +1152,14 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // Apply a soft bias rather than a hard override.
             // ------------------------------------------------------------
             if (sat_t > 0.0) {
-                // Penalize Field B more than Field A as saturation rises.
+                // Frame A gets a mild saturation penalty (underperforms there)
+                // but no reward — regime-neutral on the upside.  Field B gets
+                // the heavier penalty; Frame B gets the coherent-frame reward.
                 const double SAT_FIELD_A_PEN = 0.06;
                 const double SAT_FIELD_B_PEN = 0.14;
                 scoreA *= (1.0 + SAT_FIELD_A_PEN * sat_t);
                 scoreB *= (1.0 + SAT_FIELD_B_PEN * sat_t);
 
-                // Reward Frame when it is allowed/coherent (both regimes),
-                // but never punch through management veto or insane frame.
                 if (!managementVeto && b2VertCoherent && !frameInsane) {
                     const double SAT_FRAME_BONUS = 0.18;
                     scoreR *= (1.0 - SAT_FRAME_BONUS * sat_t);
@@ -1365,9 +1364,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             //
             // Isolated narrow luma peaks (stars in black sky) produce false
             // chroma in the field combs because 1D reads the sub-carrier-
-            // period spike as carrier. The frame comb cancels the error via
-            // interfield differencing (the spike is stationary, so the
-            // temporal difference nulls it). Reward low chroma magnitude at
+            // period spike as carrier. The frame comb can cancel the error via
+            // interfield differencing. Reward low chroma magnitude at
             // impulse sites (any candidate that stays near zero is right)
             // and give Frame a slight bonus since its mechanism is correct.
             // ------------------------------------------------------------
@@ -1376,24 +1374,38 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     (attrRow && rel < width)
                         ? std::clamp(attrRow[rel].facts.lumaImpulseRisk, 0.0, 1.0)
                         : 0.0;
-
+            
                 if (impulseT > 0.0) {
                     const double aM = std::fabs(FA) * invI;
                     const double bM = std::fabs(FB) * invI;
                     const double rM = std::fabs(FR) * invI;
-                    const double IMPULSE_CHROMA_PEN = 0.14;
-                    const double chromaPen = IMPULSE_CHROMA_PEN * impulseT;
-                    scoreA *= (1.0 + chromaPen * std::clamp(aM / 4.0, 0.0, 1.0));
-                    scoreB *= (1.0 + chromaPen * std::clamp(bM / 4.0, 0.0, 1.0));
-                    scoreR *= (1.0 + chromaPen * std::clamp(rM / 4.0, 0.0, 1.0));
-
-                    if (!frameInsane && !managementVeto) {
-                        const double IMPULSE_FRAME_BONUS = 0.10;
+            
+                    const double minM = std::min({aM, bM, rM});
+            
+                    constexpr double IMPULSE_RELATIVE_IQ_PEN = 0.85;
+                    constexpr double IMPULSE_RESIDUE_PEN     = 0.20;
+                    constexpr double IMPULSE_FRAME_BONUS     = 0.06;
+            
+                    auto impulsePenalty = [&](double m) {
+                        const double aboveBest = std::clamp((m - minM) / 3.0, 0.0, 1.0);
+                        const double residue   = std::clamp(m / 5.0, 0.0, 1.0);
+            
+                        return 1.0 + impulseT * (
+                            IMPULSE_RELATIVE_IQ_PEN * aboveBest +
+                            IMPULSE_RESIDUE_PEN     * residue
+                        );
+                    };
+            
+                    scoreA *= impulsePenalty(aM);
+                    scoreB *= impulsePenalty(bM);
+                    scoreR *= impulsePenalty(rM);
+            
+                    if (!frameInsane && !managementVeto && rM <= minM + 0.25) {
                         scoreR *= (1.0 - IMPULSE_FRAME_BONUS * impulseT);
                     }
                 }
             }
-            // ------------------------------------------------------------
+			// ------------------------------------------------------------
             // Immediate-neighbor anchor scoring.
             //
             // This is image-local neighbor shaping, not same-phase carrier
@@ -1497,9 +1509,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     else                  pickCandidate(1, FB, 0.35f);
                 }
             } else {
-                if (localUseFrameModel && b2VertCoherent)
-                    pickCandidate(2, FR, 0.8f);
-                else if (scoreR + 1e-12 < scoreA * 0.85 &&
+                if (scoreR + 1e-12 < scoreA * 0.85 &&
                          scoreR + 1e-12 < scoreB * 0.85)
                     pickCandidate(2, FR, 0.8f);
                 else if (scoreA < scoreB * 0.8)
@@ -1507,7 +1517,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 else {
                     double dFL = std::fabs(lumFB - L1) * invI;
                     double dRL = std::fabs(lumFR - L1) * invI;
-                    if (!frameInsane && dRL + 1.0 < dFL)
+                    if (!frameInsane && dRL + 3.0 < dFL)
                         pickCandidate(2, FR, 0.75f);
                     else
                         pickCandidate(1, FB, 0.35f);
