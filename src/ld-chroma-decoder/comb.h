@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <QCoreApplication>
 #include <QDebug>
 #include <QFile>
@@ -990,7 +991,19 @@ private:
 		double adjNeighborSupport= 0.0;        // average agreement of h±1 with residual (0..1)
 	};
 };
-// Inline definitions for FrameBuffer (out-of-class)
+
+    // Persistent triple-buffer: the prev/current/next FrameBuffers are reused
+    // across decodeFrames() calls instead of being allocated and zero-filled
+    // on every batch.  Each FrameBuffer owns ~180 MB of per-pixel attribution
+    // storage (CombAttributionRecord = ~456 B/pixel × 525 × 760), so per-batch
+    // reconstruction was the single largest cost in the locked path (~25 %
+    // of decode wall time on M1 Max).  decodeFrames() takes ownership into
+    // locals at entry (preserving the existing std::move rotation) and
+    // returns them at exit; updateConfiguration() resets them so a config
+    // change re-allocates with the new geometry.
+    std::unique_ptr<FrameBuffer> persistentNext;
+    std::unique_ptr<FrameBuffer> persistentCurrent;
+    std::unique_ptr<FrameBuffer> persistentPrevious;
 };
 
 #endif // COMB_H

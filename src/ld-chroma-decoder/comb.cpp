@@ -148,6 +148,12 @@ void Comb::updateConfiguration(const LdDecodeMetaData::VideoParameters &_videoPa
         qCritical() << "Comb: sample rate not ~4*fSC (colour decode may fail)";
 
     configurationSet = true;
+
+    // Geometry or mode may have changed; drop persistent FrameBuffers so the
+    // next decodeFrames() call rebuilds them with the new dimensions.
+    persistentNext.reset();
+    persistentCurrent.reset();
+    persistentPrevious.reset();
 }
 
 // Orchestrates per-frame decoding across all requested frames. Maintains a
@@ -160,9 +166,19 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     assert(configurationSet);
     assert(componentFrames.size() * 2 == (endIndex - startIndex));
 
-    auto next     = std::make_unique<FrameBuffer>(videoParameters, configuration);
-    auto current  = std::make_unique<FrameBuffer>(videoParameters, configuration);
-    auto previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
+    // Take ownership from the persistent triple-buffer.  First call allocates;
+    // every subsequent call reuses the same FrameBuffer storage (the
+    // ~180 MB attribution vector is the bulk).  The pre-roll at the head of
+    // the per-field loop overwrites all per-field state, so reusing across
+    // batches behaves identically to within a batch.
+    auto next     = std::move(persistentNext);
+    auto current  = std::move(persistentCurrent);
+    auto previous = std::move(persistentPrevious);
+    if (!next) {
+        next     = std::make_unique<FrameBuffer>(videoParameters, configuration);
+        current  = std::make_unique<FrameBuffer>(videoParameters, configuration);
+        previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
+    }
 
     const qint32 preStart = (configuration.dimensions == 3)
         ? (startIndex - 4)
@@ -342,6 +358,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             }
         }
     }
+
+    // Return the triple-buffer to the persistent slots for the next call.
+    persistentNext     = std::move(next);
+    persistentCurrent  = std::move(current);
+    persistentPrevious = std::move(previous);
 }
 
 // Seed clpbuffer[2] (the 3D working plane) from the completed 2D result in
