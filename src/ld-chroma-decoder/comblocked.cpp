@@ -604,7 +604,18 @@ void Comb::FrameBuffer::measurePostCombImpurity()
                     std::max(kImpurityFloorIRE, narrowMag));
             }
 
-            impurityRow[rel] = static_cast<float>(gA);
+            // Union with the pre-comb read buildPhaseCorrected1D() already
+            // published into this same buffer.  The post-comb pass measures what
+            // survived combing, but the interfield comb smears sharp cross-color
+            // transients into low-amplitude pseudo-coherence that aperture purity
+            // can no longer distinguish from authentic chroma -- gA collapses and
+            // the contamination leaks.  The seed saw that transient sharp, pre-comb
+            // (narrow >> wide), so take the stronger of the two reads: a pixel
+            // flagged before combing is not lost after it.  This reuses the seed's
+            // gA from carrierImpurity (no recompute); the suppression still happens
+            // only color-side, Y stays raw - full carrier, so no checkerboard.
+            impurityRow[rel] =
+                std::max(impurityRow[rel], static_cast<float>(gA));
 
             if (pcDiagLine >= 0 && line == pcDiagLine &&
                 rel >= pcDiagC0 && rel <= pcDiagC1) {
