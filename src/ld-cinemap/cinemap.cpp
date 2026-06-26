@@ -30,7 +30,69 @@ static inline int normalizePhase(long long val, int mod) {
     return (res < 0) ? res + mod : res;
 }
 
+const char* CineMap::phaseRunTypeName(PhaseRun::Type t)
+{
+    switch (t) {
+        case PhaseRun::Type::Unknown:     return "unknown";
+        case PhaseRun::Type::Pulldown32:  return "pulldown32";
+        case PhaseRun::Type::Interlaced:  return "interlaced";
+        case PhaseRun::Type::Progressive: return "progressive";
+    }
+    return "invalid";
+}
 
+const char* CineMap::twinRoleName(TwinACRole r)
+{
+    switch (r) {
+        case TwinACRole::Unknown: return "unknown";
+        case TwinACRole::AType:   return "AType";
+        case TwinACRole::CType:   return "CType";
+    }
+    return "invalid";
+}
+
+static QString phaseArrayString(const std::array<double, 5>& values,
+                                int bestPhase = -1)
+{
+    QString out;
+    for (int p = 0; p < 5; ++p) {
+        if (!out.isEmpty()) out += " ";
+        out += QString("p%1=%2%3")
+               .arg(p)
+               .arg(values[p], 0, 'f', 4)
+               .arg(p == bestPhase ? "*" : "");
+    }
+    return out;
+}
+
+static QString phaseIntArrayString(const std::array<int, 5>& values)
+{
+    QString out;
+    for (int p = 0; p < 5; ++p) {
+        if (!out.isEmpty()) out += " ";
+        out += QString("p%1=%2").arg(p).arg(values[p]);
+    }
+    return out;
+}
+
+QString CineMap::phaseRunSummary(const PhaseRun& run)
+{
+    if (run.type == PhaseRun::Type::Pulldown32) {
+        return QString("lock phase=%1 conf=%2")
+            .arg(run.phaseOffset)
+            .arg(run.confidence, 0, 'f', 3);
+    }
+
+    if (run.type != PhaseRun::Type::Unknown) {
+        return QString(phaseRunTypeName(run.type));
+    }
+
+    QString out = QString("unknown");
+    if (!run.reason.isEmpty()) {
+        out += QString(" reason=%1").arg(run.reason);
+    }
+    return out;
+}
 CineMap::CineMap(CineDisc* disc, Policy policy)
     : m_disc(disc)
     , m_policy(policy)
@@ -319,118 +381,7 @@ void CineMap::computeLumaLine_Bucket(const uint16_t* rawLine,
 
 // CAV helpers
 
-bool CineMap::verifyPhaseWithNotch(SourceVideo& sv,
-                                   int picNoPhase,
-                                   int verifyFrames)
-{
-    if (!m_disc || !m_md) return false;
-
-    const int nFrames = std::min(verifyFrames, m_disc->getNumberOfFrames());
-    if (nFrames < 10) return false;
-
-    // Field range for the verification window.
-    // Use the first non-padded frame's temporal-first field as segStart,
-    // and the last non-padded frame's temporal-second field as segEnd.
-    FieldOrderPolicy fo;
-    fo.reverse = m_disc->getReverseFieldOrder();
-
-    int segStart = -1, segEnd = -1;
-    for (int fi = 0; fi < nFrames; ++fi) {
-        if (m_disc->isPadded(fi)) continue;
-        const int fn = fi + 1;
-        int f1 = m_disc->getFirstFieldNumber(fn);
-        int f2 = m_disc->getSecondFieldNumber(fn);
-        if (f1 < 1 || f2 < 1) continue;
-        auto [tFirst, tSecond] = fo.temporalOrder(f1, f2);
-        if (segStart < 0) segStart = tFirst;
-        segEnd = tSecond;
-    }
-    if (segStart < 0 || segEnd < segStart) return false;
-
-    const auto mixed = computeFrameMixedness(sv, segStart, segEnd);
-    if (mixed.size() < 5) return false;
-
-    const int startFrameIdx = mixed.front().frameIndex;
-
-    // Dynamic range check: if all scores are essentially flat the signal is
-    // uninformative (solid black, static, freeze-frame content).
-    {
-        std::vector<double> scores;
-        scores.reserve(mixed.size());
-        for (const auto& m : mixed) scores.push_back(m.score);
-        std::sort(scores.begin(), scores.end());
-        const size_t n = scores.size();
-        if ((scores[n * 3 / 4] - scores[n / 4]) < 1e-6) {
-            qInfo() << "verifyPhaseWithNotch: mixedness has no dynamic range"
-                    << "— cannot verify, falling back to CLV policy";
-            return false;
-        }
-    }
-
-    // Find the two frames with the highest mixedness scores.
-    // These are the Notch-derived pulldown frames (AB and BC positions),
-    // independent of any picNo hypothesis.
-    // We work in 5-frame windows aligned to startFrameIdx so that positions
-    // are comparable across the window.
-    const int nMixed = static_cast<int>(mixed.size());
-
-    // Accumulate per-cycle-position scores over all complete 5-frame windows.
-    // Position within the 5-cycle relative to startFrameIdx (no phase assumed).
-    std::array<double, 5> posScore  = {};
-    std::array<int,    5> posCount  = {};
-
-    for (int i = 0; i < nMixed; ++i) {
-        const int relFrame = mixed[i].frameIndex - startFrameIdx;
-        const int pos      = ((relFrame % 5) + 5) % 5;
-        posScore[pos] += mixed[i].score;
-        posCount[pos]++;
-    }
-
-    // Normalise to mean score per position.
-    for (int p = 0; p < 5; ++p)
-        if (posCount[p] > 0) posScore[p] /= posCount[p];
-
-    // Find the two positions with the highest mean score.
-    std::array<int, 5> order = {0, 1, 2, 3, 4};
-    std::sort(order.begin(), order.end(),
-              [&](int a, int b){ return posScore[a] > posScore[b]; });
-
-    const int notchPos0 = order[0]; // highest-scoring cycle position
-    const int notchPos1 = order[1]; // second-highest
-
-    // The two Notch-derived pulldown positions must be adjacent in the cycle
-    // (AB and BC are always consecutive).  If they aren't, the signal is
-    // too noisy to trust.
-    const int gap = std::abs(notchPos0 - notchPos1);
-    const bool adjacent = (gap == 1 || gap == 4); // gap==4 wraps 4→0
-    if (!adjacent) {
-        qInfo() << "verifyPhaseWithNotch: Notch top-2 positions"
-                << notchPos0 << "and" << notchPos1
-                << "are not adjacent — signal too noisy, falling back";
-        return false;
-    }
-
-    // The lower of the two adjacent positions is the AB frame (pos 1 in the
-    // canonical cycle), so the Notch-derived phase offset is:
-    //   notch_phase = canonical_AB_pos - actual_AB_pos  (mod 5)
-    // where canonical AB pos = 1.
-    const int notchAbPos   = std::min(notchPos0, notchPos1);
-    // Handle wrap: if positions are 0 and 4, the "lower" in cycle terms is 4.
-    const int notchAbPosCyc = (gap == 4) ? 4 : notchAbPos;
-    const int notchPhase   = ((1 - notchAbPosCyc) % 5 + 5) % 5;
-
-    const bool verified = (notchPhase == picNoPhase);
-
-    qInfo() << "verifyPhaseWithNotch: Notch top-2 positions"
-            << notchPos0 << notchPos1
-            << "→ Notch phase" << notchPhase
-            << "| picNo phase" << picNoPhase
-            << (verified ? "— VERIFIED" : "— MISMATCH, falling back");
-
-    return verified;
-}
-
-CineMap::CavTwinValidation 
+CineMap::CavTwinValidation
 CineMap::validateCavWindowWithDG(SourceVideo& sv,
                                                    int f0, int f1, int f2, int f3, int f4)
 {
@@ -861,28 +812,45 @@ int CineMap::solveCavDisc()
     }
 
     // ------------------------------------------------------------------
-    // 2. Verify the picNo-derived phase with Notch over first ~10 seconds.
+    // 2. Confirm the picNo-derived phase by running pattern dG harvest
+    //    across the whole side. picNo replaces mixedness on CAV, but we
+    //    have to corroborate it. Pattern is the test we already plan to
+    //    run for harvest, so it doubles as the gate: 3:2 telecine yields
+    //    ~1 AA-twin per 5 frames, so observed coverage well below that
+    //    means picNo's canonical {numbered,absent,absent,numbered,numbered}
+    //    isn't actually riding on real twin pairs → untrust the side and
+    //    fall through to the CLV solver, which runs mixedness + pattern
+    //    + brute per segment.
+    //
+    //    Pattern's commits to doplGang here aren't a permanent scar:
+    //    redo runs clear flags, and the fallback path re-elects per
+    //    segment with the same evidence-additive ranking.
     // ------------------------------------------------------------------
-    constexpr int VERIFY_FRAMES = 300;
+    const int hardMax = computeHardMaxField();
+    const SegmentCaptureCache cache = buildCaptureCache(hardMax);
 
-    if (!verifyPhaseWithNotch(sv, bestPhase, VERIFY_FRAMES)) {
-        qInfo() << "CAV: Notch pattern disagrees with picNo phase"
-                << "— applying CLV-policy fallback";
+    const int observedPairs = harvestTwinsByPattern(sv, 1, hardMax, bestPhase, cache);
+    const int expectedPairs = nFrames / 5;
+    const double coverage   = (expectedPairs > 0)
+                              ? double(observedPairs) / double(expectedPairs)
+                              : 0.0;
+    constexpr double MIN_CAV_COVERAGE = 0.30;
+
+    qInfo().nospace() << "CAV: pattern dG harvest at phase " << bestPhase
+                      << " produced " << observedPairs << " pairs"
+                      << " (expected ~" << expectedPairs
+                      << ", coverage " << QString::number(coverage, 'f', 3) << ")";
+
+    if (coverage < MIN_CAV_COVERAGE) {
+        qInfo() << "CAV: pattern coverage below" << MIN_CAV_COVERAGE
+                << "— picNo phase not corroborated by twins — applying CLV-policy fallback";
         solveCavFallback(sv);
         sv.close();
         return 0;
     }
 
-    // ------------------------------------------------------------------
-    // 3. Verified: harvest dG twins, paint, run inversion test.
-    // ------------------------------------------------------------------
     qInfo() << "CAV: picNo phase" << bestPhase
-            << "verified by Notch — harvesting twins by pattern";
-
-    const int hardMax = computeHardMaxField();
-    const SegmentCaptureCache cache = buildCaptureCache(hardMax);
-
-    harvestTwinsByPattern(sv, 1, hardMax, bestPhase, cache);
+            << "corroborated by pattern dG — proceeding";
 
     applyCadenceToSegment(1, hardMax,
                           /*isLock=*/true,
@@ -902,7 +870,7 @@ int CineMap::solveCavDisc()
     std::vector<std::pair<int,int>> cavPairs;
     collectCavTwinPairs(groups, cavPairs);
     std::vector<TwinEdge> cavEdges;
-    buildTwinEdgesForPairs(sv, cavPairs, cavEdges, /*minConfidence=*/0.5);
+    buildTwinEdgesForPairs(sv, cavPairs, cavEdges, /*minConfidence=*/0.0);
     if (!cavEdges.empty())
         writeTwinEdgesToMetadata(sv, cavEdges);
 
@@ -1283,13 +1251,22 @@ std::vector<CineMap::TwinEdge> CineMap::harvestTwinEdges(SourceVideo& sv, int se
 
     tbcDebugStream() << "  Harvesting twin edges (Dip-Based), maxDist =" << maxDist << "Range:" << segStart << "-" << segEnd;
 
+    int pairsEvaluated = 0;
+    int belowSilence = 0;
+    int ratioPassCount = 0;
+    int threshPassCount = 0;
+    TwinConfDetail bestDetail;
+    int bestA = -1, bestB = -1;
+    TwinConfDetail bestRatioDetail;
+    int bestRatioA = -1, bestRatioB = -1;
+    double sumRatio = 0.0;
+    int ratioCount = 0;
+
     for (int a = segStart; a <= segEnd; ++a) {
         if (!isValidEvidenceField(a)) continue;
 
         auto fa = m_md->getField(a);
 
-        // Only scan +2 (Next frame, same parity) and +4 (Two frames away, same parity)
-        // Scans larger than this are rarely standard twins and confuse the dip logic.
         for (int d = 2; d <= maxDist; d += 2) {
             int b = a + d;
             if (b > segEnd) break;
@@ -1299,19 +1276,79 @@ std::vector<CineMap::TwinEdge> CineMap::harvestTwinEdges(SourceVideo& sv, int se
             auto fb = m_md->getField(b);
             if (fa.isFirstField != fb.isFirstField) continue;
 
-            // Calculate Confidence based on Grain Identity (Relative Dip)
-            double confidence = twinConfidence(sv, a, b);
+            pairsEvaluated++;
 
-            // Tunable: Minimum confidence to consider a lock
-            if (confidence > 0.5) {
-                // Retrieve cached diff for reporting
+            TwinConfDetail det;
+            double confidence = twinConfidence(sv, a, b, det);
+
+            // Sparse-scorer admit: any pair quieter than its neighbors is a clue.
+            // Downstream election (geometry / cleanup) decides which clues add up.
+            if (confidence > 0.0) {
                 double diff = dgDiffIre(sv, a, b, vp.fieldWidth, vp.fieldHeight);
                 edges.push_back({a, b, diff, confidence});
+            }
+
+            if (det.silenceMatch) belowSilence++;
+            if (det.ratio < 0.85) ratioPassCount++;
+            if (det.diffIn < det.threshAbs) threshPassCount++;
+
+            if (det.ratio < 900.0) {
+                sumRatio += det.ratio;
+                ratioCount++;
+                if (det.ratio < bestRatioDetail.ratio) {
+                    bestRatioDetail = det;
+                    bestRatioA = a; bestRatioB = b;
+                }
+            }
+
+            if (confidence > bestDetail.confidence) {
+                bestDetail = det;
+                bestA = a; bestB = b;
             }
         }
     }
 
     tbcDebugStream() << "  Found" << edges.size() << "twin edges in brute force pass.";
+
+    if (m_decisionTraceEnabled) {
+        double avgRatio = (ratioCount > 0) ? (sumRatio / ratioCount) : 999.0;
+        qInfo().noquote()
+            << QString("CineMap decision: TWIN_HARVEST fields [%1..%2] pairs=%3 accepted=%4 belowSilence=%5 ratioPass=%6 threshPass=%7 bestConf=%8 avgRatio=%9 bestRatio=%10")
+               .arg(segStart).arg(segEnd)
+               .arg(pairsEvaluated)
+               .arg(edges.size())
+               .arg(belowSilence)
+               .arg(ratioPassCount)
+               .arg(threshPassCount)
+               .arg(bestDetail.confidence, 0, 'f', 4)
+               .arg(avgRatio, 0, 'f', 4)
+               .arg(bestRatioDetail.ratio < 900.0 ? bestRatioDetail.ratio : 0.0, 0, 'f', 4);
+        if (bestA >= 0) {
+            qInfo().noquote()
+                << QString("CineMap decision: TWIN_HARVEST_BEST fields [%1..%2] pair=(%3,%4) diffIn=%5 neighbor=%6 ratio=%7 conf=%8 ratioScore=%9 threshScore=%10 threshAbs=%11")
+                   .arg(segStart).arg(segEnd)
+                   .arg(bestA).arg(bestB)
+                   .arg(bestDetail.diffIn, 0, 'f', 4)
+                   .arg(bestDetail.neighborActivity < 900.0 ? bestDetail.neighborActivity : -1.0, 0, 'f', 4)
+                   .arg(bestDetail.ratio < 900.0 ? bestDetail.ratio : -1.0, 0, 'f', 4)
+                   .arg(bestDetail.confidence, 0, 'f', 4)
+                   .arg(bestDetail.ratioScore, 0, 'f', 4)
+                   .arg(bestDetail.threshScore, 0, 'f', 4)
+                   .arg(bestDetail.threshAbs, 0, 'f', 4);
+        }
+        if (bestRatioA >= 0 && bestRatioA != bestA) {
+            qInfo().noquote()
+                << QString("CineMap decision: TWIN_HARVEST_BEST_RATIO fields [%1..%2] pair=(%3,%4) diffIn=%5 neighbor=%6 ratio=%7 conf=%8 ratioScore=%9 threshScore=%10")
+                   .arg(segStart).arg(segEnd)
+                   .arg(bestRatioA).arg(bestRatioB)
+                   .arg(bestRatioDetail.diffIn, 0, 'f', 4)
+                   .arg(bestRatioDetail.neighborActivity, 0, 'f', 4)
+                   .arg(bestRatioDetail.ratio, 0, 'f', 4)
+                   .arg(bestRatioDetail.confidence, 0, 'f', 4)
+                   .arg(bestRatioDetail.ratioScore, 0, 'f', 4)
+                   .arg(bestRatioDetail.threshScore, 0, 'f', 4);
+        }
+    }
 
     // Merge-write doplGang with conflict resolution vs existing JSON
     writeTwinEdgesToMetadata(sv, edges);
@@ -1344,7 +1381,13 @@ int CineMap::harvestTwinsByPattern(SourceVideo& sv, int segStart, int segEnd,
     }
     if (fStart < 0 || fEnd < 0) return 0;
 
-    constexpr double MIN_PATTERN_CONF = 0.40;
+    // Pattern-credibility threshold: at predicted twin sites we require a
+    // noticeable preponderance (relative-quietness ratio ≲ 0.85). This is
+    // NOT a back-off gate — pattern's failure to admit enough pairs at the
+    // segment level escalates to brute-force harvest downstream. Threshold
+    // here exists so the count of admitted pairs is a meaningful signal
+    // (the CAV coverage gate, for one, reads it).
+    constexpr double MIN_PATTERN_CONF = 0.15;
     constexpr double HYSTERESIS       = 0.10;
 
     auto tryCommitPatternPair = [&](int a, int b) {
@@ -1458,9 +1501,10 @@ void CineMap::harvestClvTwinsForSegment(SourceVideo& sv,
     collectClvTwinPairsFromMixedness(mixedness, cache, pairs);
     if (pairs.empty()) return;
 
-    // 2) Score them and filter by confidence
+    // 2) Score them. Sparse scorer: any pair quieter than its neighbors is a clue.
+    //    tryCommitReciprocalGang still gates writes with its own absolute sanity check.
     std::vector<TwinEdge> edges;
-    constexpr double MIN_CLV_CONF = 0.5;  // same ballpark as other twin gates
+    constexpr double MIN_CLV_CONF = 0.0;
     buildTwinEdgesForPairs(sv, pairs, edges, MIN_CLV_CONF);
     if (edges.empty()) return;
 
@@ -1549,29 +1593,84 @@ double CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, i
     const int endX   = (width * 3) / 4;
     const int yStart = height / 4;
     const int yEnd   = (height * 3) / 4;
-    const int step   = 4; // subsample for speed
+    const int yStep  = 4;   // subsample lines for speed; x stays stride 1
 
-    double totalDiff = 0.0;
-    uint64_t count = 0;
-    std::vector<double> Y1, Y2;
+    // dG twin metric. A telecine twin is the same film frame scanned twice, so its
+    // film grain is *identical* in both fields; a non-twin same-parity pair carries
+    // independently animated grain. Video noise animates in both cases (common-mode
+    // floor). For a same-parity d=2 pair the field difference D = field1 - field2 is,
+    // in a static region, a clean coherent 4fsc tone (the static chroma's subcarrier,
+    // opposite-phase between the two fields so it *doubles*) plus grain plus noise.
+    // The subcarrier swamps the grain, so we strip it: over a short sliding window the
+    // 4fsc quadrature basis is just {1,0,-1,0}/{0,1,0,-1}, so the local tone is two
+    // alternating sums (I on even samples, Q on odd). Grain is broadband and does not
+    // survive the windowed I/Q estimate, so it stays in the residual. We then measure
+    // the ENERGY (RMS) of D minus that tone: a true twin -> grain cancels -> residual
+    // collapses to the noise floor; animated grain survives as extra energy.
+    constexpr int N = 8;        // window length in samples (2 carrier cycles)
+    constexpr int H = N / 2;
 
     const double black = (vp.black16bIre > 0) ? vp.black16bIre : 0.0;
     const double white = (vp.white16bIre > 0) ? vp.white16bIre : 65535.0;
     const double scaleToIre = 100.0 / (white - black);
 
-    for (int y = yStart; y < yEnd; y += step) {
-        computeLumaLine_Bucket(p1 + y * width, Y1, width);
-        computeLumaLine_Bucket(p2 + y * width, Y2, width);
+    double sumSq = 0.0;
+    uint64_t count = 0;
 
-        for (int x = startX; x < endX; x += step) {
-            double diffRaw = std::abs(Y1[x] - Y2[x]);
-            totalDiff += diffRaw * scaleToIre;
+    std::vector<double> D(width);
+    std::vector<double> sI(width), sQ(width);   // signed quadrature projections of D
+    std::vector<double> PI(width + 1), PQ(width + 1); // prefix sums for sliding window
+
+    for (int y = yStart; y < yEnd; y += yStep) {
+        const uint16_t* l1 = p1 + y * width;
+        const uint16_t* l2 = p2 + y * width;
+
+        // Field difference and its 4fsc quadrature samples. cos(pi*x/2) is nonzero
+        // only on even x (+/-1); sin only on odd x. So sI carries even samples, sQ odd.
+        for (int x = 0; x < width; ++x) {
+            const double d = static_cast<double>(l1[x]) - static_cast<double>(l2[x]);
+            D[x] = d;
+            switch (x & 3) {
+                case 0: sI[x] =  d; sQ[x] = 0.0; break;
+                case 1: sI[x] = 0.0; sQ[x] =  d; break;
+                case 2: sI[x] = -d; sQ[x] = 0.0; break;
+                default: sI[x] = 0.0; sQ[x] = -d; break;
+            }
+        }
+
+        PI[0] = 0.0; PQ[0] = 0.0;
+        for (int x = 0; x < width; ++x) {
+            PI[x + 1] = PI[x] + sI[x];
+            PQ[x + 1] = PQ[x] + sQ[x];
+        }
+
+        for (int x = startX; x < endX; ++x) {
+            const int lo = std::max(0, x - H);
+            const int hi = std::min(width, x + H);
+
+            // Basis power in the (edge-clamped) window: count of even / odd indices.
+            const int evens = ((hi + 1) >> 1) - ((lo + 1) >> 1);
+            const int odds  = (hi - lo) - evens;
+
+            const double Ihat = (evens > 0) ? (PI[hi] - PI[lo]) / evens : 0.0;
+            const double Qhat = (odds  > 0) ? (PQ[hi] - PQ[lo]) / odds  : 0.0;
+
+            double carrier;
+            switch (x & 3) {
+                case 0: carrier =  Ihat; break;
+                case 1: carrier =  Qhat; break;
+                case 2: carrier = -Ihat; break;
+                default: carrier = -Qhat; break;
+            }
+
+            const double grain = D[x] - carrier;
+            sumSq += grain * grain;
             count++;
         }
     }
 
     if (count == 0) return 1000.0;
-    return totalDiff / count;
+    return std::sqrt(sumSq / count) * scaleToIre;   // RMS of carrier-stripped grain, in IRE
 }
 
 double CineMap::calculateBoostedDemodDiff(SourceVideo& sv, int f1, int f2, int width, int height)
@@ -1673,89 +1772,49 @@ double CineMap::getAdaptiveTwinThreshold(int f1, int f2)
 
 double CineMap::twinConfidence(SourceVideo& sv, int seqA, int seqB)
 {
+    TwinConfDetail d;
+    return twinConfidence(sv, seqA, seqB, d);
+}
+
+double CineMap::twinConfidence(SourceVideo& sv, int seqA, int seqB, TwinConfDetail& d)
+{
+    d = TwinConfDetail{};
     if (!m_md) return 0.0;
     const auto& vp = m_md->getVideoParameters();
-    
-    // 1. The Candidate Difference (demodulated, chroma-cancelled)
-    double diffIn = demodTwinDiffCached(sv, seqA, seqB, vp.fieldWidth, vp.fieldHeight);
-    
-    // 2. The Absolute Threshold (PSNR-based Noise Floor)
-    // We still use this as a gate for black frames or pure static scenes where 
-    // grain might not be visible enough to form a ratio.
-    double threshAbs = getAdaptiveTwinThreshold(seqA, seqB);
-    
-    // 3. The "Neighbor" Difference (The Context)
-    // We look at the same-parity fields immediately surrounding the pair.
-    // If A and B are twins (frozen grain), then A vs (A-2) and B vs (B+2)
-    // should show grain animation (higher diff).
-    double diffPre = 999.0;
-    double diffPost = 999.0;
+
+    d.diffIn = demodTwinDiffCached(sv, seqA, seqB, vp.fieldWidth, vp.fieldHeight);
+    d.threshAbs = getAdaptiveTwinThreshold(seqA, seqB);
+
     const int totalFields = m_md->getNumberOfFields();
+    if (seqA - 2 >= 1 && !boundaryBetween(seqA - 2, seqA))
+        d.diffPre = demodTwinDiffCached(sv, seqA - 2, seqA, vp.fieldWidth, vp.fieldHeight);
+    if (seqB + 2 <= totalFields && !boundaryBetween(seqB, seqB + 2))
+        d.diffPost = demodTwinDiffCached(sv, seqB, seqB + 2, vp.fieldWidth, vp.fieldHeight);
 
-    // Check backwards (A - 2)
-    if (seqA - 2 >= 1 && !boundaryBetween(seqA - 2, seqA)) {
-        diffPre = demodTwinDiffCached(sv, seqA - 2, seqA, vp.fieldWidth, vp.fieldHeight);
-    }
-    // Check forwards (B + 2)
-    if (seqB + 2 <= totalFields && !boundaryBetween(seqB, seqB + 2)) {
-        diffPost = demodTwinDiffCached(sv, seqB, seqB + 2, vp.fieldWidth, vp.fieldHeight);
-    }
-    
-    // Get the minimum neighbor activity. We need the candidate to be lower than *both*
-    // usually, but taking the min of valid neighbors is a safe baseline.
-    double neighborActivity = 999.0;
-    if (diffPre < 900.0 && diffPost < 900.0) neighborActivity = std::min(diffPre, diffPost);
-    else if (diffPre < 900.0) neighborActivity = diffPre;
-    else if (diffPost < 900.0) neighborActivity = diffPost;
-    
-    // --- SCORING LOGIC ---
+    if (d.diffPre < 900.0 && d.diffPost < 900.0) d.neighborActivity = std::min(d.diffPre, d.diffPost);
+    else if (d.diffPre < 900.0) d.neighborActivity = d.diffPre;
+    else if (d.diffPost < 900.0) d.neighborActivity = d.diffPost;
 
-    // A. Absolute Silence Check
-    // If the difference is practically zero (way below noise floor), it's a match.
-    // This catches generated black frames or digital freeze-frames.
-    if (diffIn < 0.5) return 1.0; 
-
-    // B. Ratio Test (The Grain Identity Check)
-    // If neighbors exist, we expect DiffIn to be significantly smaller than neighbors.
-    // A ratio of 0.7 means the candidate is 30% quieter than the surroundings.
-    double ratioScore = 0.0;
-    if (neighborActivity < 900.0) {
-        // We expect the twin pair to be strictly quieter than the neighbors
-        if (diffIn < neighborActivity) {
-            // How much deeper is the dip?
-            double ratio = diffIn / (neighborActivity + 0.01); // Prevent div/0
-            
-            // Map Ratio: 
-            // 0.85 -> 0.0 confidence (barely a dip)
-            // 0.50 -> 1.0 confidence (significant dip, likely frozen grain)
-            if (ratio < 0.85) {
-                ratioScore = 1.0 - (ratio / 0.85); 
-                // Boost strength: if ratio is good, we trust it highly
-                ratioScore = std::min(1.0, ratioScore * 1.5); 
-            }
+    // Sparse scorer: don't prove twinship, serve clues. Confidence is the pure RELATIVE
+    // quietness of this pair vs its same-parity d=2 neighbors. A pair more twin-like than
+    // its neighbors yields a positive score; downstream election picks the phase whose
+    // A/C pattern collects the most score. No absolute floors at this layer.
+    if (d.neighborActivity < 900.0) {
+        d.ratio = d.diffIn / (d.neighborActivity + 0.01);
+        if (d.ratio < 1.0) {
+            d.ratioScore = 1.0 - d.ratio;
+            d.confidence = d.ratioScore;
         }
+        if (d.diffIn < 0.5 && d.neighborActivity < 0.5) {
+            d.silenceMatch = true;   // trace only; not a confidence override
+        }
+    } else if (d.threshAbs > 0.0 && d.diffIn < d.threshAbs) {
+        // Segment-edge fallback: no neighbor available, lean on absolute.
+        d.threshScore = 1.0 - (d.diffIn / d.threshAbs);
+        d.confidence = d.threshScore;
     }
 
-    // C. Threshold Test (Legacy/Fallback)
-    // Use the PSNR threshold as a baseline confidence for static scenes w/o grain
-    double threshScore = 0.0;
-    if (threshAbs > 0.0 && diffIn < threshAbs) {
-        threshScore = 1.0 - (diffIn / threshAbs);
-    }
-
-    // D. Final Decision
-    // If we have a strong ratio signal (Grain Dip), it overrides the absolute threshold 
-    // (allows catching grainy films where absolute diff > threshold).
-    // If we have no context (scene change), we rely on the absolute threshold.
-    
-    if (neighborActivity < 900.0) {
-        // Weighted blend favoring the ratio.
-        // If ratio is strong (>0.5), we take it.
-        // If ratio is weak, we fallback to threshold.
-        return std::max(ratioScore, threshScore * 0.5);
-    } else {
-        return threshScore;
-    }
+    return d.confidence;
 }
 
 bool CineMap::tryCommitReciprocalGang(SourceVideo& sv,
@@ -1967,16 +2026,29 @@ CineMap::harvestACTwinsForSegment_strict(
 bool CineMap::validatePhaseGeometry(int phaseOffset,
                                     int segStart,
                                     int segEnd,
-                                    const SegmentCaptureCache& cache)
+                                    const SegmentCaptureCache& cache,
+                                    QString* rejectReason)
 {
     if (!m_md) return false;
+    if (rejectReason) rejectReason->clear();
 
-    // Anchor frame index (first valid in segment)
     int startFrameIdx = -1;
     for (int s = segStart; s <= segEnd; ++s) {
-        if (cache.validSeq(s)) { startFrameIdx = cache.cap[s].frameIndex; break; }
+        if (cache.validSeq(s)) {
+            startFrameIdx = cache.cap[s].frameIndex;
+            break;
+        }
     }
-    if (startFrameIdx < 0) return false;
+
+    if (startFrameIdx < 0) {
+        if (rejectReason) *rejectReason = "no-start-frame";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: GEOMETRY_VALIDATE fields [%1..%2] phase=%3 result=false reason=no-start-frame")
+                   .arg(segStart).arg(segEnd).arg(phaseOffset);
+        }
+        return false;
+    }
 
     GeometryEvidence ev = gatherGeometryEvidenceForPhase(phaseOffset,
                                                         segStart,
@@ -1984,19 +2056,55 @@ bool CineMap::validatePhaseGeometry(int phaseOffset,
                                                         startFrameIdx,
                                                         cache);
 
-    if (!ev.hasAny()) return false;
+    if (!ev.hasAny()) {
+        if (rejectReason) *rejectReason = "no-evidence";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: GEOMETRY_VALIDATE fields [%1..%2] phase=%3 startFrame=%4 result=false reason=no-evidence type=%5/%6 gap=%7/%8")
+                   .arg(segStart).arg(segEnd).arg(phaseOffset).arg(startFrameIdx)
+                   .arg(ev.typeAgree).arg(ev.typeSamples)
+                   .arg(ev.gapAgree).arg(ev.gapSamples);
+        }
+        return false;
+    }
 
-    // Decision policy:
-    // - type evidence is stronger than gap evidence, but both count
-    // - allow sparse evidence (film can be static), but reject strong contradictions
     const int agree = ev.agree();
     const int disagree = ev.disagree();
 
-    // Require at least one affirmative datapoint
-    if (agree <= 0) return false;
+    if (agree <= 0) {
+        if (rejectReason) *rejectReason = "no-agree";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: GEOMETRY_VALIDATE fields [%1..%2] phase=%3 startFrame=%4 result=false reason=no-agree agree=%5 disagree=%6 typeAgree=%7 typeDisagree=%8 typeSamples=%9 gapAgree=%10 gapDisagree=%11 gapSamples=%12")
+                   .arg(segStart).arg(segEnd).arg(phaseOffset).arg(startFrameIdx)
+                   .arg(agree).arg(disagree)
+                   .arg(ev.typeAgree).arg(ev.typeDisagree).arg(ev.typeSamples)
+                   .arg(ev.gapAgree).arg(ev.gapDisagree).arg(ev.gapSamples);
+        }
+        return false;
+    }
 
-    // Reject if contradictions dominate significantly
-    if (disagree > agree + 2) return false;
+    if (disagree > agree + 2) {
+        if (rejectReason) *rejectReason = "contradiction-dominates";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: GEOMETRY_VALIDATE fields [%1..%2] phase=%3 startFrame=%4 result=false reason=contradiction-dominates agree=%5 disagree=%6 typeAgree=%7 typeDisagree=%8 typeSamples=%9 gapAgree=%10 gapDisagree=%11 gapSamples=%12")
+                   .arg(segStart).arg(segEnd).arg(phaseOffset).arg(startFrameIdx)
+                   .arg(agree).arg(disagree)
+                   .arg(ev.typeAgree).arg(ev.typeDisagree).arg(ev.typeSamples)
+                   .arg(ev.gapAgree).arg(ev.gapDisagree).arg(ev.gapSamples);
+        }
+        return false;
+    }
+
+    if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString("CineMap decision: GEOMETRY_VALIDATE fields [%1..%2] phase=%3 startFrame=%4 result=true agree=%5 disagree=%6 typeAgree=%7 typeDisagree=%8 typeSamples=%9 gapAgree=%10 gapDisagree=%11 gapSamples=%12")
+               .arg(segStart).arg(segEnd).arg(phaseOffset).arg(startFrameIdx)
+               .arg(agree).arg(disagree)
+               .arg(ev.typeAgree).arg(ev.typeDisagree).arg(ev.typeSamples)
+               .arg(ev.gapAgree).arg(ev.gapDisagree).arg(ev.gapSamples);
+    }
 
     return true;
 }
@@ -2014,7 +2122,10 @@ void CineMap::writeTwinEdgesToMetadata(SourceVideo& sv,
     std::sort(sorted.begin(), sorted.end(),
               [](const TwinEdge& a, const TwinEdge& b) { return a.confidence > b.confidence; });
 
-    constexpr double MIN_EDGE_HINT = 0.50;  // keep in same ballpark as prior code
+    // Sparse scorer: process every clue in order of relative quietness.
+    // tryCommitReciprocalGang's internal absolute sanity gate (boosted demod vs
+    // adaptive threshold) filters false positives at the actual write.
+    constexpr double MIN_EDGE_HINT = 0.0;
     constexpr double HYSTERESIS    = 0.10;  // prevents thrash
 
     for (const auto& e : sorted) {
@@ -2129,18 +2240,25 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv,
                                   int segStartField,
                                   int segEndField,
                                   const SegmentCaptureCache& cache,
-                                  DgLock& outLock)
+                                  DgLock& outLock,
+                                  QString* rejectReason)
 {
     Q_UNUSED(sv);
     if (!m_md || !m_disc) return false;
+    if (rejectReason) rejectReason->clear();
 
-    // 1. Harvest strictly classified A/C twins
-    // This filters out ambiguous twins and returns only those with clear 3:2 geometry
     auto acTwins = harvestACTwinsForSegment_strict(segStartField, segEndField, cache);
-    if (acTwins.empty()) return false;
 
-    // 2. Establish Anchor Frame
-    // We need a stable reference point (start of the segment) to calculate offsets
+    if (acTwins.empty()) {
+        if (rejectReason) *rejectReason = "no-strict-ac-twins";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: DG_GEOMETRY_LOCK fields [%1..%2] result=false reason=no-strict-ac-twins")
+                   .arg(segStartField).arg(segEndField);
+        }
+        return false;
+    }
+
     int startFrameIdx = -1;
     for (int s = segStartField; s <= segEndField; ++s) {
         if (cache.validSeq(s)) {
@@ -2148,77 +2266,145 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv,
             break;
         }
     }
-    if (startFrameIdx < 0) return false;
 
-    // 3. Score all 5 potential phases based on the geometry evidence
+    if (startFrameIdx < 0) {
+        if (rejectReason) *rejectReason = "no-start-frame";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: DG_GEOMETRY_LOCK fields [%1..%2] result=false reason=no-start-frame acTwins=%3")
+                   .arg(segStartField).arg(segEndField).arg(acTwins.size());
+        }
+        return false;
+    }
+
     std::array<double, 5> score = {0, 0, 0, 0, 0};
     std::array<int,    5> count = {0, 0, 0, 0, 0};
 
+    int aTypeCount = 0;
+    int cTypeCount = 0;
+
     for (const auto& t : acTwins) {
-        // Use the Definitional field of the twin pair as the truth point
+        if (t.role == TwinACRole::AType) aTypeCount++;
+        else if (t.role == TwinACRole::CType) cTypeCount++;
+
         if (!cache.validSeq(t.defSeq)) continue;
 
         int df  = cache.cap[t.defSeq].frameIndex;
-        int rel = df - startFrameIdx; // Relative frame number from start
+        int rel = df - startFrameIdx;
 
-        // Test this twin against all 5 phase hypotheses
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: DG_GEOMETRY_TWIN fields [%1..%2] role=%3 def=%4 comp=%5 spare=%6 defFrame=%7 relFrame=%8")
+                   .arg(segStartField).arg(segEndField)
+                   .arg(twinRoleName(t.role))
+                   .arg(t.defSeq)
+                   .arg(t.compSeq)
+                   .arg(t.spareSeq)
+                   .arg(df)
+                   .arg(rel);
+        }
+
         for (int p = 0; p < 5; ++p) {
-            // Predict the position in the 5-frame cycle for this frame
-            // pos 0=AA, 1=AB, 2=BC, 3=CC, 4=DD
             int pos = normalizePhase(rel + p, 5);
             bool ok = false;
 
             if (t.role == TwinACRole::AType) {
-                // A-Twin geometry (Spare follows Def). 
-                // A-Type trio: [Def, Comp, Spare]. Def is first.
-                // In AA AB BC CC DD: 
-                // AA (0): f0(def), f1(comp).
-                // AB (1): f2(spare), f3(mixed).
-                // The A-Twin is (f0, f2). Def is f0. Def is in frame AA (0).
                 ok = (pos == 0);
             } else if (t.role == TwinACRole::CType) {
-                // C-Twin geometry (Spare precedes Def).
-                // C-Type trio: [Spare, Comp, Def].
-                // In BC CC:
-                // BC (2): f4(mixed), f5(spare).
-                // CC (3): f6(comp), f7(def).
-                // The C-Twin is (f5, f7). Def is f7. Def is in frame CC (3).
                 ok = (pos == 3);
             }
 
-            // Scoring: Strong reward for match, small penalty for mismatch
             if (ok) score[p] += 1.0;
             else    score[p] -= 0.25;
-            
+
             count[p]++;
         }
     }
 
-    // 4. Determine the Winner
     int    bestP = -1;
     double bestS = -1e9;
-    
-    // Normalize scores by count to get average agreement (approx -0.25 to 1.0)
+
+    std::array<double, 5> normScore = {0, 0, 0, 0, 0};
+
     for (int p = 0; p < 5; ++p) {
         if (count[p] == 0) continue;
+
         double s = score[p] / count[p];
+        normScore[p] = s;
+
         if (s > bestS) {
             bestS = s;
             bestP = p;
         }
     }
 
-    // 5. Validation
-    // Require a positive signal. 0.3 implies >50% of evidence agrees roughly.
-    // Since we are falling back to this method when visual pattern failed,
-    // we want fairly high confidence in the geometry.
-    if (bestP == -1 || bestS < 0.4) return false;
+    // Expose the per-phase evidence vector unconditionally so the
+    // evidence-additive election in solveSegment can consume it even when
+    // brute geometry alone wouldn't declare a lock (no clear winner).
+    bool anyCounts = false;
+    for (int p = 0; p < 5; ++p) if (count[p] > 0) { anyCounts = true; break; }
+    outLock.phaseScores = normScore;
+    outLock.phaseScoresInformative = anyCounts;
+
+    // Sparse-scorer election: don't compare bestScore against an absolute floor —
+    // that's the same vestigial gate we removed at the harvest layer. The real
+    // preponderance-of-evidence signal is the MARGIN between the winning phase
+    // and its runner-up. A clear winner with positive net agreement beats a
+    // near-tie even if the absolute count is modest.
+    double secondBestS = -1e9;
+    for (int p = 0; p < 5; ++p) {
+        if (count[p] == 0) continue;
+        if (p == bestP) continue;
+        if (normScore[p] > secondBestS) secondBestS = normScore[p];
+    }
+    constexpr double MIN_GEOMETRY_MARGIN = 0.15;
+    const bool hasClearWinner = (bestP != -1) && (bestS > 0.0)
+                                && (bestS - secondBestS >= MIN_GEOMETRY_MARGIN);
+
+    if (!hasClearWinner) {
+        if (rejectReason) *rejectReason = "no-clear-winner";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: DG_GEOMETRY_LOCK fields [%1..%2] result=false reason=no-clear-winner startFrame=%3 acTwins=%4 AType=%5 CType=%6 bestPhase=%7 bestScore=%8 secondBest=%9 margin=%10 rawScores={%11} normScores={%12} counts={%13}")
+                   .arg(segStartField).arg(segEndField)
+                   .arg(startFrameIdx)
+                   .arg(acTwins.size())
+                   .arg(aTypeCount)
+                   .arg(cTypeCount)
+                   .arg(bestP)
+                   .arg(bestS, 0, 'f', 4)
+                   .arg(secondBestS > -1e8 ? secondBestS : 0.0, 0, 'f', 4)
+                   .arg(secondBestS > -1e8 ? (bestS - secondBestS) : 0.0, 0, 'f', 4)
+                   .arg(phaseArrayString(score, bestP))
+                   .arg(phaseArrayString(normScore, bestP))
+                   .arg(phaseIntArrayString(count));
+        }
+        return false;
+    }
 
     outLock.anchorFrame = startFrameIdx;
     outLock.phaseOffset = bestP;
     outLock.baseOffset  = 0;
-    outLock.confidence  = 0.90; // Geometry locks are structurally very strong
-    
+    outLock.confidence  = 0.90;
+
+    if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString("CineMap decision: DG_GEOMETRY_LOCK fields [%1..%2] result=lock source=twin-geometry startFrame=%3 phase=%4 conf=%5 acTwins=%6 AType=%7 CType=%8 bestScore=%9 secondBest=%13 margin=%14 rawScores={%10} normScores={%11} counts={%12}")
+               .arg(segStartField).arg(segEndField)
+               .arg(startFrameIdx)
+               .arg(bestP)
+               .arg(outLock.confidence, 0, 'f', 3)
+               .arg(acTwins.size())
+               .arg(aTypeCount)
+               .arg(cTypeCount)
+               .arg(bestS, 0, 'f', 4)
+               .arg(phaseArrayString(score, bestP))
+               .arg(phaseArrayString(normScore, bestP))
+               .arg(phaseIntArrayString(count))
+               .arg(secondBestS > -1e8 ? secondBestS : 0.0, 0, 'f', 4)
+               .arg(secondBestS > -1e8 ? (bestS - secondBestS) : 0.0, 0, 'f', 4);
+    }
+
     return true;
 }
 
@@ -2234,24 +2420,38 @@ CineMap::scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
     run.confidence  = 0.0;
     run.phaseOffset = 0;
 
-    if (mixed.empty()) return run;
+    if (mixed.empty()) {
+        run.reason = "empty";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] result=unknown reason=empty")
+                   .arg(startField).arg(endField);
+        }
+        return run;
+    }
 
     int startFrameIdx = -1;
     if (cache.validSeq(startField)) {
         startFrameIdx = cache.cap[startField].frameIndex;
     }
-    if (startFrameIdx == -1) return run;
+    if (startFrameIdx == -1) {
+        run.reason = "no-start-frame";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] result=unknown reason=no-start-frame")
+                   .arg(startField).arg(endField);
+        }
+        return run;
+    }
 
     const int numFrames = static_cast<int>(mixed.size());
 
     // ---------------------------------------------------------------------
     // Composite reality check:
-    // - Absolute mixedness amplitude is not reliable (low contrast, noise floor, etc.)
-    // - We care about *relative separability* of phases within this segment.
-    // - "Clean" is often micro-mixed below threshold; subtracting it is anti-signal.
+    // - Absolute mixedness amplitude is not reliable.
+    // - We care about relative separability of phase hypotheses.
     // ---------------------------------------------------------------------
 
-    // Collect scores for robust, segment-local normalization.
     std::vector<double> vals;
     vals.reserve(static_cast<size_t>(numFrames));
     for (int i = 0; i < numFrames; ++i) vals.push_back(mixed[i].score);
@@ -2270,33 +2470,32 @@ CineMap::scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
     const double p90 = percentile(0.90);
     const double denom = std::max(1e-9, (p90 - p10));
 
-    // If the segment has essentially no dynamic range in mixedness, it is uninformative.
-    // (This catches black/freeze/ultra-low-detail regions where everything looks "clean".)
     if ((p90 - p10) < 1e-6) {
         run.type = PhaseRun::Type::Unknown;
+        run.reason = "flat-mixedness";
+
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=unknown reason=flat-mixedness p10=%4 p50=%5 p90=%6")
+                   .arg(startField).arg(endField).arg(numFrames)
+                   .arg(p10, 0, 'f', 6)
+                   .arg(p50, 0, 'f', 6)
+                   .arg(p90, 0, 'f', 6);
+        }
+
         return run;
     }
 
-    // ---------------------------------------------------------------------
-    // Accumulators for the 5 possible phases (0..4)
-    // ---------------------------------------------------------------------
     std::array<double, 5> phaseScores = {0.0, 0.0, 0.0, 0.0, 0.0};
 
     double totalW = 0.0;
     int activeFrames = 0;
 
-    // Evidence weight w is segment-relative:
-    // - w ~ 0: bottom of segment distribution (uninformative / "clean-ish")
-    // - w ~ 1: top of segment distribution (strong mixedness evidence)
-    //
-    // We only ADD evidence at expected mixed positions (1,2) for each hypothesis.
-    // We do NOT subtract "clean" evidence because it is frequently micro-mixed.
-    constexpr double ACTIVE_W = 0.25; // counts as "contributing evidence" in this segment
+    constexpr double ACTIVE_W = 0.25;
 
     for (int i = 0; i < numFrames; ++i) {
         const double val = mixed[i].score;
 
-        // Map to [0,1] based on segment-local p10..p90.
         double w = (val - p10) / denom;
         w = std::clamp(w, 0.0, 1.0);
 
@@ -2309,16 +2508,26 @@ CineMap::scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
             int pos = (relFrame + p) % 5;
             if (pos < 0) pos += 5;
 
-            // In 3:2, positions 1 (AB) and 2 (BC) are Mixed.
+            // Canonical 3:2 cycle: positions 1 (AB) and 2 (BC) are mixed; 0/3/4
+            // are clean. We reward mixedness at the "expected mixed" positions
+            // AND penalize mixedness at the "expected clean" positions — the
+            // anti-pattern term. Without it, 3-of-5-mixed content (e.g. content
+            // that animates three positions in a row, not a true 3:2 cycle)
+            // produces a misleading mixedness winner: the argmax phase puts two
+            // of the three high spots on positions 1+2, scoring nearly as well
+            // as a real lock. With the anti-pattern, the third high spot lands
+            // on an "expected clean" position and subtracts, collapsing the
+            // winner toward zero (and producing a tie between competing phases
+            // where appropriate). Real 3:2 stays at the same score because its
+            // clean positions are actually clean (w ≈ 0 there).
             if (pos == 1 || pos == 2) {
                 phaseScores[p] += w;
+            } else {
+                phaseScores[p] -= w;
             }
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Analysis
-    // ---------------------------------------------------------------------
     int bestP = -1;
     double bestScore = -1e9;
     double worstScore = 1e9;
@@ -2333,38 +2542,139 @@ CineMap::scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
         }
     }
 
+    // Expose the per-phase evidence vector unconditionally so the
+    // evidence-additive election in solveSegment can consume it even when
+    // mixedness alone wouldn't declare a lock (silence, busy-no-phase,
+    // below-confidence).
+    run.phaseScores = phaseScores;
+    run.phaseScoresInformative = true;
+
     const double spread = bestScore - worstScore;
     const double avgW = (numFrames > 0) ? (totalW / numFrames) : 0.0;
     const double activeSpread = (activeFrames > 0) ? (spread / activeFrames) : 0.0;
 
-    // CASE A: Uninformative / silence (no meaningful evidence frames)
     if (activeFrames == 0 && avgW < 0.05) {
         run.type = PhaseRun::Type::Unknown;
+        run.reason = "silence";
+
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=unknown reason=silence p10=%4 p50=%5 p90=%6 avgW=%7 activeFrames=%8 scores={%9}")
+                   .arg(startField).arg(endField).arg(numFrames)
+                   .arg(p10, 0, 'f', 6)
+                   .arg(p50, 0, 'f', 6)
+                   .arg(p90, 0, 'f', 6)
+                   .arg(avgW, 0, 'f', 4)
+                   .arg(activeFrames)
+                   .arg(phaseArrayString(phaseScores, bestP));
+        }
+
         return run;
     }
 
-    // CASE B: High activity but no decisive phase (suspect interlaced / noise).
-    // We *do not* commit to VideoInterlaced here. We leave this segment as Unknown
-    // and let geometry / dG dips and a later classifier decide whether it's truly video.
     if (avgW > 0.35 && activeSpread < (avgW * 0.15)) {
         run.type = PhaseRun::Type::Unknown;
         run.confidence = 0.0;
+        run.reason = "busy-no-phase";
+
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=unknown reason=busy-no-phase p10=%4 p50=%5 p90=%6 avgW=%7 activeFrames=%8 activeSpread=%9 threshold=%10 scores={%11}")
+                   .arg(startField).arg(endField).arg(numFrames)
+                   .arg(p10, 0, 'f', 6)
+                   .arg(p50, 0, 'f', 6)
+                   .arg(p90, 0, 'f', 6)
+                   .arg(avgW, 0, 'f', 4)
+                   .arg(activeFrames)
+                   .arg(activeSpread, 0, 'f', 4)
+                   .arg(avgW * 0.15, 0, 'f', 4)
+                   .arg(phaseArrayString(phaseScores, bestP));
+        }
+
         return run;
     }
-    
-    // CASE C: 3:2 lock
-    // Map activeSpread to confidence. In weight-space, activeSpread tends to be smaller,
-    // so the slope is steeper than the old raw-energy mapping.
+
+    // Tie / ambiguity detection. Under anti-pattern, 3-mixed-in-a-row content
+    // produces an INHERENT tie between two phases (both "off by one" placements
+    // score the same — the math is symmetric in the three-consecutive case).
+    // If the runner-up is too close to the winner, refuse to lock from
+    // mixedness alone — the additive election still sees both vector entries
+    // tied at 1.0 in mixN and lets dG break the tie correctly.
+    double secondScore = -1e9;
+    for (int p = 0; p < 5; ++p) {
+        if (p == bestP) continue;
+        if (phaseScores[p] > secondScore) secondScore = phaseScores[p];
+    }
+    const double phaseMargin = (bestP != -1 && secondScore > -1e8)
+                               ? (bestScore - secondScore)
+                               : bestScore;
+    // Tie ratio: how distinctive is the winner vs the runner-up, scaled by
+    // best. <0.25 means runner-up is within 25% of winner → ambiguous.
+    const double relMargin = (bestScore > 1e-9) ? (phaseMargin / bestScore) : 0.0;
+
     double calculatedConf = std::min(0.95, 0.38 + (activeSpread * 10.0));
 
-    // Slight penalty for extremely short bursts of activity (still allow lock if strong)
     if (activeFrames < 3) calculatedConf *= 0.85;
+
+    if (bestP != -1 && relMargin < 0.25) {
+        run.type = PhaseRun::Type::Unknown;
+        run.confidence = 0.0;
+        run.reason = "ambiguous-pattern";
+
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=unknown reason=ambiguous-pattern bestPhase=%4 bestScore=%5 secondBest=%6 relMargin=%7 avgW=%8 activeFrames=%9 scores={%10}")
+                   .arg(startField).arg(endField).arg(numFrames)
+                   .arg(bestP)
+                   .arg(bestScore, 0, 'f', 4)
+                   .arg(secondScore, 0, 'f', 4)
+                   .arg(relMargin, 0, 'f', 4)
+                   .arg(avgW, 0, 'f', 4)
+                   .arg(activeFrames)
+                   .arg(phaseArrayString(phaseScores, bestP));
+        }
+
+        return run;
+    }
 
     if (bestP != -1 && calculatedConf > 0.45) {
         run.type = PhaseRun::Type::Pulldown32;
         run.phaseOffset = bestP;
         run.confidence = calculatedConf;
+        run.reason.clear();
+
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=lock phase=%4 conf=%5 p10=%6 p50=%7 p90=%8 avgW=%9 activeFrames=%10 activeSpread=%11 scores={%12}")
+                   .arg(startField).arg(endField).arg(numFrames)
+                   .arg(bestP)
+                   .arg(calculatedConf, 0, 'f', 3)
+                   .arg(p10, 0, 'f', 6)
+                   .arg(p50, 0, 'f', 6)
+                   .arg(p90, 0, 'f', 6)
+                   .arg(avgW, 0, 'f', 4)
+                   .arg(activeFrames)
+                   .arg(activeSpread, 0, 'f', 4)
+                   .arg(phaseArrayString(phaseScores, bestP));
+        }
+
         return run;
+    }
+
+    run.reason = "below-confidence";
+    if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=unknown reason=below-confidence phase=%4 conf=%5 p10=%6 p50=%7 p90=%8 avgW=%9 activeFrames=%10 activeSpread=%11 scores={%12}")
+               .arg(startField).arg(endField).arg(numFrames)
+               .arg(bestP)
+               .arg(calculatedConf, 0, 'f', 3)
+               .arg(p10, 0, 'f', 6)
+               .arg(p50, 0, 'f', 6)
+               .arg(p90, 0, 'f', 6)
+               .arg(avgW, 0, 'f', 4)
+               .arg(activeFrames)
+               .arg(activeSpread, 0, 'f', 4)
+               .arg(phaseArrayString(phaseScores, bestP));
     }
 
     return run;
@@ -2382,40 +2692,176 @@ CineMap::PhaseRun CineMap::solveSegment(SourceVideo& sv,
     run.confidence  = 0.0;
     run.phaseOffset = 0;
 
-    if (!m_md || !m_disc || segStartField >= segEndField)
-        return run;
-
-    // 1. Mixedness-based phase scan.
-    run = scanForPhaseRun(mixedness, segStartField, segEndField, cache);
-
-    // 2. If a 3:2 pattern was found, confirm with dG geometry.
-    if (run.type == PhaseRun::Type::Pulldown32) {
-
-        // Populate doplGang links guided by the solved phase.
-        harvestTwinsByPattern(sv, segStartField, segEndField,
-                              run.phaseOffset, cache);
-
-        bool geomValid = validatePhaseGeometry(run.phaseOffset,
-                                               segStartField,
-                                               segEndField,
-                                               cache);
-        if (geomValid) {
-            // Geometry confirms the weak signal → strong lock.
-            run.confidence = std::max(run.confidence, 0.90);
+    if (!m_md || !m_disc || segStartField >= segEndField) {
+        run.reason = "invalid-input";
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: SEGMENT fields [%1..%2] result=unknown reason=invalid-input")
+                   .arg(segStartField).arg(segEndField);
+            qInfo().noquote()
+                << QString("CineMap summary: SEGMENT fields [%1..%2] mixedness=skip geometry=skip final=unknown reason=invalid-input")
+                   .arg(segStartField).arg(segEndField);
         }
-        // If geometry is silent we keep the lock but don't boost.
         return run;
     }
 
-    // 3. Last resort: pure geometry lock from doplGang relationships.
-    // Handles low-motion / low-detail content where mixedness is uninformative.
-    harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/6);
+    if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString("CineMap decision: SEGMENT fields [%1..%2] begin mixednessFrames=%3")
+               .arg(segStartField).arg(segEndField).arg(mixedness.size());
+    }
+
+    // 1. Mixedness signal — produces a per-phase score vector (mixVec).
+    run = scanForPhaseRun(mixedness, segStartField, segEndField, cache);
+    const QString mixednessSummary = phaseRunSummary(run);
+    const auto mixVec = run.phaseScores;
+    const bool mixInformative = run.phaseScoresInformative;
+    const bool mixednessLocked = (run.type == PhaseRun::Type::Pulldown32);
+    const int  mixedPhase = mixednessLocked ? run.phaseOffset : -1;
+    const double mixedConf = mixednessLocked ? run.confidence : 0.0;
+
+    // 2. Pattern harvest at the mixedness-candidate phase (side effect: writes
+    //    confident twin pairs to doplGang). Counts confirmatory pairs at the
+    //    predicted sites. The count enters the election as a bonus at the
+    //    candidate phase; pattern by itself does not render a decision —
+    //    pattern's fallback is brute force no matter what the path.
+    int patternPairs = 0;
+    if (mixednessLocked) {
+        patternPairs = harvestTwinsByPattern(sv, segStartField, segEndField,
+                                             run.phaseOffset, cache);
+    }
+
+    // 3. Brute-force dG signal — always run, produces dgVec via the A/C
+    //    geometry election in tryLockByDgGeometry. Restricted to d=2:
+    //    classifyTwinAC_strict requires hi==lo+2; d=4/6 can't form geometry.
+    std::vector<TwinEdge> harvested =
+        harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2);
+
     DgLock lock;
-    if (tryLockByDgGeometry(sv, segStartField, segEndField, cache, lock)) {
+    QString geomRejectReason;
+    (void)tryLockByDgGeometry(sv, segStartField, segEndField,
+                              cache, lock, &geomRejectReason);
+    const auto dgVec = lock.phaseScores;
+    const bool dgInformative = lock.phaseScoresInformative;
+
+    // 4. Evidence-additive election.
+    //    We have two per-phase evidence vectors with different scales:
+    //      - mixVec: raw mixedness count (unbounded above)
+    //      - dgVec:  normalized A/C agreement (~[-0.25, 0.5])
+    //    Max-normalize each (clamping negatives to 0 so phases with net
+    //    disagreement contribute nothing), then sum. Highest score wins
+    //    the segment. We never veto: a phase with both signals voting for
+    //    it beats a phase one signal disfavors, but a strong single-signal
+    //    candidate can still win if the other signal is silent.
+    auto maxNormalize = [](const std::array<double,5>& v) {
+        double mx = 0.0;
+        for (double x : v) if (x > mx) mx = x;
+        std::array<double,5> n = {0.0, 0.0, 0.0, 0.0, 0.0};
+        if (mx > 0.0) {
+            for (int i = 0; i < 5; ++i) n[i] = std::max(0.0, v[i]) / mx;
+        }
+        return n;
+    };
+
+    const auto mixN = mixInformative ? maxNormalize(mixVec) : std::array<double,5>{};
+    const auto dgN  = dgInformative  ? maxNormalize(dgVec)  : std::array<double,5>{};
+
+    std::array<double,5> combined = {0.0, 0.0, 0.0, 0.0, 0.0};
+    int signalSources = 0;
+    if (mixInformative) { for (int i = 0; i < 5; ++i) combined[i] += mixN[i]; signalSources++; }
+    if (dgInformative)  { for (int i = 0; i < 5; ++i) combined[i] += dgN[i];  signalSources++; }
+
+    // Pattern bonus at the mixedness-candidate phase: confirmatory evidence
+    // at predicted sites adds weight to that phase, calibrated against the
+    // ~1-per-5-frames expected twin rate. Capped at 1.0 (same scale as one
+    // normalized signal contribution).
+    if (mixednessLocked && patternPairs > 0) {
+        const int segFrames = std::max(1, (segEndField - segStartField + 1) / 2);
+        const int expectedPatternPairs = std::max(1, segFrames / 5);
+        const double patternBonus = std::min(1.0, double(patternPairs) / double(expectedPatternPairs));
+        combined[mixedPhase] += patternBonus;
+    }
+
+    int bestP = -1;
+    double bestC = -1e9;
+    for (int p = 0; p < 5; ++p) {
+        if (combined[p] > bestC) { bestC = combined[p]; bestP = p; }
+    }
+    double secondC = -1e9;
+    for (int p = 0; p < 5; ++p) {
+        if (p == bestP) continue;
+        if (combined[p] > secondC) secondC = combined[p];
+    }
+    const double margin = (bestP != -1 && secondC > -1e8) ? (bestC - secondC) : bestC;
+
+    // Margin floor: 0.15 per contributing signal source (same shape as the
+    // per-detector margin gate). Two signals → 0.30, one → 0.15.
+    constexpr double MARGIN_PER_SOURCE = 0.15;
+    const double marginFloor = MARGIN_PER_SOURCE * std::max(1, signalSources);
+    const bool hasWinner = (bestP != -1) && (bestC > 0.0) && (margin >= marginFloor);
+
+    if (hasWinner) {
         run.type        = PhaseRun::Type::Pulldown32;
-        run.phaseOffset = lock.phaseOffset;
-        run.confidence  = 0.85;
+        run.phaseOffset = bestP;
         run.endField    = segEndField;
+        run.reason.clear();
+        // Confidence: 0.80 base + scaled by how much the margin exceeds the
+        // floor (caps at 0.95). Both signals agreeing produces a strong margin.
+        double conf = 0.80;
+        if (marginFloor > 0.0) {
+            conf += 0.15 * std::min(1.0, (margin - marginFloor) / marginFloor);
+        }
+        run.confidence = std::clamp(conf, 0.80, 0.95);
+    } else {
+        run.type = PhaseRun::Type::Unknown;
+        run.confidence = 0.0;
+        run.reason = (signalSources == 0) ? QString("no-signals")
+                                          : QString("no-clear-combined-winner");
+    }
+
+    if (m_decisionTraceEnabled) {
+        auto vecStr = [](const std::array<double,5>& v, int bestIdx) {
+            QString out;
+            for (int p = 0; p < 5; ++p) {
+                if (p > 0) out += " ";
+                out += QString("p%1=%2%3").arg(p)
+                                          .arg(v[p], 0, 'f', 3)
+                                          .arg(p == bestIdx ? "*" : "");
+            }
+            return out;
+        };
+        QString sources;
+        if (mixInformative) sources += "mix";
+        if (dgInformative)  sources += sources.isEmpty() ? "dg" : "+dg";
+        if (mixednessLocked && patternPairs > 0)
+            sources += sources.isEmpty() ? "pattern" : "+pattern";
+        if (sources.isEmpty()) sources = "none";
+
+        qInfo().noquote()
+            << QString("CineMap decision: SEGMENT_ELECT fields [%1..%2] sources=%3 mixedPhase=%4 mixedConf=%5 patternPairs=%6 harvestedEdges=%7 mixN={%8} dgN={%9} combined={%10} bestPhase=%11 bestScore=%12 secondBest=%13 margin=%14 floor=%15 result=%16")
+               .arg(segStartField).arg(segEndField)
+               .arg(sources)
+               .arg(mixedPhase)
+               .arg(mixedConf, 0, 'f', 3)
+               .arg(patternPairs)
+               .arg(harvested.size())
+               .arg(vecStr(mixN, bestP))
+               .arg(vecStr(dgN,  bestP))
+               .arg(vecStr(combined, bestP))
+               .arg(bestP)
+               .arg(bestC, 0, 'f', 4)
+               .arg(secondC > -1e8 ? secondC : 0.0, 0, 'f', 4)
+               .arg(margin, 0, 'f', 4)
+               .arg(marginFloor, 0, 'f', 4)
+               .arg(hasWinner ? "lock" : (signalSources == 0 ? "no-signals" : "no-clear-combined-winner"));
+
+        qInfo().noquote()
+            << QString("CineMap summary: SEGMENT fields [%1..%2] mixedness=%3 final=%4 conf=%5 source=evidence-additive(%6)")
+               .arg(segStartField).arg(segEndField)
+               .arg(mixednessSummary)
+               .arg(phaseRunSummary(run))
+               .arg(run.confidence, 0, 'f', 3)
+               .arg(sources);
     }
 
     return run;

@@ -7,5 +7,6 @@ namespace visualEdits {
     int analyseVisualEdits(CineDisc& disc,
                            double threshold,
                            double strongFactor,
-                           double peakFactor);
+                           double peakFactor,
+                           bool   traceEnabled = false);
 }

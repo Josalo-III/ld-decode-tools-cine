@@ -134,16 +134,19 @@ namespace visualEdits {
     int analyseVisualEdits(CineDisc& disc,
                            double threshold,
                            double strongFactor,
-                           double peakFactor)
+                           double peakFactor,
+                           bool   traceEnabled)
     {
         auto& md = disc.getMetaData();
-    
-        // Logging controls
-        constexpr bool LOG_COMMITS        = true;   // one line per committed edit
-        constexpr bool LOG_CANDIDATES     = false;  // every candidate that passes isChange
-        constexpr bool LOG_VERBOSE_REJECT = false;  // why we rejected a candidate
-        constexpr bool LOG_RAMP_VETO      = false;  // when ramp veto fires
-        constexpr bool LOG_PROGRESS       = true;   // heartbeat/progress line
+
+        // Logging controls. The noisy per-edit/per-candidate detail is gated by
+        // traceEnabled (CLI flag --edit-trace). Compile-time consts below opt-in
+        // to additional verbosity for source-level debugging.
+        const     bool LOG_COMMITS        = traceEnabled; // one line per committed edit
+        constexpr bool LOG_CANDIDATES     = false;        // every candidate that passes isChange
+        constexpr bool LOG_VERBOSE_REJECT = false;        // why we rejected a candidate
+        constexpr bool LOG_RAMP_VETO      = false;        // when ramp veto fires
+        const     bool LOG_PROGRESS       = traceEnabled; // heartbeat/progress line
     
         // Debug target: set to a field index to enable per-field trace; -1 = off.
         constexpr int DBG_FIELD = -1;

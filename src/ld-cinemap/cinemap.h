@@ -28,6 +28,8 @@ public:
 
     int detectCadence(const QString& tbcFilePath, double threshold);
     void setVbi(vbiProbe::ProbeResult vbi) { m_vbi = std::move(vbi); }
+    void setDecisionTraceEnabled(bool enabled) { m_decisionTraceEnabled = enabled; }
+    bool decisionTraceEnabled() const { return m_decisionTraceEnabled; }
 
 private:
     // Internal structs
@@ -94,6 +96,13 @@ private:
         int phaseOffset = 0;
         int endField = 0;
         double confidence = 0.0;
+        QString reason;
+
+        // Per-phase mixedness evidence vector (raw scores from scanForPhaseRun).
+        // Populated whenever the scan ran with informative data; consumed by
+        // solveSegment's evidence-additive election. Empty/zero if not informative.
+        std::array<double, 5> phaseScores = {0.0, 0.0, 0.0, 0.0, 0.0};
+        bool   phaseScoresInformative = false;
     };
 
     struct SegmentResult {
@@ -136,6 +145,14 @@ private:
         int    phaseOffset  = 0;
         int    baseOffset   = 0;
         double confidence   = 0.0;
+
+        // Per-phase brute-geometry evidence vector (normScores from the A/C
+        // election). Always populated when there were any acTwins, regardless
+        // of whether tryLockByDgGeometry decided to declare a lock — the
+        // evidence-additive election in solveSegment consumes it directly,
+        // sidestepping the per-detector margin gate.
+        std::array<double, 5> phaseScores = {0.0, 0.0, 0.0, 0.0, 0.0};
+        bool   phaseScoresInformative = false;
     };
 
     // Evidence accumulator for validatePhaseGeometry() / gatherGeometryEvidenceForPhase().
@@ -173,10 +190,9 @@ private:
         }
     };
 
-    bool             verifyPhaseWithNotch(SourceVideo& sv,
-                                         int picNoPhase,
-                                         int verifyFrames);
-
+    static const char* phaseRunTypeName(PhaseRun::Type t);
+    static const char* twinRoleName(TwinACRole r);
+    static QString phaseRunSummary(const PhaseRun& run);
 
     bool isValidEvidenceField(int seq) const;
     bool boundaryBetween(int a, int b) const;
@@ -263,7 +279,22 @@ private:
                                 int width) const;
 
     double getAdaptiveTwinThreshold(int f1, int f2);
+
+    struct TwinConfDetail {
+        double diffIn = 0.0;
+        double diffPre = 999.0;
+        double diffPost = 999.0;
+        double neighborActivity = 999.0;
+        double ratio = 999.0;
+        double threshAbs = 0.0;
+        double ratioScore = 0.0;
+        double threshScore = 0.0;
+        double confidence = 0.0;
+        bool silenceMatch = false;
+    };
+
     double twinConfidence(SourceVideo& sv, int seqA, int seqB);
+    double twinConfidence(SourceVideo& sv, int seqA, int seqB, TwinConfDetail& detail);
     int  fieldForFrame(int frameIdx) const;
     void detectCavCadenceBreaks(std::vector<Cav5Group>& groups, SourceVideo& sv);
     void solveCavFallback(SourceVideo& sv);
@@ -294,7 +325,8 @@ private:
     bool validatePhaseGeometry(int phaseOffset,
                                int segStart,
                                int segEnd,
-                               const SegmentCaptureCache& cache);
+                               const SegmentCaptureCache& cache,
+                               QString* rejectReason = nullptr);
 
     GeometryEvidence gatherGeometryEvidenceForPhase(int phaseOffset,
                                                     int segStart,
@@ -310,7 +342,8 @@ private:
                              int segStart,
                              int segEnd,
                              const SegmentCaptureCache& cache,
-                             DgLock& outLock);
+                             DgLock& outLock,
+                             QString* rejectReason = nullptr);
 
     void classifyAsInterlaced(int segStartField,
                               int segEndField,
@@ -376,6 +409,7 @@ private:
     CineDisc*          m_disc = nullptr;  // non-owning
     Policy             m_policy = Policy::Tv;
     LdDecodeMetaData*  m_md   = nullptr;  // non-owning alias of m_disc->getMetaData()
+    bool               m_decisionTraceEnabled = false;
 
     // Per-run sensitivity overrides (0.0 = use defaults)
     double m_notchSensitivity = 1.0;

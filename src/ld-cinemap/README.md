@@ -134,6 +134,8 @@ Cadence solver locked 108000 field(s).
 Output metadata written to output.tbc.db
 ```
 
+Enable `--cinemap-trace` to include the detailed CineMap decision explainer and the per-segment summary lines.
+
 ## Workflow Integration
 
 1. **Capture** — Digitise with ld-decode, producing `.tbc` and `.tbc.db`.

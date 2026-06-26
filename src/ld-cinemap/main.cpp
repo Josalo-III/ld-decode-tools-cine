@@ -152,6 +152,7 @@ static bool runDetectEditsOnly(CineDisc& disc,
                                double editSensitivity,
                                double editStrong,
                                double editPeak,
+                               bool   editTraceEnabled,
                                const QString& editWhitelistArg,
                                const QString& editBlacklistArg,
                                const QStringList& cadenceOverrideArgs)
@@ -166,7 +167,8 @@ static bool runDetectEditsOnly(CineDisc& disc,
     const int editCount = visualEdits::analyseVisualEdits(disc,
                                                           editSensitivity,
                                                           editStrong,
-                                                          editPeak);
+                                                          editPeak,
+                                                          editTraceEnabled);
     qInfo() << "Visual edit detection committed" << editCount << "edit boundary(s).";
 
     if (!applyManualOverrides(disc,
@@ -188,11 +190,13 @@ static bool runDetectEditsOnly(CineDisc& disc,
 static bool runSolveOnly(CineDisc& disc,
                          CineMap::Policy policy,
                          double threshold,
+                         bool decisionTraceEnabled,
                          const QStringList& cadenceOverrideArgs)
 {
     qInfo() << "ld-cinemap: running cadence solver (--skip-edits; using pre-annotated boundaries).";
 
     CineMap solver(&disc, policy);
+    solver.setDecisionTraceEnabled(decisionTraceEnabled);
     const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
     qInfo() << "Cadence solver locked" << locked << "field(s).";
 
@@ -216,6 +220,8 @@ static bool runFullPipeline(CineDisc& disc,
                             const QFileInfo& outputFileInfo,
                             CineMap::Policy policy,
                             double threshold,
+                            bool decisionTraceEnabled,
+                            bool editTraceEnabled,
                             double editSensitivity,
                             double editStrong,
                             double editPeak,
@@ -233,13 +239,15 @@ static bool runFullPipeline(CineDisc& disc,
     const int editCount = visualEdits::analyseVisualEdits(disc,
                                                           editSensitivity,
                                                           editStrong,
-                                                          editPeak);
+                                                          editPeak,
+                                                          editTraceEnabled);
     qInfo() << "Visual edit detection committed" << editCount << "edit boundary(s).";
 
     applyEditOverrides(disc, editWhitelistArg, editBlacklistArg);
         
     // 4) Cadence / twin / mixedness solve
     CineMap solver(&disc, policy);
+    solver.setDecisionTraceEnabled(decisionTraceEnabled);
     const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
     qInfo() << "Cadence solver locked" << locked << "field(s).";
 
@@ -306,6 +314,14 @@ int main(int argc, char* argv[])
         QStringList() << "y" << "yes",
         "Assume 'yes' for prompts.");
 
+    QCommandLineOption cinemapTraceOpt(
+        QStringList() << "cinemap-trace",
+        "Enable detailed CineMap decision tracing and per-segment summaries.");
+
+    QCommandLineOption editTraceOpt(
+        QStringList() << "edit-trace",
+        "Enable EditDetector commit/progress tracing (noisy on long discs).");
+
     QCommandLineOption sensitivityOpt(
         QStringList() << "sensitivity",
         "Visual edit sensitivity.",
@@ -350,6 +366,8 @@ int main(int argc, char* argv[])
     parser.addOption(overrideOnlyOpt);
     parser.addOption(clearAllFlagsOpt);
     parser.addOption(yesOpt);
+    parser.addOption(cinemapTraceOpt);
+    parser.addOption(editTraceOpt);
     parser.addOption(sensitivityOpt);
     parser.addOption(strongOpt);
     parser.addOption(peakOpt);
@@ -387,6 +405,8 @@ int main(int argc, char* argv[])
     }
 
     const bool autoConfirm = parser.isSet(yesOpt);
+    const bool decisionTraceEnabled = parser.isSet(cinemapTraceOpt);
+    const bool editTraceEnabled     = parser.isSet(editTraceOpt);
 
     // Policy selection
     CineMap::Policy policy = CineMap::Policy::Tv;
@@ -447,6 +467,7 @@ int main(int argc, char* argv[])
                                            editSensitivity,
                                            editStrong,
                                            editPeak,
+                                           editTraceEnabled,
                                            editWhitelistArg,
                                            editBlacklistArg,
                                            cadenceOverrideArgs);
@@ -463,7 +484,7 @@ int main(int argc, char* argv[])
     }
 
     if (parser.isSet(skipEditsOpt)) {
-        const bool ok = runSolveOnly(*disc, policy, threshold, cadenceOverrideArgs);
+        const bool ok = runSolveOnly(*disc, policy, threshold, decisionTraceEnabled, cadenceOverrideArgs);
         return ok ? 0 : 1;
     }
 
@@ -472,6 +493,8 @@ int main(int argc, char* argv[])
                                     outputFileInfo,
                                     policy,
                                     threshold,
+                                    decisionTraceEnabled,
+                                    editTraceEnabled,
                                     editSensitivity,
                                     editStrong,
                                     editPeak,
