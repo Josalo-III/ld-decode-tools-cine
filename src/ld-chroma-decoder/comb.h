@@ -809,27 +809,23 @@ private:
 	void invalidateCombTapCache();
 	const CombTapLine &ensureCombTapLine(int lineNumber);
 	void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
-	void computeContourFieldLine(const CombTapLine &tapLine,
+	void computeFieldALine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  double  *outGate);
 
-	void computeSimpleFieldLine(int lineNumber,
+	void computeFieldBLine(int lineNumber,
 						  double *outFieldLine,
 						  std::uint8_t *outReasonLine = nullptr);
-	void computeSimpleFieldLine(const CombTapLine &tapLine,
+	void computeFieldBLine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  std::uint8_t *outReasonLine = nullptr);
 
-	void computeFrameAAdaptiveIQLine(int line,
+	void computeFrameALine(int line,
 									std::vector<std::complex<double>> &outFrameIQ);
-	void computeFrameBDirectIQCompositeLine(int line,
+	void computeFrameBLine(int line,
 								   std::vector<std::complex<double>> &outFrameIQ,
 								   std::vector<double> &outFrameScalar);
-	void computeFrameBDirectIQLine(int line,
-									std::vector<std::complex<double>> &outFrameIQ,
-									const std::vector<float> *tiOverride = nullptr,
-									const std::vector<float> *tqOverride = nullptr);
-	void computeFrameBDirectIQFromPreparedVectors(
+	void computeIQFrameBFromPreparedVectors(
 	    int line,
 	    const std::vector<std::complex<double>> &centerIQ,
 	    const std::vector<std::complex<double>> &upIQ,
@@ -837,7 +833,7 @@ private:
 	    std::vector<std::complex<double>> &outFrameIQ,
 	    const CombTapLine *reachTapLine = nullptr);
 
-	void computeFrameIQFromPreparedVectors(int line,
+	void computeIQFrameAFromPreparedVectors(int line,
 											   const std::vector<std::complex<double>> &centerIQ,
 											   std::vector<std::complex<double>> &upIQ,
 											   std::vector<std::complex<double>> &dnIQ,
@@ -853,9 +849,6 @@ private:
 								 double neighborLumaMeanIRE = -1.0,
 								 double neighborBaseMeanIRE = -1.0,
 								 double lineForwardErrorIRE = 0.0) const;
-	// Unified VDIS map builder: combines scalar (±2) and IQ (±1) evidence
-	// into scratch_vdis_flag for a given line. Does not modify FieldA/Frame.
-	void computeVDISLine(int lineNumber);
 	static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
 									   const LdDecodeMetaData::VideoParameters &vp);
 	

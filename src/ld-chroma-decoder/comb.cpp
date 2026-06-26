@@ -1998,7 +1998,7 @@ void Comb::FrameBuffer::split2D()
             if (havePrecleanLine(ln, width)) return;
             double *preclean = precleanLinePtrMutable(ln, width);
             const CombTapLine *precleanTapLine = &ensureCombTapLine(ln);
-            computeSimpleFieldLine(*precleanTapLine,
+            computeFieldBLine(*precleanTapLine,
                                    preclean,
                                    writeWeights ? fieldBDecisionReason_line(ln) : nullptr);
             double *gate = precleanGateLinePtrMutable(ln, width);
@@ -2010,7 +2010,7 @@ void Comb::FrameBuffer::split2D()
             if (fieldBPreclean) {
                 std::copy(fieldBPreclean, fieldBPreclean + width, scratch_lineWorkC.begin());
             } else {
-                computeSimpleFieldLine(tapLine,
+                computeFieldBLine(tapLine,
                                        scratch_lineWorkC.data(),
                                        writeWeights ? fieldBDecisionReason_line(line) : nullptr);
             }
@@ -2032,7 +2032,7 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (combTapBuildFlags_ & TapBuildFieldA) {
-            computeContourFieldLine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
+            computeFieldALine(tapLine, scratch_lineWorkA.data(), scratch_lineWorkB.data());
         } else {
             std::fill(scratch_lineWorkA.begin(), scratch_lineWorkA.begin() + width, 0.0);
             std::fill(scratch_lineWorkB.begin(), scratch_lineWorkB.begin() + width, 1.0);
@@ -2059,7 +2059,7 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameACompute) {
-            computeFrameAAdaptiveIQLine(line, frameAIQ);
+            computeFrameALine(line, frameAIQ);
             if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
                 scratch_frameAAdaptiveIQComposite.resize(width);
             // Symmetric round-trip with Frame A's signed demod: remod back
@@ -2080,7 +2080,7 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameBCompute) {
-            computeFrameBDirectIQCompositeLine(line, frameIQ, scratch_frameBDirectIQComposite);
+            computeFrameBLine(line, frameIQ, scratch_frameBDirectIQComposite);
         }
 
         const std::vector<double> &frameAttrScalar =

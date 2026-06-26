@@ -828,7 +828,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 // Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically
 // influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
 
-void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
+void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
                                            double *outFieldLine,
                                            double *outGate)
 {
@@ -850,44 +850,71 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
 
         const double reachUp2 = tapLine.pairU2[rel].reachGate;
         const double reachDn2 = tapLine.pairD2[rel].reachGate;
+
         double wUp2 = tapLine.pairU2[rel].weight * reachUp2;
         double wDn2 = tapLine.pairD2[rel].weight * reachDn2;
+
         const CombTapContour &curve = tapLine.contour[rel];
 
-        // Per-side coarse-luma-edge facts, cribbed from Field B. eUp/eDn rise
-        // where the center crosses a horizontal luma step on that side; chromaT
-        // weights the bevel cede by chroma presence (envelope, ripple-free).
-	        const double chromaT =
-	            (rel < (int)tapLine.centerChromaT.size())
-	                ? tapLine.centerChromaT[rel]
-	                : std::clamp((std::hypot(C, tapLine.tap0[rel].symMag) * invI - 2.0) / 8.0,
-	                             0.0, 1.0);
-        double eUp = 0.0, eDn = 0.0;
+        // Per-side coarse-luma-edge facts.  Mild mismatch can shape Field A,
+        // but a real vertical context break invalidates the same-context
+        // vertical comb premise.  Do not let one surviving side normalize into
+        // a full-strength ordered comb artifact.
+        const double chromaT =
+            (rel < (int)tapLine.centerChromaT.size())
+                ? tapLine.centerChromaT[rel]
+                : std::clamp((std::hypot(C, tapLine.tap0[rel].symMag) * invI - 2.0) / 8.0,
+                             0.0, 1.0);
+
+        double eUp = 0.0;
+        double eDn = 0.0;
+        double verticalContextBreak = 0.0;
+        bool hardVerticalBreak = false;
+
         if (rel < (int)tapLine.coarse0IRE.size() &&
             rel < (int)tapLine.coarseU2IRE.size() &&
             rel < (int)tapLine.coarseD2IRE.size())
         {
             const double LUMA_EDGE_LO_IRE = 6.0;
             const double LUMA_EDGE_HI_IRE = 20.0;
+
             const double dUpIRE = std::fabs(
                 tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]);
             const double dDnIRE = std::fabs(
                 tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]);
+
             eUp = std::clamp(
                 (dUpIRE - LUMA_EDGE_LO_IRE) /
-                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE), 0.0, 1.0);
+                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
+                0.0,
+                1.0);
+
             eDn = std::clamp(
                 (dDnIRE - LUMA_EDGE_LO_IRE) /
-                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE), 0.0, 1.0);
-            // Back the vertical comb off the side that crosses a luma edge.
-            // This is the one-sided-bevel handler; the min()-based cede below
-            // only catches the both-sides case.
-            wUp2 *= (1.0 - eUp);
-            wDn2 *= (1.0 - eDn);
+                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
+                0.0,
+                1.0);
+
+            verticalContextBreak = std::max(eUp, eDn);
+
+            // Same starting point as Field B.  If this cedes too much, try
+            // 16.0; avoid 20.0 as the first stop because the ordered-column
+            // failure is already eligible before the old HI threshold.
+            const double HARD_VERTICAL_BREAK_IRE = 14.0;
+            hardVerticalBreak = (std::max(dUpIRE, dDnIRE) >= HARD_VERTICAL_BREAK_IRE);
+
+            if (!hardVerticalBreak) {
+                // Mild contrast remains flexible, but do not fully kill a side
+                // here.  Full side loss plus sc2 normalization is the failure.
+                wUp2 *= (1.0 - 0.80 * eUp);
+                wDn2 *= (1.0 - 0.80 * eDn);
+            }
         }
 
         double boundaryCede = 0.0;
-        if (rel < (int)tapLine.pairU2.size() &&
+
+        if (!hardVerticalBreak &&
+            rel < (int)tapLine.pairU2.size() &&
             rel < (int)tapLine.pairD2.size() &&
             rel < (int)tapLine.hLumaDeltaIRE.size())
         {
@@ -901,18 +928,22 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
                 const double dUp0IRE = tapLine.pairU2[rel].diffIRE;
                 const double dDn0IRE = tapLine.pairD2[rel].diffIRE;
                 const double scalarUpDn = std::fabs(Cup2 - Cdn2) * invI;
+
                 const double lumaUpDn =
                     (rel < (int)tapLine.coarseU2IRE.size() &&
                      rel < (int)tapLine.coarseD2IRE.size())
                         ? std::fabs(tapLine.coarseU2IRE[rel] - tapLine.coarseD2IRE[rel])
                         : scalarUpDn;
+
                 const double dUpDnIRE =
                     scalarUpDn * (1.0 - chromaT) + lumaUpDn * chromaT;
+
                 const double diffGapIRE = std::fabs(dUp0IRE - dDn0IRE);
                 const double bestDiffIRE = std::min(dUp0IRE, dDn0IRE);
                 const double worstDiffIRE = std::max(dUp0IRE, dDn0IRE);
                 const double diffRatio =
                     (worstDiffIRE > 1e-9) ? (bestDiffIRE / worstDiffIRE) : 1.0;
+
                 const double wBest = std::min(tapLine.pairU2[rel].weight,
                                               tapLine.pairD2[rel].weight);
                 const double wWorst = std::max(tapLine.pairU2[rel].weight,
@@ -961,7 +992,17 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
         }
 
         double sc2 = 1.0;
-        if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
+
+        if (hardVerticalBreak) {
+            // A hard vertical context break means Field A has no valid
+            // same-context answer here.  This also blocks the revive path.
+            wUp2 = 0.0;
+            wDn2 = 0.0;
+            boundaryCede = 1.0;
+        } else if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
+            // Keep the old strong-asymmetry handling only when the hard
+            // vertical context veto has not fired.  Otherwise this becomes
+            // the ordered one-sided comb failure.
             if (wDn2 > 3.0 * wUp2)      wUp2 = 0.0;
             else if (wUp2 > 3.0 * wDn2) wDn2 = 0.0;
 
@@ -970,17 +1011,20 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
                 sc2 = 2.0 / denom;
                 if (sc2 < 1.0) sc2 = 1.0;
             } else {
-                wUp2 = wDn2 = 0.0;
+                wUp2 = 0.0;
+                wDn2 = 0.0;
             }
         } else {
             double dMag  = std::fabs(std::fabs(Cup2) - std::fabs(Cdn2));
             double sumUD = std::fabs(Cup2 + Cdn2);
+
             if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
                 wUp2 = reachUp2;
                 wDn2 = reachDn2;
                 sc2 = 1.0;
             } else {
-                wUp2 = wDn2 = 0.0;
+                wUp2 = 0.0;
+                wDn2 = 0.0;
             }
         }
 
@@ -988,6 +1032,7 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
             if (influence <= 0.0) return nearS;
             if (nearS == 0.0) return nearS;
             if ((nearS > 0.0) != (farS > 0.0)) return nearS;
+
             const double nearMag = std::fabs(nearS);
             const double farMag  = std::fabs(farS);
             const double mag = (nearMag + influence * farMag) / (1.0 + influence);
@@ -999,6 +1044,7 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
 
         double tc = 0.0;
         const bool combed = (wUp2 > 0.0 || wDn2 > 0.0);
+
         if (combed) {
             double t2  = ((C - Cup2Adj) * wUp2 * sc2);
             t2        += ((C - Cdn2Adj) * wDn2 * sc2);
@@ -1007,16 +1053,12 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
             tc = C;
         }
 
-        // Zipper defense cribbed from Field B (computeSimpleFieldLine): the
-        // bevel zipper is vertical combing across a horizontal luma edge. After
-        // the per-side weight suppression above, cede the comb back toward the
-        // local center C across both-sided coarse-luma edges and non-straight
-        // bevels, weighted by chroma presence — "chroma may only sharpen a
-        // break, never originate one." Field A already inherits the bevel REACH
-        // throttle through pairU2/pairD2.reachGate; these are the additional
-        // luma-edge defenses Field B needed on top of it.
+        // Zipper defense: cede on either participating vertical luma break,
+        // not only the both-sides case.  min(eUp,eDn) asked "are both sides
+        // bad?"  Field A's model validity needs "did either side cross a real
+        // context boundary?"
         if (combed) {
-            const double lumaEdgeCede = std::min(eUp, eDn);
+            const double lumaEdgeCede = std::max(eUp, eDn);
 
             double bevelCede = 0.0;
             if (rel < (int)tapLine.movingCoarseContour.size() &&
@@ -1026,16 +1068,21 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
                 const auto &mc = tapLine.movingCoarseContour[rel];
                 const double hEdge = std::clamp(
                     (tapLine.hLumaDeltaIRE[rel] - 0.30 * hEdgeThreshIRE) /
-                    (0.70 * hEdgeThreshIRE), 0.0, 1.0);
+                    (0.70 * hEdgeThreshIRE),
+                    0.0,
+                    1.0);
+
                 const double sideBalance =
                     1.0 - std::fabs(
                         std::clamp(mc.upTrust, 0.0, 1.0) -
                         std::clamp(mc.downTrust, 0.0, 1.0));
+
                 const double bevelRisk =
                     chromaT *
                     hEdge *
                     (1.0 - std::clamp(mc.straightness, 0.0, 1.0)) *
                     (0.35 + 0.65 * std::clamp(sideBalance, 0.0, 1.0));
+
                 bevelCede =
                     std::clamp(T.FIELD_B_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
             }
@@ -1062,7 +1109,7 @@ void Comb::FrameBuffer::computeContourFieldLine(const CombTapLine &tapLine,
 // Field B
 // Simplified Field comb as a FrameBuffer member:
 // - uses only 2 vertical neighbours
-void Comb::FrameBuffer::computeSimpleFieldLine(int lineNumber,
+void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
                                                double *outFieldLine,
                                                std::uint8_t *outReasonLine)
 {
@@ -1077,12 +1124,12 @@ void Comb::FrameBuffer::computeSimpleFieldLine(int lineNumber,
     }
 
     const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
-    computeSimpleFieldLine(tapLine, outFieldLine, outReasonLine);
+    computeFieldBLine(tapLine, outFieldLine, outReasonLine);
 }
 
-void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
-                                               double *outFieldLine,
-                                               std::uint8_t *outReasonLine)
+void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
+                                           double *outFieldLine,
+                                           std::uint8_t *outReasonLine)
 {
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
@@ -1125,6 +1172,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
     const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
     const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
+
     auto softenDominantWeights = [](double &wA, double &wB) {
         if (wA <= 0.0 || wB <= 0.0)
             return;
@@ -1152,7 +1200,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
     for (int rel = 0; rel < width; ++rel) {
         std::uint8_t reason = FieldBReasonNone;
-        const CombTapScalar &tapC = tapLine.tap0[rel];
+        const CombTapScalar &tapC  = tapLine.tap0[rel];
         const CombTapScalar &tapUp = tapLine.tapU2[rel];
         const CombTapScalar &tapDn = tapLine.tapD2[rel];
 
@@ -1188,6 +1236,7 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                     0.0,
                     1.0)
                 : 0.0;
+
         const double chromaT =
             (rel < (int)tapLine.centerChromaT.size())
                 ? tapLine.centerChromaT[rel]
@@ -1201,10 +1250,13 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
             const double lc = tapLine.coarse0IRE[rel] * irescale;
             const double lu = tapLine.coarseU2IRE[rel] * irescale;
             const double ld = tapLine.coarseD2IRE[rel] * irescale;
+
             double lumaKp = std::fabs(lc - lu);
             double lumaKn = std::fabs(lc - ld);
+
             lumaKp = std::max(lumaKp - (lc + lu) * 0.10, 0.0);
             lumaKn = std::max(lumaKn - (lc + ld) * 0.10, 0.0);
+
             kp = kp * (1.0 - chromaT) + lumaKp * chromaT;
             kn = kn * (1.0 - chromaT) + lumaKn * chromaT;
         }
@@ -1227,30 +1279,56 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
 
         double lumaEdgeUp = 0.0;
         double lumaEdgeDn = 0.0;
+        double verticalContextBreak = 0.0;
+        bool hardVerticalBreak = false;
+
         if (rel < (int)tapLine.coarse0IRE.size() &&
             rel < (int)tapLine.coarseU2IRE.size() &&
             rel < (int)tapLine.coarseD2IRE.size())
         {
             const double LUMA_EDGE_LO_IRE = 6.0;
             const double LUMA_EDGE_HI_IRE = 20.0;
+
             const double dUpIRE = std::fabs(
                 tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]);
             const double dDnIRE = std::fabs(
                 tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]);
+
             lumaEdgeUp = std::clamp(
                 (dUpIRE - LUMA_EDGE_LO_IRE) /
                 (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
-                0.0, 1.0);
+                0.0,
+                1.0);
+
             lumaEdgeDn = std::clamp(
                 (dDnIRE - LUMA_EDGE_LO_IRE) /
                 (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
-                0.0, 1.0);
-            wUp *= (1.0 - lumaEdgeUp);
-            wDn *= (1.0 - lumaEdgeDn);
+                0.0,
+                1.0);
+
+            verticalContextBreak = std::max(lumaEdgeUp, lumaEdgeDn);
+
+            // Mild vertical mismatch is still allowed to shape Field B.
+            // A real coarse-luma break on either participating ±2 leg
+            // invalidates the same-context premise outright.  This is kept
+            // as a raw IRE threshold so it cannot be undone later by
+            // sc = 2.0 / (wUp + wDn).
+            const double HARD_VERTICAL_BREAK_IRE = 14.0;
+            hardVerticalBreak = (std::max(dUpIRE, dDnIRE) >= HARD_VERTICAL_BREAK_IRE);
+
+            if (!hardVerticalBreak) {
+                // Do not kill either side completely for mild contrast; only
+                // reduce its authority.  The hard-break path below handles the
+                // real contour case.
+                wUp *= (1.0 - 0.65 * lumaEdgeUp);
+                wDn *= (1.0 - 0.65 * lumaEdgeDn);
+            }
         }
 
         double boundaryCede = 0.0;
-        if (rel < (int)tapLine.pairU2.size() &&
+
+        if (!hardVerticalBreak &&
+            rel < (int)tapLine.pairU2.size() &&
             rel < (int)tapLine.pairD2.size() &&
             rel < (int)tapLine.hLumaDeltaIRE.size())
         {
@@ -1298,7 +1376,19 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                          (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
                          (bestDiffIRE < 5.0 && kRatio < 0.45));
 
-                    if (hardPreferUp) {
+                    const double credibleColorT =
+                        chromaT *
+                        (1.0 - std::max(lumaEdgeUp, lumaEdgeDn));
+
+                    const bool allowOneSidedBoundary =
+                        (credibleColorT >= 0.45);
+
+                    if ((hardPreferUp || hardPreferDn) && !allowOneSidedBoundary) {
+                        wUp = 0.0;
+                        wDn = 0.0;
+                        boundaryCede = 1.0;
+                        reason = FieldBReasonBoundaryCede;
+                    } else if (hardPreferUp) {
                         wDn = 0.0;
                         wUp = std::max(wUp, 0.40 + 0.60 * hEdge);
                         reason = FieldBReasonBoundaryUp;
@@ -1307,6 +1397,8 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                         wDn = std::max(wDn, 0.40 + 0.60 * hEdge);
                         reason = FieldBReasonBoundaryDown;
                     } else {
+
+
                         const double sideGap = diffGapIRE;
                         const double sideGapT =
                             std::clamp((sideGap - 1.0) / 4.0, 0.0, 1.0);
@@ -1328,7 +1420,8 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
             }
         }
 
-        if (rel < (int)tapLine.movingCoarseContour.size() &&
+        if (!hardVerticalBreak &&
+            rel < (int)tapLine.movingCoarseContour.size() &&
             tapLine.movingCoarseContour[rel].valid &&
             rel < (int)tapLine.hLumaDeltaIRE.size())
         {
@@ -1337,7 +1430,8 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
                 std::clamp(
                     (tapLine.hLumaDeltaIRE[rel] - 0.30 * hEdgeThreshIRE) /
                     (0.70 * hEdgeThreshIRE),
-                    0.0, 1.0);
+                    0.0,
+                    1.0);
             const double sideBalance =
                 1.0 - std::fabs(
                     std::clamp(mc.upTrust, 0.0, 1.0) -
@@ -1357,7 +1451,15 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         double sc = 1.0;
         bool haveAnswer = false;
 
-        if (wUp > 0.0 || wDn > 0.0) {
+        if (hardVerticalBreak) {
+            // A true vertical context break means Field B has no model-valid
+            // answer.  Do not allow one side to survive, do not soften it back
+            // into balance, and do not let the revive path bring it back.
+            wUp = 0.0;
+            wDn = 0.0;
+            boundaryCede = 1.0;
+            reason = FieldBReasonBoundaryCede;
+        } else if (wUp > 0.0 || wDn > 0.0) {
             softenDominantWeights(wUp, wDn);
 
             const double denom = wUp + wDn;
@@ -1444,20 +1546,42 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
         double tc = 0.0;
 
         if (haveAnswer) {
-            const double lumaEdgeCede = std::min(lumaEdgeUp, lumaEdgeDn);
-            const double totalCede = std::max(boundaryCede, lumaEdgeCede);
+            const double lumaEdgeCede = std::max(lumaEdgeUp, lumaEdgeDn);
 
-            // Field B is a same-field ±2 scalar comb on locked1DSource. Cede
-            // toward C only on real contour breaks (boundary or coarse luma
-            // edge), per the doctrine "chroma may only sharpen a break, never
-            // originate one."  A saturation-magnitude cede was removed: it
-            // fired inside uniform saturated chroma columns and mixed the
-            // modulated locked1DSource into the comb output per pixel, which
-            // produced the 2fsc luma checkerboard after produceY's carrier
-            // subtraction.
             tc  = (C - Cup) * wUp * sc;
             tc += (C - Cdn) * wDn * sc;
             tc *= 0.25;
+
+            // Luma-only contour guard.
+            //
+            // White letters and dark drop shadows should have little or no
+            // chroma.  If Field B creates a larger chroma magnitude on a
+            // low-chroma luma contour, that is not cleanup; it is invented
+            // color from asymmetric scalar combing.
+            double lumaOnlyCede = 0.0;
+            {
+                const double centerMagIRE = std::fabs(C) * invIreScale;
+                const double outMagIRE    = std::fabs(tc) * invIreScale;
+                const double growthIRE    = outMagIRE - centerMagIRE;
+
+                const double lowChromaT =
+                    std::clamp((0.35 - chromaT) / 0.35, 0.0, 1.0);
+
+                const double contourT =
+                    std::max(boundaryCede, lumaEdgeCede);
+
+                const double chromaGrowthT =
+                    std::clamp((growthIRE - 0.75) / 2.25, 0.0, 1.0);
+
+                lumaOnlyCede =
+                    lowChromaT *
+                    contourT *
+                    chromaGrowthT;
+            }
+
+            const double totalCede =
+                std::max({boundaryCede, lumaEdgeCede, lumaOnlyCede});
+
             if (totalCede > 0.0) {
                 tc = tc * (1.0 - totalCede) + C * totalCede;
                 if (reason == FieldBReasonNone)
@@ -1469,7 +1593,6 @@ void Comb::FrameBuffer::computeSimpleFieldLine(const CombTapLine &tapLine,
             tc = C;
             reason = FieldBReasonCenter;
         }
-
         if (!std::isfinite(tc))
             tc = C;
 
@@ -1528,7 +1651,7 @@ static inline std::complex<double> applyColumnPhaseAlignment(
         s * neighbor.real() + c * neighbor.imag());
 }
 
-void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
+void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
     std::vector<std::complex<double>> &upIQ,
@@ -1656,7 +1779,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
         const double aDn = cmag(ZDnRaw);
 
         // Reach contract, shared with Frame B (consumed exactly as in
-        // computeFrameBDirectIQFromPreparedVectors).  pairU1/pairD1.reachGate
+        // computeIQFrameBFromPreparedVectors).  pairU1/pairD1.reachGate
         // already carries legality, the interfield IQ floor, and the bevel/
         // zipper throttle (composed in applyFrameReachWithIQFloor), so the
         // zipper defense Frame A used to hand-roll here — transition side-
@@ -1781,7 +1904,7 @@ void Comb::FrameBuffer::computeFrameIQFromPreparedVectors(
     }
 }
 // Frame A: adaptive interframe IQ comb fed by the Field B preclean ring.
-void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
+void Comb::FrameBuffer::computeFrameALine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ)
 {
@@ -1895,129 +2018,10 @@ void Comb::FrameBuffer::computeFrameAAdaptiveIQLine(
         }
     }
 
-    computeFrameIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
+    computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
                                       outFrameIQ, &reachTapLine);
 }
-// Frame B: direct interframe IQ comb.
-// Sources from the Field B preclean ring, with locked-1D IQ as fallback.
-// Unlike Frame A, this intentionally does not phase-align the neighbors before
-// averaging; that plainness is part of what keeps Frame B from inheriting
-// Frame A's saturated-edge alternation failure mode.
-// Reach is consumed from pairU1/pairD1.reachGate (legality + interfield IQ
-// floor); the combine itself is unconditional when reach is non-zero.
-void Comb::FrameBuffer::computeFrameBDirectIQLine(
-    int line,
-    std::vector<std::complex<double>> &outFrameIQ,
-    const std::vector<float> *tiOverride,
-    const std::vector<float> *tqOverride)
-{
-    const int first = videoParameters.firstActiveFrameLine;
-    const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-    const bool verticalAllowed = carrierFrameVerticalAllowed(line);
-
-	    if (width <= 0) {
-	        outFrameIQ.clear();
-	        return;
-	    }
-	    outFrameIQ.resize(width);
-	    auto clearFrameIQ = [&]() {
-	        std::fill(outFrameIQ.begin(), outFrameIQ.end(), std::complex<double>(0.0, 0.0));
-	    };
-	    if (line < first || line >= last) {
-	        clearFrameIQ();
-	        return;
-	    }
-	    if (line >= demodLines || demodWidth <= 0) {
-	        clearFrameIQ();
-	        return;
-	    }
-
-    // Preclean stays scalar (Field B is crisper that way).  The demod here
-    // must put the result in Grid4fscIQ — a polarity-preserving frame — so
-    // that Frame B's interfield combine cancels alien Y and preserves real
-    // chroma.  Using the unsigned sample class would produce "canonical 4fsc
-    // demod of a LockedCommonPhaseScalar," which inherits the polarity
-    // erasure: real chroma comes out anti-phased between fields and the
-    // combine flips it, while alien Y comes out co-phased and gets preserved
-    // — exactly backwards.  carrierGrammarSignedSampleClass folds lineFlip
-    // into the phase (phase + 2 mod 4 == negate both IQ components), which is
-    // the lineFlip step that locked1DSource publication left out by
-    // construction.
-    auto tiLine = [&](int ln)->const float* {
-        if (tiOverride && (int)tiOverride->size() >= (ln + 1) * demodWidth)
-            return tiOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return locked1DTI4fsc_line(ln);
-    };
-    auto tqLine = [&](int ln)->const float* {
-        if (tqOverride && (int)tqOverride->size() >= (ln + 1) * demodWidth)
-            return tqOverride->data() + static_cast<size_t>(ln) * demodWidth;
-        return locked1DTQ4fsc_line(ln);
-    };
-
-    const float *ti0_raw  = tiLine(line);
-    const float *tq0_raw  = tqLine(line);
-    const float *tiUp_raw = (verticalAllowed && line - 1 >= first) ? tiLine(line - 1) : nullptr;
-    const float *tqUp_raw = (verticalAllowed && line - 1 >= first) ? tqLine(line - 1) : nullptr;
-    const float *tiDn_raw = (verticalAllowed && line + 1 <  last)  ? tiLine(line + 1) : nullptr;
-    const float *tqDn_raw = (verticalAllowed && line + 1 <  last)  ? tqLine(line + 1) : nullptr;
-	    if (!ti0_raw || !tq0_raw) {
-	        clearFrameIQ();
-	        return;
-	    }
-
-    const bool haveUpLine = (verticalAllowed && line - 1 >= first);
-    const bool haveDnLine = (verticalAllowed && line + 1 <  last);
-    const CombTapLine &reachTapLine = ensureCombTapLine(line);
-
-    const double *preclean0  = precleanLinePtr(line, width);
-    const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
-    const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
-
-    auto phaseCursor = [&](int ln) {
-        return carrierGrammarSignedSampleCursor(
-            configuration.phaseCompensation ? carrierGrammarLine(ln) : nullptr,
-            left);
-    };
-
-    auto phase0Cursor  = phaseCursor(line);
-    auto phaseUpCursor = phaseCursor(haveUpLine ? line - 1 : line);
-    auto phaseDnCursor = phaseCursor(haveDnLine ? line + 1 : line);
-
-    if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
-    if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
-    if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
-    for (int x = 0; x < width; ++x) {
-        if (preclean0)
-            scratch_centerIQ[x] =
-                carrierGrammarDemodSignedCompositeTo4fsc(phase0Cursor, preclean0[x]);
-        else
-            scratch_centerIQ[x] = { (double)ti0_raw[x], (double)tq0_raw[x] };
-
-        if (precleanUp)
-            scratch_upIQ[x] =
-                carrierGrammarDemodSignedCompositeTo4fsc(phaseUpCursor, precleanUp[x]);
-        else if (tiUp_raw && tqUp_raw)
-            scratch_upIQ[x] = { (double)tiUp_raw[x], (double)tqUp_raw[x] };
-        else
-            scratch_upIQ[x] = { 0.0, 0.0 };
-
-        if (precleanDn)
-            scratch_dnIQ[x] =
-                carrierGrammarDemodSignedCompositeTo4fsc(phaseDnCursor, precleanDn[x]);
-        else if (tiDn_raw && tqDn_raw)
-            scratch_dnIQ[x] = { (double)tiDn_raw[x], (double)tqDn_raw[x] };
-        else
-            scratch_dnIQ[x] = { 0.0, 0.0 };
-    }
-
-    computeFrameBDirectIQFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
-                                             outFrameIQ, &reachTapLine);
-}
-
-void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
+void Comb::FrameBuffer::computeIQFrameBFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
     const std::vector<std::complex<double>> &upIQ,
@@ -2139,7 +2143,14 @@ void Comb::FrameBuffer::computeFrameBDirectIQFromPreparedVectors(
     }
 }
 
-void Comb::FrameBuffer::computeFrameBDirectIQCompositeLine(
+// Frame B: direct interframe IQ comb.
+// Sources from the Field B preclean ring, with locked-1D IQ as fallback.
+// Unlike Frame A, this intentionally does not phase-align the neighbors before
+// averaging; that plainness is part of what keeps Frame B from inheriting
+// Frame A's saturated-edge alternation failure mode.
+// Reach is consumed from pairU1/pairD1.reachGate (legality + interfield IQ
+// floor); the combine itself is unconditional when reach is non-zero.
+void Comb::FrameBuffer::computeFrameBLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ,
     std::vector<double> &outFrameScalar)
