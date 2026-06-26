@@ -58,6 +58,7 @@ public:
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
+        bool witnessCarrierRetraction = false;
 
         // Per-axis product gains: multipliers applied to I and Q before filtering.
         double gi_product = 1.0;
@@ -315,6 +316,15 @@ public:
 	void loadFields(const SourceField &firstField, const SourceField &secondField);
 
 	void split1D();
+	// Carrier-retraction / constrained-witness front end (restored 6/13 path),
+	// run in the pre-roll between phaseLocked() and buildPhaseCorrected1D().
+	void buildCarrierRetracted();
+	void buildConstrainedYWitness();
+	void lurchSharpenCoarsePrior(const double *means,
+	                             int meanCount,
+	                             int width,
+	                             double *prior,
+	                             double *gateOut) const;
 	void buildPhaseCorrected1D();
 	void split2D();
 	void copy2DTo3D();
@@ -497,9 +507,38 @@ private:
 	// measurePostCombImpurity() on the elected comb source so the value
 	// reflects post-comb carrier, not per-field 1D.
 	std::vector<float> carrierImpurity_flat;
+
+	// --- Carrier-retraction / constrained-witness buffers (restored from the
+	// 6/13 witness path).  Populated by buildCarrierRetracted() then
+	// buildConstrainedYWitness(); same geometry as the demod flats
+	// (demodLines x demodWidth).  carrierImpurity_flat above is shared with the
+	// current aperture detector and reused here. ---
+	std::vector<lddecode::FourViewCarrierAttribution> carrierParallax_flat; // four-view carrier/Y attribution
+	std::vector<float> carrierFit_flat;          // per-line four-view carrier model
+	std::vector<float> carrierRetracted_flat;    // raw - carrierFit (witness view, not Y)
+	std::vector<float> flatFloor_flat;           // 4-sample carrier-free luma floor
+	std::vector<float> combedCarrier_flat;       // interline-cancelled carrier fit
+	std::vector<float> lsRefitGate_flat;         // luma-transition reach gate
+	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat; // per-pixel four-view evidence
+	bool carrierRetractedValid = false;
+
+	// Constrained multi-witness outputs (buildConstrainedYWitness); valid when
+	// witnessValid is true.
+	std::vector<float> yWitness_flat;                 // constrained Y reconstruction
+	std::vector<float> yWitnessConfidence_flat;       // [0,1] Y witness confidence
+	std::vector<float> carrierWitness_flat;           // raw - yWitness
+	std::vector<float> carrierWitnessConfidence_flat; // [0,1] carrier witness confidence
+	std::vector<float> carrierCorrectionMask_flat;    // binary local Y<->carrier transfer mask
+	std::vector<float> carrierWitnessCombed_flat;     // witness carrier after interline cancellation
+	std::vector<float> obstructionRisk_flat;          // [0,1] carrier/luma overlap likelihood
+	std::vector<float> ambiguityWidth_flat;           // IRE width of surviving carrier solution space
+	bool witnessValid = false;
+
 	std::vector<double> scratch_lumaBaseY4;
 	std::vector<double> scratch_lumaHiRaw;
 	std::vector<double> scratch_lumaSmooth;
+	std::vector<double> scratch_envLine;
+	std::vector<double> scratch_spanLine;
 	// 3-slot ring buffers caching Field B output as shared preclean input.
 	// Frame A and Frame B only need the center line and adjacent frame lines.
 	std::array<std::vector<double>, 3> precleanRing;
@@ -974,6 +1013,149 @@ private:
 	}
 	inline const float* carrierImpurity_line(int line) const {
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	// --- Carrier-retraction / witness accessors (guarded by carrierRetractedValid
+	// / witnessValid).  Restored with the 6/13 witness path. ---
+	inline float* carrierFit_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierFit_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierFit_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierFit_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* carrierRetracted_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierRetracted_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* flatFloor_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return flatFloor_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* flatFloor_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return flatFloor_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* combedCarrier_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return combedCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* combedCarrier_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return combedCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* lsRefitGate_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines ||
+		    lsRefitGate_flat.empty()) return nullptr;
+		return lsRefitGate_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline lddecode::FourViewPixelEvidence* coarseYEvidence_line(int line) {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines ||
+		    coarseYEvidence_flat.empty()) return nullptr;
+		return coarseYEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const lddecode::FourViewPixelEvidence* coarseYEvidence_line(int line) const {
+		if (!carrierRetractedValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines ||
+		    coarseYEvidence_flat.empty()) return nullptr;
+		return coarseYEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	// Witness buffer accessors — guarded by witnessValid.
+	inline float* yWitness_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    yWitness_flat.empty()) return nullptr;
+		return yWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* yWitness_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    yWitness_flat.empty()) return nullptr;
+		return yWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* yWitnessConfidence_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    yWitnessConfidence_flat.empty()) return nullptr;
+		return yWitnessConfidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* yWitnessConfidence_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    yWitnessConfidence_flat.empty()) return nullptr;
+		return yWitnessConfidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* carrierWitness_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierWitness_flat.empty()) return nullptr;
+		return carrierWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierWitness_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierWitness_flat.empty()) return nullptr;
+		return carrierWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* carrierWitnessConfidence_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierWitnessConfidence_flat.empty()) return nullptr;
+		return carrierWitnessConfidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierWitnessConfidence_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierWitnessConfidence_flat.empty()) return nullptr;
+		return carrierWitnessConfidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* carrierCorrectionMask_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierCorrectionMask_flat.empty()) return nullptr;
+		return carrierCorrectionMask_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierCorrectionMask_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierCorrectionMask_flat.empty()) return nullptr;
+		return carrierCorrectionMask_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* carrierWitnessCombed_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierWitnessCombed_flat.empty()) return nullptr;
+		return carrierWitnessCombed_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* carrierWitnessCombed_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierWitnessCombed_flat.empty()) return nullptr;
+		return carrierWitnessCombed_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* obstructionRisk_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    obstructionRisk_flat.empty()) return nullptr;
+		return obstructionRisk_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* obstructionRisk_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    obstructionRisk_flat.empty()) return nullptr;
+		return obstructionRisk_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* ambiguityWidth_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    ambiguityWidth_flat.empty()) return nullptr;
+		return ambiguityWidth_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* ambiguityWidth_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    ambiguityWidth_flat.empty()) return nullptr;
+		return ambiguityWidth_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

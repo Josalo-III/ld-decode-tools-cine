@@ -244,6 +244,10 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
+    QCommandLineOption witnessCarrierRetractionOption(QStringList() << "witness-carrier-retraction",
+                                           QCoreApplication::translate("main", "NTSC locked mode: enable the experimental carrier-retraction and constrained-witness stages"));
+    parser.addOption(witnessCarrierRetractionOption);
+
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
                                              QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
     parser.addOption(noResidualVideoOption);
@@ -525,6 +529,14 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(ntscPhaseCompOption)) {
         combConfig.phaseCompensation = true;
+    }
+
+    if (parser.isSet(witnessCarrierRetractionOption)) {
+        if (!combConfig.phaseCompensation) {
+            qCritical("--witness-carrier-retraction requires --ntsc-phase-comp");
+            return -1;
+        }
+        combConfig.witnessCarrierRetraction = true;
     }
 
     // Residual video rollout: locked mode defaults to both residual Y and

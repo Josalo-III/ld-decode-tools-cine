@@ -205,6 +205,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             if (configuration.phaseCompensation) {
                 next->phaseLocked();
+                if (configuration.witnessCarrierRetraction) {
+                    next->buildCarrierRetracted();
+                    next->buildConstrainedYWitness();
+                }
                 next->buildPhaseCorrected1D();
             }
 
