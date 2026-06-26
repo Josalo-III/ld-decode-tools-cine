@@ -146,7 +146,7 @@ namespace visualEdits {
         constexpr bool LOG_CANDIDATES     = false;        // every candidate that passes isChange
         constexpr bool LOG_VERBOSE_REJECT = false;        // why we rejected a candidate
         constexpr bool LOG_RAMP_VETO      = false;        // when ramp veto fires
-        const     bool LOG_PROGRESS       = traceEnabled; // heartbeat/progress line
+        const     bool LOG_PROGRESS       = true;          // heartbeat/progress line (always on)
     
         // Debug target: set to a field index to enable per-field trace; -1 = off.
         constexpr int DBG_FIELD = -1;
@@ -382,9 +382,8 @@ namespace visualEdits {
             if (LOG_PROGRESS && hb.elapsed() >= 1000) {
                 const double pct = 100.0 * double(i) / double(totalFields);
                 qInfo().noquote()
-                    << QString("Visual edit scan %1/%2 (%3%) cache=%4 edits=%5")
+                    << QString("Edit detection: field %1/%2 (%3%) — %4 edit(s) found so far")
                            .arg(i).arg(totalFields).arg(pct, 0, 'f', 1)
-                           .arg(int(descCache.size()))
                            .arg(editCount);
                 hb.restart();
             }
