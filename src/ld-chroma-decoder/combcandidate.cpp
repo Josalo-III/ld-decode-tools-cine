@@ -634,6 +634,10 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         std::fill(scratch_impulseExempt.begin(),
                   scratch_impulseExempt.begin() + width, 0.0);
 
+        // Shared composite-domain star verdict (detectStars()); FVF reads this
+        // instead of re-detecting the impulse on the smoothed luma.
+        const float *starRow = starMask_line(tapLine.ln0);
+
         for (int rel = 0; rel < width; ++rel) {
             double cI, cQ, uI, uQ, dI, dQ;
             carrierGrammarDemodSignedCompositeTo4fsc(
@@ -653,9 +657,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const double dQf = dQ * invI;
             // Fast overload: supplying pre-computed magnitudes saves ~12
             // hypots/pixel that the slow overload recomputes internally.
-            const double cMag = std::hypot(cIf, cQf);
-            const double uMag = std::hypot(uIf, uQf);
-            const double dMag = std::hypot(dIf, dQf);
+            // Direct sqrt, not std::hypot: bounded IRE-domain IQ, no overflow
+            // risk, so hypot's IEEE guarding is pure cost in this per-pixel loop.
+            const double cMag = std::sqrt(cIf * cIf + cQf * cQf);
+            const double uMag = std::sqrt(uIf * uIf + uQf * uQf);
+            const double dMag = std::sqrt(dIf * dIf + dQf * dQf);
             const CombContentReach::InterfieldIQReachFloor floor =
                 CombContentReach::interfieldIQReachFloor(
                     cIf, cQf, uIf, uQf, dIf, dQf,
@@ -665,26 +671,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             double upGate = std::max(upPair[rel].reachLegalGate, floor.up);
             double dnGate = std::max(dnPair[rel].reachLegalGate, floor.down);
 
-            double impulseExempt = 0.0;
-            if (frameLuma0) {
-                const int l2 = std::max(0, rel - 2);
-                const int r2 = std::min(width - 1, rel + 2);
-                const double cIRE_luma = frameLuma0[rel] * invI;
-                const double lIRE_luma = frameLuma0[l2] * invI;
-                const double rIRE_luma = frameLuma0[r2] * invI;
-                const double surround = 0.5 * (lIRE_luma + rIRE_luma);
-                const double peakIRE = std::fabs(cIRE_luma - surround);
-                const double flanksAgree = std::fabs(lIRE_luma - rIRE_luma);
-                const double IMPULSE_LO_IRE = 5.0;
-                const double IMPULSE_HI_IRE = 15.0;
-                if (flanksAgree < 4.0) {
-                    impulseExempt = std::clamp(
-                        (peakIRE - IMPULSE_LO_IRE) /
-                        (IMPULSE_HI_IRE - IMPULSE_LO_IRE),
-                        0.0, 1.0);
-                }
-                scratch_impulseExempt[rel] = impulseExempt;
-            }
+            // Confirmed star / thin-luma site -> full impulse treatment. The
+            // verdict is the shared composite-domain detectStars() mask, which
+            // is stronger than re-deriving a peak from the smoothed luma here.
+            double impulseExempt = (starRow && starRow[rel] != 0.0f) ? 1.0 : 0.0;
+            scratch_impulseExempt[rel] = impulseExempt;
 
             if (haveCloseLuma && bevelPenalty > 0.0) {
                 const auto mcNear = CombContentReach::evaluateMovingCoarseContour(

@@ -205,6 +205,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             if (configuration.phaseCompensation) {
                 next->phaseLocked();
+                next->detectStars();
                 if (configuration.witnessCarrierRetraction) {
                     next->buildCarrierRetracted();
                     next->buildConstrainedYWitness();
@@ -600,9 +601,17 @@ void Comb::FrameBuffer::seedCombAttributionPerLine(int line)
     const CombCarrierGrammar *grammar = carrierGrammarLine(line);
     const double carrierPrior = carrierPlausibility(grammar);
 
+    // Per-frame reset is the textbook _platform_memmove tax (see perf survey
+    // 2026-06-25): with the triple-buffer fix in place, the per-batch ctor
+    // zero-fill is gone, but this per-line seed still pays roughly the same
+    // memmove cost spread frame by frame. Use a single static default-
+    // initialized template (correctly carries non-zero defaults such as
+    // CombAttributionAssessment::uncertainClaim = 1.0) and one full-record
+    // assignment per pixel, instead of two separate copy-assignments from
+    // zero-initialized temporaries.
+    static const AttributionEvidence kFreshRecord{};
     for (int rel = 0; rel < width; ++rel) {
-        row[rel].facts = AttributionFacts{};
-        row[rel].assessment = AttributionAssessment{};
+        row[rel] = kFreshRecord;
         row[rel].assessment.carrierPrior = carrierPrior;
     }
 }

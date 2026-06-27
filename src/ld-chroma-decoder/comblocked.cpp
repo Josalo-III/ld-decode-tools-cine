@@ -377,7 +377,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             demI[rel] = bpLine[rel] * cosRef[p];
             demQ[rel] = bpLine[rel] * sinRef[p];
             const int relN = std::min(rel + 1, width - 1);
-            env[rel] = std::hypot(bpLine[rel], bpLine[relN]);
+            const double b0 = bpLine[rel], b1 = bpLine[relN];
+            env[rel] = std::sqrt(b0 * b0 + b1 * b1);
         }
         preI[0] = 0.0;
         preQ[0] = 0.0;
@@ -428,6 +429,15 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // so winding cannot discriminate without a luma-coupling guard.  gA reads
         // 0 on the uniforms and 0.2-0.3 on title cross-color, so aperture alone
         // is the correct discriminator.
+        // Hoist line-invariant bounds out of the per-pixel loop. fvfMetrics is
+        // a 2D vector keyed on (line, rel); both bounds are constants within
+        // this line. Attribution likewise is a per-line pointer.
+        const int fvfRelLimit =
+            (line >= 0 && line < static_cast<int>(fvfMetrics.size()))
+                ? static_cast<int>(fvfMetrics[line].size())
+                : 0;
+        auto *fvfLineRow =
+            fvfRelLimit > 0 ? fvfMetrics[line].data() : nullptr;
         for (int rel = 0; rel < width; ++rel) {
             // Stable centre Zwide on the cycle grid (8-cycle complex mean).
             const int wa = std::clamp(rel - kWideWin / 2, 0, width);
@@ -447,17 +457,13 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     std::max(kImpurityFloorIRE, narrowMag));
             }
 
-            // Source emitted CLEAN and FULL — the detector never touches it.
             restrainedLine[rel] = bpLine[rel];
 
             if (impurityRow)
                 impurityRow[rel] = static_cast<float>(gA);
 
-            if (line >= 0 && line < static_cast<int>(fvfMetrics.size()) &&
-                rel < static_cast<int>(fvfMetrics[line].size()))
-            {
-                fvfMetrics[line][rel].intakeNyquistRiskIRE =
-                    gA * narrowMag;
+            if (fvfLineRow && rel < fvfRelLimit) {
+                fvfLineRow[rel].intakeNyquistRiskIRE = gA * narrowMag;
             }
 
             if (attribution) {
@@ -637,7 +643,8 @@ void Comb::FrameBuffer::measurePostCombImpurity()
             demI[rel] = s * cosRef[p];
             demQ[rel] = s * sinRef[p];
             const int relN = std::min(rel + 1, width - 1);
-            env[rel] = std::hypot(s, combLine[left + relN]);
+            const double sN = combLine[left + relN];
+            env[rel] = std::sqrt(s * s + sN * sN);
         }
 
         preI[0] = 0.0;
@@ -938,22 +945,30 @@ void Comb::FrameBuffer::filterIQLocked()
             // only the rendered colour and never re-introduces carrier-band
             // energy into luma -- coherent and residual modes now agree.
             const float *impRow = carrierImpurity_line(line);
+            // produceY emits a witness/comb blend; chroma = raw - Y is its exact
+            // complement, so the cross-color returned to Y (ccReturn*gA*delta) is
+            // by construction absent from raw - Y -- already governed by the same
+            // gA and --cross-color-return used in the blend. A secondary gA
+            // suppression here would double-count and only desaturate real
+            // colour, so the witness-active path runs full strength; gA stays the
+            // fallback where no witness is present, scaled by --cross-color-return.
             const double ccWeight =
                 std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
 
             for (int i = 0; i < width; ++i) {
                 const int h = left + i;
-            
+
                 // Residual-colour mode derives chroma from the same carrier residual
                 // that produceY left behind: raw - Y.  Do not apply an additional local
                 // DC follower here; that gives residual colour a different low-frequency
                 // convention from the luma it is derived from.
                 const double chroma = (double)rawLine[h] - Yrow[h];
-            
+
                 const int ph = carrierSampleClass(line, h);
-                const double alphaEff =
-                    std::max(0.0, 1.0 - (impRow ? (double)impRow[i] : 0.0) * ccWeight);
-            
+                const double alphaEff = witnessValid
+                    ? 1.0
+                    : std::max(0.0, 1.0 - (impRow ? (double)impRow[i] : 0.0) * ccWeight);
+
                 scratch_preI[i] = (chroma * lutTi[ph]) * GI_PRODUCT * alphaEff;
                 scratch_preQ[i] = (chroma * lutTq[ph]) * GQ_PRODUCT * alphaEff;
             }
@@ -1025,6 +1040,7 @@ void Comb::FrameBuffer::produceY()
     const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
     const bool residualVideo = configuration.residualVideo;
+    const bool residualColor = configuration.residualColor;
     const bool use3DY = configuration.residualVideo3D
                        && prevFrameForVet != nullptr
                        && nextFrameForVet != nullptr;
@@ -1050,6 +1066,17 @@ void Comb::FrameBuffer::produceY()
         const double *carrierComp =
             residualVideo ? lockedCarrierComposite_line(line) : nullptr;
 
+        // Witness luma model. produceY owns luma: where the witness is valid
+        // and residual colour is active, commit Y to the witness estimate --
+        // it is raw minus the interline-combed carrier, so the cross-color
+        // the coherent carrier would have removed from Y survives here as
+        // smooth luma. The matching chroma reduction is derived downstream in
+        // filterIQLocked (chroma = raw - Y), keeping raw = Y + C by
+        // construction. Gated on residualColor so --no-residual-color yields
+        // pure comb colour on the baseline Y. 3D election stays disjoint.
+        const float *witnessRow =
+            (residualColor && witnessValid) ? yWitness_line(line) : nullptr;
+
         if (use3DY) {
             for (int h = left; h < right; ++h) {
                 const double c = clpLine[h];
@@ -1058,6 +1085,169 @@ void Comb::FrameBuffer::produceY()
                     : (double)rawLine[h];
                 Y[h] = getBestY(line, h, y2D,
                                 *prevFrameForVet, *nextFrameForVet);
+            }
+        } else if (witnessRow) {
+            // Retracted-carrier / comb luma blend (simple first cut).
+            //
+            // Two full-resolution luma views differ only by the cross-color:
+            //   combY      = raw - carrierComp    (comb removed alien-Y/cross-color)
+            //   retractedY = raw - combedCarrier  (combedCarrier rejected alien-Y,
+            //                                       so this view KEEPS it as luma)
+            // retractedY - combY = carrierComp - combedCarrier = the cross-color
+            // itself, at full resolution. Both views are full-res (raw minus a
+            // per-sample carrier), so the return never drops to a boxcar.
+            //
+            // carrierImpurity (gA) is one detector for alien-Y: narrow vs wide
+            // carrier coherence. It is fooled by content that spoofs the test
+            // -- the cube's near-carrier periodic luma reads as coherent
+            // carrier; star impulses get smeared by the wide aperture. So gA
+            // alone leaves "christmas tree" cross-color on those zones.
+            //
+            // A complementary, more direct measure sits in the data: the
+            // disagreement between the elected comb carrier and the interline-
+            // cancelled carrier IS the alien-Y, point for point.
+            //   delta = retractedY - combY = carrierComp - combedCarrier
+            // Where this magnitude is large the comb is removing luma that
+            // line-to-line cancellation correctly rejected, regardless of what
+            // gA thinks. So the gate is the union: trust either detector.
+            //
+            // The magnitude path can false-positive on between-line chroma
+            // contrasts (real chroma that genuinely differs across adjacent
+            // lines): cancellation residual there also looks like delta. That
+            // would slightly desaturate horizontal chroma transitions. The
+            // trade buys back the cube/star failure mode, which is the worse
+            // visible artifact on typical content.
+            //
+            // cross-color-return scales how much of that carrier-band luma
+            // returns to Y; filterIQLocked derives chroma = raw - Y, so the
+            // matching chroma reduction follows for free, keeping raw = Y + C.
+            const float *impRow = carrierImpurity_line(line);
+            const float *retractedRow = carrierRetracted_line(line);
+            const float *witnessConfRow = yWitnessConfidence_line(line);
+            const double ccReturn =
+                std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
+
+            // Frame-B deference. carrierComp is the ELECTED comb chroma; where
+            // the field-vs-frame election chose Frame (winner == 2), it already
+            // carries the interfield cancellation that removes stationary
+            // cross-color -- the job Frame B exists to do. The witness/retracted
+            // return is INTRAFIELD (combedCarrier, which stands down over
+            // periodic near-carrier luma like the cube), so blending toward it
+            // would REPLACE the clean interfield chroma with the contaminated
+            // intrafield one. So where Frame won, the witness defers entirely
+            // and produceY emits exactly raw - carrierComp (the default-path
+            // result). The retracted leg only acts where Frame could not --
+            // the field / 1D winners (motion, no temporal partner).
+            const bool haveFvf =
+                line >= 0 && line < (int)fvfMetrics.size() &&
+                (int)fvfMetrics[line].size() >= width;
+            const FvfModelMetrics *fvfRow =
+                haveFvf ? fvfMetrics[line].data() : nullptr;
+            // Smoothstep ramp on |delta| in IRE: dormant below 2 IRE
+            // (noise / small carrier residuals), fully active by 6 IRE
+            // (clearly alien-Y / cross-color sized energy).
+            constexpr double kDeltaStartIRE = 2.0;
+            constexpr double kDeltaFullIRE  = 6.0;
+            const double deltaInvSpan =
+                1.0 / std::max(1e-9, kDeltaFullIRE - kDeltaStartIRE);
+            // Phase-invariant witness disagreement ramp. The coarse/lurch
+            // witness (witnessRow) makes no claim about carrier phase, so it
+            // cannot be fooled by near-carrier periodic luma the way comb's
+            // phase-locked carrierComp can. combY and the witness AGREE on
+            // real content -- at a real luma edge both track raw (comb
+            // removes ~0 carrier, the witness lurch-sharpens); on real chroma
+            // over smooth luma both fall to the coarse luma. They diverge
+            // only where comb removed phase-locked energy the phase-invariant
+            // reconstruction kept as luma: the cube. Baseline disagreement of
+            // a few IRE is the coarse/lurch resolution limit, so start at 3
+            // and reach full trust by 10.
+            constexpr double kWStartIRE = 3.0;
+            constexpr double kWFullIRE  = 10.0;
+            const double wInvSpan =
+                1.0 / std::max(1e-9, kWFullIRE - kWStartIRE);
+            // Structural carrier-amplitude ceiling, in samples. I and Q are
+            // bounded sinusoids: the carrier waveform's excursions cannot
+            // exceed this magnitude and remain explainable as real chroma.
+            // The same per-line bound is used by buildCarrierRetracted to
+            // clamp the carrier fit (comblocked.cpp:1582). Apparent carrier
+            // beyond this -- whatever its phase relationship looked like to
+            // the detectors -- must by impossibility be luma.
+            const CombCarrierGrammar *grammarLine =
+                carrierGrammarLine(line);
+            const double maxCarrierAmpSamples = grammarLine
+                ? std::max(24.0, grammarLine->carrierScale * 5.0) * irescale
+                : 24.0 * irescale;
+            for (int h = left; h < right; ++h) {
+                const int xi = h - left;
+                const double rawH = (double)rawLine[h];
+                double combY;
+                if (carrierComp) {
+                    const double c = carrierComp[xi];
+                    combY = std::isfinite(c)
+                        ? rawH - c
+                        : (std::isfinite(clpLine[h])
+                               ? rawH - clpLine[h]
+                               : rawH);
+                } else {
+                    const double c = clpLine[h];
+                    combY = std::isfinite(c) ? rawH - c : rawH;
+                }
+
+                double yOut;
+                if (fvfRow && fvfRow[xi].winner == 2) {
+                    // Frame won the election here -> defer entirely. carrierComp
+                    // already carries the interfield cancellation; emit exactly
+                    // raw - carrierComp (identical to the default carrierComp
+                    // path, no gates, no cap). Hoisted out of the gate math so
+                    // the witness arithmetic is skipped on these pixels -- for
+                    // progressive material Frame wins the majority, so this is
+                    // where the per-pixel cost is recovered.
+                    yOut = combY;
+                } else {
+                    const double rY = retractedRow
+                        ? (double)retractedRow[xi] : combY;
+                    const double retractedY = std::isfinite(rY) ? rY : combY;
+                    const double delta = retractedY - combY;
+                    const double gA =
+                        impRow ? std::clamp((double)impRow[xi], 0.0, 1.0) : 0.0;
+                    const double deltaIRE = std::fabs(delta) * invIreScale;
+                    double t = (deltaIRE - kDeltaStartIRE) * deltaInvSpan;
+                    t = std::clamp(t, 0.0, 1.0);
+                    const double deltaGate = t * t * (3.0 - 2.0 * t);
+                    // Phase-invariant evaluator: distrust comb where its Y
+                    // departs from the coarse/lurch witness beyond the coarse
+                    // band's tolerance, scaled by the witness's own confidence
+                    // so we only act where the phase-invariant view is sure.
+                    const double wY = (double)witnessRow[xi];
+                    const double wDisagreeIRE =
+                        std::fabs(combY - wY) * invIreScale;
+                    double wt = (wDisagreeIRE - kWStartIRE) * wInvSpan;
+                    wt = std::clamp(wt, 0.0, 1.0);
+                    double wGate = wt * wt * (3.0 - 2.0 * wt);
+                    if (witnessConfRow) {
+                        wGate *= std::clamp((double)witnessConfRow[xi], 0.0, 1.0);
+                    }
+                    const double gate = std::max({gA, deltaGate, wGate});
+                    yOut = combY + ccReturn * gate * delta;
+
+                    // Hard structural feasibility on apparent chroma. After the
+                    // detector-driven blend, anything still claiming |raw - Y|
+                    // above the legal chroma-carrier amplitude is, by
+                    // impossibility, luma. Pull Y toward raw by exactly the
+                    // excess so the remaining carrier is feasible.
+                    const double appCarrier = rawH - yOut;
+                    if (appCarrier > maxCarrierAmpSamples) {
+                        yOut = rawH - maxCarrierAmpSamples;
+                    } else if (appCarrier < -maxCarrierAmpSamples) {
+                        yOut = rawH + maxCarrierAmpSamples;
+                    }
+                }
+
+                // Stars are handled upstream: detectStars() zeros the carrier
+                // fit so the retracted view is luma (the witness blend then
+                // delivers it), and the FVF impulse election rewards the
+                // low-chroma candidate. produceY needs no star special-case.
+                Y[h] = yOut;
             }
         } else if (carrierComp) {
             for (int h = left; h < right; ++h) {
@@ -1263,6 +1453,110 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
     if (gateOut) {
         for (int xi = 0; xi < width; ++xi)
             gateOut[xi] = localGate[xi];
+    }
+}
+
+// Single composite-domain star / thin-luma detector. Run once after
+// phaseLocked() so the carrier retraction and the FVF election share ONE
+// verdict instead of each re-detecting on a weaker signal. A neutral star is a
+// single-hump bright excursion on a flat dark surround with no carrier
+// oscillation under it; by chroma bandwidth such a feature must be luma. A real
+// coloured star carries an actual carrier, so its composite oscillates (more
+// than off-on-off) and the single-hump test spares it -- which is what lets us
+// allow stars several samples wide without catching colour.
+void Comb::FrameBuffer::detectStars()
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    const int fullWidth = videoParameters.fieldWidth;
+    if (width <= 0 || first >= last || demodWidth < width)
+        return;
+
+    const size_t need = static_cast<size_t>(demodLines) * demodWidth;
+    if (starMask_flat.size() < need)
+        starMask_flat.assign(need, 0.0f);
+    else
+        std::fill(starMask_flat.begin(), starMask_flat.begin() + need, 0.0f);
+
+    constexpr double STAR_PEAK_IRE  = 12.0; // min bump height over surround
+    constexpr double STAR_FLAT_IRE  = 6.0;  // surround flatness tolerance
+    constexpr double STAR_NOISE_IRE = 1.5;  // diff below this is flat (ignored)
+    constexpr int    STAR_MAX_W     = 5;    // max bump width (slightly larger)
+    constexpr int    STAR_FLANK     = 4;    // flat surround required each side
+
+    for (int line = first; line < last; ++line) {
+        const quint16 *rawLine = rawbuffer.data()
+            + static_cast<size_t>(line) * fullWidth;
+        float *mask = starMask_line(line);
+        if (!mask) continue;
+
+        auto rawAt = [&](int rel) -> double {
+            return static_cast<double>(
+                rawLine[left + std::clamp(rel, 0, width - 1)]);
+        };
+
+        for (int rel = 1; rel < width - 1; ++rel) {
+            const double c = rawAt(rel);
+            if (!(c >= rawAt(rel - 1) && c > rawAt(rel + 1)))
+                continue; // local maximum only (cheap early-out)
+
+            const int lf = std::max(0, rel - (STAR_MAX_W + STAR_FLANK));
+            const int rf = std::min(width - 1, rel + (STAR_MAX_W + STAR_FLANK));
+            double floorV = c;
+            for (int k = lf; k <= rf; ++k)
+                floorV = std::min(floorV, rawAt(k));
+            if ((c - floorV) * invIreScale < STAR_PEAK_IRE)
+                continue; // not a strong bright excursion
+
+            const double brightThresh = floorV + 0.5 * (c - floorV);
+            int a = rel, b = rel;
+            while (a - 1 >= 0 && rawAt(a - 1) >= brightThresh &&
+                   (rel - (a - 1)) <= STAR_MAX_W) --a;
+            while (b + 1 < width && rawAt(b + 1) >= brightThresh &&
+                   ((b + 1) - rel) <= STAR_MAX_W) ++b;
+            if (b - a + 1 > STAR_MAX_W)
+                continue; // too wide to be a star bump
+
+            bool flat = true;
+            for (int k = a - 1; k >= a - STAR_FLANK && k >= 0; --k)
+                if ((rawAt(k) - floorV) * invIreScale > STAR_FLAT_IRE) {
+                    flat = false;
+                    break;
+                }
+            if (flat)
+                for (int k = b + 1; k <= b + STAR_FLANK && k < width; ++k)
+                    if ((rawAt(k) - floorV) * invIreScale > STAR_FLAT_IRE) {
+                        flat = false;
+                        break;
+                    }
+            if (!flat)
+                continue; // surround not a flat dark run -- not a star
+
+            // Single-hump test: a neutral star rises then falls once (off-on-
+            // off). A coloured star's carrier rides under the bump and adds
+            // sub-hump oscillation -> more sign changes in the first
+            // difference. Rise + fall = one change; anything more means a
+            // carrier is present -> real colour, leave it.
+            int signChanges = 0;
+            int prevSign = 0;
+            for (int k = a - 1; k <= b; ++k) {
+                const double d = rawAt(k + 1) - rawAt(k);
+                if (std::fabs(d) * invIreScale < STAR_NOISE_IRE)
+                    continue; // flat step, no slope information
+                const int s = (d > 0.0) ? 1 : -1;
+                if (prevSign != 0 && s != prevSign)
+                    ++signChanges;
+                prevSign = s;
+            }
+            if (signChanges > 1)
+                continue; // oscillating -> coloured star, spare it
+
+            for (int k = a; k <= b; ++k)
+                mask[k] = 1.0f;
+        }
     }
 }
 
@@ -2255,10 +2549,13 @@ void Comb::FrameBuffer::buildCarrierRetracted()
 
                         const double narrowSample = carrierFit[xi];
                         const int xi1 = std::min(xi + 1, width - 1);
+                        // Direct sqrt (bounded IRE-scale carrier samples).
+                        const double f0 = static_cast<double>(fitRow[xi]);
+                        const double f1 = static_cast<double>(fitRow[xi1]);
                         const double fitMagIRE =
-                            std::hypot(static_cast<double>(fitRow[xi]),
-                                       static_cast<double>(fitRow[xi1])) * invIreScale;
-                        const double wideMagIRE = std::hypot(wideI, wideQ) * invIreScale;
+                            std::sqrt(f0 * f0 + f1 * f1) * invIreScale;
+                        const double wideMagIRE =
+                            std::sqrt(wideI * wideI + wideQ * wideQ) * invIreScale;
 
                         // Membership/lurch evidence: this is not edge detection.
                         // It measures how much the legal carrier-cancelling
@@ -2446,6 +2743,26 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     }
 
     // ---------------------------------------------------------------
+    // Carrier skips confirmed stars / thin luma (detectStars(), shared).
+    //
+    // At a star the whole-range model would otherwise fit the impulse as
+    // carrier. Zero the fit at the pre-detected sites BEFORE the Pass-2
+    // interline comb, so combedCarrier has no carrier to assign there and the
+    // retracted view keeps it as luma by default (retractedY = raw). The
+    // election then has nothing to decide. The verdict comes from the single
+    // composite-domain detectStars() pass -- not re-detected here.
+    // ---------------------------------------------------------------
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *mask = starMask_line(line);
+        if (!mask) continue;
+        float *fitRow = carrierFit_flat.data()
+            + static_cast<size_t>(line) * demodWidth;
+        for (int xi = 0; xi < width; ++xi)
+            if (mask[xi] != 0.0f)
+                fitRow[xi] = 0.0f;
+    }
+
+    // ---------------------------------------------------------------
     // Pass 2: line-to-line cancellation on carrierFit → combedCarrier.
     // ---------------------------------------------------------------
     auto softReachGate = [](double diffIRE, double softIRE, double hardIRE) {
@@ -2526,10 +2843,16 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             const double n0 = static_cast<double>(neighborFit[xi]);
             const double n1 = static_cast<double>(neighborFit[xj]);
 
+            // Direct sqrt, not std::hypot: these are bounded carrier-fit
+            // samples (IRE-scale, no overflow risk), so hypot's IEEE
+            // over/underflow guarding is pure cost in a 6-call-per-pixel
+            // inner loop.
+            const double sum0 = c0 + n0, sum1 = c1 + n1;
             const double carrierMismatchIRE =
-                std::hypot(c0 + n0, c1 + n1) * invIreScale;
+                std::sqrt(sum0 * sum0 + sum1 * sum1) * invIreScale;
             const double carrierAmpIRE = 0.5 *
-                (std::hypot(c0, c1) + std::hypot(n0, n1)) * invIreScale;
+                (std::sqrt(c0 * c0 + c1 * c1) +
+                 std::sqrt(n0 * n0 + n1 * n1)) * invIreScale;
 
             double lumaGate = softReachGate(lumaDiffIRE, 3.0, 10.0);
 

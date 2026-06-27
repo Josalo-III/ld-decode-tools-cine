@@ -164,6 +164,13 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
     const double PATCH_MIN_DELTA_IRE    = 0.75;
     const double PATCH_MAX_REPAIR_IRE   = 2.0;
 
+    // Fast-contour 1D substitution: where the comb carrier confirms low real
+    // chroma (a luma edge, which does not survive interline cancellation), 1D
+    // is the phase-reliable HF-luma source lurch cannot adjudicate. The
+    // chroma-trust ramp aligns with the patch chroma ramp above.
+    const double ONE_D_FAST_CONTOUR_START_IRE = 1.25;
+    const double ONE_D_FAST_CONTOUR_FULL_IRE  = 3.50;
+
     double *envScratch = scratch_envLine.data();
     double *spanScratch = scratch_spanLine.data();
 
@@ -345,6 +352,13 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
         float *corrMask = carrierCorrectionMask_flat.data()
                         + static_cast<size_t>(line) * width;
 
+        // The interline-combed carrier (from buildCarrierRetracted) is the
+        // honest chroma test. raw - coarse re-admits luma-step energy as false
+        // carrier at sharp transitions, so 1D "sees chroma" at luma edges; the
+        // comb carrier cancels that step (it does not invert line to line) and
+        // keeps only real chroma. Used below to gate 1D trust.
+        const float *combCarrierRow = combedCarrier_line(line);
+
         /*
          * Same-phase 1D luma estimate.
          *
@@ -403,8 +417,11 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             double maxFitErrorIRE = 0.0;
 
             int viewCount = 0;
+            double viewCostCache[4] = {0.0, 0.0, 0.0, 0.0};
             if (evidence && evidence[xi].viewCount > 0) {
-                viewCount = evidence[xi].viewCount;
+                // views[] is fixed-size 4 in attributiondefs.h; cap defensively
+                // so the stack cache below stays in bounds.
+                viewCount = std::min(evidence[xi].viewCount, 4);
 
                 for (int v = 0; v < viewCount; ++v) {
                     const auto &view = evidence[xi].views[v];
@@ -414,6 +431,8 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                       + 0.50 * (double)view.remodErrorIRE
                       + 0.35 * (double)view.latticeRiskIRE
                       + 0.15 * (double)view.ySpanIRE;
+
+                    viewCostCache[v] = viewCost;
 
                     bestViewCost = std::min(bestViewCost, viewCost);
                     maxViewCost = std::max(maxViewCost, viewCost);
@@ -424,20 +443,13 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                                               (double)view.sampleFitErrorIRE);
                 }
 
-                const double keepSlackIRE = 3.0;
+                const double keepThreshold = bestViewCost + 3.0; // keepSlackIRE
 
                 for (int v = 0; v < viewCount; ++v) {
-                    const auto &view = evidence[xi].views[v];
-
-                    const double viewCost =
-                        (double)view.sampleFitErrorIRE
-                      + 0.50 * (double)view.remodErrorIRE
-                      + 0.35 * (double)view.latticeRiskIRE
-                      + 0.15 * (double)view.ySpanIRE;
-
-                    if (viewCost > bestViewCost + keepSlackIRE)
+                    if (viewCostCache[v] > keepThreshold)
                         continue;
 
+                    const auto &view = evidence[xi].views[v];
                     floorBand.include((double)view.yFloor + slopeAdj(view));
                 }
             }
@@ -519,6 +531,23 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
              * 4fSC grid the magnitudes run A,0,A,0).
              */
             const double carrierResidIRE = envScratch[xi];
+
+            // Real-chroma confirmation from the comb carrier, not raw - coarse.
+            // 2-sample quadrature envelope is flat across the carrier cycle
+            // (A,0,A,0 on the 4fSC grid). High where genuine chroma survives
+            // interline cancellation; ~0 at luma edges. trust1D is its
+            // complement on the patch chroma ramp: 1D is phase-reliable only
+            // where the comb confirms little real chroma.
+            double combChromaIRE = 0.0;
+            if (combCarrierRow) {
+                const int xj = std::min(xi + 1, width - 1);
+                const double c0 = (double)combCarrierRow[xi];
+                const double c1 = (double)combCarrierRow[xj];
+                combChromaIRE = std::sqrt(c0 * c0 + c1 * c1) * invIreScale;
+            }
+            const double trust1D = 1.0 - smoothStep01(
+                (combChromaIRE - PATCH_CHROMA_START_IRE) /
+                std::max(1e-9, PATCH_CHROMA_FULL_IRE - PATCH_CHROMA_START_IRE));
 
             /*
              * Carrier legality from the four-view evidence.
@@ -846,6 +875,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
 
             double yOut = yLurch;
             bool patchSelected = false;
+            bool contourBlended = false;
 
             if (compactRepairEligible) {
                 const double maxRepair =
@@ -856,6 +886,24 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                     maxRepair);
                 yOut = hardClamp(yOut);
                 patchSelected = true;
+            } else {
+                // Fast-contour 1D: in comb-confirmed low chroma, a large gap
+                // between 1D and the lurch-shaped prior means lurch is failing
+                // on HF luma it cannot adjudicate (direction reverses inside the
+                // span). Lean to the phase-reliable 1D, weighted by trust1D so
+                // the substitution collapses as real chroma appears -- there the
+                // compact patch above is the only 1D carve-out.
+                const double contourGate = smoothStep01(
+                    (oneDDeltaIRE - ONE_D_FAST_CONTOUR_START_IRE) /
+                    std::max(1e-9,
+                        ONE_D_FAST_CONTOUR_FULL_IRE - ONE_D_FAST_CONTOUR_START_IRE));
+                const double fastContourBlend = trust1D * contourGate;
+                if (fastContourBlend > 0.0) {
+                    const double y1DSoft = possibleBand.clamp(oneDUnclamped);
+                    yOut = yLurch * (1.0 - fastContourBlend)
+                         + y1DSoft * fastContourBlend;
+                    contourBlended = (fastContourBlend > 0.2);
+                }
             }
 
             yOut = patchSelected ? hardClamp(yOut) : possibleBand.clamp(yOut);
@@ -913,7 +961,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             const double compactRepairPenalty =
                 patchSelected ? (1.0 - 0.25 * compactPatchGate) : 1.0;
 
-            const double yConfidence = std::clamp(
+            double yConfidence = std::clamp(
                 std::max(yBaseConfidence, lurchConfidence)
                 * riskPenalty
                 * ambiguityPenalty
@@ -921,6 +969,16 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 * (1.0 - 0.35 * conflictNorm),
                 0.0,
                 1.0);
+
+            // Low-chroma 1D/lurch agreement is strong corroboration: two
+            // independent witnesses concurring where the comb confirms little
+            // real chroma. (Latent until a consumer weights yWitnessConfidence;
+            // produceY currently commits to yWitness unconditionally.)
+            const double agreementGate = 1.0 - smoothStep01(oneDDeltaIRE / 2.0);
+            const double agreementBoost = trust1D * agreementGate;
+            yConfidence = std::clamp(
+                yConfidence + 0.35 * agreementBoost * (1.0 - yConfidence),
+                0.0, 1.0);
 
             const double carrierConfidence = std::clamp(
                 (double)linePlausibility
@@ -942,7 +1000,8 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
              * transfer so candidate construction cannot use the repair's
              * carrier complement to certify the same decision.
              */
-            corrMask[xi] = patchSelected ? 1.0f : 0.0f;
+            corrMask[xi] = patchSelected ? 1.0f
+                         : (contourBlended ? 0.4f : 0.0f);
         }
 
         if (patchDiagEnabled) {

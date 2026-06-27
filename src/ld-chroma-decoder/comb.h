@@ -316,6 +316,12 @@ public:
 	void loadFields(const SourceField &firstField, const SourceField &secondField);
 
 	void split1D();
+	// Single composite-domain star / thin-luma detection, run once early
+	// (after phaseLocked) so every consumer -- carrier retraction and the FVF
+	// election -- reads the SAME verdict instead of re-detecting on a weaker
+	// signal. Fills starMask_flat.
+	void detectStars();
+
 	// Carrier-retraction / constrained-witness front end (restored 6/13 path),
 	// run in the pre-roll between phaseLocked() and buildPhaseCorrected1D().
 	void buildCarrierRetracted();
@@ -641,6 +647,22 @@ private:
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
+
+	// Per-sample confirmed-star / thin-luma-on-flat-black mask (0/1), detected
+	// once on the composite by detectStars(). Shared by buildCarrierRetracted
+	// (zeros the carrier fit) and the FVF election (impulse handling).
+	std::vector<float> starMask_flat;
+
+	inline float *starMask_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    starMask_flat.empty()) return nullptr;
+		return starMask_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float *starMask_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    starMask_flat.empty()) return nullptr;
+		return starMask_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
 
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
