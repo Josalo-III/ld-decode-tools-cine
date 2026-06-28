@@ -205,7 +205,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             if (configuration.phaseCompensation) {
                 next->phaseLocked();
-                next->detectStars();
+                if (configuration.whiteStar)
+                    next->detectStars();
                 if (configuration.witnessCarrierRetraction) {
                     next->buildCarrierRetracted();
                     next->buildConstrainedYWitness();

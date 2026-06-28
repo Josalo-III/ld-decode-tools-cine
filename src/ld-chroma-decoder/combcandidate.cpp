@@ -634,9 +634,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         std::fill(scratch_impulseExempt.begin(),
                   scratch_impulseExempt.begin() + width, 0.0);
 
-        // Shared composite-domain star verdict (detectStars()); FVF reads this
-        // instead of re-detecting the impulse on the smoothed luma.
-        const float *starRow = starMask_line(tapLine.ln0);
+        // The opt-in white-star remedy publishes a stronger composite-domain
+        // verdict. Without it, retain FVF's baseline smoothed-luma impulse
+        // exemption so ordinary phase-comp output is unchanged.
+        const float *starRow = configuration.whiteStar
+            ? starMask_line(tapLine.ln0)
+            : nullptr;
 
         for (int rel = 0; rel < width; ++rel) {
             double cI, cQ, uI, uQ, dI, dQ;
@@ -671,10 +674,29 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             double upGate = std::max(upPair[rel].reachLegalGate, floor.up);
             double dnGate = std::max(dnPair[rel].reachLegalGate, floor.down);
 
-            // Confirmed star / thin-luma site -> full impulse treatment. The
-            // verdict is the shared composite-domain detectStars() mask, which
-            // is stronger than re-deriving a peak from the smoothed luma here.
-            double impulseExempt = (starRow && starRow[rel] != 0.0f) ? 1.0 : 0.0;
+            double impulseExempt = 0.0;
+            if (configuration.whiteStar) {
+                // Confirmed star / thin-luma site -> full impulse treatment.
+                impulseExempt = (starRow && starRow[rel] != 0.0f) ? 1.0 : 0.0;
+            } else if (frameLuma0) {
+                // Baseline FVF impulse exemption from the pre-whitestar path.
+                const int l2 = std::max(0, rel - 2);
+                const int r2 = std::min(width - 1, rel + 2);
+                const double cIRE_luma = frameLuma0[rel] * invI;
+                const double lIRE_luma = frameLuma0[l2] * invI;
+                const double rIRE_luma = frameLuma0[r2] * invI;
+                const double surround = 0.5 * (lIRE_luma + rIRE_luma);
+                const double peakIRE = std::fabs(cIRE_luma - surround);
+                const double flanksAgree = std::fabs(lIRE_luma - rIRE_luma);
+                constexpr double IMPULSE_LO_IRE = 5.0;
+                constexpr double IMPULSE_HI_IRE = 15.0;
+                if (flanksAgree < 4.0) {
+                    impulseExempt = std::clamp(
+                        (peakIRE - IMPULSE_LO_IRE) /
+                        (IMPULSE_HI_IRE - IMPULSE_LO_IRE),
+                        0.0, 1.0);
+                }
+            }
             scratch_impulseExempt[rel] = impulseExempt;
 
             if (haveCloseLuma && bevelPenalty > 0.0) {

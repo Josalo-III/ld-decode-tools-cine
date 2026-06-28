@@ -244,8 +244,14 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
+    QCommandLineOption whiteStarOption(QStringList() << "whitestar",
+        QCoreApplication::translate("main",
+            "NTSC locked mode: enable the experimental fit-based white-star chroma remedy (may lose sub-fSC detail)"));
+    parser.addOption(whiteStarOption);
+
     QCommandLineOption witnessCarrierRetractionOption(QStringList() << "witness-carrier-retraction",
-                                           QCoreApplication::translate("main", "NTSC locked mode: enable the experimental carrier-retraction and constrained-witness stages"));
+        QCoreApplication::translate("main",
+            "NTSC locked mode: enable the experimental carrier-retraction and constrained-witness stages"));
     parser.addOption(witnessCarrierRetractionOption);
 
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
@@ -529,6 +535,14 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(ntscPhaseCompOption)) {
         combConfig.phaseCompensation = true;
+    }
+
+    if (parser.isSet(whiteStarOption)) {
+        if (!combConfig.phaseCompensation) {
+            qCritical("--whitestar requires --ntsc-phase-comp");
+            return -1;
+        }
+        combConfig.whiteStar = true;
     }
 
     if (parser.isSet(witnessCarrierRetractionOption)) {
