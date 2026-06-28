@@ -75,6 +75,9 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
     if ((int)scratch_lineWorkC.size()   < width) scratch_lineWorkC.resize(width, 0.0);
     if ((int)scratch_envLine.size()     < width) scratch_envLine.resize(width, 0.0);
     if ((int)scratch_spanLine.size()    < width) scratch_spanLine.resize(width, 0.0);
+    if ((int)scratch_lurchMaxDelta.size() < width) scratch_lurchMaxDelta.resize(width, 0.0);
+    if ((int)scratch_lurchGate.size()     < width) scratch_lurchGate.resize(width, 0.0);
+    if ((int)scratch_lurchCurve.size()    < width) scratch_lurchCurve.resize(width, 0.0);
 
     struct LocalBand {
         double lo =  1e300;
@@ -379,6 +382,140 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                          + (double)rawLine[hp2]);
         };
 
+        /*
+         * Lurch membership pre-pass.
+         *
+         * Reduce each pixel's four-view membership evidence to two scalars:
+         * the peak membership delta (kept for the downstream obstruction
+         * confidence) and a transition gate (support x delta). The gate is
+         * not a correction — it localizes where a genuine luma transition
+         * sits, so the regression below knows where to free the curve from
+         * the boxcar. The displacement magnitude itself is taken from the
+         * carrier-free raw difference facts in the regression, not from this
+         * membership estimate (facts, not estimates).
+         */
+        double *lurchMaxDeltaArr = scratch_lurchMaxDelta.data();
+        double *lurchGateArr = scratch_lurchGate.data();
+
+        for (int xi = 0; xi < width; ++xi) {
+            double maxSupport = 0.0;
+            double maxDeltaIRE = 0.0;
+
+            if (evidence && evidence[xi].viewCount > 0) {
+                for (int v = 0; v < evidence[xi].viewCount; ++v) {
+                    const auto &view = evidence[xi].views[v];
+                    maxSupport = std::max(maxSupport,
+                        std::clamp((double)view.membershipSupport, 0.0, 1.0));
+                    maxDeltaIRE = std::max(maxDeltaIRE,
+                        std::fabs((double)view.membershipDeltaIRE));
+                }
+            }
+
+            const double supportGate = smoothStep01(
+                (maxSupport - LURCH_SUPPORT_START) /
+                std::max(1e-9, LURCH_SUPPORT_FULL - LURCH_SUPPORT_START));
+            const double deltaGate = smoothStep01(
+                (maxDeltaIRE - LURCH_DELTA_START_IRE) /
+                std::max(1e-9, LURCH_DELTA_FULL_IRE - LURCH_DELTA_START_IRE));
+
+            lurchMaxDeltaArr[xi] = maxDeltaIRE;
+            lurchGateArr[xi]     = supportGate * deltaGate;
+        }
+
+        /*
+         * Lurch curve regression (whole-line, banded least squares).
+         *
+         * The conservation law (each four-sample block sums carrier-free to
+         * its coarse total) and the lurch evidence are one fact in integral
+         * vs. differential form: differencing two block sums one sample apart
+         * gives Y[x+4] - Y[x] = raw[x+4] - raw[x], a same-phase pair whose
+         * carrier cancels exactly. These difference facts pin the curve's HF
+         * shape to ~1-sample edge placement (finer than the boxcar); sharpPrior
+         * anchors the LF. We SOLVE the curve rather than average a displacement,
+         * so it stays associated with the composite and never deposits a
+         * decoupled per-pixel step (the old additive correction's notch / fSC
+         * beat).
+         *
+         * The anchor is sharpPrior, NOT movingCoarse. movingCoarse is the
+         * phase-invariant evidence / membership reference (the boxcar the
+         * difference facts and lurchGate are measured against); sharpPrior is
+         * the reconstruction prior, already edge-snapped by the preconditioner
+         * and purpose-built as the solved-Y anchor. Anchoring to the blurry
+         * boxcar would make the anchor fight the difference facts at every
+         * edge; sharpPrior and the difference facts agree there.
+         *
+         * Minimise over the line:
+         *     wA  * sum_x ( Y[x+4] - Y[x] - d[x] )^2        d[x] = raw[x+4]-raw[x]
+         *   + wB[x] * ( Y[x] - sharpPrior[x] )^2
+         * subject to Y[x] within the structural carrier-amplitude band
+         * (feasibility eliminates impossible carrier excursions).
+         *
+         * wB relaxes toward a floor where lurchGate fires (a real luma
+         * transition): the curve is freed to follow the difference facts'
+         * placement. At a chroma-only transition the boxcar mean does not move,
+         * lurchGate stays ~0, wB stays firm, and the difference fact --
+         * contaminated there by the carrier amplitude change -- is correctly
+         * overruled by the anchor.
+         *
+         * Each Y[x] couples only to Y[x+-4], so the system decouples into four
+         * independent tridiagonal chains by phase (x mod 4). Projected
+         * Gauss-Seidel sweeps solve all four in place, the feasibility box
+         * applied at every update. O(width) per line.
+         */
+        double *lurchCurve = scratch_lurchCurve.data();
+        {
+            constexpr double wA      = 1.0;   // carrier-free difference facts
+            constexpr double wBbase  = 0.5;   // sharpPrior anchor, smooth regions
+            constexpr double wBfloor = 0.04;  // anchor floor at luma edges
+            constexpr int    sweeps  = 14;
+
+            const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+            const double maxCarrierAmp =
+                (grammar ? std::max(24.0, grammar->carrierScale * 5.0)
+                         : 24.0) * ireToSamples;
+
+            for (int xi = 0; xi < width; ++xi)
+                lurchCurve[xi] = sharpPrior[xi];
+
+            for (int it = 0; it < sweeps; ++it) {
+                // Alternate sweep direction so neither end is favoured (a
+                // one-way Gauss-Seidel pass would bias the curve laterally).
+                const bool fwd = (it & 1) == 0;
+                for (int s = 0; s < width; ++s) {
+                    const int xi = fwd ? s : (width - 1 - s);
+                    const double anchorW =
+                        wBfloor + (wBbase - wBfloor) *
+                        (1.0 - std::clamp(lurchGateArr[xi], 0.0, 1.0));
+
+                    double diag = anchorW;
+                    double rhs  = anchorW * sharpPrior[xi];
+
+                    if (xi + 4 < width) {
+                        const double d = (double)rawLine[left + xi + 4]
+                                       - (double)rawLine[left + xi];
+                        diag += wA;
+                        rhs  += wA * (lurchCurve[xi + 4] - d);
+                    }
+                    if (xi - 4 >= 0) {
+                        const double d = (double)rawLine[left + xi]
+                                       - (double)rawLine[left + xi - 4];
+                        diag += wA;
+                        rhs  += wA * (lurchCurve[xi - 4] + d);
+                    }
+
+                    double y = (diag > 1e-12) ? rhs / diag : sharpPrior[xi];
+
+                    // Feasibility projection: Y cannot imply a carrier
+                    // excursion beyond the structural ceiling.
+                    const double rawX = (double)rawLine[left + xi];
+                    if (y > rawX + maxCarrierAmp)      y = rawX + maxCarrierAmp;
+                    else if (y < rawX - maxCarrierAmp) y = rawX - maxCarrierAmp;
+
+                    lurchCurve[xi] = y;
+                }
+            }
+        }
+
         for (int xi = 0; xi < width; ++xi) {
             const int h = left + xi;
             const double raw = (double)rawLine[h];
@@ -458,64 +595,15 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 floorBand.include(smoothPrior);
 
             /*
-             * Lurch observations:
+             * Lurch observations (pre-pass values).
              *
-             * These are aperture-membership movements.  They sharpen luma
-             * boundaries, but they are not allowed to decide the interior of
-             * compact chroma patches.
+             * The curve refinement itself was solved line-wide in the
+             * regression pre-pass (lurchCurve). Here we only carry the peak
+             * membership delta (obstruction confidence) and the transition
+             * gate forward.
              */
-            double maxMembershipSupport = 0.0;
-            double maxMembershipDeltaIRE = 0.0;
-            double lurchNumerator = 0.0;
-            double lurchDenominator = 0.0;
-
-            if (evidence && viewCount > 0) {
-                for (int v = 0; v < viewCount; ++v) {
-                    const auto &view = evidence[xi].views[v];
-
-                    const double support =
-                        std::clamp((double)view.membershipSupport, 0.0, 1.0);
-                    const double deltaSample =
-                        (double)view.membershipDeltaSample;
-                    const double deltaIRE =
-                        std::fabs((double)view.membershipDeltaIRE);
-                    const double localX =
-                        (double)view.membershipLocalX;
-
-                    maxMembershipSupport =
-                        std::max(maxMembershipSupport, support);
-                    maxMembershipDeltaIRE =
-                        std::max(maxMembershipDeltaIRE, deltaIRE);
-
-                    if (support <= 1e-6 || deltaIRE <= 1e-6)
-                        continue;
-
-                    const double localizer =
-                        std::exp(-0.5 * (localX * localX) / (1.35 * 1.35));
-
-                    /*
-                     * membershipLocalX is edge-center minus current x.
-                     * For a positive step moving rightward:
-                     *   left side  => localX > 0 => pull down
-                     *   right side => localX < 0 => pull up
-                     */
-                    const double side = -std::tanh(localX / 1.25);
-                    const double w = support * localizer;
-
-                    lurchNumerator += w * side * deltaSample;
-                    lurchDenominator += w;
-                }
-            }
-
-            const double lurchSupportGate = smoothStep01(
-                (maxMembershipSupport - LURCH_SUPPORT_START) /
-                std::max(1e-9, LURCH_SUPPORT_FULL - LURCH_SUPPORT_START));
-
-            const double lurchDeltaGate = smoothStep01(
-                (maxMembershipDeltaIRE - LURCH_DELTA_START_IRE) /
-                std::max(1e-9, LURCH_DELTA_FULL_IRE - LURCH_DELTA_START_IRE));
-
-            const double lurchGate = lurchSupportGate * lurchDeltaGate;
+            const double maxMembershipDeltaIRE = lurchMaxDeltaArr[xi];
+            const double lurchGate             = lurchGateArr[xi];
 
             const double floorWidthIRE =
                 floorBand.valid() ? floorBand.width() * invIreScale : 64.0;
@@ -717,68 +805,36 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             };
 
             const double y1DHard = hardClamp(oneDUnclamped);
-            /*
-             * Primary broad prior, lurch-preconditioned.
-             */
-            double yPrior = sharpPrior[xi];
-            yPrior = possibleBand.clamp(yPrior);
 
             /*
-             * Lurch sharpening.
+             * Lurch-shaped prior.
              *
-             * Compact detection does not alter the ordinary boundary model.
-             * Any compact repair is applied after this path is complete.
+             * The whole-line regression already solved the carrier-free,
+             * feasibility-projected curve: coarse owns the LF, the same-phase
+             * difference facts own the HF edge placement. Adopt it directly,
+             * clamped to the local possible band. No additive per-pixel
+             * correction is applied here -- the curve is solved, not summed,
+             * so it stays associated with the composite (an averaged
+             * displacement would decouple and beat at fSC).
+             *
+             * Compact detection does not alter this boundary model; any
+             * compact repair is applied after this path is complete.
              */
-            double yLurch = yPrior;
-            if (lurchDenominator > 1e-9 && lurchGate > 0.0) {
-                const double rawCorrection =
-                    lurchNumerator / lurchDenominator;
+            double yLurch = possibleBand.clamp(lurchCurve[xi]);
 
-                // The preconditioner consumed the same membership evidence
-                // upstream; where it fired, the prior is already sharp and a
-                // second additive correction would double-apply the step.
-                const double preconditionGate = 1.0 - sharpGate[xi];
-
-                const double lurchGain =
-                    (0.80 + 0.35 * lurchGate) * preconditionGate;
-
-                const double maxCorrection =
-                    (0.60 + 0.90 * lurchGate) *
-                    std::max(0.75, maxMembershipDeltaIRE) *
-                    ireToSamples;
-
-                yLurch += std::clamp(rawCorrection * lurchGain,
-                                     -maxCorrection,
-                                      maxCorrection);
-
-                if (possibleBand.valid() &&
-                    lurchGate > 0.35)
-                {
-                    const double bandCenter = possibleBand.center();
-                    const double fromCenter = yLurch - bandCenter;
-
-                    const double signSeed =
-                        (std::fabs(rawCorrection) > 1e-9)
-                            ? rawCorrection
-                            : fromCenter;
-
-                    if (std::fabs(signSeed) > 1e-9) {
-                        const double outward = std::copysign(1.0, signSeed);
-                        const double halfBand = 0.5 * possibleBand.width();
-
-                        const double edgePush =
-                            outward *
-                            halfBand *
-                            0.18 *
-                            smoothStep01((lurchGate - 0.35) / 0.65) *
-                            preconditionGate;
-
-                        if ((yLurch - bandCenter) * outward >= -1e-9)
-                            yLurch += edgePush;
-                    }
-                }
-
-                yLurch = possibleBand.clamp(yLurch);
+            // 1D cooperation: when the curve and the phase-reliable 1D estimate
+            // diverge, trust1D arbitrates — low chroma favors 1D (no carrier
+            // leak), high chroma keeps the curve. Agreement leaves it untouched.
+            {
+                const double y1DRef = possibleBand.clamp(oneDUnclamped);
+                const double divergeIRE =
+                    std::fabs(yLurch - y1DRef) * invIreScale;
+                const double coopGate = smoothStep01(
+                    (divergeIRE - 1.0) / 3.0);
+                const double coopBlend = trust1D * coopGate;
+                if (coopBlend > 0.0)
+                    yLurch = yLurch * (1.0 - coopBlend)
+                           + y1DRef * coopBlend;
             }
 
             /*

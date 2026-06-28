@@ -600,6 +600,9 @@ private:
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
 	std::vector<double> scratch_coe_frameIQMag; // pre-computed |frameIQ[r]| magnitudes (collectCombAttributionEvidence)
 		std::vector<double> scratch_lineWorkD; // Generic per-line filter scratch.
+	std::vector<double> scratch_lurchMaxDelta; // Lurch pre-pass: max(membershipDeltaIRE) per xi
+	std::vector<double> scratch_lurchGate;     // Lurch pre-pass: combined support*delta gate per xi (anchor relaxation)
+	std::vector<double> scratch_lurchCurve;    // Lurch regression: whole-line banded-LS Y curve per xi
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;
 	std::vector<double> scratch_hpY;
