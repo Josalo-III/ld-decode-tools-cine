@@ -322,7 +322,7 @@ inline void carrierGrammarApplyAffine(const CarrierGrammarState *grammar,
 inline CarrierGrammarCompositeRemodPlan carrierGrammarCompositeRemodPlan(
     const CarrierGrammarState *grammar,
     double lineScale = 1.0,
-    CarrierSignFrame sourceFrame = CarrierSignFrame::Grid4fsc)
+    CarrierSignFrame sourceFrame = CarrierSignFrame::MetadataPreservedSigned)
 {
     CarrierGrammarCompositeRemodPlan plan;
     plan.samplePhase0 = grammar ? grammar->samplePhase0 : 0;
@@ -337,7 +337,7 @@ inline CarrierGrammarCompositeRemodCursor carrierGrammarCompositeRemodCursor(
     const CarrierGrammarState *grammar,
     int firstH,
     double lineScale = 1.0,
-    CarrierSignFrame sourceFrame = CarrierSignFrame::Grid4fsc)
+    CarrierSignFrame sourceFrame = CarrierSignFrame::MetadataPreservedSigned)
 {
     const CarrierGrammarCompositeRemodPlan plan =
         carrierGrammarCompositeRemodPlan(grammar, lineScale, sourceFrame);
@@ -378,7 +378,7 @@ inline double carrierGrammarRemod4fscToComposite(
     double i4fsc,
     double q4fsc,
     double lineScale = 1.0,
-    CarrierSignFrame sourceFrame = CarrierSignFrame::Grid4fsc)
+    CarrierSignFrame sourceFrame = CarrierSignFrame::MetadataPreservedSigned)
 {
     const CarrierGrammarCompositeRemodPlan plan =
         carrierGrammarCompositeRemodPlan(grammar, lineScale, sourceFrame);

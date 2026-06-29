@@ -532,6 +532,7 @@ private:
 	// Constrained multi-witness outputs (buildConstrainedYWitness); valid when
 	// witnessValid is true.
 	std::vector<float> yWitness_flat;                 // constrained Y reconstruction
+	std::vector<float> compactPatchGate_flat;         // compact-patch authority [0,1] per pixel
 	bool witnessValid = false;
 
 	std::vector<double> scratch_lumaBaseY4;
@@ -639,6 +640,7 @@ private:
 		//  4. Cross-line scalar averaging or magnitude compare is the only
 		//     reach use the type system blesses for this source.  That is
 		//     intentional and minimal — do not widen it without scrutiny.
+		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
 	std::vector<double> lockedLumaBaseY4_flat;
@@ -687,6 +689,18 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    locked1DSource_flat.empty()) return nullptr;
 		return locked1DSource_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline double *locked1DRawBandpass_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DRawBandpass_flat.empty()) return nullptr;
+		return locked1DRawBandpass_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const double *locked1DRawBandpass_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DRawBandpass_flat.empty()) return nullptr;
+		return locked1DRawBandpass_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Bucket-path 1D scalar: valid only after split1D().
@@ -794,7 +808,16 @@ private:
 
 	inline double remodGrammarToComposite(int line, int h,
 	                                      double I, double Q) const {
-		return remodUnsignedBucketToComposite(line, h, I, Q);
+		// The unqualified boundary assumes the producer preserved physical
+		// carrier orientation. Operations that deliberately removed it must use
+		// an explicit source-frame helper instead of changing the default.
+		return lddecode::carrierGrammarRemod4fscToComposite(
+			carrierGrammarLine(line),
+			h,
+			I,
+			Q,
+			1.0,
+			lddecode::CarrierSignFrame::MetadataPreservedSigned);
 	}
 
 	inline lddecode::CombReachSourceFrame scalarReachSource() const {
@@ -1079,6 +1102,16 @@ private:
 		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    yWitness_flat.empty()) return nullptr;
 		return yWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* compactPatchGate_line(int line) {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    compactPatchGate_flat.empty()) return nullptr;
+		return compactPatchGate_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* compactPatchGate_line(int line) const {
+		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    compactPatchGate_flat.empty()) return nullptr;
+		return compactPatchGate_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

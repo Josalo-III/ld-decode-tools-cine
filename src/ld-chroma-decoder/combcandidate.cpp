@@ -427,6 +427,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         const double chromaFloor = 0.15;
         const double dropFraction = 0.25;
         const double lumaEdgeFloor = 4.0;
+        const bool haveBothV = tapLine.haveU2 && tapLine.haveD2;
         for (int rel = 0; rel < width; ++rel) {
             const double cHere = tapLine.centerChromaT[rel];
             if (cHere < chromaFloor) {
@@ -434,6 +435,31 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 continue;
             }
             const double threshold = dropFraction * cHere;
+
+            // Vertical isolation: when the center is saturated but the ±2
+            // same-field partners carry essentially no chroma envelope,
+            // Field B's vertical comb premise (chroma extends to ±2) is
+            // structurally false.  Mark the pixel irrational regardless of
+            // horizontal compactness or luma context — catches compact
+            // saturated chroma on uniform backgrounds (warp cores, impulse
+            // ports) that the luma-edge-gated path below misses.
+            if (haveBothV) {
+                const double cU2 = tapLine.tapU2[rel].comp;
+                const double sU2 = tapLine.tapU2[rel].symMag;
+                const double cD2 = tapLine.tapD2[rel].comp;
+                const double sD2 = tapLine.tapD2[rel].symMag;
+                const double envU2 = std::sqrt(cU2 * cU2 + sU2 * sU2);
+                const double envD2 = std::sqrt(cD2 * cD2 + sD2 * sD2);
+                const double chromaTU2 =
+                    std::clamp((envU2 * invI - 2.0) / 8.0, 0.0, 1.0);
+                const double chromaTD2 =
+                    std::clamp((envD2 * invI - 2.0) / 8.0, 0.0, 1.0);
+                if (chromaTU2 < threshold && chromaTD2 < threshold) {
+                    tapLine.irrationalChroma[rel] = cHere;
+                    continue;
+                }
+            }
+
             double minLeft = cHere;
             double minRight = cHere;
             for (int k = 2; k <= kSupport; ++k) {
@@ -2215,6 +2241,9 @@ void Comb::FrameBuffer::computeFrameBLine(
     const double *preclean0  = precleanLinePtr(line, width);
     const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
     const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
+    const float *compact0 = compactPatchGate_line(line);
+    const double *irr0 = ((int)reachTapLine.irrationalChroma.size() >= width)
+        ? reachTapLine.irrationalChroma.data() : nullptr;
 
     auto phaseCursor = [&](int ln) {
         return carrierGrammarSignedSampleCursor(
@@ -2226,36 +2255,53 @@ void Comb::FrameBuffer::computeFrameBLine(
     auto phaseUpCursor = phaseCursor(haveUpLine ? line - 1 : line);
     auto phaseDnCursor = phaseCursor(haveDnLine ? line + 1 : line);
 
-    // Symmetric round-trip with the demod: Frame B's input was demodded with
-    // carrierGrammarSignedSampleClass (Grid4fscIQ in), so the remod here must
-    // also be signed to land back in the physical composite frame that
-    // produceY's `raw - clpLine` subtraction expects.  Using the unsigned
-    // sample class would leave clpLine in a lineFlip-stripped convention and
-    // mis-cancel the chroma in produceY → checkerboard with flipped polarity
-    // rather than no checkerboard.
-    auto remodCursor = carrierGrammarSignedSampleCursor(
+    // Preclean and cached locked 1D have different scalar round-trip
+    // contracts.  Keep both cursors live so a per-pixel cede cannot desync the
+    // carrier phase of every pixel that follows it.
+    auto signedRemodCursor = carrierGrammarSignedSampleCursor(
         configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
         left);
+    auto gridRemodCursor = lddecode::carrierGrammarCompositeRemodCursor(
+        configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
+        left,
+        1.0,
+        lddecode::CarrierSignFrame::Grid4fsc);
 
     const auto &T = configuration.tunables;
     const double combStrength =
         std::clamp(std::max(0.0, T.FRAME_B_COMB_STRENGTH), 0.0, 1.0);
     const double maxDeltaIRE = std::max(0.0, T.FRAME_B_RAW_MAX_DELTA_IRE);
+    constexpr float FRAME_B_COMPACT_PATCH_SELECT_GATE = 0.72f;
+    constexpr double FRAME_B_IRRATIONAL_SELECT_GATE = 0.0;
+    static const bool forceFrameBLocked1D = [] {
+        const char *s = std::getenv("LD_FRAME_B_FORCE_LOCKED_1D");
+        return s && std::atoi(s) != 0;
+    }();
+
+    auto cedeToLockedCenter = [&](const float *row, const double *irrRow, int x) -> bool {
+        return forceFrameBLocked1D ||
+               (irrRow && irrRow[x] > FRAME_B_IRRATIONAL_SELECT_GATE) ||
+               (row && row[x] >= FRAME_B_COMPACT_PATCH_SELECT_GATE);
+    };
 
     for (int x = 0; x < width; ++x) {
-        const std::complex<double> Z0 = preclean0
+        const bool useLockedCenter = cedeToLockedCenter(compact0, irr0, x);
+
+        // Always consume the signed preclean cursors. Conditional consumption
+        // shifts all later samples onto the wrong carrier leg after the first
+        // compact-patch cede.
+        const std::complex<double> Z0Preclean = preclean0
             ? carrierGrammarDemodSignedCompositeTo4fsc(phase0Cursor, preclean0[x])
-            : std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x]);
+            : std::complex<double>(0.0, 0.0);
         const std::complex<double> ZUp = precleanUp
             ? carrierGrammarDemodSignedCompositeTo4fsc(phaseUpCursor, precleanUp[x])
-            : ((tiUp_raw && tqUp_raw)
-                ? std::complex<double>((double)tiUp_raw[x], (double)tqUp_raw[x])
-                : std::complex<double>(0.0, 0.0));
+            : std::complex<double>(0.0, 0.0);
         const std::complex<double> ZDn = precleanDn
             ? carrierGrammarDemodSignedCompositeTo4fsc(phaseDnCursor, precleanDn[x])
-            : ((tiDn_raw && tqDn_raw)
-                ? std::complex<double>((double)tiDn_raw[x], (double)tqDn_raw[x])
-                : std::complex<double>(0.0, 0.0));
+            : std::complex<double>(0.0, 0.0);
+        const std::complex<double> Z0 = useLockedCenter
+            ? std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x])
+            : Z0Preclean;
 
         double upReach = 0.0;
         double dnReach = 0.0;
@@ -2271,7 +2317,11 @@ void Comb::FrameBuffer::computeFrameBLine(
         }
 
         std::complex<double> Zout = Z0;
-        if (upReach > 0.0 || dnReach > 0.0) {
+        // Compact patches cede atomically to center 1D. Mixing a cached center
+        // with signed-preclean neighbors would combine different sign frames;
+        // feeding cached 1D to all three legs would still run the mechanism we
+        // are explicitly declining here.
+        if (!useLockedCenter && (upReach > 0.0 || dnReach > 0.0)) {
             const bool haveUp = upReach > 0.0 && cmag2(ZUp) > 1e-18;
             const bool haveDn = dnReach > 0.0 && cmag2(ZDn) > 1e-18;
 
@@ -2297,8 +2347,16 @@ void Comb::FrameBuffer::computeFrameBLine(
         }
 
         outFrameIQ[x] = Zout;
-        outFrameScalar[x] =
-            carrierGrammarRemodSigned4fscToComposite(remodCursor, Zout.real(), Zout.imag());
+        if (useLockedCenter) {
+            outFrameScalar[x] =
+                lddecode::carrierGrammarRemod4fscToComposite(
+                    gridRemodCursor, Zout.real(), Zout.imag());
+            lddecode::carrierGrammarAdvanceSignedSampleCursor(signedRemodCursor);
+        } else {
+            outFrameScalar[x] = carrierGrammarRemodSigned4fscToComposite(
+                signedRemodCursor, Zout.real(), Zout.imag());
+            lddecode::carrierGrammarAdvanceRemodCursor(gridRemodCursor);
+        }
     }
 }
 

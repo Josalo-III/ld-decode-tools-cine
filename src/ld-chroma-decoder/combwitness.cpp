@@ -48,6 +48,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
     };
 
     ensure(yWitness_flat);
+    ensure(compactPatchGate_flat);
 
     if ((int)scratch_lumaBaseY4.size() < width) scratch_lumaBaseY4.resize(width, 0.0);
     if ((int)scratch_lumaSmooth.size()  < width) scratch_lumaSmooth.resize(width, 0.0);
@@ -284,6 +285,8 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
 
         float *yWit    = yWitness_flat.data()
                        + static_cast<size_t>(line) * width;
+        float *patchGateRow = compactPatchGate_flat.data()
+                            + static_cast<size_t>(line) * width;
 
         // The interline-combed carrier (from buildCarrierRetracted) is the
         // honest chroma test. raw - coarse re-admits luma-step energy as false
@@ -640,6 +643,7 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 patchVetoGate,
                 0.0,
                 1.0);
+            patchGateRow[xi] = static_cast<float>(compactPatchGate);
 
             /*
              * The four coarse floors define possible Y. Compact detection does

@@ -490,9 +490,11 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
+            compactPatchGate_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         }
         scratch_frameBDirectIQComposite.assign(width, 0.0);
         scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
@@ -829,6 +831,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double FVF_SMALL_DIFF_IRE = (T.FVF_SMALL_DIFF_IRE > 0.0) ? T.FVF_SMALL_DIFF_IRE : 3.0;
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
     const AttributionEvidence *attrRow = attributionEvidence_line(line);
+    const float *compactPatchRow = compactPatchGate_line(line);
     const double *attrAuthorityRow =
         ((int)scratch_attrMembershipY.size() >= width)
             ? scratch_attrMembershipY.data()
@@ -1521,6 +1524,24 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
+            const double compactPatchGate = compactPatchRow
+                ? std::clamp((double)compactPatchRow[rel], 0.0, 1.0)
+                : 0.0;
+            const double compactPatchElectionT = std::clamp(
+                (compactPatchGate - 0.55) / (0.72 - 0.55), 0.0, 1.0);
+
+            if (compactPatchElectionT > 0.0) {
+                const double fieldPenalty =
+                    compactPatchElectionT * (0.18 + 0.10 * sat_t);
+                scoreB *= (1.0 + fieldPenalty);
+
+                if (!frameInsane && !managementVeto) {
+                    const double frameBonus =
+                        compactPatchElectionT * (0.16 + 0.10 * sat_t);
+                    scoreR *= (1.0 - frameBonus);
+                }
+            }
+
             auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
                 idx   = candIdx;
                 val   = candVal;
@@ -1560,6 +1581,22 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
+            if (compactPatchElectionT > 0.0 &&
+                idx == 1 &&
+                !frameInsane &&
+                !managementVeto)
+            {
+                const double dBL = std::fabs(lumFB - L1) * invI;
+                const double dRL = std::fabs(lumFR - L1) * invI;
+                const double frameCompetitiveScale =
+                    1.0 + (0.10 + 0.14 * compactPatchElectionT);
+                const bool frameCompetitive = scoreR <= scoreB * frameCompetitiveScale;
+                const bool frameNearRail = dRL <= dBL + (1.75 - 0.75 * compactPatchElectionT);
+
+                if (frameCompetitive && frameNearRail)
+                    pickCandidate(2, FR, 0.78f);
+            }
+
 
             // Subtle hysteresis (switch veto) in soft regions
             if (rel > 0) {
@@ -1568,6 +1605,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (prevIdx >= 0 && prevIdx <= 2 && idx != prevIdx) {
 
                     const bool hystOk =
+                        (compactPatchElectionT <= 0.0) &&
                         (chromaMagIRE <= SAT_FALLBACK_START) &&
                         !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) &&
                         !((chromaMagIRE > CHROMA_STRONG_IRE) && (vIRE > VERT_THRESH_IRE));
@@ -1627,6 +1665,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         bool changed = false;
 
         for (int rel = 1; rel < width - 1; ++rel) {
+            if (compactPatchRow && compactPatchRow[rel] > 0.55f) continue;
             if (satMap[rel] > SAT_FALLBACK_START) continue;
             const double hEdgeIRE = (rel < (int)tapLine.hLumaDeltaIRE.size())
                 ? tapLine.hLumaDeltaIRE[rel]
@@ -1676,6 +1715,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (cntF > 0 && (cntA + cntB) > 0) {
                     int blockIdx = (cntA >= cntB) ? 0 : 1;
                     for (int r = b; r < e; ++r) {
+                        if (compactPatchRow && compactPatchRow[r] > 0.55f)
+                            continue;
                         winner[r] = blockIdx;
                         if (blockIdx == 0) { outVal[r] = candidateA[r]; outShade[r] = 0.25f; }
                         else               { outVal[r] = fieldB[r]; outShade[r] = 0.35f; }
@@ -1970,10 +2011,18 @@ void Comb::FrameBuffer::split2D()
     if (width <= 0 || firstLine >= lastLine) return;
 
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
+        static const bool useLockedRawBandpassLine = [] {
+            const char *s = std::getenv("LD_LINE_USE_LOCKED_RAW_BANDPASS");
+            return s && std::atoi(s) != 0;
+        }();
         for (int line = firstLine; line < lastLine; ++line) {
             double *dst = clpbuffer[1].pixel[line];
-            const double *lockedRow = configuration.phaseCompensation
-                ? locked1DSource_line(line) : nullptr;
+            const double *lockedRow = nullptr;
+            if (configuration.phaseCompensation) {
+                lockedRow = useLockedRawBandpassLine
+                    ? locked1DRawBandpass_line(line)
+                    : locked1DSource_line(line);
+            }
             if (lockedRow) {
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = lockedRow[rel];
             } else {

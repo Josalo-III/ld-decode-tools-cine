@@ -302,11 +302,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         double i4Scale[4];
         double q4Scale[4];
         double magnitudeScale[4];
-        double remodScale[4];
-
-        const auto remodPlan =
-            lddecode::carrierGrammarCompositeRemodPlan(
-                grammar, 1.0, lddecode::CarrierSignFrame::Grid4fsc);
 
         for (int phase = 0; phase < 4; ++phase) {
             lockedTo4fsc(
@@ -315,32 +310,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
             magnitudeScale[phase] =
                 std::hypot(i4Scale[phase], q4Scale[phase]);
-
-            remodScale[phase] =
-                lddecode::carrierGrammarRemod4fscToComposite(
-                    remodPlan,
-                    phase - remodPlan.samplePhase0,
-                    i4Scale[phase],
-                    q4Scale[phase]);
-        }
-
-        // ---- Per-leg remod-scale diagnostic (gated, no output) ----
-        // lockedSource = source * remodScale[phase].  If remodScale is not flat
-        // across the four legs, that multiply is a period-4 amplitude modulation
-        // on the carrier == 2fsc checkerboard, structural to the locked path.
-        static const int ccDiagRemodLine = []{
-            const char *s = std::getenv("CC_DIAG_LINE"); return s ? std::atoi(s) : -1;
-        }();
-        if (ccDiagRemodLine >= 0 && line == ccDiagRemodLine) {
-            std::fprintf(stderr,
-                "CCREMOD line=%d locked=%d remod=[%.4f %.4f %.4f %.4f] "
-                "mag=[%.4f %.4f %.4f %.4f] i4=[%.4f %.4f %.4f %.4f] "
-                "q4=[%.4f %.4f %.4f %.4f]\n",
-                line, grammarLocked ? 1 : 0,
-                remodScale[0], remodScale[1], remodScale[2], remodScale[3],
-                magnitudeScale[0], magnitudeScale[1], magnitudeScale[2], magnitudeScale[3],
-                i4Scale[0], i4Scale[1], i4Scale[2], i4Scale[3],
-                q4Scale[0], q4Scale[1], q4Scale[2], q4Scale[3]);
         }
 
         float *demodI = demodTI_line(line);
@@ -353,6 +322,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             demodIQMag4fsc_flat.data() +
             static_cast<size_t>(line) * demodWidth;
 
+        double *rawBandpass = locked1DRawBandpass_line(line);
         double *bpLine = scratch_preI.data();
         double *restrainedLine = scratch_preQ.data();
 
@@ -370,6 +340,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double p2 = rawAtRel(rel + 2);
 
             bpLine[rel] = 0.50 * c - 0.25 * (m2 + p2);
+        }
+        if (rawBandpass) {
+            for (int rel = 0; rel < width; ++rel)
+                rawBandpass[rel] = bpLine[rel];
         }
 
         // Pass 1b: carrier-absence rewrite (the "star fix").
@@ -640,7 +614,12 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         }
 
         // Pass 3: publish the restrained source through the existing locked
-        // carrier grammar.
+        // carrier grammar. The burst-aware LUTs build common-4fsc IQ; the
+        // scalar publish must then defer to the carrier-grammar remod cursor so
+        // samplePhase0 / line-flip policy lives in one place instead of in the
+        // old per-leg scale math.
+        auto remodCursor = lddecode::carrierGrammarCompositeRemodCursor(
+            grammar, left, 1.0, lddecode::CarrierSignFrame::Grid4fsc);
         for (int rel = 0; rel < width; ++rel) {
             const int h = left + rel;
             const int phase = carrierSampleClass(line, h);
@@ -662,7 +641,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 std::fabs(source) * magnitudeScale[phase];
 
             magnitude[rel] = static_cast<float>(chromaMagnitude);
-            lockedSource[rel] = source * remodScale[phase];
+            lockedSource[rel] =
+                lddecode::carrierGrammarRemod4fscToComposite(
+                    remodCursor, i4, q4);
 
             if (attribution) {
                 AttributionFacts &facts = attribution[rel].facts;
