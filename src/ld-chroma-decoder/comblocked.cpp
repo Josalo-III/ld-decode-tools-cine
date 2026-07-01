@@ -139,10 +139,6 @@ void Comb::FrameBuffer::buildCarrierAnalysis()
     const int width = right - left;
     const int fullWidth = videoParameters.fieldWidth;
 
-    static const int ccDiagLine = []{
-        const char *s = std::getenv("CC_DIAG_LINE");
-        return s ? std::atoi(s) : -1;
-    }();
     static const int crDiagLine = []{
         const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
         return s ? std::atoi(s) : -1;
@@ -154,13 +150,6 @@ void Comb::FrameBuffer::buildCarrierAnalysis()
     static const int crDiagC1 = []{
         const char *s = std::getenv("COARSE_RESID_DIAG_C1");
         return s ? std::atoi(s) : -1;
-    }();
-    static const int parallaxRepairMode = []{
-        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
-        if (!s) return 0;
-        if (std::strcmp(s, "report") == 0) return 1;
-        if (std::strcmp(s, "apply") == 0) return 2;
-        return 0;
     }();
     static const double parallaxRepairTolIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_TOL_IRE");
@@ -174,29 +163,17 @@ void Comb::FrameBuffer::buildCarrierAnalysis()
     carrierRetractionModelValid = false;
 
     const size_t count = static_cast<size_t>(demodLines) * demodWidth;
-    const bool analysisRequested =
-        configuration.lumaWitness ||
-        parallaxRepairMode != 0 ||
-        crDiagLine >= 0 ||
-        ccDiagLine >= 0;
-    if (analysisRequested && carrierAnalysis_flat.size() < count) {
+    if (carrierAnalysis_flat.size() < count) {
         carrierAnalysis_flat.assign(count, lddecode::CarrierAnalysisRecord{});
     }
-
-    const bool residualRequested =
-        parallaxRepairMode != 0 || crDiagLine >= 0;
 
     constexpr int kNarrowWin = 16;
     constexpr int kWideWin = 32;
     static const double cosRef[4] = { 1.0, 0.0, -1.0, 0.0 };
     static const double sinRef[4] = { 0.0, 1.0,  0.0, -1.0 };
 
-    std::vector<double> preI;
-    std::vector<double> preQ;
-    if (residualRequested) {
-        preI.resize(width + 1, 0.0);
-        preQ.resize(width + 1, 0.0);
-    }
+    std::vector<double> preI(width + 1, 0.0);
+    std::vector<double> preQ(width + 1, 0.0);
 
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine =
@@ -308,7 +285,7 @@ void Comb::FrameBuffer::buildCarrierAnalysis()
             }
         }
 
-        if (!residualRequested || !analysis)
+        if (!analysis)
             continue;
 
         preI[0] = 0.0;
@@ -409,13 +386,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     static const double crDiagFitTolIRE = []{
         const char *s = std::getenv("COARSE_RESID_DIAG_FIT_TOL_IRE");
         return s ? std::atof(s) : 1.5;
-    }();
-    static const int parallaxRepairMode = []{
-        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
-        if (!s) return 0;
-        if (std::strcmp(s, "report") == 0) return 1;
-        if (std::strcmp(s, "apply") == 0) return 2;
-        return 0;
     }();
     static const double parallaxRepairTolIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_TOL_IRE");
@@ -569,19 +539,17 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
         }
 
-        // Pass 1.5: optional coarse-residual feasibility repair for locked 1D.
+        // Pass 1.5: coarse-residual feasibility repair for locked 1D.
         //
-        // This is an experiment and is disabled by default.  The ordinary 1D
-        // bandpass remains the source authority; every scanner below only gets
-        // to justify a small bounded move toward a short-fit-compatible subset
-        // of legal residual options.  Coarse residuals are options, not carrier
-        // estimates.  The short fit is a selector, not carrier authority.  The
-        // moving-centered residual is support/conflict evidence only.  The wide
-        // fit is comparison-only and never participates in survivor selection.
-        if (carrierAnalysis &&
-            (parallaxRepairMode != 0 || crDiagLine >= 0))
+        // The ordinary 1D bandpass remains the source authority; every scanner
+        // below only gets to justify a small bounded move toward a short-fit-
+        // compatible subset of legal residual options. Coarse residuals are
+        // options, not carrier estimates. The short fit is a selector, not
+        // carrier authority. The moving-centered residual is support/conflict
+        // evidence only. The wide fit is comparison-only and never participates
+        // in survivor selection.
+        if (carrierAnalysis)
         {
-            const bool repairApply = parallaxRepairMode == 2;
             const bool repairLogThisLine =
                 crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
             const int repairLogFirst =
@@ -654,18 +622,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                             -maxDeltaSamples,
                             maxDeltaSamples);
 
-                        if (repairApply) {
-                            reason = "apply";
-                            bpLine[rel] = sourceSample + appliedDelta;
-                            if (repairStrengthRow && maxDeltaSamples > 1e-9) {
-                                repairStrengthRow[rel] = static_cast<float>(
-                                    std::clamp(
-                                        std::fabs(appliedDelta) / maxDeltaSamples,
-                                        0.0,
-                                        1.0));
-                            }
-                        } else {
-                            reason = "propose";
+                        reason = "apply";
+                        bpLine[rel] = sourceSample + appliedDelta;
+                        if (repairStrengthRow && maxDeltaSamples > 1e-9) {
+                            repairStrengthRow[rel] = static_cast<float>(
+                                std::clamp(
+                                    std::fabs(appliedDelta) / maxDeltaSamples,
+                                    0.0,
+                                    1.0));
                         }
                     }
                 }
@@ -673,8 +637,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 if (repairLogThisLine &&
                     rel >= repairLogFirst && rel <= repairLogLast)
                 {
-                    const char *mode =
-                        parallaxRepairMode == 2 ? "apply" : "report";
                     std::fprintf(stderr,
                         "COARSERESREPAIR line=%d rel=%d h=%d phase=%d "
                         "mode=%s reason=%s sourceBp=%.6f shortFit=%.6f "
@@ -684,7 +646,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                         "appliedDeltaIRE=%.6f movingDistIRE=%.6f "
                         "maxAbsMembershipIRE=%.6f sourceMinusShortIRE=%.6f "
                         "shortMinusWideIRE=%.6f sourceMinusWideIRE=%.6f\n",
-                        line, rel, left + rel, p, mode, reason, sourceSample,
+                        line, rel, left + rel, p, "default", reason, sourceSample,
                         shortSample, wideSample, movingResidual, optionCount,
                         survivorCount, survivorLo, survivorHi,
                         std::max(0.0, parallaxRepairTolIRE),
@@ -2216,13 +2178,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
     const auto &T       = configuration.tunables;
-    static const int parallaxRepairMode = []{
-        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
-        if (!s) return 0;
-        if (std::strcmp(s, "report") == 0) return 1;
-        if (std::strcmp(s, "apply") == 0) return 2;
-        return 0;
-    }();
     static const double parallaxRepairMaxDeltaIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
         return s ? std::atof(s) : 0.35;
@@ -2801,8 +2756,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     sharedSurvivors > 0 &&
                     sharedSurvivors < sharedResidual.optionCount &&
                     sharedResidual.movingCompatible;
-                if (parallaxRepairMode == 2 &&
-                    sharedUseful &&
+                if (sharedUseful &&
                     !(cf >= sharedResidual.survivorLo &&
                       cf <= sharedResidual.survivorHi))
                 {

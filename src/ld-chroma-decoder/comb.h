@@ -644,10 +644,9 @@ private:
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
 		std::vector<float> locked1DParallaxRepairStrength_flat; // [0,1] actual Pass-1.5 applied repair strength
-	// Optional application-neutral carrier facts. Allocated only when a
-	// carrier-analysis client (luma witness, diagnostics, or the 1D parallax
-	// experiment) asks for them; ordinary locked output pays no additional
-	// per-pixel storage cost.
+	// Application-neutral carrier facts produced for every locked frame. The
+	// default 1D feasibility repair, luma witness, and diagnostics all consume
+	// this single shared analysis rather than privately reconstructing it.
 		std::vector<lddecode::CarrierAnalysisRecord> carrierAnalysis_flat;
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
 	std::vector<double> lockedLumaBaseY4_flat;
