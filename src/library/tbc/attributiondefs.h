@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace lddecode {
 
@@ -109,6 +110,200 @@ struct FourViewCarrierAttribution {
     CarrierResidualConsensus residualConsensus;
     double latticeRiskIRE = 0.0;
 };
+
+// Central, application-neutral carrier analysis.
+//
+// These records contain observations and compatibility results only.  They do
+// not say how much carrier to render, how much colour to suppress, or which Y
+// candidate should win.  In particular, the fit samples and residual bounds
+// below must never be used as replacement waveforms merely because they are
+// available here.
+struct CarrierFitDiagnostics {
+    float sourceSample = 0.0f;          // ordinary carrier-band source
+    float shortSample = 0.0f;           // local coherent fit
+    float wideSample = 0.0f;            // comparison-only wide coherent fit
+    float shortMagnitudeIRE = 0.0f;
+    float wideMagnitudeIRE = 0.0f;
+    float sourceMinusShortIRE = 0.0f;
+    float shortMinusWideIRE = 0.0f;
+    float sourceMinusWideIRE = 0.0f;
+    bool valid = false;
+};
+
+// Compatibility of a fit sample with the discrete legal coarse-residual
+// options.  The interval is only the extent of the surviving option set; its
+// centre is not an estimate and the options must not be averaged together.
+struct CarrierResidualDiagnostics {
+    // Preserve the actual discrete options.  Consumers must not reconstruct
+    // them from survivorLo/Hi or treat the interval between them as observed.
+    float optionSamples[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Kept as doubles because bounded application policy clamps the original
+    // double-precision source to these exact observed survivors. Publishing
+    // them must not introduce a new quantization step versus the pre-extraction
+    // construction.
+    double survivorLo = 0.0;
+    double survivorHi = 0.0;
+    float movingResidualSample = 0.0f;
+    float residualSpreadIRE = 0.0f;
+    float maxAbsMembershipIRE = 0.0f;
+    float nearestFitDistanceIRE = 0.0f;
+    float movingDistanceIRE = 0.0f;
+    float toleranceIRE = 0.0f;
+    std::uint8_t optionCount = 0;
+    std::uint8_t survivorMask = 0;
+    bool movingCompatible = false;
+    bool valid = false;
+
+    int survivorCount() const {
+        int n = 0;
+        std::uint8_t bits = survivorMask;
+        while (bits != 0) {
+            n += bits & 1u;
+            bits >>= 1u;
+        }
+        return n;
+    }
+};
+
+// Compact publication of the richer four-view carrier analysis.  The complete
+// per-view evidence remains in FourViewPixelEvidence where a client needs to
+// inspect individual legal apertures.
+struct CarrierParallaxDiagnostics {
+    float commonSample = 0.0f;
+    float commonMagnitudeIRE = 0.0f;
+    float ySpreadIRE = 0.0f;
+    float yCurvatureIRE = 0.0f;
+    float carrierSpreadIRE = 0.0f;
+    float carrierCoherence = 0.0f;
+    float sampleFitErrorIRE = 0.0f;
+    float sampleCoherence = 0.0f;
+    float latticeRiskIRE = 0.0f;
+    float residualLo = 0.0f;
+    float residualHi = 0.0f;
+    float residualTrust = 0.0f;
+    bool residualValid = false;
+    bool valid = false;
+};
+
+struct CarrierAnalysisRecord {
+    CarrierFitDiagnostics fit;
+    CarrierResidualDiagnostics residual;
+    CarrierParallaxDiagnostics parallax;
+    float carrierImpurity = 0.0f;       // detector output, not transfer policy
+};
+
+struct CarrierResidualOption {
+    double sample = 0.0;
+    double membershipDeltaIRE = 0.0;
+};
+
+// Evaluate a local fit against the legal residual options without collapsing
+// those options into a coarse estimate.  The moving-centred residual is an
+// independent scanner: it can support or conflict with the surviving subset,
+// but it is never inserted into that subset.
+inline CarrierResidualDiagnostics analyzeCarrierResidualOptions(
+    const CarrierResidualOption *options,
+    int optionCount,
+    double shortFitSample,
+    double toleranceSamples,
+    double toleranceIRE,
+    double movingResidualSample,
+    double invIreScale)
+{
+    CarrierResidualDiagnostics out;
+    optionCount = std::clamp(optionCount, 0, 4);
+    out.optionCount = static_cast<std::uint8_t>(optionCount);
+    out.movingResidualSample = static_cast<float>(movingResidualSample);
+    out.toleranceIRE = static_cast<float>(std::max(0.0, toleranceIRE));
+    if (!options || optionCount <= 0)
+        return out;
+
+    double optionLo = options[0].sample;
+    double optionHi = options[0].sample;
+    double survivorLo = 1e300;
+    double survivorHi = -1e300;
+    double nearestDistance = 1e300;
+    double maxAbsMembershipIRE = 0.0;
+
+    for (int i = 0; i < optionCount; ++i) {
+        const double sample = options[i].sample;
+        out.optionSamples[i] = static_cast<float>(sample);
+        optionLo = std::min(optionLo, sample);
+        optionHi = std::max(optionHi, sample);
+        maxAbsMembershipIRE = std::max(
+            maxAbsMembershipIRE,
+            std::fabs(options[i].membershipDeltaIRE));
+
+        const double distance = std::fabs(sample - shortFitSample);
+        nearestDistance = std::min(nearestDistance, distance);
+        if (distance <= toleranceSamples) {
+            out.survivorMask |= static_cast<std::uint8_t>(1u << i);
+            survivorLo = std::min(survivorLo, sample);
+            survivorHi = std::max(survivorHi, sample);
+        }
+    }
+
+    out.residualSpreadIRE = static_cast<float>(
+        (optionHi - optionLo) * invIreScale);
+    out.maxAbsMembershipIRE = static_cast<float>(maxAbsMembershipIRE);
+    out.nearestFitDistanceIRE = static_cast<float>(
+        nearestDistance * invIreScale);
+    out.valid = true;
+
+    if (out.survivorMask == 0)
+        return out;
+
+    out.survivorLo = survivorLo;
+    out.survivorHi = survivorHi;
+
+    double movingDistance = 0.0;
+    if (movingResidualSample < survivorLo)
+        movingDistance = survivorLo - movingResidualSample;
+    else if (movingResidualSample > survivorHi)
+        movingDistance = movingResidualSample - survivorHi;
+    out.movingDistanceIRE = static_cast<float>(movingDistance * invIreScale);
+    out.movingCompatible =
+        movingResidualSample >= survivorLo - toleranceSamples &&
+        movingResidualSample <= survivorHi + toleranceSamples;
+    return out;
+}
+
+struct CarrierImpurityEvidence {
+    double narrowMagIRE = 0.0;
+    double wideMagIRE = 0.0;
+    double phaseAgreement = 0.0;
+    double carrierCoherence = 0.0;
+    double carrierConflict = 0.0;
+    double lumaMembership = 0.0;
+};
+
+inline double detectCarrierImpurity(const CarrierImpurityEvidence &e)
+{
+    if (e.narrowMagIRE <= 1.5 || e.wideMagIRE >= e.narrowMagIRE)
+        return 0.0;
+
+    const double excessFraction = std::clamp(
+        (e.narrowMagIRE - e.wideMagIRE) /
+            std::max(1.5, e.narrowMagIRE),
+        0.0,
+        1.0);
+
+    const double lumaSupport = std::max(
+        clamp01(e.lumaMembership),
+        clamp01(e.carrierConflict));
+
+    const double coherentChromaProtect =
+        clamp01(e.phaseAgreement) *
+        clamp01(e.carrierCoherence) *
+        (1.0 - clamp01(e.carrierConflict));
+
+    const double classification = std::clamp(
+        0.20 + 0.80 * lumaSupport - 0.65 * coherentChromaProtect,
+        0.0,
+        1.0);
+
+    return excessFraction * classification;
+}
 
 inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
     const FourViewCarrierView *views,

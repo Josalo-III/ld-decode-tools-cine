@@ -244,15 +244,10 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
-    QCommandLineOption whiteStarOption(QStringList() << "whitestar",
+    QCommandLineOption lumaWitnessOption(QStringList() << "luma-witness",
         QCoreApplication::translate("main",
-            "NTSC locked mode: enable the experimental fit-based white-star chroma remedy (may lose sub-fSC detail)"));
-    parser.addOption(whiteStarOption);
-
-    QCommandLineOption witnessCarrierRetractionOption(QStringList() << "witness-carrier-retraction",
-        QCoreApplication::translate("main",
-            "NTSC locked mode: enable the experimental carrier-retraction and constrained-witness stages"));
-    parser.addOption(witnessCarrierRetractionOption);
+            "NTSC locked mode: enable the experimental luma-witness stages"));
+    parser.addOption(lumaWitnessOption);
 
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
                                              QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
@@ -537,20 +532,12 @@ int main(int argc, char *argv[])
         combConfig.phaseCompensation = true;
     }
 
-    if (parser.isSet(whiteStarOption)) {
+    if (parser.isSet(lumaWitnessOption)) {
         if (!combConfig.phaseCompensation) {
-            qCritical("--whitestar requires --ntsc-phase-comp");
+            qCritical("--luma-witness requires --ntsc-phase-comp");
             return -1;
         }
-        combConfig.whiteStar = true;
-    }
-
-    if (parser.isSet(witnessCarrierRetractionOption)) {
-        if (!combConfig.phaseCompensation) {
-            qCritical("--witness-carrier-retraction requires --ntsc-phase-comp");
-            return -1;
-        }
-        combConfig.witnessCarrierRetraction = true;
+        combConfig.lumaWitness = true;
     }
 
     // Residual video rollout: locked mode defaults to both residual Y and

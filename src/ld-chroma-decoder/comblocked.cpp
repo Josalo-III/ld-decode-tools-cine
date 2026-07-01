@@ -21,71 +21,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <QtGlobal>
 
 namespace {
 
-// Carrier impurity (cross-color) detector evidence and policy, restored with
-// the witness/carrier-retraction path.  detectCarrierImpurity is the
-// six-evidence classifier buildCarrierRetracted() uses; carrierImpurityTransfer-
-// Strength is the explicit detector->policy conversion that gates how much of
-// the measured incoherent excess is moved from carrier to Y.
-struct CarrierImpurityEvidence {
-    double narrowMagIRE = 0.0;
-    double wideMagIRE = 0.0;
-    double phaseAgreement = 0.0;
-    double carrierCoherence = 0.0;
-    double carrierConflict = 0.0;
-    double lumaMembership = 0.0;
-};
-
 inline double smoothGate01(double t)
 {
     t = std::clamp(t, 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
-}
-
-inline double detectCarrierImpurity(const CarrierImpurityEvidence &e)
-{
-    if (e.narrowMagIRE <= 1.5 || e.wideMagIRE >= e.narrowMagIRE)
-        return 0.0;
-
-    const double excessFraction = std::clamp(
-        (e.narrowMagIRE - e.wideMagIRE) /
-            std::max(1.5, e.narrowMagIRE),
-        0.0,
-        1.0);
-
-    const double lumaSupport = std::max(
-        std::clamp(e.lumaMembership, 0.0, 1.0),
-        std::clamp(e.carrierConflict, 0.0, 1.0));
-
-    const double coherentChromaProtect =
-        std::clamp(e.phaseAgreement, 0.0, 1.0) *
-        std::clamp(e.carrierCoherence, 0.0, 1.0) *
-        (1.0 - std::clamp(e.carrierConflict, 0.0, 1.0));
-
-    // Magnitude disagreement is only the invitation. Luma-membership or
-    // carrier-model conflict must support it, while a coherent phase-matched
-    // carrier protects legitimate chroma envelope transitions.
-    const double classification = std::clamp(
-        0.20 + 0.80 * lumaSupport - 0.65 * coherentChromaProtect,
-        0.0,
-        1.0);
-
-    return excessFraction * classification;
-}
-
-inline double carrierImpurityTransferStrength(double impurity,
-                                              double lumaMembership)
-{
-    // Explicit detector-to-policy conversion. The detector does not state how
-    // much waveform to move; membership support controls that promotion.
-    return std::clamp(
-        impurity * (0.35 + 0.65 * std::clamp(lumaMembership, 0.0, 1.0)),
-        0.0,
-        0.85);
 }
 
 } // namespace
@@ -185,6 +130,263 @@ void Comb::FrameBuffer::phaseLocked()
 //   - publish:     write demod buffers, locked 4fsc buffers, magnitude, and
 //                  lockedSource from the cleaned I/Q
 
+void Comb::FrameBuffer::buildCarrierAnalysis()
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    const int fullWidth = videoParameters.fieldWidth;
+
+    static const int ccDiagLine = []{
+        const char *s = std::getenv("CC_DIAG_LINE");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int crDiagLine = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int crDiagC0 = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_C0");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int crDiagC1 = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_C1");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int parallaxRepairMode = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
+        if (!s) return 0;
+        if (std::strcmp(s, "report") == 0) return 1;
+        if (std::strcmp(s, "apply") == 0) return 2;
+        return 0;
+    }();
+    static const double parallaxRepairTolIRE = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_TOL_IRE");
+        return s ? std::atof(s) : 0.5;
+    }();
+
+    if (!configuration.phaseCompensation || width <= 0 || first >= last ||
+        demodWidth != width || demodLines < last)
+        return;
+
+    carrierRetractionModelValid = false;
+
+    const size_t count = static_cast<size_t>(demodLines) * demodWidth;
+    const bool analysisRequested =
+        configuration.lumaWitness ||
+        parallaxRepairMode != 0 ||
+        crDiagLine >= 0 ||
+        ccDiagLine >= 0;
+    if (analysisRequested && carrierAnalysis_flat.size() < count) {
+        carrierAnalysis_flat.assign(count, lddecode::CarrierAnalysisRecord{});
+    }
+
+    const bool residualRequested =
+        parallaxRepairMode != 0 || crDiagLine >= 0;
+
+    constexpr int kNarrowWin = 16;
+    constexpr int kWideWin = 32;
+    static const double cosRef[4] = { 1.0, 0.0, -1.0, 0.0 };
+    static const double sinRef[4] = { 0.0, 1.0,  0.0, -1.0 };
+
+    std::vector<double> preI;
+    std::vector<double> preQ;
+    if (residualRequested) {
+        preI.resize(width + 1, 0.0);
+        preQ.resize(width + 1, 0.0);
+    }
+
+    for (int line = first; line < last; ++line) {
+        const quint16 *rawLine =
+            rawbuffer.data() + static_cast<size_t>(line) * fullWidth;
+        double *baseline = locked1DRawBandpass_line(line);
+        if (!baseline)
+            continue;
+
+        auto rawAtRel = [&](int rel) -> double {
+            const int r = std::clamp(rel, 0, width - 1);
+            return static_cast<double>(rawLine[left + r]);
+        };
+
+        // Canonical full-resolution source authority used by every later
+        // carrier client. Keep this formula and its clamped edge convention in
+        // one place so analysis and rendering cannot drift apart.
+        for (int rel = 0; rel < width; ++rel) {
+            const double c  = rawAtRel(rel);
+            const double m2 = rawAtRel(rel - 2);
+            const double p2 = rawAtRel(rel + 2);
+            baseline[rel] = 0.50 * c - 0.25 * (m2 + p2);
+        }
+
+        seedCombAttributionPerLine(line);
+        lddecode::CarrierAnalysisRecord *analysis = carrierAnalysis_line(line);
+        if (analysis) {
+            std::fill(
+                analysis,
+                analysis + width,
+                lddecode::CarrierAnalysisRecord{});
+        }
+
+        if (crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0) {
+            const int c0 = std::clamp(crDiagC0, 0, width - 1);
+            const int c1 = std::clamp(
+                crDiagC1 < 0 ? crDiagC0 : crDiagC1,
+                c0,
+                width - 1);
+
+            std::fprintf(stderr,
+                "COARSERESOPT header line rel h phase raw oldBp viewCount "
+                "resLo resHi resSpreadIRE maxAbsMembershipIRE view s y4 residual "
+                "residualIRE membershipDeltaIRE membershipLocalX\n");
+
+            for (int rel = c0; rel <= c1; ++rel) {
+                const int sFirst = std::max(0, rel - 3);
+                const int sLast = width >= 4 ? std::min(rel, width - 4) : -1;
+                double residuals[4] = {0.0, 0.0, 0.0, 0.0};
+                double memberships[4] = {0.0, 0.0, 0.0, 0.0};
+                double localXs[4] = {0.0, 0.0, 0.0, 0.0};
+                double y4s[4] = {0.0, 0.0, 0.0, 0.0};
+                int starts[4] = {0, 0, 0, 0};
+                double lo = 1e300;
+                double hi = -1e300;
+                double maxMembership = 0.0;
+                int n = 0;
+
+                for (int s = sFirst; s <= sLast && n < 4; ++s, ++n) {
+                    const double y4 = 0.25 * (
+                        rawAtRel(s + 0) + rawAtRel(s + 1) +
+                        rawAtRel(s + 2) + rawAtRel(s + 3));
+                    const double residual = rawAtRel(rel) - y4;
+                    double membership = 0.0;
+                    double localX = 0.0;
+                    if (s + 4 < width) {
+                        membership = 0.25 *
+                            (rawAtRel(s + 4) - rawAtRel(s)) * invIreScale;
+                        localX = 0.5 * (static_cast<double>(s) +
+                                        static_cast<double>(s + 4)) - rel;
+                    }
+                    starts[n] = s;
+                    y4s[n] = y4;
+                    residuals[n] = residual;
+                    memberships[n] = membership;
+                    localXs[n] = localX;
+                    lo = std::min(lo, residual);
+                    hi = std::max(hi, residual);
+                    maxMembership = std::max(maxMembership, std::fabs(membership));
+                }
+
+                if (n == 0) {
+                    std::fprintf(stderr,
+                        "COARSERESOPT line=%d rel=%d h=%d phase=%d raw=%.6f "
+                        "oldBp=%.6f viewCount=0 resLo=0.000000 resHi=0.000000 "
+                        "resSpreadIRE=0.000000 maxAbsMembershipIRE=0.000000 "
+                        "view=-1 s=-1 y4=0.000000 residual=0.000000 "
+                        "residualIRE=0.000000 membershipDeltaIRE=0.000000 "
+                        "membershipLocalX=0.000000\n",
+                        line, rel, left + rel,
+                        carrierSampleClass(line, left + rel) & 3,
+                        rawAtRel(rel), baseline[rel]);
+                    continue;
+                }
+
+                const double spreadIRE = (hi - lo) * invIreScale;
+                for (int v = 0; v < n; ++v) {
+                    std::fprintf(stderr,
+                        "COARSERESOPT line=%d rel=%d h=%d phase=%d raw=%.6f "
+                        "oldBp=%.6f viewCount=%d resLo=%.6f resHi=%.6f "
+                        "resSpreadIRE=%.6f maxAbsMembershipIRE=%.6f "
+                        "view=%d s=%d y4=%.6f residual=%.6f residualIRE=%.6f "
+                        "membershipDeltaIRE=%.6f membershipLocalX=%.6f\n",
+                        line, rel, left + rel,
+                        carrierSampleClass(line, left + rel) & 3,
+                        rawAtRel(rel), baseline[rel], n, lo, hi, spreadIRE,
+                        maxMembership, v, starts[v], y4s[v], residuals[v],
+                        residuals[v] * invIreScale, memberships[v], localXs[v]);
+                }
+            }
+        }
+
+        if (!residualRequested || !analysis)
+            continue;
+
+        preI[0] = 0.0;
+        preQ[0] = 0.0;
+        for (int rel = 0; rel < width; ++rel) {
+            const int p = carrierSampleClass(line, left + rel) & 3;
+            preI[rel + 1] = preI[rel] + baseline[rel] * cosRef[p];
+            preQ[rel + 1] = preQ[rel] + baseline[rel] * sinRef[p];
+        }
+
+        const double tolSamples =
+            std::max(0.0, parallaxRepairTolIRE) * irescale;
+        for (int rel = 0; rel < width; ++rel) {
+            const int p = carrierSampleClass(line, left + rel) & 3;
+            const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
+            const int nb = std::clamp(na + kNarrowWin, 0, width);
+            const double nn = static_cast<double>(std::max(1, nb - na));
+            const double ZnI = (preI[nb] - preI[na]) / nn;
+            const double ZnQ = (preQ[nb] - preQ[na]) / nn;
+            const double shortSample =
+                2.0 * (ZnI * cosRef[p] + ZnQ * sinRef[p]);
+
+            const int wa = std::clamp(rel - kWideWin / 2, 0, width);
+            const int wb = std::clamp(wa + kWideWin, 0, width);
+            const double wn = static_cast<double>(std::max(1, wb - wa));
+            const double ZwI = (preI[wb] - preI[wa]) / wn;
+            const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+            const double wideSample =
+                2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
+
+            lddecode::CarrierResidualOption options[4];
+            int optionCount = 0;
+            const int sFirst = std::max(0, rel - 3);
+            const int sLast = width >= 4 ? std::min(rel, width - 4) : -1;
+            for (int s = sFirst; s <= sLast && optionCount < 4; ++s) {
+                const double y4 = 0.25 * (
+                    rawAtRel(s + 0) + rawAtRel(s + 1) +
+                    rawAtRel(s + 2) + rawAtRel(s + 3));
+                options[optionCount].sample = rawAtRel(rel) - y4;
+                options[optionCount].membershipDeltaIRE =
+                    s + 4 < width
+                        ? 0.25 * (rawAtRel(s + 4) - rawAtRel(s)) * invIreScale
+                        : 0.0;
+                ++optionCount;
+            }
+
+            const double movingMean = 0.25 * (
+                rawAtRel(rel - 1) + rawAtRel(rel) +
+                rawAtRel(rel + 1) + rawAtRel(rel + 2));
+            const double movingResidual = rawAtRel(rel) - movingMean;
+            const double sourceSample = baseline[rel];
+
+            auto &record = analysis[rel];
+            record.fit.sourceSample = static_cast<float>(sourceSample);
+            record.fit.shortSample = static_cast<float>(shortSample);
+            record.fit.wideSample = static_cast<float>(wideSample);
+            record.fit.sourceMinusShortIRE = static_cast<float>(
+                (sourceSample - shortSample) * invIreScale);
+            record.fit.shortMinusWideIRE = static_cast<float>(
+                (shortSample - wideSample) * invIreScale);
+            record.fit.sourceMinusWideIRE = static_cast<float>(
+                (sourceSample - wideSample) * invIreScale);
+            record.fit.valid = true;
+            record.residual = lddecode::analyzeCarrierResidualOptions(
+                options,
+                optionCount,
+                shortSample,
+                tolSamples,
+                std::max(0.0, parallaxRepairTolIRE),
+                movingResidual,
+                invIreScale);
+        }
+    }
+
+    if (configuration.lumaWitness)
+        buildCarrierRetractionStage(true);
+}
+
 void Comb::FrameBuffer::buildPhaseCorrected1D()
 {
     const int first = videoParameters.firstActiveFrameLine;
@@ -201,11 +403,39 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     static const int ccDiagLine = []{ const char *s = std::getenv("CC_DIAG_LINE"); return s ? std::atoi(s) : -1; }();
     static const int ccDiagC0   = []{ const char *s = std::getenv("CC_DIAG_C0");   return s ? std::atoi(s) : -1; }();
     static const int ccDiagC1   = []{ const char *s = std::getenv("CC_DIAG_C1");   return s ? std::atoi(s) : -1; }();
+    static const int crDiagLine = []{ const char *s = std::getenv("COARSE_RESID_DIAG_LINE"); return s ? std::atoi(s) : -1; }();
+    static const int crDiagC0   = []{ const char *s = std::getenv("COARSE_RESID_DIAG_C0");   return s ? std::atoi(s) : -1; }();
+    static const int crDiagC1   = []{ const char *s = std::getenv("COARSE_RESID_DIAG_C1");   return s ? std::atoi(s) : -1; }();
+    static const double crDiagFitTolIRE = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_FIT_TOL_IRE");
+        return s ? std::atof(s) : 1.5;
+    }();
+    static const int parallaxRepairMode = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
+        if (!s) return 0;
+        if (std::strcmp(s, "report") == 0) return 1;
+        if (std::strcmp(s, "apply") == 0) return 2;
+        return 0;
+    }();
+    static const double parallaxRepairTolIRE = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_TOL_IRE");
+        return s ? std::atof(s) : 0.5;
+    }();
+    static const double parallaxRepairMaxDeltaIRE = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
+        return s ? std::atof(s) : 0.35;
+    }();
     if (ccDiagLine >= 0) {
         std::fprintf(stderr,
             "CCDIAG-FB phaseComp=%d activeLines=[%d,%d) width=%d target=%d %s\n",
             configuration.phaseCompensation ? 1 : 0, first, last, width, ccDiagLine,
             (ccDiagLine >= first && ccDiagLine < last) ? "in-range" : "OUT-OF-RANGE");
+    }
+    if (crDiagLine >= 0) {
+        std::fprintf(stderr,
+            "COARSERES-FB phaseComp=%d activeLines=[%d,%d) width=%d target=%d %s\n",
+            configuration.phaseCompensation ? 1 : 0, first, last, width, crDiagLine,
+            (crDiagLine >= first && crDiagLine < last) ? "in-range" : "OUT-OF-RANGE");
     }
 
     if (!configuration.phaseCompensation || width <= 0 || first >= last)
@@ -263,14 +493,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
 
-    // Opt-in white-star feasibility scratch. Pre-Pass-2 carrier-projection
-    // coherent sums; see Pass 1b below. Keep the default path allocation-free.
-    std::vector<double> preIfeas, preQfeas;
-    if (configuration.whiteStar) {
-        preIfeas.resize(width + 1);
-        preQfeas.resize(width + 1);
-    }
-
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine =
             rawbuffer.data() + static_cast<size_t>(line) * fullWidth;
@@ -279,8 +501,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         if (!lockedSource)
             continue;
 
-        seedCombAttributionPerLine(line);
         AttributionEvidence *attribution = attributionEvidence_line(line);
+        lddecode::CarrierAnalysisRecord *carrierAnalysis =
+            carrierAnalysis_line(line);
 
         CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
@@ -331,86 +554,149 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             return static_cast<double>(rawLine[left + r]);
         };
 
-        // Pass 1: ordinary carrier-spaced 1D bandpass from raw composite.
-        //
-        //     bp[x] = -0.25 raw[x-2] + 0.50 raw[x] - 0.25 raw[x+2]
-        for (int rel = 0; rel < width; ++rel) {
-            const double c  = rawAtRel(rel);
-            const double m2 = rawAtRel(rel - 2);
-            const double p2 = rawAtRel(rel + 2);
-
-            bpLine[rel] = 0.50 * c - 0.25 * (m2 + p2);
-        }
+        // Pass 1: consume the canonical full-resolution baseline harvested by
+        // buildCarrierAnalysis(). The fallback preserves standalone safety but
+        // normal locked orchestration has exactly one producer.
         if (rawBandpass) {
             for (int rel = 0; rel < width; ++rel)
-                rawBandpass[rel] = bpLine[rel];
+                bpLine[rel] = rawBandpass[rel];
+        } else {
+            for (int rel = 0; rel < width; ++rel) {
+                const double c  = rawAtRel(rel);
+                const double m2 = rawAtRel(rel - 2);
+                const double p2 = rawAtRel(rel + 2);
+                bpLine[rel] = 0.50 * c - 0.25 * (m2 + p2);
+            }
         }
 
-        // Pass 1b: carrier-absence rewrite (the "star fix").
+        // Pass 1.5: optional coarse-residual feasibility repair for locked 1D.
         //
-        // SCOPE: this rule is the EXCEPTION, not the default.  It fires
-        // only at samples where the wide coherent fit shows essentially
-        // no carrier (A_local below kNoCarrierIRE).  Everywhere else, bp
-        // passes through untouched -- the wide fit's smoothing would
-        // damage saturated chroma and chroma transitions, where the
-        // window-averaged amplitude estimate underestimates the true
-        // local carrier and would snap real chroma toward the average.
-        //
-        // The triggered population is exactly the bandpass-as-color
-        // failure mode: space, dark backgrounds, fine luma structures
-        // (Borg-cube grille, starfield grain) where the bandpass picks
-        // up HF luma energy that the chroma demod paints as colour even
-        // though no carrier is present.  At those sites the snap target
-        // expected = 2·(ZwI·cos[p] + ZwQ·sin[p]) is ~0 by construction
-        // (ZwI = ZwQ ≈ 0 when no carrier exists), so the rewrite is a
-        // structural "no chroma here" verdict, not a smoothing.
-        //
-        // Above kNoCarrierIRE, real chroma is present.  Stay out: any
-        // smoothing of saturated content is a regression (Saratoga
-        // molten edge, Data's uniform contours).
-        if (configuration.whiteStar) {
-            constexpr double kNoCarrierIRE = 4.0;
-            constexpr double kFeasBandIRE  = 3.0;
-            constexpr int    kShortWin     = 8;   // 2 carrier cycles
+        // This is an experiment and is disabled by default.  The ordinary 1D
+        // bandpass remains the source authority; every scanner below only gets
+        // to justify a small bounded move toward a short-fit-compatible subset
+        // of legal residual options.  Coarse residuals are options, not carrier
+        // estimates.  The short fit is a selector, not carrier authority.  The
+        // moving-centered residual is support/conflict evidence only.  The wide
+        // fit is comparison-only and never participates in survivor selection.
+        if (carrierAnalysis &&
+            (parallaxRepairMode != 0 || crDiagLine >= 0))
+        {
+            const bool repairApply = parallaxRepairMode == 2;
+            const bool repairLogThisLine =
+                crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
+            const int repairLogFirst =
+                repairLogThisLine ? std::clamp(crDiagC0, 0, width - 1) : 0;
+            const int repairLogLast =
+                repairLogThisLine
+                    ? std::clamp(crDiagC1 < 0 ? crDiagC0 : crDiagC1,
+                                 repairLogFirst, width - 1)
+                    : -1;
 
-            preIfeas[0] = 0.0;
-            preQfeas[0] = 0.0;
+            const double maxDeltaSamples =
+                std::max(0.0, parallaxRepairMaxDeltaIRE) * irescale;
+            float *repairStrengthRow =
+                locked1DParallaxRepairStrength_line(line);
+            if (repairStrengthRow)
+                std::fill(repairStrengthRow, repairStrengthRow + width, 0.0f);
+
+            if (repairLogThisLine) {
+                std::fprintf(stderr,
+                    "COARSERESREPAIR header line rel h phase mode reason "
+                    "sourceBp shortFit wideFit movingResidual optionCount "
+                    "survivorCount survivorLo survivorHi tolIRE maxDeltaIRE "
+                    "proposedDeltaIRE appliedDeltaIRE movingDistIRE "
+                    "maxAbsMembershipIRE sourceMinusShortIRE shortMinusWideIRE "
+                    "sourceMinusWideIRE\n");
+            }
+
             for (int rel = 0; rel < width; ++rel) {
                 const int p = carrierSampleClass(line, left + rel) & 3;
-                preIfeas[rel + 1] = preIfeas[rel] + bpLine[rel] * cosRef[p];
-                preQfeas[rel + 1] = preQfeas[rel] + bpLine[rel] * sinRef[p];
-            }
-            for (int rel = 0; rel < width; ++rel) {
-                // Wide gate (8-cycle)
-                const int wa = std::clamp(rel - kWideWin / 2, 0, width);
-                const int wb = std::clamp(wa + kWideWin, 0, width);
-                const double nw = static_cast<double>(std::max(1, wb - wa));
-                const double ZwI = (preIfeas[wb] - preIfeas[wa]) / nw;
-                const double ZwQ = (preQfeas[wb] - preQfeas[wa]) / nw;
-                const double aWideIRE =
-                    2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
-                if (aWideIRE >= kNoCarrierIRE)
-                    continue;
+                const auto &record = carrierAnalysis[rel];
+                const auto &residualDiag = record.residual;
+                const int optionCount = residualDiag.optionCount;
+                const double shortSample = record.fit.shortSample;
+                const double wideSample = record.fit.wideSample;
+                const double movingResidual = residualDiag.movingResidualSample;
+                const double sourceSample = bpLine[rel];
+                const int survivorCount = residualDiag.survivorCount();
+                const double survivorLo = residualDiag.survivorLo;
+                const double survivorHi = residualDiag.survivorHi;
+                const double maxAbsMembershipIRE =
+                    residualDiag.maxAbsMembershipIRE;
 
-                // Short gate (2-cycle) — catches real carrier the wide
-                // window averages away near chroma boundaries.
-                const int sa = std::clamp(rel - kShortWin / 2, 0, width);
-                const int sb = std::clamp(sa + kShortWin, 0, width);
-                const double ns = static_cast<double>(std::max(1, sb - sa));
-                const double ZsI = (preIfeas[sb] - preIfeas[sa]) / ns;
-                const double ZsQ = (preQfeas[sb] - preQfeas[sa]) / ns;
-                const double aShortIRE =
-                    2.0 * std::hypot(ZsI, ZsQ) * invIreScale;
-                if (aShortIRE >= kNoCarrierIRE)
-                    continue;
+                const char *reason = "no-options";
+                double proposedDelta = 0.0;
+                double appliedDelta = 0.0;
+                double movingDistIRE = 0.0;
 
-                const int    p   = carrierSampleClass(line, left + rel) & 3;
-                const double expected =
-                    2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
-                const double devIRE =
-                    std::fabs(bpLine[rel] - expected) * invIreScale;
-                if (devIRE > kFeasBandIRE)
-                    bpLine[rel] = expected;
+                if (optionCount <= 0) {
+                    reason = "no-options";
+                } else if (survivorCount <= 0) {
+                    reason = "conflict-no-survivors";
+                } else if (survivorCount == optionCount) {
+                    reason = "no-discrimination-all-survive";
+                } else if (sourceSample >= survivorLo &&
+                           sourceSample <= survivorHi)
+                {
+                    reason = "source-inside";
+                } else {
+                    movingDistIRE = residualDiag.movingDistanceIRE;
+                    const bool movingCompatible = residualDiag.movingCompatible;
+
+                    if (!movingCompatible) {
+                        reason = "moving-conflict";
+                    } else {
+                        const double target =
+                            std::clamp(sourceSample, survivorLo, survivorHi);
+                        proposedDelta = target - sourceSample;
+                        appliedDelta = std::clamp(
+                            proposedDelta,
+                            -maxDeltaSamples,
+                            maxDeltaSamples);
+
+                        if (repairApply) {
+                            reason = "apply";
+                            bpLine[rel] = sourceSample + appliedDelta;
+                            if (repairStrengthRow && maxDeltaSamples > 1e-9) {
+                                repairStrengthRow[rel] = static_cast<float>(
+                                    std::clamp(
+                                        std::fabs(appliedDelta) / maxDeltaSamples,
+                                        0.0,
+                                        1.0));
+                            }
+                        } else {
+                            reason = "propose";
+                        }
+                    }
+                }
+
+                if (repairLogThisLine &&
+                    rel >= repairLogFirst && rel <= repairLogLast)
+                {
+                    const char *mode =
+                        parallaxRepairMode == 2 ? "apply" : "report";
+                    std::fprintf(stderr,
+                        "COARSERESREPAIR line=%d rel=%d h=%d phase=%d "
+                        "mode=%s reason=%s sourceBp=%.6f shortFit=%.6f "
+                        "wideFit=%.6f movingResidual=%.6f optionCount=%d "
+                        "survivorCount=%d survivorLo=%.6f survivorHi=%.6f "
+                        "tolIRE=%.6f maxDeltaIRE=%.6f proposedDeltaIRE=%.6f "
+                        "appliedDeltaIRE=%.6f movingDistIRE=%.6f "
+                        "maxAbsMembershipIRE=%.6f sourceMinusShortIRE=%.6f "
+                        "shortMinusWideIRE=%.6f sourceMinusWideIRE=%.6f\n",
+                        line, rel, left + rel, p, mode, reason, sourceSample,
+                        shortSample, wideSample, movingResidual, optionCount,
+                        survivorCount, survivorLo, survivorHi,
+                        std::max(0.0, parallaxRepairTolIRE),
+                        std::max(0.0, parallaxRepairMaxDeltaIRE),
+                        proposedDelta * invIreScale,
+                        appliedDelta * invIreScale,
+                        movingDistIRE,
+                        maxAbsMembershipIRE,
+                        (sourceSample - shortSample) * invIreScale,
+                        (shortSample - wideSample) * invIreScale,
+                        (sourceSample - wideSample) * invIreScale);
+                }
             }
         }
 
@@ -460,6 +746,28 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             return ((preEnv[b] - preEnv[a]) / n) * invIreScale;
         };
 
+        const bool crDiagThisLine =
+            crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
+        const int crDiagFirst =
+            crDiagThisLine ? std::clamp(crDiagC0, 0, width - 1) : 0;
+        const int crDiagLast =
+            crDiagThisLine
+                ? std::clamp(crDiagC1 < 0 ? crDiagC0 : crDiagC1,
+                             crDiagFirst, width - 1)
+                : -1;
+        if (crDiagThisLine) {
+            std::fprintf(stderr,
+                "COARSERESFIT header line rel h phase sourceBp shortFit wideFit "
+                "shortTolIRE shortLo shortHi optionCount survivorCount survivorLo "
+                "survivorHi nearestShortDistIRE sourceClampDeltaIRE "
+                "wideClampDeltaIRE sourceMinusShortIRE shortMinusWideIRE "
+                "sourceMinusWideIRE narrowMagIRE wideMagIRE impurity\n");
+            std::fprintf(stderr,
+                "COARSERESFITOPT header line rel view s residual residualIRE "
+                "distShortIRE distWideIRE inShortBand membershipDeltaIRE "
+                "membershipLocalX\n");
+        }
+
         // Aperture cross-color detector.  Publishes gA = aperture contamination
         // as carrierImpurity; the emitted source is the CLEAN, FULL bandpass.
         //
@@ -507,18 +815,130 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     std::max(kImpurityFloorIRE, narrowMag));
             }
 
-            if (configuration.whiteStar) {
-                // The white-star remedy emits the wide-fit projection as the
-                // carrier source. Everything bp adds beyond that coherent fit
-                // is treated as incoherent luma energy. This is deliberately
-                // opt-in: the fit loses legitimate sub-fSC chroma detail.
+            if (crDiagThisLine && rel >= crDiagFirst && rel <= crDiagLast) {
                 const int p = carrierSampleClass(line, left + rel) & 3;
-                restrainedLine[rel] =
+                const double wideSample =
                     2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
-            } else {
-                // Baseline locked path: preserve the full ordinary bandpass.
-                restrainedLine[rel] = bpLine[rel];
+
+                const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
+                const int nb = std::clamp(na + kNarrowWin, 0, width);
+                const double nn = static_cast<double>(std::max(1, nb - na));
+                const double ZnI = (preI[nb] - preI[na]) / nn;
+                const double ZnQ = (preQ[nb] - preQ[na]) / nn;
+                const double shortSample =
+                    2.0 * (ZnI * cosRef[p] + ZnQ * sinRef[p]);
+
+                const double fitTolSamples =
+                    std::max(0.0, crDiagFitTolIRE) * irescale;
+                const double shortLo = shortSample - fitTolSamples;
+                const double shortHi = shortSample + fitTolSamples;
+
+                const int sFirst = std::max(0, rel - 3);
+                const int sLast = (width >= 4)
+                    ? std::min(rel, width - 4)
+                    : -1;
+
+                double survivorLo = 1e300;
+                double survivorHi = -1e300;
+                double nearestDistIRE = 1e300;
+                int optionCount = 0;
+                int survivorCount = 0;
+
+                for (int s = sFirst; s <= sLast && optionCount < 4; ++s) {
+                    const double y4 =
+                        0.25 * (rawAtRel(s + 0) +
+                                rawAtRel(s + 1) +
+                                rawAtRel(s + 2) +
+                                rawAtRel(s + 3));
+                    const double residual = rawAtRel(rel) - y4;
+                    const double distShortIRE =
+                        std::fabs(residual - shortSample) * invIreScale;
+                    const double distWideIRE =
+                        std::fabs(residual - wideSample) * invIreScale;
+                    const double distBandIRE =
+                        (residual < shortLo)
+                            ? (shortLo - residual) * invIreScale
+                            : ((residual > shortHi)
+                                ? (residual - shortHi) * invIreScale
+                                : 0.0);
+                    nearestDistIRE = std::min(nearestDistIRE, distBandIRE);
+
+                    const bool inBand =
+                        residual >= shortLo && residual <= shortHi;
+                    if (inBand) {
+                        ++survivorCount;
+                        survivorLo = std::min(survivorLo, residual);
+                        survivorHi = std::max(survivorHi, residual);
+                    }
+
+                    double membershipDeltaIRE = 0.0;
+                    double membershipLocalX = 0.0;
+                    if (s + 4 < width) {
+                        membershipDeltaIRE =
+                            0.25 * (rawAtRel(s + 4) - rawAtRel(s)) * invIreScale;
+                        membershipLocalX =
+                            0.5 * (static_cast<double>(s) +
+                                   static_cast<double>(s + 4)) -
+                            static_cast<double>(rel);
+                    }
+
+                    std::fprintf(stderr,
+                        "COARSERESFITOPT line=%d rel=%d view=%d s=%d "
+                        "residual=%.6f residualIRE=%.6f distShortIRE=%.6f "
+                        "distWideIRE=%.6f inShortBand=%d membershipDeltaIRE=%.6f "
+                        "membershipLocalX=%.6f\n",
+                        line, rel, optionCount, s, residual,
+                        residual * invIreScale, distShortIRE, distWideIRE,
+                        inBand ? 1 : 0, membershipDeltaIRE, membershipLocalX);
+                    ++optionCount;
+                }
+
+                if (survivorCount == 0) {
+                    survivorLo = 0.0;
+                    survivorHi = 0.0;
+                }
+                if (nearestDistIRE == 1e300)
+                    nearestDistIRE = 0.0;
+
+                auto clampDeltaIRE = [&](double sample) {
+                    if (survivorCount <= 0)
+                        return 0.0;
+                    const double clamped =
+                        std::clamp(sample, survivorLo, survivorHi);
+                    return (clamped - sample) * invIreScale;
+                };
+
+                const double sourceSample = bpLine[rel];
+                const double sourceMinusShortIRE =
+                    (sourceSample - shortSample) * invIreScale;
+                const double shortMinusWideIRE =
+                    (shortSample - wideSample) * invIreScale;
+                const double sourceMinusWideIRE =
+                    (sourceSample - wideSample) * invIreScale;
+                std::fprintf(stderr,
+                    "COARSERESFIT line=%d rel=%d h=%d phase=%d "
+                    "sourceBp=%.6f shortFit=%.6f wideFit=%.6f "
+                    "shortTolIRE=%.6f shortLo=%.6f shortHi=%.6f "
+                    "optionCount=%d survivorCount=%d survivorLo=%.6f "
+                    "survivorHi=%.6f nearestShortDistIRE=%.6f "
+                    "sourceClampDeltaIRE=%.6f wideClampDeltaIRE=%.6f "
+                    "sourceMinusShortIRE=%.6f shortMinusWideIRE=%.6f "
+                    "sourceMinusWideIRE=%.6f narrowMagIRE=%.6f wideMagIRE=%.6f "
+                    "impurity=%.6f\n",
+                    line, rel, left + rel, p, sourceSample, shortSample,
+                    wideSample, std::max(0.0, crDiagFitTolIRE), shortLo, shortHi,
+                    optionCount, survivorCount, survivorLo, survivorHi,
+                    nearestDistIRE, clampDeltaIRE(sourceSample),
+                    clampDeltaIRE(wideSample), sourceMinusShortIRE,
+                    shortMinusWideIRE, sourceMinusWideIRE, narrowMag, wideMag,
+                    gA);
             }
+
+            // The emitted source remains the full-resolution ordinary carrier
+            // plus any explicitly bounded 1D repair. Whitestar and the fits are
+            // evidence/policy inputs only; no diagnostic projection becomes
+            // picture here.
+            restrainedLine[rel] = bpLine[rel];
 
             if (impurityRow)
                 impurityRow[rel] = static_cast<float>(gA);
@@ -532,6 +952,59 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 facts.bandpassFineIRE = narrowMag;
                 facts.bandpassCoarseIRE = wideMag;
                 facts.lumaExcursionIRE = gA * narrowMag;
+            }
+        }
+
+        // Optional publication is deliberately outside the render-facing loop
+        // above.  When no analysis client is active, ordinary locked output has
+        // no extra per-pixel branch or storage traffic.
+        if (carrierAnalysis) {
+            for (int rel = 0; rel < width; ++rel) {
+                const int p = carrierSampleClass(line, left + rel) & 3;
+                const int wa = std::clamp(rel - kWideWin / 2, 0, width);
+                const int wb = std::clamp(wa + kWideWin, 0, width);
+                const double wn = std::max(1, wb - wa);
+                const double ZwI = (preI[wb] - preI[wa]) / wn;
+                const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+                const double wideSample =
+                    2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
+                const double wideMag =
+                    2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
+                const double narrowMag = narrowEnvIRE(rel);
+
+                auto &record = carrierAnalysis[rel];
+                if (!record.fit.valid) {
+                    const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
+                    const int nb = std::clamp(na + kNarrowWin, 0, width);
+                    const double nn = static_cast<double>(std::max(1, nb - na));
+                    const double ZnI = (preI[nb] - preI[na]) / nn;
+                    const double ZnQ = (preQ[nb] - preQ[na]) / nn;
+                    const double shortSample =
+                        2.0 * (ZnI * cosRef[p] + ZnQ * sinRef[p]);
+                    const double sourceSample = bpLine[rel];
+
+                    record.fit.sourceSample = static_cast<float>(sourceSample);
+                    record.fit.shortSample = static_cast<float>(shortSample);
+                    record.fit.wideSample = static_cast<float>(wideSample);
+                    record.fit.sourceMinusShortIRE = static_cast<float>(
+                        (sourceSample - shortSample) * invIreScale);
+                    record.fit.shortMinusWideIRE = static_cast<float>(
+                        (shortSample - wideSample) * invIreScale);
+                    record.fit.sourceMinusWideIRE = static_cast<float>(
+                        (sourceSample - wideSample) * invIreScale);
+                    record.fit.valid = true;
+                }
+
+                record.fit.shortMagnitudeIRE = static_cast<float>(narrowMag);
+                record.fit.wideMagnitudeIRE = static_cast<float>(wideMag);
+                const float apertureImpurity = static_cast<float>(
+                    (narrowMag > kImpurityFloorIRE && wideMag < narrowMag)
+                        ? clamp01((narrowMag - wideMag) /
+                                  std::max(kImpurityFloorIRE, narrowMag))
+                        : 0.0);
+                record.carrierImpurity = std::max(
+                    record.carrierImpurity,
+                    apertureImpurity);
             }
         }
 
@@ -1009,17 +1482,15 @@ void Comb::FrameBuffer::filterIQLocked()
 
             // Same aperture cross-color suppression as the coherent path
             // (splitIQlocked): scale the demodulated residual chroma by
-            // (1 - gA*weight).  Y is already raw - full carrier, so this scales
-            // only the rendered colour and never re-introduces carrier-band
-            // energy into luma -- coherent and residual modes now agree.
+            // (1 - gA*weight).  This is a colour-side transfer policy only;
+            // carrierImpurity remains decision data and never becomes a
+            // replacement waveform.
             const float *impRow = carrierImpurity_line(line);
-            // produceY emits a witness/comb blend; chroma = raw - Y is its exact
-            // complement, so the cross-color returned to Y (ccReturn*gA*delta) is
-            // by construction absent from raw - Y -- already governed by the same
-            // gA and --cross-color-return used in the blend. A secondary gA
-            // suppression here would double-count and only desaturate real
-            // colour, so the witness-active path runs full strength; gA stays the
-            // fallback where no witness is present, scaled by --cross-color-return.
+            // A valid witness does not prove that its per-pixel luma candidate
+            // won the HF election.  Bypassing gA whenever witnessValid was true
+            // therefore restored cross-colour wherever combY won (notably fine
+            // line structure).  Apply the published policy to the actual
+            // residual colour regardless of which luma candidates were present.
             const double ccWeight =
                 std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
 
@@ -1033,9 +1504,11 @@ void Comb::FrameBuffer::filterIQLocked()
                 const double chroma = (double)rawLine[h] - Yrow[h];
 
                 const int ph = carrierSampleClass(line, h);
-                const double alphaEff = witnessValid
-                    ? 1.0
-                    : std::max(0.0, 1.0 - (impRow ? (double)impRow[i] : 0.0) * ccWeight);
+                const double gA = impRow
+                    ? std::clamp((double)impRow[i], 0.0, 1.0)
+                    : 0.0;
+                const double alphaEff =
+                    std::max(0.0, 1.0 - gA * ccWeight);
 
                 scratch_preI[i] = (chroma * lutTi[ph]) * GI_PRODUCT * alphaEff;
                 scratch_preQ[i] = (chroma * lutTq[ph]) * GQ_PRODUCT * alphaEff;
@@ -1120,11 +1593,12 @@ void Comb::FrameBuffer::produceY()
     // fall back to full-strength subtraction of the selected comb scalar.
     //
     // When --residual-video-3d is on (and prev/next frames are available), the
-    // 3D Y election owns the per-pixel output: getBestY votes between the
-    // current 2D residual (raw - clpLine) and its temporal neighbors. This is
-    // a separate feature from residual-Y carrier correction -- election runs
-    // on the baseline 2D residual so temporal candidates are comparable across
-    // frames, independent of any current-frame carrier reshape.
+    // 3D Y election owns the per-pixel output: getBestY votes between the best
+    // pre-output luma each frame has published so far. With --luma-witness
+    // that means witness Y; otherwise it falls back to the coherent residual
+    // comb Y (raw - carrierComp), then the plain 2D comb baseline. Residual-Y
+    // 3D stays a distinct temporal feature; it just no longer ignores the
+    // better local luma model when witness is available.
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
@@ -1148,12 +1622,7 @@ void Comb::FrameBuffer::produceY()
 
         if (use3DY) {
             for (int h = left; h < right; ++h) {
-                const double c = clpLine[h];
-                const double y2D = std::isfinite(c)
-                    ? (double)rawLine[h] - c
-                    : (double)rawLine[h];
-                Y[h] = getBestY(line, h, y2D,
-                                *prevFrameForVet, *nextFrameForVet);
+                Y[h] = getBestY(line, h, *prevFrameForVet, *nextFrameForVet);
             }
         } else if (witnessRow) {
             // ================= HF luma election =================
@@ -1713,135 +2182,32 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
     }
 }
 
-// Single composite-domain star / thin-luma detector. Run once after
-// phaseLocked() so the carrier retraction and the FVF election share ONE
-// verdict instead of each re-detecting on a weaker signal. A neutral star is a
-// single-hump bright excursion on a flat dark surround with no carrier
-// oscillation under it; by chroma bandwidth such a feature must be luma. A real
-// coloured star carries an actual carrier, so its composite oscillates (more
-// than off-on-off) and the single-hump test spares it -- which is what lets us
-// allow stars several samples wide without catching colour.
-void Comb::FrameBuffer::detectStars()
-{
-    if (!configuration.whiteStar)
-        return;
-
-    const int first = videoParameters.firstActiveFrameLine;
-    const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-    const int fullWidth = videoParameters.fieldWidth;
-    if (width <= 0 || first >= last || demodWidth < width)
-        return;
-
-    const size_t need = static_cast<size_t>(demodLines) * demodWidth;
-    if (starMask_flat.size() < need)
-        starMask_flat.assign(need, 0.0f);
-    else
-        std::fill(starMask_flat.begin(), starMask_flat.begin() + need, 0.0f);
-
-    constexpr double STAR_PEAK_IRE  = 12.0; // min bump height over surround
-    constexpr double STAR_FLAT_IRE  = 6.0;  // surround flatness tolerance
-    constexpr double STAR_NOISE_IRE = 1.5;  // diff below this is flat (ignored)
-    constexpr int    STAR_MAX_W     = 5;    // max bump width (slightly larger)
-    constexpr int    STAR_FLANK     = 4;    // flat surround required each side
-
-    for (int line = first; line < last; ++line) {
-        const quint16 *rawLine = rawbuffer.data()
-            + static_cast<size_t>(line) * fullWidth;
-        float *mask = starMask_line(line);
-        if (!mask) continue;
-
-        auto rawAt = [&](int rel) -> double {
-            return static_cast<double>(
-                rawLine[left + std::clamp(rel, 0, width - 1)]);
-        };
-
-        for (int rel = 1; rel < width - 1; ++rel) {
-            const double c = rawAt(rel);
-            if (!(c >= rawAt(rel - 1) && c > rawAt(rel + 1)))
-                continue; // local maximum only (cheap early-out)
-
-            const int lf = std::max(0, rel - (STAR_MAX_W + STAR_FLANK));
-            const int rf = std::min(width - 1, rel + (STAR_MAX_W + STAR_FLANK));
-            double floorV = c;
-            for (int k = lf; k <= rf; ++k)
-                floorV = std::min(floorV, rawAt(k));
-            if ((c - floorV) * invIreScale < STAR_PEAK_IRE)
-                continue; // not a strong bright excursion
-
-            const double brightThresh = floorV + 0.5 * (c - floorV);
-            int a = rel, b = rel;
-            while (a - 1 >= 0 && rawAt(a - 1) >= brightThresh &&
-                   (rel - (a - 1)) <= STAR_MAX_W) --a;
-            while (b + 1 < width && rawAt(b + 1) >= brightThresh &&
-                   ((b + 1) - rel) <= STAR_MAX_W) ++b;
-            if (b - a + 1 > STAR_MAX_W)
-                continue; // too wide to be a star bump
-
-            bool flat = true;
-            for (int k = a - 1; k >= a - STAR_FLANK && k >= 0; --k)
-                if ((rawAt(k) - floorV) * invIreScale > STAR_FLAT_IRE) {
-                    flat = false;
-                    break;
-                }
-            if (flat)
-                for (int k = b + 1; k <= b + STAR_FLANK && k < width; ++k)
-                    if ((rawAt(k) - floorV) * invIreScale > STAR_FLAT_IRE) {
-                        flat = false;
-                        break;
-                    }
-            if (!flat)
-                continue; // surround not a flat dark run -- not a star
-
-            // Single-hump test: a neutral star rises then falls once (off-on-
-            // off). A coloured star's carrier rides under the bump and adds
-            // sub-hump oscillation -> more sign changes in the first
-            // difference. Rise + fall = one change; anything more means a
-            // carrier is present -> real colour, leave it.
-            int signChanges = 0;
-            int prevSign = 0;
-            for (int k = a - 1; k <= b; ++k) {
-                const double d = rawAt(k + 1) - rawAt(k);
-                if (std::fabs(d) * invIreScale < STAR_NOISE_IRE)
-                    continue; // flat step, no slope information
-                const int s = (d > 0.0) ? 1 : -1;
-                if (prevSign != 0 && s != prevSign)
-                    ++signChanges;
-                prevSign = s;
-            }
-            if (signChanges > 1)
-                continue; // oscillating -> coloured star, spare it
-
-            for (int k = a; k <= b; ++k)
-                mask[k] = 1.0f;
-        }
-    }
-}
-
-// Build the carrier-retracted view and its derived products.
+// Build the carrier-retracted view from the shared carrier model.
 //
-// Per-line pass:
+// buildCarrierAnalysis() first calls buildCarrierRetractionStage(true), which
+// performs the expensive per-line model pass before any render client runs:
 //   1. Four-view carrier/Y attribution on legal 4fSC luma floors
 //      → carrierFit_flat; gated LS can refit contaminated luma edges.
 //   2. Provisional raw - carrierFit stays line-local; its sliding 4-sample
 //      floor is retained only to gate the cross-line carrier reach.
 //
-// Cross-line pass (after all per-line fits):
+// This application wrapper later calls buildCarrierRetractionStage(false).
+// The valid shared model is reused rather than recomputed, then:
 //   3. Line-to-line cancellation on carrierFit → combedCarrier_flat
 //      Real chroma inverts between opposite-phase lines, alien-Y doesn't.
 //      combedCarrier preserves chroma and rejects alien-Y.
 //   4. raw - combedCarrier → carrierRetracted_flat (flattened view)
-//
-// Called between phaseLocked() and split2D().  Only needs the burst phasor
-// and lockedLumaBaseY4 (both from phaseLocked) — no comb output required.
 void Comb::FrameBuffer::buildCarrierRetracted()
+{
+    buildCarrierRetractionStage(false);
+}
+
+void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 {
     carrierRetractedValid = false;
 
     if (!configuration.phaseCompensation ||
-        !configuration.witnessCarrierRetraction)
+        !configuration.lumaWitness)
         return;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -1850,6 +2216,29 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
     const auto &T       = configuration.tunables;
+    static const int parallaxRepairMode = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
+        if (!s) return 0;
+        if (std::strcmp(s, "report") == 0) return 1;
+        if (std::strcmp(s, "apply") == 0) return 2;
+        return 0;
+    }();
+    static const double parallaxRepairMaxDeltaIRE = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
+        return s ? std::atof(s) : 0.35;
+    }();
+    static const int crDiagLine = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int crDiagC0 = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_C0");
+        return s ? std::atoi(s) : -1;
+    }();
+    static const int crDiagC1 = []{
+        const char *s = std::getenv("COARSE_RESID_DIAG_C1");
+        return s ? std::atoi(s) : -1;
+    }();
 
     if (width <= 0 || firstLine >= lastLine)
         return;
@@ -1871,6 +2260,8 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         coarseYEvidence_flat.assign(need, lddecode::FourViewPixelEvidence{});
     if (carrierImpurity_flat.size() < need)
         carrierImpurity_flat.assign(need, 0.0f);
+    if (carrierAnalysis_flat.size() < need)
+        return; // shared analysis must already have been produced
 
     if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
@@ -1883,8 +2274,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
     if ((int)scratch_carrierParallax.size() < width)
         scratch_carrierParallax.resize(width);
-    if ((int)scratch_attrMembershipY.size() < width)
-        scratch_attrMembershipY.resize(width, 0.0);
 
     double *rawWhole   = scratch_preI.data();
     double *coarseY    = scratch_preQ.data();
@@ -1894,7 +2283,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
     double *basisQ     = scratch_lineWorkD.data();
     double *refinedY   = scratch_lumaSmooth.data();
     double *slideMean4 = scratch_lateralLine.data();
-    double *membershipYIRE = scratch_attrMembershipY.data();
 
     std::vector<double> winFloor;
     std::vector<double> winI;
@@ -1953,23 +2341,24 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         return t * t * (3.0 - 2.0 * t);
     };
 
-    // ---------------------------------------------------------------
-    // Pass 1: per-line carrier withdrawal.
-    //
-    // This version does not start from the ±2 complement estimate.  It first
-    // derives a per-sample Y prior from the legal 4-sample luma-floor views,
-    // then projects raw - refinedY into locked IQ.  The four carrier windows
-    // touching the current sample are treated as attribution evidence rather
-    // than being blended as an immediate heuristic result.
-    //
-    // In other words:
-    //
-    //     raw = Y + C
-    //
-    // is resolved by asking which legal Y floor leaves the most coherent C,
-    // rather than by subtracting a complement-estimated C and trusting whatever
-    // remains as Y.
-    // ---------------------------------------------------------------
+    if (!carrierRetractionModelValid) {
+        // ---------------------------------------------------------------
+        // Analysis/model promotion: per-line carrier withdrawal.
+        //
+        // This version does not start from the ±2 complement estimate.  It first
+        // derives a per-sample Y prior from the legal 4-sample luma-floor views,
+        // then projects raw - refinedY into locked IQ.  The four carrier windows
+        // touching the current sample are treated as attribution evidence rather
+        // than being blended as an immediate heuristic result.
+        //
+        // In other words:
+        //
+        //     raw = Y + C
+        //
+        // is resolved by asking which legal Y floor leaves the most coherent C,
+        // rather than by subtracting a complement-estimated C and trusting whatever
+        // remains as Y.
+        // ---------------------------------------------------------------
     for (int line = firstLine; line < lastLine; ++line) {
         float *fitRow       = carrierFit_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
@@ -1978,12 +2367,12 @@ void Comb::FrameBuffer::buildCarrierRetracted()
         auto *evidenceRow   = coarseYEvidence_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
         auto *parallaxRow   = scratch_carrierParallax.data();
-        float *impurityRow  = carrierImpurity_flat.data()
+        auto *analysisRow   = carrierAnalysis_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
 
         std::fill(evidenceRow, evidenceRow + width, lddecode::FourViewPixelEvidence{});
-        std::fill(impurityRow, impurityRow + width, 0.0f);
-        std::fill(membershipYIRE, membershipYIRE + width, 0.0);
+        for (int xi = 0; xi < width; ++xi)
+            analysisRow[xi].parallax = lddecode::CarrierParallaxDiagnostics{};
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
@@ -2254,16 +2643,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                     dst.ySpanIRE = static_cast<float>(src.ySpanIRE);
                     dst.membershipDeltaIRE    = static_cast<float>(src.membershipDeltaIRE);
                     dst.membershipSupport     = static_cast<float>(src.membershipSupport);
-
-                    const double localX = static_cast<double>(
-                        static_cast<float>(src.membershipLocalX));
-                    const double localizer = std::exp(
-                        -0.5 * (localX * localX) / (1.35 * 1.35));
-                    const double lurch =
-                        std::fabs(static_cast<double>(dst.membershipDeltaIRE)) *
-                        std::clamp(static_cast<double>(dst.membershipSupport), 0.0, 1.0) *
-                        localizer;
-                    membershipYIRE[xi] = std::max(membershipYIRE[xi], lurch);
                 }
 
                 auto parallax = lddecode::buildFourViewCarrierAttribution(
@@ -2338,6 +2717,28 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 }
 
                 parallaxRow[xi] = parallax;
+                {
+                    auto &dst = analysisRow[xi].parallax;
+                    dst.commonSample = static_cast<float>(parallax.commonSample);
+                    dst.commonMagnitudeIRE = static_cast<float>(parallax.commonMagIRE);
+                    dst.ySpreadIRE = static_cast<float>(parallax.ySpreadIRE);
+                    dst.yCurvatureIRE = static_cast<float>(parallax.yCurvatureIRE);
+                    dst.carrierSpreadIRE = static_cast<float>(parallax.carrierSpreadIRE);
+                    dst.carrierCoherence = static_cast<float>(parallax.carrierCoherence);
+                    dst.sampleFitErrorIRE = static_cast<float>(parallax.sampleFitErrorIRE);
+                    dst.sampleCoherence = static_cast<float>(parallax.sampleCoherence);
+                    dst.latticeRiskIRE = static_cast<float>(parallax.latticeRiskIRE);
+                    dst.valid = parallax.valid;
+                    if (parallax.residualConsensus.valid) {
+                        dst.residualLo = static_cast<float>(
+                            parallax.residualConsensus.lo);
+                        dst.residualHi = static_cast<float>(
+                            parallax.residualConsensus.hi);
+                        dst.residualTrust = static_cast<float>(
+                            parallax.residualConsensus.trust);
+                        dst.residualValid = true;
+                    }
+                }
 
                 auto finalizeCarrierSample = [&](double candidateI) {
                     double sample = candidateI * basisI[xi] + modelQ * basisQ[xi];
@@ -2384,6 +2785,59 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 const double baselineModelI = modelI;
                 const double baselineCf = finalizeCarrierSample(baselineModelI);
                 double cf = baselineCf;
+
+                // Consume the same short-fit-selected residual feasibility that
+                // repaired locked 1D. The four-view fit remains the retraction
+                // candidate, but where it falls outside a discriminating,
+                // moving-supported subset it receives the same small bounded
+                // correction. Shared diagnostics constrain this application;
+                // no residual or fit sample is substituted wholesale.
+                bool sharedConstraintApplied = false;
+                double sharedDelta = 0.0;
+                const auto &sharedResidual = analysisRow[xi].residual;
+                const int sharedSurvivors = sharedResidual.survivorCount();
+                const bool sharedUseful =
+                    sharedResidual.valid &&
+                    sharedSurvivors > 0 &&
+                    sharedSurvivors < sharedResidual.optionCount &&
+                    sharedResidual.movingCompatible;
+                if (parallaxRepairMode == 2 &&
+                    sharedUseful &&
+                    !(cf >= sharedResidual.survivorLo &&
+                      cf <= sharedResidual.survivorHi))
+                {
+                    const double target = std::clamp(
+                        cf,
+                        sharedResidual.survivorLo,
+                        sharedResidual.survivorHi);
+                    const double maxDelta =
+                        std::max(0.0, parallaxRepairMaxDeltaIRE) * irescale;
+                    sharedDelta = std::clamp(
+                        target - cf,
+                        -maxDelta,
+                        maxDelta);
+                    cf += sharedDelta;
+                    sharedConstraintApplied = sharedDelta != 0.0;
+                }
+
+                if (crDiagLine == line && crDiagC0 >= 0 &&
+                    xi >= crDiagC0 &&
+                    xi <= (crDiagC1 < 0 ? crDiagC0 : crDiagC1))
+                {
+                    std::fprintf(stderr,
+                        "CARRIERRETRACTREPAIR line=%d rel=%d before=%.6f "
+                        "after=%.6f applied=%d deltaIRE=%.6f "
+                        "optionCount=%d survivorCount=%d survivorLo=%.6f "
+                        "survivorHi=%.6f movingCompatible=%d\n",
+                        line, xi, baselineCf, cf,
+                        sharedConstraintApplied ? 1 : 0,
+                        sharedDelta * invIreScale,
+                        static_cast<int>(sharedResidual.optionCount),
+                        sharedSurvivors,
+                        sharedResidual.survivorLo,
+                        sharedResidual.survivorHi,
+                        sharedResidual.movingCompatible ? 1 : 0);
+                }
 
                 carrierFit[xi] = cf;
                 flattened[xi] = rawWhole[xi] - cf;
@@ -2549,218 +3003,6 @@ void Comb::FrameBuffer::buildCarrierRetracted()
             }
         }
 */
-        // ---------------------------------------------------------------
-        // Opt-in white-star / wide-fit attribution.
-        //
-        // This modifies the carrier workprint by comparing the local one-cycle
-        // carrier estimate with a wide coherent carrier estimate. That is the
-        // fit-based star remedy's dangerous operation: it can relocate legitimate
-        // sub-fSC detail into Y and create the checkerboards seen in the witness
-        // path. Keep the restored witness/carrier-retraction path independent
-        // unless --whitestar is explicitly enabled.
-        // ---------------------------------------------------------------
-        if (configuration.whiteStar) {
-                if ((int)scratch_attrWideCarrier.size() < width) {
-                scratch_attrWideCarrier.resize(width, 0.0);
-                scratch_attrBandYClaim.resize(width, 0.0);
-            }
-            double *wideCarrierSample = scratch_attrWideCarrier.data();
-            double *carrierBandYClaim = scratch_attrBandYClaim.data();
-
-            std::fill(wideCarrierSample, wideCarrierSample + width, 0.0);
-            std::fill(carrierBandYClaim, carrierBandYClaim + width, 0.0);
-
-            constexpr int CC_WIN = 32;
-            constexpr int CC_HALF = CC_WIN / 2;
-
-            if (width >= CC_WIN) {
-                // Gram matrix for uniform-weight LS over CC_WIN samples.
-                // basisI/Q have period 4, so over 4N samples the sums are
-                // just N times the single-period values.
-                const int periods = CC_WIN / 4;
-                double sII_1 = 0.0, sIQ_1 = 0.0, sQQ_1 = 0.0;
-                for (int p = 0; p < 4; ++p) {
-                    sII_1 += basisI4[p] * basisI4[p];
-                    sIQ_1 += basisI4[p] * basisQ4[p];
-                    sQQ_1 += basisQ4[p] * basisQ4[p];
-                }
-                const double gramII = sII_1 * periods;
-                const double gramIQ = sIQ_1 * periods;
-                const double gramQQ = sQQ_1 * periods;
-                const double gramDet = gramII * gramQQ - gramIQ * gramIQ;
-
-                if (std::fabs(gramDet) > 1e-9) {
-                    const double gramInv = 1.0 / gramDet;
-
-                    // Initial window [0, CC_WIN-1].
-                    double sIY = 0.0, sQY = 0.0;
-                    for (int k = 0; k < CC_WIN; ++k) {
-                        const double obs = rawWhole[k] - coarseY[k];
-                        sIY += basisI[k] * obs;
-                        sQY += basisQ[k] * obs;
-                    }
-
-                    for (int xi = 0; xi < width; ++xi) {
-                        int wantA = xi - CC_HALF;
-                        int wantB = xi + CC_HALF - 1;
-                        if (wantA < 0) { wantB += -wantA; wantA = 0; }
-                        if (wantB >= width) {
-                            const int ov = wantB - (width - 1);
-                            wantB -= ov;
-                            wantA -= ov;
-                            if (wantA < 0) wantA = 0;
-                        }
-
-                        if (xi > 0) {
-                            int prevA = (xi - 1) - CC_HALF;
-                            int prevB = (xi - 1) + CC_HALF - 1;
-                            if (prevA < 0) { prevB += -prevA; prevA = 0; }
-                            if (prevB >= width) {
-                                const int ov = prevB - (width - 1);
-                                prevB -= ov;
-                                prevA -= ov;
-                                if (prevA < 0) prevA = 0;
-                            }
-
-                            for (int k = prevA; k < wantA; ++k) {
-                                const double obs = rawWhole[k] - coarseY[k];
-                                sIY -= basisI[k] * obs;
-                                sQY -= basisQ[k] * obs;
-                            }
-                            for (int k = prevB + 1; k <= wantB; ++k) {
-                                const double obs = rawWhole[k] - coarseY[k];
-                                sIY += basisI[k] * obs;
-                                sQY += basisQ[k] * obs;
-                            }
-                        }
-
-                        const double wideI = ( gramQQ * sIY - gramIQ * sQY) * gramInv;
-                        const double wideQ = (-gramIQ * sIY + gramII * sQY) * gramInv;
-                        const double wideSample = wideI * basisI[xi] + wideQ * basisQ[xi];
-                        wideCarrierSample[xi] = wideSample;
-
-                        const double narrowSample = carrierFit[xi];
-                        const int xi1 = std::min(xi + 1, width - 1);
-                        // Direct sqrt (bounded IRE-scale carrier samples).
-                        const double f0 = static_cast<double>(fitRow[xi]);
-                        const double f1 = static_cast<double>(fitRow[xi1]);
-                        const double fitMagIRE =
-                            std::sqrt(f0 * f0 + f1 * f1) * invIreScale;
-                        const double wideMagIRE =
-                            std::sqrt(wideI * wideI + wideQ * wideQ) * invIreScale;
-
-                        // Membership/lurch evidence: this is not edge detection.
-                        // It measures how much the legal carrier-cancelling
-                        // averages change when a pixel enters/leaves the 4-sample
-                        // cancellation window.  That component is attributed to
-                        // luma movement through the coarse aperture.
-                        const double lurchIRE = membershipYIRE[xi];
-
-                        const double membershipFraction =
-                            smoothGate01((lurchIRE - 0.50) / 4.0);
-
-                        double phaseAgreement = 0.0;
-                        double carrierCoherence = 0.0;
-                        double carrierConflict = 1.0;
-                        if (parallaxRow[xi].valid) {
-                            const auto &p = parallaxRow[xi];
-                            const double narrowMag =
-                                std::hypot(p.commonI, p.commonQ);
-                            const double wideMag = std::hypot(wideI, wideQ);
-                            if (narrowMag > 1e-9 && wideMag > 1e-9) {
-                                phaseAgreement = std::clamp(
-                                    (p.commonI * wideI + p.commonQ * wideQ) /
-                                        (narrowMag * wideMag),
-                                    0.0,
-                                    1.0);
-                            }
-
-                            carrierCoherence =
-                                std::clamp(p.carrierCoherence, 0.0, 1.0);
-                            const double spreadConflict = std::clamp(
-                                p.carrierSpreadIRE /
-                                    std::max(3.0, 0.35 * p.commonMagIRE + 1.0),
-                                0.0,
-                                1.0);
-                            const double latticeConflict = std::clamp(
-                                p.latticeRiskIRE /
-                                    std::max(3.0, 0.35 * p.commonMagIRE + 1.0),
-                                0.0,
-                                1.0);
-                            const double fitConflict = smoothGate01(
-                                (p.sampleFitErrorIRE - 1.0) / 5.0);
-                            carrierConflict = std::max({
-                                spreadConflict,
-                                latticeConflict,
-                                fitConflict,
-                                1.0 - carrierCoherence
-                            });
-                        }
-
-                        const CarrierImpurityEvidence impurityEvidence {
-                            fitMagIRE,
-                            wideMagIRE,
-                            phaseAgreement,
-                            carrierCoherence,
-                            carrierConflict,
-                            membershipFraction
-                        };
-                        const double impurity =
-                            detectCarrierImpurity(impurityEvidence);
-                        const double transferFraction =
-                            carrierImpurityTransferStrength(
-                                impurity, membershipFraction);
-
-                        double yClaim = (narrowSample - wideSample) * transferFraction;
-
-                        // Preserve sign and prevent the attribution transfer from
-                        // crossing the workprint through zero in a single pass.
-                        const double maxClaim = 0.90 * std::fabs(narrowSample);
-                        yClaim = std::clamp(yClaim, -maxClaim, maxClaim);
-
-                        carrierBandYClaim[xi] = yClaim;
-
-                        // Publish detector evidence, not the transferred
-                        // waveform amount. Consumers must choose their own
-                        // named policy conversion.
-                        impurityRow[xi] = static_cast<float>(impurity);
-                    }
-                }
-            }
-
-            // Apply the attribution transfer to the carrier workprint before
-            // Pass 2 promotion.  This is not a trust/distrust action; it moves
-            // a measured waveform component out of the carrier model and into
-            // the subsequent retracted-Y model.
-            for (int xi = 0; xi < width; ++xi) {
-                const double yClaim = carrierBandYClaim[xi];
-                if (yClaim == 0.0)
-                    continue;
-
-                double sample = carrierFit[xi] - yClaim;
-
-                // The five residual complements still define the local surviving
-                // carrier interval.  Keep the transfer inside that interval when
-                // the attribution record provides one.
-                if (parallaxRow[xi].valid &&
-                    parallaxRow[xi].residualConsensus.valid)
-                {
-                    const auto &rc = parallaxRow[xi].residualConsensus;
-                    const double padIRE = 0.75 + 2.0 * (1.0 - std::clamp(rc.trust, 0.0, 1.0));
-                    const double padSamples = padIRE / std::max(1e-12, invIreScale);
-                    const double lo = std::min(rc.lo, rc.hi) - padSamples;
-                    const double hi = std::max(rc.lo, rc.hi) + padSamples;
-                    sample = std::clamp(sample, lo, hi);
-
-                }
-
-                sample = std::clamp(sample, -maxCarrierSamples, maxCarrierSamples);
-                carrierFit[xi] = sample;
-                flattened[xi] = rawWhole[xi] - sample;
-                fitRow[xi] = static_cast<float>(sample);
-            }
-        }
-
         // Build the carrier-cancelled floor from every legal 4-sample mean of
         // the final flattened waveform.
         if (width >= 4) {
@@ -2804,26 +3046,13 @@ void Comb::FrameBuffer::buildCarrierRetracted()
                 floorRow[xi] = static_cast<float>(mean);
         }
     }
-
-    // ---------------------------------------------------------------
-    // Carrier skips confirmed stars / thin luma (detectStars(), shared).
-    //
-    // At a star the whole-range model would otherwise fit the impulse as
-    // carrier. Zero the fit at the pre-detected sites BEFORE the Pass-2
-    // interline comb, so combedCarrier has no carrier to assign there and the
-    // retracted view keeps it as luma by default (retractedY = raw). The
-    // election then has nothing to decide. The verdict comes from the single
-    // composite-domain detectStars() pass -- not re-detected here.
-    // ---------------------------------------------------------------
-    for (int line = firstLine; line < lastLine; ++line) {
-        const float *mask = starMask_line(line);
-        if (!mask) continue;
-        float *fitRow = carrierFit_flat.data()
-            + static_cast<size_t>(line) * demodWidth;
-        for (int xi = 0; xi < width; ++xi)
-            if (mask[xi] != 0.0f)
-                fitRow[xi] = 0.0f;
+        carrierRetractionModelValid = true;
     }
+
+    if (analysisOnly)
+        return;
+    if (!carrierRetractionModelValid)
+        return;
 
     // ---------------------------------------------------------------
     // Pass 2: line-to-line cancellation on carrierFit → combedCarrier.

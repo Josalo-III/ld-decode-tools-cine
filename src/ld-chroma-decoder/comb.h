@@ -58,10 +58,7 @@ public:
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
-        bool witnessCarrierRetraction = false;
-        // Experimental fit-based remedy for white stars misread as chroma.
-        // Kept opt-in because the fitted chroma path loses sub-fSC detail.
-        bool whiteStar = false;
+        bool lumaWitness = false;
 
         // Per-axis product gains: multipliers applied to I and Q before filtering.
         double gi_product = 1.0;
@@ -219,10 +216,10 @@ public:
             //   d ≤ deviationThreshold            → neutral
             //   d > deviationThreshold            → veto: +AGREEMENT_VETO_BASE + deviationPenalty·(d−threshold)
             // deviationThreshold is shared with getBestY() as the global temporal-mixing veto.
-            double AGREEMENT_REWARD_RADIUS_IRE = 8.5; // half-width of the reward lobe (IRE)
+            double AGREEMENT_REWARD_RADIUS_IRE = 7.5; // half-width of the reward lobe (IRE)
             double AGREEMENT_REWARD_MAX        = 3.3; // peak reward at d=0 (penalty units, scaled by adaptThreshold)
             double AGREEMENT_VETO_BASE         = 7.0; // base penalty added once d exceeds deviationThreshold
-            double deviationThreshold          = 8.0; // start of veto region (IRE); shared with getBestY
+            double deviationThreshold          = 10.0; // start of veto region (IRE); shared with getBestY
             double deviationPenalty            = 3.3; // penalty slope beyond deviationThreshold (per IRE)
 
             // 3D Residual Y selection
@@ -319,14 +316,14 @@ public:
 	void loadFields(const SourceField &firstField, const SourceField &secondField);
 
 	void split1D();
-	// Opt-in composite-domain star / thin-luma detection, run once early
-	// (after phaseLocked) so every consumer -- carrier retraction and the FVF
-	// election -- reads the SAME verdict instead of re-detecting on a weaker
-	// signal. Fills starMask_flat when configuration.whiteStar is enabled.
-	void detectStars();
+	// Single pre-render owner of the canonical locked 1D baseline and shared
+	// carrier diagnostics. Application paths consume these records; they do not
+	// clear or privately recreate them.
+	void buildCarrierAnalysis();
+	void buildCarrierRetractionStage(bool analysisOnly);
 
 	// Carrier-retraction / constrained-witness front end (restored 6/13 path),
-	// run in the pre-roll between phaseLocked() and buildPhaseCorrected1D().
+	// run after shared analysis and the locked local-carrier construction.
 	void buildCarrierRetracted();
 	void buildConstrainedYWitness();
 	void lurchSharpenCoarsePrior(const double *means,
@@ -369,8 +366,12 @@ public:
 	bool isSceneStart = false;
 
 private:
-	struct Candidate { double penalty; double sample; };
-
+	struct Candidate {
+	    double penalty;
+	    double sample;
+	    double yPen;
+	    double iqPen;
+	};
 	const LdDecodeMetaData::VideoParameters &videoParameters;
 	const Configuration &configuration;
 
@@ -511,10 +512,9 @@ private:
 	// remodulated to composite). produceY subtracts this from raw to form Y, so
 	// the carrier removed from luma is exactly the carrier rendered as colour.
 	std::vector<double> lockedCarrierComposite_flat;
-	// Wide-window cross-color risk [0,1] per pixel.  Initially written by
-	// buildPhaseCorrected1D() on the 1D bandpass, then overwritten by
-	// measurePostCombImpurity() on the elected comb source so the value
-	// reflects post-comb carrier, not per-field 1D.
+	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D;
+	// measurePostCombImpurity() unions the elected-comb reading with that sharp
+	// pre-comb warning rather than erasing it.
 	std::vector<float> carrierImpurity_flat;
 
 	// --- Carrier-retraction / constrained-witness buffers (restored from the
@@ -528,6 +528,7 @@ private:
 	std::vector<float> combedCarrier_flat;       // interline-cancelled carrier fit
 	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat; // per-pixel four-view evidence
 	bool carrierRetractedValid = false;
+	bool carrierRetractionModelValid = false;
 
 	// Constrained multi-witness outputs (buildConstrainedYWitness); valid when
 	// witnessValid is true.
@@ -642,26 +643,16 @@ private:
 		//     intentional and minimal — do not widen it without scrutiny.
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
+		std::vector<float> locked1DParallaxRepairStrength_flat; // [0,1] actual Pass-1.5 applied repair strength
+	// Optional application-neutral carrier facts. Allocated only when a
+	// carrier-analysis client (luma witness, diagnostics, or the 1D parallax
+	// experiment) asks for them; ordinary locked output pays no additional
+	// per-pixel storage cost.
+		std::vector<lddecode::CarrierAnalysisRecord> carrierAnalysis_flat;
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
 	bool lockedLumaCacheValid = false;
-
-	// Per-sample confirmed-star / thin-luma-on-flat-black mask (0/1), detected
-	// only for the opt-in white-star remedy. Shared by buildCarrierRetracted
-	// (zeros the carrier fit) and the FVF election (impulse handling).
-	std::vector<float> starMask_flat;
-
-	inline float *starMask_line(int line) {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    starMask_flat.empty()) return nullptr;
-		return starMask_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline const float *starMask_line(int line) const {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    starMask_flat.empty()) return nullptr;
-		return starMask_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
 
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
@@ -701,6 +692,18 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    locked1DRawBandpass_flat.empty()) return nullptr;
 		return locked1DRawBandpass_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline float *locked1DParallaxRepairStrength_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DParallaxRepairStrength_flat.empty()) return nullptr;
+		return locked1DParallaxRepairStrength_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const float *locked1DParallaxRepairStrength_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DParallaxRepairStrength_flat.empty()) return nullptr;
+		return locked1DParallaxRepairStrength_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Bucket-path 1D scalar: valid only after split1D().
@@ -983,9 +986,11 @@ private:
 						   qint32 lineNumber, qint32 h,
 						   double adjustPenalty) const;
 
-	// Dedicated 3D Residual Y selector
-	double getBestY(qint32 line, qint32 h, double currentY2D, 
-					const FrameBuffer &prev, const FrameBuffer &next) const;        
+	// Dedicated 3D residual-Y selector. Consumes the best pre-output luma
+	// available from each frame (witness when present, otherwise the coherent
+	// residual/comb baseline) rather than the stale raw-clpbuffer fallback.
+	double getBestY(qint32 line, qint32 h,
+					const FrameBuffer &prev, const FrameBuffer &next) const;
 	
 	int demodWidth  = 0;
 	int demodLines  = 0;
@@ -1051,10 +1056,24 @@ private:
 		return lockedCarrierComposite_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* carrierImpurity_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierImpurity_flat.empty()) return nullptr;
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline const float* carrierImpurity_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierImpurity_flat.empty()) return nullptr;
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline lddecode::CarrierAnalysisRecord* carrierAnalysis_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierAnalysis_flat.empty()) return nullptr;
+		return carrierAnalysis_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const lddecode::CarrierAnalysisRecord* carrierAnalysis_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    carrierAnalysis_flat.empty()) return nullptr;
+		return carrierAnalysis_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// --- Carrier-retraction / witness accessors (guarded by carrierRetractedValid

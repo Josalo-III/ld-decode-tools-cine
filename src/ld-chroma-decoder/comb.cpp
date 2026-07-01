@@ -205,13 +205,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             if (configuration.phaseCompensation) {
                 next->phaseLocked();
-                if (configuration.whiteStar)
-                    next->detectStars();
-                if (configuration.witnessCarrierRetraction) {
+                next->buildCarrierAnalysis();
+                next->buildPhaseCorrected1D();
+                if (configuration.lumaWitness) {
                     next->buildCarrierRetracted();
                     next->buildConstrainedYWitness();
                 }
-                next->buildPhaseCorrected1D();
             }
 
             next->split2D();
@@ -492,6 +491,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
+            locked1DParallaxRepairStrength_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
             compactPatchGate_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
@@ -2286,7 +2286,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         }
     }
 }
-
+// 3D Election
 void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                                          const FrameBuffer &previousFrame,
                                          const FrameBuffer &nextFrame,
@@ -2299,109 +2299,158 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     static constexpr double FIELD_BONUS = -4.0;
     static constexpr double FRAME_BONUS = -5.0;
 
-    // 1D/2D Candidates (Always available via 'this')
-    c[CAND_LEFT]  = getCandidate(lineNumber, h, *this, lineNumber, h - 2, 0.0);
+    auto invalidateCandidate = [&](int idx) {
+        c[idx].penalty = 1000.0;
+        c[idx].sample  = 0.0;
+        c[idx].yPen    = 1000.0;
+        c[idx].iqPen   = 0.0;
+        src[idx]       = nullptr;
+    };
+
+    for (int i = 0; i < NUM_CANDIDATES; ++i)
+        invalidateCandidate(i);
+
+    // 1D/2D Candidates (always available via this frame)
+    c[CAND_LEFT]   = getCandidate(lineNumber, h, *this, lineNumber,     h - 2, 0.0);
     src[CAND_LEFT] = this;
-    c[CAND_RIGHT] = getCandidate(lineNumber, h, *this, lineNumber, h + 2, 0.0);
+
+    c[CAND_RIGHT]   = getCandidate(lineNumber, h, *this, lineNumber,     h + 2, 0.0);
     src[CAND_RIGHT] = this;
+
     c[CAND_UP]   = getCandidate(lineNumber, h, *this, lineNumber - 2, h, LINE_BONUS);
     src[CAND_UP] = this;
-    c[CAND_DOWN] = getCandidate(lineNumber, h, *this, lineNumber + 2, h, LINE_BONUS);
+
+    c[CAND_DOWN]   = getCandidate(lineNumber, h, *this, lineNumber + 2, h, LINE_BONUS);
     src[CAND_DOWN] = this;
 
-    // Previous and next field candidates are evaluated independently so a valid
-    // prev does not force a symmetric next evaluation.
-    
     const bool frameVerticalAllowed = carrierFrameVerticalAllowed(lineNumber);
 
     // --- Previous Field ---
-    bool prevValid = false;
+    //
+    // Previous and next field candidates are evaluated independently. A valid
+    // previous-field candidate does not require a symmetric next-field candidate.
     if (frameVerticalAllowed && lineNumber - 1 >= videoParameters.firstActiveFrameLine) {
-        // Inter-field (line above in previous field vs line above in this field)
-        // If phases match, the info is in previousFrame. If phases flip, it's in this frame.
         if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber - 1)) {
-             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h, previousFrame, lineNumber - 1, h, FIELD_BONUS);
-             src[CAND_PREV_FIELD] = &previousFrame;
+            c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
+                                              previousFrame, lineNumber - 1, h,
+                                              FIELD_BONUS);
+            src[CAND_PREV_FIELD] = &previousFrame;
         } else {
-             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h, *this, lineNumber - 1, h, FIELD_BONUS);
-             src[CAND_PREV_FIELD] = this;
+            c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
+                                              *this, lineNumber - 1, h,
+                                              FIELD_BONUS);
+            src[CAND_PREV_FIELD] = this;
         }
-        prevValid = true;
     }
-    
+
     // --- Next Field ---
-    // Note: We don't force symmetry. If Prev is valid and Next isn't, we still evaluate Prev.
     if (frameVerticalAllowed && lineNumber + 1 < videoParameters.lastActiveFrameLine) {
         if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber + 1)) {
-             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h, nextFrame, lineNumber + 1, h, FIELD_BONUS);
-             src[CAND_NEXT_FIELD] = &nextFrame;
+            c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
+                                              nextFrame, lineNumber + 1, h,
+                                              FIELD_BONUS);
+            src[CAND_NEXT_FIELD] = &nextFrame;
         } else {
-             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h, *this, lineNumber + 1, h, FIELD_BONUS);
-             src[CAND_NEXT_FIELD] = this;
+            c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
+                                              *this, lineNumber + 1, h,
+                                              FIELD_BONUS);
+            src[CAND_NEXT_FIELD] = this;
         }
     }
 
-    // --- Temporal Frame Center (Prev/Next Frame) ---
-    // This is where the 8-field cycle breaks 3D. 
-    // We explicitly check if the target frame exists AND matches phase.
-    
-    // Check Previous Frame Phase Match
-    // We compare this->linePhase vs prev->linePhase at same line.
-    // If they match, it's a valid candidate. If they differ (decimation/cut), it's garbage.
+    // --- Temporal Frame Center: Previous Frame ---
+    //
+    // Same-line previous/next-frame candidates are only legal when the carrier
+    // line relation matches. If the phase relation differs, the temporal center
+    // candidate is invalid rather than merely expensive.
     if (carrierLineFlip(lineNumber) == previousFrame.carrierLineFlip(lineNumber)) {
-        c[CAND_PREV_FRAME] = getCandidate(lineNumber, h, previousFrame, lineNumber, h, FRAME_BONUS);
+        c[CAND_PREV_FRAME] = getCandidate(lineNumber, h,
+                                          previousFrame, lineNumber, h,
+                                          FRAME_BONUS);
         src[CAND_PREV_FRAME] = &previousFrame;
     } else {
-        c[CAND_PREV_FRAME].penalty = 1000.0;
-        src[CAND_PREV_FRAME] = nullptr;
+        invalidateCandidate(CAND_PREV_FRAME);
     }
 
-    // Check Next Frame Phase Match independently
+    // --- Temporal Frame Center: Next Frame ---
     if (carrierLineFlip(lineNumber) == nextFrame.carrierLineFlip(lineNumber)) {
-        c[CAND_NEXT_FRAME] = getCandidate(lineNumber, h, nextFrame, lineNumber, h, FRAME_BONUS);
+        c[CAND_NEXT_FRAME] = getCandidate(lineNumber, h,
+                                          nextFrame, lineNumber, h,
+                                          FRAME_BONUS);
         src[CAND_NEXT_FRAME] = &nextFrame;
     } else {
-        c[CAND_NEXT_FRAME].penalty = 1000.0;
-        src[CAND_NEXT_FRAME] = nullptr;
+        invalidateCandidate(CAND_NEXT_FRAME);
     }
 
-    // Agreement shaping logic
+    // --- Agreement Shaping ---
+    //
+    // Old behavior:
+    //
+    //     d = abs(candidate.sample - current clpbuffer[1]) / irescale
+    //
+    // That was a same-pixel scalar chroma/bandpass comparison. It rewarded
+    // temporal candidates for matching the current 2D chroma grid and punished
+    // candidates that diverged from that grid.
+    //
+    // New behavior:
+    //
+    //     d = candidate.yPen
+    //
+    // getCandidate() has already computed yPen from reconstructed luma:
+    //
+    //     Y = raw - clpbuffer[1]
+    //
+    // over a small cross neighborhood. Reusing yPen avoids another comparison
+    // and prevents compact-color checkerboard disagreement in chroma space from
+    // automatically vetoing a picture-compatible temporal candidate.
     if (configuration.dimensions == 3 && configuration.adaptive) {
-        const double ref2d = clpbuffer[1].pixel[lineNumber][h];
         const auto &T = configuration.tunables;
 
         for (int i = 0; i < NUM_CANDIDATES; ++i) {
             const FrameBuffer* s = src[i];
-            if (!s || s == this || c[i].penalty >= 1000.0) continue;
 
-            double dIRE = std::fabs(c[i].sample - ref2d) / irescale;
+            // Only shape temporal candidates here. Spatial candidates already
+            // carry their getCandidate() penalties and bonuses.
+            if (!s || s == this || c[i].penalty >= 1000.0)
+                continue;
+
+            const double dIRE = c[i].yPen;
             double delta = 0.0;
 
             if (dIRE <= T.AGREEMENT_REWARD_RADIUS_IRE) {
-                double x = dIRE / T.AGREEMENT_REWARD_RADIUS_IRE;
-                delta = - (T.AGREEMENT_REWARD_MAX * configuration.adaptThreshold) * (1.0 - x * x);
+                const double x = dIRE / T.AGREEMENT_REWARD_RADIUS_IRE;
+                delta = -(T.AGREEMENT_REWARD_MAX * configuration.adaptThreshold)
+                        * (1.0 - x * x);
             } else if (dIRE <= T.deviationThreshold) {
                 delta = 0.0;
             } else {
                 delta = T.AGREEMENT_VETO_BASE
-                      + T.deviationPenalty * (dIRE - T.deviationThreshold);
+                        + T.deviationPenalty * (dIRE - T.deviationThreshold);
             }
+
             c[i].penalty += delta;
+
+            if (c[i].penalty > configuration.candidatePenaltyHardMax)
+                c[i].penalty = configuration.candidatePenaltyHardMax;
         }
     }
 
-    // Select best
+    // Select best candidate.
     if (configuration.adaptive) {
         int best = 0;
         for (int i = 1; i < NUM_CANDIDATES; ++i) {
-            if (c[i].penalty < c[best].penalty) best = i;
+            if (c[i].penalty < c[best].penalty)
+                best = i;
         }
         bestIndex = best;
     } else {
-        // Non-adaptive fallback: prefer Previous Frame if valid, else Next, else 2D
-        if (src[CAND_PREV_FRAME]) bestIndex = CAND_PREV_FRAME;
-        else if (src[CAND_NEXT_FRAME]) bestIndex = CAND_NEXT_FRAME;
-        else bestIndex = CAND_UP; // Fallback to 2D
+        // Non-adaptive fallback: prefer Previous Frame if valid, else Next, else 2D.
+        if (src[CAND_PREV_FRAME])
+            bestIndex = CAND_PREV_FRAME;
+        else if (src[CAND_NEXT_FRAME])
+            bestIndex = CAND_NEXT_FRAME;
+        else
+            bestIndex = CAND_UP;
     }
 
     bestSample = c[bestIndex].sample;

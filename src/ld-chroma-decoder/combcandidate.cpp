@@ -660,13 +660,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         std::fill(scratch_impulseExempt.begin(),
                   scratch_impulseExempt.begin() + width, 0.0);
 
-        // The opt-in white-star remedy publishes a stronger composite-domain
-        // verdict. Without it, retain FVF's baseline smoothed-luma impulse
-        // exemption so ordinary phase-comp output is unchanged.
-        const float *starRow = configuration.whiteStar
-            ? starMask_line(tapLine.ln0)
-            : nullptr;
-
         for (int rel = 0; rel < width; ++rel) {
             double cI, cQ, uI, uQ, dI, dQ;
             carrierGrammarDemodSignedCompositeTo4fsc(
@@ -701,11 +694,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             double dnGate = std::max(dnPair[rel].reachLegalGate, floor.down);
 
             double impulseExempt = 0.0;
-            if (configuration.whiteStar) {
-                // Confirmed star / thin-luma site -> full impulse treatment.
-                impulseExempt = (starRow && starRow[rel] != 0.0f) ? 1.0 : 0.0;
-            } else if (frameLuma0) {
-                // Baseline FVF impulse exemption from the pre-whitestar path.
+            if (frameLuma0) {
+                // Baseline FVF impulse exemption from the long-standing path.
                 const int l2 = std::max(0, rel - 2);
                 const int r2 = std::min(width - 1, rel + 2);
                 const double cIRE_luma = frameLuma0[rel] * invI;
@@ -1194,6 +1184,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         return;
     }
 
+    const float *parallaxRepairStrength =
+        locked1DParallaxRepairStrength_line(lineNumber);
+
     // Missing vertical support rows: preserve the local 1D chroma estimate.
     // This avoids synthetic zero chroma without changing normal Field B geometry.
     if (!tapLine.haveU2 || !tapLine.haveD2 ||
@@ -1618,8 +1611,26 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                     chromaGrowthT;
             }
 
+            double parallaxRepairCede = 0.0;
+            if (parallaxRepairStrength) {
+                // Pass-1.5 only publishes strength for actual applied repairs:
+                // report mode, abstains, conflicts, all-survive cases, source-
+                // inside cases all stay zero.
+                // Where a substantial 1D repair landed, Field B should reduce
+                // its vertical comb and defer toward the repaired center source.
+                parallaxRepairCede = std::clamp(
+                    static_cast<double>(parallaxRepairStrength[rel]),
+                    0.0,
+                    1.0);
+            }
+
             const double totalCede =
-                std::max({boundaryCede, lumaEdgeCede, lumaOnlyCede});
+                std::max({
+                    boundaryCede,
+                    lumaEdgeCede,
+                    lumaOnlyCede,
+                    parallaxRepairCede
+                });
 
             if (totalCede > 0.0) {
                 tc = tc * (1.0 - totalCede) + C * totalCede;
@@ -2362,6 +2373,8 @@ void Comb::FrameBuffer::computeFrameBLine(
 
 // 3D Section
 // getCandidate - prescreen for 3D election
+// 3D Section
+// getCandidate - prescreen for 3D election
 Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     qint32 refLineNumber, qint32 refH,
     const FrameBuffer &frameBuffer, qint32 lineNumber, qint32 h,
@@ -2370,6 +2383,8 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     Candidate result;
     result.penalty = configuration.candidatePenaltyHardMax;
     result.sample  = 0.0;
+    result.yPen    = configuration.candidatePenaltyHardMax;
+    result.iqPen   = 0.0;
 
     const int firstLine  = videoParameters.firstActiveFrameLine;
     const int lastLine   = videoParameters.lastActiveFrameLine;
@@ -2381,10 +2396,12 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return std::clamp(x, left, right - 1);
     };
 
-    // Bounds check
+    // Bounds check.
     if ((unsigned)(lineNumber - firstLine) >= (unsigned)(lastLine - firstLine) ||
         (unsigned)(refLineNumber - firstLine) >= (unsigned)(lastLine - firstLine)) {
         result.penalty = 1000.0;
+        result.yPen    = 1000.0;
+        result.iqPen   = 0.0;
         return result;
     }
 
@@ -2405,9 +2422,12 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
          h,
          lddecode::CombReachUse::ScalarSignCompare,
          lddecode::makeBucketScalarReachSource()});
+
     if (!phaseReach.allowScalarSignCompare ||
         phaseReach.carrierRelation != lddecode::CarrierPhaseRelation::Opposite) {
         result.penalty = 1000.0;
+        result.yPen    = 1000.0;
+        result.iqPen   = 0.0;
         return result;
     }
 
@@ -2417,104 +2437,179 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     // bucket path reads clpbuffer[0] directly.
     const double *lockedRow = frameBuffer.configuration.phaseCompensation
         ? frameBuffer.locked1DSource_line(lineNumber) : nullptr;
-    if (lockedRow && (hh - left) >= 0 && (hh - left) < (right - left))
-    {
+
+    if (lockedRow && (hh - left) >= 0 && (hh - left) < (right - left)) {
         result.sample = lockedRow[hh - left];
     } else {
         result.sample = frameBuffer.bucketScalar1D_line(lineNumber)[hh];
     }
 
-    // --- Luma Penalty with Neighbor Shaping (Cross Pattern) ---
-    // Horizontal (Current Line)
+    // --- Luma Penalty with Neighbor Shaping ---
+    //
+    // This is the already-paid luma-domain evidence:
+    //
+    //     reconstructed Y = raw - 2D chroma/composite estimate
+    //
+    // It compares current/reference against candidate over a small cross:
+    //
+    //     center line: x-1, x, x+1
+    //     vertical:    y-1, y+1 at x
+    //
+    // getBestCandidate can now reuse result.yPen directly instead of
+    // re-deriving a same-pixel scalar chroma distance from result.sample.
     const quint16 *refRawC  = rawbuffer.data() + refLineNumber * fieldWidth;
     const double  *refClpC  = clpbuffer[1].pixel[refLineNumber];
+
     const quint16 *candRawC = frameBuffer.rawbuffer.data() + lineNumber * fieldWidth;
     const double  *candClpC = frameBuffer.clpbuffer[1].pixel[lineNumber];
 
-    // Vertical (Up/Down Lines) - Neighbor Shaping
     const bool verticalAllowed =
         carrierFrameVerticalAllowed(refLineNumber) &&
         frameBuffer.carrierFrameVerticalAllowed(lineNumber);
+
     const bool haveUp = verticalAllowed &&
                         (refLineNumber - 1 >= firstLine) &&
                         (lineNumber - 1 >= firstLine);
+
     const bool haveDn = verticalAllowed &&
                         (refLineNumber + 1 < lastLine) &&
                         (lineNumber + 1 < lastLine);
 
-    // Pointers for Ref Neighbors
-    const quint16 *refRawU = haveUp ? (rawbuffer.data() + (refLineNumber - 1) * fieldWidth) : refRawC;
-    const double  *refClpU = haveUp ? (clpbuffer[1].pixel[refLineNumber - 1]) : refClpC;
-    const quint16 *refRawD = haveDn ? (rawbuffer.data() + (refLineNumber + 1) * fieldWidth) : refRawC;
-    const double  *refClpD = haveDn ? (clpbuffer[1].pixel[refLineNumber + 1]) : refClpC;
+    const quint16 *refRawU = haveUp
+        ? (rawbuffer.data() + (refLineNumber - 1) * fieldWidth)
+        : refRawC;
+    const double *refClpU = haveUp
+        ? clpbuffer[1].pixel[refLineNumber - 1]
+        : refClpC;
 
-    // Pointers for Cand Neighbors
-    const quint16 *candRawU = haveUp ? (frameBuffer.rawbuffer.data() + (lineNumber - 1) * fieldWidth) : candRawC;
-    const double  *candClpU = haveUp ? (frameBuffer.clpbuffer[1].pixel[lineNumber - 1]) : candClpC;
-    const quint16 *candRawD = haveDn ? (frameBuffer.rawbuffer.data() + (lineNumber + 1) * fieldWidth) : candRawC;
-    const double  *candClpD = haveDn ? (frameBuffer.clpbuffer[1].pixel[lineNumber + 1]) : candClpC;
+    const quint16 *refRawD = haveDn
+        ? (rawbuffer.data() + (refLineNumber + 1) * fieldWidth)
+        : refRawC;
+    const double *refClpD = haveDn
+        ? clpbuffer[1].pixel[refLineNumber + 1]
+        : refClpC;
 
-    auto getLuma = [&](const quint16* r, const double* c, int idx) -> double {
-        return (double)r[idx] - c[idx];
+    const quint16 *candRawU = haveUp
+        ? (frameBuffer.rawbuffer.data() + (lineNumber - 1) * fieldWidth)
+        : candRawC;
+    const double *candClpU = haveUp
+        ? frameBuffer.clpbuffer[1].pixel[lineNumber - 1]
+        : candClpC;
+
+    const quint16 *candRawD = haveDn
+        ? (frameBuffer.rawbuffer.data() + (lineNumber + 1) * fieldWidth)
+        : candRawC;
+    const double *candClpD = haveDn
+        ? frameBuffer.clpbuffer[1].pixel[lineNumber + 1]
+        : candClpC;
+
+    auto getLuma = [&](const quint16 *raw, const double *chroma, int idx) -> double {
+        return static_cast<double>(raw[idx]) - chroma[idx];
     };
 
-    // Horizontal Diffs
-    int r0 = clampH(refH - 1), r1 = clampH(refH), r2 = clampH(refH + 1);
-    int c0 = clampH(h - 1),    c1 = hh,           c2 = clampH(h + 1);
+    const int r0 = clampH(refH - 1);
+    const int r1 = clampH(refH);
+    const int r2 = clampH(refH + 1);
 
-    double dC0 = std::fabs(getLuma(refRawC, refClpC, r0) - getLuma(candRawC, candClpC, c0));
-    double dC1 = std::fabs(getLuma(refRawC, refClpC, r1) - getLuma(candRawC, candClpC, c1));
-    double dC2 = std::fabs(getLuma(refRawC, refClpC, r2) - getLuma(candRawC, candClpC, c2));
+    const int c0 = clampH(h - 1);
+    const int c1 = hh;
+    const int c2 = clampH(h + 1);
 
-    // Vertical Diffs (Center Horizontal only)
-    double dU = std::fabs(getLuma(refRawU, refClpU, r1) - getLuma(candRawU, candClpU, c1));
-    double dD = std::fabs(getLuma(refRawD, refClpD, r1) - getLuma(candRawD, candClpD, c1));
+    const double dC0 = std::fabs(getLuma(refRawC, refClpC, r0) -
+                                 getLuma(candRawC, candClpC, c0));
+    const double dC1 = std::fabs(getLuma(refRawC, refClpC, r1) -
+                                 getLuma(candRawC, candClpC, c1));
+    const double dC2 = std::fabs(getLuma(refRawC, refClpC, r2) -
+                                 getLuma(candRawC, candClpC, c2));
 
-    // Weighted Luma Penalty
-    // Neighbors get weighted by NEIGHBOR_SHAPE_STRENGTH (implicit here via averaging, could be tuned)
-    // 3 Horizontal + 2 Vertical = 5 samples
-    double yPen = (dC0 + dC1 + dC2 + dU + dD) / 5.0;
-    yPen *= invIreScale;
+    const double dU = std::fabs(getLuma(refRawU, refClpU, r1) -
+                                getLuma(candRawU, candClpU, c1));
+    const double dD = std::fabs(getLuma(refRawD, refClpD, r1) -
+                                getLuma(candRawD, candClpD, c1));
 
-    // --- Chrominance Penalty (2D) ---
-    // (Kept similar to previous, but could also add vertical if desired. Sticking to H for speed/legacy match)
-    const int fRef = carrierLineFlip(refLineNumber);
+    const double yPen = ((dC0 + dC1 + dC2 + dU + dD) / 5.0) * invIreScale;
+
+    // --- Chroma/2D Penalty ---
+    //
+    // Preserve the existing chroma disagreement evidence separately instead of
+    // collapsing it into result.penalty only. This lets getBestCandidate treat
+    // low-yPen/high-iqPen as "picture-compatible but chroma-grid divergent",
+    // which is the compact-checkerboard repair case.
+    const int fRef  = carrierLineFlip(refLineNumber);
     const int fCand = carrierLineFlip(lineNumber);
 
-    double iqPen = (std::fabs(fRef * refClpC[r0] - fCand * candClpC[c0]) * 0.5 +
-                    std::fabs(fRef * refClpC[r1] - fCand * candClpC[c1]) * 1.0 +
-                    std::fabs(fRef * refClpC[r2] - fCand * candClpC[c2]) * 0.5) / 2.0;
+    double iqPen =
+        (std::fabs((fRef * refClpC[r0]) - (fCand * candClpC[c0])) * 0.5 +
+         std::fabs((fRef * refClpC[r1]) - (fCand * candClpC[c1])) * 1.0 +
+         std::fabs((fRef * refClpC[r2]) - (fCand * candClpC[c2])) * 0.5) / 2.0;
+
     iqPen = (iqPen * invIreScale) * 0.28 * configuration.chromaWeight;
 
     double penalty = yPen + iqPen + adjustPenalty;
+    if (penalty > configuration.candidatePenaltyHardMax)
+        penalty = configuration.candidatePenaltyHardMax;
 
-    if (penalty > configuration.candidatePenaltyHardMax) penalty = configuration.candidatePenaltyHardMax;
+    result.yPen    = yPen;
+    result.iqPen   = iqPen;
     result.penalty = penalty;
+
     return result;
 }
-// getBestY - Dedicated 3D Residual Y Election/Blend
-double Comb::FrameBuffer::getBestY(qint32 line, qint32 h, double currentY2D,
+// getBestY - Dedicated 3D residual-Y election/blend.
+//
+// The temporal vote should see the best local luma model each frame has
+// already produced, not the stale raw - clpbuffer[1] baseline. Priority:
+//   1. witness Y, when residualColor + witnessValid
+//   2. coherent residual comb Y = raw - lockedCarrierComposite
+//   3. plain 2D comb Y = raw - clpbuffer[1]
+double Comb::FrameBuffer::getBestY(qint32 line, qint32 h,
                                    const FrameBuffer &prev, const FrameBuffer &next) const
 {
     const auto &T = configuration.tunables;
     const int fw  = videoParameters.fieldWidth;
+    const int left = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
 
-    // Helper to extract Y from a framebuffer
+    // Helper to extract the best pre-output luma available from a framebuffer.
     auto getY = [&](const FrameBuffer& fb, int ln, int x) -> double {
-        if (ln < videoParameters.firstActiveFrameLine || ln >= videoParameters.lastActiveFrameLine) return 0.0;
-        double raw = (double)fb.rawbuffer.data()[ln * fw + x];
-        double clp = fb.clpbuffer[1].pixel[ln][x];
-        return raw - clp;
+        if (ln < videoParameters.firstActiveFrameLine ||
+            ln >= videoParameters.lastActiveFrameLine)
+            return 0.0;
+
+        const int xx = std::clamp(x, left, right - 1);
+        const int rel = xx - left;
+        const double raw = (double)fb.rawbuffer.data()[ln * fw + xx];
+
+        if (fb.configuration.residualColor && fb.witnessValid) {
+            const float *witRow = fb.yWitness_line(ln);
+            if (witRow) {
+                const double w = (double)witRow[rel];
+                if (std::isfinite(w))
+                    return w;
+            }
+        }
+
+        if (fb.configuration.residualVideo) {
+            const double *carrierRow = fb.lockedCarrierComposite_line(ln);
+            if (carrierRow) {
+                const double c = carrierRow[rel];
+                if (std::isfinite(c))
+                    return raw - c;
+            }
+        }
+
+        const double clp = fb.clpbuffer[1].pixel[ln][xx];
+        return std::isfinite(clp) ? (raw - clp) : raw;
     };
 
-    double yCurr = currentY2D;
+    double yCurr = getY(*this, line, h);
     double yPrev = getY(prev, line, h);
     double yNext = getY(next, line, h);
 
     // --- Neighbor Shaping ---
     // Calculate a "Spatial Consensus" for the current pixel using N/S/E/W
-    // This assumes the 2D Comb (currentY2D) captures the spatial truth reasonably well,
-    // but we check the *input* spatial context to see if candidates fit.
+    // from the current frame's best local luma model, then see which temporal
+    // candidates fit that spatial context.
 
     // Simple Consensus: Median of Current, Up, Down, Left, Right
     double valC = yCurr;
