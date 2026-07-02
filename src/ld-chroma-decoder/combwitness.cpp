@@ -11,7 +11,8 @@
  *
  * Current state: constrained witness. The stage removes impossible luma
  * candidates, sharpens the broad prior from aperture-membership evidence, and
- * permits only a bounded compact-patch correction from the 1D witness.
+ * admits 1D in two bounded roles: compact-patch repair and the low-chroma
+ * fast-contour fallback (see the policy comment in the function body).
  *
  * Conceptual mapping (see witness-migration.md):
  *   yWitness            ← constrained Y after survivor reconciliation
@@ -126,7 +127,21 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
      *   moving coarse    = broad luma prior
      *   four floor views = possible-value clamp
      *   lurch           = boundary sharpener inside the clamp
-     *   1D              = bounded repair inside strongly certified compact patches
+     *
+     * 1D roles in this file:
+     *
+     *   1. Compact-patch repair:
+     *      A bounded witness-side correction inside a strongly certified
+     *      compact chroma patch.
+     *
+     *   2. Low-chroma fast-contour fallback:
+     *      A luma-side substitution when comb-confirmed low chroma and strong
+     *      1D/lurch divergence indicate that the lurch-shaped prior is failing.
+     *
+     * Outside this witness path, 1D also remains the first comb stage in
+     * bucket mode.  None of these roles authorizes phase-erased diagnostic
+     * data to become video, and none allows comb clients to invent local
+     * phase policy.
      *
      * The old carrier-side candidate election is intentionally absent.
      */

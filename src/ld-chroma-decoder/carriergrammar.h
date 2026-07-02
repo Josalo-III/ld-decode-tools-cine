@@ -30,7 +30,15 @@ enum class CarrierSignFrame {
     UnsignedBucket,           // (h + samplePhase0) & 3; no polarity in values
     BurstLockedSigned,        // burst phasor + lineFlip baked in; do not re-sign
     MetadataPreservedSigned,  // parser/metadata polarity preserved; do not re-sign
-    Grid4fsc,                 // cross-line analysis; producer declares sign state
+
+    // Phase-preserved 4fSC-aligned working space.  Like a color-management
+    // working space: it aligns samples to the nominal 4fSC phase buckets so
+    // phase-based operations are more accurate.  Its purpose is to preserve
+    // and improve phase semantics, never to normalize them away.  Clients
+    // must preserve carrier phase and consult CarrierGrammarState for legal
+    // operations; phase-erased diagnostic data must not travel under this
+    // frame as if it were video.
+    Grid4fsc,
 };
 
 // Source priority for lineFlip and carrier polarity.

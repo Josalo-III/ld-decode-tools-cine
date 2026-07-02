@@ -78,14 +78,34 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
                                 const CarrierGrammarState *center,
                                 const CarrierGrammarState *target)
 {
+    // Signal-class triage comes first: a phase-erased diagnostic source is
+    // rejected from video-capable operations before any grammar convenience
+    // can leak it into the output path.  It needs no grammar to be scored.
+    if (request.source.signalClass == CombReachSignalClass::PhaseErasedDiagnostic) {
+        CombReachReply reply;
+        reply.verdict = CombReachVerdict::DiagnosticOnly;
+        reply.valid = true;
+        reply.allowDiagnosticCompare = true;
+        reply.allowScalarMagnitudeCompare = true;  // magnitude is phase-free
+        reply.mayBecomeVideo = false;
+        reply.centerFrame = request.source.signFrame;
+        reply.targetFrame = request.source.signFrame;
+        reply.tag = "phase-erased-diagnostic";
+        return reply;
+    }
+
     if (!center || !target)
         return unknownReply(request, "missing-grammar");
 
-    if (request.source.carrierFree)
+    if (request.source.carrierFree ||
+        request.source.signalClass == CombReachSignalClass::CarrierFree)
         return blockedReply(request, "carrier-free-y");
 
     if (request.source.kind == CombReachSourceKind::Detector)
         return blockedReply(request, "detector-not-waveform");
+
+    if (request.source.signalClass != CombReachSignalClass::PhasePreservedCarrier)
+        return blockedReply(request, "signal-class-unknown");
 
     CombReachReply reply;
     reply.valid = true;
@@ -113,6 +133,7 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
             request.use != CombReachUse::IQCancel ||
             reply.carrierRelation == CarrierPhaseRelation::Same ||
             reply.carrierRelation == CarrierPhaseRelation::Opposite;
+        reply.mayBecomeVideo = true;
         reply.tag = "iq-carrier";
         return reply;
     }
@@ -123,26 +144,16 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
     if (!request.source.scalarCarrier)
         return blockedReply(request, "not-scalar-carrier");
 
-    if (request.source.polarity == CombReachPolarity::CommonPhase) {
-        reply.verdict = CombReachVerdict::CommonPhaseOnly;
-        reply.fastPath = true;
-        reply.allowScalarAverage = true;
-        reply.allowScalarMagnitudeCompare = true;
-        reply.tag = "locked-common-phase-scalar";
-        return reply;
-    }
-
     if (reply.carrierRelation == CarrierPhaseRelation::Same ||
         reply.carrierRelation == CarrierPhaseRelation::Opposite)
     {
-        const bool polarityPreserved =
-            request.source.polarity == CombReachPolarity::Preserved;
         reply.verdict = CombReachVerdict::Green;
         reply.fastPath = true;
         reply.allowScalarAverage = true;
-        reply.allowScalarCancel = polarityPreserved;
-        reply.allowScalarSignCompare = polarityPreserved;
+        reply.allowScalarCancel = true;
+        reply.allowScalarSignCompare = true;
         reply.allowScalarMagnitudeCompare = true;
+        reply.mayBecomeVideo = true;
         reply.tag = "carrier-relation";
         return reply;
     }
@@ -194,36 +205,37 @@ CombReachSourceFrame makeBucketScalarReachSource()
     CombReachSourceFrame source;
     source.kind = CombReachSourceKind::Bucket1DScalar;
     source.signFrame = CarrierSignFrame::UnsignedBucket;
-    source.polarity = CombReachPolarity::Preserved;
+    source.signalClass = CombReachSignalClass::PhasePreservedCarrier;
     source.scalarCarrier = true;
     source.tag = "bucket-1d-scalar";
     return source;
 }
 
-// WARNING: the LockedCommonPhaseScalar source kind labels a scalar buffer
-// (locked1DSource) whose cross-line semantics are Grid4fsc but whose physical
-// per-sample value is just bandpass(raw) * remodScale.  The "polarity is gone
-// by construction" interpretation has been a repeated burden:
+// The Locked1DScalar source labels locked1DSource: physically it is
+// bandpass(raw) times a flat round-trip scale (~0.994), so the raw carrier
+// orientation — including the physical ±2 field-line alternation — is intact
+// on every line.  It is a phase-preserved carrier and grammar legality
+// decides its reach, same as the bucket scalar.
 //
-//  - It does NOT mean the scalar is physically polarity-stripped.  It means
-//    that DEMODDING it with an unsigned phase yields IQ in a frame that
-//    interfield combs misinterpret.  For correct interfield behavior, demod
-//    with carrierGrammarSignedSampleClass to land in Grid4fscIQ, or read
-//    locked1DTI4fsc/TQ4fsc (already polarity-preserving) directly.
-//  - It does NOT mean intrafield (±2 same-field) scalar operations are
-//    compromised — those are physically sound.
+// The historical "common phase / polarity gone by construction" label on this
+// buffer described a pre-reform pipeline and misled repeatedly.  One caveat
+// from that era is still real and belongs to the source contract:
+//
+//  - A per-sample DEMOD of this scalar with an unsigned sample class yields
+//    IQ that inherits raw signs, NOT Grid4fscIQ.  For interfield IQ use,
+//    demod with carrierGrammarSignedSampleClass (lineFlip folded into the
+//    phase), or read locked1DTI4fsc/TQ4fsc directly.
 //
 // New sites should prefer Grid4fscIQ (IQ caches) over re-deriving IQ from
-// this scalar.  Phase normalization for cross-line comparison convenience has
-// cost more than it has bought; do not widen its use without scrutiny.
-CombReachSourceFrame makeLockedCommonPhaseScalarReachSource()
+// this scalar.
+CombReachSourceFrame makeLocked1DScalarReachSource()
 {
     CombReachSourceFrame source;
-    source.kind = CombReachSourceKind::LockedCommonPhaseScalar;
+    source.kind = CombReachSourceKind::Locked1DScalar;
     source.signFrame = CarrierSignFrame::Grid4fsc;
-    source.polarity = CombReachPolarity::CommonPhase;
+    source.signalClass = CombReachSignalClass::PhasePreservedCarrier;
     source.scalarCarrier = true;
-    source.tag = "locked-common-phase-scalar";
+    source.tag = "locked-1d-scalar";
     return source;
 }
 
@@ -232,7 +244,7 @@ CombReachSourceFrame makeGrid4fscIQReachSource()
     CombReachSourceFrame source;
     source.kind = CombReachSourceKind::Grid4fscIQ;
     source.signFrame = CarrierSignFrame::Grid4fsc;
-    source.polarity = CombReachPolarity::Preserved;
+    source.signalClass = CombReachSignalClass::PhasePreservedCarrier;
     source.iqCarrier = true;
     source.tag = "grid-4fsc-iq";
     return source;

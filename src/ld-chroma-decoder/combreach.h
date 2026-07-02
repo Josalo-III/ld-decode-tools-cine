@@ -45,7 +45,7 @@ enum class CombReachUse {
 
 enum class CombReachVerdict {
     Green,
-    CommonPhaseOnly,
+    DiagnosticOnly,
     IQOnly,
     PriorOnly,
     Unknown,
@@ -56,7 +56,7 @@ enum class CombReachSourceKind {
     RawCompositeScalar,
     Bucket1DScalar,
     LockedScalar,
-    LockedCommonPhaseScalar,
+    Locked1DScalar,
     Grid4fscIQ,
     BurstLockedIQ,
     CarrierFreeY,
@@ -64,21 +64,32 @@ enum class CombReachSourceKind {
     Unknown
 };
 
-// Whether a source still carries physical carrier polarity.  This is one state,
-// not two independent flags: a common-phase (remodulated) source has by
-// definition erased its polarity, so the illegal "common phase yet polarity
-// preserved" combination is unrepresentable.  Sign-based reach (cancel,
-// sign-compare) is legal only for Preserved.
-enum class CombReachPolarity {
-    None,         // no polarity semantics (carrier-free Y, detector, default)
-    Preserved,    // physical carrier polarity intact
-    CommonPhase   // remodulated to common phase; polarity erased
+// What class of signal a source is.  This is the video/diagnostic boundary:
+// a client must be able to read it off the declaration alone.
+//
+//   PhasePreservedCarrier — physical carrier polarity intact.  Video-capable
+//     operations are then authorized (or not) by carrier-grammar legality for
+//     the requested line pair.
+//   CarrierFree — luma/scalar evidence with no carrier semantics.  Never a
+//     carrier operand.
+//   PhaseErasedDiagnostic — carrier phase has been deliberately erased
+//     (e.g. remodulated to a common phase for comparison convenience).  Such
+//     data may inspect math and score coherence but must never become video:
+//     the reach reply mechanically blocks every video-capable operation for
+//     this class, regardless of grammar.  There is currently no producer of
+//     this class in the tree; the class exists so any future phase-erased
+//     buffer is inconvenient to misuse.
+enum class CombReachSignalClass {
+    Unknown,
+    PhasePreservedCarrier,
+    CarrierFree,
+    PhaseErasedDiagnostic
 };
 
 struct CombReachSourceFrame {
     CombReachSourceKind kind = CombReachSourceKind::Unknown;
     CarrierSignFrame signFrame = CarrierSignFrame::UnsignedBucket;
-    CombReachPolarity polarity = CombReachPolarity::None;
+    CombReachSignalClass signalClass = CombReachSignalClass::Unknown;
     bool scalarCarrier = false;
     bool iqCarrier = false;
     bool carrierFree = false;
@@ -98,6 +109,13 @@ struct CombReachReply {
     CombReachVerdict verdict = CombReachVerdict::Unknown;
     bool valid = false;
     bool fastPath = false;
+
+    // Diagnostic-only comparison.  May inspect math and score coherence; must
+    // not produce video or authorize a carrier-bearing downstream source.
+    bool allowDiagnosticCompare = false;
+
+    // Video-capable operations.  Granted only for PhasePreservedCarrier
+    // sources with a grammar-legal relation for the requested reach.
     bool allowScalarAverage = false;
     bool allowScalarCancel = false;
     bool allowScalarSignCompare = false;
@@ -105,6 +123,11 @@ struct CombReachReply {
     bool allowIQCompare = false;
     bool allowIQAverage = false;
     bool allowIQCancel = false;
+
+    // True only when the source and requested operation preserve the
+    // downstream video phase contract.  Never true for PhaseErasedDiagnostic.
+    bool mayBecomeVideo = false;
+
     CarrierPhaseRelation carrierRelation = CarrierPhaseRelation::Unknown;
     CarrierSignFrame centerFrame = CarrierSignFrame::UnsignedBucket;
     CarrierSignFrame targetFrame = CarrierSignFrame::UnsignedBucket;
@@ -133,7 +156,7 @@ private:
 };
 
 CombReachSourceFrame makeBucketScalarReachSource();
-CombReachSourceFrame makeLockedCommonPhaseScalarReachSource();
+CombReachSourceFrame makeLocked1DScalarReachSource();
 CombReachSourceFrame makeGrid4fscIQReachSource();
 
 } // namespace lddecode

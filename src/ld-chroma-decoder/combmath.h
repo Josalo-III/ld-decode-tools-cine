@@ -34,10 +34,9 @@ inline constexpr double CAL_EPS_SAMPLES = -0.07;
 // Negative values counteract a slight green bias. Zero = no trim.
 inline constexpr double CAL_LO_ROT_DEG = 0.0;
 
-// Locked-path per-axis chroma gain. GQ < 1.0 trims the Q axis to compensate
-// for the slight chroma ellipse produced by the locked demod.
-inline constexpr double GI_PRODUCT = 1.0;
-inline constexpr double GQ_PRODUCT = 0.9;
+// Locked-path per-axis chroma gain lives in Comb::Configuration
+// (gi_product / gq_product, comb.h).  combmath.h provides reusable
+// arithmetic only; it does not own decoder product tuning.
 
 // Locked-path hue basis split.  The total locked IQ->UV rotation is preserved,
 // but the locked-specific correction is applied before the axis-specific FIRs

@@ -1187,6 +1187,56 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     const float *parallaxRepairStrength =
         locked1DParallaxRepairStrength_line(lineNumber);
 
+    const size_t iqCount =
+        static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
+    const bool haveSignedIQTests =
+        configuration.phaseCompensation &&
+        demodWidth >= width &&
+        tapLine.ln0 >= 0 && tapLine.ln0 < demodLines &&
+        tapLine.lnU2 >= 0 && tapLine.lnU2 < demodLines &&
+        tapLine.lnD2 >= 0 && tapLine.lnD2 < demodLines &&
+        locked1DTI4fsc_flat.size() >= iqCount &&
+        locked1DTQ4fsc_flat.size() >= iqCount;
+    const float *testI0 = haveSignedIQTests
+        ? locked1DTI4fsc_line(tapLine.ln0) : nullptr;
+    const float *testQ0 = haveSignedIQTests
+        ? locked1DTQ4fsc_line(tapLine.ln0) : nullptr;
+    const float *testIU2 = haveSignedIQTests
+        ? locked1DTI4fsc_line(tapLine.lnU2) : nullptr;
+    const float *testQU2 = haveSignedIQTests
+        ? locked1DTQ4fsc_line(tapLine.lnU2) : nullptr;
+    const float *testID2 = haveSignedIQTests
+        ? locked1DTI4fsc_line(tapLine.lnD2) : nullptr;
+    const float *testQD2 = haveSignedIQTests
+        ? locked1DTQ4fsc_line(tapLine.lnD2) : nullptr;
+
+    // Matched-context comparison sign for each leg in the phase-preserved
+    // Grid4fsc IQ caches.  They are demodulated with the UNSIGNED sample
+    // class, so raw carrier orientation is intact: a grammar-Opposite leg
+    // holds negated IQ for identical chroma, and |Z0 - Zleg| there reads a
+    // perfect match as a maximal break.  The grammar, not line adjacency,
+    // says which relation each leg has (combreach owns legality).  0.0
+    // means the relation is unknown: no vector evidence for that leg.
+    double iqRelSignUp = 0.0;
+    double iqRelSignDn = 0.0;
+    if (haveSignedIQTests) {
+        const lddecode::CombReachSourceFrame iqSource = iqReachSource();
+        auto matchedRelSign = [&](int targetLine) -> double {
+            const lddecode::CombReachReply reach = combReachIndex.query(
+                {lineNumber, targetLine, left, left,
+                 lddecode::CombReachUse::IQCompare, iqSource});
+            if (!reach.allowIQCompare)
+                return 0.0;
+            switch (reach.carrierRelation) {
+            case lddecode::CarrierPhaseRelation::Same:     return 1.0;
+            case lddecode::CarrierPhaseRelation::Opposite: return -1.0;
+            default:                                       return 0.0;
+            }
+        };
+        iqRelSignUp = matchedRelSign(tapLine.lnU2);
+        iqRelSignDn = matchedRelSign(tapLine.lnD2);
+    }
+
     // Missing vertical support rows: preserve the local 1D chroma estimate.
     // This avoids synthetic zero chroma without changing normal Field B geometry.
     if (!tapLine.haveU2 || !tapLine.haveD2 ||
@@ -1202,7 +1252,6 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     const auto &T = configuration.tunables;
 
     const double kRange = T.FIELD_K_RANGE_IRE * irescale;
-    const double invK   = (kRange > 1e-9) ? (1.0 / kRange) : 0.0;
     const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
 
     auto softenDominantWeights = [](double &wA, double &wB) {
@@ -1240,6 +1289,24 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         const double Cup = tapUp.comp;
         const double Cdn = tapDn.comp;
 
+        std::complex<double> testZ0;
+        std::complex<double> testZU2;
+        std::complex<double> testZD2;
+        if (haveSignedIQTests) {
+            const int rm1 = reflectCombRel(rel - 1, width);
+            const int rp1 = reflectCombRel(rel + 1, width);
+            auto fullSignedIQ = [&](const float *iRow, const float *qRow) {
+                return std::complex<double>(
+                    static_cast<double>(iRow[rel]) +
+                        0.5 * static_cast<double>(iRow[rm1] + iRow[rp1]),
+                    static_cast<double>(qRow[rel]) +
+                        0.5 * static_cast<double>(qRow[rm1] + qRow[rp1]));
+            };
+            testZ0 = fullSignedIQ(testI0, testQ0);
+            testZU2 = fullSignedIQ(testIU2, testQU2);
+            testZD2 = fullSignedIQ(testID2, testQD2);
+        }
+
         // Phase-flat chroma envelopes.  At 4fsc the center sample sits on one
         // carrier axis and its two horizontal neighbours on the orthogonal axis
         // (C_p1 = -C_m1), so hypot(on-axis, orthogonal-axis) = sqrt(I^2+Q^2),
@@ -1274,7 +1341,31 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 ? tapLine.centerChromaT[rel]
                 : std::clamp((envC * invIreScale - 2.0) / 8.0, 0.0, 1.0);
 
-        if (chromaT > 0.0 &&
+        // Per-leg saturation.  Luma evidence may substitute for envelope
+        // evidence on a leg only when BOTH endpoints of that leg are
+        // saturated.  Center-only chromaT cannot distinguish a saturated
+        // interior from the saturated side of a chroma/neutral boundary
+        // (blue sky against a drop shadow), so it stood the envelope
+        // defenses down exactly where the ±2 partner was out of context.
+        // The hoisted signed Grid4fsc IQ magnitudes are the preferred
+        // measure; envelopes remain the bucket fallback.
+        double satC = envC;
+        double satUp = envUp;
+        double satDn = envDn;
+        if (haveSignedIQTests) {
+            satC = std::abs(testZ0);
+            satUp = std::abs(testZU2);
+            satDn = std::abs(testZD2);
+        }
+        auto pairChromaT = [&](double a, double b) {
+            return std::clamp(
+                (std::min(a, b) * invIreScale - 2.0) / 8.0, 0.0, 1.0);
+        };
+        const double chromaTUp = pairChromaT(satC, satUp);
+        const double chromaTDn = pairChromaT(satC, satDn);
+        const double chromaTUpDn = pairChromaT(satUp, satDn);
+
+        if ((chromaTUp > 0.0 || chromaTDn > 0.0) &&
             rel < (int)tapLine.coarse0IRE.size() &&
             rel < (int)tapLine.coarseU2IRE.size() &&
             rel < (int)tapLine.coarseD2IRE.size())
@@ -1289,17 +1380,17 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             lumaKp = std::max(lumaKp - (lc + lu) * 0.10, 0.0);
             lumaKn = std::max(lumaKn - (lc + ld) * 0.10, 0.0);
 
-            kp = kp * (1.0 - chromaT) + lumaKp * chromaT;
-            kn = kn * (1.0 - chromaT) + lumaKn * chromaT;
+            kp = kp * (1.0 - chromaTUp) + lumaKp * chromaTUp;
+            kn = kn * (1.0 - chromaTDn) + lumaKn * chromaTDn;
         }
 
-        const double satRelax = chromaT * (1.0 - 0.55 * hEdgeForSat);
-        const double effectiveKRange = kRange * (1.0 + 0.75 * satRelax);
-        const double localInvK =
-            (effectiveKRange > 1e-9) ? (1.0 / effectiveKRange) : 0.0;
+        const double satRelaxUp = chromaTUp * (1.0 - 0.55 * hEdgeForSat);
+        const double satRelaxDn = chromaTDn * (1.0 - 0.55 * hEdgeForSat);
+        const double kRangeUp = kRange * (1.0 + 0.75 * satRelaxUp);
+        const double kRangeDn = kRange * (1.0 + 0.75 * satRelaxDn);
 
-        double wUp = (effectiveKRange > 1e-9) ? (1.0 - kp * localInvK) : 1.0;
-        double wDn = (effectiveKRange > 1e-9) ? (1.0 - kn * localInvK) : 1.0;
+        double wUp = (kRangeUp > 1e-9) ? (1.0 - kp / kRangeUp) : 1.0;
+        double wDn = (kRangeDn > 1e-9) ? (1.0 - kn / kRangeDn) : 1.0;
 
         wUp = std::clamp(wUp, 0.0, 1.0);
         wDn = std::clamp(wDn, 0.0, 1.0);
@@ -1357,6 +1448,54 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             }
         }
 
+        // Vector legality of each ±2 leg, from the signed Grid4fsc IQ.
+        // Cross-color from thin luma detail (star points, text strokes)
+        // carries chroma-band magnitude, so no magnitude test can see that
+        // the leg left the color context — and the strokes are too thin
+        // for coarse to see at all.  The vectors can: matched context keeps
+        // rho = |Z0-Zleg| / (|Z0|+|Zleg|) low, carrier-band impostors land
+        // near 1.  Gated by pair saturation so low-chroma evidence stays
+        // with the envelopes.  The verdict must be decisive: soft weight
+        // penalties are renormalized away by sc = 2 / (wUp + wDn).
+        bool vecDQUp = false;
+        bool vecDQDn = false;
+        if (haveSignedIQTests && !hardVerticalBreak) {
+            auto legBreak = [&](const std::complex<double> &zLeg,
+                                double relSign,
+                                double satLeg, double chromaTLeg) {
+                if (relSign == 0.0)
+                    return 0.0;
+                const double sum = satC + satLeg;
+                if (sum <= 1e-9)
+                    return 0.0;
+                const double rho = std::abs(testZ0 - relSign * zLeg) / sum;
+                return chromaTLeg *
+                       std::clamp((rho - 0.35) / 0.25, 0.0, 1.0);
+            };
+            const double legBreakUp =
+                legBreak(testZU2, iqRelSignUp, satUp, chromaTUp);
+            const double legBreakDn =
+                legBreak(testZD2, iqRelSignDn, satDn, chromaTDn);
+
+            const bool dqUp = vecDQUp = (legBreakUp >= 0.5);
+            const bool dqDn = vecDQDn = (legBreakDn >= 0.5);
+            if (dqUp && dqDn) {
+                // Both legs out of color context: no model-valid answer,
+                // and the revive path must not resurrect one.
+                hardVerticalBreak = true;
+            } else if (dqUp) {
+                wUp = 0.0;
+                reason = FieldBReasonBoundaryDown;
+            } else if (dqDn) {
+                wDn = 0.0;
+                reason = FieldBReasonBoundaryUp;
+            } else {
+                // Below DQ, confidence only tilts via capped penalty.
+                wUp *= (1.0 - 0.75 * legBreakUp);
+                wDn *= (1.0 - 0.75 * legBreakDn);
+            }
+        }
+
         double boundaryCede = 0.0;
 
         if (!hardVerticalBreak &&
@@ -1371,16 +1510,34 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 1.0);
 
             if (hEdge > 0.0) {
-                const double dUp0IRE = tapLine.pairU2[rel].diffIRE;
-                const double dDn0IRE = tapLine.pairD2[rel].diffIRE;
-                const double scalarUpDn = std::fabs(Cup - Cdn) * invIreScale;
+                // Locked scalar fabs reads only the current carrier axis and
+                // can alternate at 2fsc. Test the same signed sources in the
+                // polarity-preserving Grid4fsc IQ frame; the scalar fallback
+                // remains for bucket mode. This changes evidence only.
+                double dUp0IRE = tapLine.pairU2[rel].diffIRE;
+                double dDn0IRE = tapLine.pairD2[rel].diffIRE;
+                double scalarUpDn = std::fabs(Cup - Cdn) * invIreScale;
+                if (haveSignedIQTests &&
+                    iqRelSignUp != 0.0 && iqRelSignDn != 0.0) {
+                    // Matched-context differences in the phase-preserved
+                    // frame need each leg's grammar relation sign; without
+                    // it a perfect match reads as a maximal difference and
+                    // the match-driven paths below can never fire.
+                    dUp0IRE = std::abs(testZ0 - iqRelSignUp * testZU2) *
+                              invIreScale;
+                    dDn0IRE = std::abs(testZ0 - iqRelSignDn * testZD2) *
+                              invIreScale;
+                    scalarUpDn = std::abs(iqRelSignUp * testZU2 -
+                                          iqRelSignDn * testZD2) *
+                                 invIreScale;
+                }
                 const double lumaUpDn =
                     (rel < (int)tapLine.coarseU2IRE.size() &&
                      rel < (int)tapLine.coarseD2IRE.size())
                         ? std::fabs(tapLine.coarseU2IRE[rel] - tapLine.coarseD2IRE[rel])
                         : scalarUpDn;
                 const double dUpDnIRE =
-                    scalarUpDn * (1.0 - chromaT) + lumaUpDn * chromaT;
+                    scalarUpDn * (1.0 - chromaTUpDn) + lumaUpDn * chromaTUpDn;
                 const double diffGapIRE = std::fabs(dUp0IRE - dDn0IRE);
                 const double bestDiffIRE = std::min(dUp0IRE, dDn0IRE);
                 const double worstDiffIRE = std::max(dUp0IRE, dDn0IRE);
@@ -1408,8 +1565,11 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                          (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
                          (bestDiffIRE < 5.0 && kRatio < 0.45));
 
+                    // One-sided boundary survival is a claim about the
+                    // preferred leg, so its color credibility must be the
+                    // preferred pair's, not the center's.
                     const double credibleColorT =
-                        chromaT *
+                        (preferUp ? chromaTUp : chromaTDn) *
                         (1.0 - std::max(lumaEdgeUp, lumaEdgeDn));
 
                     const bool allowOneSidedBoundary =
@@ -1492,7 +1652,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             boundaryCede = 1.0;
             reason = FieldBReasonBoundaryCede;
         } else if (wUp > 0.0 || wDn > 0.0) {
-            softenDominantWeights(wUp, wDn);
+            // Test: sideline the weak-leg floor so Field B can fully express
+            // one-sided evidence on the stubborn Paramount zipper.
 
             const double denom = wUp + wDn;
 
@@ -1548,8 +1709,21 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                          : 1.0) *
                     (0.35 + 0.65 * std::clamp(mc.downTrust, 0.0, 1.0));
             } else {
-                const double dMag  = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
-                const double sumUD = std::fabs(Cup + Cdn);
+                double dMag = std::fabs(std::fabs(Cup) - std::fabs(Cdn));
+                double sumUD = std::fabs(Cup + Cdn);
+                if (haveSignedIQTests) {
+                    const double magUp = std::abs(testZU2);
+                    const double magDn = std::abs(testZD2);
+                    dMag = std::fabs(magUp - magDn);
+                    // U2/D2 are normally grammar-Same (coherent sum); the
+                    // relation signs keep the coherence measure honest on
+                    // irregular cadences and reduce to the same value when
+                    // both legs share a relation.
+                    sumUD = (iqRelSignUp != 0.0 && iqRelSignDn != 0.0)
+                        ? std::abs(iqRelSignUp * testZU2 +
+                                   iqRelSignDn * testZD2)
+                        : std::abs(testZU2 + testZD2);
+                }
                 reviveStrength = (dMag - std::fabs(sumUD * 0.2) <= 0.0) ? 1.0 : 0.0;
                 reviveUp = (rel < (int)tapLine.pairU2.size())
                     ? tapLine.pairU2[rel].reachGate
@@ -1560,8 +1734,10 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             }
 
             if (reviveStrength > 0.0) {
-                wUp = reviveUp * reviveStrength;
-                wDn = reviveDn * reviveStrength;
+                // A vector-DQ'd leg stays dead: revive's coarse evidence
+                // cannot see the thin detail that disqualified it.
+                wUp = vecDQUp ? 0.0 : reviveUp * reviveStrength;
+                wDn = vecDQDn ? 0.0 : reviveDn * reviveStrength;
                 sc = 1.0;
                 haveAnswer = (wUp > 0.0 || wDn > 0.0);
                 if (haveAnswer)
@@ -1592,8 +1768,15 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             // color from asymmetric scalar combing.
             double lumaOnlyCede = 0.0;
             {
-                const double centerMagIRE = std::fabs(C) * invIreScale;
-                const double outMagIRE    = std::fabs(tc) * invIreScale;
+                double centerMagIRE = std::fabs(C) * invIreScale;
+                double outMagIRE    = std::fabs(tc) * invIreScale;
+                if (haveSignedIQTests) {
+                    const std::complex<double> tcIQ =
+                        ((testZ0 - testZU2) * (wUp * sc) +
+                         (testZ0 - testZD2) * (wDn * sc)) * 0.25;
+                    centerMagIRE = std::abs(testZ0) * invIreScale;
+                    outMagIRE = std::abs(tcIQ) * invIreScale;
+                }
                 const double growthIRE    = outMagIRE - centerMagIRE;
 
                 const double lowChromaT =
@@ -2405,15 +2588,11 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // Source is Bucket (polarity Preserved) on purpose, NOT a mislabel: this is
-    // a cross-frame ScalarSignCompare, and only a polarity-preserved source
-    // returns allowScalarSignCompare. Re-tagging this LockedCommonPhaseScalar —
-    // as an earlier note suggested — would yield the CommonPhaseOnly verdict,
-    // drop allowScalarSignCompare, and reject every temporal candidate (penalty
-    // 1000), disabling 3D entirely. The actual polarity guard here is the
-    // carrierLineFlip gate at the getBestCandidate call site. Honest expression
-    // of "grammar phase-relation sign-compare on a common-phase scalar is legal"
-    // is deferred to the future consolidated reach system.
+    // Cross-frame ScalarSignCompare on the mode's actual 1D scalar.  Both the
+    // bucket scalar and the locked 1D scalar are PhasePreservedCarrier, so
+    // grammar legality answers identically for either; the historical Bucket
+    // mislabel (a workaround for the retired common-phase classification) is
+    // no longer needed.  The sample read below follows the same mode switch.
     const lddecode::CombReachReply phaseReach = combReachIndex.queryAgainst(
         frameBuffer.combReachIndex,
         {refLineNumber,
@@ -2421,7 +2600,7 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
          refH,
          h,
          lddecode::CombReachUse::ScalarSignCompare,
-         lddecode::makeBucketScalarReachSource()});
+         scalarReachSource()});
 
     if (!phaseReach.allowScalarSignCompare ||
         phaseReach.carrierRelation != lddecode::CarrierPhaseRelation::Opposite) {

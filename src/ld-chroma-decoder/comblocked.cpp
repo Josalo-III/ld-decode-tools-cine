@@ -1255,6 +1255,8 @@ void Comb::FrameBuffer::splitIQlocked()
     };
 
     const double ccWeight = std::max(0.0, T.CC_SUPPRESSION_WEIGHT);
+    const double giProduct = configuration.gi_product;
+    const double gqProduct = configuration.gq_product;
 
     for (int line = firstLine; line < lastLine; ++line) {
         const double *src = clpbuffer[srcBuf].pixel[line];
@@ -1351,8 +1353,8 @@ void Comb::FrameBuffer::splitIQlocked()
             const double xferTi = finiteOrZero(ti * ccAlpha);
             const double xferTq = finiteOrZero(tq * ccAlpha);
 
-            const float prodI = (float)finiteOrZero(xferTi * GI_PRODUCT);
-            const float prodQ = (float)finiteOrZero(xferTq * GQ_PRODUCT);
+            const float prodI = (float)finiteOrZero(xferTi * giProduct);
+            const float prodQ = (float)finiteOrZero(xferTq * gqProduct);
 
             if (prodIRow) prodIRow[xi] = prodI;
             if (prodQRow) prodQRow[xi] = prodQ;
@@ -1455,6 +1457,8 @@ void Comb::FrameBuffer::filterIQLocked()
             // residual colour regardless of which luma candidates were present.
             const double ccWeight =
                 std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
+            const double giProduct = configuration.gi_product;
+            const double gqProduct = configuration.gq_product;
 
             for (int i = 0; i < width; ++i) {
                 const int h = left + i;
@@ -1472,8 +1476,8 @@ void Comb::FrameBuffer::filterIQLocked()
                 const double alphaEff =
                     std::max(0.0, 1.0 - gA * ccWeight);
 
-                scratch_preI[i] = (chroma * lutTi[ph]) * GI_PRODUCT * alphaEff;
-                scratch_preQ[i] = (chroma * lutTq[ph]) * GQ_PRODUCT * alphaEff;
+                scratch_preI[i] = (chroma * lutTi[ph]) * giProduct * alphaEff;
+                scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct * alphaEff;
             }
         } else {
             // The normal locked path consumes the cache prepared by splitIQlocked().

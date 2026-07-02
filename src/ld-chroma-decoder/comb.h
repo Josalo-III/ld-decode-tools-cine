@@ -60,9 +60,14 @@ public:
         bool phaseCompensation = false;
         bool lumaWitness = false;
 
-        // Per-axis product gains: multipliers applied to I and Q before filtering.
+        // Per-axis product gains: multipliers applied to locked I and Q before
+        // filtering.  This is the sole authority for product tuning — do not
+        // reintroduce gain constants in combmath.h.  GQ < 1.0 trims the Q axis
+        // to compensate for the slight chroma ellipse of the locked demod.
+        // (Defaults match the previously live combmath.h values; the old 1.1
+        // here was never read.)
         double gi_product = 1.0;
-        double gq_product = 1.1;
+        double gq_product = 0.9;
 
         // Noise reduction levels (0 = disabled)
         double cNRLevel = 0.0;
@@ -611,36 +616,27 @@ private:
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
 		//
-		// WARNING: locked1DSource_flat is a scalar that lives under the
-		// LockedCommonPhaseScalar reach-source label.  That label has been a
-		// repeated source of bugs and confusion:
-		//
-		//  - The label declares a *cross-line interpretation convention*
-		//    (Grid4fsc / common phase), not a physical sign-stripping.  The
-		//    stored scalar is approximately bandpass(raw) * 0.994, so within a
-		//    line it preserves raw carrier orientation.
-		//  - But a per-sample DEMOD of this scalar with an unsigned sample
-		//    class does NOT yield Grid4fscIQ — it yields IQ that inherits raw
-		//    signs.  For interfield (±1) cancels in IQ that means real chroma
-		//    appears anti-phased, the combine flips it, and alien Y is
-		//    preserved instead of cancelled.  This produced the 2fsc luma
-		//    checker in Frame B's locked path.
-		//  - The "polarity is gone by construction" framing in the buffer-flow
-		//    doc has misled multiple agents (and the author) into either
-		//    distrusting legitimate intrafield scalar combs or trusting
-		//    interfield IQ combs that were actually wrong.
+		// locked1DSource_flat is the locked-path video 1D scalar, declared as
+		// the Locked1DScalar reach source (PhasePreservedCarrier).  Physically
+		// it is bandpass(raw) times a flat round-trip scale (~0.994): raw
+		// carrier orientation is intact on every line.  The retired
+		// "common phase / polarity gone by construction" label described a
+		// pre-reform pipeline and misled repeatedly.
 		//
 		// Rules for new code:
-		//  1. Prefer locked1DTI4fsc/TQ4fsc (Grid4fscIQ, physicalPolarityPreserved)
-		//     for any operation that needs polarity.
-		//  2. If a scalar must be demodded for interfield IQ use, demod with
+		//  1. Prefer locked1DTI4fsc/TQ4fsc (Grid4fscIQ, phase-preserved)
+		//     for any operation that needs polarity in IQ.
+		//  2. If this scalar must be demodded for interfield IQ use, demod with
 		//     carrierGrammarSignedSampleClass (lineFlip folded into the phase)
-		//     to land in Grid4fscIQ.  Unsigned demod here is almost always wrong.
+		//     to land in Grid4fscIQ.  An unsigned demod yields IQ that inherits
+		//     raw signs: interfield (±1) IQ cancels then see real chroma as
+		//     anti-phased, flip it, and preserve alien Y — the 2fsc luma
+		//     checker in Frame B's locked path came from exactly this.
 		//  3. Intrafield (±2 same-field) scalar combs on this buffer are
-		//     legitimate: same-field neighbors share lineFlip.
-		//  4. Cross-line scalar averaging or magnitude compare is the only
-		//     reach use the type system blesses for this source.  That is
-		//     intentional and minimal — do not widen it without scrutiny.
+		//     legitimate: same-field neighbors share lineFlip and the physical
+		//     carrier alternation is preserved in the scalar.
+		//  4. Cross-line legality is not decided here: ask CombReachIndex with
+		//     scalarReachSource(); grammar answers per line pair.
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
 		std::vector<float> locked1DParallaxRepairStrength_flat; // [0,1] actual Pass-1.5 applied repair strength
@@ -824,7 +820,7 @@ private:
 
 	inline lddecode::CombReachSourceFrame scalarReachSource() const {
 		return configuration.phaseCompensation
-			? lddecode::makeLockedCommonPhaseScalarReachSource()
+			? lddecode::makeLocked1DScalarReachSource()
 			: lddecode::makeBucketScalarReachSource();
 	}
 
