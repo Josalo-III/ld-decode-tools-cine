@@ -1746,6 +1746,21 @@ void Comb::FrameBuffer::produceY()
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
 
+            // Retracted-admission mode (isolation switch for the cube/beach
+            // A/B).  Default: conflicted fits admit retracted only with
+            // neighbour spatial support.  LD_RETRACTED_ADMIT=trust restores
+            // the residualTrust-only hard gate; =all seats unconditionally
+            // (pre-2026-07-02 behaviour).
+            static const int retractedAdmitMode = []{
+                const char *s = std::getenv("LD_RETRACTED_ADMIT");
+                if (!s) return 0;              // 0 = spatial (default)
+                if (s[0] == 't') return 1;     // trust-only hard gate
+                if (s[0] == 'a') return 2;     // admit all
+                return 0;
+            }();
+            const bool retractedAdmitSpatial = (retractedAdmitMode == 0);
+            const bool retractedAdmitAll = (retractedAdmitMode == 2);
+
             // Frame-B deference: where Frame won the field-vs-frame election it
             // already carries the interfield cancellation that removes
             // stationary cross-color; emit raw - carrierComp and skip the
@@ -1847,6 +1862,29 @@ void Comb::FrameBuffer::produceY()
             const float *witS  = haveS ? yWitness_line(lineS) : nullptr;
             const double *coaN = haveN ? lockedLumaSmooth_line(lineN) : nullptr;
             const double *coaS = haveS ? lockedLumaSmooth_line(lineS) : nullptr;
+
+            // Grammar-legal ±2 relation, hoisted per line (h cancels in the
+            // signed sample class).  A same-field ±2 line pair alternates on
+            // a KNOWN schedule, not a geometric accident; corroborating
+            // retracted HF across the pair is only meaningful where the
+            // grammar certifies a legal Same/Opposite relation.  Where the
+            // schedule says Other/Unknown the two lines are not phase-
+            // comparable and their "agreement" is noise.  This is the comb
+            // consulting the carrier schedule rather than rediscovering it.
+            const CombCarrierGrammar *gN =
+                haveN ? carrierGrammarLine(lineN) : nullptr;
+            const CombCarrierGrammar *gS =
+                haveS ? carrierGrammarLine(lineS) : nullptr;
+            auto legalRel = [&](const CombCarrierGrammar *gNbr) {
+                if (!grammarLine || !gNbr)
+                    return false;
+                const auto rel = lddecode::carrierGrammarSignedPhaseRelation(
+                    grammarLine, left, gNbr, left);
+                return rel == lddecode::CarrierPhaseRelation::Same ||
+                       rel == lddecode::CarrierPhaseRelation::Opposite;
+            };
+            const bool relLegalN = legalRel(gN);
+            const bool relLegalS = legalRel(gS);
 
             // Robust HF at a neighbour pixel: median of that pixel's complete
             // luma planes (comb, retracted, witness) minus its own coarse.
@@ -1958,21 +1996,55 @@ void Comb::FrameBuffer::produceY()
                     candY[nCand] = combY; candPlane[nCand] = 0; ++nCand;
                 }
                 {
-                    // Evidence admission: retractedY's provenance is the
-                    // four-view fit.  Where the residual consensus that
-                    // built it was in conflict (broadband texture), its
-                    // testimony is noise-fit and a medoid over independent
-                    // noise flips the election frame to frame — the beach
-                    // luma instability.  A candidate whose provenance
-                    // evidence conflicted does not get a roster seat; comb
-                    // stands.  Trust is floored at 0.35 by construction, so
-                    // 0.5 admits only pixels with genuine view coherence.
-                    const bool retractedAdmitted =
+                    // Evidence admission for retractedY (raw - combedCarrier),
+                    // the leg that keeps near-carrier HF luma the comb strips.
+                    //
+                    // A low four-view residualTrust marks a conflicted fit —
+                    // but that conflict is present for BOTH broadband texture
+                    // noise (beach: retracted is junk, comb should stand) AND
+                    // real near-carrier periodic structure (Borg-cube grid:
+                    // retracted carries the detail comb destroyed).  Trust
+                    // alone cannot separate them, so it must not hard-DQ:
+                    // that is a confidence measure vetoing geometry, which
+                    // the election forbids.
+                    //
+                    // The separator is SPATIAL COHERENCE.  Real structure
+                    // agrees with its same-field +/-2 neighbours in HF (the
+                    // cube grid is 2D-continuous; +/-2 stays in-field so its
+                    // carrier phase family is consistent).  Per-pixel texture
+                    // noise agrees with neither.  So: a clean fit is admitted
+                    // outright; a conflicted fit is admitted only when its HF
+                    // is corroborated by a neighbour.  Feasibility remains the
+                    // only true DQ.
+                    const double r = retractedRow ? (double)retractedRow[xi] : combY;
+                    const double ry = std::isfinite(r) ? r : combY;
+                    bool retractedAdmitted =
+                        retractedAdmitAll ||
                         !analysisRow ||
                         (analysisRow[xi].parallax.residualValid &&
                          analysisRow[xi].parallax.residualTrust >= 0.5f);
-                    const double r = retractedRow ? (double)retractedRow[xi] : combY;
-                    const double ry = std::isfinite(r) ? r : combY;
+                    if (!retractedAdmitted && retractedAdmitSpatial &&
+                        retractedRow && std::isfinite(r)) {
+                        const double rHF = r - coarse;
+                        // Corroborate only across grammar-legal ±2 partners:
+                        // the schedule certifies these lines are phase-
+                        // comparable, so matched HF is real structure, not
+                        // an accident of geometry.
+                        if (relLegalN && retN && coaN) {
+                            const double nHF =
+                                (double)retN[xi] - coaN[xi];
+                            if (std::isfinite(nHF) &&
+                                std::fabs(rHF - nHF) <= inlierTol)
+                                retractedAdmitted = true;
+                        }
+                        if (!retractedAdmitted && relLegalS && retS && coaS) {
+                            const double sHF =
+                                (double)retS[xi] - coaS[xi];
+                            if (std::isfinite(sHF) &&
+                                std::fabs(rHF - sHF) <= inlierTol)
+                                retractedAdmitted = true;
+                        }
+                    }
                     if (retractedAdmitted && feasible(ry)) {
                         candY[nCand] = ry; candPlane[nCand] = 1; ++nCand;
                     }
@@ -2510,11 +2582,16 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         const double maxCarrierSamples =
             std::max(24.0, grammar->carrierScale * 5.0) * irescale;
 
-        // basisI/Q at position h depend only on (h & 3) given the line's
-        // burst phasor and locked basis (remod4fscToShiftedComposite indexes
-        // spLUT/cpLUT by (h & 3); lockedTo4fsc takes no h).  Precompute the
-        // four phase values and fill by lookup — replaces 2*width function
-        // calls per line with 8 function calls + 2*width table reads.
+        // basisI/Q at position h depend only on the carrier sample class
+        // given the line's burst phasor and locked basis.  The class is the
+        // GRAMMAR sample class, carrierSampleClass(line, h) = (h+samplePhase0)
+        // & 3 — not a raw h & 3.  These are identical while samplePhase0 == 0
+        // (its current value everywhere), but every other locked-path site
+        // (Pass-3 demod, splitIQlocked, filterIQLocked, the HF-election
+        // phaseConf) indexes by the grammar class; hardcoding the raw index
+        // here was the lone site that would silently diverge the instant the
+        // schedule set a nonzero sample phase.  Consult the schedule, do not
+        // assume it.  Precompute the four phase values and fill by lookup.
         double basisI4[4];
         double basisQ4[4];
         for (int p = 0; p < 4; ++p) {
@@ -2526,7 +2603,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 spLUT_locked, cpLUT_locked);
         }
         for (int xi = 0; xi < width; ++xi) {
-            const int idx = (left + xi) & 3;
+            const int idx = carrierSampleClass(line, left + xi);
             basisI[xi] = basisI4[idx];
             basisQ[xi] = basisQ4[idx];
         }
