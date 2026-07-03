@@ -323,6 +323,158 @@ double oppositeIQFit(double centerI, double centerQ,
 
 } // namespace
 
+IntrafieldRegionReach evaluateIntrafieldRegionReach(
+    const std::complex<double> &center,
+    const std::complex<double> &up,
+    const std::complex<double> &down,
+    lddecode::CarrierPhaseRelation upRelation,
+    lddecode::CarrierPhaseRelation downRelation,
+    bool allowUp,
+    bool allowDown,
+    double invIreScale,
+    double minChromaIRE)
+{
+    IntrafieldRegionReach out;
+
+    auto relationSign = [](lddecode::CarrierPhaseRelation relation) {
+        switch (relation) {
+        case lddecode::CarrierPhaseRelation::Same:     return 1.0;
+        case lddecode::CarrierPhaseRelation::Opposite: return -1.0;
+        default:                                       return 0.0;
+        }
+    };
+
+    const double upSign = allowUp ? relationSign(upRelation) : 0.0;
+    const double downSign = allowDown ? relationSign(downRelation) : 0.0;
+    const bool haveUp = (upSign != 0.0);
+    const bool haveDown = (downSign != 0.0);
+    if (!haveUp && !haveDown)
+        return out;
+
+    const std::complex<double> alignedUp = upSign * up;
+    const std::complex<double> alignedDown = downSign * down;
+    const double scale = std::max(0.0, invIreScale);
+    const double centerMagIRE = std::abs(center) * scale;
+    const double upMagIRE = std::abs(alignedUp) * scale;
+    const double downMagIRE = std::abs(alignedDown) * scale;
+    const double chromaFloor = std::max(0.0, minChromaIRE);
+
+    // Preserve the old VDIS phase boundary as the positive non-membership
+    // threshold, but keep a small hysteresis band so marginal hue drift cannot
+    // force either a one-sided reach or a center-island verdict.
+    constexpr double kSameHueDeg = 15.0;
+    constexpr double kDifferentHueDeg = 20.0;
+    constexpr double kRadiansToDegrees = 57.2957795130823208768;
+
+    // Saturation-boundary evidence.  Hue is meaningless on a vector below the
+    // chroma floor, but a clearly saturated side whose color simply does not
+    // continue into the other side is a region break in its own right — this
+    // is the bikini-against-skin case, where the weak side never qualifies
+    // for the hue test and the pair otherwise stays Unknown while the comb
+    // mixes near-complementary hues into a gray band.  The ratio gap between
+    // Different and Unknown mirrors the hue hysteresis band.
+    constexpr double kDifferentMagRatio = 0.35;
+    constexpr double kStrongSideFloorScale = 2.0;
+
+    auto classify = [&](const std::complex<double> &leg,
+                        double legMagIRE,
+                        bool haveLeg,
+                        double &differenceIRE,
+                        double &hueDifferenceDeg) {
+        if (!haveLeg)
+            return RegionRelation::Unknown;
+
+        const double magHi = std::max(centerMagIRE, legMagIRE);
+        const double magLo = std::min(centerMagIRE, legMagIRE);
+        if (magHi < chromaFloor)
+            return RegionRelation::Unknown;
+
+        differenceIRE = std::abs(center - leg) * scale;
+
+        // Saturation collapse: the weak side is a small fraction of the
+        // strong side.  This is the drop-shadow band signature, and it is
+        // RATIO-driven, not floor-driven: a garment fade row at 8 IRE
+        // against 25 IRE is as much a band member as a 3 IRE one — gating
+        // membership on an absolute weak-side floor re-created the
+        // pixel-flicker at every row that straddled it.  The floor only
+        // qualifies the strong side: band-grade needs a clearly saturated
+        // region (>= 2.5x floor); a weaker strong side still earns a plain
+        // Different verdict when its partner is sub-floor, but never band
+        // membership (keeps low-chroma texture out of the band machinery).
+        constexpr double kBandStrongScale = 2.5;
+        if (magLo <= kDifferentMagRatio * magHi) {
+            if (magHi >= kBandStrongScale * chromaFloor) {
+                out.strongAsym = true;
+                return RegionRelation::DifferentRegion;
+            }
+            if (magLo < chromaFloor &&
+                magHi >= kStrongSideFloorScale * chromaFloor)
+                return RegionRelation::DifferentRegion;
+        }
+        if (magLo < chromaFloor)
+            return RegionRelation::Unknown;
+
+        const double denom = std::abs(center) * std::abs(leg);
+        if (denom <= 1e-12)
+            return RegionRelation::Unknown;
+
+        const double hueCos = std::clamp(
+            std::real(center * std::conj(leg)) / denom,
+            -1.0,
+            1.0);
+        hueDifferenceDeg = std::acos(hueCos) * kRadiansToDegrees;
+
+        if (hueDifferenceDeg <= kSameHueDeg)
+            return RegionRelation::SameRegion;
+
+        // Anti-aligned at comparable magnitude means raw-identical content:
+        // vertically coherent luma (cross-color), the comb's ideal
+        // cancellation partner.  Ceding here hands the alien energy to 1D,
+        // which renders it as a line-alternating rainbow.  A genuine
+        // complementary-color boundary does not land in this window because
+        // region breaks that matter are magnitude-asymmetric.
+        constexpr double kAlienHueDeg = 165.0;
+        constexpr double kAlienMagRatio = 0.60;
+        if (hueDifferenceDeg >= kAlienHueDeg &&
+            magLo >= kAlienMagRatio * magHi)
+            return RegionRelation::AlienCancel;
+
+        if (hueDifferenceDeg >= kDifferentHueDeg)
+            return RegionRelation::DifferentRegion;
+        return RegionRelation::Unknown;
+    };
+
+    out.up = classify(alignedUp, upMagIRE, haveUp,
+                      out.upDifferenceIRE, out.upHueDifferenceDeg);
+    out.down = classify(alignedDown, downMagIRE, haveDown,
+                        out.downDifferenceIRE, out.downHueDifferenceDeg);
+    out.valid = (out.up != RegionRelation::Unknown ||
+                 out.down != RegionRelation::Unknown);
+
+    if (haveUp && haveDown) {
+        out.upDownDifferenceIRE = std::abs(alignedUp - alignedDown) * scale;
+        const double outerDenom = std::abs(alignedUp) * std::abs(alignedDown);
+        if (upMagIRE >= chromaFloor && downMagIRE >= chromaFloor &&
+            outerDenom > 1e-12)
+        {
+            const double outerHueCos = std::clamp(
+                std::real(alignedUp * std::conj(alignedDown)) / outerDenom,
+                -1.0,
+                1.0);
+            out.upDownHueDifferenceDeg =
+                std::acos(outerHueCos) * kRadiansToDegrees;
+        }
+        out.centerIsland =
+            out.up == RegionRelation::DifferentRegion &&
+            out.down == RegionRelation::DifferentRegion;
+        out.threeRegion =
+            out.centerIsland &&
+            out.upDownHueDifferenceDeg >= kDifferentHueDeg;
+    }
+
+    return out;
+}
+
 double interfieldAlienCancelStrength(double centerI,
                                      double centerQ,
                                      double upI,

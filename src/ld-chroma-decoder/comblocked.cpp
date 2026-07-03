@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -566,6 +567,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 locked1DParallaxRepairStrength_line(line);
             if (repairStrengthRow)
                 std::fill(repairStrengthRow, repairStrengthRow + width, 0.0f);
+            float *repairDeltaRow =
+                locked1DParallaxRepairDelta_line(line);
+            if (repairDeltaRow)
+                std::fill(repairDeltaRow, repairDeltaRow + width, 0.0f);
 
             if (repairLogThisLine) {
                 std::fprintf(stderr,
@@ -631,6 +636,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                                     0.0,
                                     1.0));
                         }
+                        // Publish the signed move so the retraction stage
+                        // can align carrierFit with the repaired carrier.
+                        if (repairDeltaRow)
+                            repairDeltaRow[rel] =
+                                static_cast<float>(appliedDelta);
                     }
                 }
 
@@ -1094,6 +1104,105 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         for (int rel = 0; rel < width; ++rel)
             published[left + rel] = lockedSource[rel];
     }
+
+    // Trailing pass: same-region vertical partner evidence, computed once the
+    // IQ caches above are complete for every line.  A real chroma-region
+    // boundary and cross-color both fail interline carrier verification, so
+    // the gA detector alone cannot tell them apart; a ±2 partner that
+    // positively shares this pixel's chroma region (relation-signed hue
+    // agreement above the chroma floor) is the discriminator.  Evidence only:
+    // the suppression alpha converts it at the consumption sites.
+    // Diagnostic gate: LD_REGION_KEEP=0 disables the same-region veto so the
+    // suppression alpha behaves exactly as before 2026-07-02 — the
+    // single-variable isolation for witness-render regressions.
+    static const bool regionKeepEnabled = []{
+        const char *s = std::getenv("LD_REGION_KEEP");
+        return !(s && s[0] == '0');
+    }();
+
+    if (regionKeepEnabled &&
+        !regionSamePartner_flat.empty() && demodWidth >= width) {
+        const lddecode::CombReachSourceFrame iqSource = iqReachSource();
+        constexpr double kSameHueCos = 0.96592582628906829;  // cos(15 deg)
+        const double chromaFloor = 5.0 * irescale;
+
+        for (int line = first; line < last; ++line) {
+            float *sameRow = regionSamePartner_line(line);
+            if (!sameRow)
+                continue;
+            std::fill(sameRow, sameRow + width, 0.0f);
+
+            const float *i0 = locked1DTI4fsc_line(line);
+            const float *q0 = locked1DTQ4fsc_line(line);
+            if (!i0 || !q0)
+                continue;
+
+            auto legSign = [&](int target) -> double {
+                if (target < first || target >= last)
+                    return 0.0;
+                const lddecode::CombReachReply reach = combReachIndex.query(
+                    {line, target, left, left,
+                     lddecode::CombReachUse::IQCompare, iqSource});
+                if (!reach.allowIQCompare)
+                    return 0.0;
+                switch (reach.carrierRelation) {
+                case lddecode::CarrierPhaseRelation::Same:     return 1.0;
+                case lddecode::CarrierPhaseRelation::Opposite: return -1.0;
+                default:                                       return 0.0;
+                }
+            };
+            const double sUp = legSign(line - 2);
+            const double sDn = legSign(line + 2);
+            const float *iUp = (sUp != 0.0)
+                ? locked1DTI4fsc_line(line - 2) : nullptr;
+            const float *qUp = (sUp != 0.0)
+                ? locked1DTQ4fsc_line(line - 2) : nullptr;
+            const float *iDn = (sDn != 0.0)
+                ? locked1DTI4fsc_line(line + 2) : nullptr;
+            const float *qDn = (sDn != 0.0)
+                ? locked1DTQ4fsc_line(line + 2) : nullptr;
+            if (!iUp && !iDn)
+                continue;
+
+            for (int rel = 0; rel < width; ++rel) {
+                // Balanced 7-tap horizontal aggregate, matching the region
+                // evaluator in buildCombTapLine: even/odd offsets carry the
+                // two carrier axes, and the 0.5 end weights equalize them
+                // (3:3) so the vector stays phase-flat while the wider
+                // support keeps the hue verdict stable at low saturation.
+                auto fullIQ = [&](const float *iR, const float *qR) {
+                    static constexpr double w[7] =
+                        {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
+                    double si = 0.0;
+                    double sq = 0.0;
+                    for (int k = -3; k <= 3; ++k) {
+                        const int rk = std::clamp(rel + k, 0, width - 1);
+                        si += w[k + 3] * static_cast<double>(iR[rk]);
+                        sq += w[k + 3] * static_cast<double>(qR[rk]);
+                    }
+                    return std::complex<double>(si / 3.0, sq / 3.0);
+                };
+                const std::complex<double> z0 = fullIQ(i0, q0);
+                const double m0 = std::abs(z0);
+                if (m0 < chromaFloor)
+                    continue;
+
+                auto samePartner = [&](const float *iR, const float *qR,
+                                       double s) {
+                    if (!iR)
+                        return false;
+                    const std::complex<double> zl = s * fullIQ(iR, qR);
+                    const double ml = std::abs(zl);
+                    if (ml < chromaFloor)
+                        return false;
+                    return std::real(z0 * std::conj(zl)) >=
+                           kSameHueCos * m0 * ml;
+                };
+                if (samePartner(iUp, qUp, sUp) || samePartner(iDn, qDn, sDn))
+                    sameRow[rel] = 1.0f;
+            }
+        }
+    }
 }
 
 void Comb::FrameBuffer::measurePostCombImpurity()
@@ -1307,6 +1416,7 @@ void Comb::FrameBuffer::splitIQlocked()
         double *carrierComp = lockedCarrierComposite_line(line);
 
         const float *impRow = carrierImpurity_line(line);
+        const float *sameRegionRow = regionSamePartner_line(line);
 
         if (prodIRow)    std::fill(prodIRow, prodIRow + width, 0.0f);
         if (prodQRow)    std::fill(prodQRow, prodQRow + width, 0.0f);
@@ -1347,8 +1457,15 @@ void Comb::FrameBuffer::splitIQlocked()
             const double gA =
                 impRow ? std::clamp((double)impRow[xi], 0.0, 1.0) : 0.0;
 
+            // Named detector-to-policy conversion: a positively same-region
+            // ±2 partner means this chroma continues vertically — a color
+            // boundary, not cross-color — so the suppression stands down.
+            const double regionKeep = sameRegionRow
+                ? std::clamp((double)sameRegionRow[xi], 0.0, 1.0)
+                : 0.0;
+
             const double ccAlpha =
-                std::clamp(1.0 - gA * ccWeight, 0.0, 1.0);
+                std::clamp(1.0 - gA * (1.0 - regionKeep) * ccWeight, 0.0, 1.0);
 
             const double xferTi = finiteOrZero(ti * ccAlpha);
             const double xferTq = finiteOrZero(tq * ccAlpha);
@@ -1450,6 +1567,7 @@ void Comb::FrameBuffer::filterIQLocked()
             // carrierImpurity remains decision data and never becomes a
             // replacement waveform.
             const float *impRow = carrierImpurity_line(line);
+            const float *sameRegionRow = regionSamePartner_line(line);
             // A valid witness does not prove that its per-pixel luma candidate
             // won the HF election.  Bypassing gA whenever witnessValid was true
             // therefore restored cross-colour wherever combY won (notably fine
@@ -1473,8 +1591,13 @@ void Comb::FrameBuffer::filterIQLocked()
                 const double gA = impRow
                     ? std::clamp((double)impRow[i], 0.0, 1.0)
                     : 0.0;
+                // Same conversion as the coherent path: a same-region ±2
+                // partner marks a color boundary, not cross-color.
+                const double regionKeep = sameRegionRow
+                    ? std::clamp((double)sameRegionRow[i], 0.0, 1.0)
+                    : 0.0;
                 const double alphaEff =
-                    std::max(0.0, 1.0 - gA * ccWeight);
+                    std::max(0.0, 1.0 - gA * (1.0 - regionKeep) * ccWeight);
 
                 scratch_preI[i] = (chroma * lutTi[ph]) * giProduct * alphaEff;
                 scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct * alphaEff;
@@ -1620,6 +1743,8 @@ void Comb::FrameBuffer::produceY()
                     ? lockedLumaSmooth_line(line)
                     : nullptr;
             const double *oneDRow = locked1DSource_line(line); // may be null
+            const lddecode::CarrierAnalysisRecord *analysisRow =
+                carrierAnalysis_line(line);
 
             // Frame-B deference: where Frame won the field-vs-frame election it
             // already carries the interfield cancellation that removes
@@ -1833,9 +1958,22 @@ void Comb::FrameBuffer::produceY()
                     candY[nCand] = combY; candPlane[nCand] = 0; ++nCand;
                 }
                 {
+                    // Evidence admission: retractedY's provenance is the
+                    // four-view fit.  Where the residual consensus that
+                    // built it was in conflict (broadband texture), its
+                    // testimony is noise-fit and a medoid over independent
+                    // noise flips the election frame to frame — the beach
+                    // luma instability.  A candidate whose provenance
+                    // evidence conflicted does not get a roster seat; comb
+                    // stands.  Trust is floored at 0.35 by construction, so
+                    // 0.5 admits only pixels with genuine view coherence.
+                    const bool retractedAdmitted =
+                        !analysisRow ||
+                        (analysisRow[xi].parallax.residualValid &&
+                         analysisRow[xi].parallax.residualTrust >= 0.5f);
                     const double r = retractedRow ? (double)retractedRow[xi] : combY;
                     const double ry = std::isfinite(r) ? r : combY;
-                    if (feasible(ry)) {
+                    if (retractedAdmitted && feasible(ry)) {
                         candY[nCand] = ry; candPlane[nCand] = 1; ++nCand;
                     }
                 }
@@ -2250,6 +2388,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     std::vector<double> winLatticeIRE;
     std::vector<double> winYSpanIRE;
     std::vector<double> winScore;
+    std::vector<std::uint8_t> boundaryMark;
 
     auto median3 = [](double a, double b, double c) -> double {
         if (a > b) std::swap(a, b);
@@ -2403,6 +2542,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 winYSpanIRE.resize(meanCount, 0.0);
                 winScore.resize(meanCount, 0.0);
             }
+            if ((int)boundaryMark.size() < width)
+                boundaryMark.resize(width, 0);
 
             for (int s = 0; s < meanCount; ++s) {
                 winFloor[s] =
@@ -2537,6 +2678,50 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     0.10 * std::min(ampIRE, 24.0);
             }
 
+            // Residual-side chroma-boundary discovery (the lurch dual).
+            // The per-window LS fits are the carrier profile along the
+            // line, and they were solved against the lurch-sharpened Y
+            // prior, so luma steps are already out of this profile: what
+            // steps here is chroma.  A boundary is a step between two
+            // internally COHERENT runs — d(p) compares the disjoint
+            // adjacent windows ending at p and starting at p+1, so a mark
+            // at p places the transition between samples p and p+1.  The
+            // side-coherence requirement leaves broadband texture
+            // (incoherent profile) unmarked: there the four-view spread is
+            // noise, not geometry, and filtering would only cost the
+            // attribution its robustness.
+            std::fill(boundaryMark.begin(),
+                      boundaryMark.begin() + width, std::uint8_t{0});
+            {
+                const double stepFloor = 3.0 * irescale;
+                for (int p = 7; p + 5 < meanCount + 3; ++p) {
+                    const int sl = p - 3;       // window [p-3 .. p]
+                    const int sr = p + 1;       // window [p+1 .. p+4]
+                    const int sll = sl - 4;
+                    const int srr = sr + 4;
+                    if (srr >= meanCount)
+                        break;
+                    const double dI = winI[sr] - winI[sl];
+                    const double dQ = winQ[sr] - winQ[sl];
+                    const double step = std::sqrt(dI * dI + dQ * dQ);
+                    const double magL =
+                        std::sqrt(winI[sl] * winI[sl] + winQ[sl] * winQ[sl]);
+                    const double magR =
+                        std::sqrt(winI[sr] * winI[sr] + winQ[sr] * winQ[sr]);
+                    if (step < stepFloor ||
+                        step < 0.35 * std::max(magL, magR))
+                        continue;
+                    const double cI = winI[sl] - winI[sll];
+                    const double cQ = winQ[sl] - winQ[sll];
+                    const double dI2 = winI[srr] - winI[sr];
+                    const double dQ2 = winQ[srr] - winQ[sr];
+                    if (std::sqrt(cI * cI + cQ * cQ) > 0.5 * step ||
+                        std::sqrt(dI2 * dI2 + dQ2 * dQ2) > 0.5 * step)
+                        continue;
+                    boundaryMark[p] = 1;
+                }
+            }
+
             for (int xi = 0; xi < width; ++xi) {
                 const int sFirst = std::max(0, xi - 3);
                 const int sLast  = std::min(xi, meanCount - 1);
@@ -2544,9 +2729,29 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 lddecode::FourViewCarrierView views[4];
                 int viewCount = 0;
 
+                // Region-pure aperture law: a window straddling a
+                // discovered chroma boundary is not evidence for any pixel.
+                // A boundary at p splits samples p | p+1, so window
+                // [s .. s+3] straddles iff a mark lies in [s .. s+2]; the
+                // window ENDING at the boundary stays pure for the left
+                // side and the one STARTING after it for the right, so
+                // every pixel keeps at least one same-side view unless
+                // marks are pathologically dense — then fall back to the
+                // unfiltered set rather than starve attribution.
+                auto windowStraddles = [&](int s) {
+                    const int pHi = std::min(s + 2, width - 1);
+                    for (int p = s; p <= pHi; ++p)
+                        if (boundaryMark[p])
+                            return true;
+                    return false;
+                };
+
+                for (int pass = 0; pass < 2 && viewCount == 0; ++pass) {
                 for (int s = sFirst; s <= sLast; ++s) {
                     if (viewCount >= 4)
                         break;
+                    if (pass == 0 && windowStraddles(s))
+                        continue;
                     const double carrierSample = rawWhole[xi] - winFloor[s];
                     const double fittedSample =
                         winI[s] * basisI[xi] + winQ[s] * basisQ[xi];
@@ -2589,6 +2794,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     }
                     ++viewCount;
                 }
+                }  // pass: region-pure first, unfiltered fallback
 
                 evidenceRow[xi].viewCount = viewCount;
                 for (int v = 0; v < viewCount; ++v) {
@@ -2641,7 +2847,10 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     // raw - moving floor is mostly carrier plus whatever HF-Y
                     // the rolling window could not preserve.
                     double movingResidualSample = 0.0;
-                    if (meanCount > 0) {
+                    // The rolling witness obeys the same region-pure
+                    // aperture law as the four ownership views.
+                    if (meanCount > 0 &&
+                        !windowStraddles(std::clamp(xi - 1, 0, meanCount - 1))) {
                         const int centeredStart = std::clamp(xi - 1, 0, meanCount - 1);
                         movingResidualSample = rawWhole[xi] - winFloor[centeredStart];
                         residualCarrierLo = std::min(residualCarrierLo, movingResidualSample);
@@ -3011,6 +3220,30 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         return;
     if (!carrierRetractionModelValid)
         return;
+
+    // ---------------------------------------------------------------
+    // Return path: align carrierFit with the repaired 1D carrier.
+    //
+    // The fit was solved from raw before Pass 1.5 existed for this frame;
+    // the feasibility repair then moved the 1D carrier by certified,
+    // bounded deltas.  Without folding those same moves into the model,
+    // the retraction (and the witness above it) consumes a pre-repair
+    // carrier while every other client consumes the repaired one.  This
+    // applies the published deltas — the identical certified moves, not a
+    // new estimate — so 1D source authority is unchanged.  Deltas are
+    // sparse and zero elsewhere.
+    // ---------------------------------------------------------------
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *deltaRow = locked1DParallaxRepairDelta_line(line);
+        if (!deltaRow)
+            continue;
+        float *fitRow = carrierFit_flat.data()
+                        + static_cast<size_t>(line) * demodWidth;
+        for (int rel = 0; rel < width; ++rel) {
+            if (deltaRow[rel] != 0.0f)
+                fitRow[rel] += deltaRow[rel];
+        }
+    }
 
     // ---------------------------------------------------------------
     // Pass 2: line-to-line cancellation on carrierFit → combedCarrier.

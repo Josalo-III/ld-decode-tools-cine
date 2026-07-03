@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <complex>
 #include <vector>
 
 #include "carriergrammar.h"
@@ -187,6 +188,56 @@ struct MovingCoarseContour {
     double downTrust = 0.0;
     double straightness = 0.0;
 };
+
+enum class RegionRelation {
+    Unknown,
+    SameRegion,
+    DifferentRegion,
+    // Anti-aligned partner at comparable magnitude: raw-identical content,
+    // i.e. vertically coherent luma (cross-color) rather than a chroma
+    // region.  The comb difference cancels it exactly — the comb is the
+    // cure here, so this verdict must neither cede nor grant one-sided
+    // authority.  (A real complementary-color boundary is magnitude-
+    // asymmetric; shared luma structure is magnitude-symmetric.)
+    AlienCancel
+};
+
+// Shared content verdict for the two intrafield combs.  The IQ inputs retain
+// their source sign; the evaluator applies the grammar relations only to local
+// comparison copies.
+struct IntrafieldRegionReach {
+    bool valid = false;
+    RegionRelation up = RegionRelation::Unknown;
+    RegionRelation down = RegionRelation::Unknown;
+
+    double upDifferenceIRE = 0.0;
+    double downDifferenceIRE = 0.0;
+    double upDownDifferenceIRE = 0.0;
+    double upHueDifferenceDeg = 0.0;
+    double downHueDifferenceDeg = 0.0;
+    double upDownHueDifferenceDeg = 0.0;
+
+    bool centerIsland = false;
+    bool threeRegion = false;
+
+    // True when a leg classified Different through the sub-floor
+    // magnitude-asymmetry branch: a center with no bona-fide chroma of its
+    // own against a clearly saturated partner.  This is the drop-shadow
+    // signature, distinct from hue-based Different verdicts in ordinary
+    // low-saturation texture.
+    bool strongAsym = false;
+};
+
+IntrafieldRegionReach evaluateIntrafieldRegionReach(
+    const std::complex<double> &center,
+    const std::complex<double> &up,
+    const std::complex<double> &down,
+    lddecode::CarrierPhaseRelation upRelation,
+    lddecode::CarrierPhaseRelation downRelation,
+    bool allowUp,
+    bool allowDown,
+    double invIreScale,
+    double minChromaIRE);
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,

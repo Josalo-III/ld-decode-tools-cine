@@ -160,6 +160,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.tapD2);
         ensureWidth(tapLine.pairU2);
         ensureWidth(tapLine.pairD2);
+        ensureWidth(tapLine.intrafieldRegionReach);
+        ensureWidth(tapLine.intrafieldRegionCede);
     }
 
     if (wantContour) {
@@ -389,6 +391,105 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     }
 
+    if (wantContour) {
+        std::fill(tapLine.intrafieldRegionReach.begin(),
+                  tapLine.intrafieldRegionReach.end(),
+                  CombContentReach::IntrafieldRegionReach{});
+        std::fill(tapLine.intrafieldRegionCede.begin(),
+                  tapLine.intrafieldRegionCede.end(),
+                  std::uint8_t{0});
+
+        const size_t iqCount =
+            static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
+        const bool haveSignedIQ =
+            configuration.phaseCompensation &&
+            demodWidth >= width &&
+            tapLine.ln0 >= 0 && tapLine.ln0 < demodLines &&
+            tapLine.lnU2 >= 0 && tapLine.lnU2 < demodLines &&
+            tapLine.lnD2 >= 0 && tapLine.lnD2 < demodLines &&
+            locked1DTI4fsc_flat.size() >= iqCount &&
+            locked1DTQ4fsc_flat.size() >= iqCount;
+
+        if (haveSignedIQ) {
+            const lddecode::CombReachReply upReach = combReachIndex.query(
+                {lineNumber, tapLine.lnU2, left, left,
+                 lddecode::CombReachUse::IQCompare, iqSource});
+            const lddecode::CombReachReply downReach = combReachIndex.query(
+                {lineNumber, tapLine.lnD2, left, left,
+                 lddecode::CombReachUse::IQCompare, iqSource});
+
+            const float *i0 = locked1DTI4fsc_line(tapLine.ln0);
+            const float *q0 = locked1DTQ4fsc_line(tapLine.ln0);
+            const float *iUp = locked1DTI4fsc_line(tapLine.lnU2);
+            const float *qUp = locked1DTQ4fsc_line(tapLine.lnU2);
+            const float *iDown = locked1DTI4fsc_line(tapLine.lnD2);
+            const float *qDown = locked1DTQ4fsc_line(tapLine.lnD2);
+
+            for (int rel = 0; rel < width; ++rel) {
+                // Balanced 7-tap horizontal aggregate.  Even offsets carry
+                // one carrier axis and odd offsets the other, so the 0.5 end
+                // weights equalize the axis sums (3:3) and keep the vector
+                // phase-flat.  The narrow 3-tap vector was noise-limited in
+                // low-saturation skin (hue sigma ~25 deg), so the verdicts
+                // flickered at pixel pitch and one-sided combing toggled
+                // column to column — the beaded fringe on garment edges.
+                auto smoothSignedIQ = [&](const float *iRow, const float *qRow) {
+                    static constexpr double w[7] =
+                        {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
+                    double si = 0.0;
+                    double sq = 0.0;
+                    for (int k = -3; k <= 3; ++k) {
+                        const int rk = reflectCombRel(rel + k, width);
+                        si += w[k + 3] * static_cast<double>(iRow[rk]);
+                        sq += w[k + 3] * static_cast<double>(qRow[rk]);
+                    }
+                    return std::complex<double>(si / 3.0, sq / 3.0);
+                };
+
+                tapLine.intrafieldRegionReach[rel] =
+                    CombContentReach::evaluateIntrafieldRegionReach(
+                        smoothSignedIQ(i0, q0),
+                        smoothSignedIQ(iUp, qUp),
+                        smoothSignedIQ(iDown, qDown),
+                        upReach.carrierRelation,
+                        downReach.carrierRelation,
+                        upReach.allowIQCompare,
+                        downReach.allowIQCompare,
+                        invI,
+                        5.0);
+            }
+
+            // Raw no-valid-partner cede flag: a Different leg with no
+            // positively same-region partner.  Consumers OR a small
+            // horizontal window over this so three-region cedes (drop
+            // shadows) hold a uniform height across columns.
+            for (int rel = 0; rel < width; ++rel) {
+                const auto &region = tapLine.intrafieldRegionReach[rel];
+                if (!region.valid)
+                    continue;
+                const bool upDifferent = region.up ==
+                    CombContentReach::RegionRelation::DifferentRegion;
+                const bool downDifferent = region.down ==
+                    CombContentReach::RegionRelation::DifferentRegion;
+                const bool upSame = region.up ==
+                    CombContentReach::RegionRelation::SameRegion;
+                const bool downSame = region.down ==
+                    CombContentReach::RegionRelation::SameRegion;
+                std::uint8_t flag = 0;
+                if ((upDifferent && !downSame) || (downDifferent && !upSame))
+                    flag |= 1;                       // bit0: cede
+                if (region.strongAsym)
+                    flag |= 3;                       // bit1: shadow band —
+                                                     // membership outranks a
+                                                     // Same partner, so the
+                                                     // whole band takes ONE
+                                                     // render (the 1D), never
+                                                     // a comb/cede interleave
+                tapLine.intrafieldRegionCede[rel] = flag;
+            }
+        }
+    }
+
     auto sampleTapComp = [&](const std::vector<CombTapScalar> &tap, int rel)->double {
         rel = std::clamp(rel, 0, width - 1);
         return tap[rel].comp;
@@ -404,7 +505,20 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     if (wantFieldB || wantFrame) {
         for (int rel = 0; rel < width; ++rel) {
             if (configuration.phaseCompensation) {
-                if (width >= 5) {
+                if (luma0 && width >= 5) {
+                    // Carrier-free smoothed luma, already hoisted for the
+                    // coarse rows.  The notch pair this replaces averaged
+                    // rel-2/rel+2 composite samples — four apart, SAME
+                    // carrier phase — so in saturated color it passed
+                    // full-amplitude quadrature carrier into this "luma"
+                    // delta and every downstream hEdge gate alternated at
+                    // carrier pitch.  Composite level is never a luma
+                    // witness in high color.
+                    const int rm = std::clamp(rel - 2, 0, width - 1);
+                    const int rp = std::clamp(rel + 2, 0, width - 1);
+                    tapLine.hLumaDeltaIRE[rel] =
+                        std::fabs(luma0[rp] - luma0[rm]) * invI;
+                } else if (width >= 5) {
                     const double lumL = notchTap(tapLine.tap0, rel - 1);
                     const double lumR = notchTap(tapLine.tap0, rel + 1);
                     tapLine.hLumaDeltaIRE[rel] = std::fabs(lumR - lumL) * invI;
@@ -1020,11 +1134,49 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             }
         }
 
+        // Windowed OR of the no-valid-partner flag: three-region cedes
+        // (drop shadows) must hold a uniform height, not flicker column to
+        // column, so cede outranks one-sided anywhere in the window.
+        // Bit1 marks the drop-shadow (strong magnitude-asymmetry) islands
+        // that qualify for the zero-chroma render.
+        bool centerIsland = false;
+        bool shadowIsland = false;
+        if ((int)tapLine.intrafieldRegionCede.size() >= width) {
+            const int lo = std::max(rel - 4, 0);
+            const int hi = std::min(rel + 4, width - 1);
+            for (int k = lo; k <= hi; ++k) {
+                const std::uint8_t v = tapLine.intrafieldRegionCede[k];
+                if (v & 1) centerIsland = true;
+                if (v & 2) shadowIsland = true;
+            }
+        }
+        if (!centerIsland && rel < (int)tapLine.intrafieldRegionReach.size()) {
+            const auto &region = tapLine.intrafieldRegionReach[rel];
+            if (region.valid) {
+                const bool upDifferent = region.up ==
+                    CombContentReach::RegionRelation::DifferentRegion;
+                const bool downDifferent = region.down ==
+                    CombContentReach::RegionRelation::DifferentRegion;
+                const bool upSame = region.up ==
+                    CombContentReach::RegionRelation::SameRegion;
+                const bool downSame = region.down ==
+                    CombContentReach::RegionRelation::SameRegion;
+
+                if (downDifferent && upSame) {
+                    wDn2 = 0.0;
+                } else if (upDifferent && downSame) {
+                    wUp2 = 0.0;
+                }
+            }
+        }
+
         double sc2 = 1.0;
 
-        if (hardVerticalBreak) {
+        if (hardVerticalBreak || centerIsland) {
             // A hard vertical context break means Field A has no valid
-            // same-context answer here.  This also blocks the revive path.
+            // same-context answer here.  Signed-IQ center islands carry the
+            // same verdict: neither +/-2 leg belongs to the center region.
+            // Both cases also block the revive path.
             wUp2 = 0.0;
             wDn2 = 0.0;
             boundaryCede = 1.0;
@@ -1078,6 +1230,21 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             double t2  = ((C - Cup2Adj) * wUp2 * sc2);
             t2        += ((C - Cdn2Adj) * wDn2 * sc2);
             tc        += 0.25 * t2;
+        } else if (shadowIsland && chromaT < 0.375) {
+            // Same law as Field B: at a drop-shadow island the 1D holds
+            // genuine partial chroma unless horizontal luma structure can
+            // generate cross-color, so the render follows the carrier-free
+            // hEdge ramp — 1D fade where flat, zero where a luma edge
+            // would bead through the 1D.
+            const double hEdgeT =
+                (rel < (int)tapLine.hLumaDeltaIRE.size())
+                    ? std::clamp(
+                        (tapLine.hLumaDeltaIRE[rel] - 0.35 * hEdgeThreshIRE) /
+                        (0.65 * hEdgeThreshIRE),
+                        0.0,
+                        1.0)
+                    : 0.0;
+            tc = C * (1.0 - hEdgeT);
         } else {
             tc = C;
         }
@@ -1448,53 +1615,15 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             }
         }
 
-        // Vector legality of each ±2 leg, from the signed Grid4fsc IQ.
-        // Cross-color from thin luma detail (star points, text strokes)
-        // carries chroma-band magnitude, so no magnitude test can see that
-        // the leg left the color context — and the strokes are too thin
-        // for coarse to see at all.  The vectors can: matched context keeps
-        // rho = |Z0-Zleg| / (|Z0|+|Zleg|) low, carrier-band impostors land
-        // near 1.  Gated by pair saturation so low-chroma evidence stays
-        // with the envelopes.  The verdict must be decisive: soft weight
-        // penalties are renormalized away by sc = 2 / (wUp + wDn).
-        bool vecDQUp = false;
-        bool vecDQDn = false;
-        if (haveSignedIQTests && !hardVerticalBreak) {
-            auto legBreak = [&](const std::complex<double> &zLeg,
-                                double relSign,
-                                double satLeg, double chromaTLeg) {
-                if (relSign == 0.0)
-                    return 0.0;
-                const double sum = satC + satLeg;
-                if (sum <= 1e-9)
-                    return 0.0;
-                const double rho = std::abs(testZ0 - relSign * zLeg) / sum;
-                return chromaTLeg *
-                       std::clamp((rho - 0.35) / 0.25, 0.0, 1.0);
-            };
-            const double legBreakUp =
-                legBreak(testZU2, iqRelSignUp, satUp, chromaTUp);
-            const double legBreakDn =
-                legBreak(testZD2, iqRelSignDn, satDn, chromaTDn);
-
-            const bool dqUp = vecDQUp = (legBreakUp >= 0.5);
-            const bool dqDn = vecDQDn = (legBreakDn >= 0.5);
-            if (dqUp && dqDn) {
-                // Both legs out of color context: no model-valid answer,
-                // and the revive path must not resurrect one.
-                hardVerticalBreak = true;
-            } else if (dqUp) {
-                wUp = 0.0;
-                reason = FieldBReasonBoundaryDown;
-            } else if (dqDn) {
-                wDn = 0.0;
-                reason = FieldBReasonBoundaryUp;
-            } else {
-                // Below DQ, confidence only tilts via capped penalty.
-                wUp *= (1.0 - 0.75 * legBreakUp);
-                wDn *= (1.0 - 0.75 * legBreakDn);
-            }
-        }
+        // Per-leg vector legality now lives in the region-reach verdicts
+        // (tapLine.intrafieldRegionReach / intrafieldRegionCede, consumed
+        // below): hue distinguishes contexts, magnitude asymmetry catches
+        // saturation boundaries, and the AlienCancel window exempts the
+        // raw-identical pairs the comb exists to cancel.  The old rho DQ
+        // duplicated the first two and, fatally, DQ'd the alien pairs too
+        // (rho ~ 1 for anti-aligned partners), ceding vertically coherent
+        // cross-color to 1D where it rendered as a line-alternating
+        // rainbow in the thigh-gap shadow.
 
         double boundaryCede = 0.0;
 
@@ -1640,17 +1769,61 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 reason = FieldBReasonBoundaryCede;
         }
 
+        // Windowed OR of the no-valid-partner flag: three-region cedes
+        // (drop shadows) must hold a uniform height, not flicker column to
+        // column, so cede outranks one-sided anywhere in the window.
+        // Ceding to the 1D center renders each boundary row's own color
+        // instead of a vertically mixed band (near-complementary hues mix
+        // toward gray — the "middle shadow").  Bit1 marks the drop-shadow
+        // (strong magnitude-asymmetry) islands that qualify for the
+        // zero-chroma render.
+        bool centerIsland = false;
+        bool shadowIsland = false;
+        if ((int)tapLine.intrafieldRegionCede.size() >= width) {
+            const int lo = std::max(rel - 4, 0);
+            const int hi = std::min(rel + 4, width - 1);
+            for (int k = lo; k <= hi; ++k) {
+                const std::uint8_t v = tapLine.intrafieldRegionCede[k];
+                if (v & 1) centerIsland = true;
+                if (v & 2) shadowIsland = true;
+            }
+        }
+        if (!centerIsland && rel < (int)tapLine.intrafieldRegionReach.size()) {
+            const auto &region = tapLine.intrafieldRegionReach[rel];
+            if (region.valid) {
+                const bool upDifferent = region.up ==
+                    CombContentReach::RegionRelation::DifferentRegion;
+                const bool downDifferent = region.down ==
+                    CombContentReach::RegionRelation::DifferentRegion;
+                const bool upSame = region.up ==
+                    CombContentReach::RegionRelation::SameRegion;
+                const bool downSame = region.down ==
+                    CombContentReach::RegionRelation::SameRegion;
+
+                if (downDifferent && upSame) {
+                    wDn = 0.0;
+                    reason = FieldBReasonBoundaryUp;
+                } else if (upDifferent && downSame) {
+                    wUp = 0.0;
+                    reason = FieldBReasonBoundaryDown;
+                }
+            }
+        }
+
         double sc = 1.0;
         bool haveAnswer = false;
 
-        if (hardVerticalBreak) {
+        if (hardVerticalBreak || centerIsland) {
             // A true vertical context break means Field B has no model-valid
-            // answer.  Do not allow one side to survive, do not soften it back
-            // into balance, and do not let the revive path bring it back.
+            // answer.  A signed-IQ center island is the chroma-domain version:
+            // neither leg positively belongs to center.  Do not allow one side
+            // to survive or let the revive path bring it back.
             wUp = 0.0;
             wDn = 0.0;
             boundaryCede = 1.0;
-            reason = FieldBReasonBoundaryCede;
+            reason = centerIsland
+                ? FieldBReasonCenterIsland
+                : FieldBReasonBoundaryCede;
         } else if (wUp > 0.0 || wDn > 0.0) {
             // Test: sideline the weak-leg floor so Field B can fully express
             // one-sided evidence on the stubborn Paramount zipper.
@@ -1734,10 +1907,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             }
 
             if (reviveStrength > 0.0) {
-                // A vector-DQ'd leg stays dead: revive's coarse evidence
-                // cannot see the thin detail that disqualified it.
-                wUp = vecDQUp ? 0.0 : reviveUp * reviveStrength;
-                wDn = vecDQDn ? 0.0 : reviveDn * reviveStrength;
+                wUp = reviveUp * reviveStrength;
+                wDn = reviveDn * reviveStrength;
                 sc = 1.0;
                 haveAnswer = (wUp > 0.0 || wDn > 0.0);
                 if (haveAnswer)
@@ -1822,6 +1993,18 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             } else if (reason == FieldBReasonNone) {
                 reason = FieldBReasonBlend;
             }
+        } else if (shadowIsland && chromaT < 0.375) {
+            // Drop-shadow island: what the 1D holds here is genuine partial
+            // chroma UNLESS there is horizontal luma structure to generate
+            // cross-color — 1D cc needs a horizontal edge.  So the render
+            // follows the carrier-free horizontal luma activity: none
+            // (waistband against belly) → the 1D's own clean fade; strong
+            // (diagonal garment edges) → zero, keeping the edge energy
+            // composite-side where produceY renders it as luma instead of
+            // green beading.  Graded on the coarse hEdge ramp so no new
+            // per-pixel seam is created.
+            tc = C * (1.0 - hEdgeForSat);
+            reason = FieldBReasonCenterIsland;
         } else {
             tc = C;
             reason = FieldBReasonCenter;

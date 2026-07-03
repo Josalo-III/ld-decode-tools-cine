@@ -435,7 +435,8 @@ private:
 		FieldBReasonBoundaryCede = 4,
 		FieldBReasonReviveCoarse = 5,
 		FieldBReasonReviveScalar = 6,
-		FieldBReasonCenter = 7
+		FieldBReasonCenter = 7,
+		FieldBReasonCenterIsland = 8
 	};
 
 	// Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
@@ -471,6 +472,12 @@ private:
 		std::vector<CombTapPair> pairD1;
 		std::vector<CombTapPair> pairU2;
 		std::vector<CombTapPair> pairD2;
+		std::vector<CombContentReach::IntrafieldRegionReach> intrafieldRegionReach;
+		// Raw no-valid-partner cede flag per pixel (a Different leg with no
+		// positively same-region partner).  Consumers OR a small horizontal
+		// window over this so three-region cedes (drop shadows) hold a
+		// uniform height instead of flickering column to column.
+		std::vector<std::uint8_t> intrafieldRegionCede;
 		std::vector<CombTapContour> contour;
 		std::vector<CombContentReach::MovingCoarseContour> movingCoarseContour;
 		std::vector<double> coarse0IRE;
@@ -521,6 +528,13 @@ private:
 	// measurePostCombImpurity() unions the elected-comb reading with that sharp
 	// pre-comb warning rather than erasing it.
 	std::vector<float> carrierImpurity_flat;
+	// Same-region vertical partner evidence [0,1] per pixel: 1 when a ±2
+	// grammar-legal partner positively shares this pixel's chroma region
+	// (relation-signed hue agreement above the chroma floor).  Discriminates
+	// a real chroma-region boundary from cross-color — both fail interline
+	// verification, so gA alone cannot tell them apart.  Evidence only; the
+	// suppression policy converts it at the consumption sites.
+	std::vector<float> regionSamePartner_flat;
 
 	// --- Carrier-retraction / constrained-witness buffers (restored from the
 	// 6/13 witness path).  Populated by buildCarrierRetracted() then
@@ -640,6 +654,13 @@ private:
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
 		std::vector<float> locked1DParallaxRepairStrength_flat; // [0,1] actual Pass-1.5 applied repair strength
+		// Signed Pass-1.5 applied repair delta (signal units) per sample.
+		// Published so the retraction stage can align carrierFit with the
+		// repaired 1D carrier: the fit is solved from raw BEFORE the repair
+		// exists, and without this return path the witness consumes a
+		// pre-repair carrier model while every other client consumes the
+		// repaired 1D.
+		std::vector<float> locked1DParallaxRepairDelta_flat;
 	// Application-neutral carrier facts produced for every locked frame. The
 	// default 1D feasibility repair, luma witness, and diagnostics all consume
 	// this single shared analysis rather than privately reconstructing it.
@@ -699,6 +720,18 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    locked1DParallaxRepairStrength_flat.empty()) return nullptr;
 		return locked1DParallaxRepairStrength_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline float *locked1DParallaxRepairDelta_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DParallaxRepairDelta_flat.empty()) return nullptr;
+		return locked1DParallaxRepairDelta_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const float *locked1DParallaxRepairDelta_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    locked1DParallaxRepairDelta_flat.empty()) return nullptr;
+		return locked1DParallaxRepairDelta_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Bucket-path 1D scalar: valid only after split1D().
@@ -1059,6 +1092,16 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    carrierImpurity_flat.empty()) return nullptr;
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* regionSamePartner_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    regionSamePartner_flat.empty()) return nullptr;
+		return regionSamePartner_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* regionSamePartner_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    regionSamePartner_flat.empty()) return nullptr;
+		return regionSamePartner_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline lddecode::CarrierAnalysisRecord* carrierAnalysis_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||

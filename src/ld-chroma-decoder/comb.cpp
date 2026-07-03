@@ -489,9 +489,11 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            regionSamePartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DParallaxRepairStrength_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            locked1DParallaxRepairDelta_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
             compactPatchGate_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
@@ -2796,7 +2798,7 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
             quint16 u;
             quint16 v;
         };
-        const std::array<ReasonShade, 8> reasonShades = {{
+        const std::array<ReasonShade, 9> reasonShades = {{
             {32768, 32768, 32768}, // none
             {49152, 26214, 39321}, // blend: cyan
             {45875, 25000, 56500}, // boundary up: blue
@@ -2804,7 +2806,8 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
             {52428, 20000, 47000}, // boundary cede: teal
             {42598, 30000, 52000}, // coarse revive: green
             {39321, 52000, 28000}, // scalar revive: red
-            {26214, 32768, 32768}  // center / no answer: neutral dark
+            {26214, 32768, 32768}, // center / no answer: neutral dark
+            {60000, 32768, 32768}  // signed-IQ center island: bright neutral
         }};
 
         const int firstLine = videoParameters.firstActiveFrameLine;
