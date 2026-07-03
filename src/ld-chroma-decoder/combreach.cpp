@@ -359,9 +359,9 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const double downMagIRE = std::abs(alignedDown) * scale;
     const double chromaFloor = std::max(0.0, minChromaIRE);
 
-    // Preserve the old VDIS phase boundary as the positive non-membership
-    // threshold, but keep a small hysteresis band so marginal hue drift cannot
-    // force either a one-sided reach or a center-island verdict.
+    // Positive non-membership threshold at a 20-degree hue difference, with
+    // a small hysteresis band below it so marginal hue drift cannot force
+    // either a one-sided reach or a center-island verdict.
     constexpr double kSameHueDeg = 15.0;
     constexpr double kDifferentHueDeg = 20.0;
     constexpr double kRadiansToDegrees = 57.2957795130823208768;

@@ -506,9 +506,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
 // Interleave the two source fields into rawbuffer in frame-line order (even lines
 // from firstField, odd lines from secondField), record their phase IDs, and derive
 // a single cadenceId representative for this frame from the two fields' cinemap
-// metadata. Also initialises per-line carrier grammar polarity and clears
-// the VDIS mask. capturePartnerSeqNo records the original TBC frame pairing for
-// each field, carried forward for reconstruction.
+// metadata. Also initialises per-line carrier grammar polarity.
+// capturePartnerSeqNo records the original TBC frame pairing for each field,
+// carried forward for reconstruction.
 void Comb::FrameBuffer::loadFields(const SourceField &firstField,
                                    const SourceField &secondField)
 {
@@ -1067,8 +1067,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         metrics.frameModel = localUseFrameModel;
         metrics.managementVeto = managementVeto;
         metrics.frameVertCoherent = b2VertCoherent;
-        metrics.vdisSoft = false;
-        metrics.vdisHard = false;
 
         int    idx   = 1;
         double val   = FB;

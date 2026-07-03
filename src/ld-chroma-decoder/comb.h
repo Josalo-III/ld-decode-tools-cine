@@ -302,8 +302,6 @@ public:
 		bool frameModel = false;
 		bool managementVeto = false;
 		bool frameVertCoherent = false;
-		bool vdisSoft = false;
-		bool vdisHard = false;
 		int winner = 1;
 	};
 
@@ -625,8 +623,6 @@ private:
 	std::vector<double> scratch_attrBandYClaim;
 	std::vector<double> scratch_attrMembershipY;
 	std::vector<double> scratch_impulseExempt;
-	std::vector<char> scratch_vdis_flag;
-	std::vector<std::vector<char>> vdisMask; // [line][rel], persistent per frame
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
 		//
@@ -916,7 +912,6 @@ private:
 	double spLUT_locked[4] = {1.0, 0.0, -1.0, 0.0};
 	double cpLUT_locked[4] = {0.0, 1.0,  0.0, -1.0};
 	bool   basisLockedInit = false;
-	bool hasVDIS(int lineNumber, int h) const;      
 
 	// Hybrid 2D helpers
 	void invalidateCombTapCache();
@@ -962,9 +957,7 @@ private:
 								 double neighborLumaMeanIRE = -1.0,
 								 double neighborBaseMeanIRE = -1.0,
 								 double lineForwardErrorIRE = 0.0) const;
-	static void consolidateVDISRegions(std::vector<std::vector<char>> &mask,
-									   const LdDecodeMetaData::VideoParameters &vp);
-	
+
 	// Field-vs-Frame elects scalar bandpass candidates. Candidate A is the
 	// same-regime buddy: Field A in interlace, Frame A in progressive.
 	// IQ evidence can inform the scores, but IQ-derived candidates must be
