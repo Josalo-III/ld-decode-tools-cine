@@ -122,7 +122,7 @@ public:
             // alphaEff = max(0, 1 - gA*weight) applied to rendered chroma in
             // both coherent and residual paths; Y subtraction always full.
             // >1.0 drives harder suppression on ambiguous pixels.
-            double CC_SUPPRESSION_WEIGHT    = 1.0;
+            double CC_SUPPRESSION_WEIGHT    = 2.0;
 
             // =========================================================================
             // 2D Field extraction (FieldA/B) and vertical gating
