@@ -184,6 +184,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         ? (startIndex - 4)
         : (startIndex - 2);
 
+    // True when the frame analyzed on the PREVIOUS loop iteration (now
+    // sitting in `current` after rotation) was genuinely loaded this batch —
+    // the guard that keeps the frame-axis conformance test from comparing
+    // against a stale recycled buffer at pre-roll or batch boundaries.
+    bool prevIterAnalyzed = false;
+
     for (qint32 fieldIndex = preStart; fieldIndex < endIndex; fieldIndex += 2) {
         // Rotate buffers.
         {
@@ -205,7 +211,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             if (configuration.phaseCompensation) {
                 next->phaseLocked();
-                next->buildCarrierAnalysis();
+                next->buildCarrierAnalysis(
+                    prevIterAnalyzed ? current.get() : nullptr);
                 next->buildPhaseCorrected1D();
                 if (configuration.lumaWitness) {
                     next->buildCarrierRetracted();
@@ -215,6 +222,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             next->split2D();
         }
+        prevIterAnalyzed = canLoadNext;
 
         if (fieldIndex < startIndex)
             continue;
@@ -490,6 +498,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             regionSamePartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            regionAlienPartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DParallaxRepairStrength_flat.assign(size_t(demodLines) * demodWidth, 0.0f);

@@ -131,7 +131,7 @@ void Comb::FrameBuffer::phaseLocked()
 //   - publish:     write demod buffers, locked 4fsc buffers, magnitude, and
 //                  lockedSource from the cleaned I/Q
 
-void Comb::FrameBuffer::buildCarrierAnalysis()
+void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
@@ -358,6 +358,102 @@ void Comb::FrameBuffer::buildCarrierAnalysis()
                 std::max(0.0, parallaxRepairTolIRE),
                 movingResidual,
                 invIreScale);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Schedule-conformance registration (grammar-as-table).
+    //
+    // With every line's canonical bandpass harvested, register each
+    // pixel's carrier-band energy against the schedule: legal carrier
+    // MUST invert across Opposite-relation partners — the same-field ±2
+    // lines within this frame, and the same line on the neighbouring
+    // frame (the comb's own temporal structure, never the
+    // residual-video-3D enhancement).  Energy that MATCHES where the
+    // schedule demands inversion admits no legal carrier interpretation
+    // and is registered ScheduleIllegal — luma by law — at entry, rather
+    // than entering the carrier column with a bad grade for every
+    // consumer to re-adjudicate.  Same-relation partners are
+    // non-discriminative (legal and alien both match) and abstain.
+    // 4-sample windows keep the correlation phase-flat; an energy floor
+    // keeps noise Unresolved.  Conservative tie-break: any legal vote
+    // wins — real chroma is never claimed as luma.
+    if (width >= 4) {
+        const bool prevUsable =
+            prevFrame &&
+            prevFrame->demodWidth == demodWidth &&
+            prevFrame->demodLines == demodLines &&
+            !prevFrame->locked1DRawBandpass_flat.empty();
+
+        const double rmsFloor = 3.0 * irescale;           // 3 IRE RMS
+        const double energyFloor = 4.0 * rmsFloor * rmsFloor;
+        constexpr double kCorrVote = 0.5;
+
+        for (int line = first; line < last; ++line) {
+            lddecode::CarrierAnalysisRecord *analysis =
+                carrierAnalysis_line(line);
+            const double *bp0 = locked1DRawBandpass_line(line);
+            const CombCarrierGrammar *g0 = carrierGrammarLine(line);
+            if (!analysis || !bp0 || !g0 || !g0->grammarLocked)
+                continue;
+
+            // Opposite-relation partner rows, certified by the grammar.
+            const double *axes[3];
+            int nAxes = 0;
+            auto addAxis = [&](const double *bpP,
+                               const CombCarrierGrammar *gP) {
+                if (!bpP || !gP || !gP->grammarLocked || nAxes >= 3)
+                    return;
+                const auto rel = lddecode::carrierGrammarSignedPhaseRelation(
+                    g0, left, gP, left);
+                if (rel == lddecode::CarrierPhaseRelation::Opposite)
+                    axes[nAxes++] = bpP;
+            };
+            if (line - 2 >= first)
+                addAxis(locked1DRawBandpass_line(line - 2),
+                        carrierGrammarLine(line - 2));
+            if (line + 2 < last)
+                addAxis(locked1DRawBandpass_line(line + 2),
+                        carrierGrammarLine(line + 2));
+            if (prevUsable)
+                addAxis(prevFrame->locked1DRawBandpass_line(line),
+                        prevFrame->carrierGrammarLine(line));
+            if (nAxes == 0)
+                continue;
+
+            for (int rel = 0; rel < width; ++rel) {
+                const int w0 = std::clamp(rel, 0, width - 4);
+                double e0 = 0.0;
+                for (int k = 0; k < 4; ++k)
+                    e0 += bp0[w0 + k] * bp0[w0 + k];
+                if (e0 < energyFloor)
+                    continue;
+
+                bool legalVote = false;
+                bool illegalVote = false;
+                for (int a = 0; a < nAxes; ++a) {
+                    const double *bpP = axes[a];
+                    double dot = 0.0;
+                    double eP = 0.0;
+                    for (int k = 0; k < 4; ++k) {
+                        dot += bp0[w0 + k] * bpP[w0 + k];
+                        eP  += bpP[w0 + k] * bpP[w0 + k];
+                    }
+                    if (eP < energyFloor)
+                        continue;
+                    const double corr = dot / std::sqrt(e0 * eP);
+                    if (corr <= -kCorrVote)
+                        legalVote = true;
+                    else if (corr >= kCorrVote)
+                        illegalVote = true;
+                }
+
+                analysis[rel].scheduleConformance = legalVote
+                    ? lddecode::CarrierScheduleConformance::LegalCarrier
+                    : illegalVote
+                        ? lddecode::CarrierScheduleConformance::ScheduleIllegal
+                        : lddecode::CarrierScheduleConformance::Unresolved;
+            }
         }
     }
 
@@ -602,7 +698,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 double appliedDelta = 0.0;
                 double movingDistIRE = 0.0;
 
-                if (optionCount <= 0) {
+                if (carrierAnalysis[rel].scheduleConformance ==
+                    lddecode::CarrierScheduleConformance::ScheduleIllegal) {
+                    // Registered as luma at analysis time: there is no
+                    // carrier here to repair, and the residual options are
+                    // luma interpretations that would only masquerade as
+                    // survivor conflict.
+                    reason = "schedule-illegal-luma";
+                } else if (optionCount <= 0) {
                     reason = "no-options";
                 } else if (survivorCount <= 0) {
                     reason = "conflict-no-survivors";
@@ -1105,32 +1208,48 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             published[left + rel] = lockedSource[rel];
     }
 
-    // Trailing pass: same-region vertical partner evidence, computed once the
-    // IQ caches above are complete for every line.  A real chroma-region
-    // boundary and cross-color both fail interline carrier verification, so
-    // the gA detector alone cannot tell them apart; a ±2 partner that
-    // positively shares this pixel's chroma region (relation-signed hue
-    // agreement above the chroma floor) is the discriminator.  Evidence only:
-    // the suppression alpha converts it at the consumption sites.
-    // Diagnostic gate: LD_REGION_KEEP=0 disables the same-region veto so the
-    // suppression alpha behaves exactly as before 2026-07-02 — the
+    // Trailing pass: ±2 vertical partner evidence, computed once the IQ
+    // caches above are complete for every line.  Two verdicts per pixel:
+    //
+    //   SAME  — a grammar-legal partner positively shares this pixel's
+    //           chroma region (relation-signed hue agreement above the
+    //           chroma floor).  A real chroma-region boundary and
+    //           cross-color both fail interline carrier verification, so
+    //           the gA detector alone cannot tell them apart; this is the
+    //           discriminator.  Consumed by the suppression alpha.
+    //
+    //   ALIEN — a grammar-legal partner is ANTI-aligned at comparable
+    //           magnitude after relation signing: raw-identical content
+    //           where the carrier schedule demands inversion.  Legal
+    //           carrier MUST invert per the lineFlip schedule; energy that
+    //           fails the schedule is structurally not carrier, hence luma
+    //           by law (near-carrier periodic luma, the Borg-cube grid).
+    //           Consumed by the produceY retracted admission.
+    //
+    // Both are evidence only; consumers convert.  Diagnostic gate:
+    // LD_REGION_KEEP=0 disables the SAME verdict (suppression veto behaves
+    // exactly as before 2026-07-02) without touching the ALIEN fact — the
     // single-variable isolation for witness-render regressions.
     static const bool regionKeepEnabled = []{
         const char *s = std::getenv("LD_REGION_KEEP");
         return !(s && s[0] == '0');
     }();
 
-    if (regionKeepEnabled &&
-        !regionSamePartner_flat.empty() && demodWidth >= width) {
+    if (!regionSamePartner_flat.empty() &&
+        !regionAlienPartner_flat.empty() && demodWidth >= width) {
         const lddecode::CombReachSourceFrame iqSource = iqReachSource();
-        constexpr double kSameHueCos = 0.96592582628906829;  // cos(15 deg)
+        constexpr double kSameHueCos = 0.96592582628906829;   // cos(15 deg)
+        constexpr double kAlienHueCos = -0.96592582628906829; // cos(165 deg)
+        constexpr double kAlienMagRatio = 0.60; // matches AlienCancel
         const double chromaFloor = 5.0 * irescale;
 
         for (int line = first; line < last; ++line) {
             float *sameRow = regionSamePartner_line(line);
-            if (!sameRow)
+            float *alienRow = regionAlienPartner_line(line);
+            if (!sameRow || !alienRow)
                 continue;
             std::fill(sameRow, sameRow + width, 0.0f);
+            std::fill(alienRow, alienRow + width, 0.0f);
 
             const float *i0 = locked1DTI4fsc_line(line);
             const float *q0 = locked1DTQ4fsc_line(line);
@@ -1187,19 +1306,33 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 if (m0 < chromaFloor)
                     continue;
 
-                auto samePartner = [&](const float *iR, const float *qR,
-                                       double s) {
+                // Classify one leg: +1 same-region, -1 alien (schedule-
+                // illegal), 0 neither.  The alien test mirrors the region
+                // grammar's AlienCancel window: anti-aligned beyond 165
+                // degrees at comparable magnitude (weak side >= 0.6 of the
+                // strong side).
+                auto partnerClass = [&](const float *iR, const float *qR,
+                                        double s) -> int {
                     if (!iR)
-                        return false;
+                        return 0;
                     const std::complex<double> zl = s * fullIQ(iR, qR);
                     const double ml = std::abs(zl);
                     if (ml < chromaFloor)
-                        return false;
-                    return std::real(z0 * std::conj(zl)) >=
-                           kSameHueCos * m0 * ml;
+                        return 0;
+                    const double dot = std::real(z0 * std::conj(zl));
+                    if (dot >= kSameHueCos * m0 * ml)
+                        return 1;
+                    if (dot <= kAlienHueCos * m0 * ml &&
+                        std::min(m0, ml) >= kAlienMagRatio * std::max(m0, ml))
+                        return -1;
+                    return 0;
                 };
-                if (samePartner(iUp, qUp, sUp) || samePartner(iDn, qDn, sDn))
+                const int clsUp = partnerClass(iUp, qUp, sUp);
+                const int clsDn = partnerClass(iDn, qDn, sDn);
+                if (regionKeepEnabled && (clsUp == 1 || clsDn == 1))
                     sameRow[rel] = 1.0f;
+                if (clsUp == -1 || clsDn == -1)
+                    alienRow[rel] = 1.0f;
             }
         }
     }
@@ -1745,6 +1878,7 @@ void Comb::FrameBuffer::produceY()
             const double *oneDRow = locked1DSource_line(line); // may be null
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
+            const float *alienRow = regionAlienPartner_line(line);
 
             // Retracted-admission mode (isolation switch for the cube/beach
             // A/B).  Default: conflicted fits admit retracted only with
@@ -2023,6 +2157,23 @@ void Comb::FrameBuffer::produceY()
                         !analysisRow ||
                         (analysisRow[xi].parallax.residualValid &&
                          analysisRow[xi].parallax.residualTrust >= 0.5f);
+                    // Schedule-illegality admits by LAW, not corroboration:
+                    // an alien ±2 partner means this pixel's carrier-band
+                    // energy is raw-identical where the schedule demands
+                    // inversion — structurally not carrier, hence luma.
+                    // retractedY is the plane that keeps it as luma, and it
+                    // is exactly the line-pitch detail (Borg-cube grid) that
+                    // the ±2-agreement corroboration below can never certify,
+                    // because that detail IS the ±2 disagreement.
+                    if (!retractedAdmitted && alienRow && alienRow[xi] > 0.5f)
+                        retractedAdmitted = true;
+                    // Same law from the analysis-time registration, which
+                    // adds the FRAME axis (static line-decorrelated detail
+                    // the ±2 tests cannot reach).
+                    if (!retractedAdmitted && analysisRow &&
+                        analysisRow[xi].scheduleConformance ==
+                            lddecode::CarrierScheduleConformance::ScheduleIllegal)
+                        retractedAdmitted = true;
                     if (!retractedAdmitted && retractedAdmitSpatial &&
                         retractedRow && std::isfinite(r)) {
                         const double rHF = r - coarse;
@@ -2659,7 +2810,15 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     const double bI = basisI[xi];
                     const double bQ = basisQ[xi];
 
-                    const double residual = rawWhole[xi] - refinedY[xi];
+                    // Evaluation in table context: ScheduleIllegal energy
+                    // was registered as luma at analysis time, so the
+                    // carrier fit never sees it — the model cannot chase a
+                    // grid the schedule already refused.
+                    const double residual =
+                        (analysisRow[xi].scheduleConformance ==
+                         lddecode::CarrierScheduleConformance::ScheduleIllegal)
+                            ? 0.0
+                            : rawWhole[xi] - refinedY[xi];
 
                     sII += bI * bI;
                     sIQ += bI * bQ;
@@ -2698,7 +2857,14 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     const double bQ = basisQ[xi];
 
                     const double fit = fitI * bI + fitQ * bQ;
-                    const double residual = rawWhole[xi] - refinedY[xi];
+                    // Same table-context exclusion as the LS input above,
+                    // so the error/lattice metrics grade the fit against
+                    // the legal energy it was actually asked to explain.
+                    const double residual =
+                        (analysisRow[xi].scheduleConformance ==
+                         lddecode::CarrierScheduleConformance::ScheduleIllegal)
+                            ? 0.0
+                            : rawWhole[xi] - refinedY[xi];
                     const double e = residual - fit;
 
                     errSq += e * e;

@@ -185,11 +185,27 @@ struct CarrierParallaxDiagnostics {
     bool valid = false;
 };
 
+// Schedule-conformance verdict, registered at analysis time in grammar
+// coordinates.  Legal carrier must invert across Opposite-relation partners
+// (same-field +/-2 lines; the same line on the neighbouring frame).  Energy
+// that instead MATCHES where the schedule demands inversion is structurally
+// not carrier — luma by law (near-carrier periodic luma, e.g. a fine static
+// grid).  This is registration-with-rejection: the verdict is a fact of the
+// table, not a downstream confidence score, and consumers convert it via
+// named policy (fit input exclusion, repair abstention, election admission).
+enum class CarrierScheduleConformance : std::uint8_t {
+    Unresolved = 0,      // no discriminative axis had enough energy/coherence
+    LegalCarrier = 1,    // at least one Opposite-relation axis inverted
+    ScheduleIllegal = 2, // matched where inversion was demanded; no axis legal
+};
+
 struct CarrierAnalysisRecord {
     CarrierFitDiagnostics fit;
     CarrierResidualDiagnostics residual;
     CarrierParallaxDiagnostics parallax;
     float carrierImpurity = 0.0f;       // detector output, not transfer policy
+    CarrierScheduleConformance scheduleConformance =
+        CarrierScheduleConformance::Unresolved;
 };
 
 struct CarrierResidualOption {

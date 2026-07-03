@@ -322,7 +322,11 @@ public:
 	// Single pre-render owner of the canonical locked 1D baseline and shared
 	// carrier diagnostics. Application paths consume these records; they do not
 	// clear or privately recreate them.
-	void buildCarrierAnalysis();
+	// prevFrame: the comb pipeline's temporally previous FrameBuffer (its
+	// grammar + harvested bandpass supply the frame-axis conformance test).
+	// This is the comb's own 3D structure — never gated on the
+	// residual-video-3D enhancement.  Null when no contiguous predecessor.
+	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCarrierRetractionStage(bool analysisOnly);
 
 	// Carrier-retraction / constrained-witness front end (restored 6/13 path),
@@ -533,6 +537,15 @@ private:
 	// verification, so gA alone cannot tell them apart.  Evidence only; the
 	// suppression policy converts it at the consumption sites.
 	std::vector<float> regionSamePartner_flat;
+	// Schedule-illegal (alien) vertical partner evidence [0,1] per pixel: 1
+	// when a ±2 grammar-legal partner is ANTI-aligned at comparable magnitude
+	// after relation signing — raw-identical content where the carrier
+	// schedule demands inversion.  Legal carrier MUST invert per the lineFlip
+	// schedule; energy that fails the schedule is structurally not carrier
+	// and therefore luma by law (near-carrier periodic luma: the Borg-cube
+	// grid).  Evidence only; consumers convert (produceY seats retractedY,
+	// which keeps this energy as luma, without geometric corroboration).
+	std::vector<float> regionAlienPartner_flat;
 
 	// --- Carrier-retraction / constrained-witness buffers (restored from the
 	// 6/13 witness path).  Populated by buildCarrierRetracted() then
@@ -1095,6 +1108,16 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    regionSamePartner_flat.empty()) return nullptr;
 		return regionSamePartner_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* regionAlienPartner_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    regionAlienPartner_flat.empty()) return nullptr;
+		return regionAlienPartner_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* regionAlienPartner_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    regionAlienPartner_flat.empty()) return nullptr;
+		return regionAlienPartner_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline lddecode::CarrierAnalysisRecord* carrierAnalysis_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
