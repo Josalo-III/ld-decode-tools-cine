@@ -206,7 +206,49 @@ struct CarrierAnalysisRecord {
     float carrierImpurity = 0.0f;       // detector output, not transfer policy
     CarrierScheduleConformance scheduleConformance =
         CarrierScheduleConformance::Unresolved;
+    // Graded conformance MEASUREMENT (scanner layer).  carrierConformance in
+    // [-1,+1]: relation-signed correlation of carrier-band energy against
+    // grammar-certified Opposite partners.  -1 = inverts like ideal carrier;
+    // +1 = matches where the schedule demands inversion (luma by law).
+    // conformanceConfidence in [0,1] from the usable-axis count.  This is a
+    // fact of the table; the enum above is the legacy threshold view derived
+    // from it during migration.  What to DO with it is carrierTrust() +
+    // per-consumer action, never baked in here.
+    float carrierConformance = 0.0f;
+    float conformanceConfidence = 0.0f;
 };
+
+// Decision layer: the single table-owned mapping from the conformance
+// MEASUREMENT to a carrier-trust weight in [0,1].  Every consumer weights by
+// THIS function, so "how much do we trust this as carrier" is uniform; only
+// the action taken with the weight is the consumer's own (a fit weights its
+// least-squares, the interline stage weights its cancellation, the election
+// weights its admission).  Design:
+//   * conformance <= -kLegal  -> w ~ 1 (behaves like legal carrier)
+//   * conformance >= +kIllegal-> w ~ 0 (matches where inversion was demanded)
+//   * a smooth ramp between (no hard step: the fragile single-axis boundary
+//     that flipped verdicts at pixel pitch becomes a gentle slope)
+//   * low confidence pulls w toward the neutral wNeutral rather than letting a
+//     thin vote force either extreme (capped penalty, never an override).
+// Thresholding the legacy enum corresponds to carrierTrust crossing 0.5, so
+// this reduces to the old binary at the high-confidence extremes and only the
+// ambiguous middle changes.
+inline double carrierTrust(double conformance, double confidence)
+{
+    constexpr double kLegal = 0.5;      // conformance at which w reaches ~1
+    constexpr double kIllegal = 0.5;    // conformance at which w reaches ~0
+    constexpr double wNeutral = 0.5;    // trust with no discriminating evidence
+
+    // Smooth ramp from +kIllegal (w=0) down to -kLegal (w=1), centred at 0.
+    const double span = kLegal + kIllegal;
+    double t = (kIllegal - conformance) / (span > 1e-9 ? span : 1.0);
+    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    const double wFull = t * t * (3.0 - 2.0 * t); // smoothstep
+
+    // Confidence gates how far the evidence may pull away from neutral.
+    const double c = confidence < 0.0 ? 0.0 : (confidence > 1.0 ? 1.0 : confidence);
+    return wNeutral + c * (wFull - wNeutral);
+}
 
 struct CarrierResidualOption {
     double sample = 0.0;

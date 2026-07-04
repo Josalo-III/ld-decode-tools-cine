@@ -493,6 +493,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             demodTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DTI4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DTQ4fsc_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            smoothedLockedTI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            smoothedLockedTQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            smoothedLockedRowValid.assign(demodLines, std::uint8_t{0});
             lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);

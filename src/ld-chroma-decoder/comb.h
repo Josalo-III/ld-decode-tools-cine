@@ -333,6 +333,7 @@ public:
 	// run after shared analysis and the locked local-carrier construction.
 	void buildCarrierRetracted();
 	void buildConstrainedYWitness();
+
 	void lurchSharpenCoarsePrior(const double *means,
 	                             int meanCount,
 	                             int width,
@@ -480,6 +481,13 @@ private:
 		// window over this so three-region cedes (drop shadows) hold a
 		// uniform height instead of flickering column to column.
 		std::vector<std::uint8_t> intrafieldRegionCede;
+		// Per-pixel ±4 region verdicts (center vs ±4 same-field partner).
+		// Evaluated alongside the ±2 intrafieldRegionReach in
+		// buildCombTapLine; consumed by the contour influence gate so
+		// Field A's far-tap refinement refuses reaches across hue
+		// boundaries on diagonals.
+		std::vector<CombContentReach::RegionRelation> regionUp4;
+		std::vector<CombContentReach::RegionRelation> regionDown4;
 		std::vector<CombTapContour> contour;
 		std::vector<CombContentReach::MovingCoarseContour> movingCoarseContour;
 		std::vector<double> coarse0IRE;
@@ -518,6 +526,15 @@ private:
 	// Preserved 4fsc IQ from the locked 1D demod.
 	std::vector<float> locked1DTI4fsc_flat;
 	std::vector<float> locked1DTQ4fsc_flat;
+	// Per-line 7-tap smoothed signed-IQ rows, memoised for the region-reach
+	// evaluator.  smoothSignedIQ(line, rel) depends only on the line and rel,
+	// yet each line is referenced by up to five centers (self, +/-2, +/-4);
+	// caching computes it once per line instead of once per reference.
+	// Validity is cleared in invalidateCombTapCache() so the memo tracks the
+	// tap cache lifecycle (i.e. is as fresh as the locked demod it reads).
+	std::vector<float> smoothedLockedTI_flat;
+	std::vector<float> smoothedLockedTQ_flat;
+	std::vector<std::uint8_t> smoothedLockedRowValid;
 	// Product-scaled locked IQ prepared by splitIQLocked() for the output FIR.
 	// Later stages may refine this cache, but they should not overwrite demodTI/TQ.
 	std::vector<float> lockedProductI_flat;
@@ -552,10 +569,14 @@ private:
 	// buildConstrainedYWitness(); same geometry as the demod flats
 	// (demodLines x demodWidth).  carrierImpurity_flat above is shared with the
 	// current aperture detector and reused here. ---
-	std::vector<float> carrierFit_flat;          // per-line four-view carrier model
+	// Per-line four-view carrier model.  Source contract:
+	// CarrierFitScalar / BurstLockedSigned / PhasePreservedCarrier.  Any
+	// cross-line video use must go through CombReachIndex.
+	std::vector<float> carrierFit_flat;
 	std::vector<float> carrierRetracted_flat;    // raw - carrierFit (witness view, not Y)
 	std::vector<float> flatFloor_flat;           // 4-sample carrier-free luma floor
-	std::vector<float> combedCarrier_flat;       // interline-cancelled carrier fit
+	std::vector<float> combedCarrier_flat;       // grammar-reached interline carrier fit
+	std::vector<std::uint8_t> carrierEligible_flat; // schedule-conformance projection (1 = eligible)
 	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat; // per-pixel four-view evidence
 	bool carrierRetractedValid = false;
 	bool carrierRetractionModelValid = false;
@@ -930,6 +951,10 @@ private:
 	void invalidateCombTapCache();
 	const CombTapLine &ensureCombTapLine(int lineNumber);
 	void buildCombTapLine(int lineNumber, CombTapLine &tapLine);
+	// Fill the memoised 7-tap smoothed signed-IQ row for `line` if not yet
+	// current this frame.  No-op when the locked IQ / smoothed buffers are
+	// not sized (non-locked path).
+	void ensureSmoothedLockedRow(int line);
 	void computeFieldALine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  double  *outGate);
@@ -1068,6 +1093,12 @@ private:
 	}
 	inline const float* locked1DTQ4fsc_line(int line) const {
 		return locked1DTQ4fsc_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* smoothedLockedTI_line(int line) const {
+		return smoothedLockedTI_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* smoothedLockedTQ_line(int line) const {
+		return smoothedLockedTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* lockedProductI_line(int line) {
 		return lockedProductI_flat.data() + static_cast<size_t>(line) * demodWidth;

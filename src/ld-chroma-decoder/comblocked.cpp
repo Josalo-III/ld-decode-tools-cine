@@ -389,6 +389,17 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
         const double energyFloor = 4.0 * rmsFloor * rmsFloor;
         constexpr double kCorrVote = 0.5;
 
+        // --- Disposable schedule-conformance instrumentation (env-gated) ---
+        // Set LDCD_DUMP_CONFORMANCE=1 to print per-frame verdict statistics
+        // to stderr. Zero cost when unset. Remove with the rethink.
+        const bool dumpConf = std::getenv("LDCD_DUMP_CONFORMANCE") != nullptr;
+        long long cBelowFloor = 0, cUnres = 0, cLegal = 0, cIllegal = 0, cNoAxis = 0;
+        long long illBy[4]        = {0, 0, 0, 0}; // illegal grouped by illegal-axis-vote count (1..3)
+        long long illAmp[4]       = {0, 0, 0, 0}; // illegal grouped by per-sample RMS IRE bucket
+        long long usableAxisHist[4] = {0, 0, 0, 0};
+        long long strongTot = 0, strongLegal = 0, strongIllegal = 0, strongUnres = 0;
+        long long thirdTot[3] = {0, 0, 0}, thirdIll[3] = {0, 0, 0};
+
         for (int line = first; line < last; ++line) {
             lddecode::CarrierAnalysisRecord *analysis =
                 carrierAnalysis_line(line);
@@ -418,19 +429,28 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
             if (prevUsable)
                 addAxis(prevFrame->locked1DRawBandpass_line(line),
                         prevFrame->carrierGrammarLine(line));
-            if (nAxes == 0)
+            if (nAxes == 0) {
+                if (dumpConf)
+                    cNoAxis += width;
                 continue;
+            }
 
             for (int rel = 0; rel < width; ++rel) {
                 const int w0 = std::clamp(rel, 0, width - 4);
                 double e0 = 0.0;
                 for (int k = 0; k < 4; ++k)
                     e0 += bp0[w0 + k] * bp0[w0 + k];
-                if (e0 < energyFloor)
+                if (e0 < energyFloor) {
+                    if (dumpConf)
+                        ++cBelowFloor;
                     continue;
+                }
 
                 bool legalVote = false;
                 bool illegalVote = false;
+                int legalAxisVotes = 0, illegalAxisVotes = 0, usableAxes = 0;
+                double minCorr =  1e300;   // most-legal (negative) axis
+                double maxCorr = -1e300;   // most-illegal (positive) axis
                 for (int a = 0; a < nAxes; ++a) {
                     const double *bpP = axes[a];
                     double dot = 0.0;
@@ -441,11 +461,34 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                     }
                     if (eP < energyFloor)
                         continue;
+                    ++usableAxes;
                     const double corr = dot / std::sqrt(e0 * eP);
-                    if (corr <= -kCorrVote)
+                    minCorr = std::min(minCorr, corr);
+                    maxCorr = std::max(maxCorr, corr);
+                    if (corr <= -kCorrVote) {
                         legalVote = true;
-                    else if (corr >= kCorrVote)
+                        ++legalAxisVotes;
+                    } else if (corr >= kCorrVote) {
                         illegalVote = true;
+                        ++illegalAxisVotes;
+                    }
+                }
+
+                // Scanner layer (grammar-as-table): publish the graded
+                // MEASUREMENT, not a decision.  carrierConformance is the
+                // relation-signed correlation, biased to the most-legal axis
+                // when one inverts (real chroma is never disowned on the
+                // strength of a matching neighbour) and otherwise reporting
+                // the most-illegal evidence.  Thresholding it at -/+kCorrVote
+                // reproduces the legacy enum exactly; the trust POLICY that
+                // consumers weight by lives downstream in carrierTrust().
+                if (usableAxes > 0) {
+                    const double conformance = legalVote ? minCorr : maxCorr;
+                    analysis[rel].carrierConformance =
+                        static_cast<float>(std::clamp(conformance, -1.0, 1.0));
+                    analysis[rel].conformanceConfidence =
+                        static_cast<float>(std::min(1.0,
+                            static_cast<double>(usableAxes) / 3.0));
                 }
 
                 analysis[rel].scheduleConformance = legalVote
@@ -453,12 +496,79 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                     : illegalVote
                         ? lddecode::CarrierScheduleConformance::ScheduleIllegal
                         : lddecode::CarrierScheduleConformance::Unresolved;
+
+                if (dumpConf) {
+                    const double rmsIRE = std::sqrt(e0 * 0.25) * invIreScale;
+                    const int third = std::clamp(
+                        (line - first) * 3 / std::max(1, last - first), 0, 2);
+                    const bool strong = rmsIRE >= 10.0;
+                    ++thirdTot[third];
+                    ++usableAxisHist[std::clamp(usableAxes, 0, 3)];
+                    if (strong)
+                        ++strongTot;
+                    const auto verdict = analysis[rel].scheduleConformance;
+                    if (verdict == lddecode::CarrierScheduleConformance::LegalCarrier) {
+                        ++cLegal;
+                        if (strong)
+                            ++strongLegal;
+                    } else if (verdict ==
+                               lddecode::CarrierScheduleConformance::ScheduleIllegal) {
+                        ++cIllegal;
+                        ++thirdIll[third];
+                        if (strong)
+                            ++strongIllegal;
+                        ++illBy[std::clamp(illegalAxisVotes, 0, 3)];
+                        const int bkt = rmsIRE < 5.0 ? 0
+                                      : rmsIRE < 10.0 ? 1
+                                      : rmsIRE < 20.0 ? 2 : 3;
+                        ++illAmp[bkt];
+                    } else {
+                        ++cUnres;
+                        if (strong)
+                            ++strongUnres;
+                    }
+                }
             }
+        }
+
+        if (dumpConf) {
+            auto pct = [](long long a, long long b) {
+                return b > 0 ? 100.0 * static_cast<double>(a)
+                                     / static_cast<double>(b)
+                             : 0.0;
+            };
+            const long long tested = cLegal + cIllegal + cUnres;
+            std::fprintf(stderr,
+                "[CONF] lines=%d..%d tested=%lld legal=%lld(%.1f%%) "
+                "illegal=%lld(%.1f%%) unres=%lld(%.1f%%) belowFloor=%lld noAxisPix=%lld\n",
+                first, last, tested,
+                cLegal, pct(cLegal, tested),
+                cIllegal, pct(cIllegal, tested),
+                cUnres, pct(cUnres, tested),
+                cBelowFloor, cNoAxis);
+            std::fprintf(stderr,
+                "[CONF] illegal-by-axisvotes 1=%lld 2=%lld 3=%lld | "
+                "usableAxisHist a1=%lld a2=%lld a3=%lld\n",
+                illBy[1], illBy[2], illBy[3],
+                usableAxisHist[1], usableAxisHist[2], usableAxisHist[3]);
+            std::fprintf(stderr,
+                "[CONF] illegal-by-amp(IRE) <5=%lld 5-10=%lld 10-20=%lld >=20=%lld\n",
+                illAmp[0], illAmp[1], illAmp[2], illAmp[3]);
+            std::fprintf(stderr,
+                "[CONF] strong(>=10IRE) tot=%lld legal=%lld(%.1f%%) "
+                "illegal=%lld(%.1f%%) unres=%lld(%.1f%%)\n",
+                strongTot,
+                strongLegal, pct(strongLegal, strongTot),
+                strongIllegal, pct(strongIllegal, strongTot),
+                strongUnres, pct(strongUnres, strongTot));
+            std::fprintf(stderr,
+                "[CONF] illegal-by-third top=%.1f%% mid=%.1f%% bot=%.1f%%\n",
+                pct(thirdIll[0], thirdTot[0]),
+                pct(thirdIll[1], thirdTot[1]),
+                pct(thirdIll[2], thirdTot[2]));
         }
     }
 
-    if (configuration.lumaWitness)
-        buildCarrierRetractionStage(true);
 }
 
 void Comb::FrameBuffer::buildPhaseCorrected1D()
@@ -2511,19 +2621,16 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
 
 // Build the carrier-retracted view from the shared carrier model.
 //
-// buildCarrierAnalysis() first calls buildCarrierRetractionStage(true), which
-// performs the expensive per-line model pass before any render client runs:
-//   1. Four-view carrier/Y attribution on legal 4fSC luma floors
-//      → carrierFit_flat; gated LS can refit contaminated luma edges.
-//   2. Provisional raw - carrierFit stays line-local; its sliding 4-sample
-//      floor is retained only to gate the cross-line carrier reach.
+// The locked orchestration is intentionally single-pass here:
+//   1. buildCarrierAnalysis() harvests canonical bandpass and schedule
+//      conformance data.
+//   2. buildPhaseCorrected1D() builds the corrected 1D baseline.
+//   3. buildCarrierRetracted() calls buildCarrierRetractionStage(false)
+//      once, after the corrected 1D baseline exists.
 //
-// This application wrapper later calls buildCarrierRetractionStage(false).
-// The valid shared model is reused rather than recomputed, then:
-//   3. Line-to-line cancellation on carrierFit → combedCarrier_flat
-//      Real chroma inverts between opposite-phase lines, alien-Y doesn't.
-//      combedCarrier preserves chroma and rejects alien-Y.
-//   4. raw - combedCarrier → carrierRetracted_flat (flattened view)
+// buildCarrierRetractionStage() then performs four-view carrier/Y attribution,
+// line-to-line cancellation on carrierFit, and raw - combedCarrier to produce
+// the flattened carrier-retracted view.
 void Comb::FrameBuffer::buildCarrierRetracted()
 {
     buildCarrierRetractionStage(false);
@@ -2576,12 +2683,23 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         flatFloor_flat.assign(need, 0.0f);
     if (combedCarrier_flat.size() < need)
         combedCarrier_flat.assign(need, 0.0f);
+    if (carrierEligible_flat.size() < need)
+        carrierEligible_flat.assign(need, std::uint8_t{0});
     if (coarseYEvidence_flat.size() < need)
         coarseYEvidence_flat.assign(need, lddecode::FourViewPixelEvidence{});
     if (carrierImpurity_flat.size() < need)
         carrierImpurity_flat.assign(need, 0.0f);
     if (carrierAnalysis_flat.size() < need)
         return; // shared analysis must already have been produced
+
+    // --- Disposable dead-zone instrumentation (env-gated). Set
+    // LDCD_DUMP_DEADZONE=1 to print the amplified footprint of the schedule
+    // DQ downstream: how many pixels lose their carrier estimate, split by
+    // cause. Zero cost when unset. Remove with the rethink. ---
+    const bool dumpDead = std::getenv("LDCD_DUMP_DEADZONE") != nullptr;
+    long long dzActive = 0, dzIneligible = 0;
+    long long dzDead = 0, dzDeadIllegal = 0, dzDeadFitStarved = 0;
+    long long dzWinTotal = 0, dzWinInvalid = 0, dzWinRank = 0, dzWinDet = 0;
 
     if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
@@ -2611,6 +2729,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     std::vector<double> winLatticeIRE;
     std::vector<double> winYSpanIRE;
     std::vector<double> winScore;
+    std::vector<std::uint8_t> winFitValid;
     std::vector<std::uint8_t> boundaryMark;
 
     auto median3 = [](double a, double b, double c) -> double {
@@ -2680,6 +2799,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         // rather than by subtracting a complement-estimated C and trusting whatever
         // remains as Y.
         // ---------------------------------------------------------------
+
     for (int line = firstLine; line < lastLine; ++line) {
         float *fitRow       = carrierFit_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
@@ -2689,6 +2809,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                               + static_cast<size_t>(line) * demodWidth;
         auto *parallaxRow   = scratch_carrierParallax.data();
         auto *analysisRow   = carrierAnalysis_flat.data()
+                              + static_cast<size_t>(line) * demodWidth;
+        auto *eligibleRow   = carrierEligible_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
 
         std::fill(evidenceRow, evidenceRow + width, lddecode::FourViewPixelEvidence{});
@@ -2769,6 +2891,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 winLatticeIRE.resize(meanCount, 0.0);
                 winYSpanIRE.resize(meanCount, 0.0);
                 winScore.resize(meanCount, 0.0);
+                winFitValid.resize(meanCount, std::uint8_t{0});
             }
             if ((int)boundaryMark.size() < width)
                 boundaryMark.resize(width, 0);
@@ -2800,6 +2923,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             for (int s = 0; s < meanCount; ++s) {
                 double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
                 double sIY = 0.0, sQY = 0.0;
+                int carrierSampleCount = 0;
 
                 double refinedMean = 0.0;
                 double minRefined = 1e300;
@@ -2807,28 +2931,32 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 
                 for (int k = 0; k < 4; ++k) {
                     const int xi = s + k;
+                    refinedMean += refinedY[xi];
+                    minRefined = std::min(minRefined, refinedY[xi]);
+                    maxRefined = std::max(maxRefined, refinedY[xi]);
+
+                    // Registration rejection is a DQ, not a zero-valued
+                    // carrier observation.  A zero target would still enter
+                    // the normal matrix and attenuate the legal samples in a
+                    // mixed window.  Remove the sample from both sides of the
+                    // solve; support/rank below decides whether enough
+                    // independent carrier phases remain to solve and grade.
+                    if (analysisRow[xi].scheduleConformance ==
+                        lddecode::CarrierScheduleConformance::ScheduleIllegal)
+                    {
+                        continue;
+                    }
+
                     const double bI = basisI[xi];
                     const double bQ = basisQ[xi];
-
-                    // Evaluation in table context: ScheduleIllegal energy
-                    // was registered as luma at analysis time, so the
-                    // carrier fit never sees it — the model cannot chase a
-                    // grid the schedule already refused.
-                    const double residual =
-                        (analysisRow[xi].scheduleConformance ==
-                         lddecode::CarrierScheduleConformance::ScheduleIllegal)
-                            ? 0.0
-                            : rawWhole[xi] - refinedY[xi];
+                    const double residual = rawWhole[xi] - refinedY[xi];
 
                     sII += bI * bI;
                     sIQ += bI * bQ;
                     sQQ += bQ * bQ;
                     sIY += bI * residual;
                     sQY += bQ * residual;
-
-                    refinedMean += refinedY[xi];
-                    minRefined = std::min(minRefined, refinedY[xi]);
-                    maxRefined = std::max(maxRefined, refinedY[xi]);
+                    ++carrierSampleCount;
                 }
 
                 refinedMean *= 0.25;
@@ -2836,7 +2964,9 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 double fitI = 0.0;
                 double fitQ = 0.0;
                 const double det = sII * sQQ - sIQ * sIQ;
-                if (std::fabs(det) > 1e-9) {
+                const bool fitValid =
+                    carrierSampleCount >= 3 && std::fabs(det) > 1e-9;
+                if (fitValid) {
                     const double inv = 1.0 / det;
                     fitI = ( sQQ * sIY - sIQ * sQY) * inv;
                     fitQ = (-sIQ * sIY + sII * sQY) * inv;
@@ -2844,31 +2974,44 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 
                 winI[s] = fitI;
                 winQ[s] = fitQ;
+                winFitValid[s] = fitValid ? std::uint8_t{1} : std::uint8_t{0};
+
+                if (dumpDead) {
+                    ++dzWinTotal;
+                    if (!fitValid) {
+                        ++dzWinInvalid;
+                        if (carrierSampleCount < 3)
+                            ++dzWinRank;   // killed by illegal-sample removal
+                        else
+                            ++dzWinDet;    // killed by singular normal matrix
+                    }
+                }
 
                 double errSq = 0.0;
                 double basis01 = 0.0; // +-+-
                 double basis02 = 0.0; // ++--
                 double basis03 = 0.0; // +--+
                 double fitAbs = 0.0;
+                int gradedSampleCount = 0;
 
                 for (int k = 0; k < 4; ++k) {
                     const int xi = s + k;
+                    if (analysisRow[xi].scheduleConformance ==
+                        lddecode::CarrierScheduleConformance::ScheduleIllegal)
+                    {
+                        continue;
+                    }
+
                     const double bI = basisI[xi];
                     const double bQ = basisQ[xi];
 
                     const double fit = fitI * bI + fitQ * bQ;
-                    // Same table-context exclusion as the LS input above,
-                    // so the error/lattice metrics grade the fit against
-                    // the legal energy it was actually asked to explain.
-                    const double residual =
-                        (analysisRow[xi].scheduleConformance ==
-                         lddecode::CarrierScheduleConformance::ScheduleIllegal)
-                            ? 0.0
-                            : rawWhole[xi] - refinedY[xi];
+                    const double residual = rawWhole[xi] - refinedY[xi];
                     const double e = residual - fit;
 
                     errSq += e * e;
                     fitAbs += std::fabs(fit);
+                    ++gradedSampleCount;
 
                     if (k == 0) {
                         basis01 += e;
@@ -2889,17 +3032,21 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     }
                 }
 
-                const double errIRE = std::sqrt(0.25 * errSq) * invIreScale;
+                const double gradeInv = gradedSampleCount > 0
+                    ? 1.0 / static_cast<double>(gradedSampleCount)
+                    : 0.0;
+                const double errIRE =
+                    std::sqrt(gradeInv * errSq) * invIreScale;
                 const double latticeIRE =
-                    0.25 * std::max({std::fabs(basis01),
-                                     std::fabs(basis02),
-                                     std::fabs(basis03)}) * invIreScale;
+                    gradeInv * std::max({std::fabs(basis01),
+                                         std::fabs(basis02),
+                                         std::fabs(basis03)}) * invIreScale;
                 const double floorDriftIRE =
                     std::fabs(winFloor[s] - refinedMean) * invIreScale;
                 const double ySpanIRE =
                     (maxRefined - minRefined) * invIreScale;
                 const double ampIRE =
-                    0.25 * fitAbs * invIreScale;
+                    gradeInv * fitAbs * invIreScale;
 
                 winErrorIRE[s] = errIRE;
                 winLatticeIRE[s] = latticeIRE;
@@ -2944,6 +3091,11 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     const int srr = sr + 4;
                     if (srr >= meanCount)
                         break;
+                    if (!winFitValid[sl] || !winFitValid[sr] ||
+                        !winFitValid[sll] || !winFitValid[srr])
+                    {
+                        continue;
+                    }
                     const double dI = winI[sr] - winI[sl];
                     const double dQ = winQ[sr] - winQ[sl];
                     const double step = std::sqrt(dI * dI + dQ * dQ);
@@ -2971,6 +3123,11 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 
                 lddecode::FourViewCarrierView views[4];
                 int viewCount = 0;
+                const bool sampleCarrierEligible =
+                    analysisRow[xi].scheduleConformance !=
+                    lddecode::CarrierScheduleConformance::ScheduleIllegal;
+                eligibleRow[xi] = sampleCarrierEligible ? std::uint8_t{1}
+                                                        : std::uint8_t{0};
 
                 // Region-pure aperture law: a window straddling a
                 // discovered chroma boundary is not evidence for any pixel.
@@ -2989,10 +3146,14 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     return false;
                 };
 
-                for (int pass = 0; pass < 2 && viewCount == 0; ++pass) {
+                for (int pass = 0;
+                     sampleCarrierEligible && pass < 2 && viewCount == 0;
+                     ++pass) {
                 for (int s = sFirst; s <= sLast; ++s) {
                     if (viewCount >= 4)
                         break;
+                    if (!winFitValid[s])
+                        continue;
                     if (pass == 0 && windowStraddles(s))
                         continue;
                     const double carrierSample = rawWhole[xi] - winFloor[s];
@@ -3040,6 +3201,23 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 }  // pass: region-pure first, unfiltered fallback
 
                 evidenceRow[xi].viewCount = viewCount;
+
+                if (dumpDead) {
+                    ++dzActive;
+                    if (!sampleCarrierEligible)
+                        ++dzIneligible;
+                    if (viewCount == 0) {
+                        ++dzDead;
+                        // For an eligible pixel, pass 1 harvests any covering
+                        // winFitValid window, so viewCount==0 there means the
+                        // fit was starved (no covering window survived rank/det).
+                        if (!sampleCarrierEligible)
+                            ++dzDeadIllegal;
+                        else
+                            ++dzDeadFitStarved;
+                    }
+                }
+
                 for (int v = 0; v < viewCount; ++v) {
                     auto &dst = evidenceRow[xi].views[v];
                     const auto &src = views[v];
@@ -3208,6 +3386,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 const auto &sharedResidual = analysisRow[xi].residual;
                 const int sharedSurvivors = sharedResidual.survivorCount();
                 const bool sharedUseful =
+                    sampleCarrierEligible &&
                     sharedResidual.valid &&
                     sharedSurvivors > 0 &&
                     sharedSurvivors < sharedResidual.optionCount &&
@@ -3476,6 +3655,9 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     // new estimate — so 1D source authority is unchanged.  Deltas are
     // sparse and zero elsewhere.
     // ---------------------------------------------------------------
+    const lddecode::CombReachSourceFrame carrierFitSource =
+        lddecode::makeCarrierFitScalarReachSource();
+
     for (int line = firstLine; line < lastLine; ++line) {
         const float *deltaRow = locked1DParallaxRepairDelta_line(line);
         if (!deltaRow)
@@ -3523,10 +3705,21 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         const CombCarrierGrammar *gBelow =
             (lineBelow < lastLine) ? carrierGrammarLine(lineBelow) : nullptr;
 
-        const bool haveAbove = gAbove && gAbove->grammarLocked &&
-            (gAbove->lineFlip != grammar->lineFlip);
-        const bool haveBelow = gBelow && gBelow->grammarLocked &&
-            (gBelow->lineFlip != grammar->lineFlip);
+        auto legalOppositeCarrierFitReach = [&](int targetLine,
+                                                const CombCarrierGrammar *target) {
+            if (!target || !target->grammarLocked)
+                return false;
+            const lddecode::CombReachReply reach = combReachIndex.query(
+                {line, targetLine, left, left,
+                 lddecode::CombReachUse::FrameScalarCancel,
+                 carrierFitSource});
+            return reach.allowScalarCancel && reach.mayBecomeVideo &&
+                   reach.carrierRelation ==
+                       lddecode::CarrierPhaseRelation::Opposite;
+        };
+
+        const bool haveAbove = legalOppositeCarrierFitReach(lineAbove, gAbove);
+        const bool haveBelow = legalOppositeCarrierFitReach(lineBelow, gBelow);
 
         const float *fitAbove = haveAbove
             ? (carrierFit_flat.data() + static_cast<size_t>(lineAbove) * demodWidth)
@@ -3540,6 +3733,16 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         const float *floorBelow = haveBelow
             ? (flatFloor_flat.data() + static_cast<size_t>(lineBelow) * demodWidth)
             : nullptr;
+        const std::uint8_t *eligRow =
+            carrierEligible_flat.data() + static_cast<size_t>(line) * demodWidth;
+        const std::uint8_t *eligAbove = haveAbove
+            ? (carrierEligible_flat.data() +
+               static_cast<size_t>(lineAbove) * demodWidth)
+            : nullptr;
+        const std::uint8_t *eligBelow = haveBelow
+            ? (carrierEligible_flat.data() +
+               static_cast<size_t>(lineBelow) * demodWidth)
+            : nullptr;
 
         // Reach gate: determines per-pixel cancellation strength toward
         // each neighbor line.  Inlined here (was a lambda) to keep the
@@ -3549,21 +3752,32 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         // envelopes, never instantaneous samples: |fit + neighbor| dips to
         // zero twice per carrier cycle, so a per-sample gate oscillates at
         // carrier rate.  On slanted chroma (~2 px/line drift = 180° carrier
-        // rotation per line) the opposite-lineFlip neighbor presents
+        // rotation per line) the grammar-Opposite neighbor presents
         // SAME-SIGN chroma; the envelope gate sees a constant 2A mismatch
         // and stands the cancellation down consistently, where the
         // per-sample gate cancelled real chroma in carrier-rate bursts —
         // a checkerboard manufactured inside combedCarrier itself.
         auto reachGate = [&](int xi, const float *neighborFit,
-                             const float *neighborFloor) {
-            if (!neighborFit || !neighborFloor)
+                             const float *neighborFloor,
+                             const std::uint8_t *neighborElig) {
+            if (!neighborFit || !neighborFloor || !neighborElig)
+                return 0.0;
+            if (!eligRow[xi] || !neighborElig[xi])
                 return 0.0;
 
             const double lumaDiffIRE =
                 std::fabs(static_cast<double>(floorRow[xi]) -
                           static_cast<double>(neighborFloor[xi])) * invIreScale;
 
-            const int xj = std::min(xi + 1, width - 1);
+            auto pairEligibleAt = [&](int x) {
+                return x >= 0 && x < width &&
+                    eligRow[x] && neighborElig[x];
+            };
+            int xj = xi + 1;
+            if (!pairEligibleAt(xj))
+                xj = xi - 1;
+            if (!pairEligibleAt(xj))
+                return 0.0;
             const double c0 = static_cast<double>(fitRow[xi]);
             const double c1 = static_cast<double>(fitRow[xj]);
             const double n0 = static_cast<double>(neighborFit[xi]);
@@ -3613,9 +3827,13 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         // can read ±2 neighbors.
         for (int xi = 0; xi < width; ++xi) {
             wAboveRaw[xi] =
-                haveAbove ? reachGate(xi, fitAbove, floorAbove) : 0.0;
+                haveAbove
+                    ? reachGate(xi, fitAbove, floorAbove, eligAbove)
+                    : 0.0;
             wBelowRaw[xi] =
-                haveBelow ? reachGate(xi, fitBelow, floorBelow) : 0.0;
+                haveBelow
+                    ? reachGate(xi, fitBelow, floorBelow, eligBelow)
+                    : 0.0;
         }
 
         // Pass B: inline 5-tap smooth + decision blend + combRow output.
@@ -3624,6 +3842,15 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         constexpr double kWeights[5] = {1.0, 2.0, 3.0, 2.0, 1.0};
 
         for (int xi = 0; xi < width; ++xi) {
+            // A refused center sample owns no carrier column.  Keep the DQ
+            // explicit at the interline publication boundary as well as in
+            // the fit, so smoothing of neighboring reach gates cannot give
+            // it a route back into video.
+            if (!eligRow[xi]) {
+                combRow[xi] = 0.0f;
+                continue;
+            }
+
             // Inline 5-tap smooth of the raw gate arrays.
             double sumW = 0.0, sumAbove = 0.0, sumBelow = 0.0;
             for (int dx = -2; dx <= 2; ++dx) {
@@ -3639,26 +3866,36 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             // Inline localCarrierAmpIRE + decision blend.
             const int xm = std::max(0, xi - 1);
             const int xp = std::min(width - 1, xi + 1);
-            double amp = std::fabs(static_cast<double>(fitRow[xi]));
-            amp = std::max(amp, std::fabs(static_cast<double>(fitRow[xm])));
-            amp = std::max(amp, std::fabs(static_cast<double>(fitRow[xp])));
-            if (fitAbove) {
-                amp = std::max(amp, std::fabs(static_cast<double>(fitAbove[xi])));
-                amp = std::max(amp, std::fabs(static_cast<double>(fitAbove[xm])));
-                amp = std::max(amp, std::fabs(static_cast<double>(fitAbove[xp])));
-            }
-            if (fitBelow) {
-                amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xi])));
-                amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xm])));
-                amp = std::max(amp, std::fabs(static_cast<double>(fitBelow[xp])));
-            }
+            double amp = 0.0;
+            auto includeRegisteredAmp = [&](const float *fit,
+                                            const std::uint8_t *elig,
+                                            int x) {
+                if (fit && elig && elig[x])
+                    amp = std::max(amp, std::fabs(static_cast<double>(fit[x])));
+            };
+            includeRegisteredAmp(fitRow, eligRow, xi);
+            includeRegisteredAmp(fitRow, eligRow, xm);
+            includeRegisteredAmp(fitRow, eligRow, xp);
+            includeRegisteredAmp(fitAbove, eligAbove, xi);
+            includeRegisteredAmp(fitAbove, eligAbove, xm);
+            includeRegisteredAmp(fitAbove, eligAbove, xp);
+            includeRegisteredAmp(fitBelow, eligBelow, xi);
+            includeRegisteredAmp(fitBelow, eligBelow, xm);
+            includeRegisteredAmp(fitBelow, eligBelow, xp);
             const double blend = smoothStep01((amp * invIreScale - 8.0) / 10.0);
 
             // Final gated cancellation.
-            const double wAbove =
-                wAboveRaw[xi] * (1.0 - blend) + smoothAbove * blend;
-            const double wBelow =
-                wBelowRaw[xi] * (1.0 - blend) + smoothBelow * blend;
+            // Do not let the horizontal gate smoother cross a per-pixel DQ
+            // on the partner row.  The smooth value is only usable where the
+            // exact partner sample remains registered as carrier-capable.
+            const bool aboveEligible = eligAbove && eligAbove[xi];
+            const bool belowEligible = eligBelow && eligBelow[xi];
+            const double wAbove = aboveEligible
+                ? wAboveRaw[xi] * (1.0 - blend) + smoothAbove * blend
+                : 0.0;
+            const double wBelow = belowEligible
+                ? wBelowRaw[xi] * (1.0 - blend) + smoothBelow * blend
+                : 0.0;
             const double wSum = wAbove + wBelow;
 
             if (wSum > 1e-9) {
@@ -3709,4 +3946,27 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     }
 
     carrierRetractedValid = true;
+
+    if (dumpDead) {
+        auto pct = [](long long a, long long b) {
+            return b > 0 ? 100.0 * static_cast<double>(a)
+                                 / static_cast<double>(b)
+                         : 0.0;
+        };
+        std::fprintf(stderr,
+            "[DEAD] active=%lld ineligible(illegal)=%lld(%.1f%%) "
+            "dead(viewCount==0)=%lld(%.1f%%) [illegal=%lld fitStarved=%lld]\n",
+            dzActive,
+            dzIneligible, pct(dzIneligible, dzActive),
+            dzDead, pct(dzDead, dzActive),
+            dzDeadIllegal, dzDeadFitStarved);
+        std::fprintf(stderr,
+            "[DEAD] windows=%lld invalid=%lld(%.1f%%) [rank(illegal)=%lld det=%lld] "
+            "amplification dead/illegal=%.2fx\n",
+            dzWinTotal, dzWinInvalid, pct(dzWinInvalid, dzWinTotal),
+            dzWinRank, dzWinDet,
+            dzIneligible > 0 ? static_cast<double>(dzDead)
+                                   / static_cast<double>(dzIneligible)
+                             : 0.0);
+    }
 }

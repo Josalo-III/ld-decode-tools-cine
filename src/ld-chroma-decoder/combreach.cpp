@@ -67,6 +67,12 @@ bool scalarUse(CombReachUse use)
            use == CombReachUse::ScalarMagnitudeCompare;
 }
 
+bool frameScalarUse(CombReachUse use)
+{
+    return use == CombReachUse::FrameScalarAverage ||
+           use == CombReachUse::FrameScalarCancel;
+}
+
 bool iqUse(CombReachUse use)
 {
     return use == CombReachUse::IQCompare ||
@@ -106,6 +112,17 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
 
     if (request.source.signalClass != CombReachSignalClass::PhasePreservedCarrier)
         return blockedReply(request, "signal-class-unknown");
+
+    // Frame scalar reach crosses the two interleaved fields.  The carrier
+    // relation can still be arithmetically Same/Opposite at an edit split,
+    // but the frame is not a legal vertical source there.  Keep that schedule
+    // authority inside the reach translator instead of making each consumer
+    // remember a second private gate.
+    if (frameScalarUse(request.use) &&
+        (!center->frameVerticalAllowed || !target->frameVerticalAllowed))
+    {
+        return blockedReply(request, "frame-vertical-blocked");
+    }
 
     CombReachReply reply;
     reply.valid = true;
@@ -236,6 +253,20 @@ CombReachSourceFrame makeLocked1DScalarReachSource()
     source.signalClass = CombReachSignalClass::PhasePreservedCarrier;
     source.scalarCarrier = true;
     source.tag = "locked-1d-scalar";
+    return source;
+}
+
+// Four-view carrierFit is a scalar remodulation in the measured burst-locked
+// composite frame.  It preserves physical carrier polarity and may become
+// video only through grammar-authorized scalar reach.
+CombReachSourceFrame makeCarrierFitScalarReachSource()
+{
+    CombReachSourceFrame source;
+    source.kind = CombReachSourceKind::CarrierFitScalar;
+    source.signFrame = CarrierSignFrame::BurstLockedSigned;
+    source.signalClass = CombReachSignalClass::PhasePreservedCarrier;
+    source.scalarCarrier = true;
+    source.tag = "carrier-fit-scalar";
     return source;
 }
 

@@ -78,6 +78,51 @@ void Comb::FrameBuffer::invalidateCombTapCache()
         tapLine.cacheLine = -1;
         tapLine.builtFlags = 0;
     }
+    // The memoised smoothed signed-IQ rows read the locked demod, which is
+    // rebuilt per frame; clear their validity in lockstep with the tap cache.
+    std::fill(smoothedLockedRowValid.begin(),
+              smoothedLockedRowValid.end(),
+              std::uint8_t{0});
+}
+
+// Fill the 7-tap smoothed signed-IQ row for `line` once per frame.  The
+// balanced end-weighted aperture (0.5,1,1,1,1,1,0.5) equalises the two carrier
+// axis sums (3:3) and keeps the vector phase-flat; the /3.0 normalisation is
+// carried verbatim from the previous inline evaluator so the region verdicts
+// are unchanged.
+void Comb::FrameBuffer::ensureSmoothedLockedRow(int line)
+{
+    if (line < 0 || line >= demodLines)
+        return;
+    if ((int)smoothedLockedRowValid.size() != demodLines)
+        return; // non-locked path: buffers not sized
+    if (smoothedLockedRowValid[line])
+        return;
+
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    if (width <= 0)
+        return;
+
+    const float *iRow = locked1DTI4fsc_line(line);
+    const float *qRow = locked1DTQ4fsc_line(line);
+    float *sI = smoothedLockedTI_flat.data() + static_cast<size_t>(line) * demodWidth;
+    float *sQ = smoothedLockedTQ_flat.data() + static_cast<size_t>(line) * demodWidth;
+
+    static constexpr double w[7] = {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
+    for (int rel = 0; rel < width; ++rel) {
+        double si = 0.0;
+        double sq = 0.0;
+        for (int k = -3; k <= 3; ++k) {
+            const int rk = reflectCombRel(rel + k, width);
+            si += w[k + 3] * static_cast<double>(iRow[rk]);
+            sq += w[k + 3] * static_cast<double>(qRow[rk]);
+        }
+        sI[rel] = static_cast<float>(si / 3.0);
+        sQ[rel] = static_cast<float>(sq / 3.0);
+    }
+    smoothedLockedRowValid[line] = std::uint8_t{1};
 }
 
 const Comb::FrameBuffer::CombTapLine &Comb::FrameBuffer::ensureCombTapLine(int lineNumber)
@@ -162,6 +207,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.pairD2);
         ensureWidth(tapLine.intrafieldRegionReach);
         ensureWidth(tapLine.intrafieldRegionCede);
+        ensureWidth(tapLine.regionUp4);
+        ensureWidth(tapLine.regionDown4);
     }
 
     if (wantContour) {
@@ -398,6 +445,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         std::fill(tapLine.intrafieldRegionCede.begin(),
                   tapLine.intrafieldRegionCede.end(),
                   std::uint8_t{0});
+        std::fill(tapLine.regionUp4.begin(),
+                  tapLine.regionUp4.end(),
+                  CombContentReach::RegionRelation::Unknown);
+        std::fill(tapLine.regionDown4.begin(),
+                  tapLine.regionDown4.end(),
+                  CombContentReach::RegionRelation::Unknown);
 
         const size_t iqCount =
             static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
@@ -411,6 +464,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             locked1DTQ4fsc_flat.size() >= iqCount;
 
         if (haveSignedIQ) {
+            // ±2 grammar reach (hoisted per line).
             const lddecode::CombReachReply upReach = combReachIndex.query(
                 {lineNumber, tapLine.lnU2, left, left,
                  lddecode::CombReachUse::IQCompare, iqSource});
@@ -418,45 +472,91 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 {lineNumber, tapLine.lnD2, left, left,
                  lddecode::CombReachUse::IQCompare, iqSource});
 
-            const float *i0 = locked1DTI4fsc_line(tapLine.ln0);
-            const float *q0 = locked1DTQ4fsc_line(tapLine.ln0);
-            const float *iUp = locked1DTI4fsc_line(tapLine.lnU2);
-            const float *qUp = locked1DTQ4fsc_line(tapLine.lnU2);
-            const float *iDown = locked1DTI4fsc_line(tapLine.lnD2);
-            const float *qDown = locked1DTQ4fsc_line(tapLine.lnD2);
+            // Balanced 7-tap horizontal aggregate, memoised per line.  Even
+            // offsets carry one carrier axis and odd offsets the other, so the
+            // 0.5 end weights equalize the axis sums (3:3) and keep the vector
+            // phase-flat.  The narrow 3-tap vector was noise-limited in
+            // low-saturation skin (hue sigma ~25 deg), so the verdicts
+            // flickered at pixel pitch and one-sided combing toggled column to
+            // column — the beaded fringe on garment edges.  Each line's
+            // smoothed row is computed once (ensureSmoothedLockedRow) and
+            // reused by every center that references it as a ±2/±4 partner.
+            ensureSmoothedLockedRow(tapLine.ln0);
+            ensureSmoothedLockedRow(tapLine.lnU2);
+            ensureSmoothedLockedRow(tapLine.lnD2);
+            const float *sI0  = smoothedLockedTI_line(tapLine.ln0);
+            const float *sQ0  = smoothedLockedTQ_line(tapLine.ln0);
+            const float *sIUp = smoothedLockedTI_line(tapLine.lnU2);
+            const float *sQUp = smoothedLockedTQ_line(tapLine.lnU2);
+            const float *sIDn = smoothedLockedTI_line(tapLine.lnD2);
+            const float *sQDn = smoothedLockedTQ_line(tapLine.lnD2);
+
+            // ±4 grammar reach and smoothed rows for contour-influence gating.
+            const bool have4IQ =
+                tapLine.lnU4 >= 0 && tapLine.lnU4 < demodLines &&
+                tapLine.lnD4 >= 0 && tapLine.lnD4 < demodLines;
+            lddecode::CombReachReply up4Reach, dn4Reach;
+            bool haveUp4 = false, haveDn4 = false;
+            const float *sIUp4 = nullptr, *sQUp4 = nullptr;
+            const float *sIDn4 = nullptr, *sQDn4 = nullptr;
+            if (have4IQ && tapLine.haveU4) {
+                up4Reach = combReachIndex.query(
+                    {lineNumber, tapLine.lnU4, left, left,
+                     lddecode::CombReachUse::IQCompare, iqSource});
+                if (up4Reach.allowIQCompare) {
+                    ensureSmoothedLockedRow(tapLine.lnU4);
+                    sIUp4 = smoothedLockedTI_line(tapLine.lnU4);
+                    sQUp4 = smoothedLockedTQ_line(tapLine.lnU4);
+                    haveUp4 = true;
+                }
+            }
+            if (have4IQ && tapLine.haveD4) {
+                dn4Reach = combReachIndex.query(
+                    {lineNumber, tapLine.lnD4, left, left,
+                     lddecode::CombReachUse::IQCompare, iqSource});
+                if (dn4Reach.allowIQCompare) {
+                    ensureSmoothedLockedRow(tapLine.lnD4);
+                    sIDn4 = smoothedLockedTI_line(tapLine.lnD4);
+                    sQDn4 = smoothedLockedTQ_line(tapLine.lnD4);
+                    haveDn4 = true;
+                }
+            }
+            const bool want4Region = (haveUp4 || haveDn4);
 
             for (int rel = 0; rel < width; ++rel) {
-                // Balanced 7-tap horizontal aggregate.  Even offsets carry
-                // one carrier axis and odd offsets the other, so the 0.5 end
-                // weights equalize the axis sums (3:3) and keep the vector
-                // phase-flat.  The narrow 3-tap vector was noise-limited in
-                // low-saturation skin (hue sigma ~25 deg), so the verdicts
-                // flickered at pixel pitch and one-sided combing toggled
-                // column to column — the beaded fringe on garment edges.
-                auto smoothSignedIQ = [&](const float *iRow, const float *qRow) {
-                    static constexpr double w[7] =
-                        {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
-                    double si = 0.0;
-                    double sq = 0.0;
-                    for (int k = -3; k <= 3; ++k) {
-                        const int rk = reflectCombRel(rel + k, width);
-                        si += w[k + 3] * static_cast<double>(iRow[rk]);
-                        sq += w[k + 3] * static_cast<double>(qRow[rk]);
-                    }
-                    return std::complex<double>(si / 3.0, sq / 3.0);
-                };
+                const std::complex<double> z0(sI0[rel], sQ0[rel]);
 
                 tapLine.intrafieldRegionReach[rel] =
                     CombContentReach::evaluateIntrafieldRegionReach(
-                        smoothSignedIQ(i0, q0),
-                        smoothSignedIQ(iUp, qUp),
-                        smoothSignedIQ(iDown, qDown),
+                        z0,
+                        std::complex<double>(sIUp[rel], sQUp[rel]),
+                        std::complex<double>(sIDn[rel], sQDn[rel]),
                         upReach.carrierRelation,
                         downReach.carrierRelation,
                         upReach.allowIQCompare,
                         downReach.allowIQCompare,
                         invI,
                         5.0);
+
+                if (want4Region) {
+                    const auto region4 =
+                        CombContentReach::evaluateIntrafieldRegionReach(
+                            z0,
+                            haveUp4
+                                ? std::complex<double>(sIUp4[rel], sQUp4[rel])
+                                : std::complex<double>(0.0, 0.0),
+                            haveDn4
+                                ? std::complex<double>(sIDn4[rel], sQDn4[rel])
+                                : std::complex<double>(0.0, 0.0),
+                            up4Reach.carrierRelation,
+                            dn4Reach.carrierRelation,
+                            haveUp4,
+                            haveDn4,
+                            invI,
+                            5.0);
+                    tapLine.regionUp4[rel] = region4.up;
+                    tapLine.regionDown4[rel] = region4.down;
+                }
             }
 
             // Raw no-valid-partner cede flag: a Different leg with no
@@ -680,6 +780,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             combSimilarityFactor(c.upSim, simStart, simFull);
             c.dnInfluence = farInf * c.dnTrust *
                             combSimilarityFactor(c.dnSim, simStart, simFull);
+
+            if (tapLine.regionUp4[rel] == CombContentReach::RegionRelation::DifferentRegion)
+                c.upInfluence = 0.0;
+            if (tapLine.regionDown4[rel] == CombContentReach::RegionRelation::DifferentRegion)
+                c.dnInfluence = 0.0;
 
             outContour[rel] = c;
 

@@ -58,6 +58,7 @@ enum class CombReachSourceKind {
     Bucket1DScalar,
     LockedScalar,
     Locked1DScalar,
+    CarrierFitScalar,
     Grid4fscIQ,
     BurstLockedIQ,
     CarrierFreeY,
@@ -158,6 +159,7 @@ private:
 
 CombReachSourceFrame makeBucketScalarReachSource();
 CombReachSourceFrame makeLocked1DScalarReachSource();
+CombReachSourceFrame makeCarrierFitScalarReachSource();
 CombReachSourceFrame makeGrid4fscIQReachSource();
 
 } // namespace lddecode
