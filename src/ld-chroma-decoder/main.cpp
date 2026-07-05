@@ -246,8 +246,28 @@ int main(int argc, char *argv[])
 
     QCommandLineOption lumaWitnessOption(QStringList() << "luma-witness",
         QCoreApplication::translate("main",
-            "NTSC locked mode: enable the experimental luma-witness stages"));
+            "NTSC locked mode: enable the experimental carrier-retraction and witness diagnostics stages"));
     parser.addOption(lumaWitnessOption);
+
+    QCommandLineOption lumaWitnessOnlyOption(QStringList() << "luma-witness-only",
+        QCoreApplication::translate("main",
+            "NTSC diagnostic: output the final luma witness directly as GRAY16"));
+    parser.addOption(lumaWitnessOnlyOption);
+
+    QCommandLineOption carrierFitOnlyOption(QStringList() << "carrier-fit-only",
+        QCoreApplication::translate("main",
+            "NTSC diagnostic: output the fitted carrier model directly as centered GRAY16"));
+    parser.addOption(carrierFitOnlyOption);
+
+    QCommandLineOption carrierRetractedOnlyOption(QStringList() << "carrier-retracted-only",
+        QCoreApplication::translate("main",
+            "NTSC diagnostic: output raw minus the promoted carrier model directly as GRAY16"));
+    parser.addOption(carrierRetractedOnlyOption);
+
+    QCommandLineOption witnessCorrectionOnlyOption(QStringList() << "witness-correction-only",
+        QCoreApplication::translate("main",
+            "NTSC diagnostic: output carrier-retracted minus witness as centered GRAY16"));
+    parser.addOption(witnessCorrectionOnlyOption);
 
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
                                              QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
@@ -528,11 +548,34 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (parser.isSet(ntscPhaseCompOption)) {
+    int diagnosticOptionCount = 0;
+    auto selectDiagnostic = [&](const QCommandLineOption &option,
+                                Comb::Configuration::DiagnosticOutput mode) {
+        if (parser.isSet(option)) {
+            combConfig.diagnosticOutput = mode;
+            diagnosticOptionCount++;
+        }
+    };
+    selectDiagnostic(lumaWitnessOnlyOption,
+        Comb::Configuration::DiagnosticOutput::LumaWitness);
+    selectDiagnostic(carrierFitOnlyOption,
+        Comb::Configuration::DiagnosticOutput::CarrierFit);
+    selectDiagnostic(carrierRetractedOnlyOption,
+        Comb::Configuration::DiagnosticOutput::CarrierRetracted);
+    selectDiagnostic(witnessCorrectionOnlyOption,
+        Comb::Configuration::DiagnosticOutput::WitnessCorrection);
+
+    if (diagnosticOptionCount > 1) {
+        qCritical("Only one NTSC diagnostic output mode may be selected at a time");
+        return -1;
+    }
+
+    if (parser.isSet(ntscPhaseCompOption) || combConfig.diagnosticOnly()) {
         combConfig.phaseCompensation = true;
     }
 
-    if (parser.isSet(lumaWitnessOption)) {
+    if (parser.isSet(lumaWitnessOption) ||
+        combConfig.diagnosticOnly()) {
         if (!combConfig.phaseCompensation) {
             qCritical("--luma-witness requires --ntsc-phase-comp");
             return -1;
@@ -641,6 +684,11 @@ int main(int argc, char *argv[])
     } else {
         decoderName = "pal2d";
     }
+
+    if (combConfig.diagnosticOnly() && !decoderName.startsWith("ntsc")) {
+        qCritical("The selected diagnostic output mode requires an NTSC decoder");
+        return -1;
+    }
     
     // Field B reason overlays can be shown in ntsc2d; the adaptive candidate
     // map still rides the same switch for ntsc3d.
@@ -715,6 +763,10 @@ int main(int argc, char *argv[])
     } else {
         qCritical() << "Unknown output format" << outputFormatName;
         return -1;
+    }
+
+    if (combConfig.diagnosticOnly()) {
+        outputConfig.pixelFormat = OutputWriter::PixelFormat::GRAY16;
     }
     
     if (parser.isSet(outputPaddingOption)) {

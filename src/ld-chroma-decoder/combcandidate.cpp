@@ -526,6 +526,15 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             for (int rel = 0; rel < width; ++rel) {
                 const std::complex<double> z0(sI0[rel], sQ0[rel]);
 
+                const double upLumaDeltaIRE =
+                    (luma0 && lumaU2)
+                        ? std::fabs(luma0[rel] - lumaU2[rel]) * invI
+                        : -1.0;
+                const double downLumaDeltaIRE =
+                    (luma0 && lumaD2)
+                        ? std::fabs(luma0[rel] - lumaD2[rel]) * invI
+                        : -1.0;
+
                 tapLine.intrafieldRegionReach[rel] =
                     CombContentReach::evaluateIntrafieldRegionReach(
                         z0,
@@ -536,7 +545,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         upReach.allowIQCompare,
                         downReach.allowIQCompare,
                         invI,
-                        5.0);
+                        5.0,
+                        upLumaDeltaIRE,
+                        downLumaDeltaIRE);
 
                 if (want4Region) {
                     const auto region4 =
@@ -1672,6 +1683,36 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         if (rel < (int)tapLine.pairD2.size())
             wDn *= tapLine.pairD2[rel].reachGate;
 
+        // Grammar authority over the demod-magnitude penalty.
+        //
+        // kp/kn disengage a leg whose demodulated magnitude differs from
+        // center.  That magnitude is the demod's chroma READING; on fine luma
+        // detail (the Borg cube grid) the reading is a misread -- luma whose
+        // spatial frequency lands in the subcarrier band, which the demod
+        // reports as chroma amplitude.  Because the luma detail swings line to
+        // line, the misread magnitude swings with it, so the penalty
+        // consistently cedes (the zipper fix d6aa058 made the penalty
+        // phase-flat, hence consistent).  But that swing is exactly the parser
+        // mistaking luma for a chroma-content change -- the error this whole
+        // path exists to correct.  The region grammar has already identified
+        // the pair as luma the comb should cancel (SameRegion / AlienCancel),
+        // so refuse to repeat the parser's mistake: restore the full legal comb
+        // weight.  Boundaries (DifferentRegion / strongAsym) never reach this
+        // branch and keep their graded weight, and the grammar verdict is built
+        // from phase-flat smoothed IQ, so the carrier-rate zipper does not
+        // return.
+        if (rel < (int)tapLine.intrafieldRegionReach.size()) {
+            const auto &region = tapLine.intrafieldRegionReach[rel];
+            const auto Same  = CombContentReach::RegionRelation::SameRegion;
+            const auto Alien = CombContentReach::RegionRelation::AlienCancel;
+            if (region.up == Same || region.up == Alien)
+                wUp = (rel < (int)tapLine.pairU2.size())
+                    ? tapLine.pairU2[rel].reachGate : 1.0;
+            if (region.down == Same || region.down == Alien)
+                wDn = (rel < (int)tapLine.pairD2.size())
+                    ? tapLine.pairD2[rel].reachGate : 1.0;
+        }
+
         double lumaEdgeUp = 0.0;
         double lumaEdgeDn = 0.0;
         double verticalContextBreak = 0.0;
@@ -2300,7 +2341,7 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         const double aDn = cmag(ZDnRaw);
 
         // Reach contract, shared with Frame B (consumed exactly as in
-        // computeIQFrameBFromPreparedVectors).  pairU1/pairD1.reachGate
+        // computeFrameBLine).  pairU1/pairD1.reachGate
         // already carries legality, the interfield IQ floor, and the bevel/
         // zipper throttle (composed in applyFrameReachWithIQFloor), so the
         // zipper defense Frame A used to hand-roll here — transition side-
@@ -2542,127 +2583,6 @@ void Comb::FrameBuffer::computeFrameALine(
     computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
                                       outFrameIQ, &reachTapLine);
 }
-void Comb::FrameBuffer::computeIQFrameBFromPreparedVectors(
-    int line,
-    const std::vector<std::complex<double>> &centerIQ,
-    const std::vector<std::complex<double>> &upIQ,
-    const std::vector<std::complex<double>> &dnIQ,
-    std::vector<std::complex<double>> &outFrameIQ,
-    const CombTapLine *reachTapLine)
-{
-    const int first = videoParameters.firstActiveFrameLine;
-    const int last  = videoParameters.lastActiveFrameLine;
-    const int left  = videoParameters.activeVideoStart;
-    const int right = videoParameters.activeVideoEnd;
-    const int width = right - left;
-
-	    if (width <= 0) {
-	        outFrameIQ.clear();
-	        return;
-	    }
-	    outFrameIQ.resize(width);
-	    auto clearFrameIQ = [&]() {
-	        std::fill(outFrameIQ.begin(), outFrameIQ.end(), std::complex<double>(0.0, 0.0));
-	    };
-
-	    if (line < first || line >= last) {
-	        clearFrameIQ();
-	        return;
-	    }
-
-	    if ((int)centerIQ.size() < width ||
-	        (int)upIQ.size() < width ||
-	        (int)dnIQ.size() < width)
-	    {
-	        clearFrameIQ();
-	        return;
-	    }
-
-    const auto &T = configuration.tunables;
-
-    const double combStrength =
-        std::clamp(std::max(0.0, T.FRAME_B_COMB_STRENGTH), 0.0, 1.0);
-
-    const double maxDeltaIRE = std::max(0.0, T.FRAME_B_RAW_MAX_DELTA_IRE);
-
-    const bool verticalAllowed = carrierFrameVerticalAllowed(line);
-    const bool haveUpLine = verticalAllowed && (line - 1 >= first);
-    const bool haveDnLine = verticalAllowed && (line + 1 < last);
-
-    // Plain ±1 interfield comb.  Per project_frameb_comb_must_run: when a
-    // legal partner exists this MUST run — never gate to bare center via
-    // confidence correlations.  Checker suppression belongs in the reach
-    // floor (interfieldIQReachFloor in applyFrameReachWithIQFloor), which raises
-    // pairU1/pairD1.reachGate at counterpart sites; here we simply consume
-    // those gates.  Geometry: pull = 0.5 * combStrength * reachAuthority,
-    // so when both reaches are 1 the output is the 3-tap interfield average
-    // (Z0 + target)/2 — anti-phase alien cancels to zero, same-phase real
-    // chroma (delta≈0) is unchanged.
-    for (int x = 0; x < width; ++x) {
-        const std::complex<double> Z0 = centerIQ[x];
-
-        double upReach = 0.0;
-        double dnReach = 0.0;
-
-        if (reachTapLine &&
-            x < (int)reachTapLine->pairU1.size() &&
-            x < (int)reachTapLine->pairD1.size())
-        {
-            upReach = haveUpLine
-                ? std::clamp(reachTapLine->pairU1[x].reachGate, 0.0, 1.0)
-                : 0.0;
-
-            dnReach = haveDnLine
-                ? std::clamp(reachTapLine->pairD1[x].reachGate, 0.0, 1.0)
-                : 0.0;
-        }
-
-        if (upReach <= 0.0 && dnReach <= 0.0) {
-            outFrameIQ[x] = Z0;
-            continue;
-        }
-
-        const std::complex<double> ZUp = upIQ[x];
-        const std::complex<double> ZDn = dnIQ[x];
-        const bool haveUp = upReach > 0.0 && cmag2(ZUp) > 1e-18;
-        const bool haveDn = dnReach > 0.0 && cmag2(ZDn) > 1e-18;
-
-        double wsum = 0.0;
-        std::complex<double> target(0.0, 0.0);
-        if (haveUp) { target += ZUp * upReach; wsum += upReach; }
-        if (haveDn) { target += ZDn * dnReach; wsum += dnReach; }
-
-        if (wsum <= 1e-12) {
-            outFrameIQ[x] = Z0;
-            continue;
-        }
-
-        target /= wsum;
-        std::complex<double> delta = target - Z0;
-
-        // Bound the per-pixel swing.  Flat cap (no two-sided-reach relax):
-        // bevels are exactly the sites where both reaches go high AND the
-        // cross-bevel delta is large, and at those sites the unclamped pull
-        // produces the 2-pixel zipper.  The reach throttle in
-        // applyFrameReachWithIQFloor is what cancels the bevel pull at its
-        // source; this cap is the second line of defence against any
-        // pathological intermediate target the throttle leaves through.
-        const double deltaIRE = cmag(delta) * invIreScale;
-        if (maxDeltaIRE > 0.0 && deltaIRE > maxDeltaIRE && deltaIRE > 1e-9)
-            delta *= (maxDeltaIRE / deltaIRE);
-
-        const double reachAuthority = std::clamp(wsum / 2.0, 0.0, 1.0);
-        const double pull = std::clamp(0.5 * combStrength * reachAuthority, 0.0, 1.0);
-
-        outFrameIQ[x] = Z0 + delta * pull;
-
-        if (!std::isfinite(outFrameIQ[x].real()) ||
-            !std::isfinite(outFrameIQ[x].imag()))
-        {
-            outFrameIQ[x] = Z0;
-        }
-    }
-}
 
 // Frame B: direct interframe IQ comb.
 // Sources from the Field B preclean ring, with locked-1D IQ as fallback.
@@ -2821,11 +2741,27 @@ void Comb::FrameBuffer::computeFrameBLine(
 
                 const double reachAuthority = std::clamp(wsum / 2.0, 0.0, 1.0);
                 const double pull =
-                    std::clamp(0.5 * combStrength * reachAuthority, 0.0, 1.0);
+                    std::clamp(combStrength * reachAuthority, 0.0, 1.0);
                 Zout = Z0 + delta * pull;
                 if (!std::isfinite(Zout.real()) || !std::isfinite(Zout.imag()))
                     Zout = Z0;
             }
+        }
+
+        // Graceful failure at highlights.  The compact/irrational cede path
+        // emits Z0 (raw locked IQ) directly, so the comb-branch finite check
+        // above never sees it; a non-finite vector on EITHER path falls back to
+        // the finite Field B preclean rather than propagating NaN/Inf.  No
+        // magnitude clamp here: cmag(Zout) is fullSignedIQ scale (a sum of
+        // three samples), not the composite-scalar scale of maxCarrierAmp, so
+        // bounding against that rail clipped legitimate high-energy chroma into
+        // a carrier-rate checkerboard.  A finite outlier, if any survives, is a
+        // LOCAL spike (isolated vs neighbours), not a global-amplitude problem.
+        if (!std::isfinite(Zout.real()) || !std::isfinite(Zout.imag())) {
+            Zout = (std::isfinite(Z0Preclean.real()) &&
+                    std::isfinite(Z0Preclean.imag()))
+                       ? Z0Preclean
+                       : std::complex<double>(0.0, 0.0);
         }
 
         outFrameIQ[x] = Zout;
@@ -2840,6 +2776,7 @@ void Comb::FrameBuffer::computeFrameBLine(
             lddecode::carrierGrammarAdvanceRemodCursor(gridRemodCursor);
         }
     }
+
 }
 
 // 3D Section
@@ -3026,7 +2963,7 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
 //
 // The temporal vote should see the best local luma model each frame has
 // already produced, not the stale raw - clpbuffer[1] baseline. Priority:
-//   1. witness Y, when residualColor + witnessValid
+//   1. carrier-retracted Y, when residualColor + carrierRetractedValid
 //   2. coherent residual comb Y = raw - lockedCarrierComposite
 //   3. plain 2D comb Y = raw - clpbuffer[1]
 double Comb::FrameBuffer::getBestY(qint32 line, qint32 h,
@@ -3047,12 +2984,12 @@ double Comb::FrameBuffer::getBestY(qint32 line, qint32 h,
         const int rel = xx - left;
         const double raw = (double)fb.rawbuffer.data()[ln * fw + xx];
 
-        if (fb.configuration.residualColor && fb.witnessValid) {
-            const float *witRow = fb.yWitness_line(ln);
-            if (witRow) {
-                const double w = (double)witRow[rel];
-                if (std::isfinite(w))
-                    return w;
+        if (fb.configuration.residualColor && fb.carrierRetractedValid) {
+            const float *retRow = fb.carrierRetracted_line(ln);
+            if (retRow) {
+                const double r = (double)retRow[rel];
+                if (std::isfinite(r))
+                    return r;
             }
         }
 

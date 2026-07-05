@@ -172,6 +172,8 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
 
     double *envScratch = scratch_envLine.data();
     double *spanScratch = scratch_spanLine.data();
+    std::vector<double> lurchAnchorNumerator(width);
+    std::vector<double> lurchInvDiagonal(width);
 
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine = rawbuffer.data()
@@ -216,18 +218,23 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
          * Carrier-cancelled over one fsc aperture, but evaluated every sample.
          * This is the broad Y prior, not the final answer in narrow patches.
          */
-        for (int xi = 0; xi < width; ++xi) {
-            if (width >= 4) {
-                int s = xi;
-                if (s + 3 >= width)
-                    s = width - 4;
-
-                movingCoarse[xi] =
-                    0.25 * ((double)rawLine[left + s + 0]
-                           + (double)rawLine[left + s + 1]
-                           + (double)rawLine[left + s + 2]
-                           + (double)rawLine[left + s + 3]);
-            } else {
+        if (width >= 4) {
+            double sum4 = (double)rawLine[left + 0]
+                        + (double)rawLine[left + 1]
+                        + (double)rawLine[left + 2]
+                        + (double)rawLine[left + 3];
+            const int lastStart = width - 4;
+            for (int xi = 0; xi <= lastStart; ++xi) {
+                movingCoarse[xi] = 0.25 * sum4;
+                if (xi < lastStart) {
+                    sum4 += (double)rawLine[left + xi + 4]
+                          - (double)rawLine[left + xi];
+                }
+            }
+            for (int xi = lastStart + 1; xi < width; ++xi)
+                movingCoarse[xi] = movingCoarse[lastStart];
+        } else {
+            for (int xi = 0; xi < width; ++xi) {
                 movingCoarse[xi] = baseY4
                     ? baseY4[xi]
                     : (double)rawLine[left + xi];
@@ -268,16 +275,16 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
          * up.  Risk no longer participates in patch detection: it is a
          * compactness proxy that is wrong at the boundaries of real chroma,
          * and it has a history of relocating errors into detail.
-         */
+        */
+        for (int xi = 0; xi < width; ++xi)
+            spanScratch[xi] = std::fabs(
+                (double)rawLine[left + xi] - sharpPrior[xi]);
         for (int xi = 0; xi < width; ++xi) {
-            const int klo = std::max(0, xi - 1);
-            const int khi = std::min(width - 1, xi + 1);
-            double e = 0.0;
-            for (int k = klo; k <= khi; ++k) {
-                e = std::max(e, std::fabs(
-                    (double)rawLine[left + k] - sharpPrior[k]));
-            }
-            envScratch[xi] = e * invIreScale;
+            const int xm = std::max(0, xi - 1);
+            const int xp = std::min(width - 1, xi + 1);
+            envScratch[xi] = std::max(
+                spanScratch[xm],
+                std::max(spanScratch[xi], spanScratch[xp])) * invIreScale;
         }
 
         {
@@ -419,8 +426,17 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 (grammar ? std::max(24.0, grammar->carrierScale * 5.0)
                          : 24.0) * ireToSamples;
 
-            for (int xi = 0; xi < width; ++xi)
+            for (int xi = 0; xi < width; ++xi) {
                 lurchCurve[xi] = sharpPrior[xi];
+                const double anchorW =
+                    wBfloor + (wBbase - wBfloor) *
+                    (1.0 - std::clamp(lurchGateArr[xi], 0.0, 1.0));
+                lurchAnchorNumerator[xi] = anchorW * sharpPrior[xi];
+                const double diagonal = anchorW +
+                    ((xi + 4 < width) ? wA : 0.0) +
+                    ((xi - 4 >= 0) ? wA : 0.0);
+                lurchInvDiagonal[xi] = 1.0 / diagonal;
+            }
 
             for (int it = 0; it < sweeps; ++it) {
                 // Alternate sweep direction so neither end is favoured (a
@@ -428,27 +444,20 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                 const bool fwd = (it & 1) == 0;
                 for (int s = 0; s < width; ++s) {
                     const int xi = fwd ? s : (width - 1 - s);
-                    const double anchorW =
-                        wBfloor + (wBbase - wBfloor) *
-                        (1.0 - std::clamp(lurchGateArr[xi], 0.0, 1.0));
-
-                    double diag = anchorW;
-                    double rhs  = anchorW * sharpPrior[xi];
+                    double rhs = lurchAnchorNumerator[xi];
 
                     if (xi + 4 < width) {
                         const double d = (double)rawLine[left + xi + 4]
                                        - (double)rawLine[left + xi];
-                        diag += wA;
                         rhs  += wA * (lurchCurve[xi + 4] - d);
                     }
                     if (xi - 4 >= 0) {
                         const double d = (double)rawLine[left + xi]
                                        - (double)rawLine[left + xi - 4];
-                        diag += wA;
                         rhs  += wA * (lurchCurve[xi - 4] + d);
                     }
 
-                    double y = (diag > 1e-12) ? rhs / diag : sharpPrior[xi];
+                    double y = rhs * lurchInvDiagonal[xi];
 
                     // Feasibility projection: Y cannot imply a carrier
                     // excursion beyond the structural ceiling.
@@ -495,7 +504,6 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
             double bestViewCost = 1e300;
             double maxYSpanIRE = 0.0;
             double maxLatticeRiskIRE = 0.0;
-            double maxFitErrorIRE = 0.0;
 
             int viewCount = 0;
             double viewCostCache[4] = {0.0, 0.0, 0.0, 0.0};
@@ -519,8 +527,6 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
                     maxYSpanIRE = std::max(maxYSpanIRE, (double)view.ySpanIRE);
                     maxLatticeRiskIRE = std::max(maxLatticeRiskIRE,
                                                  (double)view.latticeRiskIRE);
-                    maxFitErrorIRE = std::max(maxFitErrorIRE,
-                                              (double)view.sampleFitErrorIRE);
                 }
 
                 const double keepThreshold = bestViewCost + 3.0; // keepSlackIRE
@@ -863,4 +869,105 @@ void Comb::FrameBuffer::buildConstrainedYWitness()
     }
 
     witnessValid = true;
+}
+
+void Comb::FrameBuffer::outputLumaWitness()
+{
+    if (!componentFrame || !witnessValid) {
+        qWarning("Luma witness output requested without a valid witness");
+        return;
+    }
+
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last = videoParameters.lastActiveFrameLine;
+    const int left = videoParameters.activeVideoStart;
+    const int width = videoParameters.activeVideoEnd - left;
+
+    if (width <= 0 || demodWidth != width || demodLines < last) {
+        qWarning("Luma witness output geometry is invalid");
+        return;
+    }
+
+    for (int line = first; line < last; ++line) {
+        const float *source = yWitness_line(line);
+        double *destination = componentFrame->y(line) + left;
+        for (int x = 0; x < width; ++x)
+            destination[x] = source[x];
+    }
+}
+
+void Comb::FrameBuffer::outputDiagnosticFrame()
+{
+    if (!componentFrame) {
+        qWarning("Diagnostic output requested without a destination frame");
+        return;
+    }
+
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last = videoParameters.lastActiveFrameLine;
+    const int left = videoParameters.activeVideoStart;
+    const int width = videoParameters.activeVideoEnd - left;
+
+    if (width <= 0 || demodWidth != width || demodLines < last) {
+        qWarning("Diagnostic output geometry is invalid");
+        return;
+    }
+
+    const double black = videoParameters.black16bIre;
+    const double white = videoParameters.white16bIre;
+    const double mid = black + 0.5 * (white - black);
+
+    switch (configuration.diagnosticOutput) {
+    case Configuration::DiagnosticOutput::None:
+        qWarning("Diagnostic output requested with no diagnostic mode selected");
+        return;
+
+    case Configuration::DiagnosticOutput::LumaWitness:
+        outputLumaWitness();
+        return;
+
+    case Configuration::DiagnosticOutput::CarrierFit:
+        if (!carrierRetractionModelValid) {
+            qWarning("Carrier-fit output requested without a valid carrier model");
+            return;
+        }
+        for (int line = first; line < last; ++line) {
+            const float *source = carrierFit_flat.data()
+                                + static_cast<size_t>(line) * demodWidth;
+            double *destination = componentFrame->y(line) + left;
+            for (int x = 0; x < width; ++x)
+                destination[x] = mid + static_cast<double>(source[x]);
+        }
+        return;
+
+    case Configuration::DiagnosticOutput::CarrierRetracted:
+        if (!carrierRetractedValid) {
+            qWarning("Carrier-retracted output requested without a valid retracted view");
+            return;
+        }
+        for (int line = first; line < last; ++line) {
+            const float *source = carrierRetracted_line(line);
+            double *destination = componentFrame->y(line) + left;
+            for (int x = 0; x < width; ++x)
+                destination[x] = source[x];
+        }
+        return;
+
+    case Configuration::DiagnosticOutput::WitnessCorrection:
+        if (!carrierRetractedValid || !witnessValid) {
+            qWarning("Witness-correction output requested without valid retracted and witness views");
+            return;
+        }
+        for (int line = first; line < last; ++line) {
+            const float *retracted = carrierRetracted_line(line);
+            const float *witness = yWitness_line(line);
+            double *destination = componentFrame->y(line) + left;
+            for (int x = 0; x < width; ++x) {
+                destination[x] = mid
+                    + (static_cast<double>(retracted[x]) -
+                       static_cast<double>(witness[x]));
+            }
+        }
+        return;
+    }
 }

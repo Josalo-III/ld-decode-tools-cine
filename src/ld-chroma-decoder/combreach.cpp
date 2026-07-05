@@ -363,7 +363,9 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     bool allowUp,
     bool allowDown,
     double invIreScale,
-    double minChromaIRE)
+    double minChromaIRE,
+    double upLumaDeltaIRE,
+    double downLumaDeltaIRE)
 {
     IntrafieldRegionReach out;
 
@@ -407,9 +409,20 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     constexpr double kDifferentMagRatio = 0.35;
     constexpr double kStrongSideFloorScale = 2.0;
 
+    // "Identical carrier-free luma" band: a vertical luma delta at or below
+    // this is the same luma to within noise, so a hue-only Different verdict
+    // there is a carrier-phase artifact of near-carrier vertical detail, not a
+    // region boundary. Kept well under the mild-edge floor (6 IRE) that Field B
+    // uses so a genuine luma contour never qualifies. NOTE: raising this to the
+    // 6 IRE edge floor combed real Gilgol boundaries (light checkers) and did
+    // NOT help the cube (a fine STATIC grid is Frame B's job, not Field B's ±2
+    // spatial comb), so it stays at the conservative noise-band value.
+    constexpr double kIdenticalLumaIRE = 3.0;
+
     auto classify = [&](const std::complex<double> &leg,
                         double legMagIRE,
                         bool haveLeg,
+                        double legLumaDeltaIRE,
                         double &differenceIRE,
                         double &hueDifferenceDeg) {
         if (!haveLeg)
@@ -470,14 +483,21 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
             magLo >= kAlienMagRatio * magHi)
             return RegionRelation::AlienCancel;
 
-        if (hueDifferenceDeg >= kDifferentHueDeg)
+        if (hueDifferenceDeg >= kDifferentHueDeg) {
+            // Hue says the vectors disagree, but if the carrier-free luma is
+            // vertically identical the disagreement is carrier phase, not
+            // content: this pair is the comb's cancellation partner (the
+            // Borg-cube grid), so keep the comb rather than ceding to 1D.
+            if (legLumaDeltaIRE >= 0.0 && legLumaDeltaIRE <= kIdenticalLumaIRE)
+                return RegionRelation::AlienCancel;
             return RegionRelation::DifferentRegion;
+        }
         return RegionRelation::Unknown;
     };
 
-    out.up = classify(alignedUp, upMagIRE, haveUp,
+    out.up = classify(alignedUp, upMagIRE, haveUp, upLumaDeltaIRE,
                       out.upDifferenceIRE, out.upHueDifferenceDeg);
-    out.down = classify(alignedDown, downMagIRE, haveDown,
+    out.down = classify(alignedDown, downMagIRE, haveDown, downLumaDeltaIRE,
                         out.downDifferenceIRE, out.downHueDifferenceDeg);
     out.valid = (out.up != RegionRelation::Unknown ||
                  out.down != RegionRelation::Unknown);

@@ -51,7 +51,11 @@ ld-chroma-decoder [options] <input.tbc> <output.rgb>
 - `--chroma-nr <number>`: NTSC: Chroma noise reduction level in dB (default 0.0)
 - `--luma-nr <number>`: Luma noise reduction level in dB (default 0.0)
 - `--ntsc-phase-comp`: NTSC: Adjust phase per-line using burst phase
-- `--luma-witness`: NTSC locked mode: Enable the experimental luma-witness stages. Requires `--ntsc-phase-comp`.
+- `--luma-witness`: NTSC locked mode: Enable the experimental carrier-retraction and witness-diagnostic stages. Requires `--ntsc-phase-comp`.
+- `--luma-witness-only`: NTSC diagnostic: Enable locked luma-witness processing and write the final witness directly as GRAY16, skipping normal chroma and luma rendering.
+- `--carrier-fit-only`: NTSC diagnostic: Write the fitted carrier model directly as centered GRAY16.
+- `--carrier-retracted-only`: NTSC diagnostic: Write raw minus the promoted carrier model directly as GRAY16.
+- `--witness-correction-only`: NTSC diagnostic: Write carrier-retracted minus witness directly as centered GRAY16.
 
 #### NTSC-Specific 3D Options for Adaptive Threshold:
 - `-f ntsc3d`:  Default behavior (threshold = 1.0)

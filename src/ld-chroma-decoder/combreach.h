@@ -239,7 +239,18 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     bool allowUp,
     bool allowDown,
     double invIreScale,
-    double minChromaIRE);
+    double minChromaIRE,
+    // Carrier-free vertical luma delta per leg (|smoothLuma0 - smoothLumaLeg|,
+    // in IRE). A hue-based Different verdict over vertically-IDENTICAL luma is
+    // not a region boundary: the IQ difference is a carrier-phase sampling
+    // artifact of fine vertical luma detail whose spatial frequency lands in
+    // the subcarrier band (the Borg-cube grid) -- luma the demod misreads as
+    // chroma, not chroma. That pair is exactly the comb's cancellation partner,
+    // so such a leg is reclassified AlienCancel and Field B combs instead of
+    // ceding to 1D center. Pass a negative value (default) when no luma
+    // evidence is available -> no effect.
+    double upLumaDeltaIRE = -1.0,
+    double downLumaDeltaIRE = -1.0);
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,

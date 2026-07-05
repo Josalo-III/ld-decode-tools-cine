@@ -59,6 +59,14 @@ public:
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
         bool lumaWitness = false;
+        enum class DiagnosticOutput {
+            None,
+            LumaWitness,
+            CarrierFit,
+            CarrierRetracted,
+            WitnessCorrection
+        };
+        DiagnosticOutput diagnosticOutput = DiagnosticOutput::None;
 
         // Per-axis product gains: multipliers applied to locked I and Q before
         // filtering.  This is the sole authority for product tuning — do not
@@ -113,6 +121,13 @@ public:
 
         qint32 getLookBehind() const;
         qint32 getLookAhead()  const;
+        bool diagnosticOnly() const {
+            return diagnosticOutput != DiagnosticOutput::None;
+        }
+        bool needsConstrainedWitness() const {
+            return diagnosticOutput == DiagnosticOutput::LumaWitness ||
+                   diagnosticOutput == DiagnosticOutput::WitnessCorrection;
+        }
 
         struct Tunables {
             // =========================================================================
@@ -147,7 +162,7 @@ public:
             double FRAME_CHROMA_MIN_IRE       = 1.5;   // Frame A minimum chroma amplitude to engage the frame IQ path
             double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
             double FRAME_IQ_COH_PASS_CORR     = 0.85;  // Frame A signed center/neighbor correlation at which cohGate fully passes (firm comb); ramp starts 0.30 below
-            double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B center detent: 0.5 * combStrength * reachAuthority pull
+            double FRAME_B_COMB_STRENGTH       = 0.80; // Frame B ±1 pull fraction toward the neighbour comb (0 = center only, 1 = full neighbour comb): pull = combStrength * reachAuthority. Was a fixed 0.5 [1,2,1] detent; raised for stronger interfield cross-colour / alien-chroma cancellation (crisper static detail) at the cost of some vertical chroma resolution.
             double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
             double FRAME_B_RAW_MAX_DELTA_IRE   = 12.0; // Frame B IRE-domain direct-IQ delta cap
             double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
@@ -333,12 +348,15 @@ public:
 	// run after shared analysis and the locked local-carrier construction.
 	void buildCarrierRetracted();
 	void buildConstrainedYWitness();
+	void outputLumaWitness();
+	void outputDiagnosticFrame();
 
 	void lurchSharpenCoarsePrior(const double *means,
 	                             int meanCount,
 	                             int width,
 	                             double *prior,
-	                             double *gateOut) const;
+	                             double *gateOut,
+	                             double gateGain = 1.0) const;
 	void buildPhaseCorrected1D();
 	void split2D();
 	void copy2DTo3D();
@@ -573,7 +591,7 @@ private:
 	// CarrierFitScalar / BurstLockedSigned / PhasePreservedCarrier.  Any
 	// cross-line video use must go through CombReachIndex.
 	std::vector<float> carrierFit_flat;
-	std::vector<float> carrierRetracted_flat;    // raw - carrierFit (witness view, not Y)
+	std::vector<float> carrierRetracted_flat;    // raw - promoted carrier model (retracted view, not final Y)
 	std::vector<float> flatFloor_flat;           // 4-sample carrier-free luma floor
 	std::vector<float> combedCarrier_flat;       // grammar-reached interline carrier fit
 	std::vector<std::uint8_t> carrierEligible_flat; // schedule-conformance projection (1 = eligible)
@@ -698,22 +716,35 @@ private:
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
+	// Lurch-sharpened sliding-boxcar coarse: the contour floor the constrained
+	// witness used, imported as the produceY HF-election floor (replaces the
+	// softer block-centre lockedLumaSmooth scaffold when the sharpen level is
+	// on). Populated alongside lockedLumaSmooth in the decomposition loop.
+	std::vector<double> lockedLumaSharp_flat;
 	bool lockedLumaCacheValid = false;
 
 	inline double *lockedLumaBaseY4_line(int line) {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
 	}
-	
+
 	inline double *lockedLumaSmooth_line(int line) {
 		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
 	}
-	
+
+	inline double *lockedLumaSharp_line(int line) {
+		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
+	}
+
 	inline const double *lockedLumaBaseY4_line(int line) const {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
 	}
-	
+
 	inline const double *lockedLumaSmooth_line(int line) const {
 		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const double *lockedLumaSharp_line(int line) const {
+		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline double *locked1DSource_line(int line) {
@@ -971,13 +1002,6 @@ private:
 	void computeFrameBLine(int line,
 								   std::vector<std::complex<double>> &outFrameIQ,
 								   std::vector<double> &outFrameScalar);
-	void computeIQFrameBFromPreparedVectors(
-	    int line,
-	    const std::vector<std::complex<double>> &centerIQ,
-	    const std::vector<std::complex<double>> &upIQ,
-	    const std::vector<std::complex<double>> &dnIQ,
-	    std::vector<std::complex<double>> &outFrameIQ,
-	    const CombTapLine *reachTapLine = nullptr);
 
 	void computeIQFrameAFromPreparedVectors(int line,
 											   const std::vector<std::complex<double>> &centerIQ,

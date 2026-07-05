@@ -398,9 +398,9 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
     }
 
     // Precompute the symmetric IQ-distance matrix once.  With viewCount ≤ 4
-    // this means at most 6 hypot calls instead of viewCount² (= 16) when
+    // this means at most 6 square roots instead of viewCount² (= 16) when
     // looped naively below, and the same matrix is reused for the spread
-    // computation later — together cutting parallax hypot calls from ~20
+    // computation later — together cutting parallax distance roots from ~20
     // per pixel to ~6 without changing any output.
     double iqDist[4][4] = {{0.0, 0.0, 0.0, 0.0},
                             {0.0, 0.0, 0.0, 0.0},
@@ -408,22 +408,40 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
                             {0.0, 0.0, 0.0, 0.0}};
     for (int i = 0; i < out.viewCount; ++i) {
         for (int j = i + 1; j < out.viewCount; ++j) {
-            const double d = std::hypot(
-                views[i].carrierI - views[j].carrierI,
-                views[i].carrierQ - views[j].carrierQ) * invIreScale;
+            const double dI = views[i].carrierI - views[j].carrierI;
+            const double dQ = views[i].carrierQ - views[j].carrierQ;
+            // Carrier-fit samples are bounded to video scale, so hypot's
+            // overflow/underflow rescaling is unnecessary in this hot loop.
+            const double d = std::sqrt(dI * dI + dQ * dQ) * invIreScale;
             iqDist[i][j] = d;
             iqDist[j][i] = d;
         }
     }
 
-    const auto exclusionPenalty = [&](int i) -> double {
-        const double localizer = std::exp(
-            -0.5 * (views[i].membershipLocalX * views[i].membershipLocalX) /
-            (1.35 * 1.35));
-        return std::fabs(views[i].membershipDeltaIRE) *
-               clamp01(views[i].membershipSupport) *
-               localizer;
+    // A covering four-sample view can only place its membership observation at
+    // local offsets -1, 0, 1, or 2 from the current pixel.  Cache those four
+    // Gaussian values process-wide, and cache each view's complete penalty for
+    // reuse by the IQ and scalar medoid searches below.  The generic fallback
+    // preserves this helper's contract for callers with other geometries.
+    static const double membershipLocalizer[4] = {
+        std::exp(-0.5 * 1.0 / (1.35 * 1.35)),
+        1.0,
+        std::exp(-0.5 * 1.0 / (1.35 * 1.35)),
+        std::exp(-0.5 * 4.0 / (1.35 * 1.35))
     };
+    double exclusionPenalties[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int i = 0; i < out.viewCount; ++i) {
+        const double localX = views[i].membershipLocalX;
+        const int localIndex = static_cast<int>(localX) + 1;
+        const double localizer =
+            localIndex >= 0 && localIndex < 4 &&
+            localX == static_cast<double>(localIndex - 1)
+                ? membershipLocalizer[localIndex]
+                : std::exp(-0.5 * (localX * localX) / (1.35 * 1.35));
+        exclusionPenalties[i] =
+            std::fabs(views[i].membershipDeltaIRE) *
+            clamp01(views[i].membershipSupport) * localizer;
+    }
 
     int best = 0;
     double bestCost = 1e300;
@@ -432,7 +450,7 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
         for (int j = 0; j < out.viewCount; ++j)
             cost += iqDist[i][j];
         cost += 0.35 * std::max(0.0, views[i].sampleFitErrorIRE);
-        cost += 0.10 * exclusionPenalty(i);
+        cost += 0.10 * exclusionPenalties[i];
         cost += 0.05 * std::max(0.0, views[i].score);
         if (cost < bestCost) {
             bestCost = cost;
@@ -442,7 +460,9 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
 
     out.commonI = views[best].carrierI;
     out.commonQ = views[best].carrierQ;
-    out.commonMagIRE = std::hypot(out.commonI, out.commonQ) * invIreScale;
+    out.commonMagIRE =
+        std::sqrt(out.commonI * out.commonI + out.commonQ * out.commonQ) *
+        invIreScale;
 
     int sampleBest = 0;
     double sampleBestCost = 1e300;
@@ -452,7 +472,7 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
             cost += std::fabs(views[i].carrierSample -
                               views[j].carrierSample) * invIreScale;
         cost += 0.25 * std::max(0.0, views[i].sampleFitErrorIRE);
-        cost += 0.08 * exclusionPenalty(i);
+        cost += 0.08 * exclusionPenalties[i];
         cost += 0.03 * std::max(0.0, views[i].score);
         if (cost < sampleBestCost) {
             sampleBestCost = cost;
@@ -467,7 +487,7 @@ inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
     double lattice = 0.0;
     for (int i = 0; i < out.viewCount; ++i) {
         // commonI/Q == views[best].carrierI/Q, so the IQ distance is exactly
-        // iqDist[i][best] from the precomputed matrix — no extra hypot.
+        // iqDist[i][best] from the precomputed matrix — no extra square root.
         spread = std::max(spread, iqDist[i][best]);
         sampleSpread = std::max(
             sampleSpread,

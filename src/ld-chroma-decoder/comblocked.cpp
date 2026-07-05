@@ -34,6 +34,31 @@ inline double smoothGate01(double t)
     return t * t * (3.0 - 2.0 * t);
 }
 
+// produceY HF-election coarse floor selector (sweep knob).
+//
+// The election reconstructs HF as coarse + resultHF. Historically `coarse`
+// was lockedLumaSmooth (block-centre interpolated scaffold) — smooth, so
+// contours softened. The constrained witness instead stood on a lurch-
+// sharpened sliding-boxcar coarse; importing that floor restores contour
+// (and, via chroma = raw - Y, colour-edge response) without re-admitting the
+// witness as a competing luma value.
+//
+// LD_COARSE_SHARP = L (float):
+//   unset / <=0 : baseline — election uses the soft block-centre smooth floor.
+//   > 0         : election uses the sharpened boxcar floor; L scales the lurch
+//                 snap gate (L=1 witness-native, <1 gentler, >1 snaps weaker
+//                 steps too). Sweep to find the right contour level.
+inline double coarseSharpLevel()
+{
+    static const double level = []{
+        const char *s = std::getenv("LD_COARSE_SHARP");
+        if (!s || !*s) return 0.0;
+        const double v = std::atof(s);
+        return std::isfinite(v) ? v : 0.0;
+    }();
+    return level;
+}
+
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
@@ -106,12 +131,56 @@ void Comb::FrameBuffer::phaseLocked()
         !lockedLumaSmooth_flat.empty() &&
         demodWidth == width)
     {
+        // Sharpened boxcar coarse floor for the produceY HF election. Built
+        // only when the sweep knob asks for it (the buffer is otherwise unused,
+        // so there is no cost on the baseline path). Same construction the
+        // constrained witness used: a sliding 4-sample boxcar (carrier-
+        // cancelled per aperture, evaluated every sample) lurch-sharpened so a
+        // confirmed luma step lands at one column instead of smearing across
+        // four. The gate is scaled by the sweep level.
+        const double sharpLevel = coarseSharpLevel();
+        const bool buildSharp =
+            sharpLevel > 0.0 && !lockedLumaSharp_flat.empty();
+        std::vector<double> boxcar;
+        std::vector<double> gateScratch;
+        if (buildSharp && width >= 4) {
+            boxcar.assign(width, 0.0);
+            gateScratch.assign(width, 0.0);
+        }
+
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
             buildCompositeLumaDecompositionLine(rawLine, left, width,
                                                 lockedLumaBaseY4_line(line),
                                                 nullptr,
                                                 lockedLumaSmooth_line(line));
+
+            if (!buildSharp)
+                continue;
+
+            double *sharp = lockedLumaSharp_line(line);
+            if (width < 4) {
+                std::copy(lockedLumaSmooth_line(line),
+                          lockedLumaSmooth_line(line) + width, sharp);
+                continue;
+            }
+            // Sliding 4-sample boxcar (means the lurch pass reads).
+            double sum4 = (double)rawLine[left + 0] + (double)rawLine[left + 1]
+                        + (double)rawLine[left + 2] + (double)rawLine[left + 3];
+            const int lastStart = width - 4;
+            for (int xi = 0; xi <= lastStart; ++xi) {
+                boxcar[xi] = 0.25 * sum4;
+                if (xi < lastStart)
+                    sum4 += (double)rawLine[left + xi + 4]
+                          - (double)rawLine[left + xi];
+            }
+            for (int xi = lastStart + 1; xi < width; ++xi)
+                boxcar[xi] = boxcar[lastStart];
+
+            // prior starts as a copy of the boxcar; lurch snaps confirmed steps.
+            std::copy(boxcar.begin(), boxcar.end(), sharp);
+            lurchSharpenCoarsePrior(boxcar.data(), width - 3, width,
+                                    sharp, gateScratch.data(), sharpLevel);
         }
         lockedLumaCacheValid = true;
     }
@@ -1927,10 +1996,11 @@ void Comb::FrameBuffer::produceY()
     // When --residual-video-3d is on (and prev/next frames are available), the
     // 3D Y election owns the per-pixel output: getBestY votes between the best
     // pre-output luma each frame has published so far. With --luma-witness
-    // that means witness Y; otherwise it falls back to the coherent residual
-    // comb Y (raw - carrierComp), then the plain 2D comb baseline. Residual-Y
-    // 3D stays a distinct temporal feature; it just no longer ignores the
-    // better local luma model when witness is available.
+    // that means the carrier-retracted view; otherwise it falls back to the
+    // coherent residual comb Y (raw - carrierComp), then the plain 2D comb
+    // baseline. Residual-Y 3D stays a distinct temporal feature; it just no
+    // longer ignores the better local luma model when carrier retraction is
+    // available.
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
@@ -1940,23 +2010,25 @@ void Comb::FrameBuffer::produceY()
         const double *carrierComp =
             residualVideo ? lockedCarrierComposite_line(line) : nullptr;
 
-        // Witness luma model. produceY owns luma: where the witness is valid
-        // and residual colour is active, the witness is ONE candidate in the HF
-        // luma election below -- NOT the owner. It is raw minus the interline-
-        // combed carrier, so the cross-color the coherent carrier would have
-        // removed from Y survives here as smooth luma, where it competes with
-        // combY/retracted/1D. The matching chroma reduction is derived
-        // downstream in filterIQLocked (chroma = raw - Y), keeping raw = Y + C
-        // by construction. Gated on residualColor so --no-residual-color yields
-        // pure comb colour on the baseline Y. 3D election stays disjoint.
-        const float *witnessRow =
-            (residualColor && witnessValid) ? yWitness_line(line) : nullptr;
+        // Carrier-retracted luma model. produceY owns luma: where the
+        // retracted view is valid and residual colour is active, it becomes a
+        // candidate in the HF luma election below -- NOT the owner. It is raw
+        // minus the promoted interline carrier, so the cross-color the
+        // coherent carrier would have removed from Y survives here as smooth
+        // luma, where it competes with combY and 1D. The matching chroma
+        // reduction is derived downstream in filterIQLocked (chroma = raw - Y),
+        // keeping raw = Y + C by construction. Gated on residualColor so
+        // --no-residual-color yields pure comb colour on the baseline Y. 3D
+        // election stays disjoint.
+        const float *retractedRow =
+            (residualColor && carrierRetractedValid)
+                ? carrierRetracted_line(line) : nullptr;
 
         if (use3DY) {
             for (int h = left; h < right; ++h) {
                 Y[h] = getBestY(line, h, *prevFrameForVet, *nextFrameForVet);
             }
-        } else if (witnessRow) {
+        } else if (retractedRow) {
             // ================= HF luma election =================
             //
             // Coarse owns LF; a per-pixel election adjudicates the HF among
@@ -1975,15 +2047,25 @@ void Comb::FrameBuffer::produceY()
             // neighbor anchor (comb.cpp:1398).
             //
             // Contestants (each a complete raw - carrier):
-            //   0 combY      = raw - carrierComp    (comb: senior, phase-locked)
-            //   1 retractedY = carrierRetracted     (raw - combedCarrier)
-            //   2 witnessY   = yWitness             (coarse + lurch)
-            //   3 1D         = raw - locked1DSource  ADMITTED ONLY IF comb DQ'd
+            //   0 combY      = raw - carrierComp     (comb: senior, phase-locked)
+            //   1 retractedY = carrierRetracted      (raw - combedCarrier)
+            //   2 1D         = raw - locked1DSource  ADMITTED ONLY IF comb DQ'd
             // Comb is the improvement on 1D; 1D has no voice while comb stands.
-            const float *retractedRow = carrierRetracted_line(line);
+            // Coarse floor selector. The election reconstructs HF as
+            // coarse + resultHF, so the floor's contour IS the output's
+            // contour. The sharp floor (lurch-snapped boxcar) is the witness's
+            // contour import; the smooth floor (block-centre scaffold) is the
+            // softer baseline. All coarse reads below (this line + the ±2
+            // neighbour anchors) must use the same floor.
+            const bool useSharpCoarse =
+                coarseSharpLevel() > 0.0 && !lockedLumaSharp_flat.empty();
+            auto coarseFloor_line = [&](int l) -> const double * {
+                return useSharpCoarse ? lockedLumaSharp_line(l)
+                                      : lockedLumaSmooth_line(l);
+            };
             const double *coarseRow =
                 (lockedLumaCacheValid && demodWidth == width)
-                    ? lockedLumaSmooth_line(line)
+                    ? coarseFloor_line(line)
                     : nullptr;
             const double *oneDRow = locked1DSource_line(line); // may be null
             const lddecode::CarrierAnalysisRecord *analysisRow =
@@ -2046,10 +2128,7 @@ void Comb::FrameBuffer::produceY()
                 if (plane == 1 && retractedRow) {
                     const double r = (double)retractedRow[xx];
                     if (std::isfinite(r)) return r;
-                } else if (plane == 2) {
-                    const double w = (double)witnessRow[xx];
-                    if (std::isfinite(w)) return w;
-                } else if (plane == 3 && oneDRow) {
+                } else if (plane == 2 && oneDRow) {
                     const double o = oneDRow[xx];
                     if (std::isfinite(o)) return (double)rawLine[hh] - o;
                 }
@@ -2102,10 +2181,8 @@ void Comb::FrameBuffer::produceY()
             const double *ccS  = (haveS && residualVideo) ? lockedCarrierComposite_line(lineS) : nullptr;
             const float *retN  = haveN ? carrierRetracted_line(lineN) : nullptr;
             const float *retS  = haveS ? carrierRetracted_line(lineS) : nullptr;
-            const float *witN  = haveN ? yWitness_line(lineN) : nullptr;
-            const float *witS  = haveS ? yWitness_line(lineS) : nullptr;
-            const double *coaN = haveN ? lockedLumaSmooth_line(lineN) : nullptr;
-            const double *coaS = haveS ? lockedLumaSmooth_line(lineS) : nullptr;
+            const double *coaN = haveN ? coarseFloor_line(lineN) : nullptr;
+            const double *coaS = haveS ? coarseFloor_line(lineS) : nullptr;
 
             // Grammar-legal ±2 relation, hoisted per line (h cancels in the
             // signed sample class).  A same-field ±2 line pair alternates on
@@ -2131,15 +2208,15 @@ void Comb::FrameBuffer::produceY()
             const bool relLegalS = legalRel(gS);
 
             // Robust HF at a neighbour pixel: median of that pixel's complete
-            // luma planes (comb, retracted, witness) minus its own coarse.
+            // luma planes (comb, retracted) minus its own coarse.
             // Returns false where the neighbour lacks a usable coarse.
             auto neighborHFAt = [&](const quint16 *rawP, const double *ccP,
-                                    const float *retP, const float *witP,
+                                    const float *retP,
                                     const double *coaP, int hh, double &out) -> bool {
                 if (!coaP) return false;
                 const int xx = hh - left;
                 const double co = coaP[xx];
-                double v[3]; int n = 0;
+                double v[2]; int n = 0;
                 if (ccP) {
                     const double c = ccP[xx];
                     if (std::isfinite(c)) v[n++] = ((double)rawP[hh] - c) - co;
@@ -2148,15 +2225,9 @@ void Comb::FrameBuffer::produceY()
                     const double r = (double)retP[xx];
                     if (std::isfinite(r)) v[n++] = r - co;
                 }
-                if (witP) {
-                    const double w = (double)witP[xx];
-                    if (std::isfinite(w)) v[n++] = w - co;
-                }
                 if (n == 0) return false;
                 out = (n == 1) ? v[0]
-                    : (n == 2) ? 0.5 * (v[0] + v[1])
-                    : std::max(std::min(v[0], v[1]),
-                               std::min(std::max(v[0], v[1]), v[2]));
+                    : 0.5 * (v[0] + v[1]);
                 return true;
             };
 
@@ -2310,17 +2381,11 @@ void Comb::FrameBuffer::produceY()
                         candY[nCand] = ry; candPlane[nCand] = 1; ++nCand;
                     }
                 }
-                {
-                    const double w = (double)witnessRow[xi];
-                    if (std::isfinite(w) && feasible(w)) {
-                        candY[nCand] = w; candPlane[nCand] = 2; ++nCand;
-                    }
-                }
                 if (!combOK && oneDRow) {
                     const double o = oneDRow[xi];
                     const double y1 = std::isfinite(o) ? rawH - o : combY;
                     if (std::isfinite(y1) && feasible(y1)) {
-                        candY[nCand] = y1; candPlane[nCand] = 3; ++nCand;
+                        candY[nCand] = y1; candPlane[nCand] = 2; ++nCand;
                     }
                 }
 
@@ -2381,16 +2446,16 @@ void Comb::FrameBuffer::produceY()
                 // along it and reject a one-line notch.
                 double noms[4]; int nNom = 0;
                 double dirEst;
-                if (neighborHFAt(rawN, ccN, retN, witN, coaN, h, dirEst))
+                if (neighborHFAt(rawN, ccN, retN, coaN, h, dirEst))
                     noms[nNom++] = closestSnrD(inHF, inConf, nIn, dirEst, phasePenSamp);
-                if (neighborHFAt(rawS, ccS, retS, witS, coaS, h, dirEst))
+                if (neighborHFAt(rawS, ccS, retS, coaS, h, dirEst))
                     noms[nNom++] = closestSnrD(inHF, inConf, nIn, dirEst, phasePenSamp);
                 if (h - 1 >= left &&
-                    neighborHFAt(rawLine, carrierComp, retractedRow, witnessRow,
+                    neighborHFAt(rawLine, carrierComp, retractedRow,
                                  coarseRow, h - 1, dirEst))
                     noms[nNom++] = closestSnrD(inHF, inConf, nIn, dirEst, phasePenSamp);
                 if (h + 1 < right &&
-                    neighborHFAt(rawLine, carrierComp, retractedRow, witnessRow,
+                    neighborHFAt(rawLine, carrierComp, retractedRow,
                                  coarseRow, h + 1, dirEst))
                     noms[nNom++] = closestSnrD(inHF, inConf, nIn, dirEst, phasePenSamp);
 
@@ -2456,7 +2521,8 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
                                                 int meanCount,
                                                 int width,
                                                 double *prior,
-                                                double *gateOut) const
+                                                double *gateOut,
+                                                double gateGain) const
 {
     if (gateOut && width > 0)
         std::fill(gateOut, gateOut + width, 0.0);
@@ -2513,7 +2579,11 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
         const double stepSamples =
             means[std::min(b + 1, meanCount - 1)] - means[a];
         const double stepIRE = std::fabs(stepSamples) * invIreScale;
-        const double gate = smoothStep01((stepIRE - 1.25) / 2.75);
+        // gateGain sweeps the snap aggressiveness: <1 softens the contour
+        // (weaker steps stay on the boxcar ramp), >1 snaps weaker steps too.
+        const double gate =
+            std::clamp(smoothStep01((stepIRE - 1.25) / 2.75) * gateGain,
+                       0.0, 1.0);
         if (gate <= 0.0)
             continue;
 
@@ -2639,6 +2709,7 @@ void Comb::FrameBuffer::buildCarrierRetracted()
 void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 {
     carrierRetractedValid = false;
+    witnessValid = false;
 
     if (!configuration.phaseCompensation ||
         !configuration.lumaWitness)
@@ -2710,8 +2781,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     if ((int)scratch_lumaBaseY4.size()  < width) scratch_lumaBaseY4.resize(width, 0.0);
     if ((int)scratch_lumaSmooth.size()  < width) scratch_lumaSmooth.resize(width, 0.0);
     if ((int)scratch_lateralLine.size() < width) scratch_lateralLine.resize(width, 0.0);
-    if ((int)scratch_carrierParallax.size() < width)
-        scratch_carrierParallax.resize(width);
 
     double *rawWhole   = scratch_preI.data();
     double *coarseY    = scratch_preQ.data();
@@ -2807,13 +2876,11 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                               + static_cast<size_t>(line) * demodWidth;
         auto *evidenceRow   = coarseYEvidence_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
-        auto *parallaxRow   = scratch_carrierParallax.data();
         auto *analysisRow   = carrierAnalysis_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
         auto *eligibleRow   = carrierEligible_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
 
-        std::fill(evidenceRow, evidenceRow + width, lddecode::FourViewPixelEvidence{});
         for (int xi = 0; xi < width; ++xi)
             analysisRow[xi].parallax = lddecode::CarrierParallaxDiagnostics{};
 
@@ -2845,7 +2912,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             for (int xi = 0; xi < width; ++xi) {
                 fitRow[xi]       = 0.0f;
                 floorRow[xi]     = static_cast<float>(coarseY[xi]);
-                parallaxRow[xi] = lddecode::FourViewCarrierAttribution{};
+                evidenceRow[xi].viewCount = 0;
             }
             continue;
         }
@@ -3098,20 +3165,20 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     }
                     const double dI = winI[sr] - winI[sl];
                     const double dQ = winQ[sr] - winQ[sl];
-                    const double step = std::sqrt(dI * dI + dQ * dQ);
-                    const double magL =
-                        std::sqrt(winI[sl] * winI[sl] + winQ[sl] * winQ[sl]);
-                    const double magR =
-                        std::sqrt(winI[sr] * winI[sr] + winQ[sr] * winQ[sr]);
-                    if (step < stepFloor ||
-                        step < 0.35 * std::max(magL, magR))
+                    const double stepSq = dI * dI + dQ * dQ;
+                    const double magLSq =
+                        winI[sl] * winI[sl] + winQ[sl] * winQ[sl];
+                    const double magRSq =
+                        winI[sr] * winI[sr] + winQ[sr] * winQ[sr];
+                    if (stepSq < stepFloor * stepFloor ||
+                        stepSq < (0.35 * 0.35) * std::max(magLSq, magRSq))
                         continue;
                     const double cI = winI[sl] - winI[sll];
                     const double cQ = winQ[sl] - winQ[sll];
                     const double dI2 = winI[srr] - winI[sr];
                     const double dQ2 = winQ[srr] - winQ[sr];
-                    if (std::sqrt(cI * cI + cQ * cQ) > 0.5 * step ||
-                        std::sqrt(dI2 * dI2 + dQ2 * dQ2) > 0.5 * step)
+                    if (cI * cI + cQ * cQ > 0.25 * stepSq ||
+                        dI2 * dI2 + dQ2 * dQ2 > 0.25 * stepSq)
                         continue;
                     boundaryMark[p] = 1;
                 }
@@ -3305,7 +3372,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     parallax.residualConsensus = consensus;
                 }
 
-                parallaxRow[xi] = parallax;
                 {
                     auto &dst = analysisRow[xi].parallax;
                     dst.commonSample = static_cast<float>(parallax.commonSample);
@@ -3439,7 +3505,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 carrierFit[xi] = cf;
                 flattened[xi] = rawWhole[xi];
                 fitRow[xi] = 0.0f;
-                parallaxRow[xi] = lddecode::FourViewCarrierAttribution{};
+                evidenceRow[xi].viewCount = 0;
             }
         }
 /*
