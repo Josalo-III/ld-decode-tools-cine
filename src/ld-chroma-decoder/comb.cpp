@@ -219,11 +219,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->buildCarrierAnalysis(
                     prevIterAnalyzed ? current.get() : nullptr);
                 next->buildPhaseCorrected1D();
-                if (configuration.lumaWitness) {
+                if (configuration.lumaWitness)
                     next->buildCarrierRetracted();
-                    if (configuration.needsConstrainedWitness())
-                        next->buildConstrainedYWitness();
-                }
             }
 
             if (!configuration.diagnosticOnly())
@@ -526,7 +523,6 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             locked1DParallaxRepairDelta_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             attributionEvidence_flat.assign(
                 size_t(demodLines) * demodWidth, AttributionEvidence{});
-            compactPatchGate_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
         }
         scratch_frameBDirectIQComposite.assign(width, 0.0);
         scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
@@ -863,7 +859,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double FVF_SMALL_DIFF_IRE = (T.FVF_SMALL_DIFF_IRE > 0.0) ? T.FVF_SMALL_DIFF_IRE : 3.0;
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
     const AttributionEvidence *attrRow = attributionEvidence_line(line);
-    const float *compactPatchRow = compactPatchGate_line(line);
     const double *attrAuthorityRow =
         ((int)scratch_attrMembershipY.size() >= width)
             ? scratch_attrMembershipY.data()
@@ -1565,24 +1560,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
-            const double compactPatchGate = compactPatchRow
-                ? std::clamp((double)compactPatchRow[rel], 0.0, 1.0)
-                : 0.0;
-            const double compactPatchElectionT = std::clamp(
-                (compactPatchGate - 0.55) / (0.72 - 0.55), 0.0, 1.0);
-
-            if (compactPatchElectionT > 0.0) {
-                const double fieldPenalty =
-                    compactPatchElectionT * (0.18 + 0.10 * sat_t);
-                scoreB *= (1.0 + fieldPenalty);
-
-                if (!frameInsane && !managementVeto) {
-                    const double frameBonus =
-                        compactPatchElectionT * (0.16 + 0.10 * sat_t);
-                    scoreR *= (1.0 - frameBonus);
-                }
-            }
-
             auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
                 idx   = candIdx;
                 val   = candVal;
@@ -1622,23 +1599,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
-            if (compactPatchElectionT > 0.0 &&
-                idx == 1 &&
-                !frameInsane &&
-                !managementVeto)
-            {
-                const double dBL = std::fabs(lumFB - L1) * invI;
-                const double dRL = std::fabs(lumFR - L1) * invI;
-                const double frameCompetitiveScale =
-                    1.0 + (0.10 + 0.14 * compactPatchElectionT);
-                const bool frameCompetitive = scoreR <= scoreB * frameCompetitiveScale;
-                const bool frameNearRail = dRL <= dBL + (1.75 - 0.75 * compactPatchElectionT);
-
-                if (frameCompetitive && frameNearRail)
-                    pickCandidate(2, FR, 0.78f);
-            }
-
-
             // Subtle hysteresis (switch veto) in soft regions
             if (rel > 0) {
                 const int prevIdx = winner[rel - 1];
@@ -1646,7 +1606,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (prevIdx >= 0 && prevIdx <= 2 && idx != prevIdx) {
 
                     const bool hystOk =
-                        (compactPatchElectionT <= 0.0) &&
                         (chromaMagIRE <= SAT_FALLBACK_START) &&
                         !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) &&
                         !((chromaMagIRE > CHROMA_STRONG_IRE) && (vIRE > VERT_THRESH_IRE));
@@ -1706,7 +1665,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         bool changed = false;
 
         for (int rel = 1; rel < width - 1; ++rel) {
-            if (compactPatchRow && compactPatchRow[rel] > 0.55f) continue;
             if (satMap[rel] > SAT_FALLBACK_START) continue;
             const double hEdgeIRE = (rel < (int)tapLine.hLumaDeltaIRE.size())
                 ? tapLine.hLumaDeltaIRE[rel]
@@ -1756,8 +1714,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (cntF > 0 && (cntA + cntB) > 0) {
                     int blockIdx = (cntA >= cntB) ? 0 : 1;
                     for (int r = b; r < e; ++r) {
-                        if (compactPatchRow && compactPatchRow[r] > 0.55f)
-                            continue;
                         winner[r] = blockIdx;
                         if (blockIdx == 0) { outVal[r] = candidateA[r]; outShade[r] = 0.25f; }
                         else               { outVal[r] = fieldB[r]; outShade[r] = 0.35f; }
@@ -2940,21 +2896,20 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple &&
         !fieldBDecisionReason_flat.empty())
     {
-        struct ReasonShade {
-            quint16 y;
-            quint16 u;
-            quint16 v;
-        };
-        const std::array<ReasonShade, 9> reasonShades = {{
-            {32768, 32768, 32768}, // none
-            {49152, 26214, 39321}, // blend: cyan
-            {45875, 25000, 56500}, // boundary up: blue
-            {45875, 40500, 16000}, // boundary down: orange
-            {52428, 20000, 47000}, // boundary cede: teal
-            {42598, 30000, 52000}, // coarse revive: green
-            {39321, 52000, 28000}, // scalar revive: red
-            {26214, 32768, 32768}, // center / no answer: neutral dark
-            {60000, 32768, 32768}  // signed-IQ center island: bright neutral
+        // Build the diagnostic palette through FrameCanvas.  ComponentFrame
+        // stores zero-centred U/V in signal units, not unsigned 16-bit YUV;
+        // writing literal 16-bit values here drove both chroma axes strongly
+        // positive and collapsed every reason into the same magenta image.
+        const std::array<FrameCanvas::Colour, 9> reasonShades = {{
+            canvas.rgb(0x8080, 0x8080, 0x8080), // none: gray
+            canvas.rgb(0x0000, 0xFFFF, 0xFFFF), // blend: cyan
+            canvas.rgb(0x3030, 0x5050, 0xFFFF), // boundary up: blue
+            canvas.rgb(0xFFFF, 0x8080, 0x0000), // boundary down: orange
+            canvas.rgb(0x0000, 0xA0A0, 0x9090), // boundary cede: teal
+            canvas.rgb(0x0000, 0xFFFF, 0x4040), // coarse revive: green
+            canvas.rgb(0xFFFF, 0x2020, 0x2020), // scalar revive: red
+            canvas.rgb(0x3030, 0x3030, 0x3030), // center / no answer: dark
+            canvas.rgb(0xFFFF, 0xFFFF, 0xFFFF)  // center island: white
         }};
 
         const int firstLine = videoParameters.firstActiveFrameLine;
@@ -2973,7 +2928,7 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
                 const std::uint8_t reason = std::min<std::uint8_t>(
                     reasonRow[h - left],
                     static_cast<std::uint8_t>(reasonShades.size() - 1));
-                const ReasonShade &shade = reasonShades[reason];
+                const FrameCanvas::Colour &shade = reasonShades[reason];
                 Y[h] = shade.y;
                 U[h] = shade.u;
                 V[h] = shade.v;

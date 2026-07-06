@@ -246,13 +246,8 @@ int main(int argc, char *argv[])
 
     QCommandLineOption lumaWitnessOption(QStringList() << "luma-witness",
         QCoreApplication::translate("main",
-            "NTSC locked mode: enable the experimental carrier-retraction and witness diagnostics stages"));
+            "NTSC locked mode: enable the carrier-retraction luma path and diagnostics"));
     parser.addOption(lumaWitnessOption);
-
-    QCommandLineOption lumaWitnessOnlyOption(QStringList() << "luma-witness-only",
-        QCoreApplication::translate("main",
-            "NTSC diagnostic: output the final luma witness directly as GRAY16"));
-    parser.addOption(lumaWitnessOnlyOption);
 
     QCommandLineOption carrierFitOnlyOption(QStringList() << "carrier-fit-only",
         QCoreApplication::translate("main",
@@ -263,11 +258,6 @@ int main(int argc, char *argv[])
         QCoreApplication::translate("main",
             "NTSC diagnostic: output raw minus the promoted carrier model directly as GRAY16"));
     parser.addOption(carrierRetractedOnlyOption);
-
-    QCommandLineOption witnessCorrectionOnlyOption(QStringList() << "witness-correction-only",
-        QCoreApplication::translate("main",
-            "NTSC diagnostic: output carrier-retracted minus witness as centered GRAY16"));
-    parser.addOption(witnessCorrectionOnlyOption);
 
     QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
                                              QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
@@ -556,14 +546,10 @@ int main(int argc, char *argv[])
             diagnosticOptionCount++;
         }
     };
-    selectDiagnostic(lumaWitnessOnlyOption,
-        Comb::Configuration::DiagnosticOutput::LumaWitness);
     selectDiagnostic(carrierFitOnlyOption,
         Comb::Configuration::DiagnosticOutput::CarrierFit);
     selectDiagnostic(carrierRetractedOnlyOption,
         Comb::Configuration::DiagnosticOutput::CarrierRetracted);
-    selectDiagnostic(witnessCorrectionOnlyOption,
-        Comb::Configuration::DiagnosticOutput::WitnessCorrection);
 
     if (diagnosticOptionCount > 1) {
         qCritical("Only one NTSC diagnostic output mode may be selected at a time");

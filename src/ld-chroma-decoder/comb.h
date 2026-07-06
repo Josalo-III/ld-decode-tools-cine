@@ -61,10 +61,8 @@ public:
         bool lumaWitness = false;
         enum class DiagnosticOutput {
             None,
-            LumaWitness,
             CarrierFit,
-            CarrierRetracted,
-            WitnessCorrection
+            CarrierRetracted
         };
         DiagnosticOutput diagnosticOutput = DiagnosticOutput::None;
 
@@ -124,11 +122,6 @@ public:
         bool diagnosticOnly() const {
             return diagnosticOutput != DiagnosticOutput::None;
         }
-        bool needsConstrainedWitness() const {
-            return diagnosticOutput == DiagnosticOutput::LumaWitness ||
-                   diagnosticOutput == DiagnosticOutput::WitnessCorrection;
-        }
-
         struct Tunables {
             // =========================================================================
             // 1D / Lateral baseline
@@ -162,7 +155,7 @@ public:
             double FRAME_CHROMA_MIN_IRE       = 1.5;   // Frame A minimum chroma amplitude to engage the frame IQ path
             double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
             double FRAME_IQ_COH_PASS_CORR     = 0.85;  // Frame A signed center/neighbor correlation at which cohGate fully passes (firm comb); ramp starts 0.30 below
-            double FRAME_B_COMB_STRENGTH       = 0.80; // Frame B ±1 pull fraction toward the neighbour comb (0 = center only, 1 = full neighbour comb): pull = combStrength * reachAuthority. Was a fixed 0.5 [1,2,1] detent; raised for stronger interfield cross-colour / alien-chroma cancellation (crisper static detail) at the cost of some vertical chroma resolution.
+            double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B ±1: fraction of the EXACT projection (pull = 0.5 * strength * reachAuthority). 1.0 = the [1,2,1] solution of the two-line alternation model (alien nulled, Y luma at unit gain). Values are capped at the projection: pull > 0.5 is not stronger cancellation, it re-injects inverted alien at (2p−1) — the 0.80-era overdrive that serrated diagonals and manufactured diagonal cross-color.
             double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
             double FRAME_B_RAW_MAX_DELTA_IRE   = 12.0; // Frame B IRE-domain direct-IQ delta cap
             double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
@@ -245,6 +238,11 @@ public:
             // 3D Residual Y selection
             bool   RESIDUAL_Y_ELECTION     = true; // true = winner-take-all; false = median-weighted blend
             double NEIGHBOR_SHAPE_STRENGTH = 0.5;  // how strongly spatial neighbor consensus pulls the 3D Y election
+            // produceY local HF election.  A candidate earns this capped
+            // advantage only when its HF magnitude is continued by a robust
+            // N/S/E/W image neighbour; unsupported amplitude earns nothing.
+            double PRODUCE_Y_HF_IMAGE_PREFERENCE_IRE = 1.5;
+            double PRODUCE_Y_HF_CONTINUATION_IRE = 6.0;
             double FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG = 10.0; // clamp for neighbor IQ column phase alignment in frame candidates
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
@@ -343,12 +341,16 @@ public:
 	// residual-video-3D enhancement.  Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCarrierRetractionStage(bool analysisOnly);
+	void buildCoherentCarrierEstimateRow(int line,
+	                                    const quint16 *rawLine,
+	                                    const double *baseY4,
+	                                    const float *tiLockedRow,
+	                                    const float *tqLockedRow,
+	                                    double *carrierOut);
 
-	// Carrier-retraction / constrained-witness front end (restored 6/13 path),
-	// run after shared analysis and the locked local-carrier construction.
+	// Carrier-retraction front end, run after shared analysis and the locked
+	// local-carrier construction.
 	void buildCarrierRetracted();
-	void buildConstrainedYWitness();
-	void outputLumaWitness();
 	void outputDiagnosticFrame();
 
 	void lurchSharpenCoarsePrior(const double *means,
@@ -512,7 +514,6 @@ private:
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
 		std::vector<double> hLumaDeltaIRE;
-		std::vector<double> irrationalChroma;
 	};
 	enum CombTapBuild : unsigned {
 		TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta
@@ -582,11 +583,10 @@ private:
 	// which keeps this energy as luma, without geometric corroboration).
 	std::vector<float> regionAlienPartner_flat;
 
-	// --- Carrier-retraction / constrained-witness buffers (restored from the
-	// 6/13 witness path).  Populated by buildCarrierRetracted() then
-	// buildConstrainedYWitness(); same geometry as the demod flats
-	// (demodLines x demodWidth).  carrierImpurity_flat above is shared with the
-	// current aperture detector and reused here. ---
+	// --- Carrier-retraction buffers. Populated by buildCarrierRetracted();
+	// same geometry as the demod flats (demodLines x demodWidth).
+	// carrierImpurity_flat above is shared with the current aperture detector
+	// and reused here. ---
 	// Per-line four-view carrier model.  Source contract:
 	// CarrierFitScalar / BurstLockedSigned / PhasePreservedCarrier.  Any
 	// cross-line video use must go through CombReachIndex.
@@ -598,12 +598,6 @@ private:
 	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat; // per-pixel four-view evidence
 	bool carrierRetractedValid = false;
 	bool carrierRetractionModelValid = false;
-
-	// Constrained multi-witness outputs (buildConstrainedYWitness); valid when
-	// witnessValid is true.
-	std::vector<float> yWitness_flat;                 // constrained Y reconstruction
-	std::vector<float> compactPatchGate_flat;         // compact-patch authority [0,1] per pixel
-	bool witnessValid = false;
 
 	std::vector<double> scratch_lumaBaseY4;
 	std::vector<double> scratch_lumaHiRaw;
@@ -1185,8 +1179,7 @@ private:
 		return carrierAnalysis_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
-	// --- Carrier-retraction / witness accessors (guarded by carrierRetractedValid
-	// / witnessValid).  Restored with the 6/13 witness path. ---
+	// --- Carrier-retraction accessors (guarded by carrierRetractedValid). ---
 	inline float* carrierRetracted_line(int line) {
 		if (!carrierRetractedValid || demodWidth <= 0 ||
 		    line < 0 || line >= demodLines) return nullptr;
@@ -1218,28 +1211,6 @@ private:
 		    line < 0 || line >= demodLines ||
 		    coarseYEvidence_flat.empty()) return nullptr;
 		return coarseYEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-
-	// Witness buffer accessors — guarded by witnessValid.
-	inline float* yWitness_line(int line) {
-		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    yWitness_flat.empty()) return nullptr;
-		return yWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline const float* yWitness_line(int line) const {
-		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    yWitness_flat.empty()) return nullptr;
-		return yWitness_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline float* compactPatchGate_line(int line) {
-		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    compactPatchGate_flat.empty()) return nullptr;
-		return compactPatchGate_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline const float* compactPatchGate_line(int line) const {
-		if (!witnessValid || demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    compactPatchGate_flat.empty()) return nullptr;
-		return compactPatchGate_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	// Vet result container (used by locked-path coherent Y rebuild).

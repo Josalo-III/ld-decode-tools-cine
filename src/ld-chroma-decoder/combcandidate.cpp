@@ -223,7 +223,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     if (wantFieldB || wantFrame) {
         ensureWidth(tapLine.hLumaDeltaIRE);
-        ensureWidth(tapLine.irrationalChroma);
     }
 
     auto getCompRow = [&](int ln)->const double* {
@@ -647,76 +646,14 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     }
     }
 
-    if (wantFieldB || wantFrame) {
-        const int kSupport = 3;
-        const double chromaFloor = 0.15;
-        const double dropFraction = 0.25;
-        const double lumaEdgeFloor = 4.0;
-        const bool haveBothV = tapLine.haveU2 && tapLine.haveD2;
-        for (int rel = 0; rel < width; ++rel) {
-            const double cHere = tapLine.centerChromaT[rel];
-            if (cHere < chromaFloor) {
-                tapLine.irrationalChroma[rel] = 0.0;
-                continue;
-            }
-            const double threshold = dropFraction * cHere;
-
-            // Vertical isolation: when the center is saturated but the ±2
-            // same-field partners carry essentially no chroma envelope,
-            // Field B's vertical comb premise (chroma extends to ±2) is
-            // structurally false.  Mark the pixel irrational regardless of
-            // horizontal compactness or luma context — catches compact
-            // saturated chroma on uniform backgrounds (warp cores, impulse
-            // ports) that the luma-edge-gated path below misses.
-            if (haveBothV) {
-                const double cU2 = tapLine.tapU2[rel].comp;
-                const double sU2 = tapLine.tapU2[rel].symMag;
-                const double cD2 = tapLine.tapD2[rel].comp;
-                const double sD2 = tapLine.tapD2[rel].symMag;
-                const double envU2 = std::sqrt(cU2 * cU2 + sU2 * sU2);
-                const double envD2 = std::sqrt(cD2 * cD2 + sD2 * sD2);
-                const double chromaTU2 =
-                    std::clamp((envU2 * invI - 2.0) / 8.0, 0.0, 1.0);
-                const double chromaTD2 =
-                    std::clamp((envD2 * invI - 2.0) / 8.0, 0.0, 1.0);
-                if (chromaTU2 < threshold && chromaTD2 < threshold) {
-                    tapLine.irrationalChroma[rel] = cHere;
-                    continue;
-                }
-            }
-
-            double minLeft = cHere;
-            double minRight = cHere;
-            for (int k = 2; k <= kSupport; ++k) {
-                if (rel - k >= 0)
-                    minLeft = std::min(minLeft, tapLine.centerChromaT[rel - k]);
-                if (rel + k < width)
-                    minRight = std::min(minRight, tapLine.centerChromaT[rel + k]);
-            }
-            const bool shortSupport =
-                (minLeft < threshold) && (minRight < threshold);
-
-            if (!shortSupport) {
-                tapLine.irrationalChroma[rel] = 0.0;
-                continue;
-            }
-
-            const double hEdgeHere = tapLine.hLumaDeltaIRE[rel];
-            double maxLumaWide = hEdgeHere;
-            for (int k = 2; k <= kSupport; ++k) {
-                if (rel - k >= 0)
-                    maxLumaWide = std::max(maxLumaWide,
-                                           tapLine.hLumaDeltaIRE[rel - k]);
-                if (rel + k < width)
-                    maxLumaWide = std::max(maxLumaWide,
-                                           tapLine.hLumaDeltaIRE[rel + k]);
-            }
-            const bool lumaDriven = (maxLumaWide > lumaEdgeFloor);
-
-            tapLine.irrationalChroma[rel] =
-                (shortSupport && lumaDriven) ? cHere : 0.0;
-        }
-    }
+    // There is deliberately no amplitude/compactness-based "chroma shape"
+    // exception here.  High-frequency energy defaults to luma.  Physical
+    // appearance (large envelope, narrow span, isolation, proximity to a luma
+    // edge) may limit a reach that already has carrier authority, but it may
+    // never register that energy as carrier or grant an escape from the comb.
+    // Carrier privileges come from the grammar/conformance tables and their
+    // named consumers.  The retired irrationalChroma path violated this rule
+    // by promoting exactly the fine luma structures the decoder must protect.
 
     {
     if (wantContour) {
@@ -978,10 +915,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             curvature * curvature;
                         bevelGate *= std::clamp(1.0 - satBite, 0.0, 1.0);
                     }
-                    const double irr =
-                        (rel < (int)tapLine.irrationalChroma.size())
-                            ? tapLine.irrationalChroma[rel] : 0.0;
-                    if (xColPenalty > 0.0 && irr <= 0.0 &&
+                    if (xColPenalty > 0.0 &&
                         rel < (int)tapLine.hLumaDeltaIRE.size()) {
                         const double hEdge = std::clamp(
                             (tapLine.hLumaDeltaIRE[rel] - 0.30 * xColThreshIRE) /
@@ -992,7 +926,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         bevelGate *= std::clamp(
                             1.0 - xColPenalty * xColorRisk, 0.0, 1.0);
                     }
-                    const double frameExempt = std::max(impulseExempt, irr);
+                    const double frameExempt = impulseExempt;
                     const double effectiveGate =
                         bevelGate + (1.0 - bevelGate) * frameExempt;
                     upGate *= effectiveGate;
@@ -1050,14 +984,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             0.0, 1.0);
                     upContourGate *= bevelGate;
                     dnContourGate *= bevelGate;
-                }
-            }
-            if (rel < (int)tapLine.irrationalChroma.size()) {
-                const double irr = tapLine.irrationalChroma[rel];
-                if (irr > 0.0) {
-                    const double suppress = std::clamp(1.0 - irr, 0.0, 1.0);
-                    upContourGate *= suppress;
-                    dnContourGate *= suppress;
                 }
             }
             upPair[rel].reachGate = std::clamp(
@@ -1255,16 +1181,17 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
         // column, so cede outranks one-sided anywhere in the window.
         // Bit1 marks the drop-shadow (strong magnitude-asymmetry) islands
         // that qualify for the zero-chroma render.
+        // Per-column cede island read: no rel±4 OR window.  The prior
+        // 9-column contagion spread a single cede across eight neighbours,
+        // giving Field B's render a horizontal spatial signature — lateral
+        // influence.  Vertical-comb geometry is per-column: read this
+        // column's cede flags only.
         bool centerIsland = false;
         bool shadowIsland = false;
-        if ((int)tapLine.intrafieldRegionCede.size() >= width) {
-            const int lo = std::max(rel - 4, 0);
-            const int hi = std::min(rel + 4, width - 1);
-            for (int k = lo; k <= hi; ++k) {
-                const std::uint8_t v = tapLine.intrafieldRegionCede[k];
-                if (v & 1) centerIsland = true;
-                if (v & 2) shadowIsland = true;
-            }
+        if ((int)tapLine.intrafieldRegionCede.size() > rel) {
+            const std::uint8_t v = tapLine.intrafieldRegionCede[rel];
+            if (v & 1) centerIsland = true;
+            if (v & 2) shadowIsland = true;
         }
         if (!centerIsland && rel < (int)tapLine.intrafieldRegionReach.size()) {
             const auto &region = tapLine.intrafieldRegionReach[rel];
@@ -1576,18 +1503,34 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         std::complex<double> testZU2;
         std::complex<double> testZD2;
         if (haveSignedIQTests) {
+            // IQ RECONSTRUCTION, not lateral shape aggregation.
+            //
+            // Grid4fscIQ demod writes each sample as a SINGLE-AXIS projection
+            // of the chroma phasor: at phase 0 the I channel carries Ic and Q
+            // is ~zero, at phase 1 they swap, etc. (see comblocked.cpp Pass 3:
+            // lockedI4[rel] = source * i4Scale[phase]).  Reading iRow[rel] and
+            // qRow[rel] alone therefore yields a vector whose |Z| alternates
+            // between |Ic| and |Qc| at 2fsc — a phase-bucket ripple that
+            // Field B's downstream magnitude decisions inherit and Frame B's
+            // preclean then carries into the ±1 comb (every-2-pixel decision
+            // alternation).  The 3-tap centered on rel fills the orthogonal-
+            // axis hole using the neighbour samples' one-axis reads (constant
+            // chroma over 4 samples gives raw pattern (Ic, Qc, −Ic, −Qc); the
+            // half-weighted neighbour sum reconstructs the missing component
+            // exactly for a pure carrier phasor).  This is per-column IQ
+            // completion, not multi-column shape averaging.
             const int rm1 = reflectCombRel(rel - 1, width);
             const int rp1 = reflectCombRel(rel + 1, width);
-            auto fullSignedIQ = [&](const float *iRow, const float *qRow) {
+            auto reconstructedIQ = [&](const float *iRow, const float *qRow) {
                 return std::complex<double>(
                     static_cast<double>(iRow[rel]) +
                         0.5 * static_cast<double>(iRow[rm1] + iRow[rp1]),
                     static_cast<double>(qRow[rel]) +
                         0.5 * static_cast<double>(qRow[rm1] + qRow[rp1]));
             };
-            testZ0 = fullSignedIQ(testI0, testQ0);
-            testZU2 = fullSignedIQ(testIU2, testQU2);
-            testZD2 = fullSignedIQ(testID2, testQD2);
+            testZ0 = reconstructedIQ(testI0, testQ0);
+            testZU2 = reconstructedIQ(testIU2, testQU2);
+            testZD2 = reconstructedIQ(testID2, testQD2);
         }
 
         // Phase-flat chroma envelopes.  At 4fsc the center sample sits on one
@@ -1923,16 +1866,17 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         // toward gray — the "middle shadow").  Bit1 marks the drop-shadow
         // (strong magnitude-asymmetry) islands that qualify for the
         // zero-chroma render.
+        // Per-column cede island read: no rel±4 OR window.  The prior
+        // 9-column contagion spread a single cede across eight neighbours,
+        // giving Field B's render a horizontal spatial signature — lateral
+        // influence.  Vertical-comb geometry is per-column: read this
+        // column's cede flags only.
         bool centerIsland = false;
         bool shadowIsland = false;
-        if ((int)tapLine.intrafieldRegionCede.size() >= width) {
-            const int lo = std::max(rel - 4, 0);
-            const int hi = std::min(rel + 4, width - 1);
-            for (int k = lo; k <= hi; ++k) {
-                const std::uint8_t v = tapLine.intrafieldRegionCede[k];
-                if (v & 1) centerIsland = true;
-                if (v & 2) shadowIsland = true;
-            }
+        if ((int)tapLine.intrafieldRegionCede.size() > rel) {
+            const std::uint8_t v = tapLine.intrafieldRegionCede[rel];
+            if (v & 1) centerIsland = true;
+            if (v & 2) shadowIsland = true;
         }
         if (!centerIsland && rel < (int)tapLine.intrafieldRegionReach.size()) {
             const auto &region = tapLine.intrafieldRegionReach[rel];
@@ -2643,9 +2587,6 @@ void Comb::FrameBuffer::computeFrameBLine(
     const double *preclean0  = precleanLinePtr(line, width);
     const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
     const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
-    const float *compact0 = compactPatchGate_line(line);
-    const double *irr0 = ((int)reachTapLine.irrationalChroma.size() >= width)
-        ? reachTapLine.irrationalChroma.data() : nullptr;
 
     auto phaseCursor = [&](int ln) {
         return carrierGrammarSignedSampleCursor(
@@ -2658,8 +2599,8 @@ void Comb::FrameBuffer::computeFrameBLine(
     auto phaseDnCursor = phaseCursor(haveDnLine ? line + 1 : line);
 
     // Preclean and cached locked 1D have different scalar round-trip
-    // contracts.  Keep both cursors live so a per-pixel cede cannot desync the
-    // carrier phase of every pixel that follows it.
+    // contracts. Keep both cursors live so an explicit forced-center override
+    // cannot desync the carrier phase of every pixel that follows it.
     auto signedRemodCursor = carrierGrammarSignedSampleCursor(
         configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
         left);
@@ -2673,25 +2614,17 @@ void Comb::FrameBuffer::computeFrameBLine(
     const double combStrength =
         std::clamp(std::max(0.0, T.FRAME_B_COMB_STRENGTH), 0.0, 1.0);
     const double maxDeltaIRE = std::max(0.0, T.FRAME_B_RAW_MAX_DELTA_IRE);
-    constexpr float FRAME_B_COMPACT_PATCH_SELECT_GATE = 0.72f;
-    constexpr double FRAME_B_IRRATIONAL_SELECT_GATE = 0.0;
     static const bool forceFrameBLocked1D = [] {
         const char *s = std::getenv("LD_FRAME_B_FORCE_LOCKED_1D");
         return s && std::atoi(s) != 0;
     }();
 
-    auto cedeToLockedCenter = [&](const float *row, const double *irrRow, int x) -> bool {
-        return forceFrameBLocked1D ||
-               (irrRow && irrRow[x] > FRAME_B_IRRATIONAL_SELECT_GATE) ||
-               (row && row[x] >= FRAME_B_COMPACT_PATCH_SELECT_GATE);
-    };
-
     for (int x = 0; x < width; ++x) {
-        const bool useLockedCenter = cedeToLockedCenter(compact0, irr0, x);
+        const bool useLockedCenter = forceFrameBLocked1D;
 
         // Always consume the signed preclean cursors. Conditional consumption
         // shifts all later samples onto the wrong carrier leg after the first
-        // compact-patch cede.
+        // forced-center override.
         const std::complex<double> Z0Preclean = preclean0
             ? carrierGrammarDemodSignedCompositeTo4fsc(phase0Cursor, preclean0[x])
             : std::complex<double>(0.0, 0.0);
@@ -2740,17 +2673,30 @@ void Comb::FrameBuffer::computeFrameBLine(
                     delta *= (maxDeltaIRE / deltaIRE);
 
                 const double reachAuthority = std::clamp(wsum / 2.0, 0.0, 1.0);
+                // The ±1 comb is a PROJECTION, not a gain.  In the signed
+                // frame, vertically common alien appears anti-phase on the
+                // partners, and Zout = Z0 + p·(target−Z0) solves the two-line
+                // alternation model exactly at p = 0.5: Zout = chroma, and Y
+                // keeps its own carrier-band luma at unit gain.  p > 0.5 does
+                // not cancel harder — it re-injects the alien INVERTED at
+                // (2p−1) into chroma and overdrives near-carrier luma in Y by
+                // the same factor (the 0.80 regression: +60% luma-band gain
+                // read as "crisper" static detail and serrated the cube's
+                // diagonals while manufacturing diagonal cross-color inside
+                // the elected comb).  The 0.5 here is the projection itself;
+                // combStrength expresses a fraction of it, so overdrive past
+                // the projection is structurally inexpressible.
                 const double pull =
-                    std::clamp(combStrength * reachAuthority, 0.0, 1.0);
+                    0.5 * std::clamp(combStrength * reachAuthority, 0.0, 1.0);
                 Zout = Z0 + delta * pull;
                 if (!std::isfinite(Zout.real()) || !std::isfinite(Zout.imag()))
                     Zout = Z0;
             }
         }
 
-        // Graceful failure at highlights.  The compact/irrational cede path
-        // emits Z0 (raw locked IQ) directly, so the comb-branch finite check
-        // above never sees it; a non-finite vector on EITHER path falls back to
+        // Graceful failure at highlights. The forced-center path emits Z0
+        // (raw locked IQ) directly, so the comb-branch finite check above
+        // never sees it; a non-finite vector on EITHER path falls back to
         // the finite Field B preclean rather than propagating NaN/Inf.  No
         // magnitude clamp here: cmag(Zout) is fullSignedIQ scale (a sum of
         // three samples), not the composite-scalar scale of maxCarrierAmp, so
