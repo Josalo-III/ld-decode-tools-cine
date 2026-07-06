@@ -243,6 +243,9 @@ public:
             // N/S/E/W image neighbour; unsupported amplitude earns nothing.
             double PRODUCE_Y_HF_IMAGE_PREFERENCE_IRE = 1.5;
             double PRODUCE_Y_HF_CONTINUATION_IRE = 6.0;
+            // Carrier-basis phase is only a hygiene/tie-break term in produceY;
+            // luma image continuity owns the election.
+            double PRODUCE_Y_PHASE_PENALTY_IRE = 0.75;
             double FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG = 10.0; // clamp for neighbor IQ column phase alignment in frame candidates
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when

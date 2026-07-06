@@ -161,13 +161,17 @@ CombReachReply queryGrammarPair(const CombReachRequest &request,
     if (!request.source.scalarCarrier)
         return blockedReply(request, "not-scalar-carrier");
 
-    if (reply.carrierRelation == CarrierPhaseRelation::Same ||
-        reply.carrierRelation == CarrierPhaseRelation::Opposite)
+    const bool sameRelation =
+        reply.carrierRelation == CarrierPhaseRelation::Same;
+    const bool oppositeRelation =
+        reply.carrierRelation == CarrierPhaseRelation::Opposite;
+
+    if (sameRelation || oppositeRelation)
     {
         reply.verdict = CombReachVerdict::Green;
         reply.fastPath = true;
-        reply.allowScalarAverage = true;
-        reply.allowScalarCancel = true;
+        reply.allowScalarAverage = sameRelation;
+        reply.allowScalarCancel = oppositeRelation;
         reply.allowScalarSignCompare = true;
         reply.allowScalarMagnitudeCompare = true;
         reply.mayBecomeVideo = true;

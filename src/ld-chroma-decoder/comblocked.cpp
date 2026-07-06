@@ -2395,8 +2395,9 @@ void Comb::FrameBuffer::produceY()
             // coarse + resultHF, so the floor's contour IS the output's
             // contour. The sharp floor (lurch-snapped boxcar) is the witness's
             // contour import; the smooth floor (block-centre scaffold) is the
-            // softer baseline. All coarse reads below (this line + the ±2
-            // neighbour anchors) must use the same floor.
+            // softer baseline. All coarse reads below (this line + the
+            // regime-selected vertical neighbour anchors) must use the same
+            // floor.
             const bool useSharpCoarse =
                 coarseSharpLevel() > 0.0 && !lockedLumaSharp_flat.empty();
             auto coarseFloor_line = [&](int l) -> const double * {
@@ -2457,7 +2458,9 @@ void Comb::FrameBuffer::produceY()
             // Election tolerances (IRE -> samples).
             const double agreeTol   = 2.0 * irescale; // agreement early-out band
             const double inlierTol  = 4.0 * irescale; // medoid inlier gate
-            const double phasePenSamp = 3.0 * irescale; // capped phase penalty
+            const double phasePenSamp =
+                std::max(0.0, configuration.tunables.PRODUCE_Y_PHASE_PENALTY_IRE)
+                * irescale; // capped phase hygiene penalty
 
             // Carrier-basis window norms (constant per line: the 4-sample window
             // always spans the full set of phases regardless of start).
@@ -2530,62 +2533,73 @@ void Comb::FrameBuffer::produceY()
                 return std::clamp(1.0 - carrierE / (nrm + 1e-9), 0.0, 1.0);
             };
 
-            // Vertical (±2 line, same-field) neighbour rows for the anchor. The
-            // candidate sources are all precomputed before produceY, so reading
-            // other lines is order-independent. Lateral (±1 sample) neighbours
-            // use the current-line rows. ±2 (not ±1) keeps the neighbour in the
-            // same field, free of interfield comb-phase confusion.
             const bool coarseLines = lockedLumaCacheValid && demodWidth == width;
-            const int lineN = line - 2, lineS = line + 2;
-            const bool haveN = coarseLines && lineN >= firstLine &&
-                               lineN < lastLine && lineN < demodLines;
-            const bool haveS = coarseLines && lineS >= firstLine &&
-                               lineS < lastLine && lineS < demodLines;
-            const quint16 *rawN = haveN ? rawbuffer.data() + lineN * fullWidth : nullptr;
-            const quint16 *rawS = haveS ? rawbuffer.data() + lineS * fullWidth : nullptr;
-            const double *ccN  = (haveN && residualVideo) ? lockedCarrierComposite_line(lineN) : nullptr;
-            const double *ccS  = (haveS && residualVideo) ? lockedCarrierComposite_line(lineS) : nullptr;
-            const double *clpN = haveN ? clpbuffer[srcBuf].pixel[lineN] : nullptr;
-            const double *clpS = haveS ? clpbuffer[srcBuf].pixel[lineS] : nullptr;
-            const float *retN  = haveN ? carrierRetracted_line(lineN) : nullptr;
-            const float *retS  = haveS ? carrierRetracted_line(lineS) : nullptr;
-            const double *coaN = haveN ? coarseFloor_line(lineN) : nullptr;
-            const double *coaS = haveS ? coarseFloor_line(lineS) : nullptr;
-            const double *baseN = haveN ? baseY4_line(lineN) : nullptr;
-            const double *baseS = haveS ? baseY4_line(lineS) : nullptr;
-            const float *tiN = haveN ? demodTI_line(lineN) : nullptr;
-            const float *tqN = haveN ? demodTQ_line(lineN) : nullptr;
-            const float *tiS = haveS ? demodTI_line(lineS) : nullptr;
-            const float *tqS = haveS ? demodTQ_line(lineS) : nullptr;
-            std::vector<double> coherentCarrierNVec;
-            std::vector<double> coherentCarrierSVec;
-            const double *cohN = nullptr;
-            const double *cohS = nullptr;
-            if (haveN && rawN && baseN && tiN && tqN) {
-                coherentCarrierNVec.assign(width, 0.0);
-                buildCoherentCarrierEstimateRow(
-                    lineN, rawN, baseN, tiN, tqN, coherentCarrierNVec.data());
-                cohN = coherentCarrierNVec.data();
-            }
-            if (haveS && rawS && baseS && tiS && tqS) {
-                coherentCarrierSVec.assign(width, 0.0);
-                buildCoherentCarrierEstimateRow(
-                    lineS, rawS, baseS, tiS, tqS, coherentCarrierSVec.data());
-                cohS = coherentCarrierSVec.data();
-            }
+            struct ProduceYNeighborRows {
+                int line = -1;
+                bool have = false;
+                const quint16 *raw = nullptr;
+                const double *cc = nullptr;
+                const double *clp = nullptr;
+                const float *ret = nullptr;
+                const double *coarse = nullptr;
+                const double *base = nullptr;
+                const double *coh = nullptr;
+                const CombCarrierGrammar *grammar = nullptr;
+                std::vector<double> coherentCarrier;
+            };
+            auto makeNeighborRows = [&](int l) {
+                ProduceYNeighborRows n;
+                n.line = l;
+                n.have = coarseLines && l >= firstLine &&
+                         l < lastLine && l < demodLines;
+                if (!n.have) return n;
+                n.raw = rawbuffer.data() + l * fullWidth;
+                n.cc = residualVideo ? lockedCarrierComposite_line(l) : nullptr;
+                n.clp = clpbuffer[srcBuf].pixel[l];
+                n.ret = carrierRetracted_line(l);
+                n.coarse = coarseFloor_line(l);
+                n.base = baseY4_line(l);
+                n.grammar = carrierGrammarLine(l);
+                const float *ti = demodTI_line(l);
+                const float *tq = demodTQ_line(l);
+                if (n.raw && n.base && ti && tq) {
+                    n.coherentCarrier.assign(width, 0.0);
+                    buildCoherentCarrierEstimateRow(
+                        l, n.raw, n.base, ti, tq, n.coherentCarrier.data());
+                    n.coh = n.coherentCarrier.data();
+                }
+                return n;
+            };
+            ProduceYNeighborRows north1 = makeNeighborRows(line - 1);
+            ProduceYNeighborRows south1 = makeNeighborRows(line + 1);
+            ProduceYNeighborRows north2 = makeNeighborRows(line - 2);
+            ProduceYNeighborRows south2 = makeNeighborRows(line + 2);
 
-            // Grammar-legal ±2 relation, hoisted per line (h cancels in the
-            // signed sample class).  A same-field ±2 line pair alternates on
-            // a KNOWN schedule, not a geometric accident; corroborating
-            // retracted HF across the pair is only meaningful where the
-            // grammar certifies a legal Same/Opposite relation.  Where the
-            // schedule says Other/Unknown the two lines are not phase-
-            // comparable and their "agreement" is noise.  This is the comb
-            // consulting the carrier schedule rather than rediscovering it.
-            const CombCarrierGrammar *gN =
-                haveN ? carrierGrammarLine(lineN) : nullptr;
-            const CombCarrierGrammar *gS =
-                haveS ? carrierGrammarLine(lineS) : nullptr;
+            // Regime-sensitive vertical anchors. Frame/progressive evidence
+            // uses adjacent picture lines (±1); field/interlace evidence uses
+            // same-field neighbours (±2). FVF can vary this per pixel.
+            const bool variantFrameRegime =
+                configuration.twoDVariant ==
+                    Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
+                configuration.twoDVariant ==
+                    Comb::Configuration::TwoDVariant::FrameBDirectIQ;
+            const bool variantFvf =
+                configuration.twoDVariant ==
+                    Comb::Configuration::TwoDVariant::FieldVsFrame;
+            const bool haveFvfLine =
+                line >= 0 && line < (int)fvfMetrics.size() &&
+                (int)fvfMetrics[line].size() >= width;
+            auto verticalStepAt = [&](int xi) {
+                if (variantFvf && haveFvfLine)
+                    return fvfMetrics[line][xi].frameModel ? 1 : 2;
+                return variantFrameRegime ? 1 : 2;
+            };
+            auto northRowsForStep = [&](int step) -> const ProduceYNeighborRows& {
+                return (step == 1) ? north1 : north2;
+            };
+            auto southRowsForStep = [&](int step) -> const ProduceYNeighborRows& {
+                return (step == 1) ? south1 : south2;
+            };
             auto legalRel = [&](const CombCarrierGrammar *gNbr) {
                 if (!grammarLine || !gNbr)
                     return false;
@@ -2594,8 +2608,6 @@ void Comb::FrameBuffer::produceY()
                 return rel == lddecode::CarrierPhaseRelation::Same ||
                        rel == lddecode::CarrierPhaseRelation::Opposite;
             };
-            const bool relLegalN = legalRel(gN);
-            const bool relLegalS = legalRel(gS);
 
             // Robust HF at a neighbour pixel: median of that pixel's complete
             // luma planes (comb, retracted) minus its own coarse.
@@ -2712,6 +2724,19 @@ void Comb::FrameBuffer::produceY()
                     continue;
                 }
                 const double coarse = coarseRow[xi];
+                const int verticalStep = verticalStepAt(xi);
+                const ProduceYNeighborRows &northRows =
+                    northRowsForStep(verticalStep);
+                const ProduceYNeighborRows &southRows =
+                    southRowsForStep(verticalStep);
+                const bool requireVerticalCarrierRelation =
+                    (verticalStep == 2);
+                const bool relLegalN =
+                    !requireVerticalCarrierRelation ||
+                    legalRel(northRows.grammar);
+                const bool relLegalS =
+                    !requireVerticalCarrierRelation ||
+                    legalRel(southRows.grammar);
 
                 auto feasible = [&](double y) {
                     const double c = rawH - y;
@@ -2742,14 +2767,14 @@ void Comb::FrameBuffer::produceY()
                     // that is a confidence measure vetoing geometry, which
                     // the election forbids.
                     //
-                    // The separator is SPATIAL COHERENCE.  Real structure
-                    // agrees with its same-field +/-2 neighbours in HF (the
-                    // cube grid is 2D-continuous; +/-2 stays in-field so its
-                    // carrier phase family is consistent).  Per-pixel texture
-                    // noise agrees with neither.  So: a clean fit is admitted
-                    // outright; a conflicted fit is admitted only when its HF
-                    // is corroborated by a neighbour.  Feasibility remains the
-                    // only true DQ.
+                    // The separator is SPATIAL COHERENCE. Real structure
+                    // agrees with its regime-appropriate vertical neighbours:
+                    // frame/progressive uses adjacent picture lines (±1),
+                    // field/interlace uses same-field partners (±2). Per-pixel
+                    // texture noise agrees with neither. So: a clean fit is
+                    // admitted outright; a conflicted fit is admitted only when
+                    // its HF is corroborated by a neighbour. Feasibility
+                    // remains the only true DQ.
                     const double r = retractedRow ? (double)retractedRow[xi] : combY;
                     const double ry = std::isfinite(r) ? r : combY;
                     bool retractedAdmitted =
@@ -2763,8 +2788,8 @@ void Comb::FrameBuffer::produceY()
                     // inversion — structurally not carrier, hence luma.
                     // retractedY is the plane that keeps it as luma, and it
                     // is exactly the line-pitch detail (Borg-cube grid) that
-                    // the ±2-agreement corroboration below can never certify,
-                    // because that detail IS the ±2 disagreement.
+                    // a same-field agreement check can never certify, because
+                    // that detail IS the same-field disagreement.
                     if (!retractedAdmitted && alienRow && alienRow[xi] > 0.5f)
                         retractedAdmitted = true;
                     // Same law from the analysis-time registration, which
@@ -2777,20 +2802,24 @@ void Comb::FrameBuffer::produceY()
                     if (!retractedAdmitted && retractedAdmitSpatial &&
                         retractedRow && std::isfinite(r)) {
                         const double rHF = r - coarse;
-                        // Corroborate only across grammar-legal ±2 partners:
-                        // the schedule certifies these lines are phase-
-                        // comparable, so matched HF is real structure, not
-                        // an accident of geometry.
-                        if (relLegalN && retN && coaN) {
+                        // Frame/progressive vertical checks are luma-image
+                        // checks and do not require carrier grammar. Field/
+                        // interlace checks use ±2 same-field partners; there
+                        // the schedule must certify phase-comparable lines
+                        // before matched HF is accepted as structure.
+                        if (relLegalN && northRows.ret && northRows.coarse) {
                             const double nHF =
-                                (double)retN[xi] - coaN[xi];
+                                (double)northRows.ret[xi] -
+                                northRows.coarse[xi];
                             if (std::isfinite(nHF) &&
                                 std::fabs(rHF - nHF) <= inlierTol)
                                 retractedAdmitted = true;
                         }
-                        if (!retractedAdmitted && relLegalS && retS && coaS) {
+                        if (!retractedAdmitted && relLegalS &&
+                            southRows.ret && southRows.coarse) {
                             const double sHF =
-                                (double)retS[xi] - coaS[xi];
+                                (double)southRows.ret[xi] -
+                                southRows.coarse[xi];
                             if (std::isfinite(sHF) &&
                                 std::fabs(rHF - sHF) <= inlierTol)
                                 retractedAdmitted = true;
@@ -2863,10 +2892,10 @@ void Comb::FrameBuffer::produceY()
                 // Single self-anchor: medoid of the inlier HFs (mode 6).
                 const double selfAnchor = medoidD(inHF, nIn);
 
-                // Four independent image neighbours (N/S at ±2 same-field
-                // lines, E/W at ±1 sample).  Keep them separate: a line or edge
-                // may continue in one direction while legitimately crossing a
-                // transition in another.
+                // Four independent image neighbours (N/S at regime-sensitive
+                // vertical step, E/W at ±1 sample). Keep them separate: a line
+                // or edge may continue in one direction while legitimately
+                // crossing a transition in another.
                 double dirHF[4], dirImageHF[4]; int nDir = 0;
                 auto appendDirection = [&](const quint16 *rawP,
                                            const double *ccP,
@@ -2887,10 +2916,12 @@ void Comb::FrameBuffer::produceY()
                         ++nDir;
                     }
                 };
-                appendDirection(rawN, ccN, clpN, retN, cohN,
-                                coaN, baseN, h);
-                appendDirection(rawS, ccS, clpS, retS, cohS,
-                                coaS, baseS, h);
+                appendDirection(northRows.raw, northRows.cc, northRows.clp,
+                                northRows.ret, northRows.coh,
+                                northRows.coarse, northRows.base, h);
+                appendDirection(southRows.raw, southRows.cc, southRows.clp,
+                                southRows.ret, southRows.coh,
+                                southRows.coarse, southRows.base, h);
                 if (h - 1 >= left)
                     appendDirection(rawLine, carrierComp, clpLine,
                                     retractedRow, coherentCarrierRow,

@@ -426,14 +426,14 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                      tapLine.haveU2,
                      tapLine.pairU2,
                      scalarSource,
-                     lddecode::CombReachUse::FieldScalarAverage);
+                     lddecode::CombReachUse::FieldScalarCancel);
 
             fillPair(tapLine.tapD2,
                      tapLine.lnD2,
                      tapLine.haveD2,
                      tapLine.pairD2,
                      scalarSource,
-                     lddecode::CombReachUse::FieldScalarAverage);
+                     lddecode::CombReachUse::FieldScalarCancel);
         }
     }
 
@@ -1626,35 +1626,6 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         if (rel < (int)tapLine.pairD2.size())
             wDn *= tapLine.pairD2[rel].reachGate;
 
-        // Grammar authority over the demod-magnitude penalty.
-        //
-        // kp/kn disengage a leg whose demodulated magnitude differs from
-        // center.  That magnitude is the demod's chroma READING; on fine luma
-        // detail (the Borg cube grid) the reading is a misread -- luma whose
-        // spatial frequency lands in the subcarrier band, which the demod
-        // reports as chroma amplitude.  Because the luma detail swings line to
-        // line, the misread magnitude swings with it, so the penalty
-        // consistently cedes (the zipper fix d6aa058 made the penalty
-        // phase-flat, hence consistent).  But that swing is exactly the parser
-        // mistaking luma for a chroma-content change -- the error this whole
-        // path exists to correct.  The region grammar has already identified
-        // the pair as luma the comb should cancel (SameRegion / AlienCancel),
-        // so refuse to repeat the parser's mistake: restore the full legal comb
-        // weight.  Boundaries (DifferentRegion / strongAsym) never reach this
-        // branch and keep their graded weight, and the grammar verdict is built
-        // from phase-flat smoothed IQ, so the carrier-rate zipper does not
-        // return.
-        if (rel < (int)tapLine.intrafieldRegionReach.size()) {
-            const auto &region = tapLine.intrafieldRegionReach[rel];
-            const auto Same  = CombContentReach::RegionRelation::SameRegion;
-            const auto Alien = CombContentReach::RegionRelation::AlienCancel;
-            if (region.up == Same || region.up == Alien)
-                wUp = (rel < (int)tapLine.pairU2.size())
-                    ? tapLine.pairU2[rel].reachGate : 1.0;
-            if (region.down == Same || region.down == Alien)
-                wDn = (rel < (int)tapLine.pairD2.size())
-                    ? tapLine.pairD2[rel].reachGate : 1.0;
-        }
 
         double lumaEdgeUp = 0.0;
         double lumaEdgeDn = 0.0;
@@ -1713,6 +1684,29 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         // (rho ~ 1 for anti-aligned partners), ceding vertically coherent
         // cross-color to 1D where it rendered as a line-alternating
         // rainbow in the thigh-gap shadow.
+        bool regionValid = false;
+        bool upSameRegion = false;
+        bool downSameRegion = false;
+        bool upAlienRegion = false;
+        bool downAlienRegion = false;
+        bool upDifferentRegion = false;
+        bool downDifferentRegion = false;
+        if (rel < (int)tapLine.intrafieldRegionReach.size()) {
+            const auto &region = tapLine.intrafieldRegionReach[rel];
+            regionValid = region.valid;
+            upSameRegion =
+                region.up == CombContentReach::RegionRelation::SameRegion;
+            downSameRegion =
+                region.down == CombContentReach::RegionRelation::SameRegion;
+            upAlienRegion =
+                region.up == CombContentReach::RegionRelation::AlienCancel;
+            downAlienRegion =
+                region.down == CombContentReach::RegionRelation::AlienCancel;
+            upDifferentRegion =
+                region.up == CombContentReach::RegionRelation::DifferentRegion;
+            downDifferentRegion =
+                region.down == CombContentReach::RegionRelation::DifferentRegion;
+        }
 
         double boundaryCede = 0.0;
 
@@ -1783,15 +1777,14 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                          (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
                          (bestDiffIRE < 5.0 && kRatio < 0.45));
 
-                    // One-sided boundary survival is a claim about the
-                    // preferred leg, so its color credibility must be the
-                    // preferred pair's, not the center's.
-                    const double credibleColorT =
-                        (preferUp ? chromaTUp : chromaTDn) *
-                        (1.0 - std::max(lumaEdgeUp, lumaEdgeDn));
-
+                    // One-sided boundary survival is a grammar verdict, not a
+                    // magnitude/edge verdict: the preferred side must be the
+                    // center's carrier-region continuation and the other side
+                    // must be a carrier-region break.
                     const bool allowOneSidedBoundary =
-                        (credibleColorT >= 0.45);
+                        regionValid &&
+                        ((preferUp && upSameRegion && downDifferentRegion) ||
+                         (!preferUp && downSameRegion && upDifferentRegion));
 
                     if ((hardPreferUp || hardPreferDn) && !allowOneSidedBoundary) {
                         wUp = 0.0;
@@ -1879,25 +1872,24 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             if (v & 2) shadowIsland = true;
         }
         if (!centerIsland && rel < (int)tapLine.intrafieldRegionReach.size()) {
-            const auto &region = tapLine.intrafieldRegionReach[rel];
-            if (region.valid) {
-                const bool upDifferent = region.up ==
-                    CombContentReach::RegionRelation::DifferentRegion;
-                const bool downDifferent = region.down ==
-                    CombContentReach::RegionRelation::DifferentRegion;
-                const bool upSame = region.up ==
-                    CombContentReach::RegionRelation::SameRegion;
-                const bool downSame = region.down ==
-                    CombContentReach::RegionRelation::SameRegion;
-
-                if (downDifferent && upSame) {
+            if (regionValid) {
+                if (downDifferentRegion && upSameRegion) {
                     wDn = 0.0;
                     reason = FieldBReasonBoundaryUp;
-                } else if (upDifferent && downSame) {
+                } else if (upDifferentRegion && downSameRegion) {
                     wUp = 0.0;
                     reason = FieldBReasonBoundaryDown;
                 }
             }
+        }
+        if (regionValid) {
+            // AlienCancel is a cancellation partner, not a one-sided region
+            // continuation. It can participate in a two-leg comb, but by
+            // itself it is only evidence that 1D misread luma as carrier.
+            if (upAlienRegion && !(downSameRegion || downAlienRegion))
+                wUp = 0.0;
+            if (downAlienRegion && !(upSameRegion || upAlienRegion))
+                wDn = 0.0;
         }
 
         double sc = 1.0;
@@ -1915,15 +1907,25 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 ? FieldBReasonCenterIsland
                 : FieldBReasonBoundaryCede;
         } else if (wUp > 0.0 || wDn > 0.0) {
-            // Test: sideline the weak-leg floor so Field B can fully express
-            // one-sided evidence on the stubborn Paramount zipper.
+            const bool haveUpLeg = wUp > 0.0;
+            const bool haveDnLeg = wDn > 0.0;
+
+            if (haveUpLeg && haveDnLeg)
+                softenDominantWeights(wUp, wDn);
 
             const double denom = wUp + wDn;
 
             if (denom > 1e-9) {
-                sc = 2.0 / denom;
-                if (sc < 1.0)
+                // A same-field Field B answer is a two-leg model. If only one
+                // leg survives, keep its authority partial; do not normalize a
+                // single carrier-region fact into a full two-leg cancellation.
+                if (wUp > 0.0 && wDn > 0.0) {
+                    sc = 2.0 / denom;
+                    if (sc < 1.0)
+                        sc = 1.0;
+                } else {
                     sc = 1.0;
+                }
 
                 haveAnswer = true;
             } else {
@@ -2020,6 +2022,27 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             tc  = (C - Cup) * wUp * sc;
             tc += (C - Cdn) * wDn * sc;
             tc *= 0.25;
+
+            // Arithmetic invariant, not a chroma detector: Field B's cancel
+            // render is a convex combination of C and participating
+            // carrier-aligned neighbours (-Cup/-Cdn). When reach is partial,
+            // the missing authority is neutral zero. Do not let a bad leg or
+            // stale normalization synthesize a scalar outside that envelope.
+            {
+                double lo = C;
+                double hi = C;
+                auto include = [&](double v) {
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                };
+                if (wUp > 0.0) include(-Cup);
+                if (wDn > 0.0) include(-Cdn);
+                const double coeffSum = 0.5 * sc * (wUp + wDn);
+                if (coeffSum < 1.0 - 1e-9)
+                    include(0.0);
+                if (std::isfinite(tc))
+                    tc = std::clamp(tc, lo, hi);
+            }
 
             // Luma-only contour guard.
             //
