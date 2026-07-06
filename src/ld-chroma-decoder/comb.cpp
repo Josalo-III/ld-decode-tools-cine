@@ -2067,34 +2067,6 @@ void Comb::FrameBuffer::split2D()
 
     std::vector<std::complex<double>> frameIQ;
     std::vector<std::complex<double>> frameAIQ;
-
-    // Disposable Field-B render probe (LDCD_DUMP_FIELDB). Only meaningful when
-    // Field B is the rendered plane (--two-d-variant fieldb): it answers, at the
-    // strong carrier-band pixels the cube lives in, whether Field B COMBS them
-    // (Blend -> vertical low-pass) or CEDES them to 1D, and for the combed ones
-    // whether the +/-2 legs are luma-identical (comb cancels -> sharp) or differ
-    // (comb blurs -> soft). Env-gated, no picture effect, remove when done.
-    const bool dumpFieldB =
-        std::getenv("LDCD_DUMP_FIELDB") != nullptr &&
-        configuration.twoDVariant ==
-            Comb::Configuration::TwoDVariant::FieldBSimple;
-    long fbReason[9] = {0};
-    long fbReasonStrong[9] = {0};
-    long fbStrongTot = 0;
-    long fbStrongBlendTot = 0;
-    double fbStrongBlendDeltaSum = 0.0;
-    long fbStrongBlendDeltaHist[6] = {0}; // <2,2-4,4-6,6-10,10-14,>=14 IRE
-    // Region-reach verdict at strong pixels (0=Unknown,1=Same,2=Different,
-    // 3=AlienCancel), per leg, + the windowed cede flag. This proves whether a
-    // soft cube is being CEDED on a Different verdict the AlienCancel exemption
-    // should have caught ("bad reach"), vs correctly combed (Same/AlienCancel).
-    long fbStrongRegionUp[4] = {0};
-    long fbStrongRegionDn[4] = {0};
-    long fbStrongCedeFlag = 0;   // bit0 set
-    long fbStrongShadowFlag = 0; // bit1 set
-    std::vector<std::uint8_t> fbReasonScratch;
-    if (dumpFieldB) fbReasonScratch.assign(width, 0);
-
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
@@ -2121,58 +2093,10 @@ void Comb::FrameBuffer::split2D()
                 computeFieldBLine(tapLine,
                                        scratch_lineWorkC.data(),
                                        writeWeights ? fieldBDecisionReason_line(line)
-                                                    : (dumpFieldB ? fbReasonScratch.data()
-                                                                  : nullptr));
+                                                    : nullptr);
             }
         } else {
             std::fill(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, 0.0);
-        }
-
-        // Field-B render probe tally (see LDCD_DUMP_FIELDB above). Runs only in
-        // FieldBSimple mode where the compute above populated fbReasonScratch.
-        if (dumpFieldB && (combTapBuildFlags_ & TapBuildFieldB) &&
-            !precleanLinePtr(line, width)) {
-            for (int rel = 0; rel < width && rel < (int)tapLine.tap0.size(); ++rel) {
-                const double mag = std::hypot(tapLine.tap0[rel].comp,
-                                              tapLine.tap0[rel].symMag) * invIreScale;
-                const std::uint8_t rc = fbReasonScratch[rel];
-                if (rc < 9) ++fbReason[rc];
-                if (mag >= 10.0) {
-                    ++fbStrongTot;
-                    if (rc < 9) ++fbReasonStrong[rc];
-                    if (rel < (int)tapLine.intrafieldRegionReach.size()) {
-                        auto relIdx = [](CombContentReach::RegionRelation r) {
-                            switch (r) {
-                            case CombContentReach::RegionRelation::SameRegion: return 1;
-                            case CombContentReach::RegionRelation::DifferentRegion: return 2;
-                            case CombContentReach::RegionRelation::AlienCancel: return 3;
-                            default: return 0;
-                            }
-                        };
-                        const auto &rg = tapLine.intrafieldRegionReach[rel];
-                        ++fbStrongRegionUp[relIdx(rg.up)];
-                        ++fbStrongRegionDn[relIdx(rg.down)];
-                    }
-                    if (rel < (int)tapLine.intrafieldRegionCede.size()) {
-                        const std::uint8_t f = tapLine.intrafieldRegionCede[rel];
-                        if (f & 1) ++fbStrongCedeFlag;
-                        if (f & 2) ++fbStrongShadowFlag;
-                    }
-                    if (rc == FieldBReasonBlend &&
-                        rel < (int)tapLine.coarse0IRE.size() &&
-                        rel < (int)tapLine.coarseU2IRE.size() &&
-                        rel < (int)tapLine.coarseD2IRE.size()) {
-                        const double dv = std::max(
-                            std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]),
-                            std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]));
-                        fbStrongBlendDeltaSum += dv;
-                        ++fbStrongBlendTot;
-                        const int b = dv < 2.0 ? 0 : dv < 4.0 ? 1 : dv < 6.0 ? 2
-                                    : dv < 10.0 ? 3 : dv < 14.0 ? 4 : 5;
-                        ++fbStrongBlendDeltaHist[b];
-                    }
-                }
-            }
         }
 
         if (needFrameIQCompute) {
@@ -2312,37 +2236,6 @@ void Comb::FrameBuffer::split2D()
         }
     }
 
-    if (dumpFieldB) {
-        static const char *rn[9] = {
-            "None", "Blend", "BoundUp", "BoundDn", "Cede",
-            "RevCoarse", "RevScalar", "Center", "CenterIsl"};
-        long total = 0;
-        for (int i = 0; i < 9; ++i) total += fbReason[i];
-        std::fprintf(stderr,
-            "[FIELDB] total=%ld  ", total);
-        for (int i = 0; i < 9; ++i)
-            if (fbReason[i]) std::fprintf(stderr, "%s=%ld ", rn[i], fbReason[i]);
-        std::fprintf(stderr, "\n[FIELDB]   strong(>=10IRE) tot=%ld  ",
-                     fbStrongTot);
-        for (int i = 0; i < 9; ++i)
-            if (fbReasonStrong[i])
-                std::fprintf(stderr, "%s=%ld ", rn[i], fbReasonStrong[i]);
-        const double meanDv =
-            fbStrongBlendTot > 0 ? fbStrongBlendDeltaSum / fbStrongBlendTot : 0.0;
-        std::fprintf(stderr,
-            "\n[FIELDB]   strong+Blend tot=%ld meanVertDeltaIRE=%.2f  "
-            "hist[<2,2-4,4-6,6-10,10-14,>=14]=%ld,%ld,%ld,%ld,%ld,%ld\n",
-            fbStrongBlendTot, meanDv,
-            fbStrongBlendDeltaHist[0], fbStrongBlendDeltaHist[1],
-            fbStrongBlendDeltaHist[2], fbStrongBlendDeltaHist[3],
-            fbStrongBlendDeltaHist[4], fbStrongBlendDeltaHist[5]);
-        std::fprintf(stderr,
-            "[FIELDB]   strong region up[Unk,Same,Diff,Alien]=%ld,%ld,%ld,%ld "
-            "dn=%ld,%ld,%ld,%ld cedeFlag=%ld shadowFlag=%ld\n",
-            fbStrongRegionUp[0], fbStrongRegionUp[1], fbStrongRegionUp[2], fbStrongRegionUp[3],
-            fbStrongRegionDn[0], fbStrongRegionDn[1], fbStrongRegionDn[2], fbStrongRegionDn[3],
-            fbStrongCedeFlag, fbStrongShadowFlag);
-    }
 }
 
 // 3D temporal adaptive
@@ -2900,16 +2793,10 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
         // stores zero-centred U/V in signal units, not unsigned 16-bit YUV;
         // writing literal 16-bit values here drove both chroma axes strongly
         // positive and collapsed every reason into the same magenta image.
-        const std::array<FrameCanvas::Colour, 9> reasonShades = {{
+        const std::array<FrameCanvas::Colour, FieldBReasonCount> reasonShades = {{
             canvas.rgb(0x8080, 0x8080, 0x8080), // none: gray
             canvas.rgb(0x0000, 0xFFFF, 0xFFFF), // blend: cyan
-            canvas.rgb(0x3030, 0x5050, 0xFFFF), // boundary up: blue
-            canvas.rgb(0xFFFF, 0x8080, 0x0000), // boundary down: orange
-            canvas.rgb(0x0000, 0xA0A0, 0x9090), // boundary cede: teal
-            canvas.rgb(0x0000, 0xFFFF, 0x4040), // coarse revive: green
-            canvas.rgb(0xFFFF, 0x2020, 0x2020), // scalar revive: red
-            canvas.rgb(0x3030, 0x3030, 0x3030), // center / no answer: dark
-            canvas.rgb(0xFFFF, 0xFFFF, 0xFFFF)  // center island: white
+            canvas.rgb(0x3030, 0x3030, 0x3030)  // center / no answer: dark
         }};
 
         const int firstLine = videoParameters.firstActiveFrameLine;

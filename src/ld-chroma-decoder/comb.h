@@ -453,17 +453,12 @@ private:
 		double dnInfluence = 0.0;
 	};
 
-	enum FieldBDecisionReason : std::uint8_t {
-		FieldBReasonNone = 0,
-		FieldBReasonBlend = 1,
-		FieldBReasonBoundaryUp = 2,
-		FieldBReasonBoundaryDown = 3,
-		FieldBReasonBoundaryCede = 4,
-		FieldBReasonReviveCoarse = 5,
-		FieldBReasonReviveScalar = 6,
-		FieldBReasonCenter = 7,
-		FieldBReasonCenterIsland = 8
-	};
+		enum FieldBDecisionReason : std::uint8_t {
+			FieldBReasonNone = 0,
+			FieldBReasonBlend = 1,
+			FieldBReasonCenter = 2,
+			FieldBReasonCount = 3
+		};
 
 	// Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
 	// collection and reusable geometry facts only; each comb remains a
@@ -491,18 +486,19 @@ private:
 		std::vector<CombTapScalar> tapU2;
 		std::vector<CombTapScalar> tapD2;
 		std::vector<CombTapScalar> tapU4;
-		std::vector<CombTapScalar> tapD4;
-		std::vector<double> centerEnvelope;
-		std::vector<double> centerChromaT;
+			std::vector<CombTapScalar> tapD4;
+			std::vector<double> centerEnvelope;
+			// Carrier amplitude interpreted as chroma only after the center sample
+			// has been admitted by schedule conformance.
+			std::vector<double> centerAdmittedChromaT;
 		std::vector<CombTapPair> pairU1;
 		std::vector<CombTapPair> pairD1;
 		std::vector<CombTapPair> pairU2;
 		std::vector<CombTapPair> pairD2;
-		std::vector<CombContentReach::IntrafieldRegionReach> intrafieldRegionReach;
-		// Raw no-valid-partner cede flag per pixel (a Different leg with no
-		// positively same-region partner).  Consumers OR a small horizontal
-		// window over this so three-region cedes (drop shadows) hold a
-		// uniform height instead of flickering column to column.
+			std::vector<CombContentReach::IntrafieldRegionReach> intrafieldRegionReach;
+			// Raw no-valid-partner cede flag per pixel (a Different leg with no
+			// positively same-region partner). Consumers keep it per-column so a
+			// slanted boundary does not acquire a horizontal staircase footprint.
 		std::vector<std::uint8_t> intrafieldRegionCede;
 		// Per-pixel ±4 region verdicts (center vs ±4 same-field partner).
 		// Evaluated alongside the ±2 intrafieldRegionReach in
@@ -569,16 +565,16 @@ private:
 	// measurePostCombImpurity() unions the elected-comb reading with that sharp
 	// pre-comb warning rather than erasing it.
 	std::vector<float> carrierImpurity_flat;
-	// Same-region vertical partner evidence [0,1] per pixel: 1 when a ±2
-	// grammar-legal partner positively shares this pixel's chroma region
-	// (relation-signed hue agreement above the chroma floor).  Discriminates
+	// Same-region vertical partner evidence [0,1] per pixel: 1 when two
+	// schedule-admitted carrier operands positively share a ±2 chroma region
+	// (relation-signed hue agreement above the amplitude floor).  Discriminates
 	// a real chroma-region boundary from cross-color — both fail interline
 	// verification, so gA alone cannot tell them apart.  Evidence only; the
 	// suppression policy converts it at the consumption sites.
 	std::vector<float> regionSamePartner_flat;
-	// Schedule-illegal (alien) vertical partner evidence [0,1] per pixel: 1
-	// when a ±2 grammar-legal partner is ANTI-aligned at comparable magnitude
-	// after relation signing — raw-identical content where the carrier
+	// Schedule-rejected (alien) vertical partner evidence [0,1] per pixel: 1
+	// when a negatively conforming operand is ANTI-aligned at comparable
+	// magnitude after relation signing — raw-identical content where the carrier
 	// schedule demands inversion.  Legal carrier MUST invert per the lineFlip
 	// schedule; energy that fails the schedule is structurally not carrier
 	// and therefore luma by law (near-carrier periodic luma: the Borg-cube

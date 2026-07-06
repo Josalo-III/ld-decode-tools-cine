@@ -1390,14 +1390,14 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     // Trailing pass: ±2 vertical partner evidence, computed once the IQ
     // caches above are complete for every line.  Two verdicts per pixel:
     //
-    //   SAME  — a grammar-legal partner positively shares this pixel's
-    //           chroma region (relation-signed hue agreement above the
-    //           chroma floor).  A real chroma-region boundary and
+    //   SAME  — two schedule-admitted carrier operands positively share this
+    //           pixel's chroma region (relation-signed hue agreement above
+    //           the chroma floor).  A real chroma-region boundary and
     //           cross-color both fail interline carrier verification, so
     //           the gA detector alone cannot tell them apart; this is the
     //           discriminator.  Consumed by the suppression alpha.
     //
-    //   ALIEN — a grammar-legal partner is ANTI-aligned at comparable
+    //   ALIEN — a negatively conforming operand is ANTI-aligned at comparable
     //           magnitude after relation signing: raw-identical content
     //           where the carrier schedule demands inversion.  Legal
     //           carrier MUST invert per the lineFlip schedule; energy that
@@ -1432,7 +1432,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
             const float *i0 = locked1DTI4fsc_line(line);
             const float *q0 = locked1DTQ4fsc_line(line);
-            if (!i0 || !q0)
+            const auto *analysis0 = carrierAnalysis_line(line);
+            if (!i0 || !q0 || !analysis0)
                 continue;
 
             auto legSign = [&](int target) -> double {
@@ -1459,6 +1460,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 ? locked1DTI4fsc_line(line + 2) : nullptr;
             const float *qDn = (sDn != 0.0)
                 ? locked1DTQ4fsc_line(line + 2) : nullptr;
+            const auto *analysisUp = (sUp != 0.0)
+                ? carrierAnalysis_line(line - 2) : nullptr;
+            const auto *analysisDn = (sDn != 0.0)
+                ? carrierAnalysis_line(line + 2) : nullptr;
             if (!iUp && !iDn)
                 continue;
 
@@ -1491,23 +1496,34 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 // degrees at comparable magnitude (weak side >= 0.6 of the
                 // strong side).
                 auto partnerClass = [&](const float *iR, const float *qR,
+                                        const lddecode::CarrierAnalysisRecord *legAnalysis,
                                         double s) -> int {
-                    if (!iR)
+                    if (!iR || !legAnalysis)
                         return 0;
                     const std::complex<double> zl = s * fullIQ(iR, qR);
                     const double ml = std::abs(zl);
                     if (ml < chromaFloor)
                         return 0;
                     const double dot = std::real(z0 * std::conj(zl));
-                    if (dot >= kSameHueCos * m0 * ml)
+                    const double centerTrust = lddecode::carrierTrust(
+                        analysis0[rel].carrierConformance,
+                        analysis0[rel].conformanceConfidence);
+                    const double legTrust = lddecode::carrierTrust(
+                        legAnalysis[rel].carrierConformance,
+                        legAnalysis[rel].conformanceConfidence);
+                    const bool centerCarrier = centerTrust > 0.5;
+                    const bool legCarrier = legTrust > 0.5;
+                    const bool rejected = centerTrust < 0.5 || legTrust < 0.5;
+                    if (centerCarrier && legCarrier &&
+                        dot >= kSameHueCos * m0 * ml)
                         return 1;
-                    if (dot <= kAlienHueCos * m0 * ml &&
+                    if (rejected && dot <= kAlienHueCos * m0 * ml &&
                         std::min(m0, ml) >= kAlienMagRatio * std::max(m0, ml))
                         return -1;
                     return 0;
                 };
-                const int clsUp = partnerClass(iUp, qUp, sUp);
-                const int clsDn = partnerClass(iDn, qDn, sDn);
+                const int clsUp = partnerClass(iUp, qUp, analysisUp, sUp);
+                const int clsDn = partnerClass(iDn, qDn, analysisDn, sDn);
                 if (regionKeepEnabled && (clsUp == 1 || clsDn == 1))
                     sameRow[rel] = 1.0f;
                 if (clsUp == -1 || clsDn == -1)

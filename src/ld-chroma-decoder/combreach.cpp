@@ -366,10 +366,11 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     lddecode::CarrierPhaseRelation downRelation,
     bool allowUp,
     bool allowDown,
+    double centerCarrierTrust,
+    double upCarrierTrust,
+    double downCarrierTrust,
     double invIreScale,
-    double minChromaIRE,
-    double upLumaDeltaIRE,
-    double downLumaDeltaIRE)
+    double minChromaIRE)
 {
     IntrafieldRegionReach out;
 
@@ -403,30 +404,16 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     constexpr double kDifferentHueDeg = 20.0;
     constexpr double kRadiansToDegrees = 57.2957795130823208768;
 
-    // Saturation-boundary evidence.  Hue is meaningless on a vector below the
-    // chroma floor, but a clearly saturated side whose color simply does not
-    // continue into the other side is a region break in its own right — this
-    // is the bikini-against-skin case, where the weak side never qualifies
-    // for the hue test and the pair otherwise stays Unknown while the comb
-    // mixes near-complementary hues into a gray band.  The ratio gap between
-    // Different and Unknown mirrors the hue hysteresis band.
+    // These are amplitude and angle metrics only.  They may characterize
+    // operands already admitted by schedule conformance, but must never turn
+    // carrier-band energy into color by themselves.
     constexpr double kDifferentMagRatio = 0.35;
     constexpr double kStrongSideFloorScale = 2.0;
-
-    // "Identical carrier-free luma" band: a vertical luma delta at or below
-    // this is the same luma to within noise, so a hue-only Different verdict
-    // there is a carrier-phase artifact of near-carrier vertical detail, not a
-    // region boundary. Kept well under the mild-edge floor (6 IRE) that Field B
-    // uses so a genuine luma contour never qualifies. NOTE: raising this to the
-    // 6 IRE edge floor combed real Gilgol boundaries (light checkers) and did
-    // NOT help the cube (a fine STATIC grid is Frame B's job, not Field B's ±2
-    // spatial comb), so it stays at the conservative noise-band value.
-    constexpr double kIdenticalLumaIRE = 3.0;
 
     auto classify = [&](const std::complex<double> &leg,
                         double legMagIRE,
                         bool haveLeg,
-                        double legLumaDeltaIRE,
+                        double legCarrierTrust,
                         double &differenceIRE,
                         double &hueDifferenceDeg) {
         if (!haveLeg)
@@ -439,18 +426,45 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
 
         differenceIRE = std::abs(center - leg) * scale;
 
-        // Saturation collapse: the weak side is a small fraction of the
-        // strong side.  This is the drop-shadow band signature, and it is
-        // RATIO-driven, not floor-driven: a garment fade row at 8 IRE
-        // against 25 IRE is as much a band member as a 3 IRE one — gating
-        // membership on an absolute weak-side floor re-created the
-        // pixel-flicker at every row that straddled it.  The floor only
-        // qualifies the strong side: band-grade needs a clearly saturated
-        // region (>= 2.5x floor); a weaker strong side still earns a plain
-        // Different verdict when its partner is sub-floor, but never band
-        // membership (keeps low-chroma texture out of the band machinery).
+        // carrierTrust is the table-owned graded interpretation of schedule
+        // conformance.  Neutral 0.5 has no authority; either side of neutral
+        // is positive grammar evidence without the legacy +/-0.5 correlation
+        // threshold that made diagonal admission flicker at pixel pitch.
+        const bool centerCarrier = centerCarrierTrust > 0.5;
+        const bool legCarrier = legCarrierTrust > 0.5;
+        const bool centerRejected = centerCarrierTrust < 0.5;
+        const bool legRejected = legCarrierTrust < 0.5;
+
+        const double denom = std::abs(center) * std::abs(leg);
+        double hueCos = 1.0;
+        if (magLo >= chromaFloor && denom > 1e-12) {
+            hueCos = std::clamp(
+                std::real(center * std::conj(leg)) / denom,
+                -1.0,
+                1.0);
+            hueDifferenceDeg = std::acos(hueCos) * kRadiansToDegrees;
+        }
+
+        // AlienCancel is a grammar rejection, not a hue class.  The angle and
+        // magnitude merely identify which negatively conforming operand can
+        // cancel this leg; without rejection from the grammar table they have
+        // no power to label bandpass energy as alien carrier.
+        constexpr double kAlienHueDeg = 165.0;
+        constexpr double kAlienMagRatio = 0.60;
+        if ((centerRejected || legRejected) &&
+            magLo >= chromaFloor &&
+            hueDifferenceDeg >= kAlienHueDeg &&
+            magLo >= kAlienMagRatio * magHi)
+        {
+            return RegionRelation::AlienCancel;
+        }
+
+        // A saturation boundary needs a positively registered carrier on its
+        // strong side.  A magnitude ratio alone is only spectral structure.
         constexpr double kBandStrongScale = 2.5;
-        if (magLo <= kDifferentMagRatio * magHi) {
+        const bool centerStrong = centerMagIRE >= legMagIRE;
+        const bool strongSideCarrier = centerStrong ? centerCarrier : legCarrier;
+        if (strongSideCarrier && magLo <= kDifferentMagRatio * magHi) {
             if (magHi >= kBandStrongScale * chromaFloor) {
                 out.strongAsym = true;
                 return RegionRelation::DifferentRegion;
@@ -459,49 +473,31 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
                 magHi >= kStrongSideFloorScale * chromaFloor)
                 return RegionRelation::DifferentRegion;
         }
-        if (magLo < chromaFloor)
-            return RegionRelation::Unknown;
 
-        const double denom = std::abs(center) * std::abs(leg);
+        // An admitted carrier against an explicitly rejected carrier-band
+        // operand is a region break even when their amplitudes are similar.
+        // Anti-aligned cancellation was handled above.
+        if ((centerCarrier && legRejected) || (legCarrier && centerRejected))
+            return RegionRelation::DifferentRegion;
+
+        // Hue is color evidence only after both endpoints have independently
+        // conformed to the carrier schedule.
+        if (!centerCarrier || !legCarrier || magLo < chromaFloor)
+            return RegionRelation::Unknown;
         if (denom <= 1e-12)
             return RegionRelation::Unknown;
-
-        const double hueCos = std::clamp(
-            std::real(center * std::conj(leg)) / denom,
-            -1.0,
-            1.0);
-        hueDifferenceDeg = std::acos(hueCos) * kRadiansToDegrees;
 
         if (hueDifferenceDeg <= kSameHueDeg)
             return RegionRelation::SameRegion;
 
-        // Anti-aligned at comparable magnitude means raw-identical content:
-        // vertically coherent luma (cross-color), the comb's ideal
-        // cancellation partner.  Ceding here hands the alien energy to 1D,
-        // which renders it as a line-alternating rainbow.  A genuine
-        // complementary-color boundary does not land in this window because
-        // region breaks that matter are magnitude-asymmetric.
-        constexpr double kAlienHueDeg = 165.0;
-        constexpr double kAlienMagRatio = 0.60;
-        if (hueDifferenceDeg >= kAlienHueDeg &&
-            magLo >= kAlienMagRatio * magHi)
-            return RegionRelation::AlienCancel;
-
-        if (hueDifferenceDeg >= kDifferentHueDeg) {
-            // Hue says the vectors disagree, but if the carrier-free luma is
-            // vertically identical the disagreement is carrier phase, not
-            // content: this pair is the comb's cancellation partner (the
-            // Borg-cube grid), so keep the comb rather than ceding to 1D.
-            if (legLumaDeltaIRE >= 0.0 && legLumaDeltaIRE <= kIdenticalLumaIRE)
-                return RegionRelation::AlienCancel;
+        if (hueDifferenceDeg >= kDifferentHueDeg)
             return RegionRelation::DifferentRegion;
-        }
         return RegionRelation::Unknown;
     };
 
-    out.up = classify(alignedUp, upMagIRE, haveUp, upLumaDeltaIRE,
+    out.up = classify(alignedUp, upMagIRE, haveUp, upCarrierTrust,
                       out.upDifferenceIRE, out.upHueDifferenceDeg);
-    out.down = classify(alignedDown, downMagIRE, haveDown, downLumaDeltaIRE,
+    out.down = classify(alignedDown, downMagIRE, haveDown, downCarrierTrust,
                         out.downDifferenceIRE, out.downHueDifferenceDeg);
     out.valid = (out.up != RegionRelation::Unknown ||
                  out.down != RegionRelation::Unknown);

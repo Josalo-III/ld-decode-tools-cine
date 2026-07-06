@@ -25,6 +25,7 @@
 #include <complex>
 #include <vector>
 
+#include "attributiondefs.h"
 #include "carriergrammar.h"
 
 // ===========================================================================
@@ -195,18 +196,18 @@ enum class RegionRelation {
     Unknown,
     SameRegion,
     DifferentRegion,
-    // Anti-aligned partner at comparable magnitude: raw-identical content,
-    // i.e. vertically coherent luma (cross-color) rather than a chroma
-    // region.  The comb difference cancels it exactly — the comb is the
-    // cure here, so this verdict must neither cede nor grant one-sided
-    // authority.  (A real complementary-color boundary is magnitude-
-    // asymmetric; shared luma structure is magnitude-symmetric.)
+    // Schedule-rejected partner that is anti-aligned at comparable magnitude:
+    // raw-identical content, i.e. vertically coherent luma (cross-color), not
+    // a chroma region.  The comb difference cancels it exactly, so this verdict
+    // must neither cede nor grant one-sided authority.
     AlienCancel
 };
 
 // Shared content verdict for the two intrafield combs.  The IQ inputs retain
 // their source sign; the evaluator applies the grammar relations only to local
-// comparison copies.
+// comparison copies.  Bandpass IQ describes an already-admitted carrier but
+// never admits itself: color-region verdicts also require the registered
+// schedule-conformance fact for each operand.
 struct IntrafieldRegionReach {
     bool valid = false;
     RegionRelation up = RegionRelation::Unknown;
@@ -222,11 +223,10 @@ struct IntrafieldRegionReach {
     bool centerIsland = false;
     bool threeRegion = false;
 
-    // True when a leg classified Different through the sub-floor
-    // magnitude-asymmetry branch: a center with no bona-fide chroma of its
-    // own against a clearly saturated partner.  This is the drop-shadow
-    // signature, distinct from hue-based Different verdicts in ordinary
-    // low-saturation texture.
+    // True when a leg classified Different through the magnitude-asymmetry
+    // branch and the strong side was independently admitted by the carrier
+    // schedule.  This is the drop-shadow signature, distinct from hue-based
+    // Different verdicts in ordinary low-saturation texture.
     bool strongAsym = false;
 };
 
@@ -238,19 +238,11 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     lddecode::CarrierPhaseRelation downRelation,
     bool allowUp,
     bool allowDown,
+    double centerCarrierTrust,
+    double upCarrierTrust,
+    double downCarrierTrust,
     double invIreScale,
-    double minChromaIRE,
-    // Carrier-free vertical luma delta per leg (|smoothLuma0 - smoothLumaLeg|,
-    // in IRE). A hue-based Different verdict over vertically-IDENTICAL luma is
-    // not a region boundary: the IQ difference is a carrier-phase sampling
-    // artifact of fine vertical luma detail whose spatial frequency lands in
-    // the subcarrier band (the Borg-cube grid) -- luma the demod misreads as
-    // chroma, not chroma. That pair is exactly the comb's cancellation partner,
-    // so such a leg is reclassified AlienCancel and Field B combs instead of
-    // ceding to 1D center. Pass a negative value (default) when no luma
-    // evidence is available -> no effect.
-    double upLumaDeltaIRE = -1.0,
-    double downLumaDeltaIRE = -1.0);
+    double minChromaIRE);
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,
