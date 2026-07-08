@@ -1397,12 +1397,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     //           the gA detector alone cannot tell them apart; this is the
     //           discriminator.  Consumed by the suppression alpha.
     //
-    //   ALIEN — a negatively conforming operand is ANTI-aligned at comparable
-    //           magnitude after relation signing: raw-identical content
-    //           where the carrier schedule demands inversion.  Legal
-    //           carrier MUST invert per the lineFlip schedule; energy that
-    //           fails the schedule is structurally not carrier, hence luma
-    //           by law (near-carrier periodic luma, the Borg-cube grid).
+    //   ALIEN — a relation-admitted operand is ANTI-aligned at comparable
+    //           magnitude after relation signing: raw-identical content where
+    //           the carrier grammar says the operands are phase-comparable.
+    //           That is the comb's cancellation partner, not a hue boundary
+    //           to cede to 1D (near-carrier periodic luma, the Borg-cube grid).
     //           Consumed by the produceY retracted admission.
     //
     // Both are evidence only; consumers convert.  Diagnostic gate:
@@ -1417,10 +1416,12 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     if (!regionSamePartner_flat.empty() &&
         !regionAlienPartner_flat.empty() && demodWidth >= width) {
         const lddecode::CombReachSourceFrame iqSource = iqReachSource();
-        constexpr double kSameHueCos = 0.96592582628906829;   // cos(15 deg)
-        constexpr double kAlienHueCos = -0.96592582628906829; // cos(165 deg)
-        constexpr double kAlienMagRatio = 0.60; // matches AlienCancel
-        const double chromaFloor = 5.0 * irescale;
+
+        struct RegionLegReach {
+            bool allow = false;
+            lddecode::CarrierPhaseRelation relation =
+                lddecode::CarrierPhaseRelation::Unknown;
+        };
 
         for (int line = first; line < last; ++line) {
             float *sameRow = regionSamePartner_line(line);
@@ -1432,38 +1433,34 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
             const float *i0 = locked1DTI4fsc_line(line);
             const float *q0 = locked1DTQ4fsc_line(line);
-            const auto *analysis0 = carrierAnalysis_line(line);
-            if (!i0 || !q0 || !analysis0)
+            if (!i0 || !q0)
                 continue;
 
-            auto legSign = [&](int target) -> double {
+            auto legReach = [&](int target) -> RegionLegReach {
+                RegionLegReach leg;
                 if (target < first || target >= last)
-                    return 0.0;
+                    return leg;
                 const lddecode::CombReachReply reach = combReachIndex.query(
                     {line, target, left, left,
                      lddecode::CombReachUse::IQCompare, iqSource});
                 if (!reach.allowIQCompare)
-                    return 0.0;
-                switch (reach.carrierRelation) {
-                case lddecode::CarrierPhaseRelation::Same:     return 1.0;
-                case lddecode::CarrierPhaseRelation::Opposite: return -1.0;
-                default:                                       return 0.0;
-                }
+                    return leg;
+                leg.allow =
+                    reach.carrierRelation == lddecode::CarrierPhaseRelation::Same ||
+                    reach.carrierRelation == lddecode::CarrierPhaseRelation::Opposite;
+                leg.relation = reach.carrierRelation;
+                return leg;
             };
-            const double sUp = legSign(line - 2);
-            const double sDn = legSign(line + 2);
-            const float *iUp = (sUp != 0.0)
+            const RegionLegReach upReach = legReach(line - 2);
+            const RegionLegReach dnReach = legReach(line + 2);
+            const float *iUp = upReach.allow
                 ? locked1DTI4fsc_line(line - 2) : nullptr;
-            const float *qUp = (sUp != 0.0)
+            const float *qUp = upReach.allow
                 ? locked1DTQ4fsc_line(line - 2) : nullptr;
-            const float *iDn = (sDn != 0.0)
+            const float *iDn = dnReach.allow
                 ? locked1DTI4fsc_line(line + 2) : nullptr;
-            const float *qDn = (sDn != 0.0)
+            const float *qDn = dnReach.allow
                 ? locked1DTQ4fsc_line(line + 2) : nullptr;
-            const auto *analysisUp = (sUp != 0.0)
-                ? carrierAnalysis_line(line - 2) : nullptr;
-            const auto *analysisDn = (sDn != 0.0)
-                ? carrierAnalysis_line(line + 2) : nullptr;
             if (!iUp && !iDn)
                 continue;
 
@@ -1486,48 +1483,32 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     return std::complex<double>(si / 3.0, sq / 3.0);
                 };
                 const std::complex<double> z0 = fullIQ(i0, q0);
-                const double m0 = std::abs(z0);
-                if (m0 < chromaFloor)
-                    continue;
+                const std::complex<double> zUp =
+                    iUp ? fullIQ(iUp, qUp) : std::complex<double>(0.0, 0.0);
+                const std::complex<double> zDn =
+                    iDn ? fullIQ(iDn, qDn) : std::complex<double>(0.0, 0.0);
+                const auto region =
+                    CombContentReach::evaluateIntrafieldRegionReach(
+                        z0, zUp, zDn,
+                        upReach.relation,
+                        dnReach.relation,
+                        upReach.allow && iUp,
+                        dnReach.allow && iDn,
+                        0.5, 0.5, 0.5,
+                        invIreScale,
+                        5.0);
 
-                // Classify one leg: +1 same-region, -1 alien (schedule-
-                // illegal), 0 neither.  The alien test mirrors the region
-                // grammar's AlienCancel window: anti-aligned beyond 165
-                // degrees at comparable magnitude (weak side >= 0.6 of the
-                // strong side).
-                auto partnerClass = [&](const float *iR, const float *qR,
-                                        const lddecode::CarrierAnalysisRecord *legAnalysis,
-                                        double s) -> int {
-                    if (!iR || !legAnalysis)
-                        return 0;
-                    const std::complex<double> zl = s * fullIQ(iR, qR);
-                    const double ml = std::abs(zl);
-                    if (ml < chromaFloor)
-                        return 0;
-                    const double dot = std::real(z0 * std::conj(zl));
-                    const double centerTrust = lddecode::carrierTrust(
-                        analysis0[rel].carrierConformance,
-                        analysis0[rel].conformanceConfidence);
-                    const double legTrust = lddecode::carrierTrust(
-                        legAnalysis[rel].carrierConformance,
-                        legAnalysis[rel].conformanceConfidence);
-                    const bool centerCarrier = centerTrust > 0.5;
-                    const bool legCarrier = legTrust > 0.5;
-                    const bool rejected = centerTrust < 0.5 || legTrust < 0.5;
-                    if (centerCarrier && legCarrier &&
-                        dot >= kSameHueCos * m0 * ml)
-                        return 1;
-                    if (rejected && dot <= kAlienHueCos * m0 * ml &&
-                        std::min(m0, ml) >= kAlienMagRatio * std::max(m0, ml))
-                        return -1;
-                    return 0;
-                };
-                const int clsUp = partnerClass(iUp, qUp, analysisUp, sUp);
-                const int clsDn = partnerClass(iDn, qDn, analysisDn, sDn);
-                if (regionKeepEnabled && (clsUp == 1 || clsDn == 1))
+                if (regionKeepEnabled &&
+                    (region.up == CombContentReach::RegionRelation::SameRegion ||
+                     region.down == CombContentReach::RegionRelation::SameRegion))
+                {
                     sameRow[rel] = 1.0f;
-                if (clsUp == -1 || clsDn == -1)
+                }
+                if (region.up == CombContentReach::RegionRelation::AlienCancel ||
+                    region.down == CombContentReach::RegionRelation::AlienCancel)
+                {
                     alienRow[rel] = 1.0f;
+                }
             }
         }
     }

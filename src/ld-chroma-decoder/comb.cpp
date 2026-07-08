@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -823,6 +825,25 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double invI = this->invIreScale;
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int probeLine0 = [] {
+        const char *s = std::getenv("LD_FVF_PROBE_LINE0");
+        return s ? std::atoi(s) : -1;
+    }();
+    const int probeLine1 = [probeLine0] {
+        const char *s = std::getenv("LD_FVF_PROBE_LINE1");
+        return s ? std::atoi(s) : probeLine0;
+    }();
+    const int probeC0 = [] {
+        const char *s = std::getenv("LD_FVF_PROBE_C0");
+        return s ? std::atoi(s) : -1;
+    }();
+    const int probeC1 = [probeC0] {
+        const char *s = std::getenv("LD_FVF_PROBE_C1");
+        return s ? std::atoi(s) : probeC0;
+    }();
+    const bool probeFvf =
+        probeLine0 >= 0 && probeLine1 >= probeLine0 &&
+        probeC0 >= 0 && probeC1 >= probeC0;
 
     // Radius of the horizontal neighbor window used in cross-domain estimation.
     // Kept local: this is not a tunable in the current header.
@@ -1646,6 +1667,32 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         winner[rel]   = idx;
         outVal[rel]   = val;
         outShade[rel] = shade;
+        if (probeFvf && line >= probeLine0 && line <= probeLine1 &&
+            rel >= probeC0 && rel <= probeC1)
+        {
+            std::fprintf(stderr,
+                "[FVF] line=%d rel=%d idx=%d FA=%.2f FB=%.2f FR=%.2f "
+                "L1=%.2f scoreA=%.4f scoreB=%.4f scoreR=%.4f "
+                "hIRE=%.2f vIRE=%.2f chroma=%.2f diff=%.2f "
+                "lumFA=%.2f lumFB=%.2f lumFR=%.2f\n",
+                line,
+                rel,
+                idx,
+                FA * invI,
+                FB * invI,
+                FR * invI,
+                L1 * invI,
+                scoreA,
+                scoreB,
+                scoreR,
+                hIRE,
+                vIRE,
+                chromaMagIRE,
+                diff_fvf_ire,
+                lumFA * invI,
+                lumFB * invI,
+                lumFR * invI);
+        }
         if      (idx == 2) frameCountTotal++;
         else if (idx == 0 || idx == 1) fieldCountTotal++;
         metrics.winner = idx;

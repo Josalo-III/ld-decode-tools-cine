@@ -23,6 +23,7 @@
 #pragma once
 
 #include <complex>
+#include <cstdint>
 #include <vector>
 
 #include "attributiondefs.h"
@@ -36,6 +37,7 @@ namespace lddecode {
 enum class CombReachUse {
     FieldScalarAverage,
     FieldScalarCancel,
+    FieldScalarSupport,
     FrameScalarAverage,
     FrameScalarCancel,
     ScalarSignCompare,
@@ -230,6 +232,14 @@ struct IntrafieldRegionReach {
     bool strongAsym = false;
 };
 
+constexpr std::uint8_t IntrafieldRegionCedeCenter = 1u << 0;
+constexpr std::uint8_t IntrafieldRegionCedeStrongAsym = 1u << 1;
+
+struct IntrafieldTapAuthority {
+    double upWeight = 0.0;
+    double downWeight = 0.0;
+};
+
 IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const std::complex<double> &center,
     const std::complex<double> &up,
@@ -243,6 +253,17 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     double downCarrierTrust,
     double invIreScale,
     double minChromaIRE);
+
+std::uint8_t intrafieldRegionCedeFlags(
+    const IntrafieldRegionReach &region);
+
+IntrafieldTapAuthority prepareIntrafieldTapAuthority(
+    const IntrafieldRegionReach &region,
+    std::uint8_t cedeFlags,
+    double upWeight,
+    double downWeight,
+    double horizontalLumaDeltaIRE = 0.0,
+    double horizontalLumaEdgeThresholdIRE = 1.0);
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,

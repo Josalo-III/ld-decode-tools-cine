@@ -434,6 +434,7 @@ private:
 		double diffIRE = std::numeric_limits<double>::infinity();
 		double kScore = 0.0;
 		double weight = 1.0;
+		double fieldBWeight = 1.0;    // Field B-specific authority prepared upstream
 		double reachLegalGate = 1.0;  // binary legality from reach index for this rung
 		double reachGate = 1.0;       // contour-trust * legality
 	};

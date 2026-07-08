@@ -345,6 +345,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         case lddecode::CombReachUse::FrameScalarCancel:
             return reach.allowScalarCancel ? 1.0 : 0.0;
 
+        case lddecode::CombReachUse::FieldScalarSupport:
+            return reach.allowScalarSignCompare ? 1.0 : 0.0;
+
         case lddecode::CombReachUse::ScalarSignCompare:
             return reach.allowScalarSignCompare ? 1.0 : 0.0;
 
@@ -406,6 +409,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             p.kScore = combKMetric(c.comp, c.symMag, n.comp, n.symMag);
             p.weight = (kRange > 1e-9) ? (1.0 - p.kScore * invK) : 1.0;
             p.weight = std::clamp(p.weight, 0.0, 1.0);
+            p.fieldBWeight = p.weight;
         }
     };
 
@@ -434,14 +438,14 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                      tapLine.haveU2,
                      tapLine.pairU2,
                      scalarSource,
-                     lddecode::CombReachUse::FieldScalarCancel);
+                     lddecode::CombReachUse::FieldScalarSupport);
 
             fillPair(tapLine.tapD2,
                      tapLine.lnD2,
                      tapLine.haveD2,
                      tapLine.pairD2,
                      scalarSource,
-                     lddecode::CombReachUse::FieldScalarCancel);
+                     lddecode::CombReachUse::FieldScalarSupport);
         }
     }
 
@@ -587,33 +591,13 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 }
             }
 
-            // Raw no-valid-partner cede flag: a Different leg with no
-            // positively same-region partner.  Consumers OR a small
-            // horizontal window over this so three-region cedes (drop
-            // shadows) hold a uniform height across columns.
+            // Raw no-valid-partner cede flag.  CombContentReach owns the
+            // region-to-cede conversion so consumers do not rebuild it from
+            // local same/different tests.
             for (int rel = 0; rel < width; ++rel) {
                 const auto &region = tapLine.intrafieldRegionReach[rel];
-                if (!region.valid)
-                    continue;
-                const bool upDifferent = region.up ==
-                    CombContentReach::RegionRelation::DifferentRegion;
-                const bool downDifferent = region.down ==
-                    CombContentReach::RegionRelation::DifferentRegion;
-                const bool upSame = region.up ==
-                    CombContentReach::RegionRelation::SameRegion;
-                const bool downSame = region.down ==
-                    CombContentReach::RegionRelation::SameRegion;
-                std::uint8_t flag = 0;
-                if ((upDifferent && !downSame) || (downDifferent && !upSame))
-                    flag |= 1;                       // bit0: cede
-                if (region.strongAsym)
-                    flag |= 3;                       // bit1: shadow band —
-                                                     // membership outranks a
-                                                     // Same partner, so the
-                                                     // whole band takes ONE
-                                                     // render (the 1D), never
-                                                     // a comb/cede interleave
-                tapLine.intrafieldRegionCede[rel] = flag;
+                tapLine.intrafieldRegionCede[rel] =
+                    CombContentReach::intrafieldRegionCedeFlags(region);
             }
         }
     }
@@ -1005,6 +989,64 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     };
 
+    auto prepareFieldBWeights = [&]() {
+        if (!tapLine.haveU2 || !tapLine.haveD2 ||
+            (int)tapLine.pairU2.size() < width ||
+            (int)tapLine.pairD2.size() < width)
+            return;
+
+        const CombContentReach::IntrafieldRegionReach unknownRegion;
+        const double hEdgeThreshIRE =
+            std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
+        for (int rel = 0; rel < width; ++rel) {
+            const auto &region =
+                (rel < (int)tapLine.intrafieldRegionReach.size())
+                    ? tapLine.intrafieldRegionReach[rel]
+                    : unknownRegion;
+            const std::uint8_t cedeFlags =
+                (rel < (int)tapLine.intrafieldRegionCede.size())
+                    ? tapLine.intrafieldRegionCede[rel]
+                    : std::uint8_t{0};
+            // Grail rule: a narrow middle/shadow band is one region.  Keep the
+            // old 9-column reach window here, where tap authority is prepared,
+            // so renderers consume one decision instead of rebuilding it.
+            std::uint8_t fieldBCedeFlags = cedeFlags;
+            for (int dx = -4; dx <= 4; ++dx) {
+                const int r = rel + dx;
+                if (r < 0 || r >= (int)tapLine.intrafieldRegionCede.size())
+                    continue;
+                const std::uint8_t neighborFlags =
+                    tapLine.intrafieldRegionCede[r];
+                if (neighborFlags & CombContentReach::IntrafieldRegionCedeCenter)
+                    fieldBCedeFlags |=
+                        CombContentReach::IntrafieldRegionCedeCenter;
+                if (neighborFlags &
+                    CombContentReach::IntrafieldRegionCedeStrongAsym)
+                {
+                    fieldBCedeFlags |=
+                        CombContentReach::IntrafieldRegionCedeStrongAsym;
+                }
+            }
+            const double hLumaDeltaIRE =
+                (rel < (int)tapLine.hLumaDeltaIRE.size())
+                    ? tapLine.hLumaDeltaIRE[rel]
+                    : 0.0;
+            const auto authority =
+                CombContentReach::prepareIntrafieldTapAuthority(
+                    region,
+                    fieldBCedeFlags,
+                    tapLine.pairU2[rel].weight,
+                    tapLine.pairD2[rel].weight,
+                    hLumaDeltaIRE,
+                    hEdgeThreshIRE);
+
+            tapLine.pairU2[rel].fieldBWeight =
+                authority.upWeight;
+            tapLine.pairD2[rel].fieldBWeight =
+                authority.downWeight;
+        }
+    };
+
     {
         if (wantFrame) {
             applyFrameReachWithIQFloor(tapLine.pairU1, tapLine.pairD1,
@@ -1016,6 +1058,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         if (wantFieldA || wantFieldB) {
             applyFieldReachWithMovingCoarse(tapLine.pairU2, tapLine.pairD2,
                                             tapLine.haveU2, tapLine.haveD2);
+            if (wantFieldB)
+                prepareFieldBWeights();
         }
     }
 
@@ -1208,35 +1252,17 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
         // column, so cede outranks one-sided anywhere in the window.
         // Bit1 marks the drop-shadow (strong magnitude-asymmetry) islands
         // that qualify for the zero-chroma render.
-        // Per-column cede island read: no rel±4 OR window.  The prior
-        // 9-column contagion spread a single cede across eight neighbours,
-        // giving Field B's render a horizontal spatial signature — lateral
-        // influence.  Vertical-comb geometry is per-column: read this
-        // column's cede flags only.
         bool centerIsland = false;
         bool shadowIsland = false;
-        if ((int)tapLine.intrafieldRegionCede.size() > rel) {
-            const std::uint8_t v = tapLine.intrafieldRegionCede[rel];
-            if (v & 1) centerIsland = true;
-            if (v & 2) shadowIsland = true;
-        }
-        if (!centerIsland && rel < (int)tapLine.intrafieldRegionReach.size()) {
-            const auto &region = tapLine.intrafieldRegionReach[rel];
-            if (region.valid) {
-                const bool upDifferent = region.up ==
-                    CombContentReach::RegionRelation::DifferentRegion;
-                const bool downDifferent = region.down ==
-                    CombContentReach::RegionRelation::DifferentRegion;
-                const bool upSame = region.up ==
-                    CombContentReach::RegionRelation::SameRegion;
-                const bool downSame = region.down ==
-                    CombContentReach::RegionRelation::SameRegion;
-
-                if (downDifferent && upSame) {
-                    wDn2 = 0.0;
-                } else if (upDifferent && downSame) {
-                    wUp2 = 0.0;
-                }
+        if ((int)tapLine.intrafieldRegionCede.size() >= width) {
+            const int lo = std::max(rel - 4, 0);
+            const int hi = std::min(rel + 4, width - 1);
+            for (int k = lo; k <= hi; ++k) {
+                const std::uint8_t v = tapLine.intrafieldRegionCede[k];
+                if (v & CombContentReach::IntrafieldRegionCedeCenter)
+                    centerIsland = true;
+                if (v & CombContentReach::IntrafieldRegionCedeStrongAsym)
+                    shadowIsland = true;
             }
         }
 
@@ -1453,37 +1479,80 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         const double up = tapLine.tapU2[rel].comp;
         const double down = tapLine.tapD2[rel].comp;
 
-        double wUp = std::clamp(
-            tapLine.pairU2[rel].weight * tapLine.pairU2[rel].reachGate,
+        const double wUp = std::clamp(
+            tapLine.pairU2[rel].fieldBWeight * tapLine.pairU2[rel].reachGate,
             0.0,
             1.0);
-        double wDown = std::clamp(
-            tapLine.pairD2[rel].weight * tapLine.pairD2[rel].reachGate,
+        const double wDown = std::clamp(
+            tapLine.pairD2[rel].fieldBWeight * tapLine.pairD2[rel].reachGate,
             0.0,
             1.0);
 
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
+
         double output = center;
         std::uint8_t reason = FieldBReasonCenter;
 
-        if (useUp && useDown) {
-            const double scale = 2.0 / (wUp + wDown);
-            output = 0.25 * (
-                (center - up) * wUp * scale +
-                (center - down) * wDown * scale);
-            reason = FieldBReasonBlend;
-        } else if (useUp) {
-            output = 0.25 * (center - up) * wUp;
-            reason = FieldBReasonBlend;
-        } else if (useDown) {
-            output = 0.25 * (center - down) * wDown;
-            reason = FieldBReasonBlend;
-        }
+        if (useUp || useDown) {
+            const double denom = wUp + wDown;
 
-        if (!std::isfinite(output)) {
-            output = center;
-            reason = FieldBReasonCenter;
+            // Older Field-B algebra: first build the weighted opposite-phase
+            // neighbor estimate, then cancel it against center.
+            //
+            // Equal case:
+            //      neighbor = 0.5 * up + 0.5 * down
+            //
+            // Weighted case:
+            //      neighbor shifts toward the more authoritative leg
+            //
+            // One-legged case:
+            //      neighbor = selected leg
+            const double neighbor =
+                (up * wUp + down * wDown) / denom;
+
+            const double combed = 0.5 * (center - neighbor);
+
+            // If reach authority is partial, fall back toward center rather
+            // than allowing a weak tap to fully author Field B.
+            const double authority = std::clamp(denom, 0.0, 1.0);
+            output = (combed * authority) + (center * (1.0 - authority));
+
+            reason = FieldBReasonBlend;
+
+            // Bounded-cluster guard in Field-B output space.
+            //
+            // The weighted Field-B result must lie within the cluster formed
+            // by center and the actual one-leg Field-B candidates.  If it
+            // leaves that cluster, Field B has manufactured an overshoot rather
+            // than an average/cancellation result, so cede to center.
+            double lo = center;
+            double hi = center;
+
+            auto include = [&](double v) {
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            };
+
+            if (useUp)
+                include(0.5 * (center - up));
+
+            if (useDown)
+                include(0.5 * (center - down));
+
+            // Slack is in the same scalar domain as Field B.  Use a very small
+            // margin to avoid rejecting harmless floating-point / quantization
+            // noise while still catching visible overshoots.
+            constexpr double kClusterSlackIRE = 0.25;
+            const double slack = kClusterSlackIRE * irescale;
+
+            if (!std::isfinite(output) ||
+                output < lo - slack ||
+                output > hi + slack)
+            {
+                output = center;
+                reason = FieldBReasonCenter;
+            }
         }
 
         outFieldLine[rel] = output;
