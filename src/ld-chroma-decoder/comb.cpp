@@ -526,6 +526,15 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            // Cross-color mask pair only exists when the knob is engaged so
+            // the default path pays neither the memory nor the second pass.
+            if (configuration.tunables.CC_SUPPRESSION_WEIGHT > 0.0) {
+                lockedCcMaskRaw_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+                lockedCcMask_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+            } else {
+                lockedCcMaskRaw_flat.clear();
+                lockedCcMask_flat.clear();
+            }
             regionSamePartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             regionAlienPartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);

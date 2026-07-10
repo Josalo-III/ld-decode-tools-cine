@@ -250,6 +250,48 @@ inline double carrierTrust(double conformance, double confidence)
     return wNeutral + c * (wFull - wNeutral);
 }
 
+// Decision layer, luma side: the single table-owned mapping from the
+// conformance MEASUREMENT to a luma-attribution PROOF in [0,1].  This is
+// deliberately NOT the complement of carrierTrust(): trust's graded middle
+// exists so carrier consumers degrade smoothly under ambiguity, but a
+// suppression consumer acting on that middle desaturates genuine chroma --
+// at a hue boundary the correlation windows straddle two hues, no axis can
+// produce a decisive legal vote, and the stored conformance is a weakly
+// positive maxCorr that MEANS "unresolved", not "luma".  The registration
+// layer's own tie-break is "real chroma is never claimed as luma", so the
+// proof stays ZERO through the entire ambiguous middle and engages only
+// past +kIllegalVote -- the same threshold at which an axis casts a
+// ScheduleIllegal vote -- ramping smoothly (no verdict flip at pixel pitch)
+// and scaled by confidence so a thin axis set cannot assert a full proof.
+inline double carrierIllegalProof(double conformance, double confidence)
+{
+    constexpr double kIllegalVote = 0.5;  // vote threshold: proof begins here
+    constexpr double kIllegalFull = 0.9;  // decisive match: proof saturates
+
+    double t = (conformance - kIllegalVote) / (kIllegalFull - kIllegalVote);
+    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    const double p = t * t * (3.0 - 2.0 * t); // smoothstep
+
+    // confidence arrives as usableAxes/3, but two concurring Opposite axes
+    // already constitute a full proof (the third, the frame axis, rightly
+    // abstains on motion and must not discount an intra-field conviction);
+    // a single axis is half a proof.
+    double c = 1.5 * (confidence < 0.0 ? 0.0 : confidence);
+    c = c > 1.0 ? 1.0 : c;
+    return c * p;
+}
+
+// Mirror image: certified-legal-carrier proof.  Nonzero only when the
+// bandpass decisively INVERTS across Opposite partners (conformance past
+// the legal vote threshold), i.e. this pixel is proven genuine chroma.
+// Consumers use it as spatial context: ambiguity BORDERING a certified
+// region is a hue boundary (protect), ambiguity in a legality desert is
+// actionable.
+inline double carrierLegalProof(double conformance, double confidence)
+{
+    return carrierIllegalProof(-conformance, confidence);
+}
+
 struct CarrierResidualOption {
     double sample = 0.0;
     double membershipDeltaIRE = 0.0;

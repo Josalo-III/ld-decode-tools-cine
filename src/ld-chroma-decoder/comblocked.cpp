@@ -1639,6 +1639,15 @@ void Comb::FrameBuffer::measurePostCombImpurity()
     }
 }
 
+// Cross-color vertical-image-detail corroboration ramp, shared by the
+// coherent (splitIQlocked) and residual (filterIQLocked) transfer policies.
+// Input is the 1D vertical-contrast service (|smooth[rel+2]-smooth[rel-2]|,
+// IRE): below soft the coarse field is laterally flat and the edge read is
+// silent; hard matches the established FIELD_LUMA_EDGE scale (18 IRE = a
+// solid vertical stroke).
+static constexpr double kCcEdgeSoftIRE = 6.0;
+static constexpr double kCcEdgeHardIRE = 18.0;
+
 void Comb::FrameBuffer::splitIQlocked()
 {
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -1740,12 +1749,20 @@ void Comb::FrameBuffer::splitIQlocked()
         float  *tq4Row      = demodTQ4fsc_line(line);
         float  *prodIRow    = lockedProductI_line(line);
         float  *prodQRow    = lockedProductQ_line(line);
+        float  *maskRawRow  = lockedCcMaskRaw_line(line);
         double *carrierComp = lockedCarrierComposite_line(line);
 
         const float *impRow = carrierImpurity_line(line);
         const float *sameRegionRow = regionSamePartner_line(line);
+        const float *hDeltaRow = lockedLumaHDeltaIRE_line(line);
         const lddecode::CarrierAnalysisRecord *analysisRow =
             carrierAnalysis_line(line);
+        // ±2 same-field conformance context for the boundary/desert split
+        // (see the transfer policy below).
+        const lddecode::CarrierAnalysisRecord *analysisUpRow =
+            (line - 2 >= firstLine) ? carrierAnalysis_line(line - 2) : nullptr;
+        const lddecode::CarrierAnalysisRecord *analysisDnRow =
+            (line + 2 < lastLine) ? carrierAnalysis_line(line + 2) : nullptr;
 
         if (prodIRow)    std::fill(prodIRow, prodIRow + width, 0.0f);
         if (prodQRow)    std::fill(prodQRow, prodQRow + width, 0.0f);
@@ -1783,6 +1800,19 @@ void Comb::FrameBuffer::splitIQlocked()
             if (carrierComp)
                 carrierComp[xi] = plainCarrier;
 
+            // Suppression policy below only runs when --cross-color-return
+            // is engaged (the mask buffers exist); the default path pays
+            // nothing.
+            if (!maskRawRow) {
+                const float prodI = (float)finiteOrZero(ti * giProduct);
+                const float prodQ = (float)finiteOrZero(tq * gqProduct);
+                if (prodIRow) prodIRow[xi] = prodI;
+                if (prodQRow) prodQRow[xi] = prodQ;
+                scratch_preI[xi] = prodI;
+                scratch_preQ[xi] = prodQ;
+                continue;
+            }
+
             const double gA =
                 impRow ? std::clamp((double)impRow[xi], 0.0, 1.0) : 0.0;
 
@@ -1793,70 +1823,146 @@ void Comb::FrameBuffer::splitIQlocked()
                 ? std::clamp((double)sameRegionRow[xi], 0.0, 1.0)
                 : 0.0;
 
-            // Two reads on how much of this carrier-band energy is luma
-            // stranded in the bandpass, combined into one transfer policy:
+            // Two reads with DIFFERENT guards, because their failure modes
+            // are mirror images.  One law over both: suppression may never
+            // exceed measured evidence (the cap), so ccWeight redistributes
+            // what was found but cannot manufacture.
             //
-            //   gA (aperture): statistical narrow-vs-wide envelope purity.
-            //   Catches transient contamination (title edges) but PLATEAUS on
-            //   periodic near-carrier luma (the Borg-cube grid, narrow ~= wide),
-            //   which is why the --cross-color-return knob alone could never
-            //   keep the promise there.  ccWeight overdrives it because it
-            //   under-reads.
+            // Aperture read: gA * (1 - regionKeep), NOT proof-gated.  gA is
+            // the only witness against alias-conforming cross-colour (the
+            // chain-link fence): that energy INVERTS across ±2 like legal
+            // carrier -- that is exactly why the comb passes it as chroma --
+            // so no conformance-based proof can ever convict it intra-field,
+            // and proof-gating this read let the fence confetti through
+            // untouched.  Its guard against real-chroma ringing (gA reads
+            // 0.3-0.6 at genuine chroma texture and edges) is regionKeep's
+            // same-hue vertical continuity.
             //
-            //   schedule (bandpass): the table-owned graded conformance read.
-            //   carrierConformance in [-1,+1] is the relation-signed
-            //   correlation of the raw bandpass against grammar-certified
-            //   Opposite partners -- the ±2 same-field lines AND the frame axis
-            //   (static detail the ±2 tests can't reach).  carrierTrust() maps
-            //   (conformance, confidence) to a calibrated carrier weight, low
-            //   confidence pulling toward neutral so this read stays silent
-            //   without evidence.  Its one-sided complement below neutral is
-            //   the luma attribution -- graded, so no verdict flips at pixel
-            //   pitch (the fragile binary the enum used to be).
-            //
-            // Take the stronger luma read and drive both by the promise knob.
-            // Same-region continuity may spend at most the NORMAL suppression
-            // budget (2.0) rescuing a chroma edge.  It must not erase strength
-            // explicitly requested above 2.0: doing `gA * (1-regionKeep) *
-            // ccWeight` made a false-positive same-region verdict an absolute
-            // veto, so even --cross-color-return 6 could not touch diagonal
-            // cross-colour.  Up through 2.0 the expression below is exactly
-            // the old policy; only the extra ambiguity-suppression budget is
-            // made non-vetoable.  Y is untouched, so retracted luma stays in Y
-            // and no carrier-band residue enters it (no checkerboard).
-            // regionKeep (a same-hue continuity heuristic) rescues real chroma
-            // from the APERTURE statistic, which rings on genuine chroma edges.
-            // It must NOT veto the schedule read: schedLuma is only nonzero
-            // when the bandpass conformance leans to luma, and real saturated
-            // chroma conforms (inverts across Opposite partners) so carrierTrust
-            // -> 1 and schedLuma -> 0 there on its own.  A pixel that is
-            // schedule-illegal on one axis is luma even if the OTHER axis reads
-            // same-hue, so the proof stands over the heuristic.
-            const double schedLuma = analysisRow
-                ? std::clamp(1.0 - 2.0 * lddecode::carrierTrust(
-                                 analysisRow[xi].carrierConformance,
-                                 analysisRow[xi].conformanceConfidence),
-                             0.0, 1.0)
-                : 0.0;
-            const double normalBudget = std::min(ccWeight, 2.0);
-            const double apertureBudget = std::max(
-                0.0, ccWeight - normalBudget * regionKeep);
-            const double lumaWeight = std::clamp(
-                std::max(gA * apertureBudget, schedLuma * ccWeight),
+            // Edge read: min(edgeRamp, proof), proof-REQUIRED.  edgeRamp
+            // (the 1D vertical-contrast service) is an edge detector by
+            // construction, so ungated it desaturates every garment
+            // boundary with a luma step (bikini against bright sand).  The
+            // proof has two grades over the bandpass conformance:
+            //   * strict carrierIllegalProof(): energy decisively MATCHING
+            //     where the schedule demands inversion is luma by law --
+            //     vertical strokes convict on the ±2 axes alone;
+            //   * ambient carrierTrust() complement, confined to legality
+            //     DESERTS: the ambiguous middle holds both genuine hue
+            //     boundaries (correlation windows straddle two hues, worst
+            //     near-complementary: cyan fabric against skin fakes
+            //     "fails to invert") and in-field diagonal detail.
+            //     Conformance cannot split them, vertical context can: a
+            //     hue boundary is a thin ambiguous band BETWEEN
+            //     certified-legal regions and inherits their protection
+            //     (carrierLegalProof at ±2, per-column); diagonal detail
+            //     sits where nothing certifies legal and stays actionable.
+            const double hDeltaIRE =
+                hDeltaRow ? (double)hDeltaRow[xi] : 0.0;
+            const double edgeRamp = std::clamp(
+                (hDeltaIRE - kCcEdgeSoftIRE) /
+                    (kCcEdgeHardIRE - kCcEdgeSoftIRE),
                 0.0, 1.0);
-            const double ccAlpha = std::clamp(1.0 - lumaWeight, 0.0, 1.0);
 
-            const double xferTi = finiteOrZero(ti * ccAlpha);
-            const double xferTq = finiteOrZero(tq * ccAlpha);
+            double proof = 0.0;
+            if (analysisRow) {
+                const double conf =
+                    (double)analysisRow[xi].carrierConformance;
+                const double cfd =
+                    (double)analysisRow[xi].conformanceConfidence;
+                const double proofStrict =
+                    lddecode::carrierIllegalProof(conf, cfd);
+                const double ambientLuma = std::clamp(
+                    2.0 * (0.5 - lddecode::carrierTrust(conf, cfd)),
+                    0.0, 1.0);
+                const double legalNear = std::max(
+                    analysisUpRow
+                        ? lddecode::carrierLegalProof(
+                              (double)analysisUpRow[xi].carrierConformance,
+                              (double)analysisUpRow[xi].conformanceConfidence)
+                        : 0.0,
+                    analysisDnRow
+                        ? lddecode::carrierLegalProof(
+                              (double)analysisDnRow[xi].carrierConformance,
+                              (double)analysisDnRow[xi].conformanceConfidence)
+                        : 0.0);
+                proof = std::max(proofStrict,
+                                 ambientLuma * (1.0 - legalNear));
+            }
 
-            const float prodI = (float)finiteOrZero(xferTi * giProduct);
-            const float prodQ = (float)finiteOrZero(xferTq * gqProduct);
+            const double apertureRead = gA * (1.0 - regionKeep);
+            const double edgeRead = std::min(edgeRamp, proof);
+            const double ccEvidence = std::max(gA, edgeRead);
+            const double lumaWeight = std::clamp(
+                std::max(apertureRead, edgeRead) * ccWeight,
+                0.0, ccEvidence);
+
+            // The verdict is NOT applied here.  Applied per-sample it carries
+            // regionKeep's hard flips and gA's ring chatter at pixel pitch --
+            // amplitude modulation that beats sidebands back into the chroma
+            // passband and shreds both sides of a hue boundary (the residual
+            // path documented this failure mode and band-limits; the coherent
+            // path must too).  Pass 2 below smooths it into an envelope that
+            // varies no faster than the chroma it gates, then applies.
+            if (maskRawRow)
+                maskRawRow[xi] = (float)lumaWeight;
+
+            const float prodI = (float)finiteOrZero(ti * giProduct);
+            const float prodQ = (float)finiteOrZero(tq * gqProduct);
 
             if (prodIRow) prodIRow[xi] = prodI;
             if (prodQRow) prodQRow[xi] = prodQ;
 
             scratch_preI[xi] = prodI;
             scratch_preQ[xi] = prodQ;
+        }
+    }
+
+    // Pass 2 (engaged only with --cross-color-return): band-limit the
+    // suppression verdict into an envelope, then scale the published chroma
+    // products.  In-field vertical mix (±2 lines, the same-parity partners
+    // the verdict itself was judged against) then a lateral boxcar with a
+    // radius of about one carrier cycle -- the same construction the
+    // residual path uses, so suppression cannot alias in either renderer.
+    if (ccWeight > 0.0 && !lockedCcMaskRaw_flat.empty() &&
+        !lockedCcMask_flat.empty()) {
+        constexpr int kCcMaskRadius = 4; // 9-tap, first null ~1.6 MHz
+        std::vector<double> vmix(width, 0.0);
+
+        for (int line = firstLine; line < lastLine; ++line) {
+            const float *r0 = lockedCcMaskRaw_line(line);
+            float *out = lockedCcMask_line(line);
+            float *prodIRow = lockedProductI_line(line);
+            float *prodQRow = lockedProductQ_line(line);
+            if (!r0 || !out)
+                continue;
+
+            const float *rU =
+                (line - 2 >= firstLine) ? lockedCcMaskRaw_line(line - 2)
+                                        : nullptr;
+            const float *rD =
+                (line + 2 < lastLine) ? lockedCcMaskRaw_line(line + 2)
+                                      : nullptr;
+            const double norm =
+                0.5 + (rU ? 0.25 : 0.0) + (rD ? 0.25 : 0.0);
+            for (int xi = 0; xi < width; ++xi) {
+                vmix[xi] = (0.5 * r0[xi] +
+                            (rU ? 0.25 * rU[xi] : 0.0) +
+                            (rD ? 0.25 * rD[xi] : 0.0)) / norm;
+            }
+
+            double s = 0.0;
+            int lo = 0, hi = -1;
+            for (int xi = 0; xi < width; ++xi) {
+                const int nlo = std::max(0, xi - kCcMaskRadius);
+                const int nhi = std::min(width - 1, xi + kCcMaskRadius);
+                while (hi < nhi) s += vmix[++hi];
+                while (lo < nlo) s -= vmix[lo++];
+                const double m = std::clamp(
+                    s / (double)(nhi - nlo + 1), 0.0, 1.0);
+                out[xi] = (float)m;
+                if (prodIRow) prodIRow[xi] = (float)(prodIRow[xi] * (1.0 - m));
+                if (prodQRow) prodQRow[xi] = (float)(prodQRow[xi] * (1.0 - m));
+            }
         }
     }
 }
@@ -1930,13 +2036,6 @@ void Comb::FrameBuffer::filterIQLocked()
     if ((int)scratch_preI_ext.size() < extWidth) scratch_preI_ext.resize(extWidth, 0.0);
     if ((int)scratch_preQ_ext.size() < extWidth) scratch_preQ_ext.resize(extWidth, 0.0);
 
-    // Residual-mode cross-color suppression scratch (built once, reused per
-    // line): the raw residual chroma, the per-sample luma-attribution weight,
-    // and its band-limited form.
-    std::vector<double> ccChroma(width, 0.0);
-    std::vector<double> ccMask(width, 0.0);
-    std::vector<double> ccMaskSmooth(width, 0.0);
-
     for (int line = firstLine; line < lastLine; ++line) {
         double* Irow = componentFrame->u(line);
         double* Qrow = componentFrame->v(line);
@@ -1963,21 +2062,28 @@ void Comb::FrameBuffer::filterIQLocked()
             // (1 - gA*weight).  This is a colour-side transfer policy only;
             // carrierImpurity remains decision data and never becomes a
             // replacement waveform.
-            const float *impRow = carrierImpurity_line(line);
-            const float *sameRegionRow = regionSamePartner_line(line);
-            const lddecode::CarrierAnalysisRecord *analysisRow =
-                carrierAnalysis_line(line);
             // A hypothetical luma-side repair does not prove that its per-pixel
             // value won the HF election. Bypassing gA on that basis restored
             // cross-colour wherever combY won, notably in fine line structure.
             // Apply the published policy to the actual residual colour instead.
-            const double ccWeight =
-                std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT);
+            //
+            // The policy itself is computed ONCE, in splitIQlocked(), which
+            // publishes the band-limited suppression envelope (in-field ±2
+            // vertical mix + lateral boxcar) as lockedCcMask.  Residual
+            // colour consumes that same envelope -- one policy, two
+            // renderers, no duplicate math -- so suppression cannot alias
+            // here either (the per-sample verdict used to be recomputed and
+            // only laterally smoothed in this path).
+            const float *maskRow = lockedCcMask_line(line);
+            const float *maskRawRow = lockedCcMaskRaw_line(line);
+            const lddecode::CarrierAnalysisRecord *analysisRow =
+                carrierAnalysis_line(line);
             const double giProduct = configuration.gi_product;
             const double gqProduct = configuration.gq_product;
 
             for (int i = 0; i < width; ++i) {
                 const int h = left + i;
+                const int ph = carrierSampleClass(line, h);
 
                 // Residual-colour mode derives chroma from the same carrier residual
                 // that produceY left behind: raw - Y.  Do not apply an additional local
@@ -1985,76 +2091,10 @@ void Comb::FrameBuffer::filterIQLocked()
                 // convention from the luma it is derived from.
                 const double chroma = (double)rawLine[h] - Yrow[h];
 
-                const double gA = impRow
-                    ? std::clamp((double)impRow[i], 0.0, 1.0)
+                const double m = maskRow
+                    ? std::clamp((double)maskRow[i], 0.0, 1.0)
                     : 0.0;
-                // Same conversion as the coherent path: a same-region ±2
-                // partner marks a color boundary, not cross-color.
-                const double regionKeep = sameRegionRow
-                    ? std::clamp((double)sameRegionRow[i], 0.0, 1.0)
-                    : 0.0;
-                // Second, graded read on the luma stranded in the bandpass
-                // (mirrors the coherent path in splitIQlocked).  gA is the
-                // aperture statistic that plateaus on periodic near-carrier
-                // luma; the table-owned carrierTrust() over the bandpass
-                // conformance measurement (raw bandpass vs grammar-certified
-                // Opposite partners, ±2 and frame axis) supplies the read gA
-                // lacks.  Its one-sided complement below neutral is the luma
-                // attribution, graded so no verdict flips at pixel pitch.  Take
-                // the stronger luma read and drive both by
-                // --cross-color-return.  Same-region continuity can consume
-                // the normal 2.0 rescue budget, but cannot veto strength above
-                // 2.0; this mirrors splitIQlocked and lets an aggressive CC
-                // setting override a false same-region read on a diagonal.
-                // chroma = raw - Y and the grid is already luma in Y, so
-                // suppressing the rendered chroma keeps it a monochrome
-                // wireframe -- no residue, no checkerboard.
-                // regionKeep gates only the aperture statistic (which rings on
-                // real chroma edges); the schedule read stands over it, since
-                // real chroma conforms and yields schedLuma == 0 on its own.
-                const double schedLuma = analysisRow
-                    ? std::clamp(1.0 - 2.0 * lddecode::carrierTrust(
-                                     analysisRow[i].carrierConformance,
-                                     analysisRow[i].conformanceConfidence),
-                                 0.0, 1.0)
-                    : 0.0;
-                const double normalBudget = std::min(ccWeight, 2.0);
-                const double apertureBudget = std::max(
-                    0.0, ccWeight - normalBudget * regionKeep);
-                // The weight is a REGION property (is this local area cross-
-                // color or real chroma), band-limited below before use.
-                ccMask[i] = std::clamp(
-                    std::max(gA * apertureBudget, schedLuma * ccWeight),
-                    0.0, 1.0);
-                ccChroma[i] = chroma;
-            }
-
-            // Pass 2: band-limit the suppression mask to the chroma bandwidth.
-            // Applied per-sample the weight carries regionKeep's hard 0/1 flips
-            // and gA's plateau-to-zero holes at the carrier rate, which
-            // amplitude-modulate the residual chroma and beat a diagonal back
-            // into the passband (the same failure mode as the old per-leg
-            // remodScale multiply).  A centered moving average (radius ~one
-            // carrier cycle) makes the mask an envelope that varies no faster
-            // than the colour it gates, so suppression cannot alias.
-            {
-                constexpr int kCcMaskRadius = 4; // 9-tap, first null ~1.6 MHz
-                double s = 0.0;
-                int lo = 0, hi = -1;
-                for (int i = 0; i < width; ++i) {
-                    const int nlo = std::max(0, i - kCcMaskRadius);
-                    const int nhi = std::min(width - 1, i + kCcMaskRadius);
-                    while (hi < nhi) s += ccMask[++hi];
-                    while (lo < nlo) s -= ccMask[lo++];
-                    ccMaskSmooth[i] = s / (double)(nhi - nlo + 1);
-                }
-            }
-
-            // Pass 3: apply the smoothed suppression envelope.
-            for (int i = 0; i < width; ++i) {
-                const int ph = carrierSampleClass(line, left + i);
-                const double alphaEff =
-                    std::clamp(1.0 - ccMaskSmooth[i], 0.0, 1.0);
+                const double alphaEff = 1.0 - m;
 
                 if (ccProbeLine == line && i >= ccProbeC0 && i <= ccProbeC1) {
                     const float conf = analysisRow ? analysisRow[i].carrierConformance : 0.0f;
@@ -2062,11 +2102,12 @@ void Comb::FrameBuffer::filterIQLocked()
                     std::fprintf(stderr,
                         "CCTERM line=%d col=%d maskRaw=%.3f maskSmooth=%.3f "
                         "conf=%.3f cfd=%.3f alphaEff=%.3f\n",
-                        line, i, ccMask[i], ccMaskSmooth[i], conf, cfd, alphaEff);
+                        line, i, maskRawRow ? maskRawRow[i] : 0.0f,
+                        maskRow ? maskRow[i] : 0.0f, conf, cfd, alphaEff);
                 }
 
-                scratch_preI[i] = (ccChroma[i] * lutTi[ph]) * giProduct * alphaEff;
-                scratch_preQ[i] = (ccChroma[i] * lutTq[ph]) * gqProduct * alphaEff;
+                scratch_preI[i] = (chroma * lutTi[ph]) * giProduct * alphaEff;
+                scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct * alphaEff;
             }
         } else {
             // The normal locked path consumes the cache prepared by splitIQlocked().

@@ -324,7 +324,7 @@ int main(int argc, char *argv[])
     parser.addOption(debugCadenceOption);
 
     QCommandLineOption crossColorReturnOption(QStringList() << "cross-color-return",
-                                    QCoreApplication::translate("main", "NTSC locked mode: Returns bandpass luma to Y, eliminating cross color effects and restoring high frequency luma detail. (default 2.0; values above 2.0 drive harder suppression on ambiguous pixels)"),
+                                    QCoreApplication::translate("main", "NTSC locked mode: Returns bandpass luma to Y, eliminating cross color effects and restoring high frequency luma detail. (default 0.0; set > 0 to engage, 2.0 effective max)"),
                                     QCoreApplication::translate("main", "number"));
     parser.addOption(crossColorReturnOption);
 

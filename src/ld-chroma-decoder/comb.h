@@ -127,10 +127,15 @@ public:
             // 1D / Lateral baseline
             // =========================================================================
             // Cross-color suppression strength (--cross-color-return).
-            // alphaEff = max(0, 1 - gA*weight) applied to rendered chroma in
-            // both coherent and residual paths; Y subtraction always full.
-            // >1.0 drives harder suppression on ambiguous pixels.
-            double CC_SUPPRESSION_WEIGHT    = 2.0;
+			// Set in CLI to transfer cross color back to luma.  Scales how
+			// much of the MEASURED contamination gets returned to luma; the
+			// transfer is hard-ceilinged at the evidence itself (aperture gA,
+			// or the vertical-image-detail read where gA under-reads -- see
+			// splitIQlocked/filterIQLocked).  Values above 1.0 only override
+			// a false-positive regionKeep rescue; they can never manufacture
+			// suppression beyond what was measured, so saturated textured
+			// chroma no longer grays out at strength 2.
+            double CC_SUPPRESSION_WEIGHT    = 0.0;
 
             // =========================================================================
             // 2D Field extraction (FieldA/B) and vertical gating
@@ -607,6 +612,18 @@ private:
 	// verification, so gA alone cannot tell them apart.  Evidence only; the
 	// suppression policy converts it at the consumption sites.
 	std::vector<float> regionSamePartner_flat;
+	// Cross-color suppression weight [0,1] per pixel, computed once by
+	// splitIQlocked() and consumed by both chroma renderers (coherent
+	// lockedProduct and residualColor).  Raw = the per-pixel policy verdict;
+	// the applied mask is its band-limited envelope (in-field ±2 vertical mix
+	// + lateral boxcar): applied per-sample the raw weight carries
+	// regionKeep's hard flips and gA's ring chatter at pixel pitch, which
+	// amplitude-modulates the rendered chroma and beats sidebands back into
+	// the passband (shredded colour on both sides of a hue boundary).  The
+	// envelope may vary no faster than the chroma it gates.  Allocated only
+	// when --cross-color-return is engaged.
+	std::vector<float> lockedCcMaskRaw_flat;
+	std::vector<float> lockedCcMask_flat;
 	// Schedule-rejected (alien) vertical partner evidence [0,1] per pixel: 1
 	// when a negatively conforming operand is ANTI-aligned at comparable
 	// magnitude after relation signing — raw-identical content where the carrier
@@ -1184,6 +1201,26 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    carrierImpurity_flat.empty()) return nullptr;
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* lockedCcMaskRaw_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedCcMaskRaw_flat.empty()) return nullptr;
+		return lockedCcMaskRaw_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* lockedCcMaskRaw_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedCcMaskRaw_flat.empty()) return nullptr;
+		return lockedCcMaskRaw_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* lockedCcMask_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedCcMask_flat.empty()) return nullptr;
+		return lockedCcMask_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* lockedCcMask_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedCcMask_flat.empty()) return nullptr;
+		return lockedCcMask_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* regionSamePartner_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
