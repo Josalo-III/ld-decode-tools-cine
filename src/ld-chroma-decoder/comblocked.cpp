@@ -1755,6 +1755,14 @@ void Comb::FrameBuffer::splitIQlocked()
         const float *impRow = carrierImpurity_line(line);
         const float *sameRegionRow = regionSamePartner_line(line);
         const float *hDeltaRow = lockedLumaHDeltaIRE_line(line);
+        // Pixel-accurate notch luma (raw - 1D bandpass) for the cross-color
+        // edge read only: sharper than the coarse ±2-on-lockedLumaSmooth
+        // service, which localizes edges to ~2 columns and leaves diagonals
+        // aliased. The shared lockedLumaHDeltaIRE service is left untouched for
+        // its reach/FVF clients.
+        const quint16 *ccRawLine =
+            rawbuffer.data() + static_cast<size_t>(line) * videoParameters.fieldWidth;
+        const double *ccSrc1D = locked1DSource_line(line);
         const lddecode::CarrierAnalysisRecord *analysisRow =
             carrierAnalysis_line(line);
         // ±2 same-field conformance context for the boundary/desert split
@@ -1856,41 +1864,60 @@ void Comb::FrameBuffer::splitIQlocked()
             //     certified-legal regions and inherits their protection
             //     (carrierLegalProof at ±2, per-column); diagonal detail
             //     sits where nothing certifies legal and stays actionable.
-            const double hDeltaIRE =
-                hDeltaRow ? (double)hDeltaRow[xi] : 0.0;
+            // Notch edge: raw - 1D bandpass, differenced at ±2 (same carrier
+            // phase, so the carrier cancels while the un-smoothed luma keeps a
+            // per-pixel edge). This is the "go back to notch for pixel
+            // accuracy" read; its residual-carrier leak in saturated colour is
+            // held by the grammar-pass exemption below. Falls back to the
+            // shared smooth service if the notch inputs are unavailable.
+            double hDeltaIRE = 0.0;
+            if (ccRawLine && ccSrc1D) {
+                const int xm = std::max(0, xi - 2);
+                const int xp = std::min(width - 1, xi + 2);
+                const double notchM =
+                    (double)ccRawLine[left + xm] - ccSrc1D[xm];
+                const double notchP =
+                    (double)ccRawLine[left + xp] - ccSrc1D[xp];
+                hDeltaIRE = std::fabs(notchP - notchM) * invIreScale;
+            } else if (hDeltaRow) {
+                hDeltaIRE = (double)hDeltaRow[xi];
+            }
             const double edgeRamp = std::clamp(
                 (hDeltaIRE - kCcEdgeSoftIRE) /
                     (kCcEdgeHardIRE - kCcEdgeSoftIRE),
                 0.0, 1.0);
 
-            double proof = 0.0;
+            // Burden of proof is on the CHROMA: it proves it is not luma ONLY
+            // by passing carrier-grammar (carrierLegalProof). The former
+            // "prove the energy is illegal" gate (carrierIllegalProof + the
+            // carrierTrust complement) is deleted -- that inverted burden is a
+            // rebellious shape that mutes the suppression on exactly the
+            // diagonals the Luma Delta must act on. The luma edge (edgeRamp)
+            // convicts by default; a pixel is spared ONLY where its own chroma
+            // -- or a same-column +/-2 neighbour's, so a thin real hue boundary
+            // inherits its legal regions' grammar proof -- is grammar-certified
+            // legal. In-field diagonal cross-color certifies nowhere and stays
+            // actionable.
+            double grammarPass = 0.0;
             if (analysisRow) {
-                const double conf =
-                    (double)analysisRow[xi].carrierConformance;
-                const double cfd =
-                    (double)analysisRow[xi].conformanceConfidence;
-                const double proofStrict =
-                    lddecode::carrierIllegalProof(conf, cfd);
-                const double ambientLuma = std::clamp(
-                    2.0 * (0.5 - lddecode::carrierTrust(conf, cfd)),
-                    0.0, 1.0);
-                const double legalNear = std::max(
-                    analysisUpRow
-                        ? lddecode::carrierLegalProof(
-                              (double)analysisUpRow[xi].carrierConformance,
-                              (double)analysisUpRow[xi].conformanceConfidence)
-                        : 0.0,
-                    analysisDnRow
-                        ? lddecode::carrierLegalProof(
-                              (double)analysisDnRow[xi].carrierConformance,
-                              (double)analysisDnRow[xi].conformanceConfidence)
-                        : 0.0);
-                proof = std::max(proofStrict,
-                                 ambientLuma * (1.0 - legalNear));
+                grammarPass = lddecode::carrierLegalProof(
+                    (double)analysisRow[xi].carrierConformance,
+                    (double)analysisRow[xi].conformanceConfidence);
             }
+            grammarPass = std::max(grammarPass, std::max(
+                analysisUpRow
+                    ? lddecode::carrierLegalProof(
+                          (double)analysisUpRow[xi].carrierConformance,
+                          (double)analysisUpRow[xi].conformanceConfidence)
+                    : 0.0,
+                analysisDnRow
+                    ? lddecode::carrierLegalProof(
+                          (double)analysisDnRow[xi].carrierConformance,
+                          (double)analysisDnRow[xi].conformanceConfidence)
+                    : 0.0));
 
             const double apertureRead = gA * (1.0 - regionKeep);
-            const double edgeRead = std::min(edgeRamp, proof);
+            const double edgeRead = edgeRamp * (1.0 - grammarPass);
             const double ccEvidence = std::max(gA, edgeRead);
             const double lumaWeight = std::clamp(
                 std::max(apertureRead, edgeRead) * ccWeight,
