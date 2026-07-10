@@ -153,13 +153,13 @@ public:
             // =========================================================================
             double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
             double FRAME_CHROMA_MIN_IRE       = 1.5;   // Frame A minimum chroma amplitude to engage the frame IQ path
-            double FRAME_IQ_RAW_MAX_DELTA_IRE = 12.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
+            double FRAME_IQ_RAW_MAX_DELTA_IRE = 70.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
             double FRAME_IQ_COH_PASS_CORR     = 0.85;  // Frame A signed center/neighbor correlation at which cohGate fully passes (firm comb); ramp starts 0.30 below
             double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B ±1: fraction of the EXACT projection (pull = 0.5 * strength * reachAuthority). 1.0 = the [1,2,1] solution of the two-line alternation model (alien nulled, Y luma at unit gain). Values are capped at the projection: pull > 0.5 is not stronger cancellation, it re-injects inverted alien at (2p−1) — the 0.80-era overdrive that serrated diagonals and manufactured diagonal cross-color.
             double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
-            double FRAME_B_RAW_MAX_DELTA_IRE   = 12.0; // Frame B IRE-domain direct-IQ delta cap
+            double FRAME_B_RAW_MAX_DELTA_IRE   = 100.0; // Frame B IRE-domain direct-IQ delta cap; flat, no lane-specific relax — the second line of defence behind the reach throttles
             double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
-            double FRAME_BEVEL_SAT_PENALTY     = 0.70; // extra reach penalty at saturated non-straight edges; squared chroma tightening on the bevel gate (0 = off, 1 = aggressive)
+            double FRAME_BEVEL_SAT_PENALTY     = 0.50; // extra reach penalty at saturated non-straight edges; squared chroma tightening on the bevel gate (0 = off, 1 = aggressive)
             double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // horizontal luma gradient for Frame ±1 cross-color gate; higher than Field's 18 because ±1 partners are closer (one TV line) and more resilient
             double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // cross-color reach throttle on Frame ±1: chromaWeight × hEdge × curvature (0 = off)
 
@@ -469,18 +469,52 @@ private:
 		int width = 0;
 		unsigned builtFlags = 0;
 		int ln0 = -1;
+		
+		// Requested geometric taps.  These preserve what the comb asked for before
+		// active-boundary resolution.
+		int reqU1 = -1;
+		int reqD1 = -1;
+		int reqU2 = -1;
+		int reqD2 = -1;
+		int reqU4 = -1;
+		int reqD4 = -1;
+		
+		// Resolved readable taps.  For same-field taps at the active top/bottom
+		// boundary, a missing outward leg may intentionally resolve to the inward
+		// same-field partner.  That is mirror resolution, not clamp fallback.
 		int lnU1 = -1;
 		int lnD1 = -1;
 		int lnU2 = -1;
 		int lnD2 = -1;
 		int lnU4 = -1;
 		int lnD4 = -1;
+		
+		// Resolved readability: true means the corresponding ln* can be read.
 		bool haveU1 = false;
 		bool haveD1 = false;
 		bool haveU2 = false;
 		bool haveD2 = false;
 		bool haveU4 = false;
 		bool haveD4 = false;
+		
+		// Geometric availability: true means the requested tap itself existed in the
+		// active same-field/interfield geometry before mirror resolution.
+		bool geomHaveU1 = false;
+		bool geomHaveD1 = false;
+		bool geomHaveU2 = false;
+		bool geomHaveD2 = false;
+		bool geomHaveU4 = false;
+		bool geomHaveD4 = false;
+		
+		// Active-boundary same-field mirror state.  At the top active same-field row,
+		// U2 may resolve to D2; at the bottom, D2 may resolve to U2.  Same for ±4.
+		// Consumers that only need a readable support row can use have*/ln*.
+		// Consumers that care about original geometry can inspect geomHave*/mirrored*.
+		bool mirroredU2 = false;
+		bool mirroredD2 = false;
+		bool mirroredU4 = false;
+		bool mirroredD4 = false;
+
 		std::vector<CombTapScalar> tap0;
 		std::vector<CombTapScalar> tapU1;
 		std::vector<CombTapScalar> tapD1;
@@ -607,7 +641,6 @@ private:
 	// 3-slot ring buffers caching Field B output as shared preclean input.
 	// Frame A and Frame B only need the center line and adjacent frame lines.
 	std::array<std::vector<double>, 3> precleanRing;
-	std::array<std::vector<double>, 3> precleanGateRing;
 	std::array<int, 3> precleanRingLine = { -1, -1, -1 };
 		std::vector<double> scratch_frameAAdaptiveIQComposite; // Frame A IQ candidate remodulated to composite.
 		std::vector<double> scratch_frameBDirectIQComposite;   // Frame B IQ candidate remodulated to composite.
@@ -715,6 +748,13 @@ private:
 	// softer block-centre lockedLumaSmooth scaffold when the sharpen level is
 	// on). Populated alongside lockedLumaSmooth in the decomposition loop.
 	std::vector<double> lockedLumaSharp_flat;
+	// 1D vertical-contrast service: per-sample lateral coarse-luma delta in
+	// IRE (|smooth[rel+2] - smooth[rel-2]|), published once by the locked
+	// decomposition pass.  The 1D is the first stage to cross a vertical
+	// contrast; the high-energy step it registers here serves every later
+	// client (Frame B reach exemption, hLumaDeltaIRE, cross-color, FVF
+	// vertical regime) without recomputation.
+	std::vector<float> lockedLumaHDeltaIRE_flat;
 	bool lockedLumaCacheValid = false;
 
 	inline double *lockedLumaBaseY4_line(int line) {
@@ -739,6 +779,18 @@ private:
 
 	inline const double *lockedLumaSharp_line(int line) const {
 		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline float *lockedLumaHDeltaIRE_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedLumaHDeltaIRE_flat.empty()) return nullptr;
+		return lockedLumaHDeltaIRE_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const float *lockedLumaHDeltaIRE_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedLumaHDeltaIRE_flat.empty()) return nullptr;
+		return lockedLumaHDeltaIRE_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline double *locked1DSource_line(int line) {
@@ -943,27 +995,12 @@ private:
 		return precleanRing[s].data();
 	}
 
-	inline const double *precleanGateLinePtr(int lineNumber, int width) const
-	{
-		if (!havePrecleanLine(lineNumber, width)) return nullptr;
-		const int s = precleanRingSlot(lineNumber);
-		if ((int)precleanGateRing[s].size() < width) return nullptr;
-		return precleanGateRing[s].data();
-	}
-
 		inline double *precleanLinePtrMutable(int lineNumber, int width)
 		{
 			const int s = precleanRingSlot(lineNumber);
 			if ((int)precleanRing[s].size() < width) precleanRing[s].resize(width);
 			precleanRingLine[s] = lineNumber;
 			return precleanRing[s].data();
-		}
-
-		inline double *precleanGateLinePtrMutable(int lineNumber, int width)
-		{
-			const int s = precleanRingSlot(lineNumber);
-			if ((int)precleanGateRing[s].size() < width) precleanGateRing[s].resize(width);
-			return precleanGateRing[s].data();
 		}
 
 	// Small helpers declared here; definitions provided after the class (in this header).

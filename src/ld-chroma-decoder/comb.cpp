@@ -459,14 +459,23 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         if (wantLocked) {
             lockedLumaBaseY4_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaSmooth_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
-            lockedLumaSharp_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            // The lurch-sharpened coarse floor is consumed only by the
+            // --luma-witness produceY election; the default fork subtracts the
+            // comb carrier directly and never reads it. Allocate it only under
+            // witness so the baseline path pays neither the buffer nor the
+            // lurch build below. baseY4/smooth/hDelta stay unconditional --
+            // candidate building consumes them in default mode.
+            if (configuration.lumaWitness)
+                lockedLumaSharp_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            else
+                lockedLumaSharp_flat.clear();
+            lockedLumaHDeltaIRE_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
             lockedLumaCacheValid = false;
         }
         // Preclean ring is only needed for Frame/FVF in locked mode.
         if (needFrameIQ) {
             for (int s = 0; s < 3; ++s) {
                 precleanRing[s].assign(width, 0.0);
-                precleanGateRing[s].assign(width, 1.0);
                 precleanRingLine[s] = -1;
             }
         }
@@ -2128,8 +2137,6 @@ void Comb::FrameBuffer::split2D()
             computeFieldBLine(*precleanTapLine,
                                    preclean,
                                    writeWeights ? fieldBDecisionReason_line(ln) : nullptr);
-            double *gate = precleanGateLinePtrMutable(ln, width);
-            std::fill(gate, gate + width, 1.0);
         };
 
         if (combTapBuildFlags_ & TapBuildFieldB) {
@@ -2151,8 +2158,6 @@ void Comb::FrameBuffer::split2D()
             // even when Field B's +/-2 reach cedes to the local center value.
             double *preclean = precleanLinePtrMutable(line, width);
             std::copy(scratch_lineWorkC.begin(), scratch_lineWorkC.begin() + width, preclean);
-            double *gate = precleanGateLinePtrMutable(line, width);
-            std::fill(gate, gate + width, 1.0);
         }
         if (needFrameIQCompute) {
             ensureFieldBPrecleanLine(line - 1);

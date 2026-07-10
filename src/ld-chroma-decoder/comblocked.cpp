@@ -131,15 +131,19 @@ void Comb::FrameBuffer::phaseLocked()
         !lockedLumaSmooth_flat.empty() &&
         demodWidth == width)
     {
-        // Sharpened boxcar coarse floor for the produceY HF election. Built
-        // only when the sweep knob asks for it (the buffer is otherwise unused,
-        // so there is no cost on the baseline path). Same construction the
-        // constrained witness used: a sliding 4-sample boxcar (carrier-
-        // cancelled per aperture, evaluated every sample) lurch-sharpened so a
-        // confirmed luma step lands at one column instead of smearing across
-        // four. The gate is scaled by the sweep level.
+        // Sharpened boxcar coarse floor for the produceY HF election. This is
+        // the lurch-corrected coarse and it lives ONLY in the --luma-witness
+        // fork: the default produceY subtracts the comb carrier directly and
+        // never reads it, so its buffer is left unallocated (comb.cpp) and the
+        // build below is skipped. Under witness it is built when the sweep knob
+        // asks for it. Same construction the constrained witness used: a
+        // sliding 4-sample boxcar (carrier-cancelled per aperture, evaluated
+        // every sample) lurch-sharpened so a confirmed luma step lands at one
+        // column instead of smearing across four. The gate is scaled by the
+        // sweep level.
         const double sharpLevel = coarseSharpLevel();
         const bool buildSharp =
+            configuration.lumaWitness &&
             sharpLevel > 0.0 && !lockedLumaSharp_flat.empty();
         std::vector<double> boxcar;
         std::vector<double> gateScratch;
@@ -154,6 +158,20 @@ void Comb::FrameBuffer::phaseLocked()
                                                 lockedLumaBaseY4_line(line),
                                                 nullptr,
                                                 lockedLumaSmooth_line(line));
+
+            // Vertical-contrast service: the 1D is the first stage to cross a
+            // vertical contrast, so the lateral coarse delta is registered here
+            // once for every later client (Frame B reach exemption,
+            // hLumaDeltaIRE, cross-color, FVF vertical regime).
+            if (float *hDelta = lockedLumaHDeltaIRE_line(line)) {
+                const double *smooth = lockedLumaSmooth_line(line);
+                for (int rel = 0; rel < width; ++rel) {
+                    const int rm = std::max(0, rel - 2);
+                    const int rp = std::min(width - 1, rel + 2);
+                    hDelta[rel] = static_cast<float>(
+                        std::fabs(smooth[rp] - smooth[rm]) * invIreScale);
+                }
+            }
 
             if (!buildSharp)
                 continue;
