@@ -738,9 +738,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     // read A, so risk is a true ripple-free 0; on luma-near-fsc the coherent
     // wide fit cancels while the narrow mean-of-envelope does not, so risk > 0.
     //
-    // The metric is published as carrierImpurity (a disqualification oracle).
+    // The metric is published as carrierImpurity (a provisional oracle).
     // It is NEVER applied to the carrier source; the source is emitted clean.
     // Suppression happens downstream as alpha at color demod and Y subtraction.
+    // measurePostCombImpurity() later replaces this provisional 1D read with
+    // the elected-comb measurement that splitIQlocked() actually consumes.
     // The doc's exact form is used with no shaping: any shape made it
     // unresponsive somewhere.
     constexpr int    kNarrowWin = 16;          // 4 carrier cycles (nulls 2fsc/4fsc)
@@ -1616,18 +1618,12 @@ void Comb::FrameBuffer::measurePostCombImpurity()
                     std::max(kImpurityFloorIRE, narrowMag));
             }
 
-            // Union with the pre-comb read buildPhaseCorrected1D() already
-            // published into this same buffer.  The post-comb pass measures what
-            // survived combing, but the interfield comb smears sharp cross-color
-            // transients into low-amplitude pseudo-coherence that aperture purity
-            // can no longer distinguish from authentic chroma -- gA collapses and
-            // the contamination leaks.  The seed saw that transient sharp, pre-comb
-            // (narrow >> wide), so take the stronger of the two reads: a pixel
-            // flagged before combing is not lost after it.  This reuses the seed's
-            // gA from carrierImpurity (no recompute); the suppression still happens
-            // only color-side, Y stays raw - full carrier, so no checkerboard.
-            impurityRow[rel] =
-                std::max(impurityRow[rel], static_cast<float>(gA));
+            // The post-comb read is authoritative for CCR targeting. The
+            // locked-1D seed published earlier is only a provisional read used
+            // before the elected comb exists; once we have the elected result,
+            // stale pre-comb suspicion must not linger and suppress solved
+            // pixels.
+            impurityRow[rel] = static_cast<float>(gA);
 
             if (pcDiagLine >= 0 && line == pcDiagLine &&
                 rel >= pcDiagC0 && rel <= pcDiagC1) {

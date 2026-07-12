@@ -616,9 +616,9 @@ private:
 	// row accessor stands in for the old "no coherent carrier here" case).
 	std::vector<double> lockedCoherentCarrier_flat;
 	std::vector<std::uint8_t> lockedCoherentCarrierValid;
-	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D;
-	// measurePostCombImpurity() unions the elected-comb reading with that sharp
-	// pre-comb warning rather than erasing it.
+	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D
+	// as a provisional read; measurePostCombImpurity() overwrites it with the
+	// elected-comb reading before splitIQlocked() consumes it.
 	std::vector<float> carrierImpurity_flat;
 	// Same-region vertical partner evidence [0,1] per pixel: 1 when two
 	// schedule-admitted carrier operands positively share a ±2 chroma region
