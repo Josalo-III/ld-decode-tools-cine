@@ -2354,7 +2354,8 @@ void Comb::FrameBuffer::computeFrameBLine(
         std::fprintf(stderr,
             "FRAMEBDIAG header line x haveUp haveDn legalUp legalDn "
             "reachUp reachDn pairAgreeIRE dUp0IRE dDn0IRE reachAuthority "
-            "pull deltaIRE z0MagIRE targetMagIRE imp0 impU1 impD1\n");
+            "pull deltaIRE z0MagIRE targetMagIRE imp0 impU1 impD1 "
+            "sigma dReg aGate corrIRE midLic\n");
     }
 
     // Demod the center and ±1 legs to signed 4fsc IQ, aligned to center's
@@ -2384,6 +2385,195 @@ void Comb::FrameBuffer::computeFrameBLine(
             : std::complex<double>(0.0, 0.0);
     }
 
+    // =====================================================================
+    // Signed-subtractor prepass.
+    //
+    // The signed demod folds image-locked alien with OPPOSITE signs on the
+    // Same- and Opposite-relation ±1 legs (carrier-locked chroma reads
+    // identically from both — that is the point of signed demod).  The two
+    // quadratic forms of the pair therefore split cleanly:
+    //
+    //   midpoint  (ZUp+ZDn)/2 : chroma + (a_up − a_dn)/2  — the aliens'
+    //     image-space DIFFERENCE: zero on verticals, first-order in the
+    //     diagonal slope, parity-alternating — the 2-px staircase.
+    //   difference (ZUp−ZDn)/2 : ±(a_up + a_dn)/2 — the aliens' SUM ≈ the
+    //     center's own alien, with only a second-order (vertical curvature)
+    //     error.  σ (alienSign) unfolds the parity.
+    //
+    // So the pair difference is a direct signed estimator of exactly the
+    // contamination Frame B exists to remove; the combine subtracts it from
+    // center BEFORE the midpoint projection.  σ comes from grammar lineFlip
+    // polarity — a scalar-domain fact, which is the part of alignment the
+    // grammar genuinely owns.  Evidence requires exactly one Same + one
+    // Opposite relation across the pair; σ = +1 iff up is the Same leg.
+    //
+    // Registration: a thin feature advancing ~1 px/line decorrelates across
+    // the ±1 pair, and an unregistered difference subtracts a straddled
+    // double-image (partial correction is the worst geometry).  Each column
+    // searches d ∈ [−2,+2] along the local diagonal for the offset that
+    // maximizes the windowed difference magnitude — the offset where the two
+    // legs' aliens add coherently.  Non-zero d must clear an 8% margin over
+    // d=0 so noise cannot steer the registration.  All gates are windowed:
+    // a single 4fsc sample demods onto one IQ axis (rank-1), so per-sample
+    // magnitudes flicker on the axis lattice; the 7-tap window mixes axes.
+    // =====================================================================
+    const bool havePairIQ =
+        !forceFrameBLocked1D && haveUpLine && haveDnLine &&
+        precleanUp && precleanDn;
+
+    bool haveSignedAlien = false;
+    double alienSign = 0.0;
+    if (havePairIQ && configuration.phaseCompensation) {
+        const auto *g0 = carrierGrammarLine(line);
+        const auto *gU = carrierGrammarLine(line - 1);
+        const auto *gD = carrierGrammarLine(line + 1);
+        if (g0 && gU && gD) {
+            const bool upSame = (gU->lineFlip == g0->lineFlip);
+            const bool dnSame = (gD->lineFlip == g0->lineFlip);
+            if (upSame != dnSame) {
+                haveSignedAlien = true;
+                alienSign = upSame ? 1.0 : -1.0;
+            }
+        }
+    }
+
+    if (havePairIQ) {
+        if ((int)scratch_fbPairDiff.size() < width)
+            scratch_fbPairDiff.resize(width);
+        if ((int)scratch_fbAlienGate.size() < width)
+            scratch_fbAlienGate.resize(width);
+        if ((int)scratch_fbPairAgreeWinIRE.size() < width)
+            scratch_fbPairAgreeWinIRE.resize(width);
+        if ((int)scratch_fbReg.size() < width)
+            scratch_fbReg.resize(width);
+
+        static constexpr double kWin[7] = {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
+        constexpr double kWinSum = 6.0;
+        constexpr double kRegMargin = 1.08;
+
+        auto clampX = [&](int xi) { return std::clamp(xi, 0, width - 1); };
+
+        for (int x = 0; x < width; ++x) {
+            std::complex<double> S[5];
+            for (int di = 0; di < 5; ++di) {
+                const int d = di - 2;
+                std::complex<double> acc(0.0, 0.0);
+                for (int k = -3; k <= 3; ++k) {
+                    acc += kWin[k + 3] *
+                        (scratch_upIQ[clampX(x + k - d)] -
+                         scratch_dnIQ[clampX(x + k + d)]);
+                }
+                S[di] = acc;
+            }
+
+            // Unregistered (d = 0) windowed pair agreement, consumed by the
+            // midpoint license in the combine below.
+            scratch_fbPairAgreeWinIRE[x] =
+                (cmag(S[2]) / kWinSum) * invIreScale;
+
+            if (!haveSignedAlien) {
+                scratch_fbPairDiff[x] = std::complex<double>(0.0, 0.0);
+                scratch_fbAlienGate[x] = 0.0;
+                scratch_fbReg[x] = 0;
+                continue;
+            }
+
+            // Registration anchored to STRUCTURE, not difference energy:
+            // find the shift s* that best aligns the Same-relation leg to
+            // center (the observable local diagonal advance).  Maximizing
+            // |S(d)| directly is steered by chroma texture — misregistering
+            // real chroma inflates the difference — so the search would
+            // wander on textured content.  The Same leg rides with center by
+            // the estimator's own premise, so its best-alignment shift IS the
+            // diagonal advance, and the pair difference is then taken at the
+            // registration that advance implies (up aligns to center at −d,
+            // down at +d, so d = −s* when the Same leg is up, +s* when down).
+            // s* ≠ 0 must clear an 8% improvement margin so noise cannot
+            // steer the registration off the d=0 default.
+            const bool sameIsUp = (alienSign > 0.0);
+            const std::vector<std::complex<double>> &sameLeg =
+                sameIsUp ? scratch_upIQ : scratch_dnIQ;
+
+            double devMag[5];
+            for (int si = 0; si < 5; ++si) {
+                const int s = si - 2;
+                std::complex<double> devAcc(0.0, 0.0);
+                for (int k = -3; k <= 3; ++k) {
+                    devAcc += kWin[k + 3] *
+                        (sameLeg[clampX(x + k + s)] -
+                         scratch_centerIQ[clampX(x + k)]);
+                }
+                devMag[si] = cmag(devAcc) / kWinSum;
+            }
+
+            int bestSi = 2;
+            double bestDev = devMag[2] / kRegMargin;
+            for (int si = 0; si < 5; ++si) {
+                if (si == 2) continue;
+                if (devMag[si] < bestDev) {
+                    bestDev = devMag[si];
+                    bestSi = si;
+                }
+            }
+
+            const int sStar = bestSi - 2;
+            const int d = sameIsUp ? -sStar : sStar;
+            const int di = d + 2;
+
+            const std::complex<double> pairDiff = S[di] / kWinSum;
+            scratch_fbPairDiff[x] = pairDiff;
+            scratch_fbReg[x] = d;
+
+            // Validity gate on the SAME/OPPOSITE deviation asymmetry, both
+            // legs read at their registered positions (up aligns to center at
+            // −d, down at +d).  The signed fold makes the two failure modes
+            // separable: image-locked alien leaves the Same leg riding center
+            // (dSame ≈ 0) while displacing the Opposite leg by twice the
+            // alien (dOpp ≈ 2a) — gate → 1.  A real vertical chroma gradient
+            // displaces both legs symmetrically (dSame ≈ dOpp ≈ g) — gate →
+            // 0, so real chroma structure is never subtracted.  Comparing
+            // dSame against the pair difference instead (the earlier form)
+            // conflates these, because the pair difference carries both the
+            // alien sum and the gradient.
+            const std::vector<std::complex<double>> &oppLeg =
+                sameIsUp ? scratch_dnIQ : scratch_upIQ;
+            const int oppShift = sameIsUp ? d : -d;
+            std::complex<double> oppAcc(0.0, 0.0);
+            for (int k = -3; k <= 3; ++k) {
+                oppAcc += kWin[k + 3] *
+                    (oppLeg[clampX(x + k + oppShift)] -
+                     scratch_centerIQ[clampX(x + k)]);
+            }
+            const double dSame = devMag[bestSi];
+            const double dOpp = cmag(oppAcc) / kWinSum;
+            // Commit once the signature is decisive (dSame ≤ 0.4·dOpp reads
+            // as pure alien — full retraction), proportional below.  A gate
+            // that lingers at half strength subtracts half the alien and
+            // leaves a parity-alternating residue: partial correction is the
+            // worst geometry, per the round-1 lesson.
+            const double ratioGate =
+                (dOpp > 1e-12)
+                    ? std::clamp((1.0 - dSame / dOpp) / 0.6, 0.0, 1.0)
+                    : 0.0;
+            // "Rides with center" is an ABSOLUTE condition, not merely
+            // relative: the ratio alone still commits at horizontal content
+            // boundaries where BOTH legs deviate hugely and the Opposite one
+            // happens to deviate 2.5× more — subtracting the neighbours'
+            // carrier content there paints negative vertical ghosts of the
+            // ±1 lines onto center (measured on the bridge figures,
+            // 2026-07-12).  Full retraction requires the Same leg near
+            // center in IRE terms; fades out by 5 IRE of windowed deviation.
+            constexpr double kSameRideFullIRE = 1.25;
+            constexpr double kSameRideZeroIRE = 5.0;
+            const double dSameIRE = dSame * invIreScale;
+            const double rideGate = std::clamp(
+                (kSameRideZeroIRE - dSameIRE) /
+                    (kSameRideZeroIRE - kSameRideFullIRE),
+                0.0, 1.0);
+            scratch_fbAlienGate[x] = ratioGate * rideGate;
+        }
+    }
+
     for (int x = 0; x < width; ++x) {
         const bool useLockedCenter = forceFrameBLocked1D;
 
@@ -2410,26 +2600,61 @@ void Comb::FrameBuffer::computeFrameBLine(
 
         const bool haveUpSignal =
             haveUpLine && precleanUp;
-        
+
         const bool haveDnSignal =
             haveDnLine && precleanDn;
-            
-        std::complex<double> Zout = Z0;
+
+        // Estimator (1): signed alien retraction.  Subtract the registered
+        // pair-difference alien estimate from center before any midpoint
+        // geometry.  Scaled by LEGALITY only (pairLegalGate) — reachGate's
+        // contour-trust models the midpoint's failure modes, not this one —
+        // times the windowed validity gate and comb strength.
+        std::complex<double> Zc = Z0;
 
         // Probe capture (assigned along the path; printed only when active).
         double diagPull = 0.0;
         double diagDeltaIRE = 0.0;
         double diagTargetMagIRE = 0.0;
         double diagReachAuthority = 0.0;
+        double diagSigma = 0.0;
+        double diagAlienGate = 0.0;
+        double diagCorrIRE = 0.0;
+        double diagMidLic = 1.0;
 
-        // Plain ±1 interfield comb — the grail law, one combine for both
-        // regimes.  Per project_frameb_comb_must_run: when a legal partner
+        if (!useLockedCenter && haveSignedAlien &&
+            haveUpSignal && haveDnSignal &&
+            x < (int)reachTapLine.pairU1.size() &&
+            x < (int)reachTapLine.pairD1.size())
+        {
+            const double pairLegalGate = std::min(
+                std::clamp(reachTapLine.pairU1[x].reachLegalGate, 0.0, 1.0),
+                std::clamp(reachTapLine.pairD1[x].reachLegalGate, 0.0, 1.0));
+            const double aGate = scratch_fbAlienGate[x];
+
+            if (pairLegalGate > 0.0 && aGate > 0.0) {
+                const std::complex<double> corr =
+                    ((0.5 * alienSign) * scratch_fbPairDiff[x]) *
+                    (combStrength * aGate * pairLegalGate);
+                if (std::isfinite(corr.real()) && std::isfinite(corr.imag()))
+                    Zc = Z0 - corr;
+                diagSigma = alienSign;
+                diagAlienGate = aGate;
+                diagCorrIRE = cmag(corr) * invIreScale;
+            }
+        }
+
+        std::complex<double> Zout = Zc;
+
+        // Estimator (2): plain ±1 interfield midpoint — the grail law, one
+        // combine for both regimes, now operating from the alien-retracted
+        // center.  Per project_frameb_comb_must_run: when a legal partner
         // exists this MUST run — never gate to bare center via confidence
         // correlations.  The regime discrimination does not live here: the
         // reach gates decide WHERE (bevel/cross-color throttles collapse reach
-        // at horizontal color edges; verticals keep full reach) and the flat
-        // delta cap decides HOW MUCH.  The estimate is the exact midpoint
-        // projection of the two admitted legs.
+        // at horizontal color edges; verticals keep full reach), the flat
+        // delta cap decides HOW MUCH, and the midpoint license reserves full
+        // pull for the verified center-owned-alien geometry (partners agree,
+        // center differs).
         if (!useLockedCenter && (upReachRaw > 0.0 || dnReachRaw > 0.0)) {
             const bool haveUp = haveUpSignal && upReachRaw > 0.0;
             const bool haveDn = haveDnSignal && dnReachRaw > 0.0;
@@ -2450,8 +2675,34 @@ void Comb::FrameBuffer::computeFrameBLine(
             if (wsum > 1e-12) {
                 target /= wsum;
 
-                std::complex<double> delta = target - Z0;
+                std::complex<double> delta = target - Zc;
                 const double deltaIRE = cmag(delta) * invIreScale;
+
+                // Midpoint license: the midpoint estimator's own premise is
+                // partners carrying common C ± E (agree with each other,
+                // differ from center).  Pair disagreement measures the
+                // premise violation directly — the antisymmetric alien the
+                // midpoint would inject — so the pull is licensed only where
+                // the partners agree within a quarter of the delta being
+                // pulled: the same 0.25 agreement fraction as the delta-cap
+                // verify band and crossColorExempt, so all three
+                // verified-cancellation tests share one geometry.  The
+                // canonical opposed-field case (pairAgree ≈ 0, delta large)
+                // keeps license ≈ 1.  Attribution measured 2026-07-12 on the
+                // bridge braces: with retraction active, the residual Y-plane
+                // staircase was ENTIRELY midpoint-injected — Zc-only decoded
+                // at the intrafield parity floor.
+                constexpr double kMidLicenseAgreeFrac = 0.25;
+                double midLicense = 1.0;
+                if (havePairIQ && haveUp && haveDn && deltaIRE > 1e-9) {
+                    midLicense = std::clamp(
+                        1.0 -
+                            scratch_fbPairAgreeWinIRE[x] /
+                                (kMidLicenseAgreeFrac * deltaIRE),
+                        0.0,
+                        1.0);
+                }
+                diagMidLic = midLicense;
 
                 double effectiveMaxDeltaIRE = maxDeltaIRE;
                 if (haveUp && haveDn &&
@@ -2548,17 +2799,17 @@ void Comb::FrameBuffer::computeFrameBLine(
                     0.5 * combStrength * reachAuthority,
                     0.0,
                     0.5);
-                Zout = Z0 + delta * pull;
+                Zout = Zc + delta * (pull * midLicense);
 
                 diagPull = pull;
                 diagDeltaIRE = deltaIRE;
                 diagTargetMagIRE = cmag(target) * invIreScale;
                 diagReachAuthority = reachAuthority;
-                            
+
                 if (!std::isfinite(Zout.real()) ||
                     !std::isfinite(Zout.imag()))
                 {
-                    Zout = Z0;
+                    Zout = Zc;
                 }
             }
         }
@@ -2586,7 +2837,8 @@ void Comb::FrameBuffer::computeFrameBLine(
                 "dUp0IRE=%.3f dDn0IRE=%.3f "
                 "reachAuthority=%.3f pull=%.3f "
                 "deltaIRE=%.3f z0MagIRE=%.3f "
-                "targetMagIRE=%.3f imp0=%.3f impU1=%.3f impD1=%.3f\n",
+                "targetMagIRE=%.3f imp0=%.3f impU1=%.3f impD1=%.3f "
+                "sigma=%.0f dReg=%d aGate=%.3f corrIRE=%.3f midLic=%.3f\n",
                 line, x, haveUpSignal ? 1 : 0, haveDnSignal ? 1 : 0,
                 legalUp, legalDn, upReachRaw, dnReachRaw,
                 pairAgreeIRE,
@@ -2596,7 +2848,11 @@ void Comb::FrameBuffer::computeFrameBLine(
                 cmag(Z0) * invIreScale, diagTargetMagIRE,
                 fbDiagImp0 ? fbDiagImp0[x] : -1.0f,
                 fbDiagImpU ? fbDiagImpU[x] : -1.0f,
-                fbDiagImpD ? fbDiagImpD[x] : -1.0f);
+                fbDiagImpD ? fbDiagImpD[x] : -1.0f,
+                diagSigma,
+                havePairIQ && x < (int)scratch_fbReg.size()
+                    ? scratch_fbReg[x] : 0,
+                diagAlienGate, diagCorrIRE, diagMidLic);
         }
 
         outFrameIQ[x] = Zout;
@@ -2614,6 +2870,168 @@ void Comb::FrameBuffer::computeFrameBLine(
                     signedRemodCursor, Zout.real(), Zout.imag());
 
             lddecode::carrierGrammarAdvanceRemodCursor(gridRemodCursor);
+        }
+    }
+
+    // Interfield-flip diagnostic: per-leg center-relative benefit of the
+    // carrier alignment.  For each leg independently:
+    //   rawError     = ||Z0 - RawLeg||     (leg without carrier sign correction)
+    //   alignedError = ||Z0 - AlignedLeg|| (leg as the grammar aligned it)
+    //   benefit      = (rawError - alignedError) / (rawError + alignedError + ε)
+    // Positive = flip helped (carrier-locked chroma).
+    // Negative = flip hurt  (image-locked structure).
+    if (configuration.debugInterfieldFlip && configuration.phaseCompensation) {
+        static const int flipProbeStep = [] {
+            const char *s = std::getenv("FLIP_DIAG_STEP");
+            return s ? std::max(1, std::atoi(s)) : 8;
+        }();
+        const int probeFirst = first + (last - first) / 4;
+        const int probeLast  = first + (last - first) * 3 / 4;
+        const bool lineIsProbe =
+            line >= probeFirst && line < probeLast &&
+            ((line - probeFirst) % flipProbeStep == 0);
+
+        if (lineIsProbe && (haveUpLine || haveDnLine)) {
+            const auto *grammar0 =
+                carrierGrammarLine(line);
+            const auto *grammarUp = haveUpLine
+                ? carrierGrammarLine(line - 1) : nullptr;
+            const auto *grammarDn = haveDnLine
+                ? carrierGrammarLine(line + 1) : nullptr;
+
+            const int flip0 = grammar0 ? grammar0->lineFlip : +1;
+            const bool upFlipped =
+                grammarUp && (grammarUp->lineFlip != flip0);
+            const bool dnFlipped =
+                grammarDn && (grammarDn->lineFlip != flip0);
+
+            constexpr double eps = 0.1;
+
+            double sumBenefitUp = 0.0, sumBenefitDn = 0.0;
+            double sumMinBenefit = 0.0;
+            double sumLegDisagree = 0.0;
+            double sumSamePhaseDistIRE = 0.0;
+            int countUp = 0, countDn = 0, countBoth = 0;
+            int countUpPositive = 0, countDnPositive = 0;
+            int countSamePhase = 0;
+            double sumCenterMag = 0.0;
+
+            for (int x = 0; x < width; ++x) {
+                const std::complex<double> &Z0x = scratch_centerIQ[x];
+                const double z0mag = cmag(Z0x);
+
+                if (haveUpLine && precleanUp) {
+                    const std::complex<double> &ZUpx = scratch_upIQ[x];
+                    if (upFlipped) {
+                        const std::complex<double> rawUp = -ZUpx;
+                        const double rawErr = cmag(Z0x - rawUp);
+                        const double alignedErr = cmag(Z0x - ZUpx);
+                        const double benefit =
+                            (rawErr - alignedErr) /
+                            (rawErr + alignedErr + eps);
+                        sumBenefitUp += benefit;
+                        if (benefit > 0.0) ++countUpPositive;
+                    } else {
+                        sumSamePhaseDistIRE += cmag(Z0x - ZUpx) * invIreScale;
+                        ++countSamePhase;
+                    }
+                    ++countUp;
+                    sumCenterMag += z0mag;
+                }
+
+                if (haveDnLine && precleanDn) {
+                    const std::complex<double> &ZDnx = scratch_dnIQ[x];
+                    if (dnFlipped) {
+                        const std::complex<double> rawDn = -ZDnx;
+                        const double rawErr = cmag(Z0x - rawDn);
+                        const double alignedErr = cmag(Z0x - ZDnx);
+                        const double benefit =
+                            (rawErr - alignedErr) /
+                            (rawErr + alignedErr + eps);
+                        sumBenefitDn += benefit;
+                        if (benefit > 0.0) ++countDnPositive;
+                    } else {
+                        sumSamePhaseDistIRE += cmag(Z0x - ZDnx) * invIreScale;
+                        ++countSamePhase;
+                    }
+                    ++countDn;
+                    if (!haveUpLine || !precleanUp)
+                        sumCenterMag += z0mag;
+                }
+
+                if (haveUpLine && precleanUp && haveDnLine && precleanDn) {
+                    const std::complex<double> &ZUpx = scratch_upIQ[x];
+                    const std::complex<double> &ZDnx = scratch_dnIQ[x];
+                    const double upMag = cmag(ZUpx);
+                    const double dnMag = cmag(ZDnx);
+                    const double minMag = std::min(upMag, dnMag);
+                    if (minMag > eps) {
+                        const double dot =
+                            (ZUpx.real() * ZDnx.real() +
+                             ZUpx.imag() * ZDnx.imag()) /
+                            (upMag * dnMag);
+                        sumLegDisagree += (1.0 - dot);
+                    }
+
+                    if (upFlipped || dnFlipped) {
+                        const std::complex<double> rawUp =
+                            upFlipped ? -ZUpx : ZUpx;
+                        const std::complex<double> rawDn =
+                            dnFlipped ? -ZDnx : ZDnx;
+                        const double rawErrUp = cmag(Z0x - rawUp);
+                        const double alignedErrUp = cmag(Z0x - ZUpx);
+                        const double bUp =
+                            (rawErrUp - alignedErrUp) /
+                            (rawErrUp + alignedErrUp + eps);
+                        const double rawErrDn = cmag(Z0x - rawDn);
+                        const double alignedErrDn = cmag(Z0x - ZDnx);
+                        const double bDn =
+                            (rawErrDn - alignedErrDn) /
+                            (rawErrDn + alignedErrDn + eps);
+                        sumMinBenefit += std::min(bUp, bDn);
+                    }
+                    ++countBoth;
+                }
+            }
+
+            const int flippedLegs =
+                (upFlipped ? countUp : 0) + (dnFlipped ? countDn : 0);
+            const double avgBenUp = (upFlipped && countUp > 0)
+                ? sumBenefitUp / countUp : 0.0;
+            const double avgBenDn = (dnFlipped && countDn > 0)
+                ? sumBenefitDn / countDn : 0.0;
+            const double avgFlippedBenefit = flippedLegs > 0
+                ? (sumBenefitUp + sumBenefitDn) / flippedLegs : 0.0;
+            const double avgMin = countBoth > 0
+                ? sumMinBenefit / countBoth : 0.0;
+            const double avgDisagree = countBoth > 0
+                ? sumLegDisagree / countBoth : 0.0;
+            const double avgCenterMagIRE =
+                countUp > 0
+                    ? (sumCenterMag / countUp) * invIreScale
+                    : 0.0;
+            const double avgSamePhaseDistIRE = countSamePhase > 0
+                ? sumSamePhaseDistIRE / countSamePhase : -1.0;
+            const double fracUpPos = (upFlipped && countUp > 0)
+                ? double(countUpPositive) / countUp : -1.0;
+            const double fracDnPos = (dnFlipped && countDn > 0)
+                ? double(countDnPositive) / countDn : -1.0;
+
+            std::fprintf(stderr,
+                "FLIPDIAG line=%d flipUp=%d flipDn=%d "
+                "benefitUp=%.4f benefitDn=%.4f "
+                "avgFlipBenefit=%.4f minBenefit=%.4f "
+                "legDisagree=%.4f samePhaseDistIRE=%.2f "
+                "centerMagIRE=%.2f "
+                "fracUpPos=%.3f fracDnPos=%.3f "
+                "nUp=%d nDn=%d nBoth=%d\n",
+                line, upFlipped ? 1 : 0, dnFlipped ? 1 : 0,
+                avgBenUp, avgBenDn,
+                avgFlippedBenefit, avgMin,
+                avgDisagree, avgSamePhaseDistIRE,
+                avgCenterMagIRE,
+                fracUpPos, fracDnPos,
+                countUp, countDn, countBoth);
         }
     }
 }

@@ -55,6 +55,7 @@ public:
         bool   adaptive    = true; // If true, the 3D adaptive candidate selection is used.
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
+        bool   debugInterfieldFlip = false; // Log per-leg benefit of carrier alignment on ±1 interfield pair
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
@@ -695,6 +696,22 @@ private:
 	std::vector<std::complex<double>> scratch_centerIQ; // reused per-line preclean/locked frame IQ prep
 	std::vector<std::complex<double>> scratch_upIQ;
 	std::vector<std::complex<double>> scratch_dnIQ;
+	// Frame B signed-subtractor prepass (computeFrameBLine).  The ±1 pair
+	// difference is a SIGNED estimator of the legs' shared image-locked alien:
+	// the signed demod folds the alien with opposite signs on the Same- and
+	// Opposite-relation legs, so (ZUp−ZDn)/2 recovers the aliens' SUM (≈ the
+	// center's own alien, error second-order/curvature) while the midpoint
+	// carries their difference (first-order on diagonals — the 2-px
+	// staircase).  fbPairDiff holds the diagonal-registered, window-normalized
+	// difference vector; fbAlienGate the windowed validity gate (Same leg must
+	// ride with center — a real vertical chroma gradient zeroes it);
+	// fbPairAgreeWinIRE the unregistered windowed pair-agreement magnitude
+	// consumed by the midpoint license; fbReg the chosen registration offset
+	// (diagnostic).
+	std::vector<std::complex<double>> scratch_fbPairDiff;
+	std::vector<double> scratch_fbAlienGate;
+	std::vector<double> scratch_fbPairAgreeWinIRE;
+	std::vector<int> scratch_fbReg;
 		// Shared line scratch planes used by split2D / produceY.
 		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY.
 		std::vector<double> scratch_lineWorkB; // Field gate row; coherent carrier estimate (cHat) in produceY.

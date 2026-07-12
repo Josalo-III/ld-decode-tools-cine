@@ -354,28 +354,6 @@ double interfieldAlienCancelStrength(double centerI,
                                      double minChromaIRE,
                                      double columnSupport);
 
-// Salutary-combine reach backoff in [0,1] for the ±1 interfield pair.  The
-// signed demod aligns carrier-locked chroma across the pair but anti-aligns
-// image-locked alien (luma misread into the chroma band): so real chroma makes
-// the two legs point the SAME direction (their sum is salutary — it adds real
-// chroma), while alien makes them point OPPOSITE (their sum extracts only the
-// alien's antisymmetric part — the 2-px diagonal staircase).  Hue is invariant
-// along a diagonal, so this direction test needs no registration: a real
-// single-hue diagonal keeps agreeing across the shifted pair and combs, while a
-// diagonal alien disagrees and cedes.  Returns 1.0 (inert, legality governs)
-// when one-sided or below the chroma floor; otherwise ramps on leg agreement.
-// A true chroma vertical boundary (two hues) also disagrees and cedes, which is
-// the correct outcome for a ±1 average across a color break.  Both interfield
-// combs (Frame A and Frame B) consume this through the shared reachGate, so the
-// discrimination lives once, here, not inside either comb.
-double interfieldSalutaryReach(double upI,
-                               double upQ,
-                               double downI,
-                               double downQ,
-                               bool hasUp,
-                               bool hasDown,
-                               double minChromaIRE);
-
 MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,
                                                 double up2Coarse,
                                                 double down2Coarse,

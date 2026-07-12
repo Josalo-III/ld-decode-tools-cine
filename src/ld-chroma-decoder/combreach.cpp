@@ -1038,38 +1038,6 @@ double interfieldAlienCancelStrength(double centerI,
     return clamp01(std::max(commonCarrierFit, residualTintCancel));
 }
 
-double interfieldSalutaryReach(double upI,
-                               double upQ,
-                               double downI,
-                               double downQ,
-                               bool hasUp,
-                               bool hasDown,
-                               double minChromaIRE)
-{
-    // One-sided reaches have no pair to disagree, hence no antisymmetric-alien
-    // staircase to guard against.  Leave the reach at its legality baseline.
-    if (!hasUp || !hasDown)
-        return 1.0;
-
-    const double minChroma = std::max(0.0, minChromaIRE);
-    const double mu = magIQ(upI, upQ);
-    const double md = magIQ(downI, downQ);
-
-    // A leg with no chroma-band energy cannot carry the alien that pairs the
-    // lines; there is nothing for the salutary test to discriminate, so stay
-    // inert and let legality govern.
-    if (mu < minChroma || md < minChroma)
-        return 1.0;
-
-    // The whole test: do the two aligned legs point the same way?  Agreement
-    // rises with the real-chroma fraction and falls with the alien fraction
-    // (alien enters the pair anti-aligned), so this single scalar backs off the
-    // reach exactly in proportion to the staircase risk.  Same agreement band
-    // as interfieldAlienCancelStrength's neighbour test.
-    const double agree = signedDotNormIQ(upI, upQ, downI, downQ);
-    return ramp(agree, 0.45, 0.82);
-}
-
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,
                                               double upI,

@@ -323,6 +323,10 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
     parser.addOption(debugCadenceOption);
 
+    QCommandLineOption debugInterfieldFlipOption(QStringList() << "debug-interfield-flip",
+                                    QCoreApplication::translate("main", "NTSC locked mode: log per-leg benefit of carrier alignment on the ±1 interfield pair (center-relative counterfactual)"));
+    parser.addOption(debugInterfieldFlipOption);
+
     QCommandLineOption crossColorReturnOption(QStringList() << "cross-color-return",
                                     QCoreApplication::translate("main", "NTSC locked mode: Returns bandpass luma to Y, eliminating cross color effects and restoring high frequency luma detail. (default 0.0; set > 0 to engage, 2.0 effective max)"),
                                     QCoreApplication::translate("main", "number"));
@@ -424,6 +428,10 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(debugCadenceOption)) {
         combConfig.debugCadence = true;
+    }
+
+    if (parser.isSet(debugInterfieldFlipOption)) {
+        combConfig.debugInterfieldFlip = true;
     }
 
     if (parser.isSet(crossColorReturnOption)) {
