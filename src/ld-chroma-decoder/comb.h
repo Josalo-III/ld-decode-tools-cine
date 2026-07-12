@@ -151,7 +151,7 @@ public:
             double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0; // suppress 2D field output when ±2 line pair disagrees beyond this
 
             double FIELD_LUMA_EDGE_THRESH_IRE = 18.0; // horizontal luma gradient above this suppresses vertical 2D comb
-            double FIELD_B_BEVEL_REACH_PENALTY = 0.45; // extra Field B reach damping in high-chroma bevels near luma edges
+            double FIELD_B_BEVEL_REACH_PENALTY = 0.45; // RESERVED / inert: retired Field B bevel reach damping; kept for tuning compatibility
             double FIELD_B_BEVEL_CEDE_STRENGTH = 0.15; // extra Field B center cede in high-chroma bevels near luma edges
 
             // =========================================================================
@@ -432,6 +432,7 @@ private:
 	// clpbuffer[2]: 3D temporal refinement plane, filled by split3D().
 
 	struct CombTapScalar {
+		double raw = 0.0;
 		double comp = 0.0;
 		double symMag = 0.0;
 	};
@@ -555,10 +556,6 @@ private:
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
 		std::vector<double> hLumaDeltaIRE;
-		// Dedicated bevel detector's Field B cede contribution [0,1], measured
-		// where the moving-coarse contour gates are applied so the risk math
-		// runs once; consumed only by Field B policy resolution.
-		std::vector<double> fieldBBevelCede;
 		// Complete per-column Field B policy (leg mix + explicit centerCede +
 		// reasons), resolved upstream. The renderer consumes this and the taps;
 		// it performs no analysis of its own.

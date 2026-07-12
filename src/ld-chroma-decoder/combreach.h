@@ -243,10 +243,10 @@ enum FieldBPolicyReason : std::uint8_t {
     FieldBPolicyReasonRegionCede    = 1u << 0, // region verdicts withdrew both legs
     FieldBPolicyReasonShadowBand    = 1u << 1, // strong magnitude-asymmetry band membership
     FieldBPolicyReasonHEdgeGuard    = 1u << 2, // horizontal luma edge, no positively continuing leg
-    FieldBPolicyReasonLumaEdgeCede  = 1u << 3, // graded vertical coarse-luma contrast on a ±2 leg
+    FieldBPolicyReasonLumaEdgeCede  = 1u << 3, // graded vertical coarse-luma contrast shaped a ±2 leg
     FieldBPolicyReasonVerticalBreak = 1u << 4, // hard vertical context break
     FieldBPolicyReasonOneLeg        = 1u << 5, // boundary resolution excluded one leg
-    FieldBPolicyReasonBevelCede     = 1u << 6, // dedicated bevel detector contribution
+    FieldBPolicyReasonBevelCede     = 1u << 6, // reserved: retired Field B bevel output cede
 };
 
 // The complete prepared verdict the Field B renderer consumes. Leg selection
@@ -295,10 +295,12 @@ std::uint8_t intrafieldRegionCedeFlags(
 
 // Resolve the full Field B policy from prepared evidence. Consumes the region
 // verdicts and cede flags, the baseline pair weights, the horizontal luma
-// delta, the per-leg vertical coarse-luma deltas (|coarse0 − coarse±2| in IRE;
-// pass 0 when the coarse rows are unavailable), and the dedicated bevel
-// detector's cede contribution [0,1]. Emits leg mix/eligibility, explicit
-// centerCede, and diagnostic reasons — the renderer performs no analysis.
+// delta, and the per-leg vertical coarse-luma deltas (|coarse0 − coarse±2| in
+// IRE; pass 0 when the coarse rows are unavailable). Emits leg mix/eligibility,
+// explicit centerCede, and diagnostic reasons — the renderer performs no
+// analysis.
+// Vertical coarse-luma contrast shapes or excludes legs; it must not reduce
+// Field B output strength while a legal leg remains.
 FieldBTapPolicy resolveFieldBTapPolicy(
     const IntrafieldRegionReach &region,
     std::uint8_t cedeFlags,
@@ -307,8 +309,7 @@ FieldBTapPolicy resolveFieldBTapPolicy(
     double horizontalLumaDeltaIRE = 0.0,
     double horizontalLumaEdgeThresholdIRE = 1.0,
     double upCoarseLumaDeltaIRE = 0.0,
-    double downCoarseLumaDeltaIRE = 0.0,
-    double bevelCede = 0.0);
+    double downCoarseLumaDeltaIRE = 0.0);
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,

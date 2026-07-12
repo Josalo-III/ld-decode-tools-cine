@@ -710,8 +710,7 @@ FieldBTapPolicy resolveFieldBTapPolicy(
     double horizontalLumaDeltaIRE,
     double horizontalLumaEdgeThresholdIRE,
     double upCoarseLumaDeltaIRE,
-    double downCoarseLumaDeltaIRE,
-    double bevelCede)
+    double downCoarseLumaDeltaIRE)
 {
     FieldBTapPolicy out;
     out.upWeight = std::clamp(upWeight, 0.0, 1.0);
@@ -730,11 +729,9 @@ FieldBTapPolicy resolveFieldBTapPolicy(
 
     // Vertical coarse-luma service, restored from the July 5 renderer. The ±2
     // legs sit two lines away; coarse-luma contrast between center and a leg
-    // means the same-context premise behind vertical cancellation is failing,
-    // which is exactly the vertical-comb-across-a-luma-edge alternation that
-    // serrates diagonals. Graded contrast attenuates the leg's mix share and
-    // contributes graded cede; a hard break invalidates Field B outright and
-    // is expressed as raw IRE so no later normalization can undo it.
+    // means that leg's same-context premise may be failing. Treat this as leg
+    // selection evidence, not output-amplitude evidence: a surviving legal leg
+    // must still comb at Field B strength.
     constexpr double kLumaEdgeLoIRE = 6.0;
     constexpr double kLumaEdgeHiIRE = 20.0;
     constexpr double kHardVerticalBreakIRE = 14.0;
@@ -744,9 +741,6 @@ FieldBTapPolicy resolveFieldBTapPolicy(
         (dUpIRE - kLumaEdgeLoIRE) / (kLumaEdgeHiIRE - kLumaEdgeLoIRE), 0.0, 1.0);
     const double lumaEdgeDn = std::clamp(
         (dDnIRE - kLumaEdgeLoIRE) / (kLumaEdgeHiIRE - kLumaEdgeLoIRE), 0.0, 1.0);
-
-    if (std::max(dUpIRE, dDnIRE) >= kHardVerticalBreakIRE)
-        return fullCede(FieldBPolicyReasonVerticalBreak);
 
     if ((cedeFlags & IntrafieldRegionCedeCenter) != 0) {
         std::uint8_t reasons = FieldBPolicyReasonRegionCede;
@@ -763,21 +757,22 @@ FieldBTapPolicy resolveFieldBTapPolicy(
         1.0);
 
     // Applied to every non-terminal path on the way out: graded vertical
-    // contrast shapes the mix per leg and cedes the output in proportion,
-    // and the dedicated bevel detector's contribution is maxed in.
+    // contrast shapes the mix per leg.  A hard break excludes only the
+    // offending leg; if both legs fail, the renderer naturally holds center.
     auto finishPolicy = [&]() -> FieldBTapPolicy & {
+        if (dUpIRE >= kHardVerticalBreakIRE) {
+            out.upWeight = 0.0;
+            out.reasons |= FieldBPolicyReasonVerticalBreak;
+        }
+        if (dDnIRE >= kHardVerticalBreakIRE) {
+            out.downWeight = 0.0;
+            out.reasons |= FieldBPolicyReasonVerticalBreak;
+        }
         out.upWeight *= (1.0 - 0.65 * lumaEdgeUp);
         out.downWeight *= (1.0 - 0.65 * lumaEdgeDn);
-        const double lumaEdgeCede = std::max(lumaEdgeUp, lumaEdgeDn);
-        if (lumaEdgeCede > 0.0) {
-            out.centerCede = std::max(out.centerCede, lumaEdgeCede);
+        const double lumaEdgeShape = std::max(lumaEdgeUp, lumaEdgeDn);
+        if (lumaEdgeShape > 0.0)
             out.reasons |= FieldBPolicyReasonLumaEdgeCede;
-        }
-        if (bevelCede > 0.0) {
-            out.centerCede = std::max(out.centerCede,
-                                      std::clamp(bevelCede, 0.0, 1.0));
-            out.reasons |= FieldBPolicyReasonBevelCede;
-        }
         return out;
     };
 

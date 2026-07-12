@@ -144,6 +144,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     const int width = right - left;
+    const int fieldWidth = videoParameters.fieldWidth;
 
     tapLine.width = std::max(0, width);
     if (width <= 0 || lineNumber < first || lineNumber >= last) return;
@@ -306,7 +307,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     }
 
     if (wantFieldB) {
-        ensureWidth(tapLine.fieldBBevelCede);
         ensureWidth(tapLine.fieldBPolicy);
     }
 
@@ -317,8 +317,16 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         return bucketScalar1D_line(ln) + left;
     };
 
+    auto getRawRow = [&](int ln)->const quint16* {
+        if (ln < first || ln >= last) return nullptr;
+        if (ln < 0 || ln >= demodLines) return nullptr;
+        if (rawbuffer.isEmpty()) return nullptr;
+        return rawbuffer.data() + static_cast<size_t>(ln) * fieldWidth + left;
+    };
+
     struct RowRefs {
         int ln = -1;
+        const quint16 *raw = nullptr;
         const double *comp = nullptr;
         bool haveLine = false;
     };
@@ -327,6 +335,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         RowRefs r;
         r.ln = ln;
         r.haveLine = haveLine;
+        r.raw = haveLine ? getRawRow(ln) : nullptr;
         r.comp = haveLine ? getCompRow(ln) : nullptr;
         return r;
     };
@@ -370,6 +379,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const int rp1 = reflectCombRel(rel + 1, width);
 
             CombTapScalar &s = dst[rel];
+            s.raw = r.raw ? static_cast<double>(r.raw[rel]) : 0.0;
             s.comp = r.comp[rel];
             s.symMag = 0.5 * (std::fabs(r.comp[rm1]) + std::fabs(r.comp[rp1]));
         }
@@ -866,7 +876,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     //     The intrafield combs need actual reach limiting around vertical
     //     content boundaries.  Source: movingCoarseContour exclusively.  When
     //     mc.valid -> 0.25 + 0.75 * trust; otherwise gate = 1.0 (deterministic
-    //     fall-through, not a fallback to a second confidence stream).
+    //     fall-through, not a fallback to a second confidence stream).  The
+    //     former bevel reach penalty was retired after proving to soften Field
+    //     B without preventing the Gilgol/credits errors.
     auto applyFrameReachWithIQFloor = [&](std::vector<CombTapPair> &upPair,
                                         std::vector<CombTapPair> &dnPair,
                                         bool haveUp,
@@ -1042,56 +1054,16 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                                                bool haveDn) {
         if (!haveUp || !haveDn || (int)upPair.size() < width || (int)dnPair.size() < width)
             return;
-        const double edgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
-        const bool publishBevelCede =
-            (int)tapLine.fieldBBevelCede.size() >= width;
         for (int rel = 0; rel < width; ++rel) {
             double upContourGate = 1.0;
             double dnContourGate = 1.0;
-            double bevelCede = 0.0;
             if (rel < (int)tapLine.movingCoarseContour.size() &&
                 tapLine.movingCoarseContour[rel].valid)
             {
                 const auto &mc = tapLine.movingCoarseContour[rel];
                 upContourGate = 0.25 + 0.75 * std::clamp(mc.upTrust, 0.0, 1.0);
                 dnContourGate = 0.25 + 0.75 * std::clamp(mc.downTrust, 0.0, 1.0);
-
-                if (rel < (int)tapLine.hLumaDeltaIRE.size()) {
-	                    const double chromaT =
-	                        (rel < (int)tapLine.centerAdmittedChromaT.size())
-	                            ? tapLine.centerAdmittedChromaT[rel]
-	                            : 0.0;
-                    const double hEdge =
-                        std::clamp(
-                            (tapLine.hLumaDeltaIRE[rel] - 0.30 * edgeThreshIRE) /
-                            (0.70 * edgeThreshIRE),
-                            0.0, 1.0);
-                    const double sideBalance =
-                        1.0 - std::fabs(
-                            std::clamp(mc.upTrust, 0.0, 1.0) -
-                            std::clamp(mc.downTrust, 0.0, 1.0));
-                    const double bevelRisk =
-                        chromaT *
-                        hEdge *
-                        (1.0 - std::clamp(mc.straightness, 0.0, 1.0)) *
-                        (0.35 + 0.65 * std::clamp(sideBalance, 0.0, 1.0));
-                    const double bevelGate =
-                        std::clamp(
-                            1.0 - T.FIELD_B_BEVEL_REACH_PENALTY * bevelRisk,
-                            0.0, 1.0);
-                    upContourGate *= bevelGate;
-                    dnContourGate *= bevelGate;
-                    // Dedicated detector output for Field B policy: symmetric
-                    // bevel protection must act on the OUTPUT (explicit cede),
-                    // because the renderer renormalizes accepted legs to full
-                    // comb strength and a symmetric gate attenuation would
-                    // otherwise vanish.
-                    bevelCede = std::clamp(
-                        T.FIELD_B_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
-                }
             }
-            if (publishBevelCede)
-                tapLine.fieldBBevelCede[rel] = bevelCede;
             upPair[rel].reachGate = std::clamp(
                 upContourGate * upPair[rel].reachLegalGate, 0.0, 1.0);
             dnPair[rel].reachGate = std::clamp(
@@ -1160,10 +1132,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const double downCoarseDeltaIRE = haveCoarse
                 ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel])
                 : 0.0;
-            const double bevelCede =
-                (rel < (int)tapLine.fieldBBevelCede.size())
-                    ? tapLine.fieldBBevelCede[rel]
-                    : 0.0;
 
             auto policy =
                 CombContentReach::resolveFieldBTapPolicy(
@@ -1174,14 +1142,13 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                     hLumaDeltaIRE,
                     hEdgeThreshIRE,
                     upCoarseDeltaIRE,
-                    downCoarseDeltaIRE,
-                    bevelCede);
+                    downCoarseDeltaIRE);
 
-            // Fold reach (legality × contour trust) into eligibility and mix
-            // here so the renderer consumes the policy alone.  Asymmetric
-            // trust tilts the vertical estimate; a symmetric attenuation is
-            // deliberately inert under the renderer's normalization (output
-            // strength is centerCede's channel, not the weights').
+            // Fold reach (legality x moving-coarse contour trust) into
+            // eligibility and mix here so the renderer consumes the policy
+            // alone.  The scalar input-range clamp catches amplitude
+            // excursions, but zipper errors can still sit inside that legal
+            // range; contour trust is the surviving Field B zipper guard.
             policy.upWeight *= tapLine.pairU2[rel].reachGate;
             policy.downWeight *= tapLine.pairD2[rel].reachGate;
 
@@ -1208,25 +1175,93 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     tapLine.builtFlags = flags;
 }
 
-static inline bool scalarOutsideCluster(
+static inline double clampCarrierToInputCarrierLimits(
     double v,
-    std::initializer_list<double> cluster,
-    double slack)
+    std::initializer_list<double> inputs,
+    double fallback)
 {
     double lo = std::numeric_limits<double>::infinity();
     double hi = -std::numeric_limits<double>::infinity();
+    double maxAbs = 0.0;
 
-    for (double x : cluster) {
+    for (double x : inputs) {
         if (!std::isfinite(x))
             continue;
         lo = std::min(lo, x);
         hi = std::max(hi, x);
+        maxAbs = std::max(maxAbs, std::fabs(x));
     }
 
     if (!std::isfinite(lo) || !std::isfinite(hi))
-        return true;
+        return std::isfinite(fallback) ? fallback : 0.0;
 
-    return !std::isfinite(v) || v < lo - slack || v > hi + slack;
+    double out = std::isfinite(v) ? v : fallback;
+    if (!std::isfinite(out))
+        out = 0.0;
+
+    out = std::clamp(out, -maxAbs, maxAbs);
+    return std::clamp(out, lo, hi);
+}
+
+static inline double clampScalarTowardCenterHalf(
+    double v,
+    double center,
+    double leg)
+{
+    if (!std::isfinite(v))
+        return std::isfinite(center) ? center : 0.0;
+    if (!std::isfinite(center) || !std::isfinite(leg))
+        return v;
+
+    const double mid = 0.5 * (center + leg);
+    if (center <= leg)
+        return std::clamp(v, center, mid);
+    return std::clamp(v, mid, center);
+}
+
+static inline double clampCarrierToInputLumaRange(
+    double carrier,
+    double centerRaw,
+    std::initializer_list<double> inputLuma,
+    double fallbackCarrier)
+{
+    if (!std::isfinite(centerRaw))
+        return std::isfinite(fallbackCarrier) ? fallbackCarrier : 0.0;
+
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    for (double y : inputLuma) {
+        if (!std::isfinite(y))
+            continue;
+        lo = std::min(lo, y);
+        hi = std::max(hi, y);
+    }
+
+    if (!std::isfinite(lo) || !std::isfinite(hi))
+        return std::isfinite(fallbackCarrier) ? fallbackCarrier : 0.0;
+
+    double out = std::isfinite(carrier) ? carrier : fallbackCarrier;
+    if (!std::isfinite(out))
+        out = 0.0;
+
+    const double yOut = std::clamp(centerRaw - out, lo, hi);
+    return centerRaw - yOut;
+}
+
+static inline double clampCarrierToInputLimits(
+    double carrier,
+    double centerRaw,
+    std::initializer_list<double> inputCarrier,
+    std::initializer_list<double> inputLuma,
+    double fallbackCarrier)
+{
+    // Carrier limits keep the comb estimate plausible in its own signal
+    // domain.  Luma limits are applied last because visible failures are
+    // judged after reconstructing Y = rawCenter - carrier.
+    carrier = clampCarrierToInputCarrierLimits(
+        carrier, inputCarrier, fallbackCarrier);
+    return clampCarrierToInputLumaRange(
+        carrier, centerRaw, inputLuma, fallbackCarrier);
 }
 
 static inline bool iqOutsideClusterBox(
@@ -1274,6 +1309,9 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
     const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
 
     for (int rel = 0; rel < width; ++rel) {
+        const double rawC  = tapLine.tap0[rel].raw;
+        const double rawU2 = tapLine.tapU2[rel].raw;
+        const double rawD2 = tapLine.tapD2[rel].raw;
         const double C    = tapLine.tap0[rel].comp;
         const double Cup2 = tapLine.tapU2[rel].comp;
         const double Cdn2 = tapLine.tapD2[rel].comp;
@@ -1576,16 +1614,24 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
         }
 
         if (combed) {
-            const double candUp =
-                0.5 * (C - Cup2Adj);
-            const double candDn =
-                0.5 * (C - Cdn2Adj);
-        
-            constexpr double kClusterSlackIRE = 0.25;
-            const double slack = kClusterSlackIRE * irescale;
-        
-            if (scalarOutsideCluster(tc, { C, candUp, candDn }, slack))
-                tc = C;
+            // Scalar comb outputs may not be brighter, darker, or larger in
+            // magnitude than the raw input pixels that formed the comb.
+            // Candidate/output clusters and excluded legs are not a legal range.
+            const double yC = rawC - C;
+            const double yU = rawU2 - Cup2;
+            const double yD = rawD2 - Cdn2;
+            if (wUp2 > 0.0 && wDn2 > 0.0)
+                tc = clampCarrierToInputLimits(
+                    tc, rawC, { C, Cup2, Cdn2 }, { yC, yU, yD }, C);
+            else if (wUp2 > 0.0) {
+                tc = clampCarrierToInputLimits(
+                    tc, rawC, { C, Cup2 }, { yC, yU }, C);
+                tc = clampScalarTowardCenterHalf(tc, C, Cup2);
+            } else {
+                tc = clampCarrierToInputLimits(
+                    tc, rawC, { C, Cdn2 }, { yC, yD }, C);
+                tc = clampScalarTowardCenterHalf(tc, C, Cdn2);
+            }
         }
         
         if (!std::isfinite(tc))
@@ -1679,6 +1725,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     // =====================================================================
 
     for (int rel = 0; rel < width; ++rel) {
+        const double rawCenter = tapLine.tap0[rel].raw;
+        const double rawUp = tapLine.tapU2[rel].raw;
+        const double rawDown = tapLine.tapD2[rel].raw;
         const double center = tapLine.tap0[rel].comp;
         const double up = tapLine.tapU2[rel].comp;
         const double down = tapLine.tapD2[rel].comp;
@@ -1710,39 +1759,49 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
 
             const double combed = 0.5 * (center - neighbor);
 
-            // Bounded-cluster guard in Field-B output space.
-            //
-            // The result must lie within the cluster formed by center and the
-            // actual one-leg Field-B candidates.  If it leaves that cluster,
-            // Field B has manufactured an overshoot rather than an average/
-            // cancellation result, so cede to center.  This is a feasibility
-            // clamp (a legal-range fact), not a confidence hedge.
-            const double candUp =
-                0.5 * (center - up);
-            const double candDown =
-                0.5 * (center - down);
-
-            constexpr double kClusterSlackIRE = 0.25;
-            const double slack = kClusterSlackIRE * irescale;
-
-            const bool outside =
-                useUp && useDown
-                    ? scalarOutsideCluster(combed, { center, candUp, candDown }, slack)
-                    : useUp
-                        ? scalarOutsideCluster(combed, { center, candUp }, slack)
-                        : scalarOutsideCluster(combed, { center, candDown }, slack);
-
-            if (outside) {
-                output = center;
-                reason = FieldBReasonCenter;
-            } else {
-                output = combed * (1.0 - cede) + center * cede;
-                reason = (cede >= 0.5)
-                    ? FieldBReasonCede
-                    : ((useUp && useDown)
-                        ? FieldBReasonBlend
-                        : FieldBReasonOneLeg);
-            }
+            // Scalar Field B is bounded by the raw input pixels that actually
+            // formed this output.  A leg excluded by policy must not widen the
+            // legal range for a one-sided comb.
+            const double yCenter = rawCenter - center;
+            const double yUp = rawUp - up;
+            const double yDown = rawDown - down;
+            const double bounded = (useUp && useDown)
+                ? clampCarrierToInputLimits(
+                    combed, rawCenter,
+                    { center, up, down }, { yCenter, yUp, yDown },
+                    center)
+                : (useUp
+                    ? clampCarrierToInputLimits(
+                        combed, rawCenter,
+                        { center, up }, { yCenter, yUp },
+                        center)
+                    : clampCarrierToInputLimits(
+                        combed, rawCenter,
+                        { center, down }, { yCenter, yDown },
+                        center));
+            output = bounded * (1.0 - cede) + center * cede;
+            output = (useUp && useDown)
+                ? clampCarrierToInputLimits(
+                    output, rawCenter,
+                    { center, up, down }, { yCenter, yUp, yDown },
+                    center)
+                : (useUp
+                    ? clampCarrierToInputLimits(
+                        output, rawCenter,
+                        { center, up }, { yCenter, yUp },
+                        center)
+                    : clampCarrierToInputLimits(
+                        output, rawCenter,
+                        { center, down }, { yCenter, yDown },
+                        center));
+            if (useUp != useDown)
+                output = clampScalarTowardCenterHalf(
+                    output, center, useUp ? up : down);
+            reason = (cede >= 0.5)
+                ? FieldBReasonCede
+                : ((useUp && useDown)
+                    ? FieldBReasonBlend
+                    : FieldBReasonOneLeg);
 		}
 
         if (!std::isfinite(output)) {
