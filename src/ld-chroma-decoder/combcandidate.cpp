@@ -305,6 +305,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.hLumaDeltaIRE);
     }
 
+    if (wantFieldB) {
+        ensureWidth(tapLine.fieldBBevelCede);
+        ensureWidth(tapLine.fieldBPolicy);
+    }
+
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
         if (configuration.phaseCompensation)
@@ -462,9 +467,10 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             return;
         }
 
-        const double lineReachLegalGate = legalGateForReachUse(
-            combReachIndex.query({lineNumber, targetLine, left, left, reachUse, reachSource}),
-            reachUse);
+        const lddecode::CombReachReply lineReach = combReachIndex.query(
+            {lineNumber, targetLine, left, left, reachUse, reachSource});
+        const double lineReachLegalGate =
+            legalGateForReachUse(lineReach, reachUse);
 
         const bool needScalarWeight =
             (reachUse != lddecode::CombReachUse::IQCancel);
@@ -489,7 +495,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             p.kScore = combKMetric(c.comp, c.symMag, n.comp, n.symMag);
             p.weight = (kRange > 1e-9) ? (1.0 - p.kScore * invK) : 1.0;
             p.weight = std::clamp(p.weight, 0.0, 1.0);
-            p.fieldBWeight = p.weight;
         }
     };
 
@@ -645,7 +650,15 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         trustAt(analysisUp, rel),
                         trustAt(analysisDn, rel),
                         invI,
-                        5.0);
+                        5.0,
+                        // Sharp raw ±2 scalar facts: the first-pass AlienCancel
+                        // decision (replaces the former Field B weight revive).
+                        (rel < (int)tapLine.pairU2.size())
+                            ? tapLine.pairU2[rel].diffIRE : -1.0,
+                        (rel < (int)tapLine.pairD2.size())
+                            ? tapLine.pairD2[rel].diffIRE : -1.0,
+                        (rel < (int)tapLine.centerEnvelope.size())
+                            ? tapLine.centerEnvelope[rel] * invI : 0.0);
 
                 if (want4Region) {
                     const auto region4 =
@@ -996,25 +1009,20 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             curvature * curvature;
                         bevelGate *= std::clamp(1.0 - satBite, 0.0, 1.0);
                     }
-                    if (xColPenalty > 0.0 &&
-                        rel < static_cast<int>(tapLine.hLumaDeltaIRE.size()))
-                    {
-                        const double hEdge = std::clamp(
-                            (tapLine.hLumaDeltaIRE[rel] -
-                             0.30 * xColThreshIRE) /
-                            (0.70 * xColThreshIRE),
-                            0.0,
-                            1.0);
-                    
-                        // hEdge detects a vertical luma transition: the horizontal bandpass
-                        // crosses it and may create alternating false chroma. Restore the
-                        // portion of Frame B authority withdrawn by bevel protection.
-                        const double verticalEdgeExempt =
-                            std::clamp(xColPenalty * hEdge, 0.0, 1.0);
-                    
-                        bevelGate +=
-                            (1.0 - bevelGate) * verticalEdgeExempt;
-                    }
+                    // NO undisciplined lateral-edge restore here.  A bare
+                    // hLumaDeltaIRE step cannot tell a straight vertical
+                    // misread column (safe to comb) from a diagonal region
+                    // boundary (must stay protected): both present the same
+                    // lateral luma step.  On a straight vertical the bevel
+                    // gate is already ~1.0 (curvature≈0), so restoring here
+                    // changes nothing legitimate — it only fires where
+                    // bevelGate < 1, i.e. curved/diagonal edges, where it
+                    // strips exactly the protection it should keep and
+                    // serrates the diagonal.  Alien discrimination on the ±1
+                    // pair is carried by the partner-verified crossColorExempt
+                    // in computeFrameBLine (center-relative), not here.
+                    Q_UNUSED(xColPenalty);
+                    Q_UNUSED(xColThreshIRE);
                     const double frameExempt = impulseExempt;
                     const double effectiveGate =
                         bevelGate + (1.0 - bevelGate) * frameExempt;
@@ -1035,9 +1043,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         if (!haveUp || !haveDn || (int)upPair.size() < width || (int)dnPair.size() < width)
             return;
         const double edgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
+        const bool publishBevelCede =
+            (int)tapLine.fieldBBevelCede.size() >= width;
         for (int rel = 0; rel < width; ++rel) {
             double upContourGate = 1.0;
             double dnContourGate = 1.0;
+            double bevelCede = 0.0;
             if (rel < (int)tapLine.movingCoarseContour.size() &&
                 tapLine.movingCoarseContour[rel].valid)
             {
@@ -1070,8 +1081,17 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             0.0, 1.0);
                     upContourGate *= bevelGate;
                     dnContourGate *= bevelGate;
+                    // Dedicated detector output for Field B policy: symmetric
+                    // bevel protection must act on the OUTPUT (explicit cede),
+                    // because the renderer renormalizes accepted legs to full
+                    // comb strength and a symmetric gate attenuation would
+                    // otherwise vanish.
+                    bevelCede = std::clamp(
+                        T.FIELD_B_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
                 }
             }
+            if (publishBevelCede)
+                tapLine.fieldBBevelCede[rel] = bevelCede;
             upPair[rel].reachGate = std::clamp(
                 upContourGate * upPair[rel].reachLegalGate, 0.0, 1.0);
             dnPair[rel].reachGate = std::clamp(
@@ -1079,11 +1099,26 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     };
 
-    auto prepareFieldBWeights = [&]() {
+    auto prepareFieldBPolicy = [&]() {
+        if ((int)tapLine.fieldBPolicy.size() < width)
+            return;
+
         if (!tapLine.haveU2 || !tapLine.haveD2 ||
             (int)tapLine.pairU2.size() < width ||
             (int)tapLine.pairD2.size() < width)
+        {
+            // No vertical support: no accepted legs and no cede — the
+            // renderer's own tap test holds the 1D center.
+            std::fill(tapLine.fieldBPolicy.begin(),
+                      tapLine.fieldBPolicy.begin() + width,
+                      CombContentReach::FieldBTapPolicy());
             return;
+        }
+
+        const bool haveCoarse =
+            (int)tapLine.coarse0IRE.size() >= width &&
+            (int)tapLine.coarseU2IRE.size() >= width &&
+            (int)tapLine.coarseD2IRE.size() >= width;
 
         const CombContentReach::IntrafieldRegionReach unknownRegion;
         const double hEdgeThreshIRE =
@@ -1093,90 +1128,64 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 (rel < (int)tapLine.intrafieldRegionReach.size())
                     ? tapLine.intrafieldRegionReach[rel]
                     : unknownRegion;
-            const std::uint8_t cedeFlags =
+            // Generic region cede is COLUMN-LOCAL: a slanted boundary keeps a
+            // per-column footprint instead of an 8-wide 1D stripe.  Only the
+            // dedicated shadow-band detector (strong magnitude asymmetry) may
+            // expand horizontally — the grail rule that a narrow middle/shadow
+            // band is one region and must take one render, not flicker
+            // comb/center across columns.
+            std::uint8_t fieldBCedeFlags =
                 (rel < (int)tapLine.intrafieldRegionCede.size())
                     ? tapLine.intrafieldRegionCede[rel]
                     : std::uint8_t{0};
-            // Grail rule: a narrow middle/shadow band is one region.  Keep the
-            // old 9-column reach window here, where tap authority is prepared,
-            // so renderers consume one decision instead of rebuilding it.
-            std::uint8_t fieldBCedeFlags = cedeFlags;
             for (int dx = -4; dx <= 4; ++dx) {
                 const int r = rel + dx;
                 if (r < 0 || r >= (int)tapLine.intrafieldRegionCede.size())
                     continue;
-                const std::uint8_t neighborFlags =
-                    tapLine.intrafieldRegionCede[r];
-                if (neighborFlags & CombContentReach::IntrafieldRegionCedeCenter)
-                    fieldBCedeFlags |=
-                        CombContentReach::IntrafieldRegionCedeCenter;
-                if (neighborFlags &
+                if (tapLine.intrafieldRegionCede[r] &
                     CombContentReach::IntrafieldRegionCedeStrongAsym)
                 {
                     fieldBCedeFlags |=
-                        CombContentReach::IntrafieldRegionCedeStrongAsym;
+                        CombContentReach::IntrafieldRegionCedeStrongAsym |
+                        CombContentReach::IntrafieldRegionCedeCenter;
                 }
             }
             const double hLumaDeltaIRE =
                 (rel < (int)tapLine.hLumaDeltaIRE.size())
                     ? tapLine.hLumaDeltaIRE[rel]
                     : 0.0;
-            const auto authority =
-                CombContentReach::prepareIntrafieldTapAuthority(
+            const double upCoarseDeltaIRE = haveCoarse
+                ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel])
+                : 0.0;
+            const double downCoarseDeltaIRE = haveCoarse
+                ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel])
+                : 0.0;
+            const double bevelCede =
+                (rel < (int)tapLine.fieldBBevelCede.size())
+                    ? tapLine.fieldBBevelCede[rel]
+                    : 0.0;
+
+            auto policy =
+                CombContentReach::resolveFieldBTapPolicy(
                     region,
                     fieldBCedeFlags,
                     tapLine.pairU2[rel].weight,
                     tapLine.pairD2[rel].weight,
                     hLumaDeltaIRE,
-                    hEdgeThreshIRE);
+                    hEdgeThreshIRE,
+                    upCoarseDeltaIRE,
+                    downCoarseDeltaIRE,
+                    bevelCede);
 
-            tapLine.pairU2[rel].fieldBWeight =
-                authority.upWeight;
-            tapLine.pairD2[rel].fieldBWeight =
-                authority.downWeight;
+            // Fold reach (legality × contour trust) into eligibility and mix
+            // here so the renderer consumes the policy alone.  Asymmetric
+            // trust tilts the vertical estimate; a symmetric attenuation is
+            // deliberately inert under the renderer's normalization (output
+            // strength is centerCede's channel, not the weights').
+            policy.upWeight *= tapLine.pairU2[rel].reachGate;
+            policy.downWeight *= tapLine.pairD2[rel].reachGate;
 
-            // Raw-identity revive: ±2 same-field legs are anti-phase
-            // carriers, so real chroma can NEVER present near-identical
-            // scalars across the pair — anti-phase flips the chroma
-            // waveform, and even a one-line band or shadow band shows a
-            // large leg difference.  Near-identical scalars on an energetic
-            // center are therefore vertically coherent non-carrier energy
-            // (the vertical-contrast misread): the comb annihilates it
-            // exactly (0.5*(C-n) ~ 0), while a cede passes it into preclean
-            // as fake chroma.  The region verdicts may still cede here
-            // because the smoothed-IQ hue tests flicker on edge energy; the
-            // raw scalar identity is the sharper fact, so it may revive the
-            // authority the verdicts withdrew.  Legality is untouched:
-            // reachGate (grammar legality x contour) still multiplies in the
-            // renderer.
-            {
-                constexpr double kRawIdentFullIRE = 2.0;  // identical within noise
-                constexpr double kRawIdentZeroIRE = 4.0;  // no longer identical
-                constexpr double kReviveEnvLoIRE  = 3.0;  // energetic center ramp
-                constexpr double kReviveEnvHiIRE  = 6.0;
-                const double maxDiffIRE = std::max(
-                    tapLine.pairU2[rel].diffIRE,
-                    tapLine.pairD2[rel].diffIRE);
-                const double envIRE =
-                    (rel < (int)tapLine.centerEnvelope.size())
-                        ? tapLine.centerEnvelope[rel] * invI
-                        : 0.0;
-                const double tDiff = std::clamp(
-                    (kRawIdentZeroIRE - maxDiffIRE) /
-                    (kRawIdentZeroIRE - kRawIdentFullIRE),
-                    0.0, 1.0);
-                const double tEnv = std::clamp(
-                    (envIRE - kReviveEnvLoIRE) /
-                    (kReviveEnvHiIRE - kReviveEnvLoIRE),
-                    0.0, 1.0);
-                const double revive = tDiff * tEnv;
-                if (revive > 0.0) {
-                    tapLine.pairU2[rel].fieldBWeight = std::max(
-                        tapLine.pairU2[rel].fieldBWeight, revive);
-                    tapLine.pairD2[rel].fieldBWeight = std::max(
-                        tapLine.pairD2[rel].fieldBWeight, revive);
-                }
-            }
+            tapLine.fieldBPolicy[rel] = policy;
         }
     };
 
@@ -1192,7 +1201,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             applyFieldReachWithMovingCoarse(tapLine.pairU2, tapLine.pairD2,
                                             tapLine.haveU2, tapLine.haveD2);
             if (wantFieldB)
-                prepareFieldBWeights();
+                prepareFieldBPolicy();
         }
     }
 
@@ -1639,8 +1648,7 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         tapLine.haveU2 && tapLine.haveD2 &&
         static_cast<int>(tapLine.tapU2.size()) >= width &&
         static_cast<int>(tapLine.tapD2.size()) >= width &&
-        static_cast<int>(tapLine.pairU2.size()) >= width &&
-        static_cast<int>(tapLine.pairD2.size()) >= width;
+        static_cast<int>(tapLine.fieldBPolicy.size()) >= width;
 
     if (!haveCenter) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
@@ -1662,10 +1670,11 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     //
     // DO NOT FIX PICTURE-CONTENT PROBLEMS BY ADDING CODE HERE.
     //
-    // Field B only consumes the two +/-2 tap weights prepared upstream. It
-    // does not discover chroma, parse boundaries, repair contours, revive
-    // rejected reaches, or reinterpret carrier evidence. If a tap has the
-    // wrong authority, fix CombTapLine construction or its reach contract.
+    // Field B only consumes the prepared FieldBTapPolicy (leg mix plus
+    // explicit centerCede). It does not discover chroma, parse boundaries,
+    // repair contours, revive rejected reaches, or reinterpret carrier
+    // evidence. If a column combs wrongly, fix the policy resolution
+    // (resolveFieldBTapPolicy) or the evidence feeding it.
     // Keep this function a transparent, bounded scalar combine.
     // =====================================================================
 
@@ -1674,73 +1683,72 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         const double up = tapLine.tapU2[rel].comp;
         const double down = tapLine.tapD2[rel].comp;
 
-        const double wUp = std::clamp(
-            tapLine.pairU2[rel].fieldBWeight * tapLine.pairU2[rel].reachGate,
-            0.0,
-            1.0);
-        const double wDown = std::clamp(
-            tapLine.pairD2[rel].fieldBWeight * tapLine.pairD2[rel].reachGate,
-            0.0,
-            1.0);
+        const CombContentReach::FieldBTapPolicy &policy =
+            tapLine.fieldBPolicy[rel];
+        const double wUp = std::clamp(policy.upWeight, 0.0, 1.0);
+        const double wDown = std::clamp(policy.downWeight, 0.0, 1.0);
+        const double cede = std::clamp(policy.centerCede, 0.0, 1.0);
 
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
 
         double output = center;
-        std::uint8_t reason = FieldBReasonCenter;
+        std::uint8_t reason =
+            (cede >= 1.0) ? FieldBReasonCede : FieldBReasonCenter;
 
-        if (useUp || useDown) {
+        if ((useUp || useDown) && cede < 1.0) {
             const double denom = wUp + wDown;
 
-            // Older Field-B algebra: first build the weighted opposite-phase
-            // neighbor estimate, then cancel it against center.
-            //
-            // Equal case:
-            //      neighbor = 0.5 * up + 0.5 * down
-            //
-            // Weighted case:
-            //      neighbor shifts toward the more authoritative leg
-            //
-            // One-legged case:
-            //      neighbor = selected leg
+            // Weighted opposite-phase neighbor estimate, then cancellation
+            // against center.  Normalizing by denom means accepted evidence
+            // always combs at FULL strength: the weights choose the vertical
+            // estimate (equal, tilted, or one-legged), never the output
+            // amplitude.  Output-strength reduction happens exclusively
+            // through the policy's explicit centerCede below.
             const double neighbor =
                 (up * wUp + down * wDown) / denom;
 
             const double combed = 0.5 * (center - neighbor);
 
-            // If reach authority is partial, fall back toward center rather
-            // than allowing a weak tap to fully author Field B.
-            const double authority = std::clamp(denom, 0.0, 1.0);
-            output = (combed * authority) + (center * (1.0 - authority));
-
-            reason = FieldBReasonBlend;
-
             // Bounded-cluster guard in Field-B output space.
             //
-            // The weighted Field-B result must lie within the cluster formed
-            // by center and the actual one-leg Field-B candidates.  If it
-            // leaves that cluster, Field B has manufactured an overshoot rather
-            // than an average/cancellation result, so cede to center.
+            // The result must lie within the cluster formed by center and the
+            // actual one-leg Field-B candidates.  If it leaves that cluster,
+            // Field B has manufactured an overshoot rather than an average/
+            // cancellation result, so cede to center.  This is a feasibility
+            // clamp (a legal-range fact), not a confidence hedge.
             const double candUp =
                 0.5 * (center - up);
             const double candDown =
                 0.5 * (center - down);
-            
+
             constexpr double kClusterSlackIRE = 0.25;
             const double slack = kClusterSlackIRE * irescale;
-            
+
             const bool outside =
                 useUp && useDown
-                    ? scalarOutsideCluster(output, { center, candUp, candDown }, slack)
+                    ? scalarOutsideCluster(combed, { center, candUp, candDown }, slack)
                     : useUp
-                        ? scalarOutsideCluster(output, { center, candUp }, slack)
-                        : scalarOutsideCluster(output, { center, candDown }, slack);
-            
+                        ? scalarOutsideCluster(combed, { center, candUp }, slack)
+                        : scalarOutsideCluster(combed, { center, candDown }, slack);
+
             if (outside) {
                 output = center;
                 reason = FieldBReasonCenter;
+            } else {
+                output = combed * (1.0 - cede) + center * cede;
+                reason = (cede >= 0.5)
+                    ? FieldBReasonCede
+                    : ((useUp && useDown)
+                        ? FieldBReasonBlend
+                        : FieldBReasonOneLeg);
             }
 		}
+
+        if (!std::isfinite(output)) {
+            output = center;
+            reason = FieldBReasonCenter;
+        }
 
         outFieldLine[rel] = output;
         if (outReasonLine)
@@ -2349,10 +2357,13 @@ void Comb::FrameBuffer::computeFrameBLine(
             "pull deltaIRE z0MagIRE targetMagIRE imp0 impU1 impD1\n");
     }
 
+    // Demod the center and ±1 legs to signed 4fsc IQ, aligned to center's
+    // carrier frame.
+    if ((int)scratch_centerIQ.size() < width) scratch_centerIQ.resize(width);
+    if ((int)scratch_upIQ.size() < width) scratch_upIQ.resize(width);
+    if ((int)scratch_dnIQ.size() < width) scratch_dnIQ.resize(width);
 
     for (int x = 0; x < width; ++x) {
-        const bool useLockedCenter = forceFrameBLocked1D;
-
         // Always consume the signed preclean cursors.  Conditional consumption
         // shifts all later samples onto the wrong carrier leg after the first
         // forced-center override.
@@ -2360,18 +2371,27 @@ void Comb::FrameBuffer::computeFrameBLine(
             ? carrierGrammarDemodSignedCompositeTo4fsc(phase0Cursor, preclean0[x])
             : std::complex<double>(0.0, 0.0);
 
-        std::complex<double> ZUp = precleanUp
+        scratch_centerIQ[x] = forceFrameBLocked1D
+            ? std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x])
+            : Z0Preclean;
+
+        scratch_upIQ[x] = precleanUp
             ? carrierGrammarDemodSignedCompositeTo4fsc(phaseUpCursor, precleanUp[x])
             : std::complex<double>(0.0, 0.0);
 
-        std::complex<double> ZDn = precleanDn
+        scratch_dnIQ[x] = precleanDn
             ? carrierGrammarDemodSignedCompositeTo4fsc(phaseDnCursor, precleanDn[x])
             : std::complex<double>(0.0, 0.0);
+    }
 
+    for (int x = 0; x < width; ++x) {
+        const bool useLockedCenter = forceFrameBLocked1D;
 
-        const std::complex<double> Z0 = useLockedCenter
-            ? std::complex<double>((double)ti0_raw[x], (double)tq0_raw[x])
-            : Z0Preclean;
+        const std::complex<double> &ZUp = scratch_upIQ[x];
+        const std::complex<double> &ZDn = scratch_dnIQ[x];
+
+        const std::complex<double> &Z0 = scratch_centerIQ[x];
+        const std::complex<double> &Z0Preclean = Z0;
 
         double upReachRaw = 0.0;
         double dnReachRaw = 0.0;
@@ -2406,13 +2426,10 @@ void Comb::FrameBuffer::computeFrameBLine(
         // regimes.  Per project_frameb_comb_must_run: when a legal partner
         // exists this MUST run — never gate to bare center via confidence
         // correlations.  The regime discrimination does not live here: the
-        // reach gates decide WHERE (bevel/cross-color throttles collapse
-        // reach at horizontal color edges; verticals keep full reach), the
-        // flat delta cap decides HOW MUCH, and the [1,2,1] projection decides
-        // WHAT.  Geometry: pull = 0.5 * combStrength * reachAuthority, so
-        // when both reaches are 1 the output is the 3-tap interfield average
-        // (Z0 + target)/2 — anti-phase alien cancels to zero, same-phase real
-        // chroma (delta≈0) is unchanged.
+        // reach gates decide WHERE (bevel/cross-color throttles collapse reach
+        // at horizontal color edges; verticals keep full reach) and the flat
+        // delta cap decides HOW MUCH.  The estimate is the exact midpoint
+        // projection of the two admitted legs.
         if (!useLockedCenter && (upReachRaw > 0.0 || dnReachRaw > 0.0)) {
             const bool haveUp = haveUpSignal && upReachRaw > 0.0;
             const bool haveDn = haveDnSignal && dnReachRaw > 0.0;
@@ -2432,41 +2449,41 @@ void Comb::FrameBuffer::computeFrameBLine(
 
             if (wsum > 1e-12) {
                 target /= wsum;
-            
+
                 std::complex<double> delta = target - Z0;
                 const double deltaIRE = cmag(delta) * invIreScale;
-            
+
                 double effectiveMaxDeltaIRE = maxDeltaIRE;
                 if (haveUp && haveDn &&
                     maxDeltaIRE > 0.0 && deltaIRE > maxDeltaIRE)
                 {
                     constexpr double kVerifyAgreeFrac = 0.25;
-            
+
                     const double pairAgreeIRE =
                         cmag(ZUp - ZDn) * invIreScale;
-            
+
                     const double verifyBand =
                         kVerifyAgreeFrac * deltaIRE;
-            
+
                     const double t = (verifyBand > 1e-9)
                         ? std::clamp(
                               1.0 - pairAgreeIRE / verifyBand,
                               0.0,
                               1.0)
                         : 0.0;
-            
+
                     effectiveMaxDeltaIRE =
                         maxDeltaIRE +
                         (deltaIRE - maxDeltaIRE) * t;
                 }
-            
+
                 if (effectiveMaxDeltaIRE > 0.0 &&
                     deltaIRE > effectiveMaxDeltaIRE &&
                     deltaIRE > 1e-9)
                 {
                     delta *= effectiveMaxDeltaIRE / deltaIRE;
                 }
-            
+
                 // Reach selected and weighted the target above. Do not apply the
                 // same authority a second time to the exact midpoint projection.
                 // Preserve full midpoint authority when either interfield leg is fully
@@ -2476,38 +2493,38 @@ void Comb::FrameBuffer::computeFrameBLine(
                 const double baseReachAuthority = std::max(
                     haveUp ? upReachRaw : 0.0,
                     haveDn ? dnReachRaw : 0.0);
-                
+
                 // A strong lateral luma transition is a likely source of cross-colour.
                 // Do not treat it as an exemption by itself: require both precleaned
                 // interfield partners to agree with one another while differing from center.
                 double crossColorExempt = 0.0;
-                
+
                 if (haveUp && haveDn &&
                     x < static_cast<int>(reachTapLine.hLumaDeltaIRE.size()))
                 {
                     const double hEdgeThreshIRE =
                         std::max(1.0, T.FRAME_LUMA_EDGE_THRESH_IRE);
-                
+
                     const double hEdge = std::clamp(
                         (reachTapLine.hLumaDeltaIRE[x] -
                          0.30 * hEdgeThreshIRE) /
                         (0.70 * hEdgeThreshIRE),
                         0.0,
                         1.0);
-                
+
                     const double pairAgreeIRE =
                         cmag(ZUp - ZDn) * invIreScale;
-                
+
                     const double centerDisagreeIRE =
                         0.5 * (cmag(ZUp - Z0) + cmag(ZDn - Z0)) *
                         invIreScale;
-                
+
                     // The partners must agree within one quarter of their average
                     // disagreement with center. This is the same geometry already used
                     // to recognize a verified cancellation pair for the delta cap.
                     const double verifyBand =
                         0.25 * centerDisagreeIRE;
-                
+
                     const double verifiedCancellation =
                         (verifyBand > 1e-9)
                             ? std::clamp(
@@ -2515,24 +2532,24 @@ void Comb::FrameBuffer::computeFrameBLine(
                                   0.0,
                                   1.0)
                             : 0.0;
-                
+
                     crossColorExempt =
                         hEdge * verifiedCancellation;
                 }
-                
+
                 // Verified edge-generated cross-colour restores authority withdrawn by
                 // the generic horizontal-transition/bevel throttle. It cannot create a
                 // Frame B engagement where reach supplied no partner at all.
                 const double reachAuthority =
                     baseReachAuthority +
                     (1.0 - baseReachAuthority) * crossColorExempt;
-                
+
                 const double pull = std::clamp(
                     0.5 * combStrength * reachAuthority,
                     0.0,
-                    0.5);                
+                    0.5);
                 Zout = Z0 + delta * pull;
-                
+
                 diagPull = pull;
                 diagDeltaIRE = deltaIRE;
                 diagTargetMagIRE = cmag(target) * invIreScale;

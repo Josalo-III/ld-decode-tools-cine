@@ -373,7 +373,10 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     double upCarrierTrust,
     double downCarrierTrust,
     double invIreScale,
-    double minChromaIRE)
+    double minChromaIRE,
+    double upRawDiffIRE,
+    double downRawDiffIRE,
+    double centerEnergyIRE)
 {
     IntrafieldRegionReach out;
 
@@ -420,13 +423,34 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     constexpr double kDifferentMagRatio = 0.35;
     constexpr double kStrongSideFloorScale = 2.0;
 
+    // First-pass AlienCancel gate. ±2 same-field legs are anti-phase carriers:
+    // real chroma flips the waveform and shows a LARGE raw leg difference, so a
+    // near-zero raw difference on an energetic center can only be vertically
+    // coherent non-carrier energy (the vertical-contrast misread) — the comb's
+    // ideal cancellation partner. This is the SHARP fact; the smoothed-IQ hue
+    // test below flickers on edge energy. Deciding it here means the authority
+    // is right the first time, with no downstream weight revive. A magnitude-
+    // asymmetric region break (shadow band) has a large raw difference and can
+    // never reach this path, so it cannot override a true boundary.
+    constexpr double kRawIdentIRE = 3.0;   // near-identical within noise
+    constexpr double kRawEnergyIRE = 4.0;  // center clearly carries energy
+    auto rawIdentAlien = [&](double legRawDiffIRE) {
+        return legRawDiffIRE >= 0.0 &&
+               legRawDiffIRE <= kRawIdentIRE &&
+               centerEnergyIRE >= kRawEnergyIRE;
+    };
+
     auto classify = [&](const std::complex<double> &leg,
                         double legMagIRE,
                         bool haveLeg,
+                        double legRawDiffIRE,
                         double &differenceIRE,
                         double &hueDifferenceDeg) {
         if (!haveLeg)
             return RegionRelation::Unknown;
+
+        if (rawIdentAlien(legRawDiffIRE))
+            return RegionRelation::AlienCancel;
 
         const double magHi = std::max(centerMagIRE, legMagIRE);
         const double magLo = std::min(centerMagIRE, legMagIRE);
@@ -480,9 +504,9 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
         return RegionRelation::Unknown;
     };
 
-    out.up = classify(alignedUp, upMagIRE, haveUp,
+    out.up = classify(alignedUp, upMagIRE, haveUp, upRawDiffIRE,
                       out.upDifferenceIRE, out.upHueDifferenceDeg);
-    out.down = classify(alignedDown, downMagIRE, haveDown,
+    out.down = classify(alignedDown, downMagIRE, haveDown, downRawDiffIRE,
                         out.downDifferenceIRE, out.downHueDifferenceDeg);
     out.valid = (out.up != RegionRelation::Unknown ||
                  out.down != RegionRelation::Unknown);
@@ -678,22 +702,57 @@ std::uint8_t intrafieldRegionCedeFlags(
     return flags;
 }
 
-IntrafieldTapAuthority prepareIntrafieldTapAuthority(
+FieldBTapPolicy resolveFieldBTapPolicy(
     const IntrafieldRegionReach &region,
     std::uint8_t cedeFlags,
     double upWeight,
     double downWeight,
     double horizontalLumaDeltaIRE,
-    double horizontalLumaEdgeThresholdIRE)
+    double horizontalLumaEdgeThresholdIRE,
+    double upCoarseLumaDeltaIRE,
+    double downCoarseLumaDeltaIRE,
+    double bevelCede)
 {
-    IntrafieldTapAuthority out;
+    FieldBTapPolicy out;
     out.upWeight = std::clamp(upWeight, 0.0, 1.0);
     out.downWeight = std::clamp(downWeight, 0.0, 1.0);
 
-    if ((cedeFlags & IntrafieldRegionCedeCenter) != 0) {
+    // A full cede is terminal: no leg may participate and the output is the
+    // 1D center. Weights and cede are still set independently so the renderer
+    // never has to infer one from the other.
+    auto fullCede = [&](std::uint8_t reasons) -> FieldBTapPolicy & {
         out.upWeight = 0.0;
         out.downWeight = 0.0;
+        out.centerCede = 1.0;
+        out.reasons |= reasons;
         return out;
+    };
+
+    // Vertical coarse-luma service, restored from the July 5 renderer. The ±2
+    // legs sit two lines away; coarse-luma contrast between center and a leg
+    // means the same-context premise behind vertical cancellation is failing,
+    // which is exactly the vertical-comb-across-a-luma-edge alternation that
+    // serrates diagonals. Graded contrast attenuates the leg's mix share and
+    // contributes graded cede; a hard break invalidates Field B outright and
+    // is expressed as raw IRE so no later normalization can undo it.
+    constexpr double kLumaEdgeLoIRE = 6.0;
+    constexpr double kLumaEdgeHiIRE = 20.0;
+    constexpr double kHardVerticalBreakIRE = 14.0;
+    const double dUpIRE = std::max(0.0, upCoarseLumaDeltaIRE);
+    const double dDnIRE = std::max(0.0, downCoarseLumaDeltaIRE);
+    const double lumaEdgeUp = std::clamp(
+        (dUpIRE - kLumaEdgeLoIRE) / (kLumaEdgeHiIRE - kLumaEdgeLoIRE), 0.0, 1.0);
+    const double lumaEdgeDn = std::clamp(
+        (dDnIRE - kLumaEdgeLoIRE) / (kLumaEdgeHiIRE - kLumaEdgeLoIRE), 0.0, 1.0);
+
+    if (std::max(dUpIRE, dDnIRE) >= kHardVerticalBreakIRE)
+        return fullCede(FieldBPolicyReasonVerticalBreak);
+
+    if ((cedeFlags & IntrafieldRegionCedeCenter) != 0) {
+        std::uint8_t reasons = FieldBPolicyReasonRegionCede;
+        if ((cedeFlags & IntrafieldRegionCedeStrongAsym) != 0)
+            reasons |= FieldBPolicyReasonShadowBand;
+        return fullCede(reasons);
     }
 
     const double edgeThresh = std::max(1.0, horizontalLumaEdgeThresholdIRE);
@@ -703,12 +762,29 @@ IntrafieldTapAuthority prepareIntrafieldTapAuthority(
         0.0,
         1.0);
 
-    if (!region.valid) {
-        if (hEdge > 0.0) {
-            out.upWeight = 0.0;
-            out.downWeight = 0.0;
+    // Applied to every non-terminal path on the way out: graded vertical
+    // contrast shapes the mix per leg and cedes the output in proportion,
+    // and the dedicated bevel detector's contribution is maxed in.
+    auto finishPolicy = [&]() -> FieldBTapPolicy & {
+        out.upWeight *= (1.0 - 0.65 * lumaEdgeUp);
+        out.downWeight *= (1.0 - 0.65 * lumaEdgeDn);
+        const double lumaEdgeCede = std::max(lumaEdgeUp, lumaEdgeDn);
+        if (lumaEdgeCede > 0.0) {
+            out.centerCede = std::max(out.centerCede, lumaEdgeCede);
+            out.reasons |= FieldBPolicyReasonLumaEdgeCede;
+        }
+        if (bevelCede > 0.0) {
+            out.centerCede = std::max(out.centerCede,
+                                      std::clamp(bevelCede, 0.0, 1.0));
+            out.reasons |= FieldBPolicyReasonBevelCede;
         }
         return out;
+    };
+
+    if (!region.valid) {
+        if (hEdge > 0.0)
+            return fullCede(FieldBPolicyReasonHEdgeGuard);
+        return finishPolicy();
     }
 
     const bool upSame =
@@ -738,9 +814,10 @@ IntrafieldTapAuthority prepareIntrafieldTapAuthority(
     const bool downBreaksCenter = downDifferent;
 
     if (region.centerIsland || region.strongAsym) {
-        out.upWeight = 0.0;
-        out.downWeight = 0.0;
-        return out;
+        std::uint8_t reasons = FieldBPolicyReasonRegionCede;
+        if (region.strongAsym)
+            reasons |= FieldBPolicyReasonShadowBand;
+        return fullCede(reasons);
     }
 
     // First establish the region-authorized baseline.
@@ -754,10 +831,13 @@ IntrafieldTapAuthority prepareIntrafieldTapAuthority(
         out.downWeight = 1.0;
 
     // Clear explicit refusal-to-cross cases.
-    if (downBreaksCenter && upContinuesCenter)
+    if (downBreaksCenter && upContinuesCenter) {
         out.downWeight = 0.0;
-    else if (upBreaksCenter && downContinuesCenter)
+        out.reasons |= FieldBPolicyReasonOneLeg;
+    } else if (upBreaksCenter && downContinuesCenter) {
         out.upWeight = 0.0;
+        out.reasons |= FieldBPolicyReasonOneLeg;
+    }
 
     // AlienCancel is a cancellation partner, not lone one-sided authority.
     if (upAlien && !(downSame || downAlien))
@@ -812,6 +892,7 @@ IntrafieldTapAuthority prepareIntrafieldTapAuthority(
                     out.upWeight = 0.0;
                     out.downWeight = 1.0;
                 }
+                out.reasons |= FieldBPolicyReasonOneLeg;
             } else {
                 const double t = std::clamp(
                     (gap - kWeightGapStartIRE) /
@@ -835,11 +916,8 @@ IntrafieldTapAuthority prepareIntrafieldTapAuthority(
         }
     }
 
-    if (hEdge > 0.0 && !upContinuesCenter && !downContinuesCenter) {
-        out.upWeight = 0.0;
-        out.downWeight = 0.0;
-        return out;
-    }
+    if (hEdge > 0.0 && !upContinuesCenter && !downContinuesCenter)
+        return fullCede(FieldBPolicyReasonHEdgeGuard);
 
     // Keep the existing h-edge one-sided boundary rule, but it now applies
     // after Same/Same balancing rather than being the only source of asymmetry.
@@ -875,18 +953,22 @@ IntrafieldTapAuthority prepareIntrafieldTapAuthority(
             (!preferUp && downContinuesCenter && upBreaksCenter);
 
         if ((hardPreferUp || hardPreferDown) && !allowOneSidedBoundary) {
-            out.upWeight = 0.0;
-            out.downWeight = 0.0;
+            // A hard one-sided preference whose surviving leg cannot claim a
+            // credible boundary continuation is the residual single-leg
+            // zipper; the only safe render is the center.
+            return fullCede(FieldBPolicyReasonHEdgeGuard);
         } else if (hardPreferUp) {
             out.downWeight = 0.0;
             out.upWeight = std::max(out.upWeight, 0.40 + 0.60 * hEdge);
+            out.reasons |= FieldBPolicyReasonOneLeg;
         } else if (hardPreferDown) {
             out.upWeight = 0.0;
             out.downWeight = std::max(out.downWeight, 0.40 + 0.60 * hEdge);
+            out.reasons |= FieldBPolicyReasonOneLeg;
         }
     }
 
-    return out;
+    return finishPolicy();
 }
 
 double interfieldAlienCancelStrength(double centerI,
@@ -954,6 +1036,38 @@ double interfieldAlienCancelStrength(double centerI,
         residualColumnSupport;
 
     return clamp01(std::max(commonCarrierFit, residualTintCancel));
+}
+
+double interfieldSalutaryReach(double upI,
+                               double upQ,
+                               double downI,
+                               double downQ,
+                               bool hasUp,
+                               bool hasDown,
+                               double minChromaIRE)
+{
+    // One-sided reaches have no pair to disagree, hence no antisymmetric-alien
+    // staircase to guard against.  Leave the reach at its legality baseline.
+    if (!hasUp || !hasDown)
+        return 1.0;
+
+    const double minChroma = std::max(0.0, minChromaIRE);
+    const double mu = magIQ(upI, upQ);
+    const double md = magIQ(downI, downQ);
+
+    // A leg with no chroma-band energy cannot carry the alien that pairs the
+    // lines; there is nothing for the salutary test to discriminate, so stay
+    // inert and let legality govern.
+    if (mu < minChroma || md < minChroma)
+        return 1.0;
+
+    // The whole test: do the two aligned legs point the same way?  Agreement
+    // rises with the real-chroma fraction and falls with the alien fraction
+    // (alien enters the pair anti-aligned), so this single scalar backs off the
+    // reach exactly in proportion to the staircase risk.  Same agreement band
+    // as interfieldAlienCancelStrength's neighbour test.
+    const double agree = signedDotNormIQ(upI, upQ, downI, downQ);
+    return ramp(agree, 0.45, 0.82);
 }
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,

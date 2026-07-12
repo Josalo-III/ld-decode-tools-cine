@@ -166,7 +166,7 @@ public:
             double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
             double FRAME_BEVEL_SAT_PENALTY     = 0.50; // extra reach penalty at saturated non-straight edges; squared chroma tightening on the bevel gate (0 = off, 1 = aggressive)
             double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // horizontal luma gradient for Frame ±1 cross-color gate; higher than Field's 18 because ±1 partners are closer (one TV line) and more resilient
-            double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // cross-color reach throttle on Frame ±1: chromaWeight × hEdge × curvature (0 = off)
+            double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // RESERVED / inert: the gate-side lateral-edge term was removed — a bare hLumaDeltaIRE step cannot separate a straight vertical misread column from a diagonal boundary, so it only stripped bevel protection off diagonals. Vertical-column restore now lives in the combine's partner-verified crossColorExempt (computeFrameBLine). Kept for ABI/tuning; not read by the reach gate.
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -439,7 +439,6 @@ private:
 		double diffIRE = std::numeric_limits<double>::infinity();
 		double kScore = 0.0;
 		double weight = 1.0;
-		double fieldBWeight = 1.0;    // Field B-specific authority prepared upstream
 		double reachLegalGate = 1.0;  // binary legality from reach index for this rung
 		double reachGate = 1.0;       // contour-trust * legality
 	};
@@ -463,7 +462,9 @@ private:
 			FieldBReasonNone = 0,
 			FieldBReasonBlend = 1,
 			FieldBReasonCenter = 2,
-			FieldBReasonCount = 3
+			FieldBReasonCede = 3,   // explicit policy centerCede dominated the output
+			FieldBReasonOneLeg = 4, // one-sided comb (a leg was excluded by policy)
+			FieldBReasonCount = 5
 		};
 
 	// Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
@@ -553,6 +554,14 @@ private:
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
 		std::vector<double> hLumaDeltaIRE;
+		// Dedicated bevel detector's Field B cede contribution [0,1], measured
+		// where the moving-coarse contour gates are applied so the risk math
+		// runs once; consumed only by Field B policy resolution.
+		std::vector<double> fieldBBevelCede;
+		// Complete per-column Field B policy (leg mix + explicit centerCede +
+		// reasons), resolved upstream. The renderer consumes this and the taps;
+		// it performs no analysis of its own.
+		std::vector<CombContentReach::FieldBTapPolicy> fieldBPolicy;
 	};
 	enum CombTapBuild : unsigned {
 		TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta

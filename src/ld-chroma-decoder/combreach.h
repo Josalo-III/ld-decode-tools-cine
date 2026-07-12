@@ -235,9 +235,36 @@ struct IntrafieldRegionReach {
 constexpr std::uint8_t IntrafieldRegionCedeCenter = 1u << 0;
 constexpr std::uint8_t IntrafieldRegionCedeStrongAsym = 1u << 1;
 
-struct IntrafieldTapAuthority {
+// Named contributors to a Field B policy decision. Diagnostic only: the
+// renderer maps these onto its reason plane, and every cede in the output
+// must be traceable to at least one named source here.
+enum FieldBPolicyReason : std::uint8_t {
+    FieldBPolicyReasonNone          = 0,
+    FieldBPolicyReasonRegionCede    = 1u << 0, // region verdicts withdrew both legs
+    FieldBPolicyReasonShadowBand    = 1u << 1, // strong magnitude-asymmetry band membership
+    FieldBPolicyReasonHEdgeGuard    = 1u << 2, // horizontal luma edge, no positively continuing leg
+    FieldBPolicyReasonLumaEdgeCede  = 1u << 3, // graded vertical coarse-luma contrast on a ±2 leg
+    FieldBPolicyReasonVerticalBreak = 1u << 4, // hard vertical context break
+    FieldBPolicyReasonOneLeg        = 1u << 5, // boundary resolution excluded one leg
+    FieldBPolicyReasonBevelCede     = 1u << 6, // dedicated bevel detector contribution
+};
+
+// The complete prepared verdict the Field B renderer consumes. Leg selection
+// and center cede are independent policy dimensions:
+//
+//   upWeight/downWeight — relative leg mix plus eligibility (0 excludes the
+//     leg). The renderer NORMALIZES accepted legs to full comb strength, so
+//     a weight can shift the vertical estimate toward the better leg but can
+//     never scale the output amplitude.
+//
+//   centerCede — the ONLY channel by which analysis reduces Field B output
+//     toward the 1D center, graded [0,1]. Deriving output strength from the
+//     sum of leg weights is the conflation this struct exists to prevent.
+struct FieldBTapPolicy {
     double upWeight = 0.0;
     double downWeight = 0.0;
+    double centerCede = 0.0;
+    std::uint8_t reasons = FieldBPolicyReasonNone;
 };
 
 IntrafieldRegionReach evaluateIntrafieldRegionReach(
@@ -252,18 +279,36 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     double upCarrierTrust,
     double downCarrierTrust,
     double invIreScale,
-    double minChromaIRE);
+    double minChromaIRE,
+    // Sharp raw-scalar facts for the first-pass AlienCancel decision. ±2 same-
+    // field legs are anti-phase carriers, so real chroma shows a large raw leg
+    // difference; a near-zero raw difference (IRE) on an energetic center
+    // (centerEnergyIRE, raw carrier-band envelope in IRE) is vertically
+    // coherent non-carrier energy the comb must cancel. Pass <0 for a leg's
+    // diff to disable this path (falls back to the smoothed-IQ hue test only).
+    double upRawDiffIRE = -1.0,
+    double downRawDiffIRE = -1.0,
+    double centerEnergyIRE = 0.0);
 
 std::uint8_t intrafieldRegionCedeFlags(
     const IntrafieldRegionReach &region);
 
-IntrafieldTapAuthority prepareIntrafieldTapAuthority(
+// Resolve the full Field B policy from prepared evidence. Consumes the region
+// verdicts and cede flags, the baseline pair weights, the horizontal luma
+// delta, the per-leg vertical coarse-luma deltas (|coarse0 − coarse±2| in IRE;
+// pass 0 when the coarse rows are unavailable), and the dedicated bevel
+// detector's cede contribution [0,1]. Emits leg mix/eligibility, explicit
+// centerCede, and diagnostic reasons — the renderer performs no analysis.
+FieldBTapPolicy resolveFieldBTapPolicy(
     const IntrafieldRegionReach &region,
     std::uint8_t cedeFlags,
     double upWeight,
     double downWeight,
     double horizontalLumaDeltaIRE = 0.0,
-    double horizontalLumaEdgeThresholdIRE = 1.0);
+    double horizontalLumaEdgeThresholdIRE = 1.0,
+    double upCoarseLumaDeltaIRE = 0.0,
+    double downCoarseLumaDeltaIRE = 0.0,
+    double bevelCede = 0.0);
 
 InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
                                               double centerQ,
@@ -308,6 +353,28 @@ double interfieldAlienCancelStrength(double centerI,
                                      bool hasDown,
                                      double minChromaIRE,
                                      double columnSupport);
+
+// Salutary-combine reach backoff in [0,1] for the ±1 interfield pair.  The
+// signed demod aligns carrier-locked chroma across the pair but anti-aligns
+// image-locked alien (luma misread into the chroma band): so real chroma makes
+// the two legs point the SAME direction (their sum is salutary — it adds real
+// chroma), while alien makes them point OPPOSITE (their sum extracts only the
+// alien's antisymmetric part — the 2-px diagonal staircase).  Hue is invariant
+// along a diagonal, so this direction test needs no registration: a real
+// single-hue diagonal keeps agreeing across the shifted pair and combs, while a
+// diagonal alien disagrees and cedes.  Returns 1.0 (inert, legality governs)
+// when one-sided or below the chroma floor; otherwise ramps on leg agreement.
+// A true chroma vertical boundary (two hues) also disagrees and cedes, which is
+// the correct outcome for a ±1 average across a color break.  Both interfield
+// combs (Frame A and Frame B) consume this through the shared reachGate, so the
+// discrimination lives once, here, not inside either comb.
+double interfieldSalutaryReach(double upI,
+                               double upQ,
+                               double downI,
+                               double downQ,
+                               bool hasUp,
+                               bool hasDown,
+                               double minChromaIRE);
 
 MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,
                                                 double up2Coarse,

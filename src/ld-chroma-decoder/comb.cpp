@@ -2859,7 +2859,9 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
         const std::array<FrameCanvas::Colour, FieldBReasonCount> reasonShades = {{
             canvas.rgb(0x8080, 0x8080, 0x8080), // none: gray
             canvas.rgb(0x0000, 0xFFFF, 0xFFFF), // blend: cyan
-            canvas.rgb(0x3030, 0x3030, 0x3030)  // center / no answer: dark
+            canvas.rgb(0x3030, 0x3030, 0x3030), // center / no answer: dark
+            canvas.rgb(0xFFFF, 0x8000, 0x0000), // explicit cede: orange
+            canvas.rgb(0xFFFF, 0x0000, 0xFFFF)  // one-legged comb: magenta
         }};
 
         const int firstLine = videoParameters.firstActiveFrameLine;
