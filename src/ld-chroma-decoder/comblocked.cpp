@@ -2423,6 +2423,35 @@ void Comb::FrameBuffer::produceY()
     // baseline. Residual-Y 3D stays a distinct temporal feature; it just no
     // longer ignores the better local luma model when carrier retraction is
     // available.
+
+    // Coherent carrier prepass. buildCoherentCarrierEstimateRow is a pure
+    // per-line function of raw, baseY4 and the locked demod planes; produceY
+    // reads each line's estimate for the centre pixel and for up to four
+    // vertical neighbours (±1/±2). Reconstructed locally that was five heavy
+    // rebuilds of every line's value -- and outside FVF two of the four
+    // neighbour rebuilds are the wrong vertical step and discarded. Build every
+    // line once here into a frame buffer; the centre and neighbours below are
+    // then zero-cost row lookups keyed by line.
+    const bool coherentBaseReady =
+        lockedLumaCacheValid && demodWidth == width &&
+        !lockedLumaBaseY4_flat.empty() && !demodTI_flat.empty() &&
+        !demodTQ_flat.empty();
+    if (!lockedCoherentCarrierValid.empty())
+        std::fill(lockedCoherentCarrierValid.begin(),
+                  lockedCoherentCarrierValid.end(), std::uint8_t{0});
+    if (coherentBaseReady && !lockedCoherentCarrier_flat.empty()) {
+        for (int l = firstLine; l < lastLine; ++l) {
+            if (l >= demodLines) continue;
+            double *out = lockedCoherentCarrier_rowForBuild(l);
+            if (!out) continue;
+            buildCoherentCarrierEstimateRow(
+                l, rawbuffer.data() + l * fullWidth,
+                lockedLumaBaseY4_line(l), demodTI_line(l), demodTQ_line(l),
+                out);
+            lockedCoherentCarrierValid[l] = 1;
+        }
+    }
+
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
 
@@ -2503,16 +2532,8 @@ void Comb::FrameBuffer::produceY()
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
             const float *alienRow = regionAlienPartner_line(line);
-            const float *tiLockedRow = demodTI_line(line);
-            const float *tqLockedRow = demodTQ_line(line);
-            std::vector<double> coherentCarrierRowVec(width, 0.0);
-            const double *coherentCarrierRow = nullptr;
-            if (baseY4Row && tiLockedRow && tqLockedRow) {
-                buildCoherentCarrierEstimateRow(
-                    line, rawLine, baseY4Row, tiLockedRow, tqLockedRow,
-                    coherentCarrierRowVec.data());
-                coherentCarrierRow = coherentCarrierRowVec.data();
-            }
+            const double *coherentCarrierRow =
+                lockedCoherentCarrier_line(line);
 
             // Retracted-admission mode (isolation switch for the cube/beach
             // A/B).  Default: conflicted fits admit retracted only with
@@ -2628,7 +2649,6 @@ void Comb::FrameBuffer::produceY()
                 const double *base = nullptr;
                 const double *coh = nullptr;
                 const CombCarrierGrammar *grammar = nullptr;
-                std::vector<double> coherentCarrier;
             };
             auto makeNeighborRows = [&](int l) {
                 ProduceYNeighborRows n;
@@ -2643,14 +2663,10 @@ void Comb::FrameBuffer::produceY()
                 n.coarse = coarseFloor_line(l);
                 n.base = baseY4_line(l);
                 n.grammar = carrierGrammarLine(l);
-                const float *ti = demodTI_line(l);
-                const float *tq = demodTQ_line(l);
-                if (n.raw && n.base && ti && tq) {
-                    n.coherentCarrier.assign(width, 0.0);
-                    buildCoherentCarrierEstimateRow(
-                        l, n.raw, n.base, ti, tq, n.coherentCarrier.data());
-                    n.coh = n.coherentCarrier.data();
-                }
+                // Prebuilt once in the coherent carrier prepass above; a null
+                // row means the prepass could not build it (same gating as the
+                // former inline reconstruction).
+                n.coh = lockedCoherentCarrier_line(l);
                 return n;
             };
             ProduceYNeighborRows north1 = makeNeighborRows(line - 1);

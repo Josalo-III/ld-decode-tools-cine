@@ -525,6 +525,8 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
+            lockedCoherentCarrier_flat.assign(size_t(demodLines) * demodWidth, 0.0);
+            lockedCoherentCarrierValid.assign(demodLines, std::uint8_t{0});
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             // Cross-color mask pair only exists when the knob is engaged so
             // the default path pays neither the memory nor the second pass.

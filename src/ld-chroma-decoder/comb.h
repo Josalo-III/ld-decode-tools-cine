@@ -601,6 +601,14 @@ private:
 	// remodulated to composite). produceY subtracts this from raw to form Y, so
 	// the carrier removed from luma is exactly the carrier rendered as colour.
 	std::vector<double> lockedCarrierComposite_flat;
+	// Coherent carrier estimate per line, built once by produceY. It is a pure
+	// per-line function of raw, baseY4 and the locked demod planes; produceY
+	// consumes it for the centre line and up to four vertical neighbours, so
+	// computing it locally reconstructed every line's value up to five times.
+	// The companion valid byte marks the rows that were actually built (a null
+	// row accessor stands in for the old "no coherent carrier here" case).
+	std::vector<double> lockedCoherentCarrier_flat;
+	std::vector<std::uint8_t> lockedCoherentCarrierValid;
 	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D;
 	// measurePostCombImpurity() unions the elected-comb reading with that sharp
 	// pre-comb warning rather than erasing it.
@@ -1191,6 +1199,22 @@ private:
 	inline const double* lockedCarrierComposite_line(int line) const {
 		if (lockedCarrierComposite_flat.empty()) return nullptr;
 		return lockedCarrierComposite_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	// Writable row for the produceY prepass builder (bounds-checked, no validity
+	// gate — the caller sets the valid byte once the row is populated).
+	inline double* lockedCoherentCarrier_rowForBuild(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedCoherentCarrier_flat.empty()) return nullptr;
+		return lockedCoherentCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	// Reader: returns the row only where the prepass actually built it, so a null
+	// result means "no coherent carrier for this line" exactly as before.
+	inline const double* lockedCoherentCarrier_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedCoherentCarrier_flat.empty() ||
+		    line >= static_cast<int>(lockedCoherentCarrierValid.size()) ||
+		    !lockedCoherentCarrierValid[line]) return nullptr;
+		return lockedCoherentCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* carrierImpurity_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
