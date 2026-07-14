@@ -1206,7 +1206,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // score bump when it is very close to Field B.
             // ------------------------------------------------------------
             if (localUseFrameModel) {
-                scoreB += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
+                const double modelDistanceIRE = std::max(
+                    0.0,
+                    diff_candB_ire -
+                        std::max(0.0, T.FVF_MODEL_PRIMARY_DEADBAND_IRE));
+                scoreB += T.FVF_MODEL_PRIMARY_WEIGHT * modelDistanceIRE;
                 if (!managementVeto && b2VertCoherent) {
                     scoreR *= FRAME_MODEL_BIAS_LOCAL;
                 }
@@ -1607,9 +1611,18 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 shade = candShade;
             };
 
+            // Context may establish that Frame B is safe and relevant, but it
+            // must not settle the election by itself.  The candidate still has
+            // to beat both interfield combs on the accumulated merit score.
+            const bool frameHasBestScore =
+                !frameInsane && !managementVeto &&
+                scoreR + 1e-12 < scoreA &&
+                scoreR + 1e-12 < scoreB;
+
             if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
                 double dF1 = std::fabs(lumFR - L1) * invI;
-                if (dF1 <= 3.5 && frameFieldCandidateDistIRE <= 5.0 && !frameInsane)
+                if (dF1 <= 3.5 && frameFieldCandidateDistIRE <= 5.0 &&
+                    frameHasBestScore)
                     pickCandidate(2, FR, 0.75f);
                 else {
                     if (scoreA < scoreB) pickCandidate(0, FA, 0.25f);
@@ -1617,8 +1630,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             } else if (chromaMagIRE > CHROMA_STRONG_IRE && vIRE > VERT_THRESH_IRE) {
                 // Strong chroma with vertical contrast indicates per-line alternation
-                // that Frame is well-suited to suppress. Bypass interfield gate here.
-                if (!frameInsane)
+                // that Frame is well-suited to suppress.  It may enter without
+                // the normal decisive margin, but the interfield candidates
+                // remain live choices when their merit scores are better.
+                if (frameHasBestScore)
                     pickCandidate(2, FR, 0.8f);
                 else {
                     if (scoreA <= scoreB) pickCandidate(0, FA, 0.25f);
@@ -1633,7 +1648,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 else {
                     double dFL = std::fabs(lumFB - L1) * invI;
                     double dRL = std::fabs(lumFR - L1) * invI;
-                    if (!frameInsane && dRL + 3.0 < dFL)
+                    if (frameHasBestScore && dRL + 3.0 < dFL)
                         pickCandidate(2, FR, 0.75f);
                     else
                         pickCandidate(1, FB, 0.35f);
