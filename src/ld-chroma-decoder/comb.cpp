@@ -2493,7 +2493,7 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         invalidateCandidate(CAND_NEXT_FRAME);
     }
 
-    // --- Agreement Shaping ---
+    // --- Agreement Reward Shaping ---
     //
     // Old behavior:
     //
@@ -2513,7 +2513,9 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     //
     // over a small cross neighborhood. Reusing yPen avoids another comparison
     // and prevents compact-color checkerboard disagreement in chroma space from
-    // automatically vetoing a picture-compatible temporal candidate.
+    // automatically vetoing a picture-compatible temporal candidate. Beyond
+    // the reward lobe, disagreement is deliberately neutral; split3D applies
+    // the independent-estimate output hull after the election.
     if (configuration.dimensions == 3 && configuration.adaptive) {
         const auto &T = configuration.tunables;
 

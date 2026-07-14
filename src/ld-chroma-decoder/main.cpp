@@ -276,7 +276,8 @@ int main(int argc, char *argv[])
             "NTSC: 3D adaptive filter threshold (default 1.0). "
             "Higher values increase the reward for temporally-agreeing candidates, "
             "biasing selection toward 3D results. Lower values are more conservative, "
-            "preferring 2D/1D on motion. Veto for large deviations is unaffected."),
+            "preferring 2D/1D on motion. Temporal output is guarded by an "
+            "independent-estimate hull."),
         QCoreApplication::translate("main", "number"));
     parser.addOption(adaptThresholdOption);
 
