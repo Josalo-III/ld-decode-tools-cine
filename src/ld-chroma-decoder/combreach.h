@@ -4,15 +4,14 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Two cooperating arms, kept in one translation unit:
+ * Two physical-evidence arms, kept in one translation unit:
  *
  *   namespace lddecode        — carrier-grammar reach legality translator
  *                               (CombReachIndex). Answers "is this line-to-line
  *                               operation legal in this signal frame?".
- *   namespace CombContentReach — image-content reach authority. Answers "does
- *                               the picture content here support reaching to a
- *                               neighbour?" (interfield IQ floor, moving-coarse
- *                               contour).
+ *   namespace CombContentReach — image-content observations shared by combs.
+ *                               It reports region and contour facts but never
+ *                               selects legs, scales a comb, or cedes to 1D.
  *
  * Formerly comb_reach_index.{h,cpp} (in library/tbc) and combcontentreach.{h,cpp}.
  * Merged 2026-06-21: the reach index was used only by ld-chroma-decoder, so it
@@ -172,12 +171,6 @@ CombReachSourceFrame makeGrid4fscIQReachSource();
 // ===========================================================================
 namespace CombContentReach {
 
-struct InterfieldIQReachFloor {
-    double up = 0.0;
-    double down = 0.0;
-    double cleanup = 0.0;
-};
-
 struct MovingCoarseContour {
     bool valid = false;
 
@@ -232,41 +225,6 @@ struct IntrafieldRegionReach {
     bool strongAsym = false;
 };
 
-constexpr std::uint8_t IntrafieldRegionCedeCenter = 1u << 0;
-constexpr std::uint8_t IntrafieldRegionCedeStrongAsym = 1u << 1;
-
-// Named contributors to a Field B policy decision. Diagnostic only: the
-// renderer maps these onto its reason plane, and every cede in the output
-// must be traceable to at least one named source here.
-enum FieldBPolicyReason : std::uint8_t {
-    FieldBPolicyReasonNone          = 0,
-    FieldBPolicyReasonRegionCede    = 1u << 0, // region verdicts withdrew both legs
-    FieldBPolicyReasonShadowBand    = 1u << 1, // strong magnitude-asymmetry band membership
-    FieldBPolicyReasonHEdgeGuard    = 1u << 2, // horizontal luma edge, no positively continuing leg
-    FieldBPolicyReasonLumaEdgeCede  = 1u << 3, // graded vertical coarse-luma contrast shaped a ±2 leg
-    FieldBPolicyReasonVerticalBreak = 1u << 4, // hard vertical context break
-    FieldBPolicyReasonOneLeg        = 1u << 5, // boundary resolution excluded one leg
-    FieldBPolicyReasonBevelCede     = 1u << 6, // reserved: retired Field B bevel output cede
-};
-
-// The complete prepared verdict the Field B renderer consumes. Leg selection
-// and center cede are independent policy dimensions:
-//
-//   upWeight/downWeight — relative leg mix plus eligibility (0 excludes the
-//     leg). The renderer NORMALIZES accepted legs to full comb strength, so
-//     a weight can shift the vertical estimate toward the better leg but can
-//     never scale the output amplitude.
-//
-//   centerCede — the ONLY channel by which analysis reduces Field B output
-//     toward the 1D center, graded [0,1]. Deriving output strength from the
-//     sum of leg weights is the conflation this struct exists to prevent.
-struct FieldBTapPolicy {
-    double upWeight = 0.0;
-    double downWeight = 0.0;
-    double centerCede = 0.0;
-    std::uint8_t reasons = FieldBPolicyReasonNone;
-};
-
 IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const std::complex<double> &center,
     const std::complex<double> &up,
@@ -289,71 +247,6 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     double upRawDiffIRE = -1.0,
     double downRawDiffIRE = -1.0,
     double centerEnergyIRE = 0.0);
-
-std::uint8_t intrafieldRegionCedeFlags(
-    const IntrafieldRegionReach &region);
-
-// Resolve the full Field B policy from prepared evidence. Consumes the region
-// verdicts and cede flags, the baseline pair weights, the horizontal luma
-// delta, and the per-leg vertical coarse-luma deltas (|coarse0 − coarse±2| in
-// IRE; pass 0 when the coarse rows are unavailable). Emits leg mix/eligibility,
-// explicit centerCede, and diagnostic reasons — the renderer performs no
-// analysis.
-// Vertical coarse-luma contrast shapes or excludes legs; it must not reduce
-// Field B output strength while a legal leg remains.
-FieldBTapPolicy resolveFieldBTapPolicy(
-    const IntrafieldRegionReach &region,
-    std::uint8_t cedeFlags,
-    double upWeight,
-    double downWeight,
-    double horizontalLumaDeltaIRE = 0.0,
-    double horizontalLumaEdgeThresholdIRE = 1.0,
-    double upCoarseLumaDeltaIRE = 0.0,
-    double downCoarseLumaDeltaIRE = 0.0);
-
-InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
-                                              double centerQ,
-                                              double upI,
-                                              double upQ,
-                                              double downI,
-                                              double downQ,
-                                              bool hasUp,
-                                              bool hasDown,
-                                              double minChromaIRE,
-                                              double lumaEdgeFit);
-
-// Fast overload: caller supplies pre-computed IRE-domain magnitudes to avoid
-// recomputing ~12 sqrt/hypot calls per pixel inside the function.
-InterfieldIQReachFloor interfieldIQReachFloor(double centerI,
-                                              double centerQ,
-                                              double upI,
-                                              double upQ,
-                                              double downI,
-                                              double downQ,
-                                              bool hasUp,
-                                              bool hasDown,
-                                              double minChromaIRE,
-                                              double lumaEdgeFit,
-                                              double centerMagIRE,
-                                              double upMagIRE,
-                                              double downMagIRE);
-
-// Confidence in [0,1] that the center IQ is alien chroma phase-displaced from
-// the common carrier of its two agreeing neighbors.  This is the vector-cancel
-// companion to interfieldIQReachFloor's scalar floor: a consumer that has the
-// neighbor vectors can pull the center toward 0.5*(up+down) by this strength,
-// removing only the displacement rather than upweighting a sign-aligned average.
-// Inputs are IRE-scaled.
-double interfieldAlienCancelStrength(double centerI,
-                                     double centerQ,
-                                     double upI,
-                                     double upQ,
-                                     double downI,
-                                     double downQ,
-                                     bool hasUp,
-                                     bool hasDown,
-                                     double minChromaIRE,
-                                     double columnSupport);
 
 MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,
                                                 double up2Coarse,

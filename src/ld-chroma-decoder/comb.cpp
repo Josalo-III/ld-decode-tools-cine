@@ -2320,9 +2320,11 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         
             qint32 bestIndex;
             double bestSample;
+            TemporalCandidateSamples temporalSamples;
             
             // Pass *this as well so getBestCandidate knows context
-            getBestCandidate(line, h, previousFrame, nextFrame, bestIndex, bestSample);
+            getBestCandidate(line, h, previousFrame, nextFrame,
+                             bestIndex, bestSample, &temporalSamples);
         
             const int h0 = clampH(h);
             const int rel0 = h0 - left;
@@ -2341,8 +2343,40 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                  // clpbuffer[2] already contains clpbuffer[1]
             } else {
                 // Temporal: classic (Y+C) - (Y-C) / 2
-                // We overwrite the pre-filled 2D value with the temporal result
-                clpbuffer[2].pixel[line][h] = (base1d - bestSample) * 0.5;
+                const double outBest = (base1d - bestSample) * 0.5;
+
+                // Bound the winner with estimates independent of the winner:
+                // the seeded 2D result and, when available, the opposite
+                // temporal direction's output. Including outBest itself would
+                // make this guard vacuous in a winner-take-all election.
+                const TemporalCandidateSamples::Sample *partner = nullptr;
+                switch (bestIndex) {
+                case CAND_PREV_FIELD: partner = &temporalSamples.nextField; break;
+                case CAND_NEXT_FIELD: partner = &temporalSamples.previousField; break;
+                case CAND_PREV_FRAME: partner = &temporalSamples.nextFrame; break;
+                case CAND_NEXT_FRAME: partner = &temporalSamples.previousFrame; break;
+                default: break;
+                }
+
+                const double ref2d = clpbuffer[1].pixel[line][h];
+                double hullMin = ref2d;
+                double hullMax = ref2d;
+                if (partner && partner->valid) {
+                    const double outPartner = (base1d - partner->value) * 0.5;
+                    if (std::isfinite(outPartner)) {
+                        hullMin = std::min(hullMin, outPartner);
+                        hullMax = std::max(hullMax, outPartner);
+                    }
+                }
+
+                const double slack = std::max(
+                    0.0, configuration.tunables.TEMPORAL_HULL_SLACK_IRE) * irescale;
+                if (std::isfinite(outBest) && std::isfinite(ref2d) &&
+                    outBest >= hullMin - slack && outBest <= hullMax + slack)
+                {
+                    clpbuffer[2].pixel[line][h] = outBest;
+                }
+                // Outside the hull, retain the 2D value seeded in clpbuffer[2].
             }
         }
     }
@@ -2351,7 +2385,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                                          const FrameBuffer &previousFrame,
                                          const FrameBuffer &nextFrame,
-                                         qint32 &bestIndex, double &bestSample) const
+                                         qint32 &bestIndex, double &bestSample,
+                                         TemporalCandidateSamples *temporalSamples) const
 {
     Candidate c[NUM_CANDIDATES];
     const FrameBuffer* src[NUM_CANDIDATES] = { nullptr };
@@ -2482,11 +2517,6 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                 const double x = dIRE / T.AGREEMENT_REWARD_RADIUS_IRE;
                 delta = -(T.AGREEMENT_REWARD_MAX * configuration.adaptThreshold)
                         * (1.0 - x * x);
-            } else if (dIRE <= T.deviationThreshold) {
-                delta = 0.0;
-            } else {
-                delta = T.AGREEMENT_VETO_BASE
-                        + T.deviationPenalty * (dIRE - T.deviationThreshold);
             }
 
             c[i].penalty += delta;
@@ -2512,6 +2542,19 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
             bestIndex = CAND_NEXT_FRAME;
         else
             bestIndex = CAND_UP;
+    }
+
+    if (temporalSamples) {
+        auto exportSample = [&](int idx,
+                                TemporalCandidateSamples::Sample &out) {
+            out.value = c[idx].sample;
+            out.valid = src[idx] != nullptr && c[idx].penalty < 1000.0 &&
+                        std::isfinite(c[idx].sample);
+        };
+        exportSample(CAND_PREV_FIELD, temporalSamples->previousField);
+        exportSample(CAND_NEXT_FIELD, temporalSamples->nextField);
+        exportSample(CAND_PREV_FRAME, temporalSamples->previousFrame);
+        exportSample(CAND_NEXT_FRAME, temporalSamples->nextFrame);
     }
 
     bestSample = c[bestIndex].sample;
@@ -2861,7 +2904,9 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
             canvas.rgb(0x0000, 0xFFFF, 0xFFFF), // blend: cyan
             canvas.rgb(0x3030, 0x3030, 0x3030), // center / no answer: dark
             canvas.rgb(0xFFFF, 0x8000, 0x0000), // explicit cede: orange
-            canvas.rgb(0xFFFF, 0x0000, 0xFFFF)  // one-legged comb: magenta
+            canvas.rgb(0xFFFF, 0x0000, 0xFFFF), // one-legged comb: magenta
+            canvas.rgb(0x0000, 0xFFFF, 0x0000), // physical recovery: green
+            canvas.rgb(0xFFFF, 0xFFFF, 0x0000)  // repaired-center hold: yellow
         }};
 
         const int firstLine = videoParameters.firstActiveFrameLine;

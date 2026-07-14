@@ -147,12 +147,12 @@ public:
             double FIELD_CONTOUR_HARD_IRE      = 10.0; // contour curvature above this → full edge penalty applied
             double FIELD_CONTOUR_SIM_START     = 0.55; // vertical chroma similarity below which contour gate begins to open
             double FIELD_CONTOUR_SIM_FULL      = 0.85; // similarity above which contour gate is fully closed
+            double FIELD_A_BEVEL_CEDE_STRENGTH = 0.15; // Field A's own center cede in high-chroma bevels near luma edges
 
             double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0; // suppress 2D field output when ±2 line pair disagrees beyond this
 
             double FIELD_LUMA_EDGE_THRESH_IRE = 18.0; // horizontal luma gradient above this suppresses vertical 2D comb
             double FIELD_B_BEVEL_REACH_PENALTY = 0.45; // RESERVED / inert: retired Field B bevel reach damping; kept for tuning compatibility
-            double FIELD_B_BEVEL_CEDE_STRENGTH = 0.15; // extra Field B center cede in high-chroma bevels near luma edges
 
             // =========================================================================
             // Frame comb on phase-corrected 1D
@@ -232,14 +232,15 @@ public:
             // Similarity curve for temporal candidate scoring in getBestCandidate.
             // Let d = |candidate − 2D reference| in IRE:
             //   d ≤ AGREEMENT_REWARD_RADIUS_IRE  → reward: −AGREEMENT_REWARD_MAX·(1−(d/r)²)
-            //   d ≤ deviationThreshold            → neutral
-            //   d > deviationThreshold            → veto: +AGREEMENT_VETO_BASE + deviationPenalty·(d−threshold)
-            // deviationThreshold is shared with getBestY() as the global temporal-mixing veto.
+            //   d > AGREEMENT_REWARD_RADIUS_IRE  → neutral
+            // Output safety is enforced by the independent-estimate hull at
+            // the split3D write site, not by penalizing disagreement here.
             double AGREEMENT_REWARD_RADIUS_IRE = 7.5; // half-width of the reward lobe (IRE)
             double AGREEMENT_REWARD_MAX        = 3.3; // peak reward at d=0 (penalty units, scaled by adaptThreshold)
-            double AGREEMENT_VETO_BASE         = 7.0; // base penalty added once d exceeds deviationThreshold
-            double deviationThreshold          = 10.0; // start of veto region (IRE); shared with getBestY
-            double deviationPenalty            = 3.3; // penalty slope beyond deviationThreshold (per IRE)
+            double AGREEMENT_VETO_BASE         = 7.0; // RETIRED / inert: retained for tuning compatibility
+            double deviationThreshold          = 10.0; // residual-Y temporal mixing veto; getBestY only
+            double deviationPenalty            = 3.3; // RETIRED / inert: retained for tuning compatibility
+            double TEMPORAL_HULL_SLACK_IRE      = 1.5; // output may exceed the independent 2D/partner hull by this much
 
             // 3D Residual Y selection
             bool   RESIDUAL_Y_ELECTION     = true; // true = winner-take-all; false = median-weighted blend
@@ -409,6 +410,16 @@ private:
 	    double yPen;
 	    double iqPen;
 	};
+	struct TemporalCandidateSamples {
+		struct Sample {
+			double value = 0.0;
+			bool valid = false;
+		};
+		Sample previousField;
+		Sample nextField;
+		Sample previousFrame;
+		Sample nextFrame;
+	};
 	const LdDecodeMetaData::VideoParameters &videoParameters;
 	const Configuration &configuration;
 
@@ -441,8 +452,7 @@ private:
 		double diffIRE = std::numeric_limits<double>::infinity();
 		double kScore = 0.0;
 		double weight = 1.0;
-		double reachLegalGate = 1.0;  // binary legality from reach index for this rung
-		double reachGate = 1.0;       // contour-trust * legality
+		double reachLegalGate = 1.0;  // physical legality from grammar/source contract
 	};
 
 	struct CombTapContour {
@@ -466,7 +476,9 @@ private:
 			FieldBReasonCenter = 2,
 			FieldBReasonCede = 3,   // explicit policy centerCede dominated the output
 			FieldBReasonOneLeg = 4, // one-sided comb (a leg was excluded by policy)
-			FieldBReasonCount = 5
+			FieldBReasonRecovery = 5, // cede overridden by physically valid ±2 recovery
+			FieldBReasonRepairHold = 6, // certified repaired center retained against recombing
+			FieldBReasonCount = 7
 		};
 
 	// Shared per-line harvest for the 2D combs. This centralizes row/tap/IQ
@@ -536,13 +548,11 @@ private:
 			std::vector<double> centerAdmittedChromaT;
 		std::vector<CombTapPair> pairU1;
 		std::vector<CombTapPair> pairD1;
-		std::vector<CombTapPair> pairU2;
-		std::vector<CombTapPair> pairD2;
+			std::vector<CombTapPair> pairU2;
+			std::vector<CombTapPair> pairD2;
 			std::vector<CombContentReach::IntrafieldRegionReach> intrafieldRegionReach;
-			// Raw no-valid-partner cede flag per pixel (a Different leg with no
-			// positively same-region partner). Consumers keep it per-column so a
-			// slanted boundary does not acquire a horizontal staircase footprint.
-		std::vector<std::uint8_t> intrafieldRegionCede;
+		// The shared line ends at observations. Each field comb interprets the
+		// region facts independently and owns any leg exclusion or center cede.
 		// Per-pixel ±4 region verdicts (center vs ±4 same-field partner).
 		// Evaluated alongside the ±2 intrafieldRegionReach in
 		// buildCombTapLine; consumed by the contour influence gate so
@@ -556,10 +566,6 @@ private:
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
 		std::vector<double> hLumaDeltaIRE;
-		// Complete per-column Field B policy (leg mix + explicit centerCede +
-		// reasons), resolved upstream. The renderer consumes this and the taps;
-		// it performs no analysis of its own.
-		std::vector<CombContentReach::FieldBTapPolicy> fieldBPolicy;
 	};
 	enum CombTapBuild : unsigned {
 		TapBuildFieldB = 1u << 0, // center + +/-2, pair metrics, horizontal luma delta
@@ -750,6 +756,8 @@ private:
 	std::vector<double> scratch_attrBandYClaim;
 	std::vector<double> scratch_attrMembershipY;
 	std::vector<double> scratch_impulseExempt;
+	std::vector<double> scratch_frameBReachUp;
+	std::vector<double> scratch_frameBReachDown;
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
 		//
@@ -1140,7 +1148,8 @@ private:
 	void getBestCandidate(qint32 lineNumber, qint32 h,
 						  const FrameBuffer &previousFrame,
 						  const FrameBuffer &nextFrame,
-						  qint32 &bestIndex, double &bestSample) const;
+						  qint32 &bestIndex, double &bestSample,
+						  TemporalCandidateSamples *temporalSamples = nullptr) const;
 
 	// getCandidate is declared here and implemented in comb_candidate.cpp
 	Candidate getCandidate(qint32 refLineNumber, qint32 refH,
