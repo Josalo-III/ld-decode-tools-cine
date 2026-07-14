@@ -1779,6 +1779,15 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         double cede = std::clamp(policy.centerCede, 0.0, 1.0);
         bool policyRecovered = false;
 
+        // A region cede is a structural verdict: the center has no admitted
+        // same-region partner (or lies in a strong-asymmetry band).  Agreement
+        // between the two neighbours proves only that they belong together;
+        // it does not prove that either belongs with the center.  Letting the
+        // recovery paths erase this verdict recreates the intrafield zipper
+        // by combing across the very boundary the region grammar identified.
+        const bool structuralRegionCede =
+            (cedeFlags & FieldBCedeCenter) != 0;
+
         // Field B's decisive two-leg recovery. A policy refusal must not
         // strand 1D residue when the complete ±2 method agrees on a single
         // neighbor estimate and the carrier-free luma service says the three
@@ -1797,12 +1806,14 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         const bool contextIntact = upContextIntact && downContextIntact;
         const bool pairConsensus =
             pairLegal && contextIntact && pairAgreementIRE <= kPairConsensusIRE;
-        if (pairConsensus && (cede > 0.0 || (wUp + wDown) <= 1e-9)) {
+        if (!structuralRegionCede && pairConsensus &&
+            (cede > 0.0 || (wUp + wDown) <= 1e-9))
+        {
             wUp = 1.0;
             wDown = 1.0;
             cede = 0.0;
             policyRecovered = true;
-        } else if (cede > 0.0) {
+        } else if (!structuralRegionCede && cede > 0.0) {
             // Content uncertainty is not authority to preserve 1D. Field B
             // must still return its best physically valid ±2 answer. Restore
             // the raw two-line weights independently on each intact side;
