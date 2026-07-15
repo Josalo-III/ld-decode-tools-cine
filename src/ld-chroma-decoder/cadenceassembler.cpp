@@ -321,18 +321,14 @@ void CadenceAssembler::handOffCaptureFrameToBaseline(int pos)
     baselineOwnedSeqNos.insert(seqNo);
     if (partnerSeqNo >= 0) baselineOwnedSeqNos.insert(partnerSeqNo);
 
-    int partnerPos = -1;
-    if (partnerSeqNo >= 0) {
-        auto it = seqNoToHistoryIndex.find(partnerSeqNo);
-        if (it != seqNoToHistoryIndex.end() && !history[it.value()].consumed) {
-            partnerPos = it.value();
-        }
-    }
-
-    // Transfer responsibility to the baseline path before retiring history ownership.
+    // Transfer responsibility for the original capture frame to baseline before
+    // retiring this field from history.  Do not consume the capture partner here:
+    // in a mixed AB/BC frame that partner is still a source for the neighbouring
+    // reconstructed film frame (B1 for AB, or B2 for BC).  baselineOwnedSeqNos
+    // prevents a later passthrough from being queued twice without revoking that
+    // field's eligibility for normal film extraction.
     releaseSeqToBaseline(seqNo);
 
-    if (partnerPos >= 0 && partnerPos != pos) markHistoryConsumed(partnerPos);
     markHistoryConsumed(pos);
 }
 
@@ -933,6 +929,8 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
         SourceField b = std::move(history[matePos].field);
 
         orderPairForComb(a, b);
+        a.allowProgressiveFrameRegime = false;
+        b.allowProgressiveFrameRegime = false;
         a.field.cinemap.cadenceId = -2;
         b.field.cinemap.cadenceId = -2;
 
@@ -1085,6 +1083,8 @@ bool CadenceAssembler::tryEmitPassthroughAtCursor(bool flushMode, bool force)
     SourceField b = std::move(history[i1].field);
 
     orderPairForComb(a, b);
+    a.allowProgressiveFrameRegime = false;
+    b.allowProgressiveFrameRegime = false;
 
     WorkItem wi;
     wi.kind               = WorkItem::Kind::PassthroughFrame;

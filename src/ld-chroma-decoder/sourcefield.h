@@ -33,6 +33,10 @@ struct SourceField {
     LdDecodeMetaData::Field field;
     SourceVideo::Data data;
     qint32 capturePartnerSeqNo = -1;  // seqNo of the other field in the original TBC frame
+    // Cadence identity remains in field.cinemap for diagnostics, but fallback
+    // work must not use that identity as permission for FVF's progressive
+    // frame regime. Guarded frame candidates remain part of the field regime.
+    bool allowProgressiveFrameRegime = true;
 
     static void loadFields(SourceVideo &sourceVideo, LdDecodeMetaData &ldDecodeMetaData,
                            qint32 firstFrameNumber, qint32 numFrames,

@@ -52,3 +52,7 @@ target_include_directories(ld-chroma-decoder PRIVATE ${FFTW_INCLUDE_DIR})
 target_link_libraries(ld-chroma-decoder PRIVATE Qt::Core lddecode-library lddecode-chroma ${FFTW_LIBRARY})
 
 install(TARGETS ld-chroma-decoder)
+
+if(BUILD_TESTING)
+    add_subdirectory(testcadenceassembler)
+endif()

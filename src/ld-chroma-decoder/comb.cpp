@@ -574,11 +574,16 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     secondFieldPhaseID = secondField.field.fieldPhaseID;
     
     const bool editSplit = secondField.field.cinemap.isEditBoundary;
+    const bool progressiveFrameRegimeAllowed =
+        firstField.allowProgressiveFrameRegime &&
+        secondField.allowProgressiveFrameRegime;
     
     const qint32 cidA = firstField.field.cinemap.cadenceId;
     const qint32 cidB = secondField.field.cinemap.cadenceId;
     cadenceId = lddecode::mergeCadenceIdForInterleavedFrame(
         cidA, cidB, editSplit);
+    if (!progressiveFrameRegimeAllowed)
+        cadenceId = lddecode::kCadenceVideo;
     // Clear working planes only in active region for safety
     for (int buf = 0; buf < 3; ++buf) {
         for (int y = videoParameters.firstActiveFrameLine;

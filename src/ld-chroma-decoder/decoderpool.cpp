@@ -42,6 +42,7 @@ SourceField DecoderPool::createBlackField(bool isFirst, int seqNo) const
     sf.field.seqNo = seqNo;
     sf.field.cinemap.isEditBoundary = false; // ensure padding never blocks passthrough
     sf.field.cinemap.cadenceId = -1;         // neutral cadence for padding
+    sf.allowProgressiveFrameRegime = false;
     return sf;
 }
 
@@ -144,6 +145,7 @@ bool DecoderPool::process()
     baselineFramesQueued.clear();
     resolvedOutputFrames.clear();
     upgradedTbcFrames.clear();
+    outstandingUpgradeSeqNos.clear();
     nextOutputKey24p = startFrame;
     writeCursor24p   = startFrame;
 
@@ -194,7 +196,9 @@ bool DecoderPool::process()
                 bool haveUp   = upgradedFieldsBySeq.contains(s);
                 qCritical() << "seq" << s
                             << "baseline:" << haveBase
-                            << "upgrade:"  << haveUp;
+                            << "upgrade:"  << haveUp
+                            << "upgrade outstanding:"
+                            << outstandingUpgradeSeqNos.contains(s);
             };
     
             check(s1);
@@ -376,6 +380,8 @@ void DecoderPool::enqueueBaselinePassthrough(qint32 seqNo)
     wi.filmLabel = '?';
     wi.f1 = std::move(rawVec[0]);
     wi.f2 = std::move(rawVec[1]);
+    wi.f1.allowProgressiveFrameRegime = false;
+    wi.f2.allowProgressiveFrameRegime = false;
 
     // Insert in disc order: find first workItem whose min seqNo exceeds ours.
     const qint32 minSeq = std::min(seq1, seq2);
@@ -477,12 +483,27 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         return s;
     };
 
+    auto queueAssemblerWorkAheadOfBaselines =
+        [&](QVector<CadenceAssembler::WorkItem> produced) {
+            // Baseline callbacks run inside CadenceAssembler::push/flush, so
+            // they reach workItems before popWork() returns the cadence work
+            // that caused them.  Keep the fallback jobs, but decode the
+            // planned A/B/C/D reconstructions first.
+            std::deque<CadenceAssembler::WorkItem> baselines;
+            baselines.swap(workItems);
+
+            for (auto &wi : produced) workItems.push_back(std::move(wi));
+            while (!baselines.empty()) {
+                workItems.push_back(std::move(baselines.front()));
+                baselines.pop_front();
+            }
+        };
+
     auto pumpAssembler = [&]() -> bool {
         if (inputFrameNumber > lastFrameNumber) {
             if (cadenceAssembler) {
                 cadenceAssembler->flush();
-                const auto flushed = cadenceAssembler->popWork();
-                for (auto wi : flushed) workItems.push_back(std::move(wi));
+                queueAssemblerWorkAheadOfBaselines(cadenceAssembler->popWork());
             }
             return false;
         }
@@ -521,14 +542,15 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         }
         if (cadenceAssembler) {
             cadenceAssembler->push(rawVec);
-            const auto produced = cadenceAssembler->popWork();
-            for (auto wi : produced) workItems.push_back(std::move(wi));
+            queueAssemblerWorkAheadOfBaselines(cadenceAssembler->popWork());
         } else {
             for (int i = 0; i + 1 < rawVec.size(); i += 2) {
                 CadenceAssembler::WorkItem wi;
                 wi.kind = CadenceAssembler::WorkItem::Kind::PassthroughFrame;
                 wi.f1 = std::move(rawVec[i]);
                 wi.f2 = std::move(rawVec[i + 1]);
+                wi.f1.allowProgressiveFrameRegime = false;
+                wi.f2.allowProgressiveFrameRegime = false;
                 workItems.push_back(std::move(wi));
             }
         }
@@ -719,6 +741,12 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
 
         {
             QMutexLocker outLock(&outputMutex);
+            if (ticket.kind == DecodeTicket::Kind::UpgradePair) {
+                outstandingUpgradeSeqNos.insert(ticket.homeSeq1);
+                outstandingUpgradeSeqNos.insert(ticket.homeSeq2);
+                if (ticket.duplicateTwin)
+                    outstandingUpgradeSeqNos.insert(ticket.twinHomeSeq);
+            }
             decodeTicketsByFrameNumber[startFrameNumber] = ticket;
         }
         
@@ -756,6 +784,12 @@ bool DecoderPool::assembleResolvedPairToFrame(qint32 seq1, qint32 seq2, OutputFr
         auto upIt = upgradedFieldsBySeq.constFind(seq);
         if (upIt != upgradedFieldsBySeq.constEnd() && !upIt->data.isEmpty())
             return &upIt->data;
+
+        // A fallback decode may finish before an earlier cadence decode on a
+        // different worker.  Once an upgrade ticket exists, baseline data is
+        // not sufficient to finalize this field until that upgrade arrives.
+        if (outstandingUpgradeSeqNos.contains(seq)) return nullptr;
+
         auto baseIt = baselineFieldsBySeq.constFind(seq);
         if (baseIt != baselineFieldsBySeq.constEnd() && !baseIt->data.isEmpty())
             return &baseIt->data;
@@ -857,44 +891,65 @@ bool DecoderPool::putOutputFrame(qint32 frameNumber,
     }
 
     auto ticketIt = decodeTicketsByFrameNumber.find(frameNumber);
-        if (ticketIt == decodeTicketsByFrameNumber.end()) {
-            return true;
-        }
-    
-        const DecodeTicket ticket = ticketIt.value();
-        decodeTicketsByFrameNumber.erase(ticketIt);
-    
-        const bool isUpgrade = (ticket.kind == DecodeTicket::Kind::UpgradePair);
-    
-        if (!componentFrame) {
-            qWarning() << "putOutputFrame: 29.97 path called without ComponentFrame"
-                       << "for frameNumber" << frameNumber
-                       << "homeSeq1" << ticket.homeSeq1
-                       << "homeSeq2" << ticket.homeSeq2;
-            return false;
-        }
-    
-        QVector<quint16> f1data, f2data;
-        splitOutputFrameToFields(outputFrame, f1data, f2data);
-        
-        if (isUpgrade) {
-            submitUpgradedField(ticket.homeSeq1, f1data);
-            submitUpgradedField(ticket.homeSeq2, f2data);
-        } else {
-            if (!upgradedFieldsBySeq.contains(ticket.homeSeq1))
-                submitBaselineField(ticket.homeSeq1, f1data);
-            if (!upgradedFieldsBySeq.contains(ticket.homeSeq2))
-                submitBaselineField(ticket.homeSeq2, f2data);
-        }
-        
-        if (isUpgrade && ticket.duplicateTwin) {
+    if (ticketIt == decodeTicketsByFrameNumber.end()) return true;
+
+    const DecodeTicket ticket = ticketIt.value();
+    decodeTicketsByFrameNumber.erase(ticketIt);
+
+    const bool isUpgrade = (ticket.kind == DecodeTicket::Kind::UpgradePair);
+    auto releaseUpgradeClaims = [&]() {
+        if (!isUpgrade) return;
+        outstandingUpgradeSeqNos.remove(ticket.homeSeq1);
+        outstandingUpgradeSeqNos.remove(ticket.homeSeq2);
+        if (ticket.duplicateTwin)
+            outstandingUpgradeSeqNos.remove(ticket.twinHomeSeq);
+    };
+
+    if (!componentFrame) {
+        // This ticket can no longer produce.  Relinquish every claim before
+        // aborting so a failed producer never leaves an orphaned registry hold.
+        releaseUpgradeClaims();
+        qWarning() << "putOutputFrame: 29.97 path called without ComponentFrame"
+                   << "for frameNumber" << frameNumber
+                   << "homeSeq1" << ticket.homeSeq1
+                   << "homeSeq2" << ticket.homeSeq2;
+        return false;
+    }
+
+    QVector<quint16> f1data, f2data;
+    splitOutputFrameToFields(outputFrame, f1data, f2data);
+
+    if (f1data.isEmpty() || f2data.isEmpty()) {
+        releaseUpgradeClaims();
+        qWarning() << "putOutputFrame: decoded field payload is empty"
+                   << "for frameNumber" << frameNumber
+                   << "homeSeq1" << ticket.homeSeq1
+                   << "homeSeq2" << ticket.homeSeq2;
+        return false;
+    }
+
+    if (isUpgrade) {
+        submitUpgradedField(ticket.homeSeq1, f1data);
+        submitUpgradedField(ticket.homeSeq2, f2data);
+
+        if (ticket.duplicateTwin) {
             const QVector<quint16>& twinFieldData =
                 (ticket.twinSource == 1) ? f1data : f2data;
             submitUpgradedField(ticket.twinHomeSeq, twinFieldData);
         }
-    
-        while (tryEmitNextOriginalPair()) {
-        }
-    
-        return true;
+
+        // The payloads are installed.  This ticket has fulfilled every claim;
+        // release the holds before asking the writer to make progress.
+        releaseUpgradeClaims();
+    } else {
+        if (!upgradedFieldsBySeq.contains(ticket.homeSeq1))
+            submitBaselineField(ticket.homeSeq1, f1data);
+        if (!upgradedFieldsBySeq.contains(ticket.homeSeq2))
+            submitBaselineField(ticket.homeSeq2, f2data);
+    }
+
+    while (tryEmitNextOriginalPair()) {
+    }
+
+    return true;
 }

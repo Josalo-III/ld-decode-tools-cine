@@ -186,6 +186,7 @@ struct DecodeTicket
     QElapsedTimer totalTimer;
 	QMap<qint32, StoredFieldPayload> baselineFieldsBySeq;
 	QMap<qint32, StoredFieldPayload> upgradedFieldsBySeq;
+	QSet<qint32> outstandingUpgradeSeqNos;
     std::deque<CadenceAssembler::WorkItem> scheduled24p;
     std::vector<CadenceAssembler::WorkItem> buildingSeg24p;
 
