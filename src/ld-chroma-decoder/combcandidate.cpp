@@ -1779,14 +1779,40 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         double cede = std::clamp(policy.centerCede, 0.0, 1.0);
         bool policyRecovered = false;
 
-        // A region cede is a structural verdict: the center has no admitted
-        // same-region partner (or lies in a strong-asymmetry band).  Agreement
-        // between the two neighbours proves only that they belong together;
-        // it does not prove that either belongs with the center.  Letting the
-        // recovery paths erase this verdict recreates the intrafield zipper
-        // by combing across the very boundary the region grammar identified.
+        // A region cede is normally a structural verdict: the center has no
+        // admitted same-region partner (or lies in a nearby strong-asymmetry
+        // band).  Agreement between the two neighbours proves only that they
+        // belong together; it does not prove that either belongs with center.
+        //
+        // The one exception is the region evaluator's explicit two-sided
+        // AlienCancel verdict *inside a carrier-free image context*.  The
+        // verdict comes from sharp raw-identical +/-2 evidence on an energetic
+        // center: vertically coherent luma such as the Borg-cube grid, for
+        // which the field difference is the exact cancellation operation.
+        // Near-carrier grid detail is flat both laterally and across the +/-2
+        // coarse-luma rows; garment hems and other real region boundaries are
+        // not.  Requiring tight context in both directions prevents an
+        // accidental AlienCancel classification from reopening the bikini /
+        // briefs zipper while still allowing the cube recovery away from a
+        // real contour.  Fail closed when the coarse rows are unavailable:
+        // bypassing a structural verdict requires positive luma evidence.
+        using RegionRelation = CombContentReach::RegionRelation;
+        const bool twoSidedAlienCancel =
+            region.up == RegionRelation::AlienCancel &&
+            region.down == RegionRelation::AlienCancel;
+        const bool lateralContextIntact =
+            hLumaDelta < 0.45 * hEdgeThreshold;
+        constexpr double kStructuralOverrideContextIRE = 3.5;
+        const bool verticalContextIntact =
+            haveCoarse &&
+            upCoarseDelta < kStructuralOverrideContextIRE &&
+            downCoarseDelta < kStructuralOverrideContextIRE;
+        const bool provenLumaCancellation =
+            twoSidedAlienCancel &&
+            lateralContextIntact &&
+            verticalContextIntact;
         const bool structuralRegionCede =
-            (cedeFlags & FieldBCedeCenter) != 0;
+            (cedeFlags & FieldBCedeCenter) != 0 && !provenLumaCancellation;
 
         // Field B's decisive two-leg recovery. A policy refusal must not
         // strand 1D residue when the complete ±2 method agrees on a single
