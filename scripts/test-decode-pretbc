@@ -27,6 +27,7 @@ import argparse
 import json
 import numpy
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -386,8 +387,8 @@ def run_ld_dropout_correct(args):
 def run_ld_chroma_decoder(args, decoder):
     """Run ld-chroma-decoder with a given decoder."""
 
-    clean(args, ['.rgb'])
-    rgb_file = args.output + '.rgb'
+    clean(args, ['.y4m'])
+    y4m_file = args.output + '.y4m'
 
     cmd = [resolve_tool(
         os.path.join(build_dir, 'bin', 'ld-chroma-decoder'),
@@ -395,21 +396,65 @@ def run_ld_chroma_decoder(args, decoder):
     )]
     if decoder is not None:
         cmd += ['--decoder', decoder]
-    cmd += [args.output + '.doc.tbc', rgb_file]
+    cmd += ['--output-format', 'y4m', args.output + '.doc.tbc', y4m_file]
     run_command(cmd)
 
     # Check there are enough output frames
     if (args.expect_frames is not None) and (not dry_run):
-        if not os.path.exists(rgb_file):
-            die(rgb_file, 'does not exist')
-        if args.pal:
-            frame_w, frame_h = 928, 576
-        else:
-            frame_w, frame_h = 760, 488
-        rgb_frames = os.stat(rgb_file).st_size // (2 * 3 * frame_w * frame_h)
-        if rgb_frames < args.expect_frames:
-            die(rgb_file, 'contains', rgb_frames,
+        if not os.path.exists(y4m_file):
+            die(y4m_file, 'does not exist')
+
+        # Read dimensions from the self-describing Y4M stream rather than
+        # baking a particular historical active-area crop into the test.
+        with open(y4m_file, 'rb') as stream:
+            header = stream.readline().decode('ascii', errors='strict').strip()
+            width_match = re.search(r'(?:^| )W(\d+)(?: |$)', header)
+            height_match = re.search(r'(?:^| )H(\d+)(?: |$)', header)
+            chroma_match = re.search(r'(?:^| )C([^ ]+)(?: |$)', header)
+            if (not header.startswith('YUV4MPEG2 ') or not width_match or
+                    not height_match or not chroma_match):
+                die(y4m_file, 'has an invalid Y4M header:', header)
+            frame_w = int(width_match.group(1))
+            frame_h = int(height_match.group(1))
+            if (frame_w % 8) != 0 or (frame_h % 8) != 0:
+                die(y4m_file, 'dimensions', f'{frame_w}x{frame_h}',
+                    'do not honour the default 8-pixel output alignment')
+
+            chroma = chroma_match.group(1)
+            if chroma == 'mono16':
+                bytes_per_pixel = 2
+            elif chroma == '444p16':
+                bytes_per_pixel = 6
+            else:
+                die(y4m_file, 'uses an unsupported test pixel format:', chroma)
+            frame_bytes = frame_w * frame_h * bytes_per_pixel
+            y4m_frames = 0
+            chroma_squared = 0.0
+            chroma_samples = 0
+            while True:
+                frame_header = stream.readline()
+                if frame_header == b'':
+                    break
+                if not frame_header.startswith(b'FRAME'):
+                    die(y4m_file, 'has an invalid frame header')
+                payload = stream.read(frame_bytes)
+                if len(payload) != frame_bytes:
+                    die(y4m_file, 'has a truncated frame payload')
+                if chroma == '444p16' and args.expect_max_chroma_rms is not None:
+                    samples = numpy.frombuffer(payload, dtype='<u2')
+                    neutral_chroma = samples[frame_w * frame_h:].astype(numpy.float64) - 32768.0
+                    chroma_squared += numpy.dot(neutral_chroma, neutral_chroma)
+                    chroma_samples += neutral_chroma.size
+                y4m_frames += 1
+
+        if y4m_frames < args.expect_frames:
+            die(y4m_file, 'contains', y4m_frames,
                 'frames; expected at least', args.expect_frames)
+        if chroma_samples:
+            chroma_rms = numpy.sqrt(chroma_squared / chroma_samples)
+            if chroma_rms > args.expect_max_chroma_rms:
+                die(y4m_file, 'has chroma RMS', round(chroma_rms, 2),
+                    'codes; expected at most', args.expect_max_chroma_rms)
 
 def parse_list_arg(s, num):
     """Parse an argument with a comma-separated list of values."""
@@ -431,6 +476,8 @@ def main():
                        help='Pre-generated TBC base name (e.g., test-data/ntsc/ve-snw-cut)')
     group.add_argument('output', metavar='output', nargs='?', default='testout/test',
                        help='base name for output files (default testout/test)')
+    group.add_argument('--output-base', metavar='PATH',
+                       help='base name for output files (overrides positional output)')
     group.add_argument('-n', '--dry-run', action='store_true',
                        help='show commands, rather than running them')
     group.add_argument('--build', metavar='DIR',
@@ -460,7 +507,12 @@ def main():
                        help='Print VITC values (to find out what to pass into expect-vitc)')
     group.add_argument('--expect-efm-samples', metavar='N', type=int,
                        help='expect at least N stereo pairs of samples in EFM output')
+    group.add_argument('--expect-max-chroma-rms', metavar='CODES', type=float,
+                       help='expect neutral-centred U/V RMS not to exceed CODES')
     args = parser.parse_args()
+
+    if args.output_base:
+        args.output = args.output_base
 
     global dry_run
     dry_run = args.dry_run

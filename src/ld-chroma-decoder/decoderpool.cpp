@@ -64,9 +64,6 @@ bool DecoderPool::process()
 {
     LdDecodeMetaData::VideoParameters videoParameters = ldDecodeMetaData.getVideoParameters();
 
-    // Disable padding. 
-    outputConfig.paddingAmount = 1;
-
     outputWriter.updateConfiguration(videoParameters, outputConfig);
     outputWriter.printOutputInfo();
     
