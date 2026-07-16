@@ -528,9 +528,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedCoherentCarrier_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             lockedCoherentCarrierValid.assign(demodLines, std::uint8_t{0});
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-            // Cross-color mask pair exists whenever return is active.  The
-            // conservative default therefore allocates it; an explicit 0
-            // restores the zero-cost bypass.
+            // Cross-color mask pair only exists when the return feature is
+            // explicitly engaged, so the ordinary residual-Y path pays
+            // neither the memory nor the second pass.
             if (configuration.tunables.CC_SUPPRESSION_WEIGHT > 0.0) {
                 lockedCcMaskRaw_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
                 lockedCcMask_flat.assign(size_t(demodLines) * demodWidth, 0.0f);

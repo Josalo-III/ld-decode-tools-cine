@@ -135,9 +135,9 @@ public:
 			// splitIQlocked/filterIQLocked).  Values above 1.0 only override
 			// a false-positive regionKeep rescue; they can never manufacture
 			// suppression beyond what was measured, so saturated textured
-			// chroma no longer grays out at strength 2.  A conservative
-			// baseline is active by default; 0 explicitly disables it.
-            double CC_SUPPRESSION_WEIGHT    = 0.25;
+			// chroma no longer grays out at strength 2. The feature is
+			// opt-in; 0 leaves the ordinary residual-Y path untouched.
+            double CC_SUPPRESSION_WEIGHT    = 0.0;
 
             // =========================================================================
             // 2D Field extraction (FieldA/B) and vertical gating

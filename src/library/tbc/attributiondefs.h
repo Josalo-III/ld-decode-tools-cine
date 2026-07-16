@@ -210,14 +210,16 @@ struct CarrierAnalysisRecord {
     // [-1,+1]: relation-signed correlation of carrier-band energy against
     // grammar-certified Opposite partners.  -1 = inverts like ideal carrier;
     // +1 = matches where the schedule demands inversion (luma by law).
-    // conformanceSupportFraction in [0,1] is the fraction of the three possible
-    // axes supporting the sign selected for carrierConformance.  Availability
-    // alone is not support: one legal-looking axis among three remains 1/3,
-    // rather than receiving full authority merely because three were usable.
-    // This is a fact of the table; the enum above is the legacy threshold view
-    // derived from it during migration. What to DO with it is carrierTrust()
-    // plus per-consumer action, never baked in here.
+    // conformanceUsableAxisFraction preserves the legacy availability input
+    // consumed by existing comb reach policy. conformanceSupportFraction is
+    // the distinct fraction of the three possible axes SUPPORTING the sign
+    // selected for carrierConformance. Availability alone is not support: one
+    // legal-looking axis among three remains 1/3 in the latter, rather than
+    // receiving full authority merely because three were usable. New ownership
+    // policy should consume the named supporting fraction; changing an existing
+    // consumer requires a separate, candidate-specific validation.
     float carrierConformance = 0.0f;
+    float conformanceUsableAxisFraction = 0.0f;
     float conformanceSupportFraction = 0.0f;
 };
 

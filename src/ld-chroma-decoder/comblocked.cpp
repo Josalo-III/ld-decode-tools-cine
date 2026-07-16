@@ -579,6 +579,9 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                         ? legalAxisVotes : illegalAxisVotes;
                     analysis[rel].carrierConformance =
                         static_cast<float>(std::clamp(conformance, -1.0, 1.0));
+                    analysis[rel].conformanceUsableAxisFraction =
+                        static_cast<float>(std::min(1.0,
+                            static_cast<double>(usableAxes) / 3.0));
                     analysis[rel].conformanceSupportFraction =
                         static_cast<float>(std::min(1.0,
                             static_cast<double>(supportingVotes) / 3.0));

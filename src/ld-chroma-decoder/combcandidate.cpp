@@ -736,7 +736,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const double carrierTrust = centerAnalysis
                 ? lddecode::carrierTrust(
                     centerAnalysis[rel].carrierConformance,
-                    centerAnalysis[rel].conformanceSupportFraction)
+                    centerAnalysis[rel].conformanceUsableAxisFraction)
                 : 0.5;
             const double admission =
                 std::clamp(2.0 * (carrierTrust - 0.5), 0.0, 1.0);
@@ -920,7 +920,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                               int rel) {
                 return row
                     ? lddecode::carrierTrust(row[rel].carrierConformance,
-                                             row[rel].conformanceSupportFraction)
+                                             row[rel].conformanceUsableAxisFraction)
                     : 0.5;
             };
 
