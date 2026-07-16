@@ -566,16 +566,22 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                 // relation-signed correlation, biased to the most-legal axis
                 // when one inverts (real chroma is never disowned on the
                 // strength of a matching neighbour) and otherwise reporting
-                // the most-illegal evidence.  Thresholding it at -/+kCorrVote
-                // reproduces the legacy enum exactly; the trust POLICY that
-                // consumers weight by lives downstream in carrierTrust().
+                // the most-illegal evidence. conformanceSupportFraction records
+                // the fraction of axes SUPPORTING that selected sign, not the
+                // number merely available.  The old usableAxes/3 assigned a
+                // lone coincidental legal vote full authority when all three
+                // axes were present. Thresholding conformance at
+                // -/+kCorrVote reproduces the legacy enum; action remains a
+                // downstream policy.
                 if (usableAxes > 0) {
                     const double conformance = legalVote ? minCorr : maxCorr;
+                    const int supportingVotes = legalVote
+                        ? legalAxisVotes : illegalAxisVotes;
                     analysis[rel].carrierConformance =
                         static_cast<float>(std::clamp(conformance, -1.0, 1.0));
-                    analysis[rel].conformanceConfidence =
+                    analysis[rel].conformanceSupportFraction =
                         static_cast<float>(std::min(1.0,
-                            static_cast<double>(usableAxes) / 3.0));
+                            static_cast<double>(supportingVotes) / 3.0));
                 }
 
                 analysis[rel].scheduleConformance = legalVote
@@ -1898,18 +1904,18 @@ void Comb::FrameBuffer::splitIQlocked()
             if (analysisRow) {
                 grammarPass = lddecode::carrierLegalProof(
                     (double)analysisRow[xi].carrierConformance,
-                    (double)analysisRow[xi].conformanceConfidence);
+                    (double)analysisRow[xi].conformanceSupportFraction);
             }
             grammarPass = std::max(grammarPass, std::max(
                 analysisUpRow
                     ? lddecode::carrierLegalProof(
                           (double)analysisUpRow[xi].carrierConformance,
-                          (double)analysisUpRow[xi].conformanceConfidence)
+                          (double)analysisUpRow[xi].conformanceSupportFraction)
                     : 0.0,
                 analysisDnRow
                     ? lddecode::carrierLegalProof(
                           (double)analysisDnRow[xi].carrierConformance,
-                          (double)analysisDnRow[xi].conformanceConfidence)
+                          (double)analysisDnRow[xi].conformanceSupportFraction)
                     : 0.0));
 
             const double apertureRead = gA * (1.0 - regionKeep);
@@ -1940,7 +1946,7 @@ void Comb::FrameBuffer::splitIQlocked()
         }
     }
 
-    // Pass 2 (engaged only with --cross-color-return): band-limit the
+    // Pass 2 (engaged when cross-color return is nonzero): band-limit the
     // suppression verdict into an envelope, then scale the published chroma
     // products.  In-field vertical mix (±2 lines, the same-parity partners
     // the verdict itself was judged against) then a lateral boxcar with a
@@ -1973,15 +1979,28 @@ void Comb::FrameBuffer::splitIQlocked()
                             (rD ? 0.25 * rD[xi] : 0.0)) / norm;
             }
 
-            double s = 0.0;
+            // RMS, rather than the arithmetic mean, preserves the authority of
+            // a narrow convicted line.  A one-pixel verdict in this nine-tap
+            // aperture used to collapse to 1/9 and visibly survive even at
+            // strength 1.  RMS raises it to 1/3 while remaining a smooth,
+            // chroma-band-limited envelope; broad verdicts are unchanged.
+            double sumSquares = 0.0;
             int lo = 0, hi = -1;
             for (int xi = 0; xi < width; ++xi) {
                 const int nlo = std::max(0, xi - kCcMaskRadius);
                 const int nhi = std::min(width - 1, xi + kCcMaskRadius);
-                while (hi < nhi) s += vmix[++hi];
-                while (lo < nlo) s -= vmix[lo++];
+                while (hi < nhi) {
+                    ++hi;
+                    sumSquares += vmix[hi] * vmix[hi];
+                }
+                while (lo < nlo) {
+                    sumSquares -= vmix[lo] * vmix[lo];
+                    ++lo;
+                }
                 const double m = std::clamp(
-                    s / (double)(nhi - nlo + 1), 0.0, 1.0);
+                    std::sqrt(std::max(0.0, sumSquares) /
+                              (double)(nhi - nlo + 1)),
+                    0.0, 1.0);
                 out[xi] = (float)m;
                 if (prodIRow) prodIRow[xi] = (float)(prodIRow[xi] * (1.0 - m));
                 if (prodQRow) prodQRow[xi] = (float)(prodQRow[xi] * (1.0 - m));
@@ -2080,23 +2099,12 @@ void Comb::FrameBuffer::filterIQLocked()
                 fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
             }
 
-            // Same aperture cross-color suppression as the coherent path
-            // (splitIQlocked): scale the demodulated residual chroma by
-            // (1 - gA*weight).  This is a colour-side transfer policy only;
-            // carrierImpurity remains decision data and never becomes a
-            // replacement waveform.
-            // A hypothetical luma-side repair does not prove that its per-pixel
-            // value won the HF election. Bypassing gA on that basis restored
-            // cross-colour wherever combY won, notably in fine line structure.
-            // Apply the published policy to the actual residual colour instead.
-            //
-            // The policy itself is computed ONCE, in splitIQlocked(), which
-            // publishes the band-limited suppression envelope (in-field ±2
-            // vertical mix + lateral boxcar) as lockedCcMask.  Residual
-            // colour consumes that same envelope -- one policy, two
-            // renderers, no duplicate math -- so suppression cannot alias
-            // here either (the per-sample verdict used to be recomputed and
-            // only laterally smoothed in this path).
+            // Cross-color returned Y participates in produceY's election.
+            // Residual colour is raw - the elected Y, so it is complementary
+            // to whichever complete luma candidate actually won. Applying the
+            // mask again here would suppress colour even where the election
+            // rejected returned Y, bypassing that decision and discarding
+            // energy instead of transferring it.
             const float *maskRow = lockedCcMask_line(line);
             const float *maskRawRow = lockedCcMaskRaw_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
@@ -2114,23 +2122,19 @@ void Comb::FrameBuffer::filterIQLocked()
                 // convention from the luma it is derived from.
                 const double chroma = (double)rawLine[h] - Yrow[h];
 
-                const double m = maskRow
-                    ? std::clamp((double)maskRow[i], 0.0, 1.0)
-                    : 0.0;
-                const double alphaEff = 1.0 - m;
-
                 if (ccProbeLine == line && i >= ccProbeC0 && i <= ccProbeC1) {
                     const float conf = analysisRow ? analysisRow[i].carrierConformance : 0.0f;
-                    const float cfd  = analysisRow ? analysisRow[i].conformanceConfidence : 0.0f;
+                    const float axisSupport = analysisRow
+                        ? analysisRow[i].conformanceSupportFraction : 0.0f;
                     std::fprintf(stderr,
                         "CCTERM line=%d col=%d maskRaw=%.3f maskSmooth=%.3f "
-                        "conf=%.3f cfd=%.3f alphaEff=%.3f\n",
+                        "conf=%.3f axisSupport=%.3f\n",
                         line, i, maskRawRow ? maskRawRow[i] : 0.0f,
-                        maskRow ? maskRow[i] : 0.0f, conf, cfd, alphaEff);
+                        maskRow ? maskRow[i] : 0.0f, conf, axisSupport);
                 }
 
-                scratch_preI[i] = (chroma * lutTi[ph]) * giProduct * alphaEff;
-                scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct * alphaEff;
+                scratch_preI[i] = (chroma * lutTi[ph]) * giProduct;
+                scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct;
             }
         } else {
             // The normal locked path consumes the cache prepared by splitIQlocked().
@@ -2211,7 +2215,6 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
     ensureScratch(scratch_lineWorkB);
     ensureScratch(scratch_lineWorkC);
     ensureScratch(scratch_lineWorkD);
-    ensureScratch(scratch_lateralLine);
     ensureScratch(scratch_yhp);
     ensureScratch(scratch_yI);
     ensureScratch(scratch_yQ);
@@ -2232,15 +2235,19 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
     constexpr double MAX_FIT_IRE = 35.0;
     constexpr double SAT_TROUBLE_IRE = 18.0;
     constexpr double VET_ALIGN_PHASE_MAX_DEG = 12.0;
-    constexpr double VET_ALIGN_MIN_RHO = 0.75;
+    constexpr double VET_ALIGN_MIN_FIT_CORRELATION = 0.75;
     constexpr double VET_ALIGN_MAX_SHEAR = 0.15;
     constexpr double Y_LOCAL_MAX_PHASE_DEG = 14.0;
     constexpr double Y_LOCAL_GAIN_MIN = 0.90;
     constexpr double Y_LOCAL_GAIN_MAX = 1.10;
     constexpr double Y_LOCAL_MAX_SHEAR = 0.12;
+    const lddecode::CarrierAnalysisRecord *analysisRow =
+        carrierAnalysis_line(line);
 
     double *ti4fsc      = scratch_lineWorkA.data();
+    double *tEnergy     = scratch_lineWorkB.data();
     double *tq4fsc      = scratch_lineWorkC.data();
+    double *rEnergy     = scratch_lineWorkD.data();
     double *cSTT00      = scratch_yhp.data();
     double *cSTT01      = scratch_yI.data();
     double *cSTT11      = scratch_yQ.data();
@@ -2248,7 +2255,6 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
     double *cSRT01      = scratch_hpQ.data();
     double *cSRT10      = scratch_hpY.data();
     double *cSRT11      = scratch_outMixed.data();
-    double *sampleValid = scratch_lateralLine.data();
 
     for (int x = 0; x < width; ++x) {
         const int h = left + x;
@@ -2260,19 +2266,16 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
         ti4fsc[x] = ti;
         tq4fsc[x] = tq;
 
-        double ri = 0.0, rq = 0.0;
-        demod4fscFromComposite((double)rawLine[h] - baseY4[x], h, ri, rq);
+        // Compare target and raw residual in the SAME shifted, grammar-indexed
+        // 4fSC basis. demod4fscFromComposite() uses the unshifted raw h&3
+        // basis; mixing it with the locked shifted basis manufactured a fixed
+        // CAL_EPS phase correction (about -6.3 degrees) in every accepted fit.
+        const int phase = carrierSampleClass(line, h);
+        const double residual = (double)rawLine[h] - baseY4[x];
+        const double ri = residual * spLUT_locked[phase] * 2.0;
+        const double rq = residual * cpLUT_locked[phase] * 2.0;
 
         const double magT_ire = std::hypot(ti, tq) * invI;
-        const double magR_ire = std::hypot(ri, rq) * invI;
-
-        if (magT_ire < MIN_FIT_IRE || magR_ire < MIN_FIT_IRE) {
-            cSTT00[x] = cSTT01[x] = cSTT11[x] = 0.0;
-            cSRT00[x] = cSRT01[x] = cSRT10[x] = cSRT11[x] = 0.0;
-            sampleValid[x] = 0.0;
-            continue;
-        }
-
         double w = 1.0;
         if (magT_ire > MAX_FIT_IRE) {
             const double t = (magT_ire - MAX_FIT_IRE) / (MAX_FIT_IRE + 1e-9);
@@ -2286,13 +2289,14 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
         cSRT01[x] = w * ri * tq;
         cSRT10[x] = w * rq * ti;
         cSRT11[x] = w * rq * tq;
-        sampleValid[x] = 1.0;
+        tEnergy[x] = w * (ti * ti + tq * tq);
+        rEnergy[x] = w * (ri * ri + rq * rq);
     }
 
     const int winN = (width <= WIN) ? width : WIN;
     double sSTT00 = 0.0, sSTT01 = 0.0, sSTT11 = 0.0;
     double sSRT00 = 0.0, sSRT01 = 0.0, sSRT10 = 0.0, sSRT11 = 0.0;
-    double sN = 0.0;
+    double sTEnergy = 0.0, sREnergy = 0.0;
 
     for (int i = 0; i < winN; ++i) {
         sSTT00 += cSTT00[i];
@@ -2302,7 +2306,8 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
         sSRT01 += cSRT01[i];
         sSRT10 += cSRT10[i];
         sSRT11 += cSRT11[i];
-        sN += sampleValid[i];
+        sTEnergy += tEnergy[i];
+        sREnergy += rEnergy[i];
     }
 
     for (int x = 0; x < width; ++x) {
@@ -2318,7 +2323,8 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
             sSRT01 += cSRT01[add] - cSRT01[rem];
             sSRT10 += cSRT10[add] - cSRT10[rem];
             sSRT11 += cSRT11[add] - cSRT11[rem];
-            sN += sampleValid[add] - sampleValid[rem];
+            sTEnergy += tEnergy[add] - tEnergy[rem];
+            sREnergy += rEnergy[add] - rEnergy[rem];
         }
 
         const double plainCarrier = remodLockedToShiftedComposite(
@@ -2327,14 +2333,22 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
 
         double STT[2][2] = {{sSTT00, sSTT01}, {sSTT01, sSTT11}};
         double SRT[2][2] = {{sSRT00, sSRT01}, {sSRT10, sSRT11}};
-        const int n = (int)(sN + 0.5);
+        // All samples in the aperture participate.  An instantaneous
+        // amplitude floor rejects the zero crossings of a perfectly valid
+        // carrier; eligibility is instead based on the aperture RMS below.
+        const int n = winN;
 
         double Rm[2][2] = {{1, 0}, {0, 1}};
         double U[2][2]  = {{1, 0}, {0, 1}};
         double STTinv[2][2];
         const bool invOk = mat2_inv(STT, STTinv);
-        bool vetAccept = invOk && n >= 8;
-
+        const double tWindowIRE =
+            std::sqrt(std::max(0.0, sTEnergy) / std::max(1, n)) * invI;
+        const double rWindowIRE =
+            std::sqrt(std::max(0.0, sREnergy) / std::max(1, n)) * invI;
+        bool vetAccept = invOk && n >= 8 &&
+                         tWindowIRE >= MIN_FIT_IRE &&
+                         rWindowIRE >= MIN_FIT_IRE;
         if (vetAccept) {
             double Avet[2][2];
             double RmVet[2][2];
@@ -2349,13 +2363,23 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
             const double shear =
                 (g > 1e-12) ? std::fabs(std::max(0.0, l1) - std::max(0.0, l2)) / g
                             : 0.0;
-            const double numRho = std::sqrt(
-                SRT[0][0] * SRT[0][0] + SRT[0][1] * SRT[0][1] +
-                SRT[1][0] * SRT[1][0] + SRT[1][1] * SRT[1][1]);
-            const double rho = numRho / std::max(1e-9, STT[0][0] + STT[1][1]);
+            // Actual normalized least-squares fit.  The former "rho" was
+            // ||SRT|| / trace(STT): primarily the fitted amplitude ratio, not
+            // a correlation or residual measure.  It therefore rejected the
+            // very gain mismatch this affine stage exists to correct.  For
+            // A = SRT * inv(STT), trace(A*SRT^T) is the response energy
+            // explained by the two-component carrier model.  Normalize it by
+            // the measured response energy so this gate answers only whether
+            // T explains R, independent of their relative scale.
+            const double modelEnergy =
+                Avet[0][0] * SRT[0][0] + Avet[0][1] * SRT[0][1] +
+                Avet[1][0] * SRT[1][0] + Avet[1][1] * SRT[1][1];
+            const double explainedFraction = std::clamp(
+                modelEnergy / std::max(1e-9, sREnergy), 0.0, 1.0);
+            const double fitCorrelation = std::sqrt(explainedFraction);
             const double pMaxVet = VET_ALIGN_PHASE_MAX_DEG * M_PI / 180.0;
             vetAccept = std::fabs(phase) <= pMaxVet &&
-                        rho >= VET_ALIGN_MIN_RHO &&
+                        fitCorrelation >= VET_ALIGN_MIN_FIT_CORRELATION &&
                         shear <= VET_ALIGN_MAX_SHEAR;
 
             if (vetAccept && n >= 16) {
@@ -2381,7 +2405,24 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
         const double cHat = remod4fscToShiftedComposite(
             tiAdj, tqAdj, h, spLUT_locked, cpLUT_locked);
 
-        carrierOut[x] = std::isfinite(cHat) ? cHat : plainCarrier;
+        // A good affine fit establishes what waveform the selected carrier
+        // would subtract; it does not establish that the carrier is entitled
+        // to own the energy.  Subtract it only where the independent schedule
+        // scanner positively observes carrier-law inversion.  Unresolved and
+        // schedule-illegal near-carrier energy therefore remains residual Y
+        // instead of disappearing under an aggregate "trust" default.
+        const double fittedCarrier = std::isfinite(cHat) ? cHat : plainCarrier;
+        // At least two independently scheduled Opposite axes must concur.
+        // One legal-looking four-sample correlation is a coincidence, not a
+        // licence to remove near-carrier energy from luma.
+        const double legal =
+            analysisRow &&
+                analysisRow[x].conformanceSupportFraction >= (2.0f / 3.0f)
+            ? lddecode::carrierLegalProof(
+                (double)analysisRow[x].carrierConformance,
+                (double)analysisRow[x].conformanceSupportFraction)
+            : 0.0;
+        carrierOut[x] = fittedCarrier * legal;
     }
 }
 
@@ -2420,7 +2461,12 @@ void Comb::FrameBuffer::produceY()
     // longer ignores the better local luma model when carrier retraction is
     // available.
 
-    // Coherent carrier prepass. buildCoherentCarrierEstimateRow is a pure
+    // Residual-Y carrier prepass. Historically this affine/polar refinement
+    // made the phase-solved coherent-Y subtraction exact enough to admit the
+    // remaining HF Y wholesale. Phase alignment has since moved upstream too,
+    // so this path may legitimately collapse onto coherent Y; its lineage is
+    // nevertheless residual Y, not a second coherent observation.
+    // buildCoherentCarrierEstimateRow is a pure
     // per-line function of raw, baseY4 and the locked demod planes; produceY
     // reads each line's estimate for the centre pixel and for up to four
     // vertical neighbours (±1/±2). Reconstructed locally that was five heavy
@@ -2470,12 +2516,12 @@ void Comb::FrameBuffer::produceY()
         const float *retractedRow =
             (residualColor && carrierRetractedValid)
                 ? carrierRetracted_line(line) : nullptr;
-
+        const float *ccMaskRow = lockedCcMask_line(line);
         if (use3DY) {
             for (int h = left; h < right; ++h) {
                 Y[h] = getBestY(line, h, *prevFrameForVet, *nextFrameForVet);
             }
-        } else if (retractedRow) {
+        } else if (retractedRow || ccMaskRow) {
             // ================= HF luma election =================
             //
             // Coarse owns LF; a per-pixel election adjudicates the HF among
@@ -2486,18 +2532,20 @@ void Comb::FrameBuffer::produceY()
             // and delta (= retractedY - combY) are both carrier-band, and the
             // witness lurch leaks Δchroma at carrier rate where chroma amplitude
             // is changing, so wGate*delta = fsc*fsc = DC + 2fSC. The cure is to
-            // make every contributor a complete luma VALUE and let a confidence
-            // ABOUT each candidate (never a distance between them) tilt -- never
-            // override -- a selection anchored by robust consensus and geometry.
+            // make every contributor a complete luma VALUE and let direct,
+            // named measurements about each candidate (never a distance between
+            // candidates) caution -- never override -- a selection anchored by
+            // robust consensus and geometry.
             // Pattern: ld-disc-stacker neighbor modes (medoid center + inlier DQ
             // + capped quality penalty + neighbor selection) and the FVF
             // neighbor anchor (comb.cpp:1398).
             //
             // Contestants (each a complete raw - carrier):
-            //   0 combY      = raw - carrierComp     (comb: senior, phase-locked)
+            //   0 coherentY  = raw - carrierComp     (phase-solved selected comb)
             //   1 retractedY = carrierRetracted      (raw - combedCarrier)
-            //   2 coherentY  = raw - cHat            (polar-composed carrier estimate)
+            //   2 residualY  = raw - cHat            (affine/polar residual path)
             //   3 1D         = raw - locked1DSource  ADMITTED ONLY IF comb DQ'd
+            //   4 returnedY   = combY + ccMask*(raw - combY)
             // Comb is the improvement on 1D; 1D has no voice while comb stands.
             // Coarse floor selector. The election reconstructs HF as
             // coarse + resultHF, so the floor's contour IS the output's
@@ -2584,19 +2632,27 @@ void Comb::FrameBuffer::produceY()
                 } else if (plane == 3 && oneDRow) {
                     const double o = oneDRow[xx];
                     if (std::isfinite(o)) return (double)rawLine[hh] - o;
+                } else if (plane == 4 && ccMaskRow) {
+                    const double c = carrierComp ? carrierComp[xx] : clpLine[hh];
+                    const double comb = (double)rawLine[hh] -
+                        (std::isfinite(c) ? c : 0.0);
+                    const double m = std::clamp((double)ccMaskRow[xx], 0.0, 1.0);
+                    return comb + m * ((double)rawLine[hh] - comb);
                 }
                 const double c = carrierComp ? carrierComp[xx] : clpLine[hh];
                 return (double)rawLine[hh] - (std::isfinite(c) ? c : 0.0);
             };
 
-            // Phase confidence: 1 - (AC energy explained by the carrier basis).
+            // Carrier-basis cleanliness: 1 - (AC energy explained by the carrier
+            // basis). This is a direct waveform measurement, not an aggregate
+            // "confidence" whose provenance is hidden.
             // Cycle-integrated over a complete 4-sample window, so it does NOT
             // flicker at carrier rate. Remove the window mean before both the
             // projection and norm: DC cannot project onto a complete carrier
             // cycle, and it must not inflate the denominator and make a
             // DC-displaced candidate look artificially clean. baseY4 is the
             // fixed DC reference; the selectable contour floor gets no vote.
-            auto phaseConfOf = [&](int plane, int h0) -> double {
+            auto carrierCleanlinessOf = [&](int plane, int h0) -> double {
                 const int hs = (right - left >= 4)
                     ? std::clamp(h0, left, right - 4)
                     : left;
@@ -2611,7 +2667,7 @@ void Comb::FrameBuffer::produceY()
                     // Index the carrier basis by the grammar sample class, NOT
                     // hh & 3. The locked demod (the basis these LUTs were built
                     // for) uses carrierSampleClass(line, h); a raw-position
-                    // index applies a per-line rotation, making phaseConf
+                    // index applies a per-line rotation, making cleanliness
                     // line-dependent -> a line-alternating election penalty
                     // (checkerboard) on luma transitions.
                     const int idx = carrierSampleClass(line, hh);
@@ -2774,21 +2830,25 @@ void Comb::FrameBuffer::produceY()
                         best = a[i];
                 return best;
             };
-            auto closestImageD = [](const double *a, const double *phaseConf,
+            auto closestImageD = [](const double *a, const double *carrierCleanliness,
                                     const double *imagePref, int n,
+                                    int referenceCount,
                                     double target, double phaseCap,
                                     double imageCap) -> double {
-                double sw[4];
-                for (int i = 0; i < n; ++i) sw[i] = phaseConf[i];
-                for (int i = 0; i < n; ++i)
-                    for (int j = i + 1; j < n; ++j)
+                double sw[5];
+                const int refN = std::clamp(referenceCount, 1, n);
+                for (int i = 0; i < refN; ++i)
+                    sw[i] = carrierCleanliness[i];
+                for (int i = 0; i < refN; ++i)
+                    for (int j = i + 1; j < refN; ++j)
                         if (sw[j] < sw[i]) std::swap(sw[i], sw[j]);
-                const double medianW = sw[n / 2];
+                const double medianW = sw[refN / 2];
                 double best = a[0]; double bestCost = 1e300;
                 for (int i = 0; i < n; ++i) {
                     double dist = std::fabs(target - a[i]);
                     if (medianW > 0.0)
-                        dist += (std::max(0.0, medianW - phaseConf[i]) / medianW) * phaseCap;
+                        dist += (std::max(0.0, medianW - carrierCleanliness[i]) /
+                                 medianW) * phaseCap;
                     dist -= std::clamp(imagePref[i], 0.0, 1.0) * imageCap;
                     if (dist < bestCost) { bestCost = dist; best = a[i]; }
                 }
@@ -2811,6 +2871,18 @@ void Comb::FrameBuffer::produceY()
                 } else {
                     const double c = clpLine[h];
                     combY = std::isfinite(c) ? rawH - c : rawH;
+                }
+
+                const double ccReturn = ccMaskRow
+                    ? std::clamp((double)ccMaskRow[xi], 0.0, 1.0)
+                    : 0.0;
+                // A mask buffer exists for the whole frame whenever the feature
+                // is enabled. Do not let that allocation alone activate the
+                // larger election at an unmarked pixel when no retracted luma
+                // plane otherwise requires it.
+                if (!retractedRow && ccReturn <= 0.0) {
+                    Y[h] = combY;
+                    continue;
                 }
 
                 // Coarse floor unavailable -> emit combY.
@@ -2838,18 +2910,18 @@ void Comb::FrameBuffer::produceY()
                     return c <= maxCarrierAmpSamples && c >= -maxCarrierAmpSamples;
                 };
 
-                // Roster (with feasibility DQ). The polar-composed coherent
-                // carrier estimate is restored here as a contrast candidate
-                // against retractedY. 1D remains emergency-only and is
+                // Roster (with feasibility DQ). The affine/polar residual-Y
+                // carrier estimate is retained as a contrast candidate against
+                // retractedY. 1D remains emergency-only and is
                 // admitted only if comb DQ'd.
-                double candY[4];
-                int    candPlane[4];
+                double candY[5];
+                int    candPlane[5];
                 int    nCand = 0;
                 const bool combOK = std::isfinite(combY) && feasible(combY);
                 if (combOK) {
                     candY[nCand] = combY; candPlane[nCand] = 0; ++nCand;
                 }
-                {
+                if (retractedRow) {
                     // Evidence admission for retractedY (raw - combedCarrier),
                     // the leg that keeps near-carrier HF luma the comb strips.
                     //
@@ -2859,7 +2931,7 @@ void Comb::FrameBuffer::produceY()
                     // real near-carrier periodic structure (Borg-cube grid:
                     // retracted carries the detail comb destroyed).  Trust
                     // alone cannot separate them, so it must not hard-DQ:
-                    // that is a confidence measure vetoing geometry, which
+                    // that is a fit-quality measure vetoing geometry, which
                     // the election forbids.
                     //
                     // The separator is SPATIAL COHERENCE. Real structure
@@ -2939,6 +3011,16 @@ void Comb::FrameBuffer::produceY()
                     }
                 }
 
+                // Returned Y is derived from combY, so it is a selectable
+                // challenger but not another independent observation when the
+                // base candidates establish their center, subset, or scoring
+                // scales. It joins only after those quantities are fixed.
+                const double returnedY =
+                    combY + ccReturn * (rawH - combY);
+                const bool returnedFeasible =
+                    ccReturn > 0.0 && std::isfinite(returnedY) &&
+                    feasible(returnedY);
+
                 if (nCand == 0) {
                     // Nothing feasible: clamp combY into the legal band.
                     const double c = rawH - combY;
@@ -2947,45 +3029,68 @@ void Comb::FrameBuffer::produceY()
                          : combY;
                     continue;
                 }
-                if (nCand == 1) { Y[h] = candY[0]; continue; } // single survivor
-
-                // Agreement early-out: tight cluster -> mean, skip the phase work.
+                // Establish the base population without the derived return.
                 double lo = candY[0], hi = candY[0], sum = candY[0];
                 for (int k = 1; k < nCand; ++k) {
                     lo = std::min(lo, candY[k]);
                     hi = std::max(hi, candY[k]);
                     sum += candY[k];
                 }
-                if (hi - lo <= agreeTol) { Y[h] = sum / nCand; continue; }
+                const double baseMean = sum / nCand;
+                const bool baseAgrees = hi - lo <= agreeTol;
+                if (baseAgrees && !returnedFeasible) {
+                    Y[h] = baseMean;
+                    continue;
+                }
 
                 // Robust center: medoid (min sum of absolute distances).
-                double center = candY[0];
-                double bestTot = 1e300;
-                for (int i = 0; i < nCand; ++i) {
-                    double t = 0.0;
-                    for (int j = 0; j < nCand; ++j)
-                        t += std::fabs(candY[i] - candY[j]);
-                    if (t < bestTot) { bestTot = t; center = candY[i]; }
+                double center = baseMean;
+                if (!baseAgrees) {
+                    center = candY[0];
+                    double bestTot = 1e300;
+                    for (int i = 0; i < nCand; ++i) {
+                        double t = 0.0;
+                        for (int j = 0; j < nCand; ++j)
+                            t += std::fabs(candY[i] - candY[j]);
+                        if (t < bestTot) { bestTot = t; center = candY[i]; }
+                    }
                 }
 
                 // Inlier DQ around the center.
-                int inIdx[4];
+                int inIdx[5];
                 int nIn = 0;
                 for (int k = 0; k < nCand; ++k)
                     if (std::fabs(candY[k] - center) <= inlierTol)
                         inIdx[nIn++] = k;
-                if (nIn == 1) { Y[h] = candY[inIdx[0]]; continue; }
+                // The named cross-colour mask, rather than distance from the
+                // base center, admits returned Y. A distance gate here removes
+                // exactly the strong HF that the return exists to recover.
+                const bool returnedAdmitted = returnedFeasible;
+                if (nIn == 1 && !returnedAdmitted) {
+                    Y[h] = candY[inIdx[0]];
+                    continue;
+                }
 
                 // Inlier HF set + per-inlier carrier-basis cleanliness. This is
                 // a cautionary term, not the positive reason to select HF.
-                double inHF[4], inConf[4];
+                double inHF[5], inCarrierCleanliness[5];
                 for (int k = 0; k < nIn; ++k) {
-                    inHF[k]   = candY[inIdx[k]] - coarse;
-                    inConf[k] = phaseConfOf(candPlane[inIdx[k]], h);
+                    inHF[k] = candY[inIdx[k]] - coarse;
+                    inCarrierCleanliness[k] =
+                        carrierCleanlinessOf(candPlane[inIdx[k]], h);
                 }
+                const int baseNIn = nIn;
 
-                // Single self-anchor: medoid of the inlier HFs (mode 6).
-                const double selfAnchor = medoidD(inHF, nIn);
+                // Single self-anchor: medoid of the BASE inlier HFs (mode 6).
+                // The derived return may be selected, but does not move this
+                // population statistic.
+                const double selfAnchor = medoidD(inHF, baseNIn);
+                if (returnedAdmitted) {
+                    inHF[nIn] = returnedY - coarse;
+                    inCarrierCleanliness[nIn] =
+                        carrierCleanlinessOf(4, h);
+                    ++nIn;
+                }
 
                 // Four independent image neighbours (N/S at regime-sensitive
                 // vertical step, E/W at ±1 sample). Keep them separate: a line
@@ -3034,15 +3139,15 @@ void Comb::FrameBuffer::produceY()
                 // pairwise differences did not change. The reconstruction
                 // floor remains free to place contours; it cannot vote by
                 // moving zero.
-                double imagePref[4] = {0.0, 0.0, 0.0, 0.0};
+                double imagePref[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
                 if (nDir > 0 && baseY4Row) {
-                    double imageHF[4];
+                    double imageHF[5];
                     for (int k = 0; k < nIn; ++k)
-                        imageHF[k] = candY[inIdx[k]] - baseY4Row[xi];
+                        imageHF[k] = inHF[k] + coarse - baseY4Row[xi];
 
                     double minMag = std::fabs(imageHF[0]);
                     double maxMag = minMag;
-                    for (int k = 1; k < nIn; ++k) {
+                    for (int k = 1; k < baseNIn; ++k) {
                         const double m = std::fabs(imageHF[k]);
                         minMag = std::min(minMag, m);
                         maxMag = std::max(maxMag, m);
@@ -3060,7 +3165,8 @@ void Comb::FrameBuffer::produceY()
                             continuation = std::max(continuation, match);
                         }
                         const double retained = (magSpan > 1e-9)
-                            ? (std::fabs(imageHF[k]) - minMag) / magSpan
+                            ? std::clamp((std::fabs(imageHF[k]) - minMag) /
+                                         magSpan, 0.0, 1.0)
                             : 0.0;
                         imagePref[k] = continuation * retained;
                     }
@@ -3076,7 +3182,8 @@ void Comb::FrameBuffer::produceY()
                 double noms[4]; int nNom = 0;
                 for (int d = 0; d < nDir; ++d)
                     noms[nNom++] = closestImageD(
-                        inHF, inConf, imagePref, nIn, dirHF[d],
+                        inHF, inCarrierCleanliness, imagePref, nIn, baseNIn,
+                        dirHF[d],
                         phasePenSamp, imagePrefCap);
 
                 double resultHF;
@@ -3095,13 +3202,15 @@ void Comb::FrameBuffer::produceY()
                     // after the image preference had selected sharper HF.
                     const double decisionAnchor = 0.5 * (selfAnchor + neighborAnchor);
                     resultHF = closestImageD(
-                        inHF, inConf, imagePref, nIn, decisionAnchor,
+                        inHF, inCarrierCleanliness, imagePref, nIn, baseNIn,
+                        decisionAnchor,
                         phasePenSamp, imagePrefCap);
                 } else {
                     // With no spatial nomination, still close onto a real
                     // candidate. The medoid/mean is an anchor, not an output.
                     resultHF = closestImageD(
-                        inHF, inConf, imagePref, nIn, selfAnchor,
+                        inHF, inCarrierCleanliness, imagePref, nIn, baseNIn,
+                        selfAnchor,
                         phasePenSamp, imagePrefCap);
                 }
 

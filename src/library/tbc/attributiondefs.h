@@ -210,12 +210,15 @@ struct CarrierAnalysisRecord {
     // [-1,+1]: relation-signed correlation of carrier-band energy against
     // grammar-certified Opposite partners.  -1 = inverts like ideal carrier;
     // +1 = matches where the schedule demands inversion (luma by law).
-    // conformanceConfidence in [0,1] from the usable-axis count.  This is a
-    // fact of the table; the enum above is the legacy threshold view derived
-    // from it during migration.  What to DO with it is carrierTrust() +
-    // per-consumer action, never baked in here.
+    // conformanceSupportFraction in [0,1] is the fraction of the three possible
+    // axes supporting the sign selected for carrierConformance.  Availability
+    // alone is not support: one legal-looking axis among three remains 1/3,
+    // rather than receiving full authority merely because three were usable.
+    // This is a fact of the table; the enum above is the legacy threshold view
+    // derived from it during migration. What to DO with it is carrierTrust()
+    // plus per-consumer action, never baked in here.
     float carrierConformance = 0.0f;
-    float conformanceConfidence = 0.0f;
+    float conformanceSupportFraction = 0.0f;
 };
 
 // Decision layer: the single table-owned mapping from the conformance
@@ -272,10 +275,10 @@ inline double carrierIllegalProof(double conformance, double confidence)
     t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
     const double p = t * t * (3.0 - 2.0 * t); // smoothstep
 
-    // confidence arrives as usableAxes/3, but two concurring Opposite axes
+    // confidence arrives as supportingAxes/3. Two concurring Opposite axes
     // already constitute a full proof (the third, the frame axis, rightly
     // abstains on motion and must not discount an intra-field conviction);
-    // a single axis is half a proof.
+    // a single supporting axis is half a proof for consumers that permit it.
     double c = 1.5 * (confidence < 0.0 ? 0.0 : confidence);
     c = c > 1.0 ? 1.0 : c;
     return c * p;
