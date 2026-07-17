@@ -1031,7 +1031,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         const int n = std::min(width, frameIQN);
         for (int r = 0; r < n; ++r) {
             const auto &z = (*frameIQ)[r];
-            scratch_fvf_iqMag[r] = std::hypot(z.real(), z.imag());
+            scratch_fvf_iqMag[r] = boundedMag(z);
         }
         // If frameIQ is shorter than width, replicate the last valid mag for
         // tail entries — matches the original lambda's std::clamp(r,0,width-1)
@@ -1871,7 +1871,7 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
         const int n = std::min(width, iqN);
         for (int r = 0; r < n; ++r) {
             const auto &z = frameIQData[r];
-            scratch_coe_frameIQMag[r] = std::hypot(z.real(), z.imag());
+            scratch_coe_frameIQMag[r] = boundedMag(z);
         }
         const double tailMag = (n > 0) ? scratch_coe_frameIQMag[n - 1] : 0.0;
         std::fill(scratch_coe_frameIQMag.begin() + n,
@@ -1899,7 +1899,7 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
             const std::complex<double> sum =
                 frameIQData[rm2] + frameIQData[rr] + frameIQData[rp2];
             scratch_coe_coherence[r] = (magSum > 1e-9)
-                ? std::clamp(std::hypot(sum.real(), sum.imag()) / magSum, 0.0, 1.0)
+                ? std::clamp(boundedMag(sum) / magSum, 0.0, 1.0)
                 : 0.0;
             lineMeanFrameCoherence += scratch_coe_coherence[r];
         }

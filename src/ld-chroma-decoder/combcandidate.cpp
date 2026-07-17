@@ -785,7 +785,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         const auto *centerAnalysis = carrierAnalysis_line(tapLine.ln0);
         for (int rel = 0; rel < width; ++rel) {
             const CombTapScalar &s = tapLine.tap0[rel];
-            const double envC = std::hypot(s.comp, s.symMag);
+            const double envC = boundedMag(s.comp, s.symMag);
             tapLine.centerEnvelope[rel] = envC;
             const double carrierTrust = centerAnalysis
                 ? lddecode::carrierTrust(
@@ -2006,7 +2006,7 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
 }
 
 
-static inline double cmag(const std::complex<double> &z) { return std::hypot(z.real(), z.imag()); }
+static inline double cmag(const std::complex<double> &z) { return boundedMag(z); }
 static inline double cmag2(const std::complex<double> &z) { return z.real() * z.real() + z.imag() * z.imag(); }
 static inline double dotIQ(const std::complex<double> &a, const std::complex<double> &b) { return a.real()*b.real() + a.imag()*b.imag(); }
 
@@ -2032,14 +2032,14 @@ static inline std::complex<double> applyColumnPhaseAlignment(
 
     // The rotation we want is by phase = atan2(cross, dot).  When the clamp
     // doesn't bind, cos(phase) = dot/h and sin(phase) = cross/h where
-    // h = hypot(dot, cross) — so one hypot replaces atan2 + cos + sin.
+    // h = |(dot, cross)| — so one magnitude replaces atan2 + cos + sin.
     // The clamp binds iff |phase| > pMax, equivalent to
     //   dot < 0  (phase in second/third quadrant, always > pMax for pMax<90°)
     //   or  |cross| > dot * tan(pMax).
     // Only then do we fall back to atan2+cos+sin to honor the clamp.
     double c, s;
     if (dot > 0.0 && std::fabs(cross) <= dot * limits.tanPMax) {
-        const double h = std::hypot(dot, cross);
+        const double h = boundedMag(dot, cross);
         if (h <= 1e-18) return neighbor;
         c = dot / h;
         s = cross / h;

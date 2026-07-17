@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "combmath.h"
+
 // ===========================================================================
 // Carrier-grammar reach legality translator
 // ===========================================================================
@@ -321,7 +323,7 @@ double dotIQ(double ai, double aq, double bi, double bq)
 
 double magIQ(double i, double q)
 {
-    return std::hypot(i, q);
+    return boundedMag(i, q);
 }
 
 double signedDotNormIQ(double ai, double aq, double bi, double bq)
@@ -398,9 +400,12 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const std::complex<double> alignedUp = upSign * up;
     const std::complex<double> alignedDown = downSign * down;
     const double scale = std::max(0.0, invIreScale);
-    const double centerMagIRE = std::abs(center) * scale;
-    const double upMagIRE = std::abs(alignedUp) * scale;
-    const double downMagIRE = std::abs(alignedDown) * scale;
+    const double centerMagRaw = boundedMag(center);
+    const double upMagRaw = boundedMag(alignedUp);
+    const double downMagRaw = boundedMag(alignedDown);
+    const double centerMagIRE = centerMagRaw * scale;
+    const double upMagIRE = upMagRaw * scale;
+    const double downMagIRE = downMagRaw * scale;
     const double chromaFloor = std::max(0.0, minChromaIRE);
 
     // The reach query has already provided the carrier grammar: a leg only
@@ -441,6 +446,7 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     };
 
     auto classify = [&](const std::complex<double> &leg,
+                        double legMagRaw,
                         double legMagIRE,
                         bool haveLeg,
                         double legRawDiffIRE,
@@ -457,7 +463,7 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
         if (magHi < chromaFloor)
             return RegionRelation::Unknown;
 
-        differenceIRE = std::abs(center - leg) * scale;
+        differenceIRE = boundedMag(center - leg) * scale;
 
         // Saturation collapse / shadow band. This is ratio-driven, not simply
         // floor-driven: a weak member beside a strong saturated member is a
@@ -476,7 +482,7 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
         if (magLo < chromaFloor)
             return RegionRelation::Unknown;
 
-        const double denom = std::abs(center) * std::abs(leg);
+        const double denom = centerMagRaw * legMagRaw;
         if (denom <= 1e-12)
             return RegionRelation::Unknown;
 
@@ -504,17 +510,17 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
         return RegionRelation::Unknown;
     };
 
-    out.up = classify(alignedUp, upMagIRE, haveUp, upRawDiffIRE,
+    out.up = classify(alignedUp, upMagRaw, upMagIRE, haveUp, upRawDiffIRE,
                       out.upDifferenceIRE, out.upHueDifferenceDeg);
-    out.down = classify(alignedDown, downMagIRE, haveDown, downRawDiffIRE,
+    out.down = classify(alignedDown, downMagRaw, downMagIRE, haveDown, downRawDiffIRE,
                         out.downDifferenceIRE, out.downHueDifferenceDeg);
     out.valid = (out.up != RegionRelation::Unknown ||
                  out.down != RegionRelation::Unknown);
 
     if (haveUp && haveDown) {
-        out.upDownDifferenceIRE = std::abs(alignedUp - alignedDown) * scale;
+        out.upDownDifferenceIRE = boundedMag(alignedUp - alignedDown) * scale;
 
-        const double outerDenom = std::abs(alignedUp) * std::abs(alignedDown);
+        const double outerDenom = upMagRaw * downMagRaw;
         if (upMagIRE >= chromaFloor && downMagIRE >= chromaFloor &&
             outerDenom > 1e-12)
         {

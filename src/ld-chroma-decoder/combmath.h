@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <vector>
 
@@ -25,6 +26,13 @@ static constexpr double sin4fsc_data_global[] = { 1.0, 0.0, -1.0, 0.0 };
 
 inline double sin4fsc(int i) { return sin4fsc_data_global[i & 3]; }
 inline double cos4fsc(int i) { return sin4fsc((i + 1) & 3); }
+
+// Magnitude of a bounded 2-vector: direct sqrt, not std::hypot.  Comb
+// magnitudes are video-domain quantities (sample/IRE scale) whose squares
+// cannot over- or underflow a double, so hypot's IEEE range guarding is
+// pure per-call cost on the per-pixel paths.
+inline double boundedMag(double a, double b) { return std::sqrt(a * a + b * b); }
+inline double boundedMag(const std::complex<double> &z) { return boundedMag(z.real(), z.imag()); }
 
 // Shared fractional-basis demod helpers. These are tiny math utilities used by
 // both the locked demod path and candidate generation.
@@ -239,7 +247,7 @@ inline void eig2_sym(const double S[2][2], double &l1, double &l2, double V[2][2
     }
     // Normalise columns
     for (int j = 0; j < 2; ++j) {
-        double n = std::hypot(V[0][j], V[1][j]);
+        double n = boundedMag(V[0][j], V[1][j]);
         if (n > 1e-12) { V[0][j] /= n; V[1][j] /= n; }
     }
 }

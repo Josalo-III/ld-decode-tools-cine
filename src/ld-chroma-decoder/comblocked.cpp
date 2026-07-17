@@ -807,7 +807,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 i4Scale[phase], q4Scale[phase]);
 
             magnitudeScale[phase] =
-                std::hypot(i4Scale[phase], q4Scale[phase]);
+                boundedMag(i4Scale[phase], q4Scale[phase]);
         }
 
         float *demodI = demodTI_line(line);
@@ -1016,7 +1016,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double sumI = preI[b] - preI[a];
             const double sumQ = preQ[b] - preQ[a];
             const double n = static_cast<double>(std::max(1, b - a));
-            return (2.0 * std::hypot(sumI, sumQ) / n) * invIreScale;
+            return (2.0 * boundedMag(sumI, sumQ) / n) * invIreScale;
         };
 
         // Narrow fit: rolling, current-centered mean of the 2-sample envelope.
@@ -1088,7 +1088,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
 
             const double narrowMag = narrowEnvIRE(rel);
-            const double wideMag = 2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
+            const double wideMag = 2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
 
             // Aperture contamination: clamp((narrow - wide)/max(floor, narrow)).
             double gA = 0.0;
@@ -1252,7 +1252,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const double wideSample =
                     2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
                 const double wideMag =
-                    2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
+                    2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
                 const double narrowMag = narrowEnvIRE(rel);
 
                 auto &record = carrierAnalysis[rel];
@@ -1618,7 +1618,7 @@ void Comb::FrameBuffer::measurePostCombImpurity()
             const double nn = std::max(1, nb - na);
             const double narrowMag = ((preEnv[nb] - preEnv[na]) / nn) * invIreScale;
 
-            const double wideMag = 2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
+            const double wideMag = 2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
 
             double gA = 0.0;
             if (narrowMag > kImpurityFloorIRE && wideMag < narrowMag) {
@@ -2328,7 +2328,7 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
         const double ri = residual * spLUT_locked[phase] * 2.0;
         const double rq = residual * cpLUT_locked[phase] * 2.0;
 
-        const double magT_ire = std::hypot(ti, tq) * invI;
+        const double magT_ire = boundedMag(ti, tq) * invI;
         double w = 1.0;
         if (magT_ire > MAX_FIT_IRE) {
             const double t = (magT_ire - MAX_FIT_IRE) / (MAX_FIT_IRE + 1e-9);
@@ -2445,7 +2445,7 @@ void Comb::FrameBuffer::buildCoherentCarrierEstimateRow(
 
         const double ti0 = ti4fsc[x];
         const double tq0 = tq4fsc[x];
-        const bool satTrouble = (std::hypot(ti0, tq0) * invI > SAT_TROUBLE_IRE);
+        const bool satTrouble = (boundedMag(ti0, tq0) * invI > SAT_TROUBLE_IRE);
         clamp_rotation_gain_shear(
             Rm, U,
             Y_LOCAL_MAX_PHASE_DEG * M_PI / 180.0,
@@ -4470,10 +4470,10 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                             ? (xi + 1)
                             : (xi > 0 ? xi - 1 : xi);
                         const double brightAmpIRE =
-                            std::hypot(carrierFit[brightIdx],
+                            boundedMag(carrierFit[brightIdx],
                                        carrierFit[brightJ]) * invIreScale;
                         const double localAmpIRE =
-                            std::hypot(carrierFit[xi],
+                            boundedMag(carrierFit[xi],
                                        carrierFit[xiJ]) * invIreScale;
                         const double coloredBrightIRE =
                             std::max(brightAmpIRE, localAmpIRE);
