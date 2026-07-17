@@ -251,6 +251,12 @@ public:
             // N/S/E/W image neighbour; unsupported amplitude earns nothing.
             double PRODUCE_Y_HF_IMAGE_PREFERENCE_IRE = 1.5;
             double PRODUCE_Y_HF_CONTINUATION_IRE = 6.0;
+            // Maximum score advantage earned by ACTUAL carrier-band reduction
+            // when cross-colour has been measured. The advantage is bounded by
+            // both this cap and the measured false-colour amount; no mask means
+            // no score change. This lets the detector participate in the tally
+            // without turning its measurement into a selection verdict.
+            double PRODUCE_Y_CC_RETURN_EVIDENCE_CAP_IRE = 3.0;
             // Carrier-basis phase is only a hygiene/tie-break term in produceY;
             // luma image continuity owns the election.
             double PRODUCE_Y_PHASE_PENALTY_IRE = 0.75;
@@ -716,6 +722,16 @@ private:
 	std::vector<double> scratch_fbAlienGate;
 	std::vector<double> scratch_fbPairAgreeWinIRE;
 	std::vector<int> scratch_fbReg;
+    // Prepass working rows: edge-replicated padded copies of the three
+    // demodded IQ rows (padding reproduces the clamp-to-edge indexing, so
+    // the windowed sums read straight pointers), the hoisted d = 0
+    // pair-difference row, and the five hoisted same-leg deviation rows
+    // used by the registration search.
+    std::vector<std::complex<double>> scratch_fbPadCenter;
+    std::vector<std::complex<double>> scratch_fbPadUp;
+    std::vector<std::complex<double>> scratch_fbPadDn;
+    std::vector<std::complex<double>> scratch_fbDiff0;
+    std::vector<std::complex<double>> scratch_fbDevRows;
 		// Shared line scratch planes used by split2D / produceY.
 		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY.
 		std::vector<double> scratch_lineWorkB; // Field gate row; coherent carrier estimate (cHat) in produceY.

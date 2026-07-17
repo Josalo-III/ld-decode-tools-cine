@@ -70,6 +70,60 @@ static inline double combSimilarityFactor(double sim, double start, double full)
     return std::clamp(t, 0.0, 1.0);
 }
 
+// Geometry-only evidence for a compact luma excursion.  This replaces the
+// old fixed +/-2 comparison: an optically broadened star can still be sitting
+// on its own shoulder at two samples, so that aperture measured little or
+// nothing.  Each wider read must show the same background on both sides and
+// stable outer flanks; a step or an extended texture therefore does not become
+// an impulse merely because one radius happens to be symmetric.
+//
+// Carrier legality is intentionally absent here.  This service publishes the
+// luma shape once as lumaImpulseRisk; each downstream consumer combines that
+// named fact with its own carrier evidence and policy.
+static inline double compactLumaExcursionEvidence(
+    const double *luma, int x, int width, double invIreScale)
+{
+    if (!luma || width <= 0)
+        return 0.0;
+
+    constexpr std::array<int, 4> radii = { 2, 4, 6, 8 };
+    constexpr int outerStep = 2;
+    constexpr double flatSoftIRE = 2.0;
+    constexpr double flatHardIRE = 4.0;
+    constexpr double excursionSoftIRE = 5.0;
+    constexpr double excursionHardIRE = 15.0;
+
+    double best = 0.0;
+    for (const int radius : radii) {
+        if (x - radius - outerStep < 0 ||
+            x + radius + outerStep >= width)
+            continue;
+
+        const double left = luma[x - radius];
+        const double right = luma[x + radius];
+        const double outerLeft = luma[x - radius - outerStep];
+        const double outerRight = luma[x + radius + outerStep];
+        const double surroundSpanIRE = std::max({
+            std::fabs(left - right),
+            std::fabs(left - outerLeft),
+            std::fabs(right - outerRight)
+        }) * invIreScale;
+        const double flatSupport = combSmoothGate(
+            surroundSpanIRE, flatSoftIRE, flatHardIRE);
+        if (flatSupport <= 0.0)
+            continue;
+
+        const double excursionIRE = std::fabs(
+            luma[x] - 0.5 * (left + right)) * invIreScale;
+        const double excursion = std::clamp(
+            (excursionIRE - excursionSoftIRE) /
+                (excursionHardIRE - excursionSoftIRE),
+            0.0, 1.0);
+        best = std::max(best, excursion * flatSupport);
+    }
+    return best;
+}
+
 // -------------------------------------------------------------------------
 // Comb-owned policy.  combreach publishes grammar legality and measured
 // content relationships only; it never selects a leg or cedes output to 1D.
@@ -2614,6 +2668,14 @@ void Comb::FrameBuffer::computeFrameBLine(
     const double satPenalty =
         std::clamp(T.FRAME_BEVEL_SAT_PENALTY, 0.0, 1.0);
 
+    // One producer for the existing lumaImpulseRisk channel.  Field B reads
+    // this scratch below, and collectCombAttributionEvidence publishes the
+    // same samples for FVF and later cross-colour consumers.
+    for (int x = 0; x < width; ++x) {
+        scratch_impulseExempt[x] = compactLumaExcursionEvidence(
+            frameLuma0, x, width, invIreScale);
+    }
+
     for (int x = 0; x < width; ++x) {
         const auto c = scratch_centerIQ[x] * invIreScale;
         const auto u = scratch_upIQ[x] * invIreScale;
@@ -2632,20 +2694,7 @@ void Comb::FrameBuffer::computeFrameBLine(
         double upGate = haveUpLine ? std::max(legalUp, iqPolicy.up) : 0.0;
         double downGate = haveDnLine ? std::max(legalDown, iqPolicy.down) : 0.0;
 
-        double impulseExempt = 0.0;
-        if (frameLuma0) {
-            const int xl = std::max(0, x - 2);
-            const int xr = std::min(width - 1, x + 2);
-            const double centerLuma = frameLuma0[x] * invIreScale;
-            const double leftLuma = frameLuma0[xl] * invIreScale;
-            const double rightLuma = frameLuma0[xr] * invIreScale;
-            if (std::fabs(leftLuma - rightLuma) < 4.0) {
-                impulseExempt = std::clamp(
-                    (std::fabs(centerLuma - 0.5 * (leftLuma + rightLuma)) - 5.0) /
-                    10.0, 0.0, 1.0);
-            }
-        }
-        scratch_impulseExempt[x] = impulseExempt;
+        const double impulseExempt = scratch_impulseExempt[x];
 
         if (haveCloseLuma && bevelPenalty > 0.0) {
             const auto contour = CombContentReach::evaluateMovingCoarseContour(
@@ -2744,25 +2793,78 @@ void Comb::FrameBuffer::computeFrameBLine(
         constexpr double kWinSum = 6.0;
         constexpr double kRegMargin = 1.08;
 
-        auto clampX = [&](int xi) { return std::clamp(xi, 0, width - 1); };
+        // The windowed sums reach at most |k| + |d| = 3 + 2 = 5 samples past
+        // a column, and the previous clampX indexing clamped every access to
+        // [0, width - 1] — edge replication.  Padded copies reproduce that
+        // exactly, so every window below reads straight pointers (no per-tap
+        // clamp, no vector bounds check), and each window keeps its tap
+        // order, so all sums are bit-identical to the clamped form.
+        constexpr int kPad = 5;
+        const int paddedWidth = width + 2 * kPad;
+        if ((int)scratch_fbPadCenter.size() < paddedWidth) {
+            scratch_fbPadCenter.resize(paddedWidth);
+            scratch_fbPadUp.resize(paddedWidth);
+            scratch_fbPadDn.resize(paddedWidth);
+        }
+        auto padRow = [&](std::vector<std::complex<double>> &dst,
+                          const std::vector<std::complex<double>> &src) {
+            std::copy(src.begin(), src.begin() + width, dst.begin() + kPad);
+            std::fill(dst.begin(), dst.begin() + kPad, src[0]);
+            std::fill(dst.begin() + kPad + width,
+                      dst.begin() + paddedWidth, src[width - 1]);
+        };
+        padRow(scratch_fbPadCenter, scratch_centerIQ);
+        padRow(scratch_fbPadUp, scratch_upIQ);
+        padRow(scratch_fbPadDn, scratch_dnIQ);
+
+        // pX[j] == scratch_xIQ[clamp(j, 0, width-1)] for j in
+        // [-kPad, width - 1 + kPad].
+        const std::complex<double> *pC = scratch_fbPadCenter.data() + kPad;
+        const std::complex<double> *pU = scratch_fbPadUp.data() + kPad;
+        const std::complex<double> *pD = scratch_fbPadDn.data() + kPad;
+
+        // Hoisted d = 0 pair-difference row: every column takes the
+        // unregistered windowed pair agreement, so the per-tap subtraction
+        // moves out of the window loop.  Rows carry the window overhang:
+        // index j in [-3, width + 2].
+        constexpr int kRowPad = 3;
+        const int rowWidth = width + 2 * kRowPad;
+        if ((int)scratch_fbDiff0.size() < rowWidth)
+            scratch_fbDiff0.resize(rowWidth);
+        std::complex<double> *f0 = scratch_fbDiff0.data() + kRowPad;
+        for (int j = -kRowPad; j < width + kRowPad; ++j)
+            f0[j] = pU[j] - pD[j];
+
+        // Leg roles are line-level facts (alienSign is per line), so the
+        // Same/Opposite selection and the deviation rows the registration
+        // search reads at every column hoist out of the pixel loop:
+        // g_s[j] = same[j + s] - center[j] for s in [-2, 2].
+        const bool sameIsUp = (alienSign > 0.0);
+        const std::complex<double> *pSame = sameIsUp ? pU : pD;
+        const std::complex<double> *pOpp = sameIsUp ? pD : pU;
+        std::complex<double> *devRows[5] = {nullptr, nullptr, nullptr,
+                                            nullptr, nullptr};
+        if (haveSignedAlien) {
+            if ((int)scratch_fbDevRows.size() < 5 * rowWidth)
+                scratch_fbDevRows.resize(5 * rowWidth);
+            for (int si = 0; si < 5; ++si) {
+                const int s = si - 2;
+                std::complex<double> *g =
+                    scratch_fbDevRows.data() + si * rowWidth + kRowPad;
+                for (int j = -kRowPad; j < width + kRowPad; ++j)
+                    g[j] = pSame[j + s] - pC[j];
+                devRows[si] = g;
+            }
+        }
 
         for (int x = 0; x < width; ++x) {
-            std::complex<double> S[5];
-            for (int di = 0; di < 5; ++di) {
-                const int d = di - 2;
-                std::complex<double> acc(0.0, 0.0);
-                for (int k = -3; k <= 3; ++k) {
-                    acc += kWin[k + 3] *
-                        (scratch_upIQ[clampX(x + k - d)] -
-                         scratch_dnIQ[clampX(x + k + d)]);
-                }
-                S[di] = acc;
-            }
-
             // Unregistered (d = 0) windowed pair agreement, consumed by the
             // midpoint license in the combine below.
+            std::complex<double> S0(0.0, 0.0);
+            for (int k = -3; k <= 3; ++k)
+                S0 += kWin[k + 3] * f0[x + k];
             scratch_fbPairAgreeWinIRE[x] =
-                (cmag(S[2]) / kWinSum) * invIreScale;
+                (cmag(S0) / kWinSum) * invIreScale;
 
             if (!haveSignedAlien) {
                 scratch_fbPairDiff[x] = std::complex<double>(0.0, 0.0);
@@ -2783,19 +2885,12 @@ void Comb::FrameBuffer::computeFrameBLine(
             // down at +d, so d = −s* when the Same leg is up, +s* when down).
             // s* ≠ 0 must clear an 8% improvement margin so noise cannot
             // steer the registration off the d=0 default.
-            const bool sameIsUp = (alienSign > 0.0);
-            const std::vector<std::complex<double>> &sameLeg =
-                sameIsUp ? scratch_upIQ : scratch_dnIQ;
-
             double devMag[5];
             for (int si = 0; si < 5; ++si) {
-                const int s = si - 2;
+                const std::complex<double> *g = devRows[si];
                 std::complex<double> devAcc(0.0, 0.0);
-                for (int k = -3; k <= 3; ++k) {
-                    devAcc += kWin[k + 3] *
-                        (sameLeg[clampX(x + k + s)] -
-                         scratch_centerIQ[clampX(x + k)]);
-                }
+                for (int k = -3; k <= 3; ++k)
+                    devAcc += kWin[k + 3] * g[x + k];
                 devMag[si] = cmag(devAcc) / kWinSum;
             }
 
@@ -2811,9 +2906,17 @@ void Comb::FrameBuffer::computeFrameBLine(
 
             const int sStar = bestSi - 2;
             const int d = sameIsUp ? -sStar : sStar;
-            const int di = d + 2;
 
-            const std::complex<double> pairDiff = S[di] / kWinSum;
+            // Registration and the Same/Opposite discriminator need a
+            // multi-axis aperture, but the correction waveform must retain
+            // the sample that was measured.  Using the seven-tap average here
+            // moved energy away from narrow vertical details: carrier-like
+            // peaks were under-subtracted while adjacent columns received a
+            // correction belonging to their neighbours.  Read the registered
+            // pair pointwise; the windowed facts above still decide whether
+            // this sample is an image-locked alien before it can be applied.
+            const std::complex<double> pairDiff =
+                pU[x - d] - pD[x + d];
             scratch_fbPairDiff[x] = pairDiff;
             scratch_fbReg[x] = d;
 
@@ -2828,14 +2931,11 @@ void Comb::FrameBuffer::computeFrameBLine(
             // dSame against the pair difference instead (the earlier form)
             // conflates these, because the pair difference carries both the
             // alien sum and the gradient.
-            const std::vector<std::complex<double>> &oppLeg =
-                sameIsUp ? scratch_dnIQ : scratch_upIQ;
             const int oppShift = sameIsUp ? d : -d;
             std::complex<double> oppAcc(0.0, 0.0);
             for (int k = -3; k <= 3; ++k) {
                 oppAcc += kWin[k + 3] *
-                    (oppLeg[clampX(x + k + oppShift)] -
-                     scratch_centerIQ[clampX(x + k)]);
+                    (pOpp[x + k + oppShift] - pC[x + k]);
             }
             const double dSame = devMag[bestSi];
             const double dOpp = cmag(oppAcc) / kWinSum;

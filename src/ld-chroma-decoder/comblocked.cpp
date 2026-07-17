@@ -1974,12 +1974,28 @@ void Comb::FrameBuffer::splitIQlocked()
             const float *rD =
                 (line + 2 < lastLine) ? lockedCcMaskRaw_line(line + 2)
                                       : nullptr;
+            const AttributionEvidence *attributionRow =
+                attributionEvidence_line(line);
             const double norm =
                 0.5 + (rU ? 0.25 : 0.0) + (rD ? 0.25 : 0.0);
             for (int xi = 0; xi < width; ++xi) {
-                vmix[xi] = (0.5 * r0[xi] +
-                            (rU ? 0.25 * rU[xi] : 0.0) +
-                            (rD ? 0.25 * rD[xi] : 0.0)) / norm;
+                const double verticalMean =
+                    (0.5 * r0[xi] +
+                     (rU ? 0.25 * rU[xi] : 0.0) +
+                     (rD ? 0.25 * rD[xi] : 0.0)) / norm;
+                const double impulse = attributionRow
+                    ? std::clamp(
+                          attributionRow[xi].facts.lumaImpulseRisk, 0.0, 1.0)
+                    : 0.0;
+
+                // A moving compact luma impulse is not expected at the same
+                // column on its +/-2 partners.  Preserve its own measured raw
+                // cross-colour evidence in proportion to the shared impulse
+                // geometry instead of allowing the vertical envelope to halve
+                // it.  This cannot invent suppression: it only raises the mix
+                // toward r0 when r0 is already the stronger measurement.
+                vmix[xi] = verticalMean + impulse *
+                    std::max(0.0, (double)r0[xi] - verticalMean);
             }
 
             // RMS, rather than the arithmetic mean, preserves the authority of
@@ -2112,6 +2128,16 @@ void Comb::FrameBuffer::filterIQLocked()
             const float *maskRawRow = lockedCcMaskRaw_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
+            const lddecode::CarrierAnalysisRecord *analysisUpRow =
+                (line - 2 >= firstLine) ? carrierAnalysis_line(line - 2) : nullptr;
+            const lddecode::CarrierAnalysisRecord *analysisDnRow =
+                (line + 2 < lastLine) ? carrierAnalysis_line(line + 2) : nullptr;
+            const AttributionEvidence *attributionRow =
+                attributionEvidence_line(line);
+            const double *lumaRow = lockedLumaCacheValid
+                ? lockedLumaSmooth_line(line) : nullptr;
+            const quint16 *rawRow = rawbuffer.data()
+                + static_cast<size_t>(line) * videoParameters.fieldWidth;
             const double giProduct = configuration.gi_product;
             const double gqProduct = configuration.gq_product;
 
@@ -2129,11 +2155,35 @@ void Comb::FrameBuffer::filterIQLocked()
                     const float conf = analysisRow ? analysisRow[i].carrierConformance : 0.0f;
                     const float axisSupport = analysisRow
                         ? analysisRow[i].conformanceSupportFraction : 0.0f;
+                    double grammarPass = analysisRow
+                        ? lddecode::carrierLegalProof(
+                              (double)analysisRow[i].carrierConformance,
+                              (double)analysisRow[i].conformanceSupportFraction)
+                        : 0.0;
+                    grammarPass = std::max(grammarPass, std::max(
+                        analysisUpRow
+                            ? lddecode::carrierLegalProof(
+                                  (double)analysisUpRow[i].carrierConformance,
+                                  (double)analysisUpRow[i].conformanceSupportFraction)
+                            : 0.0,
+                        analysisDnRow
+                            ? lddecode::carrierLegalProof(
+                                  (double)analysisDnRow[i].carrierConformance,
+                                  (double)analysisDnRow[i].conformanceSupportFraction)
+                            : 0.0));
+                    const double impulse = attributionRow
+                        ? std::clamp(
+                              attributionRow[i].facts.lumaImpulseRisk, 0.0, 1.0)
+                        : 0.0;
                     std::fprintf(stderr,
                         "CCTERM line=%d col=%d maskRaw=%.3f maskSmooth=%.3f "
-                        "conf=%.3f axisSupport=%.3f\n",
+                        "conf=%.3f axisSupport=%.3f grammarPass=%.3f "
+                        "impulse=%.3f lumaIRE=%.3f rawIRE=%.3f\n",
                         line, i, maskRawRow ? maskRawRow[i] : 0.0f,
-                        maskRow ? maskRow[i] : 0.0f, conf, axisSupport);
+                        maskRow ? maskRow[i] : 0.0f, conf, axisSupport,
+                        grammarPass, impulse,
+                        lumaRow ? lumaRow[i] * invIreScale : 0.0,
+                        rawRow ? rawRow[left + i] * invIreScale : 0.0);
                 }
 
                 scratch_preI[i] = (chroma * lutTi[ph]) * giProduct;
@@ -2692,6 +2742,30 @@ void Comb::FrameBuffer::produceY()
                 return std::clamp(1.0 - carrierE / (nrm + 1e-9), 0.0, 1.0);
             };
 
+            // Cycle-integrated carrier remaining in raw - candidate Y. This is
+            // the amount that candidate would still publish as chroma, measured
+            // on the locked carrier basis over a complete four-sample cycle.
+            // It is an amplitude measurement with explicit provenance, not a
+            // candidate label or an aggregate quality judgment.
+            auto residualCarrierMagnitudeOf = [&](int plane, int h0) -> double {
+                const int hs = (right - left >= 4)
+                    ? std::clamp(h0, left, right - 4)
+                    : left;
+                double dotS = 0.0, dotC = 0.0;
+                for (int j = 0; j < 4; ++j) {
+                    const int hh = std::min(right - 1, hs + j);
+                    const double residualCarrier =
+                        (double)rawLine[hh] - planeY(plane, hh);
+                    const int idx = carrierSampleClass(line, hh);
+                    dotS += residualCarrier * spLUT_locked[idx];
+                    dotC += residualCarrier * cpLUT_locked[idx];
+                }
+                const double carrierE =
+                    (basisSN > 1e-9 ? dotS * dotS / basisSN : 0.0) +
+                    (basisCN > 1e-9 ? dotC * dotC / basisCN : 0.0);
+                return std::sqrt(std::max(0.0, carrierE));
+            };
+
             const bool coarseLines = lockedLumaCacheValid && demodWidth == width;
             struct ProduceYNeighborRows {
                 int line = -1;
@@ -2834,7 +2908,9 @@ void Comb::FrameBuffer::produceY()
                 return best;
             };
             auto closestImageD = [](const double *a, const double *carrierCleanliness,
-                                    const double *imagePref, int n,
+                                    const double *imagePref,
+                                    const double *crossColorReturnEvidence,
+                                    int n,
                                     int referenceCount,
                                     double target, double phaseCap,
                                     double imageCap) -> double {
@@ -2853,6 +2929,11 @@ void Comb::FrameBuffer::produceY()
                         dist += (std::max(0.0, medianW - carrierCleanliness[i]) /
                                  medianW) * phaseCap;
                     dist -= std::clamp(imagePref[i], 0.0, 1.0) * imageCap;
+                    // This term is already an evidence-bounded carrier
+                    // reduction in sample units. It cannot DQ a candidate, and
+                    // its IRE cap keeps geometry dominant when the candidate is
+                    // far from the image tally.
+                    dist -= std::max(0.0, crossColorReturnEvidence[i]);
                     if (dist < bestCost) { bestCost = dist; best = a[i]; }
                 }
                 return best;
@@ -3077,6 +3158,9 @@ void Comb::FrameBuffer::produceY()
                 // Inlier HF set + per-inlier carrier-basis cleanliness. This is
                 // a cautionary term, not the positive reason to select HF.
                 double inHF[5], inCarrierCleanliness[5];
+                double inCrossColorReturnEvidence[5] = {
+                    0.0, 0.0, 0.0, 0.0, 0.0
+                };
                 for (int k = 0; k < nIn; ++k) {
                     inHF[k] = candY[inIdx[k]] - coarse;
                     inCarrierCleanliness[k] =
@@ -3093,6 +3177,38 @@ void Comb::FrameBuffer::produceY()
                     inCarrierCleanliness[nIn] =
                         carrierCleanlinessOf(4, h);
                     ++nIn;
+                }
+
+                // Let the named cross-colour evidence affect scoring according
+                // to what each candidate actually does. The comb plane defines
+                // zero return. A candidate earns only the cycle-integrated
+                // carrier reduction it delivers relative to comb, and never
+                // more than either the measured false-colour amount or the
+                // configured cap. Residual/retracted Y can therefore receive
+                // this evidence when they already outperform nominal returned
+                // Y; a label cannot win an advantage its samples did not earn.
+                if (ccReturn > 0.0) {
+                    const double combCarrierMagnitude =
+                        residualCarrierMagnitudeOf(0, h);
+                    const double measuredFalseCarrier =
+                        ccReturn * combCarrierMagnitude;
+                    const double crossColorReturnCap =
+                        std::max(0.0,
+                            configuration.tunables
+                                .PRODUCE_Y_CC_RETURN_EVIDENCE_CAP_IRE) *
+                        irescale;
+                    for (int k = 0; k < nIn; ++k) {
+                        const int plane = (k < baseNIn)
+                            ? candPlane[inIdx[k]] : 4;
+                        const double deliveredReduction = std::max(
+                            0.0,
+                            combCarrierMagnitude -
+                                residualCarrierMagnitudeOf(plane, h));
+                        inCrossColorReturnEvidence[k] = std::min(
+                            crossColorReturnCap,
+                            std::min(measuredFalseCarrier,
+                                     deliveredReduction));
+                    }
                 }
 
                 // Four independent image neighbours (N/S at regime-sensitive
@@ -3185,7 +3301,8 @@ void Comb::FrameBuffer::produceY()
                 double noms[4]; int nNom = 0;
                 for (int d = 0; d < nDir; ++d)
                     noms[nNom++] = closestImageD(
-                        inHF, inCarrierCleanliness, imagePref, nIn, baseNIn,
+                        inHF, inCarrierCleanliness, imagePref,
+                        inCrossColorReturnEvidence, nIn, baseNIn,
                         dirHF[d],
                         phasePenSamp, imagePrefCap);
 
@@ -3205,14 +3322,16 @@ void Comb::FrameBuffer::produceY()
                     // after the image preference had selected sharper HF.
                     const double decisionAnchor = 0.5 * (selfAnchor + neighborAnchor);
                     resultHF = closestImageD(
-                        inHF, inCarrierCleanliness, imagePref, nIn, baseNIn,
+                        inHF, inCarrierCleanliness, imagePref,
+                        inCrossColorReturnEvidence, nIn, baseNIn,
                         decisionAnchor,
                         phasePenSamp, imagePrefCap);
                 } else {
                     // With no spatial nomination, still close onto a real
                     // candidate. The medoid/mean is an anchor, not an output.
                     resultHF = closestImageD(
-                        inHF, inCarrierCleanliness, imagePref, nIn, baseNIn,
+                        inHF, inCarrierCleanliness, imagePref,
+                        inCrossColorReturnEvidence, nIn, baseNIn,
                         selfAnchor,
                         phasePenSamp, imagePrefCap);
                 }
