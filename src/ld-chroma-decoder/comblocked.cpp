@@ -3256,8 +3256,24 @@ void Comb::FrameBuffer::produceY()
                 }
                 const double coarse = coarseRow[xi];
                 const double combMiddle = candidateMiddleAt(0, h);
+                // The comb's platform-residual band (the centred 8-sample mean
+                // of comb-minus-platform) must be carried, not dropped.  It was
+                // omitted on the theory that the selected coarse already owns
+                // everything below the 8-sample aperture, but the coarse is a
+                // raster-aligned BLOCK mean -- piecewise constant across each
+                // 4fSC cycle -- not a centred 8-sample mean.  Its block-pitch
+                // stairstep is exactly what this band corrects, so discarding
+                // it published that stairstep as luma: +20% line-alternation at
+                // Gilgol Beach chroma transitions (the bead crawl) and inflated
+                // GGV false saturation, because the discarded remainder is
+                // carrier-band.  Carrying it makes the identity explicit --
+                //   Y = combY + (electedTop - combTop)
+                // -- which IS the stated design: coarse owns LF, comb owns the
+                // middle and the provisional top, and the election swaps only
+                // the top band.
+                const double combPlatform = candidatePlatformResidualAt(0, h);
                 auto reconstructTop = [&](double top) {
-                    return coarse + combMiddle + top;
+                    return coarse + combMiddle + combPlatform + top;
                 };
                 const int verticalStep = verticalStepAt(xi);
                 const ProduceYNeighborRows &northRows =
