@@ -460,11 +460,10 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedLumaBaseY4_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaSmooth_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             // The lurch-sharpened coarse floor is consumed only by the
-            // --luma-witness produceY election; the default fork subtracts the
-            // comb carrier directly and never reads it. Allocate it only under
-            // witness so the baseline path pays neither the buffer nor the
-            // lurch build below. baseY4/smooth/hDelta stay unconditional --
-            // candidate building consumes them in default mode.
+            // --luma-witness produceY election. Default reconstructs on the
+            // cheap baseY4 floor. Allocate sharp only under witness so the
+            // baseline path pays neither its buffer nor its build. baseY4 and
+            // the geometry-only smooth/hDelta services stay unconditional.
             if (configuration.lumaWitness)
                 lockedLumaSharp_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             else
@@ -525,8 +524,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
-            lockedCoherentCarrier_flat.assign(size_t(demodLines) * demodWidth, 0.0);
-            lockedCoherentCarrierValid.assign(demodLines, std::uint8_t{0});
+            lockedResidualCarrier_flat.assign(size_t(demodLines) * demodWidth, 0.0);
+            lockedResidualCarrierValid.assign(demodLines, std::uint8_t{0});
+            lockedResidualCarrierLicense_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             // Cross-color mask pair only exists when the return feature is
             // explicitly engaged, so the ordinary residual-Y path pays
@@ -1984,57 +1984,75 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
                                                             double *hiRaw,
                                                             double *lumaSmooth) const
 {
-    auto writeCenteredWindowMean = [&](int win, double *out) {
-        if (!out) return;
-        std::vector<double> prefix(width + 1, 0.0);
-        for (int x = 0; x < width; ++x)
-            prefix[x + 1] = prefix[x] + static_cast<double>(rawLine[left + x]);
-        for (int x = 0; x < width; ++x) {
-            const int a = std::clamp(x - win / 2, 0, width);
-            const int b = std::clamp(a + win, 0, width);
-            const double n = static_cast<double>(std::max(1, b - a));
-            out[x] = (prefix[b] - prefix[a]) / n;
-        }
-    };
-
     if (!rawLine || width <= 0)
         return;
 
     if (!baseY4 && !hiRaw && !lumaSmooth)
         return;
 
-    // Per-sample coarse luma base: rolling, current-centred 4-sample mean.
-    // This replaces the old raster-aligned 4-pixel block average while keeping
-    // the existing buffer contract for downstream consumers.
-    const double *coarseBase = baseY4;
-    std::vector<double> coarseScratch;
-    if (baseY4) {
-        writeCenteredWindowMean(4, baseY4);
-    } else if (hiRaw) {
-        coarseScratch.assign(width, 0.0);
-        writeCenteredWindowMean(4, coarseScratch.data());
-        coarseBase = coarseScratch.data();
+    // Default coarse: one raster-aligned 4fSC-cycle mean, repeated across the
+    // four samples it owns.  This is the inexpensive coherent-Y basis.  A
+    // sliding mean is not a harmless refinement here: it is the unsharpened
+    // half of the witness lurch model, costs another whole-line construction,
+    // and changes the HF residual's zero from sample to sample.  The witness
+    // builds its sliding/lurch-sharpened coarse separately and explicitly.
+    if (width < 4) {
+        double avg = 0.0;
+        for (int x = 0; x < width; ++x)
+            avg += static_cast<double>(rawLine[left + x]);
+        avg /= static_cast<double>(width);
+        for (int x = 0; x < width; ++x) {
+            if (baseY4) baseY4[x] = avg;
+            if (hiRaw) hiRaw[x] = static_cast<double>(rawLine[left + x]) - avg;
+            if (lumaSmooth) lumaSmooth[x] = avg;
+        }
+        return;
     }
 
-    if (hiRaw && coarseBase) {
-        for (int x = 0; x < width; ++x)
-            hiRaw[x] = static_cast<double>(rawLine[left + x]) - coarseBase[x];
+    int p = 0;
+    for (; p + 3 < width; p += 4) {
+        const double y = 0.25 *
+            (static_cast<double>(rawLine[left + p + 0]) +
+             static_cast<double>(rawLine[left + p + 1]) +
+             static_cast<double>(rawLine[left + p + 2]) +
+             static_cast<double>(rawLine[left + p + 3]));
+        for (int k = 0; k < 4; ++k) {
+            if (baseY4) baseY4[p + k] = y;
+            if (hiRaw)
+                hiRaw[p + k] = static_cast<double>(rawLine[left + p + k]) - y;
+        }
+    }
+
+    // Active width normally contains complete 4fSC cycles.  Keep the tail on
+    // the final complete cycle if metadata presents an odd width.
+    if (p < width) {
+        const int tb = width - 4;
+        const double y = 0.25 *
+            (static_cast<double>(rawLine[left + tb + 0]) +
+             static_cast<double>(rawLine[left + tb + 1]) +
+             static_cast<double>(rawLine[left + tb + 2]) +
+             static_cast<double>(rawLine[left + tb + 3]));
+        for (int x = p; x < width; ++x) {
+            if (baseY4) baseY4[x] = y;
+            if (hiRaw)
+                hiRaw[x] = static_cast<double>(rawLine[left + x]) - y;
+        }
     }
 
     if (!lumaSmooth)
         return;
 
-    // lumaSmooth keeps the original block-centre scaffold used by the contour
-    // path. baseY4 now carries the moving coarse, so block anchors are
-    // recomputed directly from raw instead of reusing baseY4.
+    // Legacy block-centre scaffold for geometry-only consumers.  Reuse the
+    // already-built coarse instead of averaging raw a second time.
     auto blockAvg = [&](int block)->double {
         const int x0 = std::clamp(block * 4, 0, std::max(0, width - 4));
-        const int x1 = std::min(width, x0 + 4);
-        double sum = 0.0;
-        for (int x = x0; x < x1; ++x)
-            sum += static_cast<double>(rawLine[left + x]);
-        const double n = static_cast<double>(std::max(1, x1 - x0));
-        return sum / n;
+        if (baseY4)
+            return baseY4[x0];
+        return 0.25 *
+            (static_cast<double>(rawLine[left + x0 + 0]) +
+             static_cast<double>(rawLine[left + x0 + 1]) +
+             static_cast<double>(rawLine[left + x0 + 2]) +
+             static_cast<double>(rawLine[left + x0 + 3]));
     };
 
     const int blockCount = (width + 3) / 4;

@@ -221,7 +221,58 @@ struct CarrierAnalysisRecord {
     float carrierConformance = 0.0f;
     float conformanceUsableAxisFraction = 0.0f;
     float conformanceSupportFraction = 0.0f;
+    // Contradiction is a distinct observation from absence.  This is the
+    // fraction of the three possible axes that decisively voted AGAINST the
+    // sign selected for carrierConformance (e.g. a matching axis when the
+    // selected sign is legal-inverting).  An axis that is below the energy
+    // floor or non-decisive abstains and appears in NEITHER fraction.
+    // Collapsing "not observed" and "observed conflicting" into the support
+    // count was the evidence-compression bug that made schedule licenses
+    // demand multi-axis corroboration (a run-length tax in the axis
+    // dimension): one decisive on-schedule inversion IS compatibility, and
+    // only an observed contradiction may revoke it.
+    float conformanceContradictionFraction = 0.0f;
 };
+
+// Decision layer: schedule-compatibility LICENSE for subtracting/confiscating
+// a fitted carrier from Y.  Grammar compatibility is not corroboration: one
+// axis observed decisively inverting on schedule licenses the operation at
+// any spatial scale (microscopic runs included), and only an observed
+// decisive contradiction (an axis MATCHING where the schedule demands
+// inversion -- luma by law, e.g. a fine static grid) revokes it.  Absent or
+// abstaining axes do neither.  The graded part is decisiveness of the best
+// supporting axis (same -0.5 vote / -0.9 saturation ramp as
+// carrierLegalProof); the axis COUNT contributes nothing.
+inline double carrierScheduleLicense(double conformance,
+                                     double supportFraction,
+                                     double contradictionFraction)
+{
+    if (contradictionFraction > 0.0)  // observed contradiction: fail closed
+        return 0.0;
+    if (supportFraction <= 0.0)       // nothing observed: no license
+        return 0.0;
+    constexpr double kLegalVote = 0.5;
+    constexpr double kLegalFull = 0.9;
+    double t = (-conformance - kLegalVote) / (kLegalFull - kLegalVote);
+    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Decisiveness ramp shared by schedule-compatibility licenses: input is a
+// relation-signed correlation where -1 means "behaves like legal carrier".
+// Zero until the legal vote threshold, saturating at a decisive inversion —
+// the same -0.5 / -0.9 shape as carrierLegalProof, without any axis-count
+// or corroboration input.  One observed on-schedule alternation licenses at
+// any spatial scale; what the correlation is measured ON (raw bandpass, a
+// fitted operand, ...) is the consumer's stated choice.
+inline double scheduleAlternationLicense(double signedCorr)
+{
+    constexpr double kLegalVote = 0.5;
+    constexpr double kLegalFull = 0.9;
+    double t = (-signedCorr - kLegalVote) / (kLegalFull - kLegalVote);
+    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    return t * t * (3.0 - 2.0 * t);
+}
 
 // Decision layer: the single table-owned mapping from the conformance
 // MEASUREMENT to a carrier-trust weight in [0,1].  Every consumer weights by

@@ -251,11 +251,9 @@ public:
             // N/S/E/W image neighbour; unsupported amplitude earns nothing.
             double PRODUCE_Y_HF_IMAGE_PREFERENCE_IRE = 1.5;
             double PRODUCE_Y_HF_CONTINUATION_IRE = 6.0;
-            // Maximum score advantage earned by ACTUAL carrier-band reduction
-            // when cross-colour has been measured. The advantage is bounded by
-            // both this cap and the measured false-colour amount; no mask means
-            // no score change. This lets the detector participate in the tally
-            // without turning its measurement into a selection verdict.
+            // Explicit policy limit on score advantage earned by actual
+            // carrier reduction under measured cross-colour. Raw and smoothed
+            // detector values remain separately observable in diagnostics.
             double PRODUCE_Y_CC_RETURN_EVIDENCE_CAP_IRE = 3.0;
             // Carrier-basis phase is only a hygiene/tie-break term in produceY;
             // luma image continuity owns the election.
@@ -358,9 +356,9 @@ public:
 	// residual-video-3D enhancement.  Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCarrierRetractionStage(bool analysisOnly);
-	void buildCoherentCarrierEstimateRow(int line,
+	void buildResidualCarrierEstimateRow(int line,
 	                                    const quint16 *rawLine,
-	                                    const double *baseY4,
+	                                    const double *lumaBasis,
 	                                    const float *tiLockedRow,
 	                                    const float *tqLockedRow,
 	                                    double *carrierOut);
@@ -621,14 +619,26 @@ private:
 	// remodulated to composite). produceY subtracts this from raw to form Y, so
 	// the carrier removed from luma is exactly the carrier rendered as colour.
 	std::vector<double> lockedCarrierComposite_flat;
-	// Coherent carrier estimate per line, built once by produceY. It is a pure
-	// per-line function of raw, baseY4 and the locked demod planes; produceY
-	// consumes it for the centre line and up to four vertical neighbours, so
-	// computing it locally reconstructed every line's value up to five times.
+	// Affine/polar residual-Y carrier refinement per line, built once by
+	// produceY from the SAME selected-comb locked IQ used by coherent Y.
+	// produceY consumes it for the centre line and up to four vertical
+	// neighbours, so computing it locally reconstructed every line's value up
+	// to five times.
 	// The companion valid byte marks the rows that were actually built (a null
-	// row accessor stands in for the old "no coherent carrier here" case).
-	std::vector<double> lockedCoherentCarrier_flat;
-	std::vector<std::uint8_t> lockedCoherentCarrierValid;
+	// row accessor stands in for the old "no residual refinement here" case).
+	std::vector<double> lockedResidualCarrier_flat;
+	std::vector<std::uint8_t> lockedResidualCarrierValid;
+	// Operand schedule-compatibility license [0,1] per pixel for the residual
+	// carrier estimate (cHat).  Built in the produceY prepass by testing the
+	// OPERAND itself — cHat against its ±1 partner's cHat under the grammar
+	// relation — over one 4-sample cycle.  cHat is comb IQ affined/polar-
+	// refined, so its lineage is already schedule-legal; the only residual
+	// question is whether the refinement absorbed off-schedule energy (alien
+	// luma: the fitted waveform then MATCHES the partner where the schedule
+	// demands inversion).  One observed on-schedule alternation licenses at
+	// any spatial scale; unobservable (quiet partner) fails closed.  No raw-
+	// bandpass votes, axis counts, or run-length demands are involved.
+	std::vector<float> lockedResidualCarrierLicense_flat;
 	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D
 	// as a provisional read; measurePostCombImpurity() overwrites it with the
 	// elected-comb reading before splitIQlocked() consumes it.
@@ -814,12 +824,14 @@ private:
 	// this single shared analysis rather than privately reconstructing it.
 		std::vector<lddecode::CarrierAnalysisRecord> carrierAnalysis_flat;
 		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
+	// Default LF platform: one legal carrier-cycle mean per four input
+	// samples, held over that cycle (information-rate Nyquist fSC/2).
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
-	// Lurch-sharpened sliding-boxcar coarse: the contour floor the constrained
-	// witness used, imported as the produceY HF-election floor (replaces the
-	// softer block-centre lockedLumaSmooth scaffold when the sharpen level is
-	// on). Populated alongside lockedLumaSmooth in the decomposition loop.
+	// Centered lurch-sharpened sliding-boxcar coarse: the witness-only LF
+	// platform and authority. Comb supplies middle and provisional top above
+	// this same base; only the top is replaceable. lockedLumaSmooth remains a
+	// geometry service.
 	std::vector<double> lockedLumaSharp_flat;
 	// 1D vertical-contrast service: per-sample lateral coarse-luma delta in
 	// IRE (|smooth[rel+2] - smooth[rel-2]|), published once by the locked
@@ -1251,19 +1263,33 @@ private:
 	}
 	// Writable row for the produceY prepass builder (bounds-checked, no validity
 	// gate — the caller sets the valid byte once the row is populated).
-	inline double* lockedCoherentCarrier_rowForBuild(int line) {
+	inline double* lockedResidualCarrier_rowForBuild(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    lockedCoherentCarrier_flat.empty()) return nullptr;
-		return lockedCoherentCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+		    lockedResidualCarrier_flat.empty()) return nullptr;
+		return lockedResidualCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	// Reader: returns the row only where the prepass actually built it, so a null
-	// result means "no coherent carrier for this line" exactly as before.
-	inline const double* lockedCoherentCarrier_line(int line) const {
+	// result means "no residual refinement for this line" exactly as before.
+	inline const double* lockedResidualCarrier_line(int line) const {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    lockedCoherentCarrier_flat.empty() ||
-		    line >= static_cast<int>(lockedCoherentCarrierValid.size()) ||
-		    !lockedCoherentCarrierValid[line]) return nullptr;
-		return lockedCoherentCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+		    lockedResidualCarrier_flat.empty() ||
+		    line >= static_cast<int>(lockedResidualCarrierValid.size()) ||
+		    !lockedResidualCarrierValid[line]) return nullptr;
+		return lockedResidualCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* lockedResidualCarrierLicense_rowForBuild(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedResidualCarrierLicense_flat.empty()) return nullptr;
+		return lockedResidualCarrierLicense_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	// License row follows the carrier row's validity: null where the operand
+	// row itself was never built.
+	inline const float* lockedResidualCarrierLicense_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lockedResidualCarrierLicense_flat.empty() ||
+		    line >= static_cast<int>(lockedResidualCarrierValid.size()) ||
+		    !lockedResidualCarrierValid[line]) return nullptr;
+		return lockedResidualCarrierLicense_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* carrierImpurity_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
