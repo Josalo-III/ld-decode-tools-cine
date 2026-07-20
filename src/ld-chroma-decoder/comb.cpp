@@ -197,6 +197,15 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     // against a stale recycled buffer at pre-roll or batch boundaries.
     bool prevIterAnalyzed = false;
 
+    // Which of the rotating buffers hold a frame genuinely loaded during THIS
+    // call.  The triple-buffer persists across decodeFrames(), so a buffer that
+    // was never loaded here still holds a recycled frame from an earlier call —
+    // combing against that is silent temporal corruption, not a missing
+    // optimisation.  This replaces an index test (`fieldIndex < startIndex + 4`)
+    // that assumed a multi-frame batch; the pool serves one frame per call, so
+    // that test was permanently true and the temporal stage never ran at all.
+    bool nextLoaded = false, currentLoaded = false, previousLoaded = false;
+
     for (qint32 fieldIndex = preStart; fieldIndex < endIndex; fieldIndex += 2) {
         // Rotate buffers.
         {
@@ -204,6 +213,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             previous = std::move(current);
             current  = std::move(next);
             next     = std::move(recycle);
+
+            // Rotate the load flags with the buffers they describe.
+            const bool wasPrevious = previousLoaded;
+            previousLoaded = currentLoaded;
+            currentLoaded  = nextLoaded;
+            nextLoaded     = wasPrevious;
         }
 
         const bool canLoadNext =
@@ -211,6 +226,17 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (fieldIndex + 3 < inputFields.size());
 
         if (canLoadNext) {
+            // The pool pre-seeds its look-behind history with synthetic BLACK
+            // fields (negative seqNo) so the first frames of a decode have a
+            // window at all.  Those frames must still be loaded — the 2D
+            // pipeline runs on them — but they are not evidence about motion,
+            // and combing against them would subtract a black frame.  Load,
+            // but do not report as temporal context.
+            const bool isPadding =
+                inputFields[fieldIndex + 2].field.seqNo < 0 ||
+                inputFields[fieldIndex + 3].field.seqNo < 0;
+            nextLoaded = !isPadding;
+
             next->loadFields(inputFields[fieldIndex + 2],
                              inputFields[fieldIndex + 3]);
 
@@ -233,18 +259,23 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         if (fieldIndex < startIndex)
             continue;
 
-        const bool isStartUp = (fieldIndex < startIndex + 4);
+        // Temporal context exists only when all three rotating buffers were
+        // loaded in this call: `previous` and `current` from the pool's
+        // look-behind padding, `next` from its look-ahead tail.  At the end of
+        // the stream there is no tail, so the last frame keeps its 2D result.
+        const bool temporalContextReady =
+            previousLoaded && currentLoaded && nextLoaded;
 
         if (configuration.dimensions == 3 &&
             !configuration.diagnosticOnly()) {
             current->copy2DTo3D();
 
-            if (!isStartUp)
+            if (temporalContextReady)
                 current->split3D(*previous, *next);
         }
 
         if (configuration.residualVideo3D) {
-            if (!isStartUp) {
+            if (temporalContextReady) {
                 current->prevFrameForVet = previous.get();
                 current->nextFrameForVet = next.get();
             } else {

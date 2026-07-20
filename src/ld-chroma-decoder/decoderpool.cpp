@@ -771,6 +771,38 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
     startIndex = paddingSize;
     endIndex   = fields.size();
 
+    // Look-ahead tail.  The window contract is
+    //
+    //     {lookbehind... [startIndex] real... [endIndex] lookahead...}
+    //
+    // Decoder derives its frame count from (endIndex - startIndex), so fields
+    // appended BEYOND endIndex change neither the number of decoded frames nor
+    // their order -- they exist purely so the temporal comb can see the frame
+    // that follows the one being decoded.
+    //
+    // The next work item is PEEKED, never popped.  Serving order, decode
+    // tickets, 24p scheduling keys, and output ordering are all untouched; the
+    // only cost is copying two fields.  paddingHistory is deliberately built
+    // above, from the served window, so the look-ahead frame does not
+    // double-advance the look-behind history.
+    //
+    // At end of stream there is no tail: `next` stays unloaded, the comb sees
+    // no temporal context, and that final frame keeps its 2D result.
+    if (decoderLookAhead > 0) {
+        const CadenceAssembler::WorkItem *ahead = nullptr;
+        if (cadenceConfig.export24p) {
+            if (ensureScheduled24p() && !scheduled24p.empty())
+                ahead = &scheduled24p.front();
+        } else {
+            if (ensureWorkItems() && !workItems.empty())
+                ahead = &workItems.front();
+        }
+        if (ahead) {
+            fields.push_back(ahead->f1);
+            fields.push_back(ahead->f2);
+        }
+    }
+
     servedFrameNumber += 1;
     return true;
 }
