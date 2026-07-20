@@ -198,6 +198,33 @@ enum class RegionRelation {
     AlienCancel
 };
 
+// Leg-vs-leg coherence: does a PAIR of comb legs offer a common chroma to
+// cancel against?  Published as evidence for every comb, at any vertical step
+// -- intrafield (+/-2, +/-4) and interfield (+/-1) alike -- because the
+// question is a property of the leg pair alone.  Each comb owns what it does
+// with the answer; this evaluator states no policy.
+//
+// SIGNAL FRAME: both legs must ALREADY be relation-aligned into a common
+// frame by the caller (grammar sign applied).  Comparing raw-frame legs here
+// would read a perfect match as a maximal break.
+//
+// `comparable` is the validity fact and must be consulted: when either leg is
+// below the chroma floor the angle is not measurable and hueDifferenceDeg
+// stays 0.0, which a consumer would otherwise read as "the legs agree" --
+// absence of evidence masquerading as positive evidence.
+struct LegPairCoherence {
+    bool comparable = false;        // both legs cleared the chroma floor
+    double differenceIRE = 0.0;     // |legA - legB|, aligned frame
+    double hueDifferenceDeg = 0.0;  // angle between the legs; 0 unless comparable
+    double magRatio = 0.0;          // min/max magnitude, 0..1
+};
+
+LegPairCoherence evaluateLegPairCoherence(
+    const std::complex<double> &legA,
+    const std::complex<double> &legB,
+    double invIreScale,
+    double minChromaIRE);
+
 // Shared content verdict for the two intrafield combs.  The IQ inputs retain
 // their source sign; the evaluator applies the grammar relations only to local
 // comparison copies.  Bandpass IQ describes an already-admitted carrier but
@@ -214,6 +241,10 @@ struct IntrafieldRegionReach {
     double upHueDifferenceDeg = 0.0;
     double downHueDifferenceDeg = 0.0;
     double upDownHueDifferenceDeg = 0.0;
+    // Validity for the two upDown* fields above: false means the angle was
+    // never measured (a leg below the chroma floor), NOT that the legs agree.
+    // Consult before reading upDownHueDifferenceDeg as evidence.
+    bool outerComparable = false;
 
     bool centerIsland = false;
     bool threeRegion = false;

@@ -570,6 +570,14 @@ private:
 		std::vector<double> coarse0IRE;
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
+		// True only when BOTH neighbour coarse rows carry real luma evidence
+		// (a locked decomposition row, or a notch luma from a tap that exists).
+		// An absent neighbour row falls back to the centre value, which reads
+		// as a zero vertical delta -- i.e. "no luma break anywhere", the most
+		// permissive answer there is.  Consumers that bypass a structural
+		// verdict on the strength of a flat-luma context MUST consult this and
+		// fail closed; vector size alone is not evidence.
+		bool coarseLumaValid = false;
 		std::vector<double> hLumaDeltaIRE;
 	};
 	enum CombTapBuild : unsigned {
@@ -731,6 +739,12 @@ private:
 	std::vector<std::complex<double>> scratch_fbPairDiff;
 	std::vector<double> scratch_fbAlienGate;
 	std::vector<double> scratch_fbPairAgreeWinIRE;
+	// Frame B leg-deviation symmetry, dSame/dOpp in [0,1].  A published FACT
+	// about the ±1 pair, not a policy: 0 = asymmetric (Same leg rides centre,
+	// Opposite carries ~2a -> vertically-invariant image-locked alien), 1 =
+	// legs deviate together (diagonal advance or real vertical gradient).
+	// Absence of evidence reports 1, never 0.
+	std::vector<double> scratch_fbLegSymmetry;
 	std::vector<int> scratch_fbReg;
     // Prepass working rows: edge-replicated padded copies of the three
     // demodded IQ rows (padding reproduces the clamp-to-edge indexing, so

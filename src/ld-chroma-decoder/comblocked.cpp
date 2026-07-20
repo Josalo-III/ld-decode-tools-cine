@@ -3404,7 +3404,15 @@ void Comb::FrameBuffer::produceY()
                     if (retractedAdmitted)
                         addBaseCandidate(ry, 1);
                 }
-                if (affineResidualCarrierRow) {
+                // Diagnostic seat exclusion (A/B only, same family as
+                // LD_RETRACTED_ADMIT): LD_RESIDUALY_SEAT=0 keeps the
+                // affine/polar residual candidate off the roster so a decode
+                // can attribute an artifact to this seat in one variable.
+                static const bool residualYSeat = []{
+                    const char *s = std::getenv("LD_RESIDUALY_SEAT");
+                    return !(s && s[0] == '0');
+                }();
+                if (affineResidualCarrierRow && residualYSeat) {
                     const double c = affineResidualCarrierRow[xi];
                     const double cy = std::isfinite(c)
                         ? rawH - residualCarrierForCandidate(residualLicenseRow, xi, c)
@@ -3659,7 +3667,7 @@ void Comb::FrameBuffer::produceY()
                         phasePenSamp, imagePrefCap);
                 }
 
-                Y[h] = coarse + combMiddle + resultHF;
+                Y[h] = reconstructTop(resultHF);
 
                 if (pyDiag && line >= pyDiagL0 && line <= pyDiagL1 &&
                     xi >= pyDiagC0 && xi <= pyDiagC1) {

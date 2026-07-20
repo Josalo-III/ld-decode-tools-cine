@@ -363,6 +363,45 @@ double oppositeIQFit(double centerI, double centerQ,
 
 } // namespace
 
+// Leg-vs-leg coherence.  States no policy: it reports what the pair looks
+// like and whether the comparison was possible at all.  See combreach.h for
+// the signal-frame requirement (callers pass ALREADY relation-aligned legs).
+LegPairCoherence evaluateLegPairCoherence(
+    const std::complex<double> &legA,
+    const std::complex<double> &legB,
+    double invIreScale,
+    double minChromaIRE)
+{
+    constexpr double kRadiansToDegrees = 57.2957795130823208768;
+
+    LegPairCoherence out;
+    const double scale = std::max(0.0, invIreScale);
+    const double floorIRE = std::max(0.0, minChromaIRE);
+
+    const double magA = boundedMag(legA);
+    const double magB = boundedMag(legB);
+    const double magAIRE = magA * scale;
+    const double magBIRE = magB * scale;
+
+    out.differenceIRE = boundedMag(legA - legB) * scale;
+
+    const double hi = std::max(magAIRE, magBIRE);
+    const double lo = std::min(magAIRE, magBIRE);
+    out.magRatio = (hi > 1e-12) ? std::clamp(lo / hi, 0.0, 1.0) : 0.0;
+
+    // Hue is meaningless on a vector below the chroma floor.  Leave the angle
+    // at its 0.0 default and report the pair as not comparable, so absence is
+    // never read as agreement.
+    const double denom = magA * magB;
+    if (magAIRE >= floorIRE && magBIRE >= floorIRE && denom > 1e-12) {
+        const double hueCos = std::clamp(
+            std::real(legA * std::conj(legB)) / denom, -1.0, 1.0);
+        out.hueDifferenceDeg = std::acos(hueCos) * kRadiansToDegrees;
+        out.comparable = true;
+    }
+    return out;
+}
+
 IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const std::complex<double> &center,
     const std::complex<double> &up,
@@ -518,19 +557,14 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
                  out.down != RegionRelation::Unknown);
 
     if (haveUp && haveDown) {
-        out.upDownDifferenceIRE = boundedMag(alignedUp - alignedDown) * scale;
-
-        const double outerDenom = upMagRaw * downMagRaw;
-        if (upMagIRE >= chromaFloor && downMagIRE >= chromaFloor &&
-            outerDenom > 1e-12)
-        {
-            const double outerHueCos = std::clamp(
-                std::real(alignedUp * std::conj(alignedDown)) / outerDenom,
-                -1.0,
-                1.0);
-            out.upDownHueDifferenceDeg =
-                std::acos(outerHueCos) * kRadiansToDegrees;
-        }
+        // Leg-vs-leg coherence via the shared evaluator: the same primitive
+        // any comb can call on its own leg pair at its own vertical step.
+        // Both operands are already relation-aligned above.
+        const LegPairCoherence outer = evaluateLegPairCoherence(
+            alignedUp, alignedDown, scale, chromaFloor);
+        out.upDownDifferenceIRE = outer.differenceIRE;
+        out.upDownHueDifferenceDeg = outer.hueDifferenceDeg;
+        out.outerComparable = outer.comparable;
 
         const bool upDifferent =
             out.up == RegionRelation::DifferentRegion;
