@@ -1335,33 +1335,6 @@ static inline double clampCarrierToInputLimits(
         carrier, centerRaw, inputLuma, fallbackCarrier);
 }
 
-static inline bool iqOutsideClusterBox(
-    const std::complex<double> &z,
-    std::initializer_list<std::complex<double>> cluster,
-    double slack)
-{
-    double loI = std::numeric_limits<double>::infinity();
-    double hiI = -std::numeric_limits<double>::infinity();
-    double loQ = std::numeric_limits<double>::infinity();
-    double hiQ = -std::numeric_limits<double>::infinity();
-
-    for (const auto &c : cluster) {
-        if (!std::isfinite(c.real()) || !std::isfinite(c.imag()))
-            continue;
-        loI = std::min(loI, c.real());
-        hiI = std::max(hiI, c.real());
-        loQ = std::min(loQ, c.imag());
-        hiQ = std::max(hiQ, c.imag());
-    }
-
-    if (!std::isfinite(loI) || !std::isfinite(hiI) ||
-        !std::isfinite(loQ) || !std::isfinite(hiQ))
-        return true;
-
-    return !std::isfinite(z.real()) || !std::isfinite(z.imag()) ||
-           z.real() < loI - slack || z.real() > hiI + slack ||
-           z.imag() < loQ - slack || z.imag() > hiQ + slack;
-}
 
 // Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically
 // influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
@@ -2345,48 +2318,13 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
 
         std::complex<double> Zcandidate = Z0 + (delta * localStrength);
         
-        // Output-space one-leg candidates under the same Frame A strength law.
-        // These are deliberately conservative: they use the already phase-aligned,
-        // reach-gated neighbors, not fresh picture analysis.
-        std::complex<double> ZupCand = Z0;
-        std::complex<double> ZdnCand = Z0;
-        
-        if (useUp) {
-            std::complex<double> contrib;
-            double w;
-            softAlignBoth(Z0, ZUpRaw, a0, aUp, contrib, w);
-            w *= upReach;
-            if (w > 0.0) {
-                std::complex<double> Zu = (Z0 + contrib * upReach) / (1.0 + w);
-                std::complex<double> du = Zu - Z0;
-                const double duIRE = cmag(du) * invI;
-                if (MAX_DELTA_IRE > 0.0 && duIRE > MAX_DELTA_IRE && duIRE > 1e-9)
-                    du *= (MAX_DELTA_IRE / duIRE);
-                ZupCand = Z0 + du * localStrength;
-            }
-        }
-        
-        if (useDn) {
-            std::complex<double> contrib;
-            double w;
-            softAlignBoth(Z0, ZDnRaw, a0, aDn, contrib, w);
-            w *= dnReach;
-            if (w > 0.0) {
-                std::complex<double> Zd = (Z0 + contrib * dnReach) / (1.0 + w);
-                std::complex<double> dd = Zd - Z0;
-                const double ddIRE = cmag(dd) * invI;
-                if (MAX_DELTA_IRE > 0.0 && ddIRE > MAX_DELTA_IRE && ddIRE > 1e-9)
-                    dd *= (MAX_DELTA_IRE / ddIRE);
-                ZdnCand = Z0 + dd * localStrength;
-            }
-        }
-        
-        constexpr double kIQClusterSlackIRE = 0.35;
-        const double iqSlack = kIQClusterSlackIRE * irescale;
-        
-        if (iqOutsideClusterBox(Zcandidate, { Z0, ZupCand, ZdnCand }, iqSlack))
-            Zcandidate = Z0;
-        
+        // No bound in IQ.  Frame A's failures are judged as luma, and the
+        // reconstructed-luma feasibility bound is applied to its composite
+        // scalar in split2D() where the remod puts it one subtraction from Y.
+        // The box that used to sit here was over {Z0, ZupCand, ZdnCand}: two
+        // candidates re-derived from Frame A's own strength law, so a wrong
+        // strength moved the candidate and its bound together and the box
+        // admitted exactly the excursions it existed to catch.
         outFrameIQ[x] = Zcandidate;
     }
 }
@@ -2587,6 +2525,13 @@ void Comb::FrameBuffer::computeFrameBLine(
     const double *preclean0  = precleanLinePtr(line, width);
     const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
     const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
+
+    // Raw rows for the reconstructed-luma feasibility bound at the output.
+    const quint16 *rawCenterRow = rawbuffer.constData() + line * videoParameters.fieldWidth;
+    const quint16 *rawUpRow = haveUpLine
+        ? rawbuffer.constData() + (line - 1) * videoParameters.fieldWidth : nullptr;
+    const quint16 *rawDnRow = haveDnLine
+        ? rawbuffer.constData() + (line + 1) * videoParameters.fieldWidth : nullptr;
 
     auto phaseCursor = [&](int ln) {
         return carrierGrammarSignedSampleCursor(
@@ -3357,6 +3302,30 @@ void Comb::FrameBuffer::computeFrameBLine(
                     signedRemodCursor, Zout.real(), Zout.imag());
 
             lddecode::carrierGrammarAdvanceRemodCursor(gridRemodCursor);
+        }
+
+        // Reconstructed-luma feasibility on the composite Frame B just made.
+        //
+        // Deliberately not a bound in IQ.  Frame B's signed-subtractor path
+        // removes an alien present in ALL of its legs, so the correct carrier
+        // routinely sits outside the legs' carrier range; clamping there was
+        // measured binding on 53% of pixels, which is an under-comb, not a
+        // net.  In luma the statement is true again: whatever the comb does
+        // to the chroma, the luma it implies must be a luma its own legs
+        // could have produced.  Unsaturated light/dark zippers are the
+        // failure this is here to catch.
+        if (preclean0) {
+            const int h = left + x;
+            const double yC = (double)rawCenterRow[h] - preclean0[x];
+            const double yU = (rawUpRow && precleanUp)
+                ? (double)rawUpRow[h] - precleanUp[x]
+                : std::numeric_limits<double>::quiet_NaN();
+            const double yD = (rawDnRow && precleanDn)
+                ? (double)rawDnRow[h] - precleanDn[x]
+                : std::numeric_limits<double>::quiet_NaN();
+            outFrameScalar[x] = clampCarrierToInputLumaRangeShared(
+                outFrameScalar[x], (double)rawCenterRow[h],
+                { yC, yU, yD }, preclean0[x]);
         }
     }
 

@@ -2251,11 +2251,43 @@ void Comb::FrameBuffer::split2D()
             auto phaseCursor = carrierGrammarSignedSampleCursor(
                 configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
                 left);
+
+            // Reconstructed-luma feasibility, applied here because this is
+            // where Frame A's IQ becomes the composite carrier that produceY
+            // subtracts from raw.  The legs are the preclean carriers Frame A
+            // actually combed, so raw-minus-preclean is each leg's luma.
+            const bool frameAVertical = carrierFrameVerticalAllowed(line);
+            const double *precleanC = precleanLinePtr(line, width);
+            const double *precleanU = frameAVertical
+                ? precleanLinePtr(line - 1, width) : nullptr;
+            const double *precleanD = frameAVertical
+                ? precleanLinePtr(line + 1, width) : nullptr;
+            const quint16 *rawC = rawbuffer.constData() + line * videoParameters.fieldWidth;
+            const quint16 *rawU = (precleanU && line - 1 >= 0)
+                ? rawbuffer.constData() + (line - 1) * videoParameters.fieldWidth : nullptr;
+            const quint16 *rawD = precleanD
+                ? rawbuffer.constData() + (line + 1) * videoParameters.fieldWidth : nullptr;
+
             for (int rel = 0; rel < width; ++rel) {
                 if (rel < (int)frameAIQ.size()) {
                     const auto &Z = frameAIQ[rel];
-                    scratch_frameAAdaptiveIQComposite[rel] =
+                    double carrier =
                         carrierGrammarRemodSigned4fscToComposite(phaseCursor, Z.real(), Z.imag());
+
+                    if (precleanC) {
+                        const int h = left + rel;
+                        const double yC = (double)rawC[h] - precleanC[rel];
+                        const double yU = (rawU && precleanU)
+                            ? (double)rawU[h] - precleanU[rel]
+                            : std::numeric_limits<double>::quiet_NaN();
+                        const double yD = (rawD && precleanD)
+                            ? (double)rawD[h] - precleanD[rel]
+                            : std::numeric_limits<double>::quiet_NaN();
+                        carrier = clampCarrierToInputLumaRangeShared(
+                            carrier, (double)rawC[h], { yC, yU, yD }, precleanC[rel]);
+                    }
+
+                    scratch_frameAAdaptiveIQComposite[rel] = carrier;
                 } else {
                     scratch_frameAAdaptiveIQComposite[rel] = 0.0;
                 }
