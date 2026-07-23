@@ -14,6 +14,10 @@
 
 #include "cadencedefs.h"
 #include "comb.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <cstdio>
 #include "combmath.h"
 #include "framecanvas.h"
 #include "deemp.h"
@@ -197,14 +201,23 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     // against a stale recycled buffer at pre-roll or batch boundaries.
     bool prevIterAnalyzed = false;
 
-    // Which of the rotating buffers hold a frame genuinely loaded during THIS
-    // call.  The triple-buffer persists across decodeFrames(), so a buffer that
-    // was never loaded here still holds a recycled frame from an earlier call —
-    // combing against that is silent temporal corruption, not a missing
-    // optimisation.  This replaces an index test (`fieldIndex < startIndex + 4`)
-    // that assumed a multi-frame batch; the pool serves one frame per call, so
-    // that test was permanently true and the temporal stage never ran at all.
-    bool nextLoaded = false, currentLoaded = false, previousLoaded = false;
+    // NOTE: the buffers persisting across calls invites an obvious
+    // optimisation -- a call that just served frame F leaves them holding
+    // {F-1, F, F+1}, and the next call, serving F+1, needs {F, F+1, F+2}: one
+    // rotation and one new frame rather than a fresh pre-roll.  It was tried
+    // and reverted.  Two things defeat it.  Threads take frames round-robin
+    // with a Comb (and triple-buffer) each, so at -t 8 a thread never holds
+    // its own predecessor and the reuse never fires; measured 0% at -t 8
+    // against 95% at -t 1.  Worse, where it did fire it CHANGED THE PICTURE:
+    // the pre-roll analyses its first frame with a null temporal context
+    // (prevIterAnalyzed starts false), while a reused frame keeps the analysis
+    // it was given with its real predecessor, so -t 1 and -t 8 stopped
+    // agreeing.  Output must not depend on --threads.
+    //
+    // The reuse only becomes available once a thread is handed a RUN of
+    // consecutive frames (upstream's batchFrames, which the cadence rework
+    // reduced to 1).  Batch composition does not depend on thread count, so
+    // that form keeps the decode deterministic.
 
     for (qint32 fieldIndex = preStart; fieldIndex < endIndex; fieldIndex += 2) {
         // Rotate buffers.
@@ -213,12 +226,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             previous = std::move(current);
             current  = std::move(next);
             next     = std::move(recycle);
-
-            // Rotate the load flags with the buffers they describe.
-            const bool wasPrevious = previousLoaded;
-            previousLoaded = currentLoaded;
-            currentLoaded  = nextLoaded;
-            nextLoaded     = wasPrevious;
         }
 
         const bool canLoadNext =
@@ -226,17 +233,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (fieldIndex + 3 < inputFields.size());
 
         if (canLoadNext) {
-            // The pool pre-seeds its look-behind history with synthetic BLACK
-            // fields (negative seqNo) so the first frames of a decode have a
-            // window at all.  Those frames must still be loaded — the 2D
-            // pipeline runs on them — but they are not evidence about motion,
-            // and combing against them would subtract a black frame.  Load,
-            // but do not report as temporal context.
-            const bool isPadding =
-                inputFields[fieldIndex + 2].field.seqNo < 0 ||
-                inputFields[fieldIndex + 3].field.seqNo < 0;
-            nextLoaded = !isPadding;
-
             next->loadFields(inputFields[fieldIndex + 2],
                              inputFields[fieldIndex + 3]);
 
@@ -253,18 +249,27 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             if (!configuration.diagnosticOnly())
                 next->split2D();
+        } else {
+            // Nothing to load into the recycled buffer, so whatever it still
+            // holds belongs to an earlier call.  Say so, rather than leaving a
+            // stale frame wearing the `next` label.
+            next->forgetHeldFrame();
         }
         prevIterAnalyzed = canLoadNext;
 
         if (fieldIndex < startIndex)
             continue;
 
-        // Temporal context exists only when all three rotating buffers were
-        // loaded in this call: `previous` and `current` from the pool's
-        // look-behind padding, `next` from its look-ahead tail.  At the end of
-        // the stream there is no tail, so the last frame keeps its 2D result.
+        // Temporal context exists only when all three buffers hold a real
+        // neighbouring picture.  The buffers answer for themselves: a frame
+        // that was never loaded, was invalidated above, or came from the
+        // pool's synthetic black padding reports no identity and is refused.
+        // At the end of the stream there is no look-ahead tail, so the last
+        // frame keeps its 2D result.
         const bool temporalContextReady =
-            previousLoaded && currentLoaded && nextLoaded;
+            previous->holdsRealFrame() &&
+            current->holdsRealFrame() &&
+            next->holdsRealFrame();
 
         if (configuration.dimensions == 3 &&
             !configuration.diagnosticOnly()) {
@@ -584,6 +589,9 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
                                               videoParameters.fieldWidth));
         fieldLine++;
     }
+
+    heldSeq1 = firstField.field.seqNo;
+    heldSeq2 = secondField.field.seqNo;
 
     firstFieldPhaseID  = firstField.field.fieldPhaseID;
     secondFieldPhaseID = secondField.field.fieldPhaseID;
@@ -2427,7 +2435,9 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                  // Best is 1D/2D; keep pre-filled 2D value
                  // clpbuffer[2] already contains clpbuffer[1]
             } else {
-                // Temporal: classic (Y+C) - (Y-C) / 2
+                // Temporal carrier estimate: classic (Y+C) - (Y-C) / 2.
+                // This is a point operation on the full-band locked scalar;
+                // there is no horizontal averaging or HF roll-off here.
                 const double outBest = (base1d - bestSample) * 0.5;
 
                 // Bound the winner with estimates independent of the winner:
@@ -2461,7 +2471,9 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 {
                     clpbuffer[2].pixel[line][h] = outBest;
                 }
-                // Outside the hull, retain the 2D value seeded in clpbuffer[2].
+                // Outside the hull, retain the full-band 2D value seeded in
+                // clpbuffer[2]. The hull can refuse a temporal replacement,
+                // but it never substitutes a filtered carrier.
             }
         }
     }

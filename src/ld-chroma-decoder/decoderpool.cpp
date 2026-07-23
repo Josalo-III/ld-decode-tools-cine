@@ -657,24 +657,52 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         return true;
     };
 
+    // Serve a RUN of consecutive frames, not one.
+    //
+    // The rolling triple-buffer needs {F-1, F, F+1} to emit F, so a call that
+    // emits a single frame must analyse three: measured 3.00 analysed per 1
+    // output in locked 3D (2.00 in 2D), i.e. two thirds of all locked analysis
+    // computed and discarded.  A batch of N amortises the same pre-roll over N
+    // outputs -- (N + 2) / N -- without weakening the estimator anywhere.
+    //
+    // Everything downstream was already batch-shaped: decoder.cpp derives
+    // numFrames from (endIndex - startIndex) and putOutputFrames() walks
+    // startFrameNumber + i.  Only this producer served one at a time.
+    //
+    // Determinism: batch composition depends only on the work-item queue
+    // order, never on which thread asks or how many exist, so the decode stays
+    // reproducible under --threads.  (This is why per-call buffer REUSE was
+    // rejected earlier: round-robin meant a thread rarely held its own
+    // predecessor, and where it did the picture changed with thread count.)
+    fields.clear();
+    for (const auto &pad : paddingHistory) fields.push_back(pad);
+    const int paddingSize = fields.size();
+
+    qint32 servedThisCall = 0;
+
+    for (qint32 batchSlot = 0; batchSlot < decoderBatchFrames; ++batchSlot) {
     CadenceAssembler::WorkItem wi;
+    qint32 thisFrameNumber = 0;
 
     if (cadenceConfig.export24p) {
-        if (!ensureScheduled24p()) return false;
+        if (!ensureScheduled24p()) break;
 
         wi = std::move(scheduled24p.front());
         scheduled24p.pop_front();
 
-        startFrameNumber = nextOutputKey24p++;
+        thisFrameNumber = nextOutputKey24p++;
     } else {
-        if (!ensureWorkItems()) return false;
+        if (!ensureWorkItems()) break;
 
         wi = std::move(workItems.front());
         workItems.pop_front();
 
         // Non-24p path: servedFrameNumber is only a decode ticket, not slot ownership.
-        startFrameNumber = servedFrameNumber;
+        thisFrameNumber = servedFrameNumber;
     }
+
+    if (servedThisCall == 0)
+        startFrameNumber = thisFrameNumber;
 
     // Keep existing reconstruction metadata if you still want it for debugging / future use.
     if (!cadenceConfig.export24p &&
@@ -698,7 +726,7 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         info.spareIsTopDef = (info.f1Role == FrameReconstructionInfo::Role::Def);
 
         QMutexLocker metaLock(&metaDataMutex);
-        frameReconstructionMap[servedFrameNumber] = info;
+        frameReconstructionMap[thisFrameNumber] = info;
     }
     // Build decode ticket for non-24p.
     if (!cadenceConfig.export24p) {
@@ -744,18 +772,21 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
                 if (ticket.duplicateTwin)
                     outstandingUpgradeSeqNos.insert(ticket.twinHomeSeq);
             }
-            decodeTicketsByFrameNumber[startFrameNumber] = ticket;
+            decodeTicketsByFrameNumber[thisFrameNumber] = ticket;
         }
         
     }
 
-    fields.clear();
-
-    for (const auto &pad : paddingHistory) fields.push_back(pad);
-    const int paddingSize = fields.size();
-
     fields.push_back(std::move(wi.f1));
     fields.push_back(std::move(wi.f2));
+
+    servedFrameNumber += 1;
+    ++servedThisCall;
+
+    }   // end batch loop
+
+    if (servedThisCall == 0)
+        return false;
 
     paddingHistory.clear();
     const int total = fields.size();
@@ -803,7 +834,6 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         }
     }
 
-    servedFrameNumber += 1;
     return true;
 }
 

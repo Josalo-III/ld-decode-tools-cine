@@ -385,13 +385,30 @@ public:
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
 
-	// Optional temporal context pointers used by Residual Y 3D election (set by decodeFrames)
-	// Not owned — just references to neighboring FrameBuffer objects (may be nullptr).
-	const FrameBuffer *prevFrameForVet = nullptr;
-	const FrameBuffer *nextFrameForVet = nullptr;
-
 	// Tracks if this frame is the start of a scene (edit boundary).
 	bool isSceneStart = false;
+
+	// Identity of the frame this buffer currently holds, as the seqNos of the
+	// two fields it was loaded from.  The triple-buffer persists across
+	// decodeFrames() calls, so a buffer's contents outlive the call that
+	// produced them; without an identity there is no way to tell a frame that
+	// is still wanted from a stale recycled one.
+	//
+	// Negative means "holds nothing usable as temporal context": either never
+	// loaded, explicitly invalidated after a skipped load, or loaded from the
+	// pool's synthetic black padding (which carries negative seqNos by
+	// construction).  Combing against any of those subtracts something that is
+	// not the neighbouring picture.
+	qint32 heldSeq1 = -1;
+	qint32 heldSeq2 = -1;
+
+	bool holdsRealFrame() const { return heldSeq1 >= 0 && heldSeq2 >= 0; }
+
+	bool holds(const SourceField &a, const SourceField &b) const {
+		return heldSeq1 == a.field.seqNo && heldSeq2 == b.field.seqNo;
+	}
+
+	void forgetHeldFrame() { heldSeq1 = -1; heldSeq2 = -1; }
 
 private:
 	struct Candidate {

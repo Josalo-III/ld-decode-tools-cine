@@ -169,6 +169,12 @@ struct DecodeTicket
     QMutex inputMutex;
     qint32 decoderLookBehind = 0;
     qint32 decoderLookAhead  = 0;
+    // Consecutive frames served per getInputFrames() call.  The rolling
+    // triple-buffer costs a fixed 2-frame pre-roll per call, so the locked
+    // analysis runs (N + 2) / N times per emitted frame: 3.00x at N = 1,
+    // 1.25x at N = 8.  Batch composition depends only on work-item order, so
+    // the decode stays deterministic under --threads.
+    qint32 decoderBatchFrames = 8;
     qint32 inputFrameNumber  = 1;
     qint32 lastFrameNumber   = 1;
     qint32 servedFrameNumber = 1;
