@@ -274,16 +274,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 current->split3D(*previous, *next);
         }
 
-        if (configuration.residualVideo3D) {
-            if (temporalContextReady) {
-                current->prevFrameForVet = previous.get();
-                current->nextFrameForVet = next.get();
-            } else {
-                current->prevFrameForVet = nullptr;
-                current->nextFrameForVet = nullptr;
-            }
-        }
-
         const qint32 frameIndex = (fieldIndex - startIndex) / 2;
         componentFrames[frameIndex].init(videoParameters,
                                          configuration.diagnosticOnly());
@@ -530,10 +520,6 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         // Reusable per-line chroma pre-FIR buffers
         scratch_preI.resize(width, 0.0);
         scratch_preQ.resize(width, 0.0);
-        // New leakage/coherence scratch
-        scratch_yhp.resize(width, 0.0);
-        scratch_yI.resize(width, 0.0);
-        scratch_yQ.resize(width, 0.0);
         // Initialize demod contiguous buffers geometry
         // demodLines indexed by absolute line number (safe upper bound)
         demodWidth = width;
@@ -555,12 +541,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             lockedProductI_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedProductQ_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             lockedCarrierComposite_flat.assign(size_t(demodLines) * demodWidth, 0.0);
-            lockedResidualCarrier_flat.assign(size_t(demodLines) * demodWidth, 0.0);
-            lockedResidualCarrierValid.assign(demodLines, std::uint8_t{0});
-            lockedResidualCarrierLicense_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             carrierImpurity_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             // Cross-color mask pair only exists when the return feature is
-            // explicitly engaged, so the ordinary residual-Y path pays
+            // explicitly engaged, so the ordinary locked path pays
             // neither the memory nor the second pass.
             if (configuration.tunables.CC_SUPPRESSION_WEIGHT > 0.0) {
                 lockedCcMaskRaw_flat.assign(size_t(demodLines) * demodWidth, 0.0f);

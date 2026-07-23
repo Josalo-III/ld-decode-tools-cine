@@ -241,7 +241,7 @@ int main(int argc, char *argv[])
 
     QCommandLineOption ntscPhaseCompOption(QStringList() << "ntsc-phase-comp",
                                            QCoreApplication::translate("main", "NTSC: Adjust phase per-line using burst phase -"
-                                           "also enables the advanced 2D interfield comb and election, high frequency Y from composite residual, and discrete filtering of I and Q"));
+                                           "also enables the advanced 2D/3D comb and HF luma election, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
     QCommandLineOption lumaWitnessOption(QStringList() << "luma-witness",
@@ -258,18 +258,6 @@ int main(int argc, char *argv[])
         QCoreApplication::translate("main",
             "NTSC diagnostic: output raw minus the promoted carrier model directly as GRAY16"));
     parser.addOption(carrierRetractedOnlyOption);
-
-    QCommandLineOption noResidualVideoOption(QStringList() << "no-residual-video",
-                                             QCoreApplication::translate("main", "NTSC (locked mode): Disable composite-derived residual video (Y and color)"));
-    parser.addOption(noResidualVideoOption);
-
-    QCommandLineOption residualVideo3DOption(QStringList() << "residual-video-3d",
-                                         QCoreApplication::translate("main", "Enable temporal enhancement for residual video"));
-    parser.addOption(residualVideo3DOption);
-
-    QCommandLineOption noResidualColorOption(QStringList() << "no-residual-color",
-                                         QCoreApplication::translate("main", "NTSC (locked mode): Keep residual Y but disable residual color refinement"));
-    parser.addOption(noResidualColorOption);
 
     QCommandLineOption adaptThresholdOption(QStringList() << "adapt-threshold",
         QCoreApplication::translate("main",
@@ -578,23 +566,6 @@ int main(int argc, char *argv[])
         combConfig.lumaWitness = true;
     }
 
-    // Residual video rollout: locked mode defaults to both residual Y and
-    // residual color. --no-residual-video disables both; --no-residual-color
-    // keeps residual Y but falls back to coherent color from splitIQlocked().
-    if (combConfig.phaseCompensation) {
-        combConfig.residualVideo = true;
-        combConfig.residualColor = true;
-    }
-
-    if (parser.isSet(noResidualVideoOption)) {
-        combConfig.residualVideo = false;
-        combConfig.residualColor = false;
-    }
-
-    if (parser.isSet(noResidualColorOption)) {
-        combConfig.residualColor = false;
-    }
-
     if (parser.isSet(adaptThresholdOption)) {
         const double v = parser.value(adaptThresholdOption).toDouble();
         if (v <= 0.0) {
@@ -611,10 +582,6 @@ int main(int argc, char *argv[])
             return -1;
         }
         combConfig.chromaWeight = v;
-    }
-
-    if (parser.isSet(residualVideo3DOption)) {
-        combConfig.residualVideo3D = true;
     }
 
     if (parser.isSet(transformThresholdOption)) {

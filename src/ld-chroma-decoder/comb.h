@@ -101,11 +101,6 @@ public:
         };
         TwoDVariant twoDVariant = FieldVsFrame;
 
-        // Opt-in for 3D temporal checks in Residual Y (getBestY)
-        bool residualVideo3D = false;
-        bool residualVideo = false;
-        bool residualColor = false;             
-
         // Scoring / penalties used in candidate selection:
         bool allowOuterFrameTemporal = true;
         bool allowSpatial2DIn3D      = true;
@@ -231,7 +226,8 @@ public:
             // 3D candidate / vet / Y path
             // =========================================================================
             // Similarity curve for temporal candidate scoring in getBestCandidate.
-            // Let d = |candidate − 2D reference| in IRE:
+            // Let d be the mean absolute reconstructed-luma difference over
+            // the centered five-point spatial cross in getCandidate():
             //   d ≤ AGREEMENT_REWARD_RADIUS_IRE  → reward: −AGREEMENT_REWARD_MAX·(1−(d/r)²)
             //   d > AGREEMENT_REWARD_RADIUS_IRE  → neutral
             // Output safety is enforced by the independent-estimate hull at
@@ -239,13 +235,9 @@ public:
             double AGREEMENT_REWARD_RADIUS_IRE = 7.5; // half-width of the reward lobe (IRE)
             double AGREEMENT_REWARD_MAX        = 3.3; // peak reward at d=0 (penalty units, scaled by adaptThreshold)
             double AGREEMENT_VETO_BASE         = 7.0; // RETIRED / inert: retained for tuning compatibility
-            double deviationThreshold          = 10.0; // residual-Y temporal mixing veto; getBestY only
             double deviationPenalty            = 3.3; // RETIRED / inert: retained for tuning compatibility
             double TEMPORAL_HULL_SLACK_IRE      = 1.5; // output may exceed the independent 2D/partner hull by this much
 
-            // 3D Residual Y selection
-            bool   RESIDUAL_Y_ELECTION     = true; // true = winner-take-all; false = median-weighted blend
-            double NEIGHBOR_SHAPE_STRENGTH = 0.5;  // how strongly spatial neighbor consensus pulls the 3D Y election
             // produceY local HF election.  A candidate earns this capped
             // advantage only when its HF magnitude is continued by a robust
             // N/S/E/W image neighbour; unsupported amplitude earns nothing.
@@ -352,16 +344,9 @@ public:
 	// clear or privately recreate them.
 	// prevFrame: the comb pipeline's temporally previous FrameBuffer (its
 	// grammar + harvested bandpass supply the frame-axis conformance test).
-	// This is the comb's own 3D structure — never gated on the
-	// residual-video-3D enhancement.  Null when no contiguous predecessor.
+	// This is the comb's own 3D structure. Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCarrierRetractionStage(bool analysisOnly);
-	void buildResidualCarrierEstimateRow(int line,
-	                                    const quint16 *rawLine,
-	                                    const double *lumaBasis,
-	                                    const float *tiLockedRow,
-	                                    const float *tqLockedRow,
-	                                    double *carrierOut);
 
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
@@ -629,26 +614,6 @@ private:
 	// remodulated to composite). produceY subtracts this from raw to form Y, so
 	// the carrier removed from luma is exactly the carrier rendered as colour.
 	std::vector<double> lockedCarrierComposite_flat;
-	// Affine/polar residual-Y carrier refinement per line, built once by
-	// produceY from the SAME selected-comb locked IQ used by coherent Y.
-	// produceY consumes it for the centre line and up to four vertical
-	// neighbours, so computing it locally reconstructed every line's value up
-	// to five times.
-	// The companion valid byte marks the rows that were actually built (a null
-	// row accessor stands in for the old "no residual refinement here" case).
-	std::vector<double> lockedResidualCarrier_flat;
-	std::vector<std::uint8_t> lockedResidualCarrierValid;
-	// Operand schedule-compatibility license [0,1] per pixel for the residual
-	// carrier estimate (cHat).  Built in the produceY prepass by testing the
-	// OPERAND itself — cHat against its ±1 partner's cHat under the grammar
-	// relation — over one 4-sample cycle.  cHat is comb IQ affined/polar-
-	// refined, so its lineage is already schedule-legal; the only residual
-	// question is whether the refinement absorbed off-schedule energy (alien
-	// luma: the fitted waveform then MATCHES the partner where the schedule
-	// demands inversion).  One observed on-schedule alternation licenses at
-	// any spatial scale; unobservable (quiet partner) fails closed.  No raw-
-	// bandpass votes, axis counts, or run-length demands are involved.
-	std::vector<float> lockedResidualCarrierLicense_flat;
 	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D
 	// as a provisional read; measurePostCombImpurity() overwrites it with the
 	// elected-comb reading before splitIQlocked() consumes it.
@@ -661,8 +626,8 @@ private:
 	// suppression policy converts it at the consumption sites.
 	std::vector<float> regionSamePartner_flat;
 	// Cross-color suppression weight [0,1] per pixel, computed once by
-	// splitIQlocked() and consumed by both chroma renderers (coherent
-	// lockedProduct and residualColor).  Raw = the per-pixel policy verdict;
+	// splitIQlocked() and applied to the coherent lockedProduct chroma.
+	// Raw = the per-pixel policy verdict;
 	// the applied mask is its band-limited envelope (in-field ±2 vertical mix
 	// + lateral boxcar): applied per-sample the raw weight carries
 	// regionKeep's hard flips and gA's ring chatter at pixel pitch, which
@@ -713,12 +678,8 @@ private:
 		std::vector<double> scratch_preQ;          // Unscaled pre-FIR Q row (per-line).
 		std::vector<double> scratch_preI_ext;      // Edge-extended I row for FIR.
 		std::vector<double> scratch_preQ_ext;      // Edge-extended Q row for FIR.
-        // Per-line HP-Y and predictor demod scratch (used by splitIQlocked leakage cancellation)
-		std::vector<double> scratch_yhp;   // simple HP of Y (per-line)
-		std::vector<double> scratch_yI;    // demodulated HP-Y I component (post-affine)
-		std::vector<double> scratch_yQ;    // demodulated HP-Y Q component (post-affine)
 		std::vector<double> scratch_outMixed; // FVF elected mixed scalar output row.
-		std::vector<double> scratch_lateralLine; // 1D lateral reference row / vet confidence row.
+		std::vector<double> scratch_lateralLine; // 1D lateral/reference row.
 		std::vector<std::vector<float>> w2d_frame_weight;
 		std::vector<std::vector<double>> w2d_fieldA_gate;
 		std::vector<std::vector<FvfModelMetrics>> fvfMetrics;
@@ -758,10 +719,10 @@ private:
     std::vector<std::complex<double>> scratch_fbPadDn;
     std::vector<std::complex<double>> scratch_fbDiff0;
     std::vector<std::complex<double>> scratch_fbDevRows;
-		// Shared line scratch planes used by split2D / produceY.
-		std::vector<double> scratch_lineWorkA; // Field A scalar row; tiAdjLocked in produceY.
-		std::vector<double> scratch_lineWorkB; // Field gate row; coherent carrier estimate (cHat) in produceY.
-		std::vector<double> scratch_lineWorkC; // Field B scalar row; tqAdjLocked in produceY.
+		// Shared line scratch planes used by split2D and witness retraction.
+		std::vector<double> scratch_lineWorkA; // Field A scalar / carrier-fit row.
+		std::vector<double> scratch_lineWorkB; // Field gate / witness basis-I row.
+		std::vector<double> scratch_lineWorkC; // Field B scalar / flattened row.
 	// FVF divergence cluster: per-pixel condition DATA, pooled once per line and
 	// consumed by the election (central management). Pure information — no
 	// decisions live here; the consumer acts. Per-line now; promote to a 3-deep
@@ -1204,12 +1165,6 @@ private:
 						   qint32 lineNumber, qint32 h,
 						   double adjustPenalty) const;
 
-	// Dedicated 3D residual-Y selector. Consumes the best pre-output luma
-	// available from each frame (witness when present, otherwise the coherent
-	// residual/comb baseline) rather than the stale raw-clpbuffer fallback.
-	double getBestY(qint32 line, qint32 h,
-					const FrameBuffer &prev, const FrameBuffer &next) const;
-	
 	int demodWidth  = 0;
 	int demodLines  = 0;
 
@@ -1278,36 +1233,6 @@ private:
 	inline const double* lockedCarrierComposite_line(int line) const {
 		if (lockedCarrierComposite_flat.empty()) return nullptr;
 		return lockedCarrierComposite_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	// Writable row for the produceY prepass builder (bounds-checked, no validity
-	// gate — the caller sets the valid byte once the row is populated).
-	inline double* lockedResidualCarrier_rowForBuild(int line) {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    lockedResidualCarrier_flat.empty()) return nullptr;
-		return lockedResidualCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	// Reader: returns the row only where the prepass actually built it, so a null
-	// result means "no residual refinement for this line" exactly as before.
-	inline const double* lockedResidualCarrier_line(int line) const {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    lockedResidualCarrier_flat.empty() ||
-		    line >= static_cast<int>(lockedResidualCarrierValid.size()) ||
-		    !lockedResidualCarrierValid[line]) return nullptr;
-		return lockedResidualCarrier_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	inline float* lockedResidualCarrierLicense_rowForBuild(int line) {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    lockedResidualCarrierLicense_flat.empty()) return nullptr;
-		return lockedResidualCarrierLicense_flat.data() + static_cast<size_t>(line) * demodWidth;
-	}
-	// License row follows the carrier row's validity: null where the operand
-	// row itself was never built.
-	inline const float* lockedResidualCarrierLicense_line(int line) const {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    lockedResidualCarrierLicense_flat.empty() ||
-		    line >= static_cast<int>(lockedResidualCarrierValid.size()) ||
-		    !lockedResidualCarrierValid[line]) return nullptr;
-		return lockedResidualCarrierLicense_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* carrierImpurity_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
@@ -1380,6 +1305,15 @@ private:
 		if (!carrierRetractedValid || demodWidth <= 0 ||
 		    line < 0 || line >= demodLines) return nullptr;
 		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	// The NATIVE per-line fit, before any vertical promotion.  raw minus this
+	// is the independent inverse-encoder view; raw minus combedCarrier is the
+	// comb-conditioned one.  They are different products and must not be
+	// confused: only the native fit is free of Field/Frame reach policy.
+	inline const float* carrierFit_line(int line) const {
+		if (!carrierRetractionModelValid || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines) return nullptr;
+		return carrierFit_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* combedCarrier_line(int line) {
 		if (!carrierRetractedValid || demodWidth <= 0 ||
