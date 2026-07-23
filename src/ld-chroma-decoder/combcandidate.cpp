@@ -136,11 +136,11 @@ struct FieldBTapPolicy {
     double centerCede = 0.0;
 };
 
-constexpr std::uint8_t FieldBCedeCenter = 1u << 0;
-constexpr std::uint8_t FieldBCedeStrongAsym = 1u << 1;
+constexpr std::uint8_t FieldBCedeCenter       = 1u << 0;
+constexpr std::uint8_t FieldBCedeBoundaryBand = 1u << 1;
 
-constexpr std::uint8_t FieldACedeCenter = 1u << 0;
-constexpr std::uint8_t FieldACedeStrongAsym = 1u << 1;
+constexpr std::uint8_t FieldACedeCenter       = 1u << 0;
+constexpr std::uint8_t FieldACedeStrongAsym   = 1u << 1;
 
 std::uint8_t fieldARegionCedeFlags(
     const CombContentReach::IntrafieldRegionReach &region)
@@ -191,7 +191,18 @@ std::uint8_t fieldBRegionCedeFlags(
     const CombContentReach::IntrafieldRegionReach &region)
 {
     using R = CombContentReach::RegionRelation;
-    if (!region.valid) return 0;
+
+    std::uint8_t flags = 0;
+
+    // The expanded band remains valid even when this particular column had
+    // no independently measurable center/leg region relationship.
+    if (region.chromaBoundaryBand) {
+        flags |= FieldBCedeCenter |
+                 FieldBCedeBoundaryBand;
+    }
+
+    if (!region.valid)
+        return flags;
 
     const bool upDifferent = region.up == R::DifferentRegion;
     const bool downDifferent = region.down == R::DifferentRegion;
@@ -202,11 +213,12 @@ std::uint8_t fieldBRegionCedeFlags(
     const bool upContinues = upSame || upAlien;
     const bool downContinues = downSame || downAlien;
 
-    std::uint8_t flags = 0;
-    if (region.centerIsland) flags |= FieldBCedeCenter;
-    if (region.strongAsym)
-        flags |= FieldBCedeCenter | FieldBCedeStrongAsym;
+    if (region.centerIsland)
+        flags |= FieldBCedeCenter;
 
+    if (region.strongAsym)
+        flags |= FieldBCedeCenter;
+        
     if ((upDifferent && !downContinues) ||
         (downDifferent && !upContinues))
         flags |= FieldBCedeCenter;
@@ -1013,7 +1025,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                     tapLine.regionDown4[rel] = region4.down;
                 }
             }
-
+            CombContentReach::markIntrafieldChromaBoundaryBand(
+                tapLine.intrafieldRegionReach,
+                4);
         }
     }
 
@@ -1792,18 +1806,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         const auto &region = rel < (int)tapLine.intrafieldRegionReach.size()
             ? tapLine.intrafieldRegionReach[rel] : unknownRegion;
 
-        std::uint8_t cedeFlags = fieldBRegionCedeFlags(region);
-        const int lo = std::max(0, rel - 4);
-        const int hi = std::min(width - 1, rel + 4);
-        for (int k = lo; k <= hi; ++k) {
-            if (k >= (int)tapLine.intrafieldRegionReach.size()) break;
-            if (fieldBRegionCedeFlags(tapLine.intrafieldRegionReach[k]) &
-                FieldBCedeStrongAsym)
-            {
-                cedeFlags |= FieldBCedeCenter | FieldBCedeStrongAsym;
-            }
-        }
-
+        const std::uint8_t cedeFlags =
+            fieldBRegionCedeFlags(region);
+            
         // Vector size is not evidence: an absent neighbour row is filled from
         // the centre, so the deltas below would read a flat zero -- "no luma
         // break anywhere" -- and silently license every context test.
@@ -1871,9 +1876,14 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             twoSidedAlienCancel &&
             lateralContextIntact &&
             verticalContextIntact;
+        const bool boundaryBandCede =
+            (cedeFlags & FieldBCedeBoundaryBand) != 0;
+        
         const bool structuralRegionCede =
-            (cedeFlags & FieldBCedeCenter) != 0 && !provenLumaCancellation;
-
+            boundaryBandCede ||
+            (((cedeFlags & FieldBCedeCenter) != 0) &&
+             !provenLumaCancellation);
+             
         // Field B's decisive two-leg recovery. A policy refusal must not
         // strand 1D residue when the complete ±2 method agrees on a single
         // neighbor estimate and the carrier-free luma service says the three

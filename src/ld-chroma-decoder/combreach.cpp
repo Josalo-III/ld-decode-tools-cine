@@ -651,8 +651,67 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
             out.threeRegion = outerDifferent;
         }
     }
-
+    const bool bothAlienCancel =
+        out.up == RegionRelation::AlienCancel &&
+        out.down == RegionRelation::AlienCancel;
+    
+    const bool anyDifferentRegion =
+        out.up == RegionRelation::DifferentRegion ||
+        out.down == RegionRelation::DifferentRegion;
+    
+    // The two legs themselves occupy different chroma regions. This catches
+    // the center-on-boundary case where center may resemble either leg enough
+    // to avoid centerIsland.
+    const bool outerChromaBoundary =
+        out.outerComparable &&
+        (out.upDownDifferenceIRE >= 6.0 ||
+         out.upDownHueDifferenceDeg >= kDifferentHueDeg);
+    
+    // Two-sided AlienCancel is the explicit cancellation class and is not a
+    // chroma boundary. A single AlienCancel does not erase a DifferentRegion
+    // verdict on the other side.
+    out.chromaBoundarySeed =
+        out.valid &&
+        !bothAlienCancel &&
+        (out.strongAsym ||
+         anyDifferentRegion ||
+         outerChromaBoundary);
+    
+    // Before the row-level pass, the seed owns only its current column.
+    out.chromaBoundaryBand = out.chromaBoundarySeed;
+    
     return out;
+}
+
+void markIntrafieldChromaBoundaryBand(
+    std::vector<IntrafieldRegionReach> &row,
+    int radius)
+{
+    const int n = static_cast<int>(row.size());
+    if (n <= 0)
+        return;
+
+    radius = std::max(0, radius);
+
+    int activeSeeds = 0;
+    const int initialHi = std::min(n - 1, radius);
+    for (int x = 0; x <= initialHi; ++x) {
+        if (row[x].chromaBoundarySeed)
+            ++activeSeeds;
+    }
+
+    for (int x = 0; x < n; ++x) {
+        row[x].chromaBoundaryBand = activeSeeds > 0;
+
+        // Advance from the window centred at x to the window centred at x+1.
+        const int leaving = x - radius;
+        const int entering = x + radius + 1;
+
+        if (leaving >= 0 && row[leaving].chromaBoundarySeed)
+            --activeSeeds;
+        if (entering < n && row[entering].chromaBoundarySeed)
+            ++activeSeeds;
+    }
 }
 
 MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,

@@ -241,20 +241,24 @@ struct IntrafieldRegionReach {
     double upHueDifferenceDeg = 0.0;
     double downHueDifferenceDeg = 0.0;
     double upDownHueDifferenceDeg = 0.0;
-    // Validity for the two upDown* fields above: false means the angle was
-    // never measured (a leg below the chroma floor), NOT that the legs agree.
-    // Consult before reading upDownHueDifferenceDeg as evidence.
     bool outerComparable = false;
 
     bool centerIsland = false;
     bool threeRegion = false;
-
-    // True when a leg classified Different through the magnitude-asymmetry
-    // branch and the strong side was independently admitted by the carrier
-    // schedule.  This is the drop-shadow signature, distinct from hue-based
-    // Different verdicts in ordinary low-saturation texture.
     bool strongAsym = false;
+
+    // A local sample whose vertical chroma geometry proves that the
+    // +/-2 aperture crosses a chroma-region boundary.
+    bool chromaBoundarySeed = false;
+
+    // Row-level expansion of chromaBoundarySeed. Every sample in this
+    // band receives one uniform render from consumers that adopt the rule.
+    bool chromaBoundaryBand = false;
 };
+
+void markIntrafieldChromaBoundaryBand(
+    std::vector<IntrafieldRegionReach> &row,
+    int radius);
 
 IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const std::complex<double> &center,
