@@ -675,7 +675,22 @@ private:
 	std::vector<float> carrierRetracted_flat;    // raw - promoted carrier model (retracted view, not final Y)
 	std::vector<float> flatFloor_flat;           // 4-sample carrier-free luma floor
 	std::vector<float> combedCarrier_flat;       // grammar-reached interline carrier fit
-	std::vector<std::uint8_t> carrierEligible_flat; // schedule-conformance projection (1 = eligible)
+	// Envelope-scale schedule corroboration in [0,1]: how much of the
+	// published fit is PROVEN carrier by relation-folded alternation
+	// evidence, integrated at the aperture the encoder bandwidth law
+	// defines (a legal envelope cannot vary faster than ~1.3 MHz, so
+	// alternation evidence about it is only meaningful at that scale).
+	// Scales the carrier the published retracted view withdraws; varies
+	// no faster than a legal envelope, so the scaling manufactures no
+	// out-of-band sidebands.
+	std::vector<float> carrierCorroboration_flat;
+	// Graded schedule-conformance participation in [0,1], from the table-owned
+	// carrierTrust() on the scanner's MEASUREMENT (carrierConformance +
+	// support fraction) — never the thresholded enum.  1 = full participant
+	// (legal / unresolved / quiet), 0 = decisively proven schedule-illegal.
+	// The old uint8 projection quantized a smooth vertical correlation to one
+	// bit and made the retraction's engage/disengage flip at line pitch.
+	std::vector<float> carrierEligibility_flat;
 	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat; // per-pixel four-view evidence
 	bool carrierRetractedValid = false;
 	bool carrierRetractionModelValid = false;
