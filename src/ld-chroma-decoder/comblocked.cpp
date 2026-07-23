@@ -16,8 +16,10 @@
 
 #include "comb.h"
 #include "combmath.h"
+#include "feasibleband.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -32,6 +34,41 @@ inline double smoothGate01(double t)
 {
     t = std::clamp(t, 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
+}
+
+// Mean over an even effective sample weight, but with an integer centroid.
+// Support is effectiveWidth+1 samples: half weight at center +/- half and
+// full weight between.  The endpoints are the same carrier phase, so their
+// two halves preserve the complete-cycle population of the old even window.
+// Edge replication keeps the coordinate fixed instead of sliding the aperture
+// away from the requested sample.
+inline double centeredEvenWeightMean(const double *values,
+                                     const double *prefix,
+                                     int width,
+                                     int center,
+                                     int effectiveWidth)
+{
+    if (!values || !prefix || width <= 0 || effectiveWidth <= 0 ||
+        (effectiveWidth & 1))
+        return 0.0;
+
+    const int half = effectiveWidth / 2;
+    const int lo = center - half;
+    const int hi = center + half;
+    double sum = 0.0;
+
+    if (lo >= 0 && hi < width) {
+        sum = 0.5 * (values[lo] + values[hi]) +
+              (prefix[hi] - prefix[lo + 1]);
+    } else {
+        for (int k = -half; k <= half; ++k) {
+            const int x = std::clamp(center + k, 0, width - 1);
+            const double w = (k == -half || k == half) ? 0.5 : 1.0;
+            sum += w * values[x];
+        }
+    }
+
+    return sum / static_cast<double>(effectiveWidth);
 }
 
 // produceY coarse-platform selector (witness isolation knob).
@@ -194,15 +231,14 @@ void Comb::FrameBuffer::phaseLocked()
             for (int xi = lastStart + 1; xi < width; ++xi)
                 boxcar[xi] = boxcar[lastStart];
 
-            // The lurch prior is registered to the current pixel, not to the
-            // window's left edge. This must match buildCarrierRetractionStage:
-            // pixel xi starts from the legal mean whose aperture is xi-1..xi+2.
-            // Copying boxcar[xi] here shifts the whole witness floor one sample
-            // and publishes its edge error as a carrier-rate raster when HF is
-            // reconstructed on top of it.
+            // Register the even four-sample means at integer xi by averaging
+            // the two half-sample apertures on either side.  Their combination
+            // is the phase-balanced five-sample support
+            // (0.5,1,1,1,0.5)/4 centred exactly at xi.
             for (int xi = 0; xi < width; ++xi) {
-                const int sc = std::clamp(xi - 1, 0, lastStart);
-                sharp[xi] = boxcar[sc];
+                const int s0 = std::clamp(xi - 2, 0, lastStart);
+                const int s1 = std::clamp(xi - 1, 0, lastStart);
+                sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
             }
             lurchSharpenCoarsePrior(boxcar.data(), width - 3, width,
                                     sharp, gateScratch.data(), sharpLevel);
@@ -781,6 +817,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     std::vector<double> demI(width), demQ(width);
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
+    std::vector<double> wLaw(width), wLawSmooth(width);
+    std::vector<double> nativeI4(width), nativeQ4(width);
 
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine =
@@ -1000,7 +1038,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         float *impurityRow = carrierImpurity_line(line);
 
         // Pass 2: wide-window cross-color detector.  Publishes carrierImpurity;
-        // the emitted source is the clean bandpass (no gain on the carrier).
+        // the emitted source is the bandpass under the envelope-legality
+        // restraint below (an envelope-scale weight, never a carrier-rate gain).
         //
         // Demodulate the bandpass into quadrature against the period-4
         // reference (for the wide coherent fit) and form the 2-sample fit
@@ -1025,23 +1064,81 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // Wide coherent envelope: |sum(I,Q)| over the window, normalized so a
         // coherent carrier of amplitude A returns ~A regardless of width.
         auto wideEnvIRE = [&](int center) -> double {
-            const int a = std::clamp(center - kWideWin / 2, 0, width);
-            const int b = std::clamp(a + kWideWin, 0, width);
-            const double sumI = preI[b] - preI[a];
-            const double sumQ = preQ[b] - preQ[a];
-            const double n = static_cast<double>(std::max(1, b - a));
-            return (2.0 * boundedMag(sumI, sumQ) / n) * invIreScale;
+            const double meanI = centeredEvenWeightMean(
+                demI.data(), preI.data(), width, center, kWideWin);
+            const double meanQ = centeredEvenWeightMean(
+                demQ.data(), preQ.data(), width, center, kWideWin);
+            return 2.0 * boundedMag(meanI, meanQ) * invIreScale;
         };
 
         // Narrow fit: rolling, current-centered mean of the 2-sample envelope.
         // The point envelope = A on coherent carrier but ripples at 2fsc under
-        // phase error; the centered mean over 4 cycles nulls that ripple.
+        // phase error; the mean over 4 cycles nulls that ripple.  env[k]
+        // describes the pair (k,k+1), so its physical coordinate is k+0.5:
+        // indices center-8 through center+7 are already centred on `center`.
         auto narrowEnvIRE = [&](int center) -> double {
             const int a = std::clamp(center - kNarrowWin / 2, 0, width);
             const int b = std::clamp(a + kNarrowWin, 0, width);
             const double n = static_cast<double>(std::max(1, b - a));
             return ((preEnv[b] - preEnv[a]) / n) * invIreScale;
         };
+
+        // Envelope-legality restraint on the emitted source (encoder
+        // bandwidth law, imposed at envelope scale).
+        //
+        // A legal chroma envelope is bandlimited to 1.3 MHz -- ~11 samples
+        // at 4fSC -- so corroboration evidence about the envelope is
+        // meaningful only at that scale, and the ceiling is the encoder's
+        // own law: demodulated I/Q passed through the encoder's 1.3 MHz
+        // chroma kernel is everything the encoder could have modulated
+        // here; envelope the source holds above that (plus noise slack) is
+        // inexpressible as chroma.  It is luma the blind bandpass
+        // swallowed, and restraining it returns the energy to Y through
+        // raw - lockedSource, where it belongs.  Both sides of the ratio
+        // are smoothed by the SAME kernel, so the comparison never mixes
+        // scales.  (Two falsified ceilings, kept as negative results: the
+        // 2-sample POINT envelope under an envelope-scale ceiling rectifies
+        // noise/sideband ripple into ~25% desaturation of legal saturated
+        // bars; a coherent VECTOR mean over the law window punishes legal
+        // I/Q modulation -- the law bounds envelope bandwidth, not phasor
+        // constancy -- and still cost the bars ~21%.)
+        //
+        // The historical prohibition on any source gain ("checkerboard by
+        // construction") was a prohibition on CARRIER-RATE gain: a
+        // bandlimited carrier times a fast gain is amplitude modulation that
+        // manufactures out-of-band sidebands.  This weight is gathered at
+        // envelope scale and applied through the encoder's own envelope
+        // kernel, so it varies no faster than a legal envelope may -- it
+        // cannot manufacture sidebands.  Genuine chroma, including legal
+        // 1.3 MHz edges, is expressible by construction and passes at
+        // w = 1; the weight never exceeds 1, so it can only return energy
+        // to Y, never manufacture carrier.
+        constexpr double kLawSlackIRE = 2.0;  // noise inflation of the envelope
+        const double lawSlack = kLawSlackIRE * irescale;
+        // Expressible envelope: encoder kernel over demod I/Q.  The demod
+        // products demI/demQ carry the 2fsc image term; the kernel itself
+        // rejects it (-20 dB well below the image), so no separate image
+        // cancellation is needed.  wLaw reuses the scratch vectors as the
+        // kernel-smoothed I and Q before being overwritten with the weight.
+        lddecode::projectExpressibleChromaEnvelope(
+            demI.data(), nullptr, width, wLaw.data());
+        lddecode::projectExpressibleChromaEnvelope(
+            demQ.data(), nullptr, width, wLawSmooth.data());
+        for (int rel = 0; rel < width; ++rel) {
+            const double lpEnv =
+                2.0 * boundedMag(wLaw[rel], wLawSmooth[rel]);
+            wLaw[rel] = lpEnv;
+        }
+        // Source envelope, smoothed by the same kernel (like for like).
+        lddecode::projectExpressibleChromaEnvelope(
+            env.data(), nullptr, width, wLawSmooth.data());
+        for (int rel = 0; rel < width; ++rel) {
+            const double ceiling = wLaw[rel] + lawSlack;
+            const double srcEnv = wLawSmooth[rel];
+            wLaw[rel] = srcEnv > ceiling ? ceiling / srcEnv : 1.0;
+        }
+        lddecode::projectExpressibleChromaEnvelope(
+            wLaw.data(), nullptr, width, wLawSmooth.data());
 
         const bool crDiagThisLine =
             crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
@@ -1066,18 +1163,17 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         }
 
         // Aperture cross-color detector.  Publishes gA = aperture contamination
-        // as carrierImpurity; the emitted source is the CLEAN, FULL bandpass.
+        // as carrierImpurity; gA is never a source gain.
         //
-        // The correction is NOT applied to the source.  In the locked path Y is
-        // raw - clpLine and (with --no-residual-color) chroma is demod(clpLine)
-        // from lockedProduct.  Reducing clpLine would leave the removed residual
-        // as carrier-band energy in Y == checkerboard (and in residualColor mode
-        // luma and chroma are rigidly complementary, so any source correction is
-        // a checkerboard by construction).  The carrier source must therefore be
-        // emitted at full strength so Y = raw - full carrier has no carrier-band
-        // ripple; the cross-color correction lives on the COLOR side only, as the
-        // gA alpha applied in splitIQlocked().  This requires the lockedProduct
-        // chroma path: run --no-residual-color.
+        // gA is NOT applied to the source.  Coherent contamination (dubbed
+        // cross-color) is corroborated at envelope scale, so the legality
+        // restraint above passes it untouched; discriminating it from
+        // authentic chroma is gA's job, and that correction lives on the
+        // COLOR side only, as the gA alpha applied in splitIQlocked().
+        // A per-pixel gA gain on the source would be carrier-rate AM, and
+        // removing coherent carrier from the source would strand its
+        // complement in Y as checkerboard. The lockedProduct chroma path
+        // therefore remains separate from luma policy.
         //
         // Winding is deliberately NOT used: control measurements on saturated
         // clothing showed coh/turn overlap authentic chroma and contamination,
@@ -1095,11 +1191,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             fvfRelLimit > 0 ? fvfMetrics[line].data() : nullptr;
         for (int rel = 0; rel < width; ++rel) {
             // Stable centre Zwide on the cycle grid (8-cycle complex mean).
-            const int wa = std::clamp(rel - kWideWin / 2, 0, width);
-            const int wb = std::clamp(wa + kWideWin, 0, width);
-            const double wn = std::max(1, wb - wa);
-            const double ZwI = (preI[wb] - preI[wa]) / wn;
-            const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+            const double ZwI = centeredEvenWeightMean(
+                demI.data(), preI.data(), width, rel, kWideWin);
+            const double ZwQ = centeredEvenWeightMean(
+                demQ.data(), preQ.data(), width, rel, kWideWin);
 
             const double narrowMag = narrowEnvIRE(rel);
             const double wideMag = 2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
@@ -1117,11 +1212,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 const double wideSample =
                     2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
 
-                const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
-                const int nb = std::clamp(na + kNarrowWin, 0, width);
-                const double nn = static_cast<double>(std::max(1, nb - na));
-                const double ZnI = (preI[nb] - preI[na]) / nn;
-                const double ZnQ = (preQ[nb] - preQ[na]) / nn;
+                const double ZnI = centeredEvenWeightMean(
+                    demI.data(), preI.data(), width, rel, kNarrowWin);
+                const double ZnQ = centeredEvenWeightMean(
+                    demQ.data(), preQ.data(), width, rel, kNarrowWin);
                 const double shortSample =
                     2.0 * (ZnI * cosRef[p] + ZnQ * sinRef[p]);
 
@@ -1231,11 +1325,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                     gA);
             }
 
-            // The emitted source remains the full-resolution ordinary carrier
-            // plus any explicitly bounded 1D repair. Whitestar and the fits are
-            // evidence/policy inputs only; no diagnostic projection becomes
-            // picture here.
-            restrainedLine[rel] = bpLine[rel];
+            // The emitted source is the full-resolution ordinary carrier plus
+            // any explicitly bounded 1D repair, bounded by the envelope-
+            // legality weight above. Whitestar and the fits are evidence/policy
+            // inputs only; no diagnostic projection becomes picture here.
+            restrainedLine[rel] = wLawSmooth[rel] * bpLine[rel];
 
             if (impurityRow)
                 impurityRow[rel] = static_cast<float>(gA);
@@ -1258,11 +1352,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         if (carrierAnalysis) {
             for (int rel = 0; rel < width; ++rel) {
                 const int p = carrierSampleClass(line, left + rel) & 3;
-                const int wa = std::clamp(rel - kWideWin / 2, 0, width);
-                const int wb = std::clamp(wa + kWideWin, 0, width);
-                const double wn = std::max(1, wb - wa);
-                const double ZwI = (preI[wb] - preI[wa]) / wn;
-                const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+                const double ZwI = centeredEvenWeightMean(
+                    demI.data(), preI.data(), width, rel, kWideWin);
+                const double ZwQ = centeredEvenWeightMean(
+                    demQ.data(), preQ.data(), width, rel, kWideWin);
                 const double wideSample =
                     2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
                 const double wideMag =
@@ -1271,11 +1364,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
 
                 auto &record = carrierAnalysis[rel];
                 if (!record.fit.valid) {
-                    const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
-                    const int nb = std::clamp(na + kNarrowWin, 0, width);
-                    const double nn = static_cast<double>(std::max(1, nb - na));
-                    const double ZnI = (preI[nb] - preI[na]) / nn;
-                    const double ZnQ = (preQ[nb] - preQ[na]) / nn;
+                    const double ZnI = centeredEvenWeightMean(
+                        demI.data(), preI.data(), width, rel, kNarrowWin);
+                    const double ZnQ = centeredEvenWeightMean(
+                        demQ.data(), preQ.data(), width, rel, kNarrowWin);
                     const double shortSample =
                         2.0 * (ZnI * cosRef[p] + ZnQ * sinRef[p]);
                     const double sourceSample = bpLine[rel];
@@ -1320,11 +1412,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const int c1 = std::clamp(ccDiagC1 < 0 ? ccDiagC0 : ccDiagC1, c0, width - 1);
             for (int rel = c0; rel <= c1; ++rel) {
                 // Stable centre Zwide (8-cycle complex mean).
-                const int wa = std::clamp(rel - kWideWin / 2, 0, width);
-                const int wb = std::clamp(wa + kWideWin, 0, width);
-                const double wn = std::max(1, wb - wa);
-                const double ZwI = (preI[wb] - preI[wa]) / wn;
-                const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+                const double ZwI = centeredEvenWeightMean(
+                    demI.data(), preI.data(), width, rel, kWideWin);
+                const double ZwQ = centeredEvenWeightMean(
+                    demQ.data(), preQ.data(), width, rel, kWideWin);
                 const double stableAmpIRE = 2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
 
                 const double narrowMag = narrowEnvIRE(rel);
@@ -1340,14 +1431,20 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 int nk = 0;
                 double prevTheta = 0.0;
                 bool havePrev = false;
-                const int ka = std::clamp(rel - kNarrowWin / 2, 0, width);
-                const int kb = std::clamp(ka + kNarrowWin, 0, width);
-                for (int k = ka; k < kb; ++k) {
-                    const int ca = std::clamp(k - 2, 0, width);
-                    const int cb = std::clamp(k + 2, 0, width);
-                    const double cn = std::max(1, cb - ca);
-                    const double ZcI = (preI[cb] - preI[ca]) / cn;
-                    const double ZcQ = (preQ[cb] - preQ[ca]) / cn;
+                const int ka = rel - kNarrowWin / 2;
+                const int kb = rel + kNarrowWin / 2;
+                for (int k = ka; k <= kb; ++k) {
+                    auto demAt = [&](const std::vector<double> &v, int x) {
+                        return v[std::clamp(x, 0, width - 1)];
+                    };
+                    const double ZcI = centeredCarrierCycle4Mean(
+                        demAt(demI, k - 2), demAt(demI, k - 1),
+                        demAt(demI, k), demAt(demI, k + 1),
+                        demAt(demI, k + 2));
+                    const double ZcQ = centeredCarrierCycle4Mean(
+                        demAt(demQ, k - 2), demAt(demQ, k - 1),
+                        demAt(demQ, k), demAt(demQ, k + 1),
+                        demAt(demQ, k + 2));
                     const double Ri = ZcI - ZwI;
                     const double Rq = ZcQ - ZwQ;
                     const double Rmag = std::hypot(Ri, Rq);
@@ -1383,13 +1480,18 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
         }
 
-        // Pass 3: publish the restrained source through the existing locked
-        // carrier grammar. The burst-aware LUTs build common-4fsc IQ; the
-        // scalar publish must then defer to the carrier-grammar remod cursor so
-        // samplePhase0 / line-flip policy lives in one place instead of in the
-        // old per-leg scale math.
-        auto remodCursor = lddecode::carrierGrammarCompositeRemodCursor(
-            grammar, left, 1.0, lddecode::CarrierSignFrame::Grid4fsc);
+        // Pass 3a: publish two distinct NATIVE products without confusing
+        // their phase contracts:
+        //
+        //   * demodI/Q and demodI/Q4 are sample-local carrier products;
+        //   * restrainedLine is already a scalar carrier in physical composite
+        //     sample geometry.
+        //
+        // The scalar must therefore be copied, not demodulated and remodulated.
+        // The locked basis includes CAL_EPS while the Grid4fsc remodulator does
+        // not; round-tripping the scalar through those unlike bases multiplies
+        // it by cos(CAL_EPS*pi/2), leaving a small carrier residue in every
+        // downstream raw-minus-carrier reconstruction.
         for (int rel = 0; rel < width; ++rel) {
             const int h = left + rel;
             const int phase = carrierSampleClass(line, h);
@@ -1399,22 +1501,35 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double q = source * lutQ[phase];
             const double i4 = source * i4Scale[phase];
             const double q4 = source * q4Scale[phase];
+            nativeI4[rel] = i4;
+            nativeQ4[rel] = q4;
 
             if (demodI) demodI[rel] = static_cast<float>(i);
             if (demodQ) demodQ[rel] = static_cast<float>(q);
             if (demodI4) demodI4[rel] = static_cast<float>(i4);
             if (demodQ4) demodQ4[rel] = static_cast<float>(q4);
+            lockedSource[rel] = source;
+        }
+
+        // Pass 3b: the pre-comb IQ authority is a separate pair of
+        // integer-centred baseband products.  The symmetric three-sample
+        // aperture cancels the alternating product image while keeping both
+        // axes registered at the native sample h.  It is deliberately never
+        // remodulated into lockedSource: raw-minus-carrier must continue to
+        // consume the physical scalar above.
+        for (int rel = 0; rel < width; ++rel) {
+            const int rm = std::max(0, rel - 1);
+            const int rp = std::min(width - 1, rel + 1);
+            const double i4 = centeredCarrierProduct3(
+                nativeI4[rm], nativeI4[rel], nativeI4[rp]);
+            const double q4 = centeredCarrierProduct3(
+                nativeQ4[rm], nativeQ4[rel], nativeQ4[rp]);
+
             if (lockedI4) lockedI4[rel] = static_cast<float>(i4);
             if (lockedQ4) lockedQ4[rel] = static_cast<float>(q4);
 
-            const double chromaMagnitude =
-                std::fabs(source) * magnitudeScale[phase];
-
+            const double chromaMagnitude = boundedMag(i4, q4);
             magnitude[rel] = static_cast<float>(chromaMagnitude);
-            lockedSource[rel] =
-                lddecode::carrierGrammarRemod4fscToComposite(
-                    remodCursor, i4, q4);
-
             if (attribution) {
                 AttributionFacts &facts = attribution[rel].facts;
                 facts.locked1DChromaIRE =
@@ -1508,11 +1623,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 continue;
 
             for (int rel = 0; rel < width; ++rel) {
-                // Balanced 7-tap horizontal aggregate, matching the region
-                // evaluator in buildCombTapLine: even/odd offsets carry the
-                // two carrier axes, and the 0.5 end weights equalize them
-                // (3:3) so the vector stays phase-flat while the wider
-                // support keeps the hue verdict stable at low saturation.
+                // Symmetric 7-tap horizontal aggregate, matching the region
+                // evaluator in buildCombTapLine.  Its input is already the
+                // full, integer-centred IQ vector; divide by the complete
+                // weight (6), not by the old per-axis weight (3).
                 auto fullIQ = [&](const float *iR, const float *qR) {
                     static constexpr double w[7] =
                         {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
@@ -1523,7 +1637,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                         si += w[k + 3] * static_cast<double>(iR[rk]);
                         sq += w[k + 3] * static_cast<double>(qR[rk]);
                     }
-                    return std::complex<double>(si / 3.0, sq / 3.0);
+                    return std::complex<double>(si / 6.0, sq / 6.0);
                 };
                 const std::complex<double> z0 = fullIQ(i0, q0);
                 const std::complex<double> zUp =
@@ -1621,16 +1735,18 @@ void Comb::FrameBuffer::measurePostCombImpurity()
         }
 
         for (int rel = 0; rel < width; ++rel) {
-            const int wa = std::clamp(rel - kWideWin / 2, 0, width);
-            const int wb = std::clamp(wa + kWideWin, 0, width);
-            const double wn = std::max(1, wb - wa);
-            const double ZwI = (preI[wb] - preI[wa]) / wn;
-            const double ZwQ = (preQ[wb] - preQ[wa]) / wn;
+            const double ZwI = centeredEvenWeightMean(
+                demI.data(), preI.data(), width, rel, kWideWin);
+            const double ZwQ = centeredEvenWeightMean(
+                demQ.data(), preQ.data(), width, rel, kWideWin);
 
+            // env[k] is centred at k+0.5, so this asymmetric index range is
+            // the integer-centred physical aperture.
             const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
             const int nb = std::clamp(na + kNarrowWin, 0, width);
             const double nn = std::max(1, nb - na);
-            const double narrowMag = ((preEnv[nb] - preEnv[na]) / nn) * invIreScale;
+            const double narrowMag =
+                ((preEnv[nb] - preEnv[na]) / nn) * invIreScale;
 
             const double wideMag = 2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
 
@@ -1700,20 +1816,6 @@ void Comb::FrameBuffer::splitIQlocked()
     ensureScratch(scratch_preI);
     ensureScratch(scratch_preQ);
 
-    // Keep these sized because other recent versions of this function used them
-    // directly; this prevents stale/undersized scratch state from reappearing if
-    // small edits are made around this function.
-    ensureScratch(scratch_lineWorkA);
-    ensureScratch(scratch_lineWorkC);
-    ensureScratch(scratch_lineWorkD);
-    ensureScratch(scratch_yhp);
-    ensureScratch(scratch_yI);
-    ensureScratch(scratch_yQ);
-    ensureScratch(scratch_hpI);
-    ensureScratch(scratch_hpQ);
-    ensureScratch(scratch_hpY);
-    ensureScratch(scratch_outMixed);
-
     auto finiteOrZero = [](double v) -> double {
         return std::isfinite(v) ? v : 0.0;
     };
@@ -1745,21 +1847,6 @@ void Comb::FrameBuffer::splitIQlocked()
                 lutTi[i] = finiteOrZero(lutTi[i]);
                 lutTq[i] = finiteOrZero(lutTq[i]);
             }
-        }
-
-        // Remod coefficients for burst-locked IQ back into composite sample space.
-        //
-        // c = ti * 0.5 * (bcos*sp - bsin*cp)
-        //   + tq * 0.5 * (bsin*sp + bcos*cp)
-        double remodI[4];
-        double remodQ[4];
-
-        for (int ph = 0; ph < 4; ++ph) {
-            const double sp = spLUT_locked[ph];
-            const double cp = cpLUT_locked[ph];
-
-            remodI[ph] = finiteOrZero(0.5 * (bcos * sp - bsin * cp));
-            remodQ[ph] = finiteOrZero(0.5 * (bsin * sp + bcos * cp));
         }
 
         float  *tiRow       = demodTI_line(line);
@@ -1799,9 +1886,16 @@ void Comb::FrameBuffer::splitIQlocked()
             const int h  = left + xi;
             const int ph = carrierSampleClass(line, h);
 
-            // Plain locked demod only.  No line affine, no local affine, no
-            // sliding-window carrier fit.  This function may suppress transfer,
-            // but it must not reshape the carrier that produceY subtracts.
+            // Plain locked demod at the native composite coordinate h.  Keep I
+            // and Q as independent product streams: their common output
+            // centroid is established later by the centered axis-specific
+            // FIRs, not by averaging adjacent demod products here.  Such an
+            // average is an extra half-sample filter on the demodulator and,
+            // once remodulated, gives produceY a different carrier geometry.
+            //
+            // No line affine, local affine, or sliding-window carrier fit.
+            // This function may suppress transfer, but it must not reshape the
+            // carrier that produceY subtracts.
             const double ti = finiteOrZero(src[h] * lutTi[ph]);
             const double tq = finiteOrZero(src[h] * lutTq[ph]);
 
@@ -1817,15 +1911,15 @@ void Comb::FrameBuffer::splitIQlocked()
             if (ti4Row) ti4Row[xi] = (float)ti4;
             if (tq4Row) tq4Row[xi] = (float)tq4;
 
-            const double plainCarrier =
-                finiteOrZero(ti * remodI[ph] + tq * remodQ[ph]);
-
             // Critical geometry rule:
-            // produceY subtracts only the carrier in the original comb geometry.
-            // Do not feed it any local affine, fitted carrier, or vetter-shaped
-            // carrier.
+            // src is already the elected scalar carrier in physical composite
+            // geometry.  It is the subtraction authority; the demodulated
+            // products above are colour/evidence products, not a reason to
+            // synthesize a second, numerically different scalar.  This also
+            // makes the invariant exact when the locked basis or calibration
+            // trim changes.
             if (carrierComp)
-                carrierComp[xi] = plainCarrier;
+                carrierComp[xi] = finiteOrZero(src[h]);
 
             // Suppression policy below only runs when --cross-color-return
             // is engaged (the mask buffers exist); the default path pays
@@ -2317,6 +2411,11 @@ void Comb::FrameBuffer::filterIQLocked()
             preQext[pad + width + i] = rightQ;
         }
 
+        // Both axes are evaluated by symmetric look-around at the same output
+        // coordinate h.  The I and Q kernels intentionally have different
+        // cutoffs (the oval correction), but the same odd support and centre,
+        // so this final bandwidth filter adds no further relative displacement.
+        // Registration belongs to the pre-comb products, not to this renderer.
         for (int i = 0; i < width; ++i) {
             double accI = tapsI[MI] * preIext[pad + i];
             double accQ = tapsQ[MQ] * preQext[pad + i];

@@ -407,10 +407,10 @@ void Comb::FrameBuffer::invalidateCombTapCache()
 }
 
 // Fill the 7-tap smoothed signed-IQ row for `line` once per frame.  The
-// balanced end-weighted aperture (0.5,1,1,1,1,1,0.5) equalises the two carrier
-// axis sums (3:3) and keeps the vector phase-flat; the /3.0 normalisation is
-// carried verbatim from the previous inline evaluator so the region verdicts
-// are unchanged.
+// balanced end-weighted aperture (0.5,1,1,1,1,1,0.5) now smooths the
+// integer-centred baseband products published by buildPhaseCorrected1D.
+// Normalize by its total weight (6): the input already has the full-signed-IQ
+// scale, so no carrier-lattice compensation remains to be done here.
 void Comb::FrameBuffer::ensureSmoothedLockedRow(int line)
 {
     if (line < 0 || line >= demodLines)
@@ -440,8 +440,8 @@ void Comb::FrameBuffer::ensureSmoothedLockedRow(int line)
             si += w[k + 3] * static_cast<double>(iRow[rk]);
             sq += w[k + 3] * static_cast<double>(qRow[rk]);
         }
-        sI[rel] = static_cast<float>(si / 3.0);
-        sQ[rel] = static_cast<float>(sq / 3.0);
+        sI[rel] = static_cast<float>(si / 6.0);
+        sQ[rel] = static_cast<float>(sq / 6.0);
     }
     smoothedLockedRowValid[line] = std::uint8_t{1};
 }
@@ -1145,12 +1145,16 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             return tap[c].raw - tap[c].comp;
         };
         auto fillNotchCoarse = [&](const CombTapScalar *tap, double *out) {
-            // Centred 4-sample window [rel-1, rel+2], carried as a running sum.
-            double sum = notchLumaAt(tap, -1) + notchLumaAt(tap, 0) +
-                         notchLumaAt(tap, 1) + notchLumaAt(tap, 2);
+            // One carrier cycle with integer centroid rel.  The former
+            // [rel-1, rel+2] box was centred at rel+0.5, so locked luma and
+            // fallback notch luma described different horizontal positions.
             for (int rel = 0; rel < width; ++rel) {
-                out[rel] = 0.25 * sum * invI;
-                sum += notchLumaAt(tap, rel + 3) - notchLumaAt(tap, rel - 1);
+                out[rel] = centeredCarrierCycle4Mean(
+                    notchLumaAt(tap, rel - 2),
+                    notchLumaAt(tap, rel - 1),
+                    notchLumaAt(tap, rel),
+                    notchLumaAt(tap, rel + 1),
+                    notchLumaAt(tap, rel + 2)) * invI;
             }
         };
         auto fillLockedCoarse = [&](const double *luma, double *out) {
@@ -2441,6 +2445,14 @@ void Comb::FrameBuffer::computeFrameALine(
         }
     }
 
+    // Product demodulation is sample-local and still carries its 2fSC image.
+    // Marshal every Frame-A operand onto the native integer coordinate before
+    // the comb sees it.  The symmetric 3-tap aperture is zero at 2fSC and has
+    // centroid x; I and Q remain independent components of the complex row.
+    centerCarrierProductRowInPlace(scratch_centerIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_upIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_dnIQ.data(), width);
+
     computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
                                       outFrameIQ, &reachTapLine);
 }
@@ -2496,8 +2508,12 @@ void Comb::FrameBuffer::computeFrameBLine(
 
     const bool verticalAllowed = carrierFrameVerticalAllowed(line);
 
-    auto tiLine = [&](int ln)->const float* { return locked1DTI4fsc_line(ln); };
-    auto tqLine = [&](int ln)->const float* { return locked1DTQ4fsc_line(ln); };
+    // Native product rows are centred together with the signed-preclean rows
+    // below.  Do not start from locked1DTI4fsc/TQ4fsc here: those are already
+    // the canonical centred pre-comb products, and filtering them again would
+    // give the forced 1D diagnostic a different aperture.
+    auto tiLine = [&](int ln)->const float* { return demodTI4fsc_line(ln); };
+    auto tqLine = [&](int ln)->const float* { return demodTQ4fsc_line(ln); };
 
     const float *ti0_raw = tiLine(line);
     const float *tq0_raw = tqLine(line);
@@ -2618,6 +2634,13 @@ void Comb::FrameBuffer::computeFrameBLine(
             : std::complex<double>(0.0, 0.0);
     }
 
+    // Put all three operands on the same native integer coordinate before
+    // either Frame-B estimator sees them.  This cancels the carrier-product
+    // image without the h-0.5 delay of a previous/current average.
+    centerCarrierProductRowInPlace(scratch_centerIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_upIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_dnIQ.data(), width);
+
     // Frame B takes its reach from the shared tap service's physical legality
     // and throttles the midpoint at close luma bevels.
     //
@@ -2726,9 +2749,10 @@ void Comb::FrameBuffer::computeFrameBLine(
     // searches d ∈ [−2,+2] along the local diagonal for the offset that
     // maximizes the windowed difference magnitude — the offset where the two
     // legs' aliens add coherently.  Non-zero d must clear an 8% margin over
-    // d=0 so noise cannot steer the registration.  All gates are windowed:
-    // a single 4fsc sample demods onto one IQ axis (rank-1), so per-sample
-    // magnitudes flicker on the axis lattice; the 7-tap window mixes axes.
+    // d=0 so noise cannot steer the registration.  All gates are windowed.
+    // The canonical input is already a full integer-centred IQ vector; the
+    // wider 7-tap windows below provide decision stability, not registration
+    // or missing-axis reconstruction.
     // =====================================================================
     const bool havePairIQ =
         !forceFrameBLocked1D && haveUpLine && haveDnLine &&

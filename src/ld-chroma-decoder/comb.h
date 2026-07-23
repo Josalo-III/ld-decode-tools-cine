@@ -598,16 +598,18 @@ private:
 	lddecode::CombReachIndex combReachIndex;
 
 	// Flat/contiguous buffers (lines x width)
-	// Line-local locked IQ after burst alignment and affine trim.
+	// Line-local locked IQ after burst alignment.
 	std::vector<float> demodTI_flat;
 	std::vector<float> demodTQ_flat;
-	// Common 4fsc IQ export derived from the locked IQ. This is the seam
-	// between the line-local locked domain and the cross-line 4fsc domain.
+	// Native, sample-local 4fsc products derived from the locked scalar.
+	// These retain the alternating product image and are an intermediate,
+	// not the cross-line comb contract.
 	std::vector<float> demodTI4fsc_flat;
 	std::vector<float> demodTQ4fsc_flat;
-	// Precomputed IQ magnitude: hypot(demodTI4fsc, demodTQ4fsc) per pixel.
+	// Precomputed magnitude service retained for legacy local evidence.
 	std::vector<float> demodIQMag4fsc_flat;
-	// Preserved 4fsc IQ from the locked 1D demod.
+	// Canonical pre-comb IQ: separate full-scale I and Q, low-passed with a
+	// symmetric integer-centred aperture and registered to locked1DSource[h].
 	std::vector<float> locked1DTI4fsc_flat;
 	std::vector<float> locked1DTQ4fsc_flat;
 	// Per-line 7-tap smoothed signed-IQ rows, memoised for the region-reach
@@ -804,14 +806,16 @@ private:
 		//
 		// locked1DSource_flat is the locked-path video 1D scalar, declared as
 		// the Locked1DScalar reach source (PhasePreservedCarrier).  Physically
-		// it is bandpass(raw) times a flat round-trip scale (~0.994): raw
-		// carrier orientation is intact on every line.  The retired
+		// it is the restrained native bandpass itself: no IQ round trip and no
+		// fractional resampling.  Raw carrier orientation is intact on every
+		// line.  The retired
 		// "common phase / polarity gone by construction" label described a
 		// pre-reform pipeline and misled repeatedly.
 		//
 		// Rules for new code:
-		//  1. Prefer locked1DTI4fsc/TQ4fsc (Grid4fscIQ, phase-preserved)
-		//     for any operation that needs polarity in IQ.
+		//  1. Prefer locked1DTI4fsc/TQ4fsc (Grid4fscIQ, phase-preserved and
+		//     integer-centred on the matching scalar sample) for any operation
+		//     that needs polarity in IQ.
 		//  2. If this scalar must be demodded for interfield IQ use, demod with
 		//     carrierGrammarSignedSampleClass (lineFlip folded into the phase)
 		//     to land in Grid4fscIQ.  An unsigned demod yields IQ that inherits
