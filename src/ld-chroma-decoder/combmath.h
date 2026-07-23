@@ -36,6 +36,59 @@ inline double cos4fsc(int i) { return sin4fsc((i + 1) & 3); }
 inline double boundedMag(double a, double b) { return std::sqrt(a * a + b * b); }
 inline double boundedMag(const std::complex<double> &z) { return boundedMag(z.real(), z.imag()); }
 
+// Integer-centred reconstruction of a carrier product stream.
+//
+// Product demodulation at 4fSC contains the wanted baseband vector plus an
+// alternating 2fSC image.  A previous/current average rejects that image only
+// by placing the result at h-0.5; applying it at carrier phase h then mixes
+// two different composite coordinates.  The symmetric binomial
+// aperture below has centroid exactly h and a zero at 2fSC.  Its gain of two
+// preserves this decoder's full-signed-IQ convention (composite remodulation
+// applies the reciprocal 0.5).  Apply it to I and Q independently; it is a
+// registration/image-rejection primitive, not an I/Q merge and not a
+// scalar-carrier replacement.
+template <typename T>
+inline T centeredCarrierProduct3(const T &previous,
+                                 const T &current,
+                                 const T &next)
+{
+    return previous * 0.5 + current + next * 0.5;
+}
+
+// In-place row form of centeredCarrierProduct3.  Reads each original sample
+// before overwriting it and uses edge replication, matching the locked 1D
+// producer's boundary convention.
+template <typename T>
+inline void centerCarrierProductRowInPlace(T *row, int width)
+{
+    if (!row || width <= 0)
+        return;
+
+    T previous = row[0];
+    T current = row[0];
+    for (int x = 0; x < width; ++x) {
+        const T next = row[std::min(x + 1, width - 1)];
+        row[x] = centeredCarrierProduct3(previous, current, next);
+        previous = current;
+        current = next;
+    }
+}
+
+// One complete four-sample carrier cycle, registered at an integer sample.
+// The half-weight endpoints are the same carrier phase, so together they
+// contribute one ordinary phase sample.  Total weight is four and the
+// centroid is the middle argument.
+template <typename T>
+inline T centeredCarrierCycle4Mean(const T &minus2,
+                                   const T &minus1,
+                                   const T &center,
+                                   const T &plus1,
+                                   const T &plus2)
+{
+    return (minus2 + plus2) * 0.125 +
+           (minus1 + center + plus1) * 0.25;
+}
+
 // Shared fractional-basis demod helpers. These are tiny math utilities used by
 // both the locked demod path and candidate generation.
 inline constexpr double CAL_EPS_SAMPLES = -0.07;
@@ -160,34 +213,36 @@ inline double remodLockedToShiftedComposite(double iLocked, double qLocked, int 
 
 inline void eig2_sym(const double S[2][2], double &l1, double &l2, double V[2][2]);
 
-// Polar-decompose a 2x2 affine matrix A = RU into a rotation R and symmetric U,
-// then clamp R to a maximum phase rotation, clamp U's shear metric, and optionally
-// clamp the gain (mean singular value). The clamped gain is folded into R so callers
-// can apply a single matrix.
+// General 2x2 polar/affine helpers. The retired residual-Y estimator no longer
+// calls these, but they remain available as representation math; removing that
+// one policy path is not a reason to erase the general primitive.
 inline void clamp_rotation_gain_shear(double R[2][2], double U[2][2],
                                       double phaseMaxRad, bool allowGain,
                                       double gMin, double gMax, double shearMax)
 {
     double phase = std::atan2(R[1][0], R[0][0]);
     if (std::fabs(phase) > phaseMaxRad) {
-        double p = (phase < 0.0 ? -phaseMaxRad : phaseMaxRad);
-        double c = std::cos(p), s = std::sin(p);
+        const double p = (phase < 0.0 ? -phaseMaxRad : phaseMaxRad);
+        const double c = std::cos(p), s = std::sin(p);
         R[0][0] = c; R[0][1] = -s; R[1][0] = s; R[1][1] = c;
     }
 
     double l1, l2, V[2][2];
     eig2_sym(U, l1, l2, V);
     double s1 = std::max(0.0, l1), s2 = std::max(0.0, l2);
-    double g  = 0.5 * (s1 + s2);
-    double shear = (g > 1e-12) ? std::fabs(s1 - s2) / g : 0.0;
+    double g = 0.5 * (s1 + s2);
+    const double shear =
+        (g > 1e-12) ? std::fabs(s1 - s2) / g : 0.0;
 
     if (shear > shearMax && (s1 > 0.0 || s2 > 0.0)) {
-        double target = g * shearMax;
-        double avg = 0.5 * (s1 + s2);
+        const double target = g * shearMax;
+        const double avg = 0.5 * (s1 + s2);
         s1 = avg + 0.5 * target;
         s2 = avg - 0.5 * target;
-        double VD[2][2] = { { V[0][0] * s1, V[0][1] * s2 },
-                            { V[1][0] * s1, V[1][1] * s2 } };
+        const double VD[2][2] = {
+            {V[0][0] * s1, V[0][1] * s2},
+            {V[1][0] * s1, V[1][1] * s2}
+        };
         U[0][0] = VD[0][0] * V[0][0] + VD[0][1] * V[0][1];
         U[0][1] = VD[0][0] * V[1][0] + VD[0][1] * V[1][1];
         U[1][0] = VD[1][0] * V[0][0] + VD[1][1] * V[0][1];
@@ -196,50 +251,48 @@ inline void clamp_rotation_gain_shear(double R[2][2], double U[2][2],
     }
 
     if (!allowGain) g = 1.0;
-    else            g = std::min(std::max(g, gMin), gMax);
-    R[0][0] *= g; R[0][1] *= g; R[1][0] *= g; R[1][1] *= g;
+    else g = std::clamp(g, gMin, gMax);
+    R[0][0] *= g; R[0][1] *= g;
+    R[1][0] *= g; R[1][1] *= g;
 }
 
-// 2x2 matrix helpers used by locked demod, LS, and vetComposite1D.
-
-inline void mat2_mul(const double A[2][2], const double B[2][2], double C[2][2])
+inline void mat2_mul(const double A[2][2], const double B[2][2],
+                     double C[2][2])
 {
-    C[0][0] = A[0][0]*B[0][0] + A[0][1]*B[1][0];
-    C[0][1] = A[0][0]*B[0][1] + A[0][1]*B[1][1];
-    C[1][0] = A[1][0]*B[0][0] + A[1][1]*B[1][0];
-    C[1][1] = A[1][0]*B[0][1] + A[1][1]*B[1][1];
+    C[0][0] = A[0][0] * B[0][0] + A[0][1] * B[1][0];
+    C[0][1] = A[0][0] * B[0][1] + A[0][1] * B[1][1];
+    C[1][0] = A[1][0] * B[0][0] + A[1][1] * B[1][0];
+    C[1][1] = A[1][0] * B[0][1] + A[1][1] * B[1][1];
 }
 
-inline void mat2_T_mul(const double A[2][2], const double B[2][2], double C[2][2])
+inline void mat2_T_mul(const double A[2][2], const double B[2][2],
+                       double C[2][2])
 {
-    // C = A^T * B
-    C[0][0] = A[0][0]*B[0][0] + A[1][0]*B[1][0];
-    C[0][1] = A[0][0]*B[0][1] + A[1][0]*B[1][1];
-    C[1][0] = A[0][1]*B[0][0] + A[1][1]*B[1][0];
-    C[1][1] = A[0][1]*B[0][1] + A[1][1]*B[1][1];
+    C[0][0] = A[0][0] * B[0][0] + A[1][0] * B[1][0];
+    C[0][1] = A[0][0] * B[0][1] + A[1][0] * B[1][1];
+    C[1][0] = A[0][1] * B[0][0] + A[1][1] * B[1][0];
+    C[1][1] = A[0][1] * B[0][1] + A[1][1] * B[1][1];
 }
 
 inline bool mat2_inv(const double M[2][2], double Minv[2][2])
 {
-    const double det = M[0][0]*M[1][1] - M[0][1]*M[1][0];
+    const double det = M[0][0] * M[1][1] - M[0][1] * M[1][0];
     if (std::fabs(det) < 1e-12) return false;
     const double inv = 1.0 / det;
-    Minv[0][0] =  M[1][1]*inv; Minv[0][1] = -M[0][1]*inv;
-    Minv[1][0] = -M[1][0]*inv; Minv[1][1] =  M[0][0]*inv;
+    Minv[0][0] =  M[1][1] * inv; Minv[0][1] = -M[0][1] * inv;
+    Minv[1][0] = -M[1][0] * inv; Minv[1][1] =  M[0][0] * inv;
     return true;
 }
 
-inline void eig2_sym(const double S[2][2], double &l1, double &l2, double V[2][2])
+inline void eig2_sym(const double S[2][2], double &l1, double &l2,
+                     double V[2][2])
 {
-    // Symmetric 2x2: S = [a b; b d]
     const double a = S[0][0], b = S[0][1], d = S[1][1];
-    const double tr   = a + d;
-    const double det  = a*d - b*b;
-    const double disc = std::max(0.0, tr*tr/4 - det);
-    const double rt   = std::sqrt(disc);
-    l1 = tr/2 + rt;
-    l2 = tr/2 - rt;
-    // Eigenvectors
+    const double tr = a + d;
+    const double det = a * d - b * b;
+    const double rt = std::sqrt(std::max(0.0, tr * tr / 4.0 - det));
+    l1 = tr / 2.0 + rt;
+    l2 = tr / 2.0 - rt;
     if (std::fabs(b) > 1e-12) {
         V[0][0] = l1 - d; V[1][0] = b;
         V[0][1] = l2 - d; V[1][1] = b;
@@ -247,10 +300,12 @@ inline void eig2_sym(const double S[2][2], double &l1, double &l2, double V[2][2
         V[0][0] = 1.0; V[1][0] = 0.0;
         V[0][1] = 0.0; V[1][1] = 1.0;
     }
-    // Normalise columns
     for (int j = 0; j < 2; ++j) {
-        double n = boundedMag(V[0][j], V[1][j]);
-        if (n > 1e-12) { V[0][j] /= n; V[1][j] /= n; }
+        const double n = boundedMag(V[0][j], V[1][j]);
+        if (n > 1e-12) {
+            V[0][j] /= n;
+            V[1][j] /= n;
+        }
     }
 }
 
@@ -258,26 +313,30 @@ inline void sym_inv_sqrt(const double S[2][2], double Sminushalf[2][2])
 {
     double l1, l2, V[2][2];
     eig2_sym(S, l1, l2, V);
-    double d1 = (l1 > 1e-12) ? 1.0 / std::sqrt(l1) : 0.0;
-    double d2 = (l2 > 1e-12) ? 1.0 / std::sqrt(l2) : 0.0;
-    // S^{-1/2} = V diag(d1,d2) V^T
-    double VD[2][2] = { { V[0][0]*d1, V[0][1]*d2 }, { V[1][0]*d1, V[1][1]*d2 } };
-    Sminushalf[0][0] = VD[0][0]*V[0][0] + VD[0][1]*V[0][1];
-    Sminushalf[0][1] = VD[0][0]*V[1][0] + VD[0][1]*V[1][1];
-    Sminushalf[1][0] = VD[1][0]*V[0][0] + VD[1][1]*V[0][1];
-    Sminushalf[1][1] = VD[1][0]*V[1][0] + VD[1][1]*V[1][1];
+    const double d1 = (l1 > 1e-12) ? 1.0 / std::sqrt(l1) : 0.0;
+    const double d2 = (l2 > 1e-12) ? 1.0 / std::sqrt(l2) : 0.0;
+    const double VD[2][2] = {
+        {V[0][0] * d1, V[0][1] * d2},
+        {V[1][0] * d1, V[1][1] * d2}
+    };
+    Sminushalf[0][0] = VD[0][0] * V[0][0] + VD[0][1] * V[0][1];
+    Sminushalf[0][1] = VD[0][0] * V[1][0] + VD[0][1] * V[1][1];
+    Sminushalf[1][0] = VD[1][0] * V[0][0] + VD[1][1] * V[0][1];
+    Sminushalf[1][1] = VD[1][0] * V[1][0] + VD[1][1] * V[1][1];
 }
 
-inline void polar_decompose_2x2(const double A[2][2], double R[2][2], double U[2][2])
+inline void polar_decompose_2x2(const double A[2][2],
+                                double R[2][2], double U[2][2])
 {
-    // A = R U, with R orthogonal, U symmetric positive definite
     double AtA[2][2];
     mat2_T_mul(A, A, AtA);
     double AtA_mhalf[2][2];
     sym_inv_sqrt(AtA, AtA_mhalf);
-    mat2_mul(A, AtA_mhalf, R); // R = A (A^T A)^{-1/2}
-    // U = R^T A
-    double Rt[2][2] = { { R[0][0], R[1][0] }, { R[0][1], R[1][1] } };
+    mat2_mul(A, AtA_mhalf, R);
+    const double Rt[2][2] = {
+        {R[0][0], R[1][0]},
+        {R[0][1], R[1][1]}
+    };
     mat2_mul(Rt, A, U);
 }
 
