@@ -495,6 +495,11 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             else
                 lockedLumaSharp_flat.clear();
             lockedLumaHDeltaIRE_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
+            // Collected pool: sliding four-sample aperture means. Unconditional
+            // -- it is a running sum (O(1)/sample) and it is the raw material
+            // for the coarse-residual parallax, which is a default-path client.
+            // lockedLumaSharp is derived from it rather than rebuilding it.
+            lockedApertureMean_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaCacheValid = false;
         }
         // Preclean ring is only needed for Frame/FVF in locked mode.

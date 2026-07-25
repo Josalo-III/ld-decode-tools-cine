@@ -851,6 +851,24 @@ private:
 	// client (Frame B reach exemption, hLumaDeltaIRE, cross-color, FVF
 	// vertical regime) without recomputation.
 	std::vector<float> lockedLumaHDeltaIRE_flat;
+	// COLLECTED POOL (unfiltered): the sliding four-sample aperture means.
+	//
+	//   lockedApertureMean[v] = mean( raw[left+v .. left+v+3] )
+	//
+	// indexed by the aperture's START position, so the (up to four) legal
+	// apertures covering sample x are v in {x-3, x-2, x-1, x}.
+	//
+	// This is a measurement, not a product: a legal carrier sums to zero over
+	// ANY legal four-sample window, so each mean equals that window's luma mean
+	// exactly, and the divergence between the apertures covering one sample is
+	// pure luma with the carrier removed exactly (the coarse-residual parallax).
+	// It is deliberately published raw -- no sharpening, no gating, no absolute
+	// value -- so consumers own the decisions. `lockedLumaSharp` is derived FROM
+	// this pool rather than rebuilding it privately.
+	//
+	// Built unconditionally (a running sum, O(1) per sample) because it has
+	// default-path clients, not "just in case".
+	std::vector<double> lockedApertureMean_flat;
 	bool lockedLumaCacheValid = false;
 
 	inline double *lockedLumaBaseY4_line(int line) {
@@ -875,6 +893,16 @@ private:
 
 	inline const double *lockedLumaSharp_line(int line) const {
 		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline double *lockedApertureMean_line(int line) {
+		if (lockedApertureMean_flat.empty()) return nullptr;
+		return lockedApertureMean_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const double *lockedApertureMean_line(int line) const {
+		if (lockedApertureMean_flat.empty()) return nullptr;
+		return lockedApertureMean_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline float *lockedLumaHDeltaIRE_line(int line) {

@@ -181,12 +181,9 @@ void Comb::FrameBuffer::phaseLocked()
         const bool buildSharp =
             configuration.lumaWitness &&
             sharpLevel > 0.0 && !lockedLumaSharp_flat.empty();
-        std::vector<double> boxcar;
         std::vector<double> gateScratch;
-        if (buildSharp && width >= 4) {
-            boxcar.assign(width, 0.0);
+        if (buildSharp && width >= 4)
             gateScratch.assign(width, 0.0);
-        }
 
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
@@ -209,6 +206,44 @@ void Comb::FrameBuffer::phaseLocked()
                 }
             }
 
+            // ---- Collected pool: sliding four-sample aperture means --------
+            // apMean[v] = mean(raw[left+v .. left+v+3]), indexed by aperture
+            // START, so the legal apertures covering sample x are
+            // v in {x-3, x-2, x-1, x}.  Published unfiltered: no sharpening,
+            // no gate, no absolute value -- consumers own the decisions.
+            //
+            // A legal carrier sums to zero over ANY legal four-sample window,
+            // so each mean is that window's LUMA mean exactly; the divergence
+            // between apertures covering one sample is therefore pure luma with
+            // the carrier removed exactly.  That is the coarse-residual
+            // parallax, and it is why this must not be pre-digested here.
+            //
+            // Running sum: O(1) per sample, so it is built for every locked
+            // frame rather than only under --luma-witness.
+            double *apMean = lockedApertureMean_line(line);
+            const int lastStart = width - 4;
+            if (apMean && width >= 4) {
+                double sum4 = (double)rawLine[left + 0] + (double)rawLine[left + 1]
+                            + (double)rawLine[left + 2] + (double)rawLine[left + 3];
+                for (int xi = 0; xi <= lastStart; ++xi) {
+                    apMean[xi] = 0.25 * sum4;
+                    if (xi < lastStart)
+                        sum4 += (double)rawLine[left + xi + 4]
+                              - (double)rawLine[left + xi];
+                }
+                // Tail: no legal aperture starts here. Hold the last real mean
+                // so the buffer stays readable; consumers needing "a real
+                // aperture started here" must respect xi <= width-4.
+                for (int xi = lastStart + 1; xi < width; ++xi)
+                    apMean[xi] = apMean[lastStart];
+            } else if (apMean) {
+                double avg = 0.0;
+                for (int xi = 0; xi < width; ++xi)
+                    avg += (double)rawLine[left + xi];
+                avg /= std::max(1, width);
+                for (int xi = 0; xi < width; ++xi) apMean[xi] = avg;
+            }
+
             if (!buildSharp)
                 continue;
 
@@ -218,18 +253,8 @@ void Comb::FrameBuffer::phaseLocked()
                           lockedLumaSmooth_line(line) + width, sharp);
                 continue;
             }
-            // Sliding 4-sample boxcar (means the lurch pass reads).
-            double sum4 = (double)rawLine[left + 0] + (double)rawLine[left + 1]
-                        + (double)rawLine[left + 2] + (double)rawLine[left + 3];
-            const int lastStart = width - 4;
-            for (int xi = 0; xi <= lastStart; ++xi) {
-                boxcar[xi] = 0.25 * sum4;
-                if (xi < lastStart)
-                    sum4 += (double)rawLine[left + xi + 4]
-                          - (double)rawLine[left + xi];
-            }
-            for (int xi = lastStart + 1; xi < width; ++xi)
-                boxcar[xi] = boxcar[lastStart];
+            // Derived FROM the pool above, not a private rebuild.
+            const double *boxcar = apMean;
 
             // Register the even four-sample means at integer xi by averaging
             // the two half-sample apertures on either side.  Their combination
@@ -240,7 +265,7 @@ void Comb::FrameBuffer::phaseLocked()
                 const int s1 = std::clamp(xi - 1, 0, lastStart);
                 sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
             }
-            lurchSharpenCoarsePrior(boxcar.data(), width - 3, width,
+            lurchSharpenCoarsePrior(boxcar, width - 3, width,
                                     sharp, gateScratch.data(), sharpLevel);
         }
         lockedLumaCacheValid = true;
@@ -319,12 +344,29 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
         };
 
         // Canonical full-resolution source authority used by every later
-        // carrier client. Keep this formula and its clamped edge convention in
-        // one place so analysis and rendering cannot drift apart.
+        // carrier client. Keep this formula and its edge convention in one
+        // place so analysis and rendering cannot drift apart.
+        //
+        // The ±2 bandpass taps use half-sample edge REFLECTION, matching the
+        // bucket split1D convention ([-1]->[0], [-2]->[1] at the left; mirror
+        // at the right). Edge-clamp (repeating the boundary sample) injects a
+        // DC pedestal at the wrong carrier phase, so the aperture goes
+        // asymmetric at the frame boundary and the bandpass fires on that
+        // false step — a spurious carrier fringe along the picture edge that
+        // also pollutes the interline schedule fingerprint out there.
+        // Reflection continues the waveform instead. (Only the bandpass taps
+        // reflect; the coarse-residual/luma-floor reads below keep rawAtRel's
+        // clamp — those four-sample means never wanted reflection.)
+        auto rawMirror = [&](int rel) -> double {
+            if (rel < 0)              rel = -rel - 1;
+            else if (rel >= width)    rel = 2 * width - 1 - rel;
+            rel = std::clamp(rel, 0, width - 1);   // safety for tiny widths
+            return static_cast<double>(rawLine[left + rel]);
+        };
         for (int rel = 0; rel < width; ++rel) {
-            const double c  = rawAtRel(rel);
-            const double m2 = rawAtRel(rel - 2);
-            const double p2 = rawAtRel(rel + 2);
+            const double c  = static_cast<double>(rawLine[left + rel]);
+            const double m2 = rawMirror(rel - 2);
+            const double p2 = rawMirror(rel + 2);
             baseline[rel] = 0.50 * c - 0.25 * (m2 + p2);
         }
 
@@ -713,7 +755,6 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                 pct(thirdIll[2], thirdTot[2]));
         }
     }
-
 }
 
 void Comb::FrameBuffer::buildPhaseCorrected1D()
@@ -2900,8 +2941,14 @@ void Comb::FrameBuffer::produceY()
                 // middle and the provisional top, and the election swaps only
                 // the top band.
                 const double combPlatform = candidatePlatformResidualAt(0, h);
-                auto reconstructTop = [&](double top) {
-                    return coarse + combMiddle + combPlatform + top;
+                auto reconstructTop = [&](int plane, double top) {
+                    // Non-comb winners keep their own four-mean so the top
+                    // band is rebuilt in the same candidate geometry that won.
+                    const double fourMean =
+                        (plane == 0)
+                            ? (combMiddle + combPlatform)
+                            : candidateFourMeanAt(plane, h);
+                    return coarse + fourMean + top;
                 };
                 const int verticalStep = verticalStepAt(xi);
                 const ProduceYNeighborRows &northRows =
@@ -3036,8 +3083,10 @@ void Comb::FrameBuffer::produceY()
                 }
                 if (!combOK && oneDRow) {
                     const double o = oneDRow[xi];
-                    const double y1 = std::isfinite(o) ? rawH - o : combY;
-                    addBaseCandidate(y1, 3);
+                    if (std::isfinite(o)) {
+                        const double y1 = rawH - o;
+                        addBaseCandidate(y1, 3);
+                    }
                 }
 
                 // Returned Y is derived from combY, so it is a selectable
@@ -3051,11 +3100,17 @@ void Comb::FrameBuffer::produceY()
                     feasible(returnedY);
 
                 if (nCand == 0) {
-                    // Nothing feasible: clamp combY into the legal band.
-                    const double c = rawH - combY;
-                    Y[h] = (c > maxCarrierAmpSamples) ? rawH - maxCarrierAmpSamples
-                         : (c < -maxCarrierAmpSamples) ? rawH + maxCarrierAmpSamples
-                         : combY;
+                    // No legal top band exists here. Publishing the illegal
+                    // one truncated to the hull edge (Y = raw -/+ maxAmp) is
+                    // not a rejection: it moves Y TOWARD raw, so it keeps a
+                    // signed slice of the carrier waveform as luma. raw
+                    // alternates about the luma at carrier rate, so that
+                    // slice renders as a 2fSC speckle of up to ~20 IRE at
+                    // exactly the near-peak samples where the estimate broke.
+                    // Reject instead: keep the bands below the top aperture,
+                    // which are 4- and 8-sample centred means and therefore
+                    // cancel carrier by construction, and publish no top.
+                    Y[h] = reconstructTop(0, 0.0);
                     continue;
                 }
                 // Establish the base population without the derived return.
@@ -3066,12 +3121,33 @@ void Comb::FrameBuffer::produceY()
                     sum += candY[k];
                 }
                 const double baseMean = sum / nCand;
+                const double baseMedian = medoidD(candY, nCand);
                 const bool baseAgrees = hi - lo <= agreeTol;
+                
+                // The agreement center is an anchor, not an output. Close it
+                // onto an actual candidate so reconstruction uses that
+                // candidate's own four-sample coarse/basis. Strict comparison
+                // preserves roster order as the neutral tie-break, so coherent
+                // comb remains senior when two candidates straddle the anchor
+                // equally.
+                int baseWinnerIdx = 0;
+                for (int k = 1; k < nCand; ++k) {
+                    if (std::fabs(candY[k] - baseMedian) <
+                        std::fabs(candY[baseWinnerIdx] - baseMedian))
+                    {
+                        baseWinnerIdx = k;
+                    }
+                }
+                
                 if (baseAgrees && !returnedFeasible) {
-                    Y[h] = reconstructTop(baseMean);
+                    const int baseWinnerPlane = candPlane[baseWinnerIdx];
+                    const double baseWinnerTop = candY[baseWinnerIdx];
+                
+                    Y[h] = reconstructTop(
+                        baseWinnerPlane,
+                        baseWinnerTop);
                     continue;
                 }
-
                 // Robust center: medoid (min sum of absolute distances).
                 double center = baseMean;
                 if (!baseAgrees) {
@@ -3096,7 +3172,7 @@ void Comb::FrameBuffer::produceY()
                 // exactly the strong HF that the return exists to recover.
                 const bool returnedAdmitted = returnedFeasible;
                 if (nIn == 1 && !returnedAdmitted) {
-                    Y[h] = reconstructTop(candY[inIdx[0]]);
+                    Y[h] = reconstructTop(candPlane[inIdx[0]], candY[inIdx[0]]);
                     continue;
                 }
 
@@ -3110,6 +3186,15 @@ void Comb::FrameBuffer::produceY()
                         carrierCleanlinessOf(candPlane[inIdx[k]], h);
                 }
                 const int baseNIn = nIn;
+                auto planeForTop = [&](double top) {
+                    for (int k = 0; k < baseNIn; ++k)
+                        if (inHF[k] == top)
+                            return candPlane[inIdx[k]];
+                    for (int k = baseNIn; k < nIn; ++k)
+                        if (inHF[k] == top)
+                            return 4;
+                    return 0;
+                };
 
                 // Single self-anchor: medoid of the BASE inlier HFs (mode 6).
                 // The derived return may be selected, but does not move this
@@ -3323,7 +3408,8 @@ void Comb::FrameBuffer::produceY()
                         phasePenSamp, imagePrefCap);
                 }
 
-                Y[h] = reconstructTop(resultHF);
+                const int winnerPlane = planeForTop(resultHF);
+                Y[h] = reconstructTop(winnerPlane, resultHF);
 
                 if (pyDiag && line >= pyDiagL0 && line <= pyDiagL1 &&
                     xi >= pyDiagC0 && xi <= pyDiagC1) {
@@ -3471,6 +3557,7 @@ void Comb::FrameBuffer::produceY()
                       w2d_frame_weight[line].end(), 0.0f);
         }
     }
+
 }
 
 // Lurch preconditioner for the coarse luma prior.
