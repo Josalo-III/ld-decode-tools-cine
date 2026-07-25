@@ -2318,14 +2318,61 @@ void Comb::FrameBuffer::filterIQLocked()
         double* Irow = componentFrame->u(line);
         double* Qrow = componentFrame->v(line);
 
-        // Consume the separate, integer-centred I/Q products prepared by
-        // splitIQlocked(). Luma policy never re-demodulates raw - elected Y;
-        // keeping the axes independent here preserves the oval correction.
-        const float *prodIRow = lockedProductI_line(line);
-        const float *prodQRow = lockedProductQ_line(line);
+        // Colour is the carrier residual the elected luma left behind:
+        //
+        //     chroma = raw - Y
+        //
+        // One scalar, two outputs -- the same shape the bucket path has always
+        // had (Y[h] = line[h] - val; I/Q = demod(val)).  Because Y is whatever
+        // the election emitted, the published colour is its EXACT complement
+        // and Y + chroma == raw holds at every pixel by construction.
+        //
+        // Consuming splitIQlocked's cached products instead lets the two
+        // outputs drift: those products are demodulated from the elected comb
+        // scalar, while produceY emits a band reassembly that only telescopes
+        // back to raw - carrierComp when the comb plane wins the top band.
+        // Measured on the beach, ~20% of pixels take a non-comb top band and
+        // the emitted Y departs from the complement by 3.5 IRE RMS (max ~11),
+        // so the colour on those pixels did not belong to the luma beside it.
+        // That is exactly the population the election deviates on -- edges and
+        // compact detail.
+        //
+        // No additional local DC follower here: that would give the colour a
+        // different low-frequency convention from the luma it is derived from.
+        const quint16* rawLine = rawbuffer.data() + line * videoParameters.fieldWidth;
+        const double*  Yrow    = componentFrame->y(line);
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        const bool grammarLocked = grammar && grammar->grammarLocked;
+        const double bcos = grammarLocked ? grammar->burstCos : 1.0;
+        const double bsin = grammarLocked ? grammar->burstSin : 0.0;
+        double lutTi[4], lutTq[4];
+        if (grammarLocked) {
+            for (int i = 0; i < 4; ++i) {
+                lutTi[i] = (double)grammar->demodLUTTi[i];
+                lutTq[i] = (double)grammar->demodLUTTq[i];
+            }
+        } else {
+            fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked, lutTi, lutTq);
+        }
+
+        // Cross-colour suppression consumes the band-limited envelope
+        // splitIQlocked already published (in-field +/-2 vertical mix + lateral
+        // boxcar). One policy, computed once; this renderer only applies it, so
+        // the suppression cannot alias here.
+        const float *maskRow = lockedCcMask_line(line);
+        const double giProduct = configuration.gi_product;
+        const double gqProduct = configuration.gq_product;
+
         for (int i = 0; i < width; ++i) {
-            scratch_preI[i] = prodIRow ? (double)prodIRow[i] : 0.0;
-            scratch_preQ[i] = prodQRow ? (double)prodQRow[i] : 0.0;
+            const int h = left + i;
+            const int ph = carrierSampleClass(line, h);
+            const double chroma = (double)rawLine[h] - Yrow[h];
+            const double m = maskRow
+                ? std::clamp((double)maskRow[i], 0.0, 1.0)
+                : 0.0;
+            const double alphaEff = 1.0 - m;
+            scratch_preI[i] = (chroma * lutTi[ph]) * giProduct * alphaEff;
+            scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct * alphaEff;
         }
 
         constexpr double lockedPreRot =
