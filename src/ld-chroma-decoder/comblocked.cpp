@@ -4697,18 +4697,112 @@ static void detectLurchSteps(const double *means, int meanCount,
     }
 }
 
+// Disposable stats for the tandem edge fit (LDCD_PROBE_TANDEM=1). Measurement
+// only; the verdict counters are cheap enough to run whenever the doublet is
+// enabled, but nothing prints unless asked.
+namespace {
+
+enum class TandemVerdict { Window, Margin, Boundary };
+
+struct TandemProbe {
+    std::mutex mu;
+    long nWindow = 0, nMargin = 0, nBoundary = 0, nAccept = 0;
+    double sumDe = 0.0, sumAbsDe = 0.0, sumRatio = 0.0;
+    long wHist[4] = {0, 0, 0, 0};
+
+    static bool on()
+    {
+        static const bool v = []{
+            const char *s = std::getenv("LDCD_PROBE_TANDEM");
+            return s && std::atoi(s) != 0;
+        }();
+        return v;
+    }
+
+    void count(TandemVerdict v)
+    {
+        if (!on()) return;
+        std::lock_guard<std::mutex> lk(mu);
+        switch (v) {
+        case TandemVerdict::Window:   ++nWindow;   break;
+        case TandemVerdict::Margin:   ++nMargin;   break;
+        case TandemVerdict::Boundary: ++nBoundary; break;
+        }
+    }
+
+    void accept(double de, double w, double ratio)
+    {
+        if (!on()) return;
+        std::lock_guard<std::mutex> lk(mu);
+        ++nAccept;
+        sumDe += de; sumAbsDe += std::fabs(de); sumRatio += ratio;
+        const int wi = (w < 0.8) ? 0 : (w < 1.3) ? 1 : (w < 2.0) ? 2 : 3;
+        ++wHist[wi];
+    }
+
+    ~TandemProbe()
+    {
+        if (!on()) return;
+        const long total = nAccept + nMargin + nBoundary + nWindow;
+        if (total <= 0) return;
+        std::fprintf(stderr,
+            "\n[TANDEM] runs %ld: accept %.1f%%  reject margin %.1f%% "
+            "boundary %.1f%% window %.1f%%\n",
+            total,
+            100.0 * (double)nAccept   / (double)total,
+            100.0 * (double)nMargin   / (double)total,
+            100.0 * (double)nBoundary / (double)total,
+            100.0 * (double)nWindow   / (double)total);
+        if (nAccept > 0)
+            std::fprintf(stderr,
+                "[TANDEM] accepted: de mean %+.2f  |de| mean %.2f px  "
+                "err/err0 mean %.2f  widths 0.6:%ld 1.0:%ld 1.6:%ld 2.4:%ld\n",
+                sumDe / nAccept, sumAbsDe / nAccept, sumRatio / nAccept,
+                wHist[0], wHist[1], wHist[2], wHist[3]);
+    }
+};
+
+TandemProbe g_tandemProbe;
+
+} // namespace
+
 // Subtract the known steep-edge leak doublet from the emitted 1D carrier.
 //
 // At a luma step the bandpass reads -0.25*D2Y as false carrier -- a fixed
 // doublet scaled by step height (the "known profile"). The corner leak drove
 // this from the notch, which is chroma-contaminated at coincident edges (the
-// parked lesson). Here the AMPLITUDE and LOCATION come from the lurch step-solve
-// on the coarse aperture means, which is carrier-free by construction, and the
-// NOTCH is advisory only: it confirms a real coincident sharp edge and vetoes
-// where it disagrees, but never sets the amplitude. Neither signal suffices
-// alone -- lurch has the clean amplitude but a step template, the notch has the
-// sharp shape but a corrupt amplitude -- so the doublet is lurch's height at
-// lurch's edge, admitted in proportion to the notch's least-squares agreement.
+// parked lesson), and P9b's notch-shape fit inherited a softened corner: the
+// notch is S{Y}, the sharp point already rounded off.
+//
+// TANDEM (P10): the two coarse-residual signals split the parameters by what
+// each owns incorruptibly.
+//   * The COARSE MEMBERSHIP DIFFERENCES (lurch) own EXISTENCE and AMPLITUDE:
+//     D[s] = (raw[s+4]-raw[s])/4 compares identical carrier phase, so the
+//     same-sign run and the flanking plateau means are chroma-free by
+//     construction. What they cannot give is position -- the boxcar's blur is
+//     baked into the centroid.
+//   * The MEAN APERTURE RESIDUAL m[x] = raw[x] - A[x] (A = mean of covering
+//     apMeans = T{Y}, T the 7-tap triangle) owns POSITION and SHARPNESS: the
+//     coarse platform is smooth, so the residual keeps the true discontinuity
+//     -- the sharp point of Y that both the boxcar and the notch round off.
+//     Its price is the carrier, present at full strength: m = C + (I-T){Y}.
+//
+// The carrier is FIT AROUND, not subtracted: over the step footprint the
+// lawful envelope is nearly constant (1.3 MHz barely moves in ~11 samples at
+// 4fSC), so within a lurch run we model
+//     m[x] ~= (I-T){ramp_{e,w}}[x] + p*sin4fsc + q*cos4fsc
+// with the ramp's LEVELS PINNED by lurch (lo/hi plateau means -- amplitude is
+// never fitted, so chroma cannot inflate it) and only edge position e, width
+// w, and the two nuisance envelope terms free. The doublet is fast, the
+// envelope slow by law: nearly orthogonal over the window, the bandwidth
+// asymmetry applied inside a low-dimensional edge model instead of per-sample
+// (the S7 probe's constructive residue).
+//
+// ABSTENTION IS BINARY: the pinned-amplitude doublet either materially beats
+// the envelope-only hypothesis under the SAME nuisance model (common-mode
+// envelope error cancels in the comparison) and localizes in the scan
+// interior, or the run emits NOTHING and the 1D goes out untouched. 1D is the
+// fallback; there is no partial correction.
 void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
 {
     static const bool enabled = []{
@@ -4717,74 +4811,131 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
     }();
     if (!enabled || !carrierAtLeft) return;
 
+    // Accept threshold on bestErr/err0: the pinned doublet must explain at
+    // least this fraction of the nuisance-adjusted residual energy. Tunable
+    // for the probe sweep only.
+    static const double kAccept = []{
+        const char *s = std::getenv("LDCD_TANDEM_ACCEPT");
+        return s ? std::atof(s) : 0.5;
+    }();
     const double *apMean = lockedApertureMean_line(line);
     if (!apMean) return;
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int fullWidth = videoParameters.fieldWidth;
     const int width     = right - left;
-    if (width < 8) return;
+    if (width < 16) return;
     const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+    const int lastStart = width - 4;
 
     std::vector<LurchStepRun> runs;
     detectLurchSteps(apMean, width, irescale, invIreScale, 1.0, runs);
     if (runs.empty()) return;
 
     std::vector<double> leak(width, 0.0);
-    std::vector<double> pred(width, 0.0);   // per-run predicted doublet
-    std::vector<double> ntch(width, 0.0);   // per-run notch doublet
+    bool any = false;
 
     for (const LurchStepRun &run : runs) {
         if (run.suppressed || run.gate <= 0.0) continue;
 
-        // Clean, chroma-free levels flanking the step and its signed height.
+        // Clean, chroma-free plateau levels flanking the step (lurch's
+        // amplitude authority; never refitted).
         const int ia = std::clamp(run.a, 0, width - 1);
         const int ib = std::clamp(run.b + 1, 0, width - 1);
         const double lo = apMean[ia];
         const double hi = apMean[ib];
-        const double e  = run.edge;                 // sample coordinate
 
-        // pred: the forward-model doublet for an IDEAL step at the lurch edge,
-        // carrying only the CLEAN amplitude (lo->hi). It is the amplitude
-        // reference, not the emitted shape -- a hard step is quantized to a
-        // column and staircases on diagonals.
-        auto Ystep = [&](int j) { return ((double)j < e) ? lo : hi; };
-        const int x0 = std::clamp((int)std::floor(e) - 3, 0, width - 1);
-        const int x1 = std::clamp((int)std::ceil(e) + 3, 0, width - 1);
-        std::fill(pred.begin() + x0, pred.begin() + x1 + 1, 0.0);
-        std::fill(ntch.begin() + x0, ntch.begin() + x1 + 1, 0.0);
+        // Fit window: the step's own footprint. Every sample needs all four
+        // covering apertures (x in [3, width-4]) so (I-T) is exact; an edge
+        // too near the margins simply gets no correction (1D fallback).
+        const int x0 = (int)std::floor(run.edge) - 5;
+        const int x1 = (int)std::ceil(run.edge) + 5;
+        if (x0 < 3 || x1 > width - 4) { g_tandemProbe.count(TandemVerdict::Window); continue; }
+        const int n = x1 - x0 + 1;      // <= 13
+
+        double m[16], s4[16], c4[16], d[16];
         for (int x = x0; x <= x1; ++x) {
-            const double d2Y = Ystep(x - 2) - 2.0 * Ystep(x) + Ystep(x + 2);
-            pred[x] = -0.25 * d2Y;
-            // ntch: the notch's own doublet. notch = raw - carrier ~= Y (the
-            // carrier cancels), so this is the REAL luma edge's leak -- smooth,
-            // sub-sample-positioned, correct width -- but chroma-contaminated in
-            // amplitude at a coincident colour boundary. It supplies the SHAPE.
-            auto notch = [&](int j) {
-                const int jc = std::clamp(j, 0, width - 1);
-                return (double)rawLine[left + jc] - carrierAtLeft[jc];
-            };
-            ntch[x] = -0.25 * (notch(x - 2) - 2.0 * notch(x) + notch(x + 2));
+            double acc = 0.0;
+            for (int dd = 0; dd < 4; ++dd)
+                acc += apMean[x - (3 - dd)];
+            const int i = x - x0;
+            m[i] = (double)rawLine[left + x] - 0.25 * acc;
+            const int ph = carrierSampleClass(line, left + x);
+            s4[i] = sin4fsc(ph);
+            c4[i] = cos4fsc(ph);
         }
 
-        // Reshape the clean amplitude onto the real shape: beta is the scalar
-        // that best fits pred by a multiple of the notch doublet (least
-        // squares). beta*ntch therefore has the NOTCH'S shape (smooth, follows
-        // the diagonal) and, by construction, an amplitude no larger than the
-        // lurch reference -- so chroma inflation of the notch is divided out and
-        // we never over-subtract. sPN<=0 (opposite doublet) or a flat notch
-        // vetoes. Neither signal alone: lurch sets the amplitude, notch the
-        // shape.
-        double sPN = 0.0, sNN = 0.0;
-        for (int x = x0; x <= x1; ++x) { sPN += pred[x] * ntch[x]; sNN += ntch[x] * ntch[x]; }
-        if (sPN <= 0.0 || sNN < 1e-12) continue;
-        const double beta = sPN / sNN;
+        // ramp_{e,w}: pinned plateau levels, transition of width w centred on
+        // e. Analytic, so sub-sample e follows a diagonal smoothly (the P9b
+        // jaggies lesson).
+        auto rampAt = [&](double j, double e, double w) {
+            return lo + (hi - lo) * std::clamp((j - e) / w + 0.5, 0.0, 1.0);
+        };
+        static constexpr double T7[7] = {1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0};
+        auto buildDoublet = [&](double e, double w) {
+            for (int x = x0; x <= x1; ++x) {
+                double t = 0.0;
+                for (int k = -3; k <= 3; ++k)
+                    t += T7[k + 3] * rampAt((double)(x + k), e, w);
+                d[x - x0] = rampAt((double)x, e, w) - t / 16.0;
+            }
+        };
+        // LS over the two nuisance envelope terms, closed form; returns the
+        // residual energy after the envelope has done its best. Comparing
+        // hypotheses under the SAME nuisance model makes envelope-model error
+        // common-mode.
+        auto fitErr = [&](const double *dbl) {
+            double Sss = 0, Scc = 0, Ssc = 0, Srs = 0, Src = 0, Srr = 0;
+            for (int i = 0; i < n; ++i) {
+                const double r = m[i] - (dbl ? dbl[i] : 0.0);
+                Sss += s4[i] * s4[i]; Scc += c4[i] * c4[i]; Ssc += s4[i] * c4[i];
+                Srs += r * s4[i];     Src += r * c4[i];     Srr += r * r;
+            }
+            const double det = Sss * Scc - Ssc * Ssc;
+            if (det < 1e-9) return Srr;
+            const double p = (Scc * Srs - Ssc * Src) / det;
+            const double q = (Sss * Src - Ssc * Srs) / det;
+            return Srr - (p * Srs + q * Src);
+        };
 
-        const double w = run.gate;
-        for (int x = x0; x <= x1; ++x)
-            leak[x] += beta * ntch[x] * w;
+        const double err0 = fitErr(nullptr);
+        if (err0 < 1e-12) { g_tandemProbe.count(TandemVerdict::Window); continue; }
+
+        static constexpr double kWidths[4] = {0.6, 1.0, 1.6, 2.4};
+        const double eLo = run.edge - 2.0, eHi = run.edge + 2.0;
+        double bestErr = err0, bestE = run.edge, bestW = 0.0;
+        for (double e = eLo; e <= eHi + 1e-9; e += 0.25) {
+            for (double w : kWidths) {
+                buildDoublet(e, w);
+                const double err = fitErr(d);
+                if (err < bestErr) { bestErr = err; bestE = e; bestW = w; }
+            }
+        }
+
+        // Binary verdict. No margin, no localization => nothing is emitted.
+        if (bestW == 0.0 || bestErr > kAccept * err0) {
+            g_tandemProbe.count(TandemVerdict::Margin); continue;
+        }
+        if (bestE <= eLo + 1e-9 || bestE >= eHi - 1e-9) {
+            g_tandemProbe.count(TandemVerdict::Boundary); continue;
+        }
+        g_tandemProbe.accept(bestE - run.edge, bestW, bestErr / err0);
+
+        // Emit the bandpass's own forward-model leak for the fitted edge:
+        // -0.25 * D2_2{ramp}. The fit estimated (e,w) through (I-T); the
+        // emission uses the operator the bandpass actually applies.
+        const int y0 = std::max(0, (int)std::floor(bestE) - 4);
+        const int y1 = std::min(width - 1, (int)std::ceil(bestE) + 4);
+        for (int x = y0; x <= y1; ++x) {
+            const double d2 = rampAt((double)(x - 2), bestE, bestW)
+                            - 2.0 * rampAt((double)x, bestE, bestW)
+                            + rampAt((double)(x + 2), bestE, bestW);
+            leak[x] += -0.25 * d2 * run.gate;
+        }
+        any = true;
     }
 
+    if (!any) return;
     for (int x = 0; x < width; ++x)
         carrierAtLeft[x] -= leak[x];
 }
