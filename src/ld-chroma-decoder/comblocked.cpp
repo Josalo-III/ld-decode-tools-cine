@@ -4707,6 +4707,7 @@ enum class TandemVerdict { Window, Margin, Boundary };
 struct TandemProbe {
     std::mutex mu;
     long nWindow = 0, nMargin = 0, nBoundary = 0, nAccept = 0;
+    long nAccPar[2] = {0, 0};
     double sumDe = 0.0, sumAbsDe = 0.0, sumRatio = 0.0;
     long wHist[4] = {0, 0, 0, 0};
 
@@ -4730,11 +4731,12 @@ struct TandemProbe {
         }
     }
 
-    void accept(double de, double w, double ratio)
+    void accept(double de, double w, double ratio, int parity)
     {
         if (!on()) return;
         std::lock_guard<std::mutex> lk(mu);
         ++nAccept;
+        ++nAccPar[parity & 1];
         sumDe += de; sumAbsDe += std::fabs(de); sumRatio += ratio;
         const int wi = (w < 0.8) ? 0 : (w < 1.3) ? 1 : (w < 2.0) ? 2 : 3;
         ++wHist[wi];
@@ -4756,9 +4758,11 @@ struct TandemProbe {
         if (nAccept > 0)
             std::fprintf(stderr,
                 "[TANDEM] accepted: de mean %+.2f  |de| mean %.2f px  "
-                "err/err0 mean %.2f  widths 0.6:%ld 1.0:%ld 1.6:%ld 2.4:%ld\n",
+                "err/err0 mean %.2f  widths 0.6:%ld 1.0:%ld 1.6:%ld 2.4:%ld  "
+                "parity even:%ld odd:%ld\n",
                 sumDe / nAccept, sumAbsDe / nAccept, sumRatio / nAccept,
-                wHist[0], wHist[1], wHist[2], wHist[3]);
+                wHist[0], wHist[1], wHist[2], wHist[3],
+                nAccPar[0], nAccPar[1]);
     }
 };
 
@@ -4880,46 +4884,60 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
                 d[x - x0] = rampAt((double)x, e, w) - t / 16.0;
             }
         };
-        // LS over the two nuisance envelope terms, closed form; returns the
-        // residual energy after the envelope has done its best. Comparing
-        // hypotheses under the SAME nuisance model makes envelope-model error
-        // common-mode.
-        auto fitErr = [&](const double *dbl) {
-            double Sss = 0, Scc = 0, Ssc = 0, Srs = 0, Src = 0, Srr = 0;
-            for (int i = 0; i < n; ++i) {
-                const double r = m[i] - (dbl ? dbl[i] : 0.0);
-                Sss += s4[i] * s4[i]; Scc += c4[i] * c4[i]; Ssc += s4[i] * c4[i];
-                Srs += r * s4[i];     Src += r * c4[i];     Srr += r * r;
+        // SPLIT-ENVELOPE nuisance: independent (p,q) on each side of the
+        // candidate edge, two independent 2x2 solves. A scene object boundary
+        // is one edge in two channels -- the luma ramp AND a colour
+        // transition share the same e -- and a constant-envelope null is
+        // WRONG at exactly the coincident colour+luma edges this corrector
+        // targets: the null's error is inflated by envelope-transition energy
+        // the doublet cannot explain, and the ratio test self-blinds (the
+        // concert-CCR trap: right detector, wrong null). Both hypotheses get
+        // the split at the SAME e, so the comparison isolates the doublet
+        // alone; where there is no real doublet the null only gets stronger,
+        // so false accepts get harder, not easier.
+        auto fitErrSplit = [&](const double *dbl, double e) {
+            double err = 0.0;
+            for (int side = 0; side < 2; ++side) {
+                double Sss = 0, Scc = 0, Ssc = 0, Srs = 0, Src = 0, Srr = 0;
+                int cnt = 0;
+                for (int i = 0; i < n; ++i) {
+                    if ((side == 1) != ((double)(x0 + i) > e)) continue;
+                    const double r = m[i] - (dbl ? dbl[i] : 0.0);
+                    Sss += s4[i] * s4[i]; Scc += c4[i] * c4[i];
+                    Ssc += s4[i] * c4[i];
+                    Srs += r * s4[i];     Src += r * c4[i];     Srr += r * r;
+                    ++cnt;
+                }
+                if (cnt < 3) return 1e300;   // unusable partition
+                const double det = Sss * Scc - Ssc * Ssc;
+                err += (det < 1e-9) ? Srr
+                                    : Srr - ((Scc * Srs - Ssc * Src) * Srs
+                                           + (Sss * Src - Ssc * Srs) * Src) / det;
             }
-            const double det = Sss * Scc - Ssc * Ssc;
-            if (det < 1e-9) return Srr;
-            const double p = (Scc * Srs - Ssc * Src) / det;
-            const double q = (Sss * Src - Ssc * Srs) / det;
-            return Srr - (p * Srs + q * Src);
+            return err;
         };
-
-        const double err0 = fitErr(nullptr);
-        if (err0 < 1e-12) { g_tandemProbe.count(TandemVerdict::Window); continue; }
 
         static constexpr double kWidths[4] = {0.6, 1.0, 1.6, 2.4};
         const double eLo = run.edge - 2.0, eHi = run.edge + 2.0;
-        double bestErr = err0, bestE = run.edge, bestW = 0.0;
+        double bestRatio = 1e300, bestE = run.edge, bestW = 0.0;
         for (double e = eLo; e <= eHi + 1e-9; e += 0.25) {
+            const double errNull = fitErrSplit(nullptr, e);
+            if (errNull >= 1e300 || errNull < 1e-12) continue;
             for (double w : kWidths) {
                 buildDoublet(e, w);
-                const double err = fitErr(d);
-                if (err < bestErr) { bestErr = err; bestE = e; bestW = w; }
+                const double ratio = fitErrSplit(d, e) / errNull;
+                if (ratio < bestRatio) { bestRatio = ratio; bestE = e; bestW = w; }
             }
         }
 
         // Binary verdict. No margin, no localization => nothing is emitted.
-        if (bestW == 0.0 || bestErr > kAccept * err0) {
+        if (bestW == 0.0 || bestRatio > kAccept) {
             g_tandemProbe.count(TandemVerdict::Margin); continue;
         }
         if (bestE <= eLo + 1e-9 || bestE >= eHi - 1e-9) {
             g_tandemProbe.count(TandemVerdict::Boundary); continue;
         }
-        g_tandemProbe.accept(bestE - run.edge, bestW, bestErr / err0);
+        g_tandemProbe.accept(bestE - run.edge, bestW, bestRatio, line & 1);
 
         // Emit the bandpass's own forward-model leak for the fitted edge:
         // -0.25 * D2_2{ramp}. The fit estimated (e,w) through (I-T); the
