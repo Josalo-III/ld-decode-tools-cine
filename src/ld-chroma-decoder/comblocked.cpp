@@ -4913,6 +4913,56 @@ struct EdgeFateProbe {
 
 EdgeFateProbe g_edgeFate;
 
+// Post-law hull-violation stats (LDCD_PROBE_RETRHULL=1). Measurement only.
+// Pass 1 clamps the carrier fit into the residual-consensus feasible range
+// (region-pure four-view complements + the rolling witness), but the encoder
+// bandwidth law is imposed AFTER that clamp at publication, and its 9-tap
+// FIR mixes neighbours -- the published fit can leave the per-sample range
+// the clamp enforced. This measures how often and by how much, deciding
+// whether re-imposing the hull after the law is load-bearing or insurance.
+struct RetrHullProbe {
+    std::mutex mu;
+    long   n = 0, nOut = 0;
+    double sumExcess = 0.0, maxExcess = 0.0, sumWidth = 0.0;
+
+    static bool on()
+    {
+        static const bool v = []{
+            const char *s = std::getenv("LDCD_PROBE_RETRHULL");
+            return s && std::atoi(s) != 0;
+        }();
+        return v;
+    }
+
+    void sample(double fit, double lo, double hi, double invIre)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ++n;
+        sumWidth += (hi - lo) * invIre;
+        double ex = 0.0;
+        if (fit < lo)      ex = (lo - fit) * invIre;
+        else if (fit > hi) ex = (fit - hi) * invIre;
+        if (ex > 0.0) {
+            ++nOut;
+            sumExcess += ex;
+            maxExcess = std::max(maxExcess, ex);
+        }
+    }
+
+    ~RetrHullProbe()
+    {
+        if (!on() || n <= 0) return;
+        std::fprintf(stderr,
+            "\n[RETRHULL] n=%ld  outside %.1f%%  excess mean %.3f IRE "
+            "(of violators)  max %.2f  hull width mean %.2f IRE\n",
+            n, 100.0 * (double)nOut / (double)n,
+            nOut ? sumExcess / nOut : 0.0, maxExcess,
+            sumWidth / n);
+    }
+};
+
+RetrHullProbe g_retrHull;
+
 } // namespace
 
 // Pair class-map probe at luma steps. MEASUREMENT ONLY -- writes nothing.
@@ -5490,12 +5540,20 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             if ((int)boundaryMark.size() < width)
                 boundaryMark.resize(width, 0);
 
-            for (int s = 0; s < meanCount; ++s) {
-                winFloor[s] =
-                    0.25 * (rawWhole[s + 0] +
-                            rawWhole[s + 1] +
-                            rawWhole[s + 2] +
-                            rawWhole[s + 3]);
+            // winFloor IS the shared aperture pool: 0.25*(raw[s..s+3]) is
+            // exactly what buildApertureMeans() published (both are exact
+            // integer sums, so the copy is byte-identical to the old private
+            // rebuild). One scan, many readers.
+            {
+                const double *apRow = lockedApertureMean_line(line);
+                if (apRow) {
+                    std::copy(apRow, apRow + meanCount, winFloor.begin());
+                } else {
+                    for (int s = 0; s < meanCount; ++s)
+                        winFloor[s] =
+                            0.25 * (rawWhole[s + 0] + rawWhole[s + 1] +
+                                    rawWhole[s + 2] + rawWhole[s + 3]);
+                }
             }
 
             // Luma prior: the integer-centred moving coarse, not a medoid of the
@@ -5511,9 +5569,10 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 
             // Lurch preconditioner: sharpen the prior before the carrier fit
             // consumes it, so step energy stays out of raw - refinedY and
-            // never enters the carrier band.
-            lurchSharpenCoarsePrior(winFloor.data(), meanCount, width,
-                                    refinedY, nullptr);
+            // never enters the carrier band. Canonical runs (built once in
+            // split1D on the same pool); apply-only here.
+            applyLurchSteps(lurchStepRuns_line(line), winFloor.data(),
+                            meanCount, width, 1.0, refinedY, nullptr);
 
             for (int s = 0; s < meanCount; ++s) {
                 double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
@@ -6159,6 +6218,57 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                         carrierFit[xi] = cf;
                         flattened[xi] = rawWhole[xi] - cf;
                         fitRow[xi] = static_cast<float>(cf);
+                    }
+                }
+            }
+
+            // Post-law hull-violation probe (measurement only; inert unless
+            // LDCD_PROBE_RETRHULL). Reports what the re-clamp below is about
+            // to correct: how far the law's FIR moved the published fit back
+            // outside the per-sample feasible range the Pass-1 clamp had
+            // enforced.
+            if (RetrHullProbe::on()) {
+                for (int xi = 0; xi < width; ++xi) {
+                    const auto &pp = analysisRow[xi].parallax;
+                    if (!pp.residualValid) continue;
+                    g_retrHull.sample(carrierFit[xi],
+                                      static_cast<double>(pp.residualLo),
+                                      static_cast<double>(pp.residualHi),
+                                      invIreScale);
+                }
+            }
+
+            // Re-impose the residual-consensus hull AFTER the law. The law's
+            // FIR mixes neighbours and re-manufactures carrier the per-sample
+            // feasible range forbids (measured: cube 45.4% of samples
+            // outside, mean excess 0.56 IRE, max 44; beach 37.9%). The two
+            // constraints cannot be imposed by one pass each in either order
+            // -- but they are not symmetric: a clamp is a TRUE projection
+            // (idempotent, per-sample), so it cannot compound the FIR, and
+            // what it removes returns to Y via flattened = raw - cf, which
+            // is lawful -- carrier outside the hull IS luma by the
+            // conservation facts. The residual envelope kink this leaves is
+            // bounded by the clamp delta; publishing impossible carrier is
+            // the greater crime (it is the cube face's manufactured Y). Law
+            // once, hull last. Kill switch for A/B only: LDCD_RETRHULL=0.
+            {
+                static const bool retrHullOn = []{
+                    const char *s = std::getenv("LDCD_RETRHULL");
+                    return !s || std::atoi(s) != 0;
+                }();
+                if (retrHullOn) {
+                    for (int xi = 0; xi < width; ++xi) {
+                        const auto &pp = analysisRow[xi].parallax;
+                        if (!pp.residualValid) continue;
+                        const double cf = std::clamp(
+                            carrierFit[xi],
+                            static_cast<double>(pp.residualLo),
+                            static_cast<double>(pp.residualHi));
+                        if (cf != carrierFit[xi]) {
+                            carrierFit[xi] = cf;
+                            flattened[xi]  = rawWhole[xi] - cf;
+                            fitRow[xi]     = static_cast<float>(cf);
+                        }
                     }
                 }
             }
