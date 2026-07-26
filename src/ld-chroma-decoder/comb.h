@@ -348,6 +348,16 @@ public:
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCarrierRetractionStage(bool analysisOnly);
 
+	// Corner-leak corrector. The locked bandpass reads luma CURVATURE as false
+	// carrier: leak[x] = -0.25 * (Y[x-2] - 2Y[x] + Y[x+2]), exactly. A
+	// constant-slope ramp has zero curvature and therefore leaks nothing, so
+	// this stage is identically inert wherever the luma foundation does not
+	// bend. It recovers the curvature by deconvolving the KNOWN notch kernel
+	// ([0.25,0.5,0.25] at stride 2), gates the result by carrier-free evidence,
+	// and publishes the predicted leak. DIAGNOSTIC ONLY at present: nothing
+	// consumes lockedCornerLeak_flat, so the render is unchanged.
+	void buildCornerLeak();
+
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
 	void buildCarrierRetracted();
@@ -869,6 +879,12 @@ private:
 	// Built unconditionally (a running sum, O(1) per sample) because it has
 	// default-path clients, not "just in case".
 	std::vector<double> lockedApertureMean_flat;
+	// Predicted 1D corner leak, raw units, same geometry as
+	// locked1DRawBandpass. chroma = bp - leak, and Y = raw - chroma, so the
+	// removed leak RETURNS to luma and Y + chroma == raw exactly (the
+	// conservation condition a desaturating suppressor cannot satisfy).
+	// DIAGNOSTIC ONLY for now: no consumer, so the render is unchanged.
+	std::vector<double> lockedCornerLeak_flat;
 	bool lockedLumaCacheValid = false;
 
 	inline double *lockedLumaBaseY4_line(int line) {
@@ -898,6 +914,16 @@ private:
 	inline double *lockedApertureMean_line(int line) {
 		if (lockedApertureMean_flat.empty()) return nullptr;
 		return lockedApertureMean_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline double *lockedCornerLeak_line(int line) {
+		if (lockedCornerLeak_flat.empty()) return nullptr;
+		return lockedCornerLeak_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const double *lockedCornerLeak_line(int line) const {
+		if (lockedCornerLeak_flat.empty()) return nullptr;
+		return lockedCornerLeak_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline const double *lockedApertureMean_line(int line) const {

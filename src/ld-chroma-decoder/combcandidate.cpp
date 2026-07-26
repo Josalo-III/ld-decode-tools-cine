@@ -1782,6 +1782,12 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         return;
     }
 
+    static const bool dumpFB = std::getenv("LDCD_DUMP_FB") != nullptr;
+    static const int dumpFBL0 = []{ const char *s = std::getenv("LDCD_DUMP_FB_L0"); return s ? std::atoi(s) : 0; }();
+    static const int dumpFBL1 = []{ const char *s = std::getenv("LDCD_DUMP_FB_L1"); return s ? std::atoi(s) : 0; }();
+    static const int dumpFBC0 = []{ const char *s = std::getenv("LDCD_DUMP_FB_C0"); return s ? std::atoi(s) : 0; }();
+    static const int dumpFBC1 = []{ const char *s = std::getenv("LDCD_DUMP_FB_C1"); return s ? std::atoi(s) : 0; }();
+
     // =========================== RED LABEL ================================
     // FIELD B MAINTENANCE RULE
     //
@@ -2018,6 +2024,36 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         outFieldLine[rel] = output;
         if (outReasonLine)
             outReasonLine[rel] = reason;
+
+        if (dumpFB && lineNumber >= dumpFBL0 && lineNumber <= dumpFBL1 &&
+            rel >= dumpFBC0 && rel <= dumpFBC1)
+        {
+            const char *tag =
+                (reason == FieldBReasonCede)      ? "cede" :
+                (reason == FieldBReasonCenter)    ? "ctr " :
+                (reason == FieldBReasonBlend)     ? "blnd" :
+                (reason == FieldBReasonOneLeg)    ? "1leg" :
+                (reason == FieldBReasonRecovery)  ? "recv" :
+                (reason == FieldBReasonRepairHold)? "hold" : "??? ";
+            const double centerIRE = center * invIreScale;
+            const double outputIRE = output * invIreScale;
+            const double combedIRE = (useUp || useDown)
+                ? 0.5 * (center - (up * wUp + down * wDown) / (wUp + wDown)) * invIreScale
+                : centerIRE;
+            std::fprintf(stderr,
+                "[FB] ln=%d c=%d %s  1d=%.2f comb=%.2f out=%.2f  "
+                "lgU=%.2f lgD=%.2f cede=%.2f  "
+                "flags=%02x recov=%d pcons=%d  "
+                "outerHue=%.1f outerCmp=%d\n",
+                lineNumber, rel, tag,
+                centerIRE, combedIRE, outputIRE,
+                tapLine.pairU2[rel].reachLegalGate,
+                tapLine.pairD2[rel].reachLegalGate,
+                cede,
+                cedeFlags, (int)policyRecovered, (int)pairConsensus,
+                region.upDownHueDifferenceDeg,
+                (int)region.outerComparable);
+        }
     }
 }
 

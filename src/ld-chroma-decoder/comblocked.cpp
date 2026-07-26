@@ -755,6 +755,441 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                 pct(thirdIll[2], thirdTot[2]));
         }
     }
+
+    // --- Disposable 1D-fingerprint dump (env-gated). The three orthogonal
+    // views of "luma entered the bandpass", per pixel along a scanline:
+    //   incoh = sourceMinusWideIRE  (horizontal: source minus wide coherent fit)
+    //   lurch = maxAbsMembershipIRE (carrier-free luma movement through aperture)
+    //   conf  = carrierConformance  (interline: -1 inverts like carrier,
+    //                                +1 matches where schedule demands inversion
+    //                                = image-locked luma leak)
+    // Enable with LDCD_DUMP_FP_L (frame line) and LDCD_DUMP_FP_C0/C1 (active
+    // column range = h - left). Run -t 1. Zero cost when unset.
+    static const int fpLine = []{ const char *s = std::getenv("LDCD_DUMP_FP_L"); return s ? std::atoi(s) : -1; }();
+    static const int fpC0   = []{ const char *s = std::getenv("LDCD_DUMP_FP_C0"); return s ? std::atoi(s) : -1; }();
+    static const int fpC1   = []{ const char *s = std::getenv("LDCD_DUMP_FP_C1"); return s ? std::atoi(s) : -1; }();
+    if (fpLine >= first && fpLine < last && fpC0 >= 0) {
+        const lddecode::CarrierAnalysisRecord *rec = carrierAnalysis_line(fpLine);
+        // Notch = raw - 1D bandpass (the CCR pixel edge read).  Recomputed
+        // here from the canonical bandpass so the dump shows the SAME signal
+        // splitIQlocked differences at +/-2.  IRE units.  The +/-2 difference
+        // uses CCR's clamp (max/min), not the bandpass reflection, matching
+        // the edge read exactly.
+        const double  *bpLine  = locked1DRawBandpass_line(fpLine);
+        const quint16 *rawLine =
+            rawbuffer.data() + static_cast<size_t>(fpLine) * fullWidth;
+        auto notchIRE = [&](int rel) -> double {
+            const int r = std::clamp(rel, 0, width - 1);
+            return ((double)rawLine[left + r] - bpLine[r]) * invIreScale;
+        };
+        if (rec && bpLine) {
+            const int c1 = (fpC1 >= 0 ? fpC1 : fpC0);
+            for (int rel = fpC0; rel <= c1 && rel < width; ++rel) {
+                const auto &r = rec[rel];
+                const char *sc = r.scheduleConformance ==
+                        lddecode::CarrierScheduleConformance::LegalCarrier ? "LEG"
+                    : r.scheduleConformance ==
+                        lddecode::CarrierScheduleConformance::ScheduleIllegal ? "ILL"
+                    : "unr";
+                const int    xm     = std::max(0, rel - 2);
+                const int    xp     = std::min(width - 1, rel + 2);
+                const double notch  = notchIRE(rel);
+                const double nedge  = std::fabs(notchIRE(xp) - notchIRE(xm));
+                const double rawIRE = (double)rawLine[left + rel] * invIreScale;
+                const double bpIRE  = bpLine[rel] * invIreScale;
+                std::fprintf(stderr,
+                    "[FP] line=%d h=%d raw=%.2f bp=%.2f src=%.2f wide=%.2f "
+                    "incoh=%.2f lurch=%.2f notch=%.2f nedge=%.2f conf=%+.2f "
+                    "supp=%.2f sched=%s\n",
+                    fpLine, rel + left,
+                    rawIRE, bpIRE,
+                    r.fit.sourceSample * invIreScale,
+                    r.fit.wideSample * invIreScale,
+                    r.fit.sourceMinusWideIRE,
+                    r.residual.maxAbsMembershipIRE,
+                    notch, nedge,
+                    r.carrierConformance,
+                    r.conformanceSupportFraction, sc);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Corner-leak corrector.
+//
+// The locked bandpass bp[x] = 0.50*c - 0.25*(m2 + p2) has response sin^2(w) and
+// cancels a CONSTANT luma foundation exactly (-0.25 + 0.50 - 0.25 = 0).  The
+// carrier is stacked on luma, so where the foundation bends the cancellation
+// fails by exactly the curvature:
+//
+//     leak[x] = -0.25 * (Y[x-2] - 2*Y[x] + Y[x+2])        (an identity)
+//
+// Consequences this stage relies on:
+//   * a constant-slope ramp has ZERO curvature and therefore leaks NOTHING --
+//     gradients and shading are invisible, and this stage is inert there by
+//     construction rather than by a gate;
+//   * only CORNERS leak, so a ramped edge is two curvature events;
+//   * the alternation seen at edges arises at demod (the LUT flips sign per the
+//     schedule), not in the raw leak, so one correction serves every line.
+//
+// Recovery.  The complementary notch is exactly
+//     notch[x] = raw[x] - bp[x] = 0.25*Y[x-2] + 0.5*Y[x] + 0.25*Y[x+2],
+// i.e. Y through a KNOWN 3-tap stride-2 smoother S (response cos^2(w)).  With
+// m = D2{notch} we have m = S{kappa} for kappa = D2{Y}, so the curvature is
+// recovered by deconvolving S.  Van Cittert (kappa += m - S{kappa}) propagates
+// error as (I - S) = sin^2(w): it converges everywhere EXCEPT at fSC, where it
+// is frozen at the initial guess.  Starting from kappa = 0 therefore makes NO
+// claim about the one mode that is genuinely unknowable on a single line -- the
+// regulariser is the physics, and there is no tuning constant in it.
+//
+// Gating.  Three carrier-free tests, each used for what it can actually do:
+//   * lurch  -- PRESENCE of luma motion across a cycle (it cannot localise a
+//               corner: full-cycle smear, one corner per cycle);
+//   * schedule -- energy matching where the schedule demands inversion is luma
+//               BY LAW; legal carrier is protected;
+//   * parallax -- from the collected aperture-mean pool.  A legal carrier nulls
+//               in EVERY legal four-sample window, so it contributes no spread
+//               between the apertures covering a sample; only luma moves them.
+//               The ratio spread/|carrier| is literally "what fraction of this
+//               carrier-band energy fails to null in the aperture".
+// All gates multiply KAPPA (a luma-domain quantity), never the carrier, so they
+// cannot manufacture sidebands.
+//
+// DIAGNOSTIC ONLY: the published leak has no consumer yet, so the render is
+// unchanged.  When it is adopted, chroma = bp - leak and Y = raw - chroma, so
+// the leak returns to luma and Y + chroma == raw exactly.
+// ---------------------------------------------------------------------------
+
+// Deconvolution depth. Van Cittert converges slowest near fSC by design; more
+// iterations claim more of the near-fSC neighbourhood. Measured: the strong-edge
+// saturation DIPS then RECOVERS as this rises (a PARTIAL doublet subtraction
+// leaves a residue that cancels chroma; a converged one restores it).
+static constexpr int    kCornerLeakIters      = 60;
+// Outer rounds of the two-way contamination fix (see buildCornerLeak).
+static constexpr int    kCornerOuterRounds    = 2;
+static constexpr double kCornerSchedSoft      = -0.2;
+static constexpr double kCornerSchedHard      =  0.6;
+// Parallax ratio: below soft the energy nulls in every aperture like legal
+// carrier (protect); above hard it fails to null (luma, act). Measured
+// populations: colour p50 0.05-0.12, pure luma p50 0.89.
+static constexpr double kCornerParallaxSoft   = 0.15;
+static constexpr double kCornerParallaxHard   = 0.45;
+
+void Comb::FrameBuffer::buildCornerLeak()
+{
+    // No consumer yet, so the default path must not pay for it: ~11% of a
+    // locked decode (the 60 Van Cittert sweeps dominate). Enable explicitly
+    // with LDCD_CORNER_LEAK=1 while developing. Remove this gate when the
+    // corrected source is adopted -- a stage with a real client is not
+    // optional, and "on by default when it earns its place" is the rule.
+    static const bool enabled = []{
+        const char *s = std::getenv("LDCD_CORNER_LEAK");
+        return s && std::atoi(s) != 0;
+    }();
+    if (!enabled)                         return;
+    if (!configuration.phaseCompensation) return;
+    if (lockedCornerLeak_flat.empty())    return;
+
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    const int fullWidth = videoParameters.fieldWidth;
+    if (width < 8 || first >= last) return;
+
+    auto ramp = [](double v, double a, double b) {
+        return std::clamp((v - a) / (b - a), 0.0, 1.0);
+    };
+
+    std::vector<double> notch(width), notchAdj(width), chromaEst(width),
+                        mObs(width), kappa(width), sKappa(width);
+    std::vector<double> ratio(width), gate(width), gateSmooth(width);
+    std::vector<double> envI(width), envQ(width), sEnvI(width), sEnvQ(width),
+                        envExcess(width);
+    // Four aperture views of the residual, demodulated.
+    std::vector<double> vI(size_t(4) * width), vQ(size_t(4) * width);
+    std::vector<double> sI(size_t(4) * width), sQ(size_t(4) * width);
+
+    // S: the notch kernel, [0.25, 0.5, 0.25] at stride 2.
+    auto applyS = [&](const std::vector<double> &in, std::vector<double> &out) {
+        for (int i = 0; i < width; ++i) {
+            if (i >= 2 && i < width - 2)
+                out[i] = 0.25 * in[i - 2] + 0.5 * in[i] + 0.25 * in[i + 2];
+            else
+                out[i] = in[i];
+        }
+    };
+
+    for (int line = first; line < last; ++line) {
+        double *leakRow = lockedCornerLeak_line(line);
+        if (!leakRow) continue;
+        // Clear unconditionally: a stale leak from an earlier frame must never
+        // survive into this one (FrameBuffers persist across batches).
+        std::fill(leakRow, leakRow + width, 0.0);
+        const double *bpLine = locked1DRawBandpass_line(line);
+        if (!bpLine) continue;
+
+        const quint16 *rawLine =
+            rawbuffer.data() + static_cast<size_t>(line) * fullWidth;
+        const lddecode::CarrierAnalysisRecord *analysisRow =
+            carrierAnalysis_line(line);
+        const double *apMean = lockedApertureMean_line(line);
+
+        for (int x = 0; x < width; ++x)
+            notch[x] = (double)rawLine[left + x] - bpLine[x];
+
+        // Contamination runs BOTH ways, and correcting only one is what made
+        // thin straps worse:
+        //     bp    = chroma + leak      (luma  -> carrier band)  <- corrected
+        //     notch = Y      - leak + N{chroma}  (chroma -> notch) <- was NOT
+        // N = I - B has response cos^2(w), which is zero only AT fSC; a compact
+        // colour feature has a fast envelope with content away from band centre,
+        // so N{chroma} is significant there, D2{notch} picks up chroma-derived
+        // curvature, and the recovered leak is wrong. A wrong leak shows up as
+        // carrier-rate ALTERNATION IN LUMA, because Y = notch + leak and the
+        // identity notch = Y - leak means a CORRECT leak reconstructs the sharp
+        // luma exactly, with no alternation. Alternation in Y is therefore
+        // direct proof of mis-estimation, and is the metric to watch.
+        //
+        // So estimate the chroma, remove its notch-band image from the notch,
+        // and re-solve. Two outer rounds suffice (the second correction is an
+        // order smaller).
+        std::fill(kappa.begin(), kappa.end(), 0.0);
+        for (int outer = 0; outer < kCornerOuterRounds; ++outer) {
+            // notch corrected for the chroma that leaks INTO it.
+            for (int x = 0; x < width; ++x) notchAdj[x] = notch[x];
+            if (outer > 0) {
+                // chroma = bp - leak, with the current leak estimate.
+                for (int x = 0; x < width; ++x)
+                    chromaEst[x] = bpLine[x] + 0.25 * kappa[x];
+                // N{chroma} = chroma - B{chroma}: the part of the chroma that
+                // survives into the notch band and masquerades as luma.
+                for (int x = 0; x < width; ++x) {
+                    const int m2 = std::clamp(x - 2, 0, width - 1);
+                    const int p2 = std::clamp(x + 2, 0, width - 1);
+                    const double b = 0.50 * chromaEst[x]
+                                   - 0.25 * (chromaEst[m2] + chromaEst[p2]);
+                    notchAdj[x] -= (chromaEst[x] - b);
+                }
+            }
+            std::fill(mObs.begin(), mObs.end(), 0.0);
+            for (int x = 2; x < width - 2; ++x)
+                mObs[x] = notchAdj[x - 2] - 2.0 * notchAdj[x] + notchAdj[x + 2];
+
+            // Van Cittert deconvolution of S. Error propagates as
+            // (I - S) = sin^2, so this stalls at fSC by construction and never
+            // claims that mode.
+            std::fill(kappa.begin(), kappa.end(), 0.0);
+            for (int it = 0; it < kCornerLeakIters; ++it) {
+                applyS(kappa, sKappa);
+                for (int x = 0; x < width; ++x)
+                    kappa[x] += (mObs[x] - sKappa[x]);
+            }
+        }
+
+        // ---- Parallax: does this carrier-band energy null in every aperture?
+        std::fill(ratio.begin(), ratio.end(), 1.0);   // unknown => act
+        if (apMean) {
+            const int lastStart = width - 4;
+            for (int k = 0; k < 4; ++k) {
+                for (int x = 0; x < width; ++x) {
+                    const int v = std::clamp(x - (3 - k), 0, std::max(0, lastStart));
+                    const double r = (double)rawLine[left + x] - apMean[v];
+                    const int ph = carrierSampleClass(line, left + x);
+                    vI[size_t(k) * width + x] = 2.0 * r * sin4fsc(ph);
+                    vQ[size_t(k) * width + x] = 2.0 * r * cos4fsc(ph);
+                }
+            }
+            // 3-sample smooth per view (envelope extraction after demod).
+            for (int k = 0; k < 4; ++k) {
+                const double *pi = &vI[size_t(k) * width];
+                const double *pq = &vQ[size_t(k) * width];
+                double *oi = &sI[size_t(k) * width];
+                double *oq = &sQ[size_t(k) * width];
+                for (int x = 0; x < width; ++x) {
+                    const int a = std::max(0, x - 1), b = std::min(width - 1, x + 1);
+                    oi[x] = (pi[a] + pi[x] + pi[b]) / 3.0;
+                    oq[x] = (pq[a] + pq[x] + pq[b]) / 3.0;
+                }
+            }
+            for (int x = 0; x < width; ++x) {
+                double mi = 0.0, mq = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    mi += sI[size_t(k) * width + x];
+                    mq += sQ[size_t(k) * width + x];
+                }
+                mi *= 0.25; mq *= 0.25;
+                double div = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    const double di = sI[size_t(k) * width + x] - mi;
+                    const double dq = sQ[size_t(k) * width + x] - mq;
+                    div += std::hypot(di, dq);
+                }
+                div *= 0.25;
+                const double mag = std::hypot(mi, mq);
+                ratio[x] = div / std::max(mag, 1e-6);
+            }
+        }
+
+        // ---- Gate: parallax alone. Multiplies KAPPA (a luma-domain quantity),
+        // never the carrier, so it cannot manufacture sidebands.
+        //
+        // A lurch-presence gate and a schedule gate were both measured here and
+        // both REMOVED, on evidence:
+        //   * lurch changed nothing once parallax was present (identical to
+        //     0.2% on every metric) -- it asks a cruder version of the same
+        //     question;
+        //   * the schedule THROTTLED the correction 2-4x (chevron beading
+        //     -18.3% -> -7.5%, luma return +59.9% -> +15.5%) while helping
+        //     neither the monochrome case nor compact colour. It is the wrong
+        //     instrument for this job: the schedule reports that legal carrier
+        //     is PRESENT, but the corner leak rides ON TOP of legal carrier at
+        //     an edge, so it protected whole pixels. Parallax reports what
+        //     FRACTION of the energy fails to null in the aperture, which is
+        //     the proportional question removing a component actually poses.
+        // Measured with parallax alone: compact colour (earring) +0.2%,
+        // monochrome false colour -20.7% frame-wide, luma return +26.6%.
+        //
+        // THE GATE MUST VARY AT ENVELOPE SCALE. Multiplication in space is
+        // convolution in frequency: a per-pixel gain smears kappa's spectrum
+        // into fSC and MANUFACTURES carrier-rate content, which then lands in
+        // luma via Y = notch + leak and reads as a garish alternating edge.
+        // Measured with a raw per-pixel gate: ~28% of the injected luma change
+        // sat at fSC. Van Cittert cannot produce that itself (it stalls at fSC
+        // by construction), so the gate was the only possible source. Smooth
+        // the gate with the encoder's own chroma-envelope kernel before
+        // applying it -- a weight gathered AND applied at envelope scale cannot
+        // manufacture out-of-band sidebands.
+        // The schedule gate is RESTORED. It was removed earlier on chroma-side
+        // metrics (beading/saturation), which the Y-alternation finding then
+        // invalidated: with parallax alone the corrector injects +28.5% luma
+        // alternation at thin straps versus +10.5% with the schedule in place,
+        // and the straps read garishly worse. Chroma metrics could not see it
+        // because strap SATURATION is flat in every configuration -- the damage
+        // is entirely on the luma side.
+        for (int x = 0; x < width; ++x) {
+            double g = ramp(ratio[x], kCornerParallaxSoft, kCornerParallaxHard);
+            if (analysisRow) {
+                const double supp =
+                    std::clamp((double)analysisRow[x].conformanceSupportFraction,
+                               0.0, 1.0);
+                g *= ramp((double)analysisRow[x].carrierConformance,
+                          kCornerSchedSoft, kCornerSchedHard) * supp
+                     + (1.0 - supp) * 0.5;
+            }
+            gate[x] = g;
+        }
+        for (int x = 0; x < width; ++x) {
+            double acc = 0.0, wsum = 0.0;
+            for (int t = 0; t < lddecode::kChromaEnvelopeTaps; ++t) {
+                const int o = x + t - lddecode::kChromaEnvelopeTaps / 2;
+                if (o < 0 || o >= width) continue;
+                const double w = lddecode::kChromaEnvelopeFilter[t];
+                acc += w * gate[o]; wsum += w;
+            }
+            gateSmooth[x] = (wsum > 0.0) ? acc / wsum : gate[x];
+        }
+        for (int x = 0; x < width; ++x)
+            kappa[x] *= gateSmooth[x];
+        // ---- The SECOND curvature term: the carrier's own envelope. --------
+        //
+        // The bandpass cancels a constant luma foundation exactly, but it also
+        // assumes a CONSTANT CARRIER ENVELOPE. With c[x+-2] = -A[x+-2]*basis,
+        //
+        //   B{C}[x] = basis*(0.5*A[x] + 0.25*A[x-2] + 0.25*A[x+2])
+        //           = C[x] + 0.25*basis*D2{A}[x]
+        //
+        // so where the envelope BENDS the bandpass OVER-estimates the carrier.
+        // The full error is therefore TWO curvature terms:
+        //
+        //   bp = C  +  0.25*D2{A}*basis  -  0.25*D2{Y}
+        //
+        // Only the second was corrected before. At a thin strap the turquoise
+        // envelope switches on and off within a few samples, so D2{A} is large:
+        // the carrier is UNDER-COMBED, and Y = raw - chroma inherits the
+        // complement as a carrier-rate alternation. That is the garish strap.
+        // It is uncancelled CARRIER -- the schedule already tells us this energy
+        // is legal chroma -- not an unknowable mode to abstain from.
+        //
+        // A is recovered by demodulating bp on the grammar's own phase and
+        // taking the envelope-scale components, so this converts alternation
+        // into colour rather than discarding it.
+        for (int x = 0; x < width; ++x) {
+            const int ph = carrierSampleClass(line, left + x);
+            envI[x] = 2.0 * bpLine[x] * sin4fsc(ph);
+            envQ[x] = 2.0 * bpLine[x] * cos4fsc(ph);
+        }
+        for (int x = 0; x < width; ++x) {
+            double ai = 0.0, aq = 0.0, wsum = 0.0;
+            for (int t = 0; t < lddecode::kChromaEnvelopeTaps; ++t) {
+                const int o = x + t - lddecode::kChromaEnvelopeTaps / 2;
+                if (o < 0 || o >= width) continue;
+                const double w = lddecode::kChromaEnvelopeFilter[t];
+                ai += w * envI[o]; aq += w * envQ[o]; wsum += w;
+            }
+            if (wsum > 0.0) { sEnvI[x] = ai / wsum; sEnvQ[x] = aq / wsum; }
+            else            { sEnvI[x] = envI[x];   sEnvQ[x] = envQ[x];   }
+        }
+        for (int x = 0; x < width; ++x) {
+            const int m2 = std::clamp(x - 2, 0, width - 1);
+            const int p2 = std::clamp(x + 2, 0, width - 1);
+            const int ph = carrierSampleClass(line, left + x);
+            const double d2I = sEnvI[m2] - 2.0 * sEnvI[x] + sEnvI[p2];
+            const double d2Q = sEnvQ[m2] - 2.0 * sEnvQ[x] + sEnvQ[p2];
+            // 0.5 * (...) undoes the 2x demod gain; the excess is what the
+            // bandpass added to the carrier it should not have.
+            envExcess[x] = 0.25 * 0.5 * (d2I * sin4fsc(ph) + d2Q * cos4fsc(ph));
+        }
+
+        // Total withdrawal: envelope over-estimate MINUS the luma leak.
+        //   chroma = bp - leakRow,  Y = raw - chroma.
+        for (int x = 0; x < width; ++x) {
+            const int a = std::max(0, x - 1), b = std::min(width - 1, x + 1);
+            const double lumaTerm =
+                -0.25 * (0.25 * kappa[a] + 0.5 * kappa[x] + 0.25 * kappa[b]);
+            leakRow[x] = lumaTerm + envExcess[x];
+        }
+    }
+
+    // Disposable metrics (env-gated): beading, saturation and luma-edge
+    // sharpness under the correction, without changing any output.
+    static const int clDump = []{
+        const char *s = std::getenv("LDCD_DUMP_CORNER"); return s ? std::atoi(s) : 0;
+    }();
+    if (clDump) {
+        double sat0 = 0.0, sat1 = 0.0, bead0 = 0.0, bead1 = 0.0, maxLeak = 0.0;
+        long   nSat = 0, nB = 0;
+        for (int line = first; line < last; ++line) {
+            const double *bpLine = locked1DRawBandpass_line(line);
+            const double *leakRow = lockedCornerLeak_line(line);
+            if (!bpLine || !leakRow) continue;
+            for (int x = 6; x < width - 6; ++x) {
+                const int ph = carrierSampleClass(line, left + x);
+                const double e0 = std::fabs(2.0 * bpLine[x]);
+                const double e1 = std::fabs(2.0 * (bpLine[x] - leakRow[x]));
+                (void)ph;
+                maxLeak = std::max(maxLeak, std::fabs(leakRow[x]) * invIreScale);
+                if (e0 * invIreScale > 12.0) {
+                    sat0 += e0 * invIreScale; sat1 += e1 * invIreScale; ++nSat;
+                }
+                const double d0 = bpLine[x - 1] - 2.0 * bpLine[x] + bpLine[x + 1];
+                const double d1 = (bpLine[x - 1] - leakRow[x - 1])
+                                - 2.0 * (bpLine[x] - leakRow[x])
+                                + (bpLine[x + 1] - leakRow[x + 1]);
+                bead0 += std::fabs(d0) * invIreScale;
+                bead1 += std::fabs(d1) * invIreScale; ++nB;
+            }
+        }
+        if (nSat > 0 && nB > 0)
+            std::fprintf(stderr,
+                "[CORNER] sat %.2f -> %.2f (%+.1f%%)  bead %.3f -> %.3f (%+.1f%%)"
+                "  maxLeak %.1f IRE  nSat=%ld\n",
+                sat0 / nSat, sat1 / nSat, 100.0 * (sat1 - sat0) / std::max(sat0, 1e-9),
+                bead0 / nB, bead1 / nB, 100.0 * (bead1 - bead0) / std::max(bead0, 1e-9),
+                maxLeak, nSat);
+    }
 }
 
 void Comb::FrameBuffer::buildPhaseCorrected1D()
@@ -787,6 +1222,18 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     static const double parallaxRepairMaxDeltaIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
         return s ? std::atof(s) : 0.35;
+    }();
+    // Pass-1.5 mode. The repair is an EXPERIMENT and is opt-in, as the
+    // buffer-flow doc has always described it:
+    //   unset   -- analysis only, the source is untouched (default)
+    //   report  -- analyse and log, still do not touch the source
+    //   apply   -- commit the bounded move
+    // It had lost its gate and was running unconditionally on every locked
+    // frame, worth ~0.9 IRE rms of luma difference from bucket frame-wide.
+    // Restoring the gate is a doc/code reconciliation, not a new policy.
+    static const bool parallaxRepairApply = []{
+        const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
+        return s && std::strcmp(s, "apply") == 0;
     }();
     if (ccDiagLine >= 0) {
         std::fprintf(stderr,
@@ -857,7 +1304,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     std::vector<double> demI(width), demQ(width);
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
-    std::vector<double> wLaw(width), wLawSmooth(width);
     std::vector<double> nativeI4(width), nativeQ4(width);
 
     for (int line = first; line < last; ++line) {
@@ -924,9 +1370,28 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // Pass 1: consume the canonical full-resolution baseline harvested by
         // buildCarrierAnalysis(). The fallback preserves standalone safety but
         // normal locked orchestration has exactly one producer.
+        //
+        // The corner leak is withdrawn HERE, at the point the source authority
+        // enters the stage, so every later consumer (repair, restraint, demod,
+        // publish, and the candidates built from the published source) sees one
+        // corrected carrier rather than a patched output. Because
+        //     source = bp - leak   and   Y = raw - source,
+        // the withdrawn leak lands in luma automatically: Y + chroma == raw
+        // stays exact, which is the conservation a desaturating suppressor
+        // cannot satisfy. No output-side correction pass, so the produceY
+        // boundary is untouched.
+        //
+        // lockedCornerLeak is zero-filled unless buildCornerLeak() ran, so this
+        // subtraction is inert by construction when the stage is disabled.
+        const double *cornerLeak = lockedCornerLeak_line(line);
         if (rawBandpass) {
-            for (int rel = 0; rel < width; ++rel)
-                bpLine[rel] = rawBandpass[rel];
+            if (cornerLeak) {
+                for (int rel = 0; rel < width; ++rel)
+                    bpLine[rel] = rawBandpass[rel] - cornerLeak[rel];
+            } else {
+                for (int rel = 0; rel < width; ++rel)
+                    bpLine[rel] = rawBandpass[rel];
+            }
         } else {
             for (int rel = 0; rel < width; ++rel) {
                 const double c  = rawAtRel(rel);
@@ -1030,20 +1495,28 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                             -maxDeltaSamples,
                             maxDeltaSamples);
 
-                        reason = "apply";
-                        bpLine[rel] = sourceSample + appliedDelta;
-                        if (repairStrengthRow && maxDeltaSamples > 1e-9) {
-                            repairStrengthRow[rel] = static_cast<float>(
-                                std::clamp(
-                                    std::fabs(appliedDelta) / maxDeltaSamples,
-                                    0.0,
-                                    1.0));
+                        if (!parallaxRepairApply) {
+                            // Analysis complete, but the repair is opt-in:
+                            // the ordinary bandpass remains source authority
+                            // and no repair hold is published downstream.
+                            reason = "report-only";
+                            appliedDelta = 0.0;
+                        } else {
+                            reason = "apply";
+                            bpLine[rel] = sourceSample + appliedDelta;
+                            if (repairStrengthRow && maxDeltaSamples > 1e-9) {
+                                repairStrengthRow[rel] = static_cast<float>(
+                                    std::clamp(
+                                        std::fabs(appliedDelta) / maxDeltaSamples,
+                                        0.0,
+                                        1.0));
+                            }
+                            // Publish the signed move so the retraction stage
+                            // can align carrierFit with the repaired carrier.
+                            if (repairDeltaRow)
+                                repairDeltaRow[rel] =
+                                    static_cast<float>(appliedDelta);
                         }
-                        // Publish the signed move so the retraction stage
-                        // can align carrierFit with the repaired carrier.
-                        if (repairDeltaRow)
-                            repairDeltaRow[rel] =
-                                static_cast<float>(appliedDelta);
                     }
                 }
 
@@ -1153,33 +1626,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // 1.3 MHz edges, is expressible by construction and passes at
         // w = 1; the weight never exceeds 1, so it can only return energy
         // to Y, never manufacture carrier.
-        constexpr double kLawSlackIRE = 2.0;  // noise inflation of the envelope
-        const double lawSlack = kLawSlackIRE * irescale;
-        // Expressible envelope: encoder kernel over demod I/Q.  The demod
-        // products demI/demQ carry the 2fsc image term; the kernel itself
-        // rejects it (-20 dB well below the image), so no separate image
-        // cancellation is needed.  wLaw reuses the scratch vectors as the
-        // kernel-smoothed I and Q before being overwritten with the weight.
-        lddecode::projectExpressibleChromaEnvelope(
-            demI.data(), nullptr, width, wLaw.data());
-        lddecode::projectExpressibleChromaEnvelope(
-            demQ.data(), nullptr, width, wLawSmooth.data());
-        for (int rel = 0; rel < width; ++rel) {
-            const double lpEnv =
-                2.0 * boundedMag(wLaw[rel], wLawSmooth[rel]);
-            wLaw[rel] = lpEnv;
-        }
-        // Source envelope, smoothed by the same kernel (like for like).
-        lddecode::projectExpressibleChromaEnvelope(
-            env.data(), nullptr, width, wLawSmooth.data());
-        for (int rel = 0; rel < width; ++rel) {
-            const double ceiling = wLaw[rel] + lawSlack;
-            const double srcEnv = wLawSmooth[rel];
-            wLaw[rel] = srcEnv > ceiling ? ceiling / srcEnv : 1.0;
-        }
-        lddecode::projectExpressibleChromaEnvelope(
-            wLaw.data(), nullptr, width, wLawSmooth.data());
-
         const bool crDiagThisLine =
             crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
         const int crDiagFirst =
@@ -1366,10 +1812,29 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
 
             // The emitted source is the full-resolution ordinary carrier plus
-            // any explicitly bounded 1D repair, bounded by the envelope-
-            // legality weight above. Whitestar and the fits are evidence/policy
-            // inputs only; no diagnostic projection becomes picture here.
-            restrainedLine[rel] = wLawSmooth[rel] * bpLine[rel];
+            // any explicitly bounded 1D repair. Whitestar and the fits are
+            // evidence/policy inputs only; no diagnostic projection becomes
+            // picture here.
+            //
+            // The envelope-legality hull was REMOVED from the 1D source
+            // (2026-07-25). A hull presumes a safer value to retreat to when
+            // the estimate looks illegal; in produceY an outlier candidate can
+            // simply lose an election. In 1D there is no such harbour -- the
+            // bandpass IS the only estimate -- so bounding it is not a choice
+            // between candidates but an unconditional subtraction from the sole
+            // source, and whatever it removes lands in luma via Y = raw - src.
+            // Worse, the ceiling is measured with the encoder's 9-tap 1.3 MHz
+            // kernel, which smooths ACROSS a thin feature and therefore reads
+            // its envelope as smaller than it is: the hull then cuts LEGAL
+            // carrier at exactly the compact features it should protect, and
+            // that carrier reappears in luma as carrier-rate alternation.
+            // Measured on the beach strap (pure luma, --chroma-gain 0, vs
+            // bucket): hull on 148 rms / peak 1383; hull off 83 / 230 -- the
+            // strap-local dominant term while barely moving the frame-wide
+            // figure, which is the signature of something that only bites on
+            // thin detail. With the hull and the Pass-1.5 repair both out, the
+            // locked 1D luma is BIT-IDENTICAL to bucket.
+            restrainedLine[rel] = bpLine[rel];
 
             if (impurityRow)
                 impurityRow[rel] = static_cast<float>(gA);
@@ -1823,6 +2288,17 @@ void Comb::FrameBuffer::measurePostCombImpurity()
 static constexpr double kCcEdgeSoftIRE = 6.0;
 static constexpr double kCcEdgeHardIRE = 18.0;
 
+// Concert gate: carrier-free confirmation that the notch edge is a real luma
+// transition and not saturated-carrier leak.  The notch (edgeRamp) localizes
+// the corner sharply but doubles residual carrier in saturated colour;
+// maxAbsMembershipIRE (the same-carrier-phase membership change = lurch) reads
+// luma movement through the aperture with the carrier cancelled, so it is dark
+// in a saturated-chroma interior and bright at a genuine luma edge.  Measured
+// on the beach strap (frame 52100, line 150): smooth/interior lurch 0.3-1.4,
+// true skin<->strap edges 5-10.  soft/hard bracket that gap.
+static constexpr double kCcLurchSoftIRE = 1.0;
+static constexpr double kCcLurchHardIRE = 4.0;
+
 void Comb::FrameBuffer::splitIQlocked()
 {
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -2069,8 +2545,30 @@ void Comb::FrameBuffer::splitIQlocked()
                           (double)analysisDnRow[xi].conformanceSupportFraction)
                     : 0.0));
 
+            // Concert edge gate (LDCD_CCR_CONCERT): replace the binary
+            // schedule veto (1 - grammarPass) with a carrier-free lurch
+            // confirmation.  The veto spared the whole legal-carrier strap and
+            // let the 1D bead survive on it (measured: CCR acted 0.00 across
+            // h=376-401 while the true skin->strap edge sat under it); the
+            // lurch gate instead fires the notch edge exactly where luma is
+            // moving through the aperture and stays dark in the saturated
+            // interior where the notch edge is pure carrier leak.
+            static const bool ccrConcert = []{
+                const char *s = std::getenv("LDCD_CCR_CONCERT");
+                return s && std::atoi(s) != 0;
+            }();
+            double edgeGate = 1.0 - grammarPass;
+            if (ccrConcert) {
+                const double lurchIRE = analysisRow
+                    ? (double)analysisRow[xi].residual.maxAbsMembershipIRE
+                    : 0.0;
+                edgeGate = std::clamp(
+                    (lurchIRE - kCcLurchSoftIRE) /
+                        (kCcLurchHardIRE - kCcLurchSoftIRE),
+                    0.0, 1.0);
+            }
             const double apertureRead = gA * (1.0 - regionKeep);
-            const double edgeRead = edgeRamp * (1.0 - grammarPass);
+            const double edgeRead = edgeRamp * edgeGate;
             const double ccEvidence = std::max(gA, edgeRead);
             const double lumaWeight = std::clamp(
                 std::max(apertureRead, edgeRead) * ccWeight,
@@ -2085,6 +2583,24 @@ void Comb::FrameBuffer::splitIQlocked()
             // varies no faster than the chroma it gates, then applies.
             if (maskRawRow)
                 maskRawRow[xi] = (float)lumaWeight;
+
+            // Disposable CCR-path dump (env-gated): shows which read drives
+            // lumaWeight at a chosen strap line, so we can see whether the
+            // aperture (gA) path shadows the edge concert.
+            static const int ccL  = []{ const char *s=std::getenv("LDCD_DUMP_CC_L");  return s?std::atoi(s):-1; }();
+            static const int ccC0 = []{ const char *s=std::getenv("LDCD_DUMP_CC_C0"); return s?std::atoi(s):-1; }();
+            static const int ccC1 = []{ const char *s=std::getenv("LDCD_DUMP_CC_C1"); return s?std::atoi(s):-1; }();
+            if (line == ccL && (int)(h - left) >= ccC0 && (int)(h - left) <= ccC1) {
+                const double lurchIRE = analysisRow
+                    ? (double)analysisRow[xi].residual.maxAbsMembershipIRE : 0.0;
+                std::fprintf(stderr,
+                    "[CC] line=%d h=%d gA=%.2f regKeep=%.2f edgeRamp=%.2f "
+                    "gPass=%.2f lurch=%.2f edgeGate=%.2f aperRead=%.2f "
+                    "edgeRead=%.2f lumaW=%.2f drive=%s\n",
+                    line, h, gA, regionKeep, edgeRamp, grammarPass, lurchIRE,
+                    edgeGate, apertureRead, edgeRead, lumaWeight,
+                    apertureRead >= edgeRead ? "APER" : "EDGE");
+            }
 
             const float prodI = (float)finiteOrZero(ti * giProduct);
             const float prodQ = (float)finiteOrZero(tq * gqProduct);
@@ -2333,7 +2849,7 @@ void Comb::FrameBuffer::filterIQLocked()
         // back to raw - carrierComp when the comb plane wins the top band.
         // Measured on the beach, ~20% of pixels take a non-comb top band and
         // the emitted Y departs from the complement by 3.5 IRE RMS (max ~11),
-        // so the colour on those pixels did not belong to the luma beside it.
+        // so the colour on those pixels does not belong to the luma beside it.
         // That is exactly the population the election deviates on -- edges and
         // compact detail.
         //
@@ -2449,6 +2965,44 @@ void Comb::FrameBuffer::produceY()
     static const int pyDiagC0 = []{ const char *s = std::getenv("LDCD_PY_C0"); return s ? std::atoi(s) : -1; }();
     static const int pyDiagC1 = []{ const char *s = std::getenv("LDCD_PY_C1"); return s ? std::atoi(s) : -1; }();
     const bool pyDiag = pyDiagL0 >= 0 && pyDiagC0 >= 0;
+    const bool consDump = std::getenv("LDCD_DUMP_CONS") != nullptr;
+    long long consN = 0, consP0N = 0, consOtherN = 0;
+    double consSum = 0.0, consP0Sum = 0.0, consOtherSum = 0.0, consMax = 0.0;
+
+    // --- Disposable emission-hull instrumentation (env-gated). Set
+    // LDCD_DUMP_YHULL=1 to print, per frame, how many emitted pixels fail
+    // |raw - Y| <= maxCarrierAmpSamples -- the legality test the election
+    // applies to CANDIDATES but never re-applies to the emitted band splice
+    // reconstructTop(top) = coarse + combMiddle + combPlatform + top.
+    // Broken out by which top band won so a fix can be targeted. Set
+    // LDCD_DUMP_YHULL=2 to also print each individual violation. Zero cost
+    // when unset. Remove with the rethink.
+    static const char *dumpHullEnv = std::getenv("LDCD_DUMP_YHULL");
+    const bool dumpHull = dumpHullEnv != nullptr;
+    const bool dumpHullVerbose = dumpHullEnv && std::atoi(dumpHullEnv) >= 2;
+    long long hullTotal = 0, hullOver = 0;
+    long long hullOverByPlane[7] = {0, 0, 0, 0, 0, 0, 0}; // 0,1,3,4 planes; 5=blend; 6=clamped
+    double hullOverSumIRE = 0.0, hullMaxOvershootIRE = 0.0;
+    double hullMismatchSumIRE = 0.0, hullMaxMismatchIRE = 0.0;
+
+    // --- Disposable retracted-win schedule attribution (env-gated). Set
+    // LDCD_DUMP_RETR=1. Answers the decisive question: when the retracted
+    // plane wins the election, is its kept near-carrier energy schedule-LEGAL
+    // (comb was right, retracted is passthrough failure) or schedule-ILLEGAL
+    // (real grid luma comb destroyed, retracted correctly kept it)? Split by
+    // the "bright passthrough" signature: retracted sits at raw while comb
+    // removed a full carrier lobe. Zero cost when unset. Remove with the
+    // rethink.
+    const bool dumpRetr = std::getenv("LDCD_DUMP_RETR") != nullptr;
+    // [conformance 0=Unresolved 1=Legal 2=Illegal][passthrough 0/1]
+    long long retrWinBySchedule[3][2] = {{0,0},{0,0},{0,0}};
+    long long retrWinTotal = 0, retrPassthroughTotal = 0;
+    double retrLicenseSumOnPass = 0.0;
+    // Very-bright retracted wins (the ones the eye spots): output above a high
+    // IRE threshold. Split by schedule so we learn whether the visible bright
+    // specks are legal carrier (passthrough failure) or illegal grid luma.
+    long long retrBrightBySchedule[3] = {0, 0, 0};
+    long long retrBrightTotal = 0;
 
     // produceY is a pure consumer. splitIQlocked() exports the selected comb
     // scalar at the same physical integer sample as raw, and that exact scalar
@@ -2588,6 +3142,84 @@ void Comb::FrameBuffer::produceY()
             const double maxCarrierAmpSamples = grammarLine
                 ? std::max(24.0, grammarLine->carrierScale * 5.0) * irescale
                 : 24.0 * irescale;
+
+            // Checks the emitted band splice against the same hull the
+            // election applies to candidates -- candidate feasibility says
+            // nothing about the reconstructTop() value actually written to
+            // Y[h], since only plane 0 telescopes back to combY exactly.
+            auto tallyHull = [&](double rawSample, double emittedY, int plane, int h,
+                                 double fourMismatch, double planeComplete) {
+                if (!dumpHull) return;
+                ++hullTotal;
+                const double c = rawSample - emittedY;
+                if (c > maxCarrierAmpSamples || c < -maxCarrierAmpSamples) {
+                    ++hullOver;
+                    const int p = std::clamp(plane, 0, 6);
+                    ++hullOverByPlane[p];
+                    const double overIRE =
+                        (std::fabs(c) - maxCarrierAmpSamples) * invIreScale;
+                    hullOverSumIRE += overIRE;
+                    hullMaxOvershootIRE = std::max(hullMaxOvershootIRE, overIRE);
+                    hullMismatchSumIRE += std::fabs(fourMismatch) * invIreScale;
+                    hullMaxMismatchIRE = std::max(hullMaxMismatchIRE,
+                                                  std::fabs(fourMismatch) * invIreScale);
+                    if (dumpHullVerbose)
+                        std::fprintf(stderr,
+                            "[YHULL-EV] line=%d h=%d plane=%d raw=%.2f Y=%.2f "
+                            "c=%.2f maxAmp=%.2f overIRE=%.2f "
+                            "four0-fourP=%.2f planeComplete=%.2f "
+                            "cIfOwnBands=%.2f\n",
+                            line, h, plane, rawSample * invIreScale,
+                            emittedY * invIreScale, c * invIreScale,
+                            maxCarrierAmpSamples * invIreScale, overIRE,
+                            fourMismatch * invIreScale,
+                            planeComplete * invIreScale,
+                            (rawSample - planeComplete) * invIreScale);
+                }
+            };
+
+            // Retracted-win schedule attribution. Called at each emission with
+            // the winning plane; only plane 1 (retracted) is tallied. The
+            // "bright passthrough" signature is retracted sitting at raw while
+            // comb removed a full carrier lobe -- the failure the reframe
+            // targets. The schedule enum then says whether that kept energy is
+            // legal carrier (comb right, retracted wrong) or illegal grid luma
+            // (retracted right).
+            const double passRetrTolSamp = 6.0 * irescale;
+            const double passLobeSamp    = 12.0 * irescale;
+            auto tallyRetr = [&](double rawSample, int winnerPlane,
+                                 double combVal, double retrVal, int h,
+                                 const lddecode::CarrierAnalysisRecord *rec) {
+                if (!dumpRetr || winnerPlane != 1) return;
+                ++retrWinTotal;
+                const bool passthrough =
+                    std::fabs(retrVal - rawSample) < passRetrTolSamp &&
+                    std::fabs(combVal - rawSample) > passLobeSamp;
+                if (passthrough) ++retrPassthroughTotal;
+                int sc = 0; // Unresolved
+                double lic = 0.0;
+                if (rec) {
+                    switch (rec->scheduleConformance) {
+                        case lddecode::CarrierScheduleConformance::LegalCarrier:
+                            sc = 1; break;
+                        case lddecode::CarrierScheduleConformance::ScheduleIllegal:
+                            sc = 2; break;
+                        default: sc = 0; break;
+                    }
+                    lic = lddecode::carrierScheduleLicense(
+                        (double)rec->carrierConformance,
+                        (double)rec->conformanceSupportFraction,
+                        (double)rec->conformanceContradictionFraction);
+                }
+                ++retrWinBySchedule[sc][passthrough ? 1 : 0];
+                if (passthrough) retrLicenseSumOnPass += lic;
+                // retrVal is a sample-domain luma; convert to IRE for the
+                // brightness gate the same way the hull dump does.
+                if (retrVal * invIreScale > 100.0) {
+                    ++retrBrightTotal;
+                    ++retrBrightBySchedule[sc];
+                }
+            };
 
             // Election tolerances (IRE -> samples).
             const double agreeTol   = 2.0 * irescale; // agreement early-out band
@@ -3158,6 +3790,7 @@ void Comb::FrameBuffer::produceY()
                     // which are 4- and 8-sample centred means and therefore
                     // cancel carrier by construction, and publish no top.
                     Y[h] = reconstructTop(0, 0.0);
+                    tallyHull(rawH, Y[h], 6 /* no legal top */, h, 0.0, combY);
                     continue;
                 }
                 // Establish the base population without the derived return.
@@ -3193,6 +3826,19 @@ void Comb::FrameBuffer::produceY()
                     Y[h] = reconstructTop(
                         baseWinnerPlane,
                         baseWinnerTop);
+                
+                    if (dumpHull) {
+                        tallyHull(
+                            rawH,
+                            Y[h],
+                            baseWinnerPlane,
+                            h,
+                            candidateFourMeanAt(0, h) -
+                                candidateFourMeanAt(baseWinnerPlane, h),
+                            planeY(baseWinnerPlane, h));
+                    }
+                    tallyRetr(rawH, baseWinnerPlane, combY, planeY(1, h), h,
+                              analysisRow ? &analysisRow[xi] : nullptr);
                     continue;
                 }
                 // Robust center: medoid (min sum of absolute distances).
@@ -3220,6 +3866,14 @@ void Comb::FrameBuffer::produceY()
                 const bool returnedAdmitted = returnedFeasible;
                 if (nIn == 1 && !returnedAdmitted) {
                     Y[h] = reconstructTop(candPlane[inIdx[0]], candY[inIdx[0]]);
+                    if (dumpHull) {
+                        const int wp = candPlane[inIdx[0]];
+                        tallyHull(rawH, Y[h], wp, h,
+                                  candidateFourMeanAt(0, h) - candidateFourMeanAt(wp, h),
+                                  planeY(wp, h));
+                    }
+                    tallyRetr(rawH, candPlane[inIdx[0]], combY, planeY(1, h), h,
+                              analysisRow ? &analysisRow[xi] : nullptr);
                     continue;
                 }
 
@@ -3457,6 +4111,37 @@ void Comb::FrameBuffer::produceY()
 
                 const int winnerPlane = planeForTop(resultHF);
                 Y[h] = reconstructTop(winnerPlane, resultHF);
+                if (consDump) {
+                    // Bucket writes Y and chroma from ONE scalar:
+                    //   Y = raw - val, chroma = demod(val)  => Y + chroma == raw.
+                    // Locked demodulates chroma from carrierComp but emits Y
+                    // from a band reassembly, so the identity only survives
+                    // where the winner telescopes back to raw - carrierComp.
+                    const double bucketY = rawH - (carrierComp ? carrierComp[xi]
+                                                               : clpLine[h]);
+                    const double d = Y[h] - bucketY;
+                    ++consN; consSum += d * d;
+                    consMax = std::max(consMax, std::fabs(d));
+                    if (winnerPlane == 0) { ++consP0N; consP0Sum += d * d; }
+                    else                  { ++consOtherN; consOtherSum += d * d; }
+                }
+
+                tallyRetr(rawH, winnerPlane, combY, planeY(1, h), h,
+                          analysisRow ? &analysisRow[xi] : nullptr);
+
+                if (dumpHull) {
+                    int winnerPlaneHull = 5; // fallback: unattributed blend
+                    for (int k = 0; k < nIn; ++k) {
+                        if (inHF[k] == resultHF) {
+                            winnerPlaneHull = (k < baseNIn) ? candPlane[inIdx[k]] : 4;
+                            break;
+                        }
+                    }
+                    const int wp = (winnerPlaneHull == 5) ? 0 : winnerPlaneHull;
+                    tallyHull(rawH, Y[h], winnerPlaneHull, h,
+                              candidateFourMeanAt(0, h) - candidateFourMeanAt(wp, h),
+                              planeY(wp, h));
+                }
 
                 if (pyDiag && line >= pyDiagL0 && line <= pyDiagL1 &&
                     xi >= pyDiagC0 && xi <= pyDiagC1) {
@@ -3605,6 +4290,63 @@ void Comb::FrameBuffer::produceY()
         }
     }
 
+    if (consDump && consN > 0) {
+        std::fprintf(stderr,
+            "[CONS] Y vs (raw-carrierComp): rms=%.3f IRE max=%.2f IRE  "
+            "plane0 n=%lld rms=%.3f | other n=%lld rms=%.3f (%.1f%% of px)\n",
+            std::sqrt(consSum / consN) * invIreScale,
+            consMax * invIreScale,
+            consP0N, consP0N ? std::sqrt(consP0Sum / consP0N) * invIreScale : 0.0,
+            consOtherN, consOtherN ? std::sqrt(consOtherSum / consOtherN) * invIreScale : 0.0,
+            100.0 * (double)consOtherN / (double)consN);
+    }
+
+    if (dumpHull) {
+        auto pct = [](long long a, long long b) {
+            return b > 0 ? 100.0 * static_cast<double>(a)
+                                 / static_cast<double>(b)
+                         : 0.0;
+        };
+        std::fprintf(stderr,
+            "[YHULL] tested=%lld over=%lld(%.4f%%) sumOverIRE=%.1f maxOverIRE=%.2f\n",
+            hullTotal, hullOver, pct(hullOver, hullTotal),
+            hullOverSumIRE, hullMaxOvershootIRE);
+        std::fprintf(stderr,
+            "[YHULL] over-by-plane comb=%lld retracted=%lld oneD=%lld "
+            "returned=%lld blend=%lld clamped=%lld | "
+            "sumMismatchIRE=%.1f maxMismatchIRE=%.2f\n",
+            hullOverByPlane[0], hullOverByPlane[1], hullOverByPlane[3],
+            hullOverByPlane[4], hullOverByPlane[5], hullOverByPlane[6],
+            hullMismatchSumIRE, hullMaxMismatchIRE);
+    }
+
+    if (dumpRetr) {
+        auto pct = [](long long a, long long b) {
+            return b > 0 ? 100.0 * static_cast<double>(a)
+                                 / static_cast<double>(b) : 0.0;
+        };
+        std::fprintf(stderr,
+            "[RETR] wins=%lld passthrough=%lld(%.2f%%) meanLicenseOnPass=%.3f\n",
+            retrWinTotal, retrPassthroughTotal,
+            pct(retrPassthroughTotal, retrWinTotal),
+            retrPassthroughTotal > 0
+                ? retrLicenseSumOnPass / (double)retrPassthroughTotal : 0.0);
+        std::fprintf(stderr,
+            "[RETR] all-wins   bySchedule unres=%lld legal=%lld illegal=%lld\n",
+            retrWinBySchedule[0][0] + retrWinBySchedule[0][1],
+            retrWinBySchedule[1][0] + retrWinBySchedule[1][1],
+            retrWinBySchedule[2][0] + retrWinBySchedule[2][1]);
+        std::fprintf(stderr,
+            "[RETR] passthrough bySchedule unres=%lld legal=%lld illegal=%lld"
+            " <- LEGAL here = passthrough failure; ILLEGAL = real grid luma\n",
+            retrWinBySchedule[0][1], retrWinBySchedule[1][1],
+            retrWinBySchedule[2][1]);
+        std::fprintf(stderr,
+            "[RETR] bright(>100IRE) total=%lld bySchedule unres=%lld legal=%lld"
+            " illegal=%lld <- the specks the eye spots\n",
+            retrBrightTotal, retrBrightBySchedule[0],
+            retrBrightBySchedule[1], retrBrightBySchedule[2]);
+    }
 }
 
 // Lurch preconditioner for the coarse luma prior.
@@ -4447,6 +5189,47 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     dst.ySpanIRE = static_cast<float>(src.ySpanIRE);
                     dst.membershipDeltaIRE    = static_cast<float>(src.membershipDeltaIRE);
                     dst.membershipSupport     = static_cast<float>(src.membershipSupport);
+                }
+
+                // ---- Stage-0 line-solve harness dump (env-gated, disposable).
+                // Emits everything the offline event solver needs, at the one
+                // point where the four-view feasible band is already built:
+                //   raw, bp        -> notch = raw-bp, and the leak lives in bp
+                //   lurch          -> carrier-free luma-motion evidence
+                //   conf/sched     -> interline grammar (luma by law)
+                //   yFloor[0..3]   -> the FOUR LEGAL VIEWS as a feasible band
+                //                     (constraints, never collapsed here)
+                // LDCD_DUMP_SOLVE_L / _C0 / _C1.  Run -t 1.
+                {
+                    static const int slL  = []{ const char *s=std::getenv("LDCD_DUMP_SOLVE_L");  return s?std::atoi(s):-1; }();
+                    static const int slC0 = []{ const char *s=std::getenv("LDCD_DUMP_SOLVE_C0"); return s?std::atoi(s):-1; }();
+                    static const int slC1 = []{ const char *s=std::getenv("LDCD_DUMP_SOLVE_C1"); return s?std::atoi(s):-1; }();
+                    if (line == slL && xi >= slC0 && xi <= slC1) {
+                        const double *bpL = locked1DRawBandpass_line(line);
+                        const double rawI = (double)rawLine[left + xi] * invIreScale;
+                        const double bpI  = bpL ? bpL[xi] * invIreScale : 0.0;
+                        const double *apM = lockedApertureMean_line(line);
+                        const double *clk = lockedCornerLeak_line(line);
+                        std::fprintf(stderr, "[LEAK] h=%d leak=%.4f\n",
+                                     left + xi, clk ? clk[xi] * invIreScale : 0.0);
+                        std::fprintf(stderr,
+                            "[SOLVE] h=%d raw=%.3f bp=%.3f am0=%.3f am1=%.3f "
+                            "am2=%.3f am3=%.3f lurch=%.3f conf=%+.2f "
+                            "supp=%.2f nviews=%d f0=%.2f f1=%.2f f2=%.2f f3=%.2f\n",
+                            left + xi, rawI, bpI,
+                            apM ? apM[std::max(0,xi-3)] * invIreScale : 0.0,
+                            apM ? apM[std::max(0,xi-2)] * invIreScale : 0.0,
+                            apM ? apM[std::max(0,xi-1)] * invIreScale : 0.0,
+                            apM ? apM[xi] * invIreScale : 0.0,
+                            (double)analysisRow[xi].residual.maxAbsMembershipIRE,
+                            (double)analysisRow[xi].carrierConformance,
+                            (double)analysisRow[xi].conformanceSupportFraction,
+                            viewCount,
+                            viewCount > 0 ? evidenceRow[xi].views[0].yFloor * invIreScale : 0.0f,
+                            viewCount > 1 ? evidenceRow[xi].views[1].yFloor * invIreScale : 0.0f,
+                            viewCount > 2 ? evidenceRow[xi].views[2].yFloor * invIreScale : 0.0f,
+                            viewCount > 3 ? evidenceRow[xi].views[3].yFloor * invIreScale : 0.0f);
+                    }
                 }
 
                 auto parallax = lddecode::buildFourViewCarrierAttribution(

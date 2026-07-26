@@ -242,6 +242,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->phaseLocked();
                 next->buildCarrierAnalysis(
                     prevIterAnalyzed ? current.get() : nullptr);
+                // Corner-leak corrector: consumes the analysis record, the
+                // canonical bandpass and the aperture-mean pool. Diagnostic
+                // only -- publishes lockedCornerLeak_flat, changes no output.
+                next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
                 if (configuration.lumaWitness)
                     next->buildCarrierRetracted();
@@ -500,6 +504,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             // for the coarse-residual parallax, which is a default-path client.
             // lockedLumaSharp is derived from it rather than rebuilding it.
             lockedApertureMean_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            lockedCornerLeak_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaCacheValid = false;
         }
         // Preclean ring is only needed for Frame/FVF in locked mode.
