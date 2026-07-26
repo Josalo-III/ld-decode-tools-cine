@@ -868,8 +868,6 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
 static constexpr int    kCornerLeakIters      = 60;
 // Outer rounds of the two-way contamination fix (see buildCornerLeak).
 static constexpr int    kCornerOuterRounds    = 2;
-static constexpr double kCornerSchedSoft      = -0.2;
-static constexpr double kCornerSchedHard      =  0.6;
 // Parallax ratio: below soft the energy nulls in every aperture like legal
 // carrier (protect); above hard it fails to null (luma, act). Measured
 // populations: colour p50 0.05-0.12, pure luma p50 0.89.
@@ -1069,15 +1067,28 @@ void Comb::FrameBuffer::buildCornerLeak()
         // and the straps read garishly worse. Chroma metrics could not see it
         // because strap SATURATION is flat in every configuration -- the damage
         // is entirely on the luma side.
+        // Schedule side of the gate: the sanctioned table-owned luma proof,
+        // not a local ramp. carrierIllegalProof() is ZERO through the entire
+        // ambiguous middle by design ("real chroma is never claimed as luma"),
+        // which is exactly what a leak that RETURNS energy to Y needs -- the
+        // previous local form set unsupported evidence to a half-gate
+        // (+ (1-supp)*0.5), desaturating genuine chroma wherever the axes could
+        // not decide. Contradiction is consumed distinctly from absence, the
+        // same fail-closed rule the schedule licenses use: one axis that
+        // decisively votes legal carrier revokes the luma claim outright,
+        // whereas an absent/abstaining axis merely fails to support it.
         for (int x = 0; x < width; ++x) {
             double g = ramp(ratio[x], kCornerParallaxSoft, kCornerParallaxHard);
             if (analysisRow) {
-                const double supp =
-                    std::clamp((double)analysisRow[x].conformanceSupportFraction,
-                               0.0, 1.0);
-                g *= ramp((double)analysisRow[x].carrierConformance,
-                          kCornerSchedSoft, kCornerSchedHard) * supp
-                     + (1.0 - supp) * 0.5;
+                const double contra = std::clamp(
+                    (double)analysisRow[x].conformanceContradictionFraction,
+                    0.0, 1.0);
+                if (contra > 0.0)
+                    g = 0.0;                 // observed legal-carrier vote: protect
+                else
+                    g *= lddecode::carrierIllegalProof(
+                        (double)analysisRow[x].carrierConformance,
+                        (double)analysisRow[x].conformanceSupportFraction);
             }
             gate[x] = g;
         }
