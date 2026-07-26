@@ -1151,6 +1151,35 @@ void Comb::FrameBuffer::buildCornerLeak()
         // it silently halved every fSC-rate leak the solve had recovered.
         for (int x = 0; x < width; ++x)
             leakRow[x] = -0.25 * kappa[x] + envExcess[x];
+
+        // ---- Coarse-residual carrier hull (P5). -----------------------------
+        //
+        // The corner leak estimates carrier from a single line and, at a
+        // compact feature, the encoder bandwidth law forbids the lawful
+        // envelope from modelling the fast on/off -- so P2 under-corrects and
+        // leaves carrier-rate content that is really luma. The coarse residuals
+        // bound the carrier INDEPENDENTLY, from the luma side where compact
+        // content is lawful (luma is never bandlimited): carrier must lie in
+        // [raw - max_v apMean, raw - min_v apMean] over the covering apertures.
+        // Clamp the emitted carrier (bp - leak) into that range and send the
+        // excess to luma by ADDING to the leak; both bounds are applied so an
+        // oscillating carrier is not rectified. This RESTRICTS, never averages.
+        // v1 is unguarded: the dark-side ceiling is clean but the pixel luma
+        // floor can be violated at a lone dark sample, which would clip legal
+        // carrier -- the decomposed metric (satRet/hueRot) is what reveals it.
+        static const bool hullEnabled = []{
+            const char *s = std::getenv("LDCD_CORNER_HULL");
+            return !s || std::atoi(s) != 0;         // default ON when leak runs
+        }();
+        if (hullEnabled && apMean) {
+            for (int x = 0; x < width; ++x) {
+                const auto rng = lddecode::carrierFeasibleRange(
+                    (double)rawLine[left + x], apMean, x, width);
+                const double chroma  = bpLine[x] - leakRow[x];
+                const double clamped = std::clamp(chroma, rng.floor, rng.ceiling);
+                leakRow[x] += (chroma - clamped);   // excess carrier -> luma
+            }
+        }
     }
 
     // ---- Disposable metrics (env-gated), without changing any output. -------

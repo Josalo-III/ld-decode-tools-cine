@@ -166,4 +166,41 @@ inline void projectExpressibleChromaEnvelope(const double *in,
     }
 }
 
+// Coarse-residual feasibility bounds on the COMPOSITE carrier at one sample.
+//
+// A legal carrier sums to zero over every legal four-sample window, so each
+// coarse mean apMean[v] = mean(raw[v..v+3]) is that window's LUMA mean exactly
+// -- the carrier is removed with no filter and no assumption. The four windows
+// covering sample x (starts v in {x-3 .. x}) therefore share x's carrier and
+// differ only in their luma. Bounding the luma at x bounds the carrier:
+//
+//   Y[x] >= min_v apMean[v]   (the darkest covering coarse is the BRIGHTEST the
+//                              luma floor could be; the bright side is less
+//                              knowable) => carrier <= raw - min_v apMean[v]
+//   Y[x] <= max_v apMean[v]                => carrier >= raw - max_v apMean[v]
+//
+// The ceiling (dark side) is the clean bound; the floor (bright side) is
+// ambiguous. These RESTRICT the emitted carrier -- a consumer clamps into the
+// range and the excess returns to luma -- they are never averaged into it, and
+// the primitive publishes them unfiltered so the consumer owns the decision.
+struct CarrierFeasibleRange { double floor; double ceiling; };
+inline CarrierFeasibleRange carrierFeasibleRange(double rawSample,
+                                                 const double *apMean,
+                                                 int x, int width)
+{
+    const int lastStart = width - 4;      // last legal aperture START
+    double lo = 0.0, hi = 0.0;
+    bool any = false;
+    for (int d = 0; d < 4; ++d) {
+        const int v = x - (3 - d);        // covering starts x-3, x-2, x-1, x
+        if (v < 0 || v > lastStart) continue;
+        const double m = apMean[v];
+        if (!any) { lo = hi = m; any = true; }
+        else { lo = m < lo ? m : lo; hi = m > hi ? m : hi; }
+    }
+    if (!any)                             // no legal aperture: no restriction
+        return { -1e300, 1e300 };
+    return { rawSample - hi, rawSample - lo };   // { floor, ceiling }
+}
+
 } // namespace lddecode
