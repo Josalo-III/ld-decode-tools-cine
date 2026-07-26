@@ -381,6 +381,11 @@ public:
 	// Rotation-free; acts in place on the emitted 1D carrier (both paths).
 	void applyEdgeDoublet(int line, double *carrierAtLeft);
 
+	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
+	// demodulated aperture views can bound the chroma at a luma step. Reads
+	// state only; writes nothing and changes no output. See comb.cpp.
+	void probeApertureChroma(int line, const double *carrierAtLeft);
+
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
 	void buildCarrierRetracted();

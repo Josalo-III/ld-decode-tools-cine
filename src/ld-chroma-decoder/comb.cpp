@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "combmath.h"
+#include "feasibleband.h"
 #include "framecanvas.h"
 #include "deemp.h"
 #include "firfilter.h"
@@ -651,6 +652,226 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 // 1D horizontal bandpass: isolates subcarrier energy by subtracting the average
 // of the samples two positions either side (a 2-tap comb at 2fsc), scaled by 0.5.
 // Result written to clpbuffer[0].
+// ---------------------------------------------------------------------------
+// APERTURE-CHROMA PHYSICS PROBE (LDCD_PROBE_APERTURE=1). Measurement only: it
+// reads state, writes nothing, and changes no output.
+//
+// The question (writeup S7): do the four demodulated aperture views bound the
+// chroma usefully at a hard luma step?
+//
+// Algebra answers half of it outright, so the probe does not need to ask it.
+// The four covering views of sample x are view_k[x] = raw[x] - apMean[x-3+k],
+// so their MEAN is
+//     m[x] = raw[x] - A[x],      A[x] = (1/4) * sum_k apMean[x-3+k]
+// and A is exactly the 7-tap triangle T = {1,2,3,4,3,2,1}/16 applied to LUMA:
+// four width-4 boxcars at unit offsets convolve to that triangle, and every
+// boxcar is chroma-free because a legal carrier nulls over any four samples.
+// Hence
+//     m[x] = C[x] + (I - T){Y}[x]
+// The four-view mean is the true carrier PLUS A HIGHPASS OF LUMA. T is
+// symmetric with unit gain and zero first moment, so it reproduces affine luma
+// exactly and m is unbiased on constant and on RAMP luma -- but not at a STEP,
+// where a unit step leaves the doublet {-1,-3,-6,+6,+3,+1}/16. That is the same
+// family of error the 1D bandpass itself makes (-0.25*D2_2 Y). So the naive
+// aperture reference is biased exactly where the edge colour band lives, and
+// averaging the views cannot be the instrument.
+//
+// What survives is the WIDTH of the feasible interval rather than its centre.
+// On flat luma the four covering means agree, the hull collapses to a POINT,
+// and the carrier is known EXACTLY -- raw minus luma, no filter and no
+// assumption. Ambiguity is confined to a narrow zone around each luma edge.
+// The envelope is bandlimited BY LAW, so the exact anchors flanking an edge
+// constrain the envelope through the zone -- provided the zone is narrower
+// than the envelope kernel's reach. That proviso is a measurement, not a
+// derivation, and it is the load-bearing one.
+//
+// Measured here, binned by hull width (which IS edge proximity -- it is the
+// luma spread over T's support -- so no edge detector is needed):
+//   (1) what fraction of the line is exact-anchor, and how the ambiguous run
+//       lengths compare with the 9-tap envelope kernel's +-4 reach;
+//   (2) E_mean -- the naive four-view-mean envelope (the biased reference);
+//   (3) E_ext  -- the SAME quantity restricted to anchors and extended
+//       lawfully by the envelope kernel (the proposed reference);
+//   against E_1d -- what the 1D bandpass actually emits.
+// E_mean and E_ext are built from one signal m and differ only in whether m is
+// trusted where it is provably exact, which isolates the step bias directly.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Hull width below which the covering means agree well enough that the carrier
+// is taken as exactly determined. Not a tuning knob on any output -- it only
+// selects which samples this probe reports as anchors.
+double probeAnchorIRE()
+{
+    static const double v = []{
+        const char *s = std::getenv("LDCD_PROBE_ANCHOR_IRE");
+        return s ? std::atof(s) : 1.0;
+    }();
+    return v;
+}
+
+struct ApertureProbeBin {
+    long   n       = 0;
+    long   nUnsup  = 0;    // no anchor within the envelope kernel's reach
+    double sum1D   = 0.0;
+    double sumMean = 0.0;
+    double sumExt  = 0.0;
+    double excess  = 0.0;  // sum of max(E_1d - E_ext, 0) over supported samples
+    long   nExceed = 0;    // E_1d exceeds E_ext by more than 2 IRE
+};
+
+struct ApertureProbeStats {
+    static constexpr int kBins = 5;
+    ApertureProbeBin bin[kBins];
+    long nSamples = 0;
+    long nAnchor  = 0;
+    long runHist[10] = {0};      // ambiguous run length; last bucket is >= 9
+    long nRuns = 0;
+
+    ~ApertureProbeStats() { report(); }
+
+    void report() const
+    {
+        if (nSamples <= 0) return;
+        static const char *kBinName[kBins] = {
+            "  <1 (anchor)", " 1-4         ", " 4-10        ",
+            "10-25        ", " >=25        "
+        };
+        std::fprintf(stderr,
+            "\n[APROBE] %ld samples, anchors %.1f%% (hull width < %.1f IRE)\n",
+            nSamples, 100.0 * double(nAnchor) / double(nSamples),
+            probeAnchorIRE());
+        std::fprintf(stderr,
+            "[APROBE] hullWidth      n      %%   E_1d   E_mean  E_ext   "
+            "excess  exceed%%  unsup%%\n");
+        for (int b = 0; b < kBins; ++b) {
+            const ApertureProbeBin &k = bin[b];
+            if (k.n == 0) continue;
+            const double inv = 1.0 / double(k.n);
+            std::fprintf(stderr,
+                "[APROBE] %s %8ld %5.1f %6.2f %7.2f %6.2f %7.2f %7.1f %7.1f\n",
+                kBinName[b], k.n, 100.0 * double(k.n) / double(nSamples),
+                k.sum1D * inv, k.sumMean * inv, k.sumExt * inv, k.excess * inv,
+                100.0 * double(k.nExceed) * inv,
+                100.0 * double(k.nUnsup) * inv);
+        }
+        std::fprintf(stderr, "[APROBE] ambiguous run lengths (%ld runs):", nRuns);
+        for (int i = 1; i < 10; ++i)
+            std::fprintf(stderr, " %d:%.1f%%", i,
+                         nRuns ? 100.0 * double(runHist[i]) / double(nRuns) : 0.0);
+        std::fprintf(stderr, "   (kernel reach +-4)\n");
+    }
+};
+
+ApertureProbeStats g_apertureProbe;
+
+int apertureProbeBin(double wIRE)
+{
+    if (wIRE <  1.0) return 0;
+    if (wIRE <  4.0) return 1;
+    if (wIRE < 10.0) return 2;
+    if (wIRE < 25.0) return 3;
+    return 4;
+}
+
+} // namespace
+
+void Comb::FrameBuffer::probeApertureChroma(int line, const double *carrierAtLeft)
+{
+    const double *apMean = lockedApertureMean_line(line);
+    if (!apMean || !carrierAtLeft) return;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int fullWidth = videoParameters.fieldWidth;
+    const int width     = right - left;
+    if (width < 16) return;
+    const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+    const int lastStart = width - 4;
+
+    std::vector<double> mI(width), mQ(width), mIs(width), mQs(width);
+    std::vector<double> eI(width), eQ(width), eIs(width), eQs(width);
+    std::vector<double> aI(width), aQ(width);
+    std::vector<double> wIRE(width);
+    std::vector<std::uint8_t> anchor(width, 0);
+
+    for (int x = 0; x < width; ++x) {
+        const double raw = (double)rawLine[left + x];
+        // Feasible interval and the four-view mean, from the same covering set.
+        const auto rng = lddecode::carrierFeasibleRange(raw, apMean, x, width);
+        wIRE[x] = (rng.ceiling - rng.floor) * invIreScale;
+        double acc = 0.0; int nAcc = 0;
+        for (int d = 0; d < 4; ++d) {
+            const int v = x - (3 - d);
+            if (v < 0 || v > lastStart) continue;
+            acc += apMean[v]; ++nAcc;
+        }
+        const double m = nAcc ? (raw - acc / nAcc) : 0.0;
+        const int ph = carrierSampleClass(line, left + x);
+        const double s = sin4fsc(ph), c = cos4fsc(ph);
+        mI[x] = 2.0 * m * s;               mQ[x] = 2.0 * m * c;
+        eI[x] = 2.0 * carrierAtLeft[x] * s; eQ[x] = 2.0 * carrierAtLeft[x] * c;
+        anchor[x] = (nAcc == 4 && wIRE[x] < probeAnchorIRE()) ? 1 : 0;
+    }
+
+    // E_mean and E_1d: the lawful envelope of each stream, everywhere.
+    lddecode::projectExpressibleChromaEnvelope(mI.data(), nullptr, width, mIs.data());
+    lddecode::projectExpressibleChromaEnvelope(mQ.data(), nullptr, width, mQs.data());
+    lddecode::projectExpressibleChromaEnvelope(eI.data(), nullptr, width, eIs.data());
+    lddecode::projectExpressibleChromaEnvelope(eQ.data(), nullptr, width, eQs.data());
+
+    // E_ext: the same m, read ONLY where it is exact, and extended by the
+    // envelope kernel over anchors alone. Unlike the shared projection this
+    // WRITES the invalid positions -- that is the whole point here (extend the
+    // law into the gap), so it stays local to the probe rather than changing
+    // the sanctioned primitive, which must never smear a fit into an absence.
+    constexpr int half = lddecode::kChromaEnvelopeTaps / 2;
+    std::vector<std::uint8_t> supported(width, 0);
+    for (int x = 0; x < width; ++x) {
+        double accI = 0.0, accQ = 0.0, used = 0.0;
+        for (int t = 0; t < lddecode::kChromaEnvelopeTaps; ++t) {
+            const int j = x + t - half;
+            if (j < 0 || j >= width || !anchor[j]) continue;
+            const double w = lddecode::kChromaEnvelopeFilter[t];
+            accI += w * mI[j]; accQ += w * mQ[j]; used += w;
+        }
+        // Require real support, not one far tap carrying the whole estimate.
+        if (used > 0.10) {
+            aI[x] = accI / used; aQ[x] = accQ / used; supported[x] = 1;
+        } else {
+            aI[x] = 0.0; aQ[x] = 0.0;
+        }
+    }
+
+    for (int x = half; x < width - half; ++x) {
+        const int b = apertureProbeBin(wIRE[x]);
+        ApertureProbeBin &k = g_apertureProbe.bin[b];
+        const double e1d  = std::hypot(eIs[x], eQs[x]) * invIreScale;
+        const double emn  = std::hypot(mIs[x], mQs[x]) * invIreScale;
+        const double eext = std::hypot(aI[x],  aQ[x])  * invIreScale;
+        ++k.n;
+        k.sum1D += e1d; k.sumMean += emn;
+        ++g_apertureProbe.nSamples;
+        if (anchor[x]) ++g_apertureProbe.nAnchor;
+        if (!supported[x]) { ++k.nUnsup; continue; }
+        k.sumExt += eext;
+        k.excess += std::max(e1d - eext, 0.0);
+        if (e1d > eext + 2.0) ++k.nExceed;
+    }
+
+    // Ambiguous run lengths, against the kernel's +-4 reach.
+    int run = 0;
+    for (int x = 0; x <= width; ++x) {
+        const bool amb = (x < width) && !anchor[x];
+        if (amb) { ++run; continue; }
+        if (run > 0) {
+            ++g_apertureProbe.nRuns;
+            ++g_apertureProbe.runHist[std::min(run, 9)];
+            run = 0;
+        }
+    }
+}
+
 void Comb::FrameBuffer::split1D()
 {
     const int left      = videoParameters.activeVideoStart;
@@ -678,6 +899,12 @@ void Comb::FrameBuffer::split1D()
     }();
     const bool applyBucketHull = bucketHull && !configuration.phaseCompensation;
 
+    // Disposable measurement; off unless explicitly asked for.
+    static const bool probeAperture = []{
+        const char *s = std::getenv("LDCD_PROBE_APERTURE");
+        return s && std::atoi(s) != 0;
+    }();
+
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *src = rawbuffer.data() + line * fullWidth;
         double *dst        = clpbuffer[0].pixel[line];
@@ -687,6 +914,11 @@ void Comb::FrameBuffer::split1D()
             int hp2 = h + 2; if (hp2 >= right)  hp2 = right - 1 - (hp2 - right);
             dst[h] = ((double)src[h] - 0.5 * ((double)src[hm2] + (double)src[hp2])) * 0.5;
         }
+
+        // Probe the unmodified bandpass: it is the baseline the chroma-side
+        // constraint would act on, before any hull or doublet touches it.
+        if (probeAperture)
+            probeApertureChroma(line, dst + left);
 
         if (applyBucketHull)
             applyCarrierFeasibilityHull(line, dst + left);
