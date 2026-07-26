@@ -4744,7 +4744,10 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
         const double hi = apMean[ib];
         const double e  = run.edge;                 // sample coordinate
 
-        // Forward model on a sharpened step at e: pred = -0.25 * D2{Ystep}.
+        // pred: the forward-model doublet for an IDEAL step at the lurch edge,
+        // carrying only the CLEAN amplitude (lo->hi). It is the amplitude
+        // reference, not the emitted shape -- a hard step is quantized to a
+        // column and staircases on diagonals.
         auto Ystep = [&](int j) { return ((double)j < e) ? lo : hi; };
         const int x0 = std::clamp((int)std::floor(e) - 3, 0, width - 1);
         const int x1 = std::clamp((int)std::ceil(e) + 3, 0, width - 1);
@@ -4753,8 +4756,10 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
         for (int x = x0; x <= x1; ++x) {
             const double d2Y = Ystep(x - 2) - 2.0 * Ystep(x) + Ystep(x + 2);
             pred[x] = -0.25 * d2Y;
-            // Notch = raw - emitted carrier; its stride-2 second difference is
-            // the notch's own (chroma-contaminated) leak doublet.
+            // ntch: the notch's own doublet. notch = raw - carrier ~= Y (the
+            // carrier cancels), so this is the REAL luma edge's leak -- smooth,
+            // sub-sample-positioned, correct width -- but chroma-contaminated in
+            // amplitude at a coincident colour boundary. It supplies the SHAPE.
             auto notch = [&](int j) {
                 const int jc = std::clamp(j, 0, width - 1);
                 return (double)rawLine[left + jc] - carrierAtLeft[jc];
@@ -4762,18 +4767,22 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
             ntch[x] = -0.25 * (notch(x - 2) - 2.0 * notch(x) + notch(x + 2));
         }
 
-        // Advisory admission: least-squares scale of pred present in the notch
-        // doublet. ~1 = notch confirms the edge cleanly; >1 = chroma-inflated
-        // (clamped, so we never over-subtract); <=0 = absent or opposite (veto).
-        double sPN = 0.0, sPP = 0.0;
-        for (int x = x0; x <= x1; ++x) { sPN += pred[x] * ntch[x]; sPP += pred[x] * pred[x]; }
-        const double proj = (sPP > 1e-12) ? (sPN / sPP) : 0.0;
-        const double confirm = std::clamp(proj, 0.0, 1.0);
+        // Reshape the clean amplitude onto the real shape: beta is the scalar
+        // that best fits pred by a multiple of the notch doublet (least
+        // squares). beta*ntch therefore has the NOTCH'S shape (smooth, follows
+        // the diagonal) and, by construction, an amplitude no larger than the
+        // lurch reference -- so chroma inflation of the notch is divided out and
+        // we never over-subtract. sPN<=0 (opposite doublet) or a flat notch
+        // vetoes. Neither signal alone: lurch sets the amplitude, notch the
+        // shape.
+        double sPN = 0.0, sNN = 0.0;
+        for (int x = x0; x <= x1; ++x) { sPN += pred[x] * ntch[x]; sNN += ntch[x] * ntch[x]; }
+        if (sPN <= 0.0 || sNN < 1e-12) continue;
+        const double beta = sPN / sNN;
 
-        const double w = run.gate * confirm;
-        if (w <= 0.0) continue;
+        const double w = run.gate;
         for (int x = x0; x <= x1; ++x)
-            leak[x] += pred[x] * w;
+            leak[x] += beta * ntch[x] * w;
     }
 
     for (int x = 0; x < width; ++x)
