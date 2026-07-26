@@ -375,11 +375,13 @@ public:
 	                          std::vector<double> &vI, std::vector<double> &vQ,
 	                          std::vector<double> &sI, std::vector<double> &sQ,
 	                          double *ratioOut) const;
-	// Steep-edge doublet corrector: subtract the known -0.25*D2Y leak at luma
-	// steps, amplitude and location from the lurch step-solve on the coarse
-	// residuals (chroma-free), shape confirmed/vetoed by the notch (advisory).
-	// Rotation-free; acts in place on the emitted 1D carrier (both paths).
-	void applyEdgeDoublet(int line, double *carrierAtLeft);
+	// Pair disentangle at luma steps: withdraw the MEASURED class-common
+	// carrier-band error (the pair mean of the raw bandpass with the line's
+	// complement partner) at lurch-triggered footprints. No edge model, no
+	// fits -- the measurement is the correction; solving the edge is
+	// downstream's job. Rotation-free; acts in place on the emitted 1D
+	// carrier (both paths). Supersedes the P9-P11 doublet correctors.
+	void applyEdgePairDisentangle(int line, double *carrierAtLeft);
 
 	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
 	// demodulated aperture views can bound the chroma at a luma step. Reads

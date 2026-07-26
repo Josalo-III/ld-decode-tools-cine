@@ -1538,10 +1538,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
         }
 
-        // Steep-edge doublet: withdraw the known -0.25*D2Y leak at luma steps
-        // from the emitted carrier (self-gated; inert unless LDCD_EDGE_DOUBLET).
+        // Pair disentangle: withdraw the measured class-common carrier-band
+        // error at luma steps (self-gated; inert unless LDCD_EDGE_DISENT).
         // bpLine[rel] is the carrier at sample left+rel, i.e. carrierAtLeft.
-        applyEdgeDoublet(line, bpLine);
+        applyEdgePairDisentangle(line, bpLine);
 
         // Pass 1.5: coarse-residual feasibility repair for locked 1D.
         //
@@ -4697,140 +4697,132 @@ static void detectLurchSteps(const double *means, int meanCount,
     }
 }
 
-// Disposable stats for the tandem edge fit (LDCD_PROBE_TANDEM=1). Measurement
-// only; the verdict counters are cheap enough to run whenever the doublet is
-// enabled, but nothing prints unless asked.
+// Reverse-engineering stats for the pair disentangle (LDCD_PROBE_DISENT=1).
+// Measurement only. The per-class map is the point: the leak's demod hue is
+// set by (x mod 4, lineFlip), so the SAME luma edge presents a different
+// error per line class -- Y colliding with different conventions along the
+// phase sequence. These counters expose that map and the field asymmetry.
 namespace {
 
-enum class TandemVerdict { Window, Margin, Boundary, NoPartner, VContra };
-
-struct TandemProbe {
+struct DisentProbe {
     std::mutex mu;
-    long nWindow = 0, nMargin = 0, nBoundary = 0, nAccept = 0;
-    long nNoPartner = 0, nVContra = 0;
-    long nAccPar[2] = {0, 0};
-    double sumDe = 0.0, sumAbsDe = 0.0, sumRatio = 0.0, sumAbsDev = 0.0;
-    long wHist[4] = {0, 0, 0, 0};
+    long nRuns = 0, nNoPartner = 0;
+    long partnerUp[2] = {0, 0}, partnerDn[2] = {0, 0};
+    // [line parity][lineFlip < 0]: samples and IRE sums.
+    long   cn[2][2]   = {{0, 0}, {0, 0}};
+    double cAbs[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+    double cI[2][2]   = {{0.0, 0.0}, {0.0, 0.0}};
+    double cQ[2][2]   = {{0.0, 0.0}, {0.0, 0.0}};
 
     static bool on()
     {
         static const bool v = []{
-            const char *s = std::getenv("LDCD_PROBE_TANDEM");
+            const char *s = std::getenv("LDCD_PROBE_DISENT");
             return s && std::atoi(s) != 0;
         }();
         return v;
     }
 
-    void count(TandemVerdict v)
+    void run(int parity, int partnerDelta)
     {
         if (!on()) return;
         std::lock_guard<std::mutex> lk(mu);
-        switch (v) {
-        case TandemVerdict::Window:    ++nWindow;    break;
-        case TandemVerdict::Margin:    ++nMargin;    break;
-        case TandemVerdict::Boundary:  ++nBoundary;  break;
-        case TandemVerdict::NoPartner: ++nNoPartner; break;
-        case TandemVerdict::VContra:   ++nVContra;   break;
-        }
+        ++nRuns;
+        if (partnerDelta < 0) ++partnerUp[parity & 1];
+        else                  ++partnerDn[parity & 1];
     }
 
-    void accept(double de, double w, double ratio, int parity, double dev)
+    void noPartner(long gatedRuns)
     {
         if (!on()) return;
         std::lock_guard<std::mutex> lk(mu);
-        ++nAccept;
-        ++nAccPar[parity & 1];
-        sumDe += de; sumAbsDe += std::fabs(de); sumRatio += ratio;
-        sumAbsDev += std::fabs(dev);
-        const int wi = (w < 1.4) ? 0 : (w < 1.8) ? 1 : (w < 2.2) ? 2 : 3;
-        ++wHist[wi];
+        nRuns += gatedRuns;
+        nNoPartner += gatedRuns;
     }
 
-    ~TandemProbe()
+    void sample(int parity, int flipNeg, double cmIRE, double iIRE, double qIRE)
     {
         if (!on()) return;
-        const long total = nAccept + nMargin + nBoundary + nWindow
-                         + nNoPartner + nVContra;
-        if (total <= 0) return;
+        std::lock_guard<std::mutex> lk(mu);
+        ++cn[parity & 1][flipNeg & 1];
+        cAbs[parity & 1][flipNeg & 1] += cmIRE;
+        cI[parity & 1][flipNeg & 1]   += iIRE;
+        cQ[parity & 1][flipNeg & 1]   += qIRE;
+    }
+
+    ~DisentProbe()
+    {
+        if (!on() || nRuns <= 0) return;
         std::fprintf(stderr,
-            "\n[TANDEM] runs %ld: accept %.1f%%  reject margin %.1f%% "
-            "boundary %.1f%% window %.1f%% noPartner %.1f%% vContra %.1f%%\n",
-            total,
-            100.0 * (double)nAccept    / (double)total,
-            100.0 * (double)nMargin    / (double)total,
-            100.0 * (double)nBoundary  / (double)total,
-            100.0 * (double)nWindow    / (double)total,
-            100.0 * (double)nNoPartner / (double)total,
-            100.0 * (double)nVContra   / (double)total);
-        if (nAccept > 0)
-            std::fprintf(stderr,
-                "[TANDEM] accepted: de mean %+.2f  |de| mean %.2f px  "
-                "err/err0 mean %.2f  |ev-eh| mean %.2f px  "
-                "wV <1.4:%ld <1.8:%ld <2.2:%ld >=2.2:%ld  "
-                "parity even:%ld odd:%ld\n",
-                sumDe / nAccept, sumAbsDe / nAccept, sumRatio / nAccept,
-                sumAbsDev / nAccept,
-                wHist[0], wHist[1], wHist[2], wHist[3],
-                nAccPar[0], nAccPar[1]);
+            "\n[DISENT] runs %ld  noPartner %.1f%%  partner up/dn: "
+            "even %ld/%ld  odd %ld/%ld\n",
+            nRuns, 100.0 * (double)nNoPartner / (double)nRuns,
+            partnerUp[0], partnerDn[0], partnerUp[1], partnerDn[1]);
+        for (int p = 0; p < 2; ++p)
+            for (int f = 0; f < 2; ++f) {
+                if (cn[p][f] <= 0) continue;
+                const double inv = 1.0 / (double)cn[p][f];
+                std::fprintf(stderr,
+                    "[DISENT] class parity=%d flip=%c: n=%ld  |cm| %.2f IRE"
+                    "  |I| %.2f  |Q| %.2f\n",
+                    p, f ? '-' : '+', cn[p][f],
+                    cAbs[p][f] * inv, cI[p][f] * inv, cQ[p][f] * inv);
+            }
     }
 };
 
-TandemProbe g_tandemProbe;
+DisentProbe g_disentProbe;
 
 } // namespace
 
-// Subtract the known steep-edge leak doublet from the emitted 1D carrier.
+// Pair disentangle: withdraw the MEASURED class-common carrier-band error at
+// luma steps. (P12; supersedes the P9-P11 edge-model correctors.)
 //
-// At a luma step the bandpass reads -0.25*D2Y as false carrier -- a fixed
-// doublet scaled by step height (the "known profile"). The corner leak drove
-// this from the notch, which is chroma-contaminated at coincident edges (the
-// parked lesson), and P9b's notch-shape fit inherited a softened corner: the
-// notch is S{Y}, the sharp point already rounded off.
+// We are out of the business of solving the edge. P9-P11 fitted an edge
+// model (position, width) and emitted its predicted leak; every failure
+// traced to the model substituting for a reality it could not know -- blur
+// where the disc was sharper, per-line verdict stipple, field-asymmetric
+// misattribution. Solving the edge is downstream's job (comb, Y-building,
+// with vertical information the 1D does not have). This stage only needs to
+// hand off something MANAGEABLE: disentangle, at least partially, so the
+// error's luma impact is reduced and what remains is a tame, understood
+// shape.
 //
-// TANDEM (P10): the two coarse-residual signals split the parameters by what
-// each owns incorruptibly.
-//   * The COARSE MEMBERSHIP DIFFERENCES (lurch) own EXISTENCE and AMPLITUDE:
-//     D[s] = (raw[s+4]-raw[s])/4 compares identical carrier phase, so the
-//     same-sign run and the flanking plateau means are chroma-free by
-//     construction. What they cannot give is position -- the boxcar's blur is
-//     baked into the centroid.
-//   * The MEAN APERTURE RESIDUAL m[x] = raw[x] - A[x] (A = mean of covering
-//     apMeans = T{Y}, T the 7-tap triangle) owns POSITION and SHARPNESS: the
-//     coarse platform is smooth, so the residual keeps the true discontinuity
-//     -- the sharp point of Y that both the boxcar and the notch round off.
-//     Its price is the carrier, present at full strength: m = C + (I-T){Y}.
+// The disentanglement needs no edge model -- only the error's class
+// structure, which is foreknowledge:
+//     bp_n = C_n + L_n,     bp_p = -C_n + L_p     (complement partner p)
+// The leak L (the bandpass's luma read, -0.25*D2_2 Y) is CLASS-INVARIANT in
+// composite; the carrier is CLASS-ALTERNATING. Fields are co-temporal on
+// telecine material, so line and complement see the same scene. The pair
+// mean
+//     cm = 0.5*(B{raw_n} + B{raw_p}) = Lbar + 0.5*dC
+// therefore MEASURES the common leak -- at the disc's own sharpness,
+// whatever that is; nothing is positioned, widthed, or synthesized, so a
+// sharper-than-imagined edge cannot be blurred by a model that guessed
+// wrong. Subtracting cm from the emitted carrier returns the true leak to Y
+// (Y = raw - carrier) and leaves the class-DIFFERENTIAL half 0.5*(dL - dC)
+// in chroma -- precisely the shape the downstream interfield machinery is
+// built to eat. Both lines of a complement pair receive the SAME cm, so the
+// correction cannot stipple within a pair.
 //
-// The carrier is FIT AROUND, not subtracted: over the step footprint the
-// lawful envelope is nearly constant (1.3 MHz barely moves in ~11 samples at
-// 4fSC), so within a lurch run we model
-//     m[x] ~= (I-T){ramp_{e,w}}[x] + p*sin4fsc + q*cos4fsc
-// with the ramp's LEVELS PINNED by lurch (lo/hi plateau means -- amplitude is
-// never fitted, so chroma cannot inflate it) and only edge position e, width
-// w, and the two nuisance envelope terms free. The doublet is fast, the
-// envelope slow by law: nearly orthogonal over the window, the bandwidth
-// asymmetry applied inside a low-dimensional edge model instead of per-sample
-// (the S7 probe's constructive residue).
+// Confinement: lurch-triggered footprints only (everywhere else the 1D
+// remains a fully distinct candidate), tapered at the footprint ends so no
+// step is manufactured in the carrier, scaled by lurch's own gate. No fits,
+// no verdicts: the measurement is the correction. No partner in range =>
+// plain 1D, per the fallback doctrine.
 //
-// ABSTENTION IS BINARY: the pinned-amplitude doublet either materially beats
-// the envelope-only hypothesis under the SAME nuisance model (common-mode
-// envelope error cancels in the comparison) and localizes in the scan
-// interior, or the run emits NOTHING and the 1D goes out untouched. 1D is the
-// fallback; there is no partial correction.
-void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
+// Signal frame: carrierAtLeft is the B{raw}-frame scalar carrier with
+// physical line polarity at BOTH call sites (bucket dst and locked Pass-1
+// bpLine); cm is built from rawbuffer through the same operator. Same
+// frame, per the buffer-flow contract.
+void Comb::FrameBuffer::applyEdgePairDisentangle(int line, double *carrierAtLeft)
 {
     static const bool enabled = []{
-        const char *s = std::getenv("LDCD_EDGE_DOUBLET");
+        const char *s = std::getenv("LDCD_EDGE_DISENT");
         return s && std::atoi(s) != 0;
     }();
     if (!enabled || !carrierAtLeft) return;
 
-    // Accept threshold on bestErr/err0: the pinned doublet must explain at
-    // least this fraction of the nuisance-adjusted residual energy. Tunable
-    // for the probe sweep only.
-    static const double kAccept = []{
-        const char *s = std::getenv("LDCD_TANDEM_ACCEPT");
-        return s ? std::atof(s) : 0.5;
-    }();
     const double *apMean = lockedApertureMean_line(line);
     if (!apMean) return;
     const int left      = videoParameters.activeVideoStart;
@@ -4838,225 +4830,78 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
     const int fullWidth = videoParameters.fieldWidth;
     const int width     = right - left;
     if (width < 16) return;
-    const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
-    const int lastStart = width - 4;
 
     std::vector<LurchStepRun> runs;
     detectLurchSteps(apMean, width, irescale, invIreScale, 1.0, runs);
-    if (runs.empty()) return;
+    long gated = 0;
+    for (const LurchStepRun &run : runs)
+        if (!run.suppressed && run.gate > 0.0) ++gated;
+    if (gated == 0) return;
 
-    std::vector<double> leak(width, 0.0);
-    bool any = false;
-
-    for (const LurchStepRun &run : runs) {
-        if (run.suppressed || run.gate <= 0.0) continue;
-
-        // Clean, chroma-free plateau levels flanking the step (lurch's
-        // amplitude authority; never refitted).
-        const int ia = std::clamp(run.a, 0, width - 1);
-        const int ib = std::clamp(run.b + 1, 0, width - 1);
-        const double lo = apMean[ia];
-        const double hi = apMean[ib];
-
-        // Fit window: the step's own footprint. Every sample needs all four
-        // covering apertures (x in [3, width-4]) so (I-T) is exact; an edge
-        // too near the margins simply gets no correction (1D fallback).
-        const int x0 = (int)std::floor(run.edge) - 5;
-        const int x1 = (int)std::ceil(run.edge) + 5;
-        if (x0 < 3 || x1 > width - 4) { g_tandemProbe.count(TandemVerdict::Window); continue; }
-        const int n = x1 - x0 + 1;      // <= 13
-
-        double m[16], s4[16], c4[16], d[16];
-        for (int x = x0; x <= x1; ++x) {
-            double acc = 0.0;
-            for (int dd = 0; dd < 4; ++dd)
-                acc += apMean[x - (3 - dd)];
-            const int i = x - x0;
-            m[i] = (double)rawLine[left + x] - 0.25 * acc;
-            const int ph = carrierSampleClass(line, left + x);
-            s4[i] = sin4fsc(ph);
-            c4[i] = cos4fsc(ph);
-        }
-
-        // ramp_{e,w}: pinned plateau levels, transition of width w centred on
-        // e. Analytic, so sub-sample e follows a diagonal smoothly (the P9b
-        // jaggies lesson).
-        auto rampAt = [&](double j, double e, double w) {
-            return lo + (hi - lo) * std::clamp((j - e) / w + 0.5, 0.0, 1.0);
-        };
-        static constexpr double T7[7] = {1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0};
-        auto buildDoublet = [&](double e, double w) {
-            for (int x = x0; x <= x1; ++x) {
-                double t = 0.0;
-                for (int k = -3; k <= 3; ++k)
-                    t += T7[k + 3] * rampAt((double)(x + k), e, w);
-                d[x - x0] = rampAt((double)x, e, w) - t / 16.0;
-            }
-        };
-        // SPLIT-ENVELOPE nuisance: independent (p,q) on each side of the
-        // candidate edge, two independent 2x2 solves. A scene object boundary
-        // is one edge in two channels -- the luma ramp AND a colour
-        // transition share the same e -- and a constant-envelope null is
-        // WRONG at exactly the coincident colour+luma edges this corrector
-        // targets: the null's error is inflated by envelope-transition energy
-        // the doublet cannot explain, and the ratio test self-blinds (the
-        // concert-CCR trap: right detector, wrong null). Both hypotheses get
-        // the split at the SAME e, so the comparison isolates the doublet
-        // alone; where there is no real doublet the null only gets stronger,
-        // so false accepts get harder, not easier.
-        auto fitErrSplit = [&](const double *dbl, double e) {
-            double err = 0.0;
-            for (int side = 0; side < 2; ++side) {
-                double Sss = 0, Scc = 0, Ssc = 0, Srs = 0, Src = 0, Srr = 0;
-                int cnt = 0;
-                for (int i = 0; i < n; ++i) {
-                    if ((side == 1) != ((double)(x0 + i) > e)) continue;
-                    const double r = m[i] - (dbl ? dbl[i] : 0.0);
-                    Sss += s4[i] * s4[i]; Scc += c4[i] * c4[i];
-                    Ssc += s4[i] * c4[i];
-                    Srs += r * s4[i];     Src += r * c4[i];     Srr += r * r;
-                    ++cnt;
-                }
-                if (cnt < 3) return 1e300;   // unusable partition
-                const double det = Sss * Scc - Ssc * Ssc;
-                err += (det < 1e-9) ? Srr
-                                    : Srr - ((Scc * Srs - Ssc * Src) * Srs
-                                           + (Sss * Src - Ssc * Srs) * Src) / det;
-            }
-            return err;
-        };
-
-        // 1D-REACH WIDTH LAW -- scope is the 1D path, not video. The +-2
-        // reach softens any transition too much for an instant shift, so no
-        // 1D-DERIVED evidence can license a sub-2px ramp: within this
-        // composite-domain fit such hypotheses are IMPOSSIBLE inputs and are
-        // absent from the family -- not penalized, absent. (The family once
-        // reached 0.6 and the fit skewed there: with amplitude pinned,
-        // plateau-level error can only be absorbed by width, so amplitude
-        // error ALIASES INTO SHARPNESS and the emission manufactured
-        // near-Nyquist luma.) Downstream comb / Y-building CAN legitimately
-        // produce sharper transitions from non-1D evidence -- and the
-        // vertical triangulation below is exactly such evidence, so ITS
-        // family extends below 2.0 and the emission follows it.
-        static constexpr double kWidths[4] = {2.0, 2.4, 3.0, 3.8};
-        const double eLo = run.edge - 2.0, eHi = run.edge + 2.0;
-        double bestRatio = 1e300, bestE = run.edge, bestW = 0.0;
-        for (double e = eLo; e <= eHi + 1e-9; e += 0.25) {
-            const double errNull = fitErrSplit(nullptr, e);
-            if (errNull >= 1e300 || errNull < 1e-12) continue;
-            for (double w : kWidths) {
-                buildDoublet(e, w);
-                const double ratio = fitErrSplit(d, e) / errNull;
-                if (ratio < bestRatio) { bestRatio = ratio; bestE = e; bestW = w; }
-            }
-        }
-
-        // Binary verdict, horizontal half. No margin, no localization =>
-        // nothing is emitted.
-        if (bestW == 0.0 || bestRatio > kAccept) {
-            g_tandemProbe.count(TandemVerdict::Margin); continue;
-        }
-        if (bestE <= eLo + 1e-9 || bestE >= eHi - 1e-9) {
-            g_tandemProbe.count(TandemVerdict::Boundary); continue;
-        }
-
-        // ---- VERTICAL TRIANGULATION (phase-aware, progressive telecine). ---
-        // Fields are co-temporal on this material, so the adjacent frame
-        // lines are true spatial neighbours -- and they sit in the COMPLEMENT
-        // error class: the signed carrier class is opposite (checked against
-        // the grammar per partner, never presumed from the schedule), so the
-        // top-class error is aligned for cancellation with its complement.
-        // [1,2,1]/4 across the triple cancels the carrier and yields ybar, a
-        // luma read at FULL horizontal bandwidth -- the sharp profile the
-        // notch (S-rounded) and the residual (carrier-laden) never had. Its
-        // blur axis is vertical; lurch's is horizontal: triangulation.
-        //
-        // The anticipated error is confirmed, not discovered: lurch supplies
-        // the trigger and pinned amplitude, the composite fit the candidate
-        // e; ybar must reproduce the SAME edge (position within tolerance,
-        // pinned plateaus, one DC nuisance for vertical shading) or the run
-        // abstains to plain 1D. Because ybar is NON-1D evidence, its width
-        // family extends below the 1D floor -- a genuinely sharp edge is
-        // licensed by the vertical read -- and the EMISSION follows ybar's
-        // profile: the leak the bandpass created came from the true Y, so
-        // the doublet subtracted is -0.25*D2_2 of the profile ybar measured.
-        const int firstLine = videoParameters.firstActiveFrameLine;
-        const int lastLine  = videoParameters.lastActiveFrameLine;
-        if (line - 1 < firstLine || line + 1 >= lastLine) {
-            g_tandemProbe.count(TandemVerdict::NoPartner); continue;
-        }
-        // The schedule runs [+ - - +] down the frame: every line has exactly
-        // ONE complement neighbour among the adjacent frame lines, alternating
-        // above/below. The grammar names it; nothing is presumed.
-        const int clsC = carrierSignedSampleClass(line,     left + x0);
-        const int clsU = carrierSignedSampleClass(line - 1, left + x0);
-        const int clsD = carrierSignedSampleClass(line + 1, left + x0);
-        const int want = (clsC + 2) & 3;
-        int partner = 0;
-        if (clsU == want) partner = line - 1;
-        else if (clsD == want) partner = line + 1;
-        else { g_tandemProbe.count(TandemVerdict::NoPartner); continue; }
-        const quint16 *rawP = rawbuffer.data() + size_t(partner) * fullWidth;
-        double ybar[16];
-        for (int x = x0; x <= x1; ++x)
-            ybar[x - x0] = 0.5 * ((double)rawLine[left + x]
-                                + (double)rawP[left + x]);
-
-        // Pinned-plateau ramp against ybar, one DC nuisance (vertical
-        // shading moves the platform, never the edge). Closed form.
-        auto fitYbar = [&](double e, double w) {
-            double se = 0.0;
-            for (int i = 0; i < n; ++i)
-                se += ybar[i] - rampAt((double)(x0 + i), e, w);
-            const double c0 = se / n;
-            double err = 0.0;
-            for (int i = 0; i < n; ++i) {
-                const double r = ybar[i] - rampAt((double)(x0 + i), e, w) - c0;
-                err += r * r;
-            }
-            return err;
-        };
-        // Flat null: no edge in ybar at all (cancellation failed or the
-        // trigger was false) -- the ramp must beat it to confirm.
-        double yMean = 0.0;
-        for (int i = 0; i < n; ++i) yMean += ybar[i];
-        yMean /= n;
-        double errFlat = 0.0;
-        for (int i = 0; i < n; ++i)
-            errFlat += (ybar[i] - yMean) * (ybar[i] - yMean);
-
-        static constexpr double kWidthsV[6] = {1.2, 1.6, 2.0, 2.4, 3.0, 3.8};
-        double bestErrV = 1e300, bestEV = bestE, bestWV = 0.0;
-        for (double e = bestE - 1.25; e <= bestE + 1.25 + 1e-9; e += 0.25) {
-            for (double w : kWidthsV) {
-                const double err = fitYbar(e, w);
-                if (err < bestErrV) { bestErrV = err; bestEV = e; bestWV = w; }
-            }
-        }
-        if (bestWV == 0.0 || errFlat < 1e-12
-                || bestErrV > kAccept * errFlat
-                || std::fabs(bestEV - bestE) > 1.0) {
-            g_tandemProbe.count(TandemVerdict::VContra); continue;
-        }
-        g_tandemProbe.accept(bestE - run.edge, bestWV, bestRatio, line & 1,
-                             bestEV - bestE);
-
-        // Emit the bandpass's own forward-model leak for the CONFIRMED
-        // profile: -0.25 * D2_2{ramp_{eV,wV}}.
-        const int y0 = std::max(0, (int)std::floor(bestEV) - 4);
-        const int y1 = std::min(width - 1, (int)std::ceil(bestEV) + 4);
-        for (int x = y0; x <= y1; ++x) {
-            const double d2 = rampAt((double)(x - 2), bestEV, bestWV)
-                            - 2.0 * rampAt((double)x, bestEV, bestWV)
-                            + rampAt((double)(x + 2), bestEV, bestWV);
-            leak[x] += -0.25 * d2 * run.gate;
-        }
-        any = true;
+    // Complement partner: the schedule tiles [+ - - +] down the frame, so
+    // exactly one adjacent frame line carries the opposite signed class.
+    // The grammar names it; nothing is presumed from the schedule.
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int want = (carrierSignedSampleClass(line, left) + 2) & 3;
+    int partner = -1;
+    if (line - 1 >= firstLine
+            && carrierSignedSampleClass(line - 1, left) == want)
+        partner = line - 1;
+    else if (line + 1 < lastLine
+            && carrierSignedSampleClass(line + 1, left) == want)
+        partner = line + 1;
+    if (partner < 0) {
+        g_disentProbe.noPartner(gated);
+        return;                                   // plain 1D
     }
 
+    const auto sstep = [](double t) {
+        t = std::clamp(t, 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
+    };
+
+    // Footprint weights: max-combine overlapping runs (cm is one measurement
+    // per line, so overlap must not subtract it twice).
+    std::vector<double> wAcc(width, 0.0);
+    bool any = false;
+    for (const LurchStepRun &run : runs) {
+        if (run.suppressed || run.gate <= 0.0) continue;
+        g_disentProbe.run(line & 1, partner - line);
+        const int x0 = (int)std::floor(run.edge) - 6;
+        const int x1 = (int)std::ceil(run.edge) + 6;
+        for (int x = std::max(0, x0); x <= std::min(width - 1, x1); ++x) {
+            const double tIn =
+                std::min((double)(x - x0), (double)(x1 - x)) / 3.0;
+            const double w = run.gate * sstep(tIn);
+            if (w > wAcc[x]) { wAcc[x] = w; any = true; }
+        }
+    }
     if (!any) return;
-    for (int x = 0; x < width; ++x)
-        carrierAtLeft[x] -= leak[x];
+
+    const quint16 *rawLine = rawbuffer.data() + size_t(line)    * fullWidth;
+    const quint16 *rawP    = rawbuffer.data() + size_t(partner) * fullWidth;
+    auto bpAt = [&](const quint16 *rl, int x) {
+        const int m2 = std::clamp(x - 2, 0, width - 1);
+        const int p2 = std::clamp(x + 2, 0, width - 1);
+        return 0.50 * (double)rl[left + x]
+             - 0.25 * ((double)rl[left + m2] + (double)rl[left + p2]);
+    };
+
+    const int parity  = line & 1;
+    const int flipNeg = carrierLineFlip(line) < 0 ? 1 : 0;
+    for (int x = 0; x < width; ++x) {
+        if (wAcc[x] <= 0.0) continue;
+        const double cm = 0.5 * (bpAt(rawLine, x) + bpAt(rawP, x));
+        carrierAtLeft[x] -= wAcc[x] * cm;
+        if (DisentProbe::on()) {
+            const int ph = carrierSampleClass(line, left + x);
+            g_disentProbe.sample(parity, flipNeg,
+                std::fabs(cm) * invIreScale,
+                std::fabs(2.0 * cm * sin4fsc(ph)) * invIreScale,
+                std::fabs(2.0 * cm * cos4fsc(ph)) * invIreScale);
+        }
+    }
 }
 
 void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
