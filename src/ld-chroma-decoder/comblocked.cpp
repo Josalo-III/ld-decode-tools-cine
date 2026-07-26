@@ -2325,9 +2325,19 @@ void Comb::FrameBuffer::measurePostCombImpurity()
         const char *s = std::getenv("CC_DIAG_C1"); return s ? std::atoi(s) : -1;
     }();
 
+    // Bandwidth-law cross-color contributor (opt-in, default off so the
+    // authoritative impurity is byte-identical when disabled). Scores demod
+    // envelope activity too fast to be legal carrier and MAXes it into gA; it
+    // is a discriminator input for the color-side handler, never a source gain.
+    static const bool bwCrossColor = []{
+        const char *s = std::getenv("LDCD_BW_CROSSCOLOR");
+        return s && std::atoi(s) != 0;
+    }();
+
     std::vector<double> demI(width), demQ(width);
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
+    std::vector<double> lawI(width), lawQ(width);   // encoder-band envelope
 
     for (int line = firstLine; line < lastLine; ++line) {
         const double *combLine = clpbuffer[srcBuf].pixel[line];
@@ -2353,6 +2363,17 @@ void Comb::FrameBuffer::measurePostCombImpurity()
             preEnv[rel + 1] = preEnv[rel] + env[rel];
         }
 
+        // Lawful (<=1.3 MHz) envelope of the elected chroma: the most the
+        // encoder could have modulated here. The demod's 2fSC image sits at
+        // Nyquist, which this kernel nulls, so lawI/lawQ is the legal envelope
+        // with the image already gone.
+        if (bwCrossColor) {
+            lddecode::projectExpressibleChromaEnvelope(
+                demI.data(), nullptr, width, lawI.data());
+            lddecode::projectExpressibleChromaEnvelope(
+                demQ.data(), nullptr, width, lawQ.data());
+        }
+
         for (int rel = 0; rel < width; ++rel) {
             const double ZwI = centeredEvenWeightMean(
                 demI.data(), preI.data(), width, rel, kWideWin);
@@ -2374,6 +2395,27 @@ void Comb::FrameBuffer::measurePostCombImpurity()
                 gA = clamp01(
                     (narrowMag - wideMag) /
                     std::max(kImpurityFloorIRE, narrowMag));
+            }
+
+            // Bandwidth-law contributor: the fraction of the elected chroma
+            // envelope that a legal <=1.3 MHz envelope cannot reconstruct, i.e.
+            // activity too fast to be carrier. imageFree = [1,2,1]/4 (stride 1)
+            // removes the 2fSC image at Nyquist but keeps the 1.3 MHz-to-Nyquist
+            // band; law = P{demod} keeps only the legal envelope; their
+            // difference is the too-fast part. Floor-guarded so the soft 1.3 MHz
+            // skirt and noise do not flag legal chroma edges. Scored, never
+            // filtered -- MAXed into gA for the same color-side handler.
+            if (bwCrossColor) {
+                const int rm = std::max(0, rel - 1);
+                const int rp = std::min(width - 1, rel + 1);
+                const double ifI = 0.25 * (demI[rm] + 2.0 * demI[rel] + demI[rp]);
+                const double ifQ = 0.25 * (demQ[rm] + 2.0 * demQ[rel] + demQ[rp]);
+                const double crossMag = 2.0 *
+                    std::hypot(ifI - lawI[rel], ifQ - lawQ[rel]) * invIreScale;
+                const double actualMag =
+                    2.0 * std::hypot(ifI, ifQ) * invIreScale;
+                if (crossMag > kImpurityFloorIRE && actualMag > kImpurityFloorIRE)
+                    gA = std::max(gA, clamp01(crossMag / actualMag));
             }
 
             // The post-comb read is authoritative for CCR targeting. The
