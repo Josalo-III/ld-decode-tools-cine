@@ -4702,13 +4702,14 @@ static void detectLurchSteps(const double *means, int meanCount,
 // enabled, but nothing prints unless asked.
 namespace {
 
-enum class TandemVerdict { Window, Margin, Boundary };
+enum class TandemVerdict { Window, Margin, Boundary, NoPartner, VContra };
 
 struct TandemProbe {
     std::mutex mu;
     long nWindow = 0, nMargin = 0, nBoundary = 0, nAccept = 0;
+    long nNoPartner = 0, nVContra = 0;
     long nAccPar[2] = {0, 0};
-    double sumDe = 0.0, sumAbsDe = 0.0, sumRatio = 0.0;
+    double sumDe = 0.0, sumAbsDe = 0.0, sumRatio = 0.0, sumAbsDev = 0.0;
     long wHist[4] = {0, 0, 0, 0};
 
     static bool on()
@@ -4725,42 +4726,50 @@ struct TandemProbe {
         if (!on()) return;
         std::lock_guard<std::mutex> lk(mu);
         switch (v) {
-        case TandemVerdict::Window:   ++nWindow;   break;
-        case TandemVerdict::Margin:   ++nMargin;   break;
-        case TandemVerdict::Boundary: ++nBoundary; break;
+        case TandemVerdict::Window:    ++nWindow;    break;
+        case TandemVerdict::Margin:    ++nMargin;    break;
+        case TandemVerdict::Boundary:  ++nBoundary;  break;
+        case TandemVerdict::NoPartner: ++nNoPartner; break;
+        case TandemVerdict::VContra:   ++nVContra;   break;
         }
     }
 
-    void accept(double de, double w, double ratio, int parity)
+    void accept(double de, double w, double ratio, int parity, double dev)
     {
         if (!on()) return;
         std::lock_guard<std::mutex> lk(mu);
         ++nAccept;
         ++nAccPar[parity & 1];
         sumDe += de; sumAbsDe += std::fabs(de); sumRatio += ratio;
-        const int wi = (w < 2.2) ? 0 : (w < 2.7) ? 1 : (w < 3.4) ? 2 : 3;
+        sumAbsDev += std::fabs(dev);
+        const int wi = (w < 1.4) ? 0 : (w < 1.8) ? 1 : (w < 2.2) ? 2 : 3;
         ++wHist[wi];
     }
 
     ~TandemProbe()
     {
         if (!on()) return;
-        const long total = nAccept + nMargin + nBoundary + nWindow;
+        const long total = nAccept + nMargin + nBoundary + nWindow
+                         + nNoPartner + nVContra;
         if (total <= 0) return;
         std::fprintf(stderr,
             "\n[TANDEM] runs %ld: accept %.1f%%  reject margin %.1f%% "
-            "boundary %.1f%% window %.1f%%\n",
+            "boundary %.1f%% window %.1f%% noPartner %.1f%% vContra %.1f%%\n",
             total,
-            100.0 * (double)nAccept   / (double)total,
-            100.0 * (double)nMargin   / (double)total,
-            100.0 * (double)nBoundary / (double)total,
-            100.0 * (double)nWindow   / (double)total);
+            100.0 * (double)nAccept    / (double)total,
+            100.0 * (double)nMargin    / (double)total,
+            100.0 * (double)nBoundary  / (double)total,
+            100.0 * (double)nWindow    / (double)total,
+            100.0 * (double)nNoPartner / (double)total,
+            100.0 * (double)nVContra   / (double)total);
         if (nAccept > 0)
             std::fprintf(stderr,
                 "[TANDEM] accepted: de mean %+.2f  |de| mean %.2f px  "
-                "err/err0 mean %.2f  widths 2.0:%ld 2.4:%ld 3.0:%ld 3.8:%ld  "
+                "err/err0 mean %.2f  |ev-eh| mean %.2f px  "
+                "wV <1.4:%ld <1.8:%ld <2.2:%ld >=2.2:%ld  "
                 "parity even:%ld odd:%ld\n",
                 sumDe / nAccept, sumAbsDe / nAccept, sumRatio / nAccept,
+                sumAbsDev / nAccept,
                 wHist[0], wHist[1], wHist[2], wHist[3],
                 nAccPar[0], nAccPar[1]);
     }
@@ -4917,17 +4926,18 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
             return err;
         };
 
-        // CAPTURE-CHAIN WIDTH LAW. Only aliased edges are ever abrupt: every
-        // natural transition arrives through the chain's lowpass as a
-        // gradient, even if only over ~2 px. A sub-2px ramp is therefore an
-        // IMPOSSIBLE hypothesis and is excluded from the family -- not
-        // penalized, absent -- so the emitted Y transition can never exceed
-        // chain sharpness. (The earlier family reached down to 0.6 and the
-        // fit skewed there after the split: with amplitude pinned, plateau-
-        // level error can only be absorbed by width, so amplitude error
-        // ALIASES INTO SHARPNESS and the emission manufactures near-Nyquist
-        // luma the chain could not have delivered.) A genuinely sharper-than-
-        // law edge simply fits worse and abstains to 1D, per doctrine.
+        // 1D-REACH WIDTH LAW -- scope is the 1D path, not video. The +-2
+        // reach softens any transition too much for an instant shift, so no
+        // 1D-DERIVED evidence can license a sub-2px ramp: within this
+        // composite-domain fit such hypotheses are IMPOSSIBLE inputs and are
+        // absent from the family -- not penalized, absent. (The family once
+        // reached 0.6 and the fit skewed there: with amplitude pinned,
+        // plateau-level error can only be absorbed by width, so amplitude
+        // error ALIASES INTO SHARPNESS and the emission manufactured
+        // near-Nyquist luma.) Downstream comb / Y-building CAN legitimately
+        // produce sharper transitions from non-1D evidence -- and the
+        // vertical triangulation below is exactly such evidence, so ITS
+        // family extends below 2.0 and the emission follows it.
         static constexpr double kWidths[4] = {2.0, 2.4, 3.0, 3.8};
         const double eLo = run.edge - 2.0, eHi = run.edge + 2.0;
         double bestRatio = 1e300, bestE = run.edge, bestW = 0.0;
@@ -4941,24 +4951,104 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
             }
         }
 
-        // Binary verdict. No margin, no localization => nothing is emitted.
+        // Binary verdict, horizontal half. No margin, no localization =>
+        // nothing is emitted.
         if (bestW == 0.0 || bestRatio > kAccept) {
             g_tandemProbe.count(TandemVerdict::Margin); continue;
         }
         if (bestE <= eLo + 1e-9 || bestE >= eHi - 1e-9) {
             g_tandemProbe.count(TandemVerdict::Boundary); continue;
         }
-        g_tandemProbe.accept(bestE - run.edge, bestW, bestRatio, line & 1);
 
-        // Emit the bandpass's own forward-model leak for the fitted edge:
-        // -0.25 * D2_2{ramp}. The fit estimated (e,w) through (I-T); the
-        // emission uses the operator the bandpass actually applies.
-        const int y0 = std::max(0, (int)std::floor(bestE) - 4);
-        const int y1 = std::min(width - 1, (int)std::ceil(bestE) + 4);
+        // ---- VERTICAL TRIANGULATION (phase-aware, progressive telecine). ---
+        // Fields are co-temporal on this material, so the adjacent frame
+        // lines are true spatial neighbours -- and they sit in the COMPLEMENT
+        // error class: the signed carrier class is opposite (checked against
+        // the grammar per partner, never presumed from the schedule), so the
+        // top-class error is aligned for cancellation with its complement.
+        // [1,2,1]/4 across the triple cancels the carrier and yields ybar, a
+        // luma read at FULL horizontal bandwidth -- the sharp profile the
+        // notch (S-rounded) and the residual (carrier-laden) never had. Its
+        // blur axis is vertical; lurch's is horizontal: triangulation.
+        //
+        // The anticipated error is confirmed, not discovered: lurch supplies
+        // the trigger and pinned amplitude, the composite fit the candidate
+        // e; ybar must reproduce the SAME edge (position within tolerance,
+        // pinned plateaus, one DC nuisance for vertical shading) or the run
+        // abstains to plain 1D. Because ybar is NON-1D evidence, its width
+        // family extends below the 1D floor -- a genuinely sharp edge is
+        // licensed by the vertical read -- and the EMISSION follows ybar's
+        // profile: the leak the bandpass created came from the true Y, so
+        // the doublet subtracted is -0.25*D2_2 of the profile ybar measured.
+        const int firstLine = videoParameters.firstActiveFrameLine;
+        const int lastLine  = videoParameters.lastActiveFrameLine;
+        if (line - 1 < firstLine || line + 1 >= lastLine) {
+            g_tandemProbe.count(TandemVerdict::NoPartner); continue;
+        }
+        // The schedule runs [+ - - +] down the frame: every line has exactly
+        // ONE complement neighbour among the adjacent frame lines, alternating
+        // above/below. The grammar names it; nothing is presumed.
+        const int clsC = carrierSignedSampleClass(line,     left + x0);
+        const int clsU = carrierSignedSampleClass(line - 1, left + x0);
+        const int clsD = carrierSignedSampleClass(line + 1, left + x0);
+        const int want = (clsC + 2) & 3;
+        int partner = 0;
+        if (clsU == want) partner = line - 1;
+        else if (clsD == want) partner = line + 1;
+        else { g_tandemProbe.count(TandemVerdict::NoPartner); continue; }
+        const quint16 *rawP = rawbuffer.data() + size_t(partner) * fullWidth;
+        double ybar[16];
+        for (int x = x0; x <= x1; ++x)
+            ybar[x - x0] = 0.5 * ((double)rawLine[left + x]
+                                + (double)rawP[left + x]);
+
+        // Pinned-plateau ramp against ybar, one DC nuisance (vertical
+        // shading moves the platform, never the edge). Closed form.
+        auto fitYbar = [&](double e, double w) {
+            double se = 0.0;
+            for (int i = 0; i < n; ++i)
+                se += ybar[i] - rampAt((double)(x0 + i), e, w);
+            const double c0 = se / n;
+            double err = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const double r = ybar[i] - rampAt((double)(x0 + i), e, w) - c0;
+                err += r * r;
+            }
+            return err;
+        };
+        // Flat null: no edge in ybar at all (cancellation failed or the
+        // trigger was false) -- the ramp must beat it to confirm.
+        double yMean = 0.0;
+        for (int i = 0; i < n; ++i) yMean += ybar[i];
+        yMean /= n;
+        double errFlat = 0.0;
+        for (int i = 0; i < n; ++i)
+            errFlat += (ybar[i] - yMean) * (ybar[i] - yMean);
+
+        static constexpr double kWidthsV[6] = {1.2, 1.6, 2.0, 2.4, 3.0, 3.8};
+        double bestErrV = 1e300, bestEV = bestE, bestWV = 0.0;
+        for (double e = bestE - 1.25; e <= bestE + 1.25 + 1e-9; e += 0.25) {
+            for (double w : kWidthsV) {
+                const double err = fitYbar(e, w);
+                if (err < bestErrV) { bestErrV = err; bestEV = e; bestWV = w; }
+            }
+        }
+        if (bestWV == 0.0 || errFlat < 1e-12
+                || bestErrV > kAccept * errFlat
+                || std::fabs(bestEV - bestE) > 1.0) {
+            g_tandemProbe.count(TandemVerdict::VContra); continue;
+        }
+        g_tandemProbe.accept(bestE - run.edge, bestWV, bestRatio, line & 1,
+                             bestEV - bestE);
+
+        // Emit the bandpass's own forward-model leak for the CONFIRMED
+        // profile: -0.25 * D2_2{ramp_{eV,wV}}.
+        const int y0 = std::max(0, (int)std::floor(bestEV) - 4);
+        const int y1 = std::min(width - 1, (int)std::ceil(bestEV) + 4);
         for (int x = y0; x <= y1; ++x) {
-            const double d2 = rampAt((double)(x - 2), bestE, bestW)
-                            - 2.0 * rampAt((double)x, bestE, bestW)
-                            + rampAt((double)(x + 2), bestE, bestW);
+            const double d2 = rampAt((double)(x - 2), bestEV, bestWV)
+                            - 2.0 * rampAt((double)x, bestEV, bestWV)
+                            + rampAt((double)(x + 2), bestEV, bestWV);
             leak[x] += -0.25 * d2 * run.gate;
         }
         any = true;
