@@ -1153,42 +1153,79 @@ void Comb::FrameBuffer::buildCornerLeak()
         }
     }
 
-    // Disposable metrics (env-gated): beading, saturation and luma-edge
-    // sharpness under the correction, without changing any output.
+    // ---- Disposable metrics (env-gated), without changing any output. -------
+    //
+    // The old scalar was a stride-1 second difference of bp. For a pure fSC
+    // carrier |D2_1{C}| = 2|C| and |D2_2{C}| = 4|C|: BOTH are proportional to
+    // carrier amplitude pointwise, so a second-difference scalar cannot tell a
+    // beading reduction from a desaturation. Retired. The correction's effect
+    // decomposes EXACTLY into two disjoint channels:
+    //     Y  += leak                       (luma gains the withdrawn energy)
+    //     rendered chroma envelope += -P{demod(leak)}
+    // so the honest instruments are (a) the fSC-rate content the leak injects
+    // into luma -- zero for any pure legal carrier, hence non-tautological and
+    // PRIMARY -- and (b) what the withdrawal does to the rendered envelope,
+    // split into magnitude (legal-carrier retention, a cost) versus hue
+    // rotation (a cross-colour signature, a defect). Conservation is demoted to
+    // an assertion: Y + chroma == raw holds for ANY leak by construction, so it
+    // measures arithmetic, not the model.
     static const int clDump = []{
         const char *s = std::getenv("LDCD_DUMP_CORNER"); return s ? std::atoi(s) : 0;
     }();
     if (clDump) {
-        double sat0 = 0.0, sat1 = 0.0, bead0 = 0.0, bead1 = 0.0, maxLeak = 0.0;
-        long   nSat = 0, nB = 0;
+        std::vector<double> lI(width), lQ(width), lIs(width), lQs(width);
+        std::vector<double> c0I(width), c0Q(width), c0Is(width), c0Qs(width);
+        std::vector<double> c1I(width), c1Q(width), c1Is(width), c1Qs(width);
+        double yAltAll = 0.0, yAltHot = 0.0, maxLeak = 0.0;
+        double satNum = 0.0, satDen = 0.0, hueW = 0.0, hueAcc = 0.0;
+        long nAll = 0, nHot = 0;
         for (int line = first; line < last; ++line) {
             const double *bpLine = locked1DRawBandpass_line(line);
             const double *leakRow = lockedCornerLeak_line(line);
             if (!bpLine || !leakRow) continue;
-            for (int x = 6; x < width - 6; ++x) {
+            for (int x = 0; x < width; ++x) {
                 const int ph = carrierSampleClass(line, left + x);
-                const double e0 = std::fabs(2.0 * bpLine[x]);
-                const double e1 = std::fabs(2.0 * (bpLine[x] - leakRow[x]));
-                (void)ph;
+                const double s = sin4fsc(ph), c = cos4fsc(ph);
+                lI[x]  = 2.0 * leakRow[x] * s;         lQ[x]  = 2.0 * leakRow[x] * c;
+                c0I[x] = 2.0 * bpLine[x] * s;          c0Q[x] = 2.0 * bpLine[x] * c;
+                const double cc = bpLine[x] - leakRow[x];
+                c1I[x] = 2.0 * cc * s;                 c1Q[x] = 2.0 * cc * c;
+            }
+            // Lowpass each demodulated stream to the lawful envelope band; this
+            // strips the 2fSC demod image so the fSC-rate part is what remains.
+            lddecode::projectExpressibleChromaEnvelope(lI.data(),  nullptr, width, lIs.data());
+            lddecode::projectExpressibleChromaEnvelope(lQ.data(),  nullptr, width, lQs.data());
+            lddecode::projectExpressibleChromaEnvelope(c0I.data(), nullptr, width, c0Is.data());
+            lddecode::projectExpressibleChromaEnvelope(c0Q.data(), nullptr, width, c0Qs.data());
+            lddecode::projectExpressibleChromaEnvelope(c1I.data(), nullptr, width, c1Is.data());
+            lddecode::projectExpressibleChromaEnvelope(c1Q.data(), nullptr, width, c1Qs.data());
+            for (int x = 6; x < width - 6; ++x) {
                 maxLeak = std::max(maxLeak, std::fabs(leakRow[x]) * invIreScale);
-                if (e0 * invIreScale > 12.0) {
-                    sat0 += e0 * invIreScale; sat1 += e1 * invIreScale; ++nSat;
+                // (a) fSC-rate envelope of the injected luma change = alternation.
+                const double yAlt = std::hypot(lIs[x], lQs[x]) * invIreScale;
+                yAltAll += yAlt; ++nAll;
+                const double a0 = std::hypot(c0Is[x], c0Qs[x]);
+                const double a1 = std::hypot(c1Is[x], c1Qs[x]);
+                if (a0 * invIreScale > 6.0) {          // real carrier present
+                    yAltHot += yAlt; ++nHot;
+                    satNum += a1 * invIreScale; satDen += a0 * invIreScale;
+                    // (b) hue rotation, amplitude-weighted, corrected vs raw.
+                    double dth = std::atan2(c1Qs[x], c1Is[x])
+                               - std::atan2(c0Qs[x], c0Is[x]);
+                    while (dth >  M_PI) dth -= 2.0 * M_PI;
+                    while (dth < -M_PI) dth += 2.0 * M_PI;
+                    hueAcc += a0 * std::fabs(dth); hueW += a0;
                 }
-                const double d0 = bpLine[x - 1] - 2.0 * bpLine[x] + bpLine[x + 1];
-                const double d1 = (bpLine[x - 1] - leakRow[x - 1])
-                                - 2.0 * (bpLine[x] - leakRow[x])
-                                + (bpLine[x + 1] - leakRow[x + 1]);
-                bead0 += std::fabs(d0) * invIreScale;
-                bead1 += std::fabs(d1) * invIreScale; ++nB;
             }
         }
-        if (nSat > 0 && nB > 0)
+        if (nAll > 0)
             std::fprintf(stderr,
-                "[CORNER] sat %.2f -> %.2f (%+.1f%%)  bead %.3f -> %.3f (%+.1f%%)"
-                "  maxLeak %.1f IRE  nSat=%ld\n",
-                sat0 / nSat, sat1 / nSat, 100.0 * (sat1 - sat0) / std::max(sat0, 1e-9),
-                bead0 / nB, bead1 / nB, 100.0 * (bead1 - bead0) / std::max(bead0, 1e-9),
-                maxLeak, nSat);
+                "[CORNER] Yalt %.3f IRE (hot %.3f)  satRet %+.1f%%  hueRot %.1f deg"
+                "  maxLeak %.1f IRE  nHot=%ld\n",
+                yAltAll / nAll, nHot ? yAltHot / nHot : 0.0,
+                100.0 * (satNum - satDen) / std::max(satDen, 1e-9),
+                nHot ? (hueAcc / std::max(hueW, 1e-9)) * 180.0 / M_PI : 0.0,
+                maxLeak, nHot);
     }
 }
 
