@@ -1538,10 +1538,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
         }
 
-        // Pair disentangle: withdraw the measured class-common carrier-band
-        // error at luma steps (self-gated; inert unless LDCD_EDGE_DISENT).
-        // bpLine[rel] is the carrier at sample left+rel, i.e. carrierAtLeft.
-        applyEdgePairDisentangle(line, bpLine);
+        // Pair class-map probe (measurement only; inert unless
+        // LDCD_PROBE_DISENT). The 1D output is never touched from other
+        // lines -- 1D is downstream's safe retreat.
+        probeEdgePairClassMap(line);
 
         // Pass 1.5: coarse-residual feasibility repair for locked 1D.
         //
@@ -4775,53 +4775,31 @@ DisentProbe g_disentProbe;
 
 } // namespace
 
-// Pair disentangle: withdraw the MEASURED class-common carrier-band error at
-// luma steps. (P12; supersedes the P9-P11 edge-model correctors.)
+// Pair class-map probe at luma steps. MEASUREMENT ONLY -- writes nothing.
 //
-// We are out of the business of solving the edge. P9-P11 fitted an edge
-// model (position, width) and emitted its predicted leak; every failure
-// traced to the model substituting for a reality it could not know -- blur
-// where the disc was sharper, per-line verdict stipple, field-asymmetric
-// misattribution. Solving the edge is downstream's job (comb, Y-building,
-// with vertical information the 1D does not have). This stage only needs to
-// hand off something MANAGEABLE: disentangle, at least partially, so the
-// error's luma impact is reduced and what remains is a tame, understood
-// shape.
+// LAW (1D safe retreat, 2026-07-26): the 1D stage may contain no comb,
+// blend, or influence from other lines. Downstream 2D is programmed to
+// fall back to 1D precisely when its vertical machinery produces errors;
+// 1D is the safe retreat, and the fallback hierarchy only works if 1D is
+// structurally incapable of vertical error. Adjacent-line data may CONFIRM
+// (phase relations, luma contrasts) as verdict inputs; rejection comes
+// from the line's own model; no cross-line sample may contribute signal.
 //
-// The disentanglement needs no edge model -- only the error's class
-// structure, which is foreknowledge:
-//     bp_n = C_n + L_n,     bp_p = -C_n + L_p     (complement partner p)
-// The leak L (the bandpass's luma read, -0.25*D2_2 Y) is CLASS-INVARIANT in
-// composite; the carrier is CLASS-ALTERNATING. Fields are co-temporal on
-// telecine material, so line and complement see the same scene. The pair
-// mean
+// P12 briefly subtracted the pair common mode
 //     cm = 0.5*(B{raw_n} + B{raw_p}) = Lbar + 0.5*dC
-// therefore MEASURES the common leak -- at the disc's own sharpness,
-// whatever that is; nothing is positioned, widthed, or synthesized, so a
-// sharper-than-imagined edge cannot be blurred by a model that guessed
-// wrong. Subtracting cm from the emitted carrier returns the true leak to Y
-// (Y = raw - carrier) and leaves the class-DIFFERENTIAL half 0.5*(dL - dC)
-// in chroma -- precisely the shape the downstream interfield machinery is
-// built to eat. Both lines of a complement pair receive the SAME cm, so the
-// correction cannot stipple within a pair.
-//
-// Confinement: lurch-triggered footprints only (everywhere else the 1D
-// remains a fully distinct candidate), tapered at the footprint ends so no
-// step is manufactured in the carrier, scaled by lurch's own gate. No fits,
-// no verdicts: the measurement is the correction. No partner in range =>
-// plain 1D, per the fallback doctrine.
-//
-// Signal frame: carrierAtLeft is the B{raw}-frame scalar carrier with
-// physical line polarity at BOTH call sites (bucket dst and locked Pass-1
-// bpLine); cm is built from rawbuffer through the same operator. Same
-// frame, per the buffer-flow contract.
-void Comb::FrameBuffer::applyEdgePairDisentangle(int line, double *carrierAtLeft)
+// from the emitted carrier at lurch footprints. That is a 2-tap interfield
+// comb inside 1D -- a violation of the law above -- and it injected 0.5*dC
+// at vertical colour boundaries. WITHDRAWN. What the measurement itself
+// established is kept (and this probe reproduces it on demand): the leak
+// is CLASS-INVARIANT in composite -- |cm| and its I/Q split are uniform
+// across all four parity x flip cells -- so the field asymmetry seen in
+// renders was manufactured by per-line verdict actuators, never present in
+// the error. The complement-pair tiling ([+ - - +]; even lines pair down,
+// odd pair up, swapping per frame) is confirmed against the grammar here,
+// not presumed.
+void Comb::FrameBuffer::probeEdgePairClassMap(int line)
 {
-    static const bool enabled = []{
-        const char *s = std::getenv("LDCD_EDGE_DISENT");
-        return s && std::atoi(s) != 0;
-    }();
-    if (!enabled || !carrierAtLeft) return;
+    if (!DisentProbe::on()) return;
 
     const double *apMean = lockedApertureMean_line(line);
     if (!apMean) return;
@@ -4853,7 +4831,7 @@ void Comb::FrameBuffer::applyEdgePairDisentangle(int line, double *carrierAtLeft
         partner = line + 1;
     if (partner < 0) {
         g_disentProbe.noPartner(gated);
-        return;                                   // plain 1D
+        return;
     }
 
     const auto sstep = [](double t) {
@@ -4861,8 +4839,8 @@ void Comb::FrameBuffer::applyEdgePairDisentangle(int line, double *carrierAtLeft
         return t * t * (3.0 - 2.0 * t);
     };
 
-    // Footprint weights: max-combine overlapping runs (cm is one measurement
-    // per line, so overlap must not subtract it twice).
+    // Footprint weights: max-combine overlapping runs so each sample is
+    // counted once in the class-map stats regardless of run overlap.
     std::vector<double> wAcc(width, 0.0);
     bool any = false;
     for (const LurchStepRun &run : runs) {
@@ -4893,14 +4871,11 @@ void Comb::FrameBuffer::applyEdgePairDisentangle(int line, double *carrierAtLeft
     for (int x = 0; x < width; ++x) {
         if (wAcc[x] <= 0.0) continue;
         const double cm = 0.5 * (bpAt(rawLine, x) + bpAt(rawP, x));
-        carrierAtLeft[x] -= wAcc[x] * cm;
-        if (DisentProbe::on()) {
-            const int ph = carrierSampleClass(line, left + x);
-            g_disentProbe.sample(parity, flipNeg,
-                std::fabs(cm) * invIreScale,
-                std::fabs(2.0 * cm * sin4fsc(ph)) * invIreScale,
-                std::fabs(2.0 * cm * cos4fsc(ph)) * invIreScale);
-        }
+        const int ph = carrierSampleClass(line, left + x);
+        g_disentProbe.sample(parity, flipNeg,
+            std::fabs(cm) * invIreScale,
+            std::fabs(2.0 * cm * sin4fsc(ph)) * invIreScale,
+            std::fabs(2.0 * cm * cos4fsc(ph)) * invIreScale);
     }
 }
 

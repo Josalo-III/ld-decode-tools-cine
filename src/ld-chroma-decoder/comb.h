@@ -375,13 +375,12 @@ public:
 	                          std::vector<double> &vI, std::vector<double> &vQ,
 	                          std::vector<double> &sI, std::vector<double> &sQ,
 	                          double *ratioOut) const;
-	// Pair disentangle at luma steps: withdraw the MEASURED class-common
-	// carrier-band error (the pair mean of the raw bandpass with the line's
-	// complement partner) at lurch-triggered footprints. No edge model, no
-	// fits -- the measurement is the correction; solving the edge is
-	// downstream's job. Rotation-free; acts in place on the emitted 1D
-	// carrier (both paths). Supersedes the P9-P11 doublet correctors.
-	void applyEdgePairDisentangle(int line, double *carrierAtLeft);
+	// Pair class-map probe at luma steps (LDCD_PROBE_DISENT). MEASUREMENT
+	// ONLY -- writes nothing. LAW: the 1D stage may contain no comb, blend,
+	// or cross-line signal; 1D is downstream's safe retreat. Adjacent lines
+	// may CONFIRM (phase, luma contrast); the P12 subtraction that briefly
+	// consumed this measurement was withdrawn for violating that law.
+	void probeEdgePairClassMap(int line);
 
 	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
 	// demodulated aperture views can bound the chroma at a luma step. Reads

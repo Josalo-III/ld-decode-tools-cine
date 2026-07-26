@@ -923,11 +923,11 @@ void Comb::FrameBuffer::split1D()
         if (applyBucketHull)
             applyCarrierFeasibilityHull(line, dst + left);
 
-        // Pair disentangle on the bucket carrier (self-gated; inert unless
-        // LDCD_EDGE_DISENT). Only the bucket path applies it here; the locked
-        // path applies it on its own bandpass in buildPhaseCorrected1D.
+        // Pair class-map probe (measurement only; inert unless
+        // LDCD_PROBE_DISENT). The 1D output is never touched from other
+        // lines -- 1D is downstream's safe retreat.
         if (!configuration.phaseCompensation)
-            applyEdgePairDisentangle(line, dst + left);
+            probeEdgePairClassMap(line);
     }
 }
 
