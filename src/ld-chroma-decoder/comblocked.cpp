@@ -1145,12 +1145,15 @@ void Comb::FrameBuffer::buildCornerLeak()
 
         // Total withdrawal: envelope over-estimate MINUS the luma leak.
         //   chroma = bp - leakRow,  Y = raw - chroma.
-        for (int x = 0; x < width; ++x) {
-            const int a = std::max(0, x - 1), b = std::min(width - 1, x + 1);
-            const double lumaTerm =
-                -0.25 * (0.25 * kappa[a] + 0.5 * kappa[x] + 0.25 * kappa[b]);
-            leakRow[x] = lumaTerm + envExcess[x];
-        }
+        // kappa already estimates the stride-2 second difference D2Y, and the
+        // luma leak the bandpass added is exactly -0.25*D2Y, so the luma term
+        // is -0.25*kappa[x] with no further smoothing. An earlier stride-1
+        // [0.25,0.5,0.25] smoother on kappa here was a SECOND regulariser on
+        // the fSC neighbourhood (its response is exactly 0.5 at fSC), redundant
+        // with the Van Cittert recovery profile that already owns that band;
+        // it silently halved every fSC-rate leak the solve had recovered.
+        for (int x = 0; x < width; ++x)
+            leakRow[x] = -0.25 * kappa[x] + envExcess[x];
     }
 
     // ---- Disposable metrics (env-gated), without changing any output. -------
