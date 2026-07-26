@@ -901,7 +901,7 @@ void Comb::FrameBuffer::buildCornerLeak()
         return std::clamp((v - a) / (b - a), 0.0, 1.0);
     };
 
-    std::vector<double> notch(width), notchAdj(width), chromaEst(width),
+    std::vector<double> notch(width), notchAdj(width),
                         mObs(width), kappa(width), sKappa(width);
     std::vector<double> ratio(width), gate(width), gateSmooth(width);
     std::vector<double> envI(width), envQ(width), sEnvI(width), sEnvQ(width),
@@ -1054,45 +1054,75 @@ void Comb::FrameBuffer::buildCornerLeak()
             gateSmooth[x] = (wsum > 0.0) ? acc / wsum : gate[x];
         }
 
-        // Contamination runs BOTH ways, and correcting only one is what made
-        // thin straps worse:
-        //     bp    = chroma + leak      (luma  -> carrier band)  <- corrected
-        //     notch = Y      - leak + N{chroma}  (chroma -> notch) <- was NOT
-        // N = I - B has response cos^2(w), which is zero only AT fSC; a compact
-        // colour feature has a fast envelope with content away from band centre,
-        // so N{chroma} is significant there, D2{notch} picks up chroma-derived
-        // curvature, and the recovered leak is wrong. A wrong leak shows up as
-        // carrier-rate ALTERNATION IN LUMA, because Y = notch + leak and the
-        // identity notch = Y - leak means a CORRECT leak reconstructs the sharp
-        // luma exactly, with no alternation. Alternation in Y is therefore
-        // direct proof of mis-estimation, and is the metric to watch.
+        // ---- One lawful estimate of the carrier-envelope curvature D2A. -----
         //
-        // So estimate the chroma, remove its notch-band image from the notch,
-        // and re-solve. Two outer rounds suffice (the second correction is an
-        // order smaller). The gate is now known BEFORE this loop, so the
-        // contamination correction reasons about the chroma that ACTUALLY
-        // ships -- bp + 0.25*gate*kappa, the gated leak that gets returned to
-        // luma -- rather than the ungated solve it used to subtract. (The
-        // envExcess term is not yet folded into chromaEst; that coupling is the
-        // Phase-2 single-estimator recurrence.)
+        // The bandpass assumes a constant carrier ENVELOPE as well as a constant
+        // luma foundation. With c[x+-2] = -A[x+-2]*basis,
+        //   B{C}[x] = basis*(0.5*A[x] + 0.25*A[x-2] + 0.25*A[x+2])
+        //           = C[x] + 0.25*basis*D2{A}[x]
+        // so the full error the bandpass carries is TWO curvature terms:
+        //   bp = C + 0.25*basis*D2A - 0.25*D2Y
+        //
+        // D2A appears in BOTH corrections this loop performs, and they MUST be
+        // one estimate or their difference lands in Y:
+        //   * the envelope over-estimate withdrawn from the leak (+envExcess);
+        //   * the chroma's own image in the notch band. N = I - B has response
+        //     cos^2(w) (zero only AT fSC), and N{C} = -0.25*basis*D2A, so a
+        //     compact colour feature -- fast envelope, content away from band
+        //     centre -- injects curvature into D2{notch} that the luma solve
+        //     would otherwise read as false leak. Removing it is notch +=
+        //     0.25*basis*D2A = notch + envExcess.
+        // Previously these were TWO different D2A estimates: the notch used a
+        // BROADBAND N{chromaEst} off the raw (luma- and noise-contaminated)
+        // chroma estimate, the leak used a lawfully projected one off bp. They
+        // disagreed, and the disagreement was carrier-rate alternation in Y.
+        //
+        // The single estimate: demodulate the current carrier estimate, project
+        // onto the encoder's own chroma-envelope band (the sanctioned P, applied
+        // EXACTLY ONCE to a quantity that is never a prior P output, so it
+        // cannot compound), stride-2 second difference, remodulate.
+        //   envExcess[x] = 0.25 * basis * D2A[x]   (composite domain)
+        //
+        // Recurrence: the carrier estimate is bp cleaned of the LUMA leak
+        // (bp + 0.25*gate*kappa) -- NOT of the envelope term itself, since
+        // feeding the projected envelope back into its own input is exactly
+        // what would compound the FIR. Round 0 has kappa = 0, so the first
+        // Ahat = P{demod bp}; later rounds sharpen it with the luma solve.
+        // Because envExcess no longer needs kappa, the notch correction now
+        // runs from round 0 -- the envelope contamination was always present,
+        // the old chicken-and-egg (chromaEst needs kappa) was the only reason
+        // it waited. A wrong leak shows up as carrier-rate ALTERNATION in Y
+        // (Y = notch + leak; a correct leak reconstructs the sharp luma with
+        // none), so that alternation is the metric to watch.
         std::fill(kappa.begin(), kappa.end(), 0.0);
+        std::fill(envExcess.begin(), envExcess.end(), 0.0);
         for (int outer = 0; outer < kCornerOuterRounds; ++outer) {
-            // notch corrected for the chroma that leaks INTO it.
-            for (int x = 0; x < width; ++x) notchAdj[x] = notch[x];
-            if (outer > 0) {
-                // chroma = bp - leak, with the current GATED leak estimate.
-                for (int x = 0; x < width; ++x)
-                    chromaEst[x] = bpLine[x] + 0.25 * gateSmooth[x] * kappa[x];
-                // N{chroma} = chroma - B{chroma}: the part of the chroma that
-                // survives into the notch band and masquerades as luma.
-                for (int x = 0; x < width; ++x) {
-                    const int m2 = std::clamp(x - 2, 0, width - 1);
-                    const int p2 = std::clamp(x + 2, 0, width - 1);
-                    const double b = 0.50 * chromaEst[x]
-                                   - 0.25 * (chromaEst[m2] + chromaEst[p2]);
-                    notchAdj[x] -= (chromaEst[x] - b);
-                }
+            // Carrier estimate: bp with the current (gated) luma leak removed.
+            for (int x = 0; x < width; ++x) {
+                const int ph = carrierSampleClass(line, left + x);
+                const double cEst = bpLine[x] + 0.25 * gateSmooth[x] * kappa[x];
+                envI[x] = 2.0 * cEst * sin4fsc(ph);
+                envQ[x] = 2.0 * cEst * cos4fsc(ph);
             }
+            // Lawful envelope: the sanctioned projection, applied once.
+            lddecode::projectExpressibleChromaEnvelope(envI.data(), nullptr,
+                                                       width, sEnvI.data());
+            lddecode::projectExpressibleChromaEnvelope(envQ.data(), nullptr,
+                                                       width, sEnvQ.data());
+            // The single D2A term, in composite: envExcess = 0.25*basis*D2A.
+            for (int x = 0; x < width; ++x) {
+                const int m2 = std::clamp(x - 2, 0, width - 1);
+                const int p2 = std::clamp(x + 2, 0, width - 1);
+                const int ph = carrierSampleClass(line, left + x);
+                const double d2I = sEnvI[m2] - 2.0 * sEnvI[x] + sEnvI[p2];
+                const double d2Q = sEnvQ[m2] - 2.0 * sEnvQ[x] + sEnvQ[p2];
+                // 0.5*(...) undoes the 2x demod gain.
+                envExcess[x] = 0.25 * 0.5 * (d2I * sin4fsc(ph) + d2Q * cos4fsc(ph));
+            }
+            // Notch corrected for the chroma that leaks INTO it, using the SAME
+            // envExcess: N{chroma} = -envExcess in composite, so notch += it.
+            for (int x = 0; x < width; ++x)
+                notchAdj[x] = notch[x] + envExcess[x];
             std::fill(mObs.begin(), mObs.end(), 0.0);
             for (int x = 2; x < width - 2; ++x)
                 mObs[x] = notchAdj[x - 2] - 2.0 * notchAdj[x] + notchAdj[x + 2];
@@ -1109,55 +1139,6 @@ void Comb::FrameBuffer::buildCornerLeak()
         }
         for (int x = 0; x < width; ++x)
             kappa[x] *= gateSmooth[x];
-        // ---- The SECOND curvature term: the carrier's own envelope. --------
-        //
-        // The bandpass cancels a constant luma foundation exactly, but it also
-        // assumes a CONSTANT CARRIER ENVELOPE. With c[x+-2] = -A[x+-2]*basis,
-        //
-        //   B{C}[x] = basis*(0.5*A[x] + 0.25*A[x-2] + 0.25*A[x+2])
-        //           = C[x] + 0.25*basis*D2{A}[x]
-        //
-        // so where the envelope BENDS the bandpass OVER-estimates the carrier.
-        // The full error is therefore TWO curvature terms:
-        //
-        //   bp = C  +  0.25*D2{A}*basis  -  0.25*D2{Y}
-        //
-        // Only the second was corrected before. At a thin strap the turquoise
-        // envelope switches on and off within a few samples, so D2{A} is large:
-        // the carrier is UNDER-COMBED, and Y = raw - chroma inherits the
-        // complement as a carrier-rate alternation. That is the garish strap.
-        // It is uncancelled CARRIER -- the schedule already tells us this energy
-        // is legal chroma -- not an unknowable mode to abstain from.
-        //
-        // A is recovered by demodulating bp on the grammar's own phase and
-        // taking the envelope-scale components, so this converts alternation
-        // into colour rather than discarding it.
-        for (int x = 0; x < width; ++x) {
-            const int ph = carrierSampleClass(line, left + x);
-            envI[x] = 2.0 * bpLine[x] * sin4fsc(ph);
-            envQ[x] = 2.0 * bpLine[x] * cos4fsc(ph);
-        }
-        for (int x = 0; x < width; ++x) {
-            double ai = 0.0, aq = 0.0, wsum = 0.0;
-            for (int t = 0; t < lddecode::kChromaEnvelopeTaps; ++t) {
-                const int o = x + t - lddecode::kChromaEnvelopeTaps / 2;
-                if (o < 0 || o >= width) continue;
-                const double w = lddecode::kChromaEnvelopeFilter[t];
-                ai += w * envI[o]; aq += w * envQ[o]; wsum += w;
-            }
-            if (wsum > 0.0) { sEnvI[x] = ai / wsum; sEnvQ[x] = aq / wsum; }
-            else            { sEnvI[x] = envI[x];   sEnvQ[x] = envQ[x];   }
-        }
-        for (int x = 0; x < width; ++x) {
-            const int m2 = std::clamp(x - 2, 0, width - 1);
-            const int p2 = std::clamp(x + 2, 0, width - 1);
-            const int ph = carrierSampleClass(line, left + x);
-            const double d2I = sEnvI[m2] - 2.0 * sEnvI[x] + sEnvI[p2];
-            const double d2Q = sEnvQ[m2] - 2.0 * sEnvQ[x] + sEnvQ[p2];
-            // 0.5 * (...) undoes the 2x demod gain; the excess is what the
-            // bandpass added to the carrier it should not have.
-            envExcess[x] = 0.25 * 0.5 * (d2I * sin4fsc(ph) + d2Q * cos4fsc(ph));
-        }
 
         // Total withdrawal: envelope over-estimate MINUS the luma leak.
         //   chroma = bp - leakRow,  Y = raw - chroma.
