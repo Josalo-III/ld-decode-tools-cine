@@ -4720,6 +4720,15 @@ struct DisentProbe {
     double cAbs[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
     double cI[2][2]   = {{0.0, 0.0}, {0.0, 0.0}};
     double cQ[2][2]   = {{0.0, 0.0}, {0.0, 0.0}};
+    // Scale law: per-run (step height h, footprint peak |cm|) regression.
+    long   nScale = 0;
+    double sH = 0.0, sP = 0.0, sHP = 0.0, sHH = 0.0;
+    long peakHist[5] = {0, 0, 0, 0, 0};   // <1, 1-2, 2-4, 4-8, >=8 IRE
+    // Shape conformance: per-run corr r of measured cm against the
+    // anticipated doublet, and amplitude ratio beta where the shape holds.
+    long rHist[5] = {0, 0, 0, 0, 0};      // <0, 0-.3, .3-.6, .6-.8, >=.8
+    long   nBeta = 0;
+    double sBeta = 0.0;
 
     static bool on()
     {
@@ -4757,6 +4766,21 @@ struct DisentProbe {
         cQ[parity & 1][flipNeg & 1]   += qIRE;
     }
 
+    void runProfile(double hIRE, double peakIRE, double r, double beta,
+                    bool shapeValid)
+    {
+        if (!on()) return;
+        std::lock_guard<std::mutex> lk(mu);
+        ++nScale;
+        sH += hIRE; sP += peakIRE; sHP += hIRE * peakIRE; sHH += hIRE * hIRE;
+        peakHist[peakIRE < 1.0 ? 0 : peakIRE < 2.0 ? 1
+               : peakIRE < 4.0 ? 2 : peakIRE < 8.0 ? 3 : 4]++;
+        if (shapeValid) {
+            rHist[r < 0.0 ? 0 : r < 0.3 ? 1 : r < 0.6 ? 2 : r < 0.8 ? 3 : 4]++;
+            if (r >= 0.6) { ++nBeta; sBeta += beta; }
+        }
+    }
+
     ~DisentProbe()
     {
         if (!on() || nRuns <= 0) return;
@@ -4775,10 +4799,97 @@ struct DisentProbe {
                     p, f ? '-' : '+', cn[p][f],
                     cAbs[p][f] * inv, cI[p][f] * inv, cQ[p][f] * inv);
             }
+        if (nScale > 1) {
+            const double det = nScale * sHH - sH * sH;
+            const double slope = (det > 1e-9)
+                ? (nScale * sHP - sH * sP) / det : 0.0;
+            const double icept = (sP - slope * sH) / nScale;
+            std::fprintf(stderr,
+                "[DISENT] scale: n=%ld  peak|cm| = %.3f*h %+.2f IRE  "
+                "(h mean %.1f, peak mean %.2f)\n",
+                nScale, slope, icept, sH / nScale, sP / nScale);
+            std::fprintf(stderr,
+                "[DISENT] peak|cm| IRE: <1:%.1f%% 1-2:%.1f%% 2-4:%.1f%% "
+                "4-8:%.1f%% >=8:%.1f%%\n",
+                100.0 * peakHist[0] / nScale, 100.0 * peakHist[1] / nScale,
+                100.0 * peakHist[2] / nScale, 100.0 * peakHist[3] / nScale,
+                100.0 * peakHist[4] / nScale);
+            long nR = 0;
+            for (int i = 0; i < 5; ++i) nR += rHist[i];
+            if (nR > 0)
+                std::fprintf(stderr,
+                    "[DISENT] shape r: <0:%.1f%% 0-.3:%.1f%% .3-.6:%.1f%% "
+                    ".6-.8:%.1f%% >=.8:%.1f%%   beta(r>=.6) %.2f (n=%ld)\n",
+                    100.0 * rHist[0] / nR, 100.0 * rHist[1] / nR,
+                    100.0 * rHist[2] / nR, 100.0 * rHist[3] / nR,
+                    100.0 * rHist[4] / nR,
+                    nBeta ? sBeta / nBeta : 0.0, nBeta);
+        }
     }
 };
 
 DisentProbe g_disentProbe;
+
+// Downstream-fate stats (LDCD_PROBE_EDGEFATE=1). Measurement only. Every
+// render judged so far was ntsc1d -- pure 1D, no comb ever touched the edge
+// bands. This probe asks what the REAL pipeline does at lurch footprints:
+// how far 2D moves the carrier off its 1D source there (vs a control of all
+// other pixels), how often it effectively passes 1D through (the fallback),
+// and what 3D adds. The answer decides WHERE edge evidence should be
+// delivered: into the fallback conditioning, into the comb's own gates, or
+// into the election.
+struct EdgeFateProbe {
+    std::mutex mu;
+    // [isEdgeFootprint]: pixels, |clp1-clp0| and |clp2-clp1| sums (IRE),
+    // and counts of |clp1-clp0| under the pass-through thresholds.
+    long   n[2]     = {0, 0};
+    double d21[2]   = {0.0, 0.0};
+    double d32[2]   = {0.0, 0.0};
+    long   nEx[2]   = {0, 0};      // < 0.1 IRE: effectively 1D
+    long   nNear[2] = {0, 0};      // < 0.5 IRE
+    bool   have3D   = false;
+
+    static bool on()
+    {
+        static const bool v = []{
+            const char *s = std::getenv("LDCD_PROBE_EDGEFATE");
+            return s && std::atoi(s) != 0;
+        }();
+        return v;
+    }
+
+    void merge(const long *ln, const double *ld21, const double *ld32,
+               const long *lex, const long *lnear, bool dims3)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        for (int e = 0; e < 2; ++e) {
+            n[e] += ln[e]; d21[e] += ld21[e]; d32[e] += ld32[e];
+            nEx[e] += lex[e]; nNear[e] += lnear[e];
+        }
+        have3D = have3D || dims3;
+    }
+
+    ~EdgeFateProbe()
+    {
+        if (!on() || (n[0] + n[1]) <= 0) return;
+        static const char *kName[2] = {"control", "edge   "};
+        std::fprintf(stderr, "\n");
+        for (int e = 1; e >= 0; --e) {
+            if (n[e] <= 0) continue;
+            const double inv = 1.0 / (double)n[e];
+            std::fprintf(stderr,
+                "[EDGEFATE] %s n=%ld  |2D-1D| %.3f IRE  1D-passthru "
+                "<0.1:%.1f%% <0.5:%.1f%%%s%.3f IRE\n",
+                kName[e], n[e], d21[e] * inv,
+                100.0 * (double)nEx[e] * inv,
+                100.0 * (double)nNear[e] * inv,
+                have3D ? "  |3D-2D| " : "  (no 3D) ",
+                have3D ? d32[e] * inv : 0.0);
+        }
+    }
+};
+
+EdgeFateProbe g_edgeFate;
 
 } // namespace
 
@@ -4846,6 +4957,15 @@ void Comb::FrameBuffer::probeEdgePairClassMap(int line)
         return t * t * (3.0 - 2.0 * t);
     };
 
+    const quint16 *rawLine = rawbuffer.data() + size_t(line)    * fullWidth;
+    const quint16 *rawP    = rawbuffer.data() + size_t(partner) * fullWidth;
+    auto bpAt = [&](const quint16 *rl, int x) {
+        const int m2 = std::clamp(x - 2, 0, width - 1);
+        const int p2 = std::clamp(x + 2, 0, width - 1);
+        return 0.50 * (double)rl[left + x]
+             - 0.25 * ((double)rl[left + m2] + (double)rl[left + p2]);
+    };
+
     // Footprint weights: max-combine overlapping runs so each sample is
     // counted once in the class-map stats regardless of run overlap.
     std::vector<double> wAcc(width, 0.0);
@@ -4861,17 +4981,38 @@ void Comb::FrameBuffer::probeEdgePairClassMap(int line)
             const double w = run.gate * sstep(tIn);
             if (w > wAcc[x]) { wAcc[x] = w; any = true; }
         }
+
+        // Per-run error profile against the ANTICIPATED doublet: a chain-
+        // sharp (w = 2) ramp with lurch's pinned plateau levels at lurch's
+        // edge, through the bandpass's own operator -0.25*D2_2. r says
+        // whether the anticipation carries the SHAPE (evidence can predict
+        // the waveform) or only a location and magnitude bound; beta says
+        // whether lurch's amplitude scales it correctly where the shape
+        // holds. peak|cm| vs step height h feeds the scale law.
+        const int xa = std::max(0, x0), xb = std::min(width - 1, x1);
+        if (xb - xa < 6) continue;
+        const double lo = apMean[std::clamp(run.a, 0, width - 1)];
+        const double hi = apMean[std::clamp(run.b + 1, 0, width - 1)];
+        auto rampAt = [&](double j) {
+            return lo + (hi - lo)
+                 * std::clamp((j - run.edge) / 2.0 + 0.5, 0.0, 1.0);
+        };
+        double peak = 0.0, sCC = 0.0, sPP = 0.0, sCP = 0.0;
+        for (int x = xa; x <= xb; ++x) {
+            const double cm = 0.5 * (bpAt(rawLine, x) + bpAt(rawP, x));
+            const double d2 = rampAt((double)(x - 2)) - 2.0 * rampAt((double)x)
+                            + rampAt((double)(x + 2));
+            const double pred = -0.25 * d2;
+            peak = std::max(peak, std::fabs(cm));
+            sCC += cm * cm; sPP += pred * pred; sCP += cm * pred;
+        }
+        const bool shapeValid = sPP > 1e-9 && sCC > 1e-9;
+        const double r    = shapeValid ? sCP / std::sqrt(sCC * sPP) : 0.0;
+        const double beta = (sPP > 1e-9) ? sCP / sPP : 0.0;
+        g_disentProbe.runProfile(run.stepAbsIRE, peak * invIreScale,
+                                 r, beta, shapeValid);
     }
     if (!any) return;
-
-    const quint16 *rawLine = rawbuffer.data() + size_t(line)    * fullWidth;
-    const quint16 *rawP    = rawbuffer.data() + size_t(partner) * fullWidth;
-    auto bpAt = [&](const quint16 *rl, int x) {
-        const int m2 = std::clamp(x - 2, 0, width - 1);
-        const int p2 = std::clamp(x + 2, 0, width - 1);
-        return 0.50 * (double)rl[left + x]
-             - 0.25 * ((double)rl[left + m2] + (double)rl[left + p2]);
-    };
 
     const int parity  = line & 1;
     const int flipNeg = carrierLineFlip(line) < 0 ? 1 : 0;
@@ -4884,6 +5025,61 @@ void Comb::FrameBuffer::probeEdgePairClassMap(int line)
             std::fabs(2.0 * cm * sin4fsc(ph)) * invIreScale,
             std::fabs(2.0 * cm * cos4fsc(ph)) * invIreScale);
     }
+}
+
+// Downstream fate of the edge footprints (LDCD_PROBE_EDGEFATE). Measurement
+// only -- reads the finished scalar planes after 2D/3D have run, writes
+// nothing. See EdgeFateProbe above for what the numbers decide.
+void Comb::FrameBuffer::probeEdgeFate(int dimensions)
+{
+    if (!EdgeFateProbe::on()) return;
+
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int width     = right - left;
+    if (width < 16 || firstLine >= lastLine) return;
+
+    const bool dims3 = dimensions == 3;
+    long   ln[2]    = {0, 0};
+    double ld21[2]  = {0.0, 0.0};
+    double ld32[2]  = {0.0, 0.0};
+    long   lex[2]   = {0, 0};
+    long   lnear[2] = {0, 0};
+
+    std::vector<LurchStepRun> runs;
+    std::vector<std::uint8_t> mask(width);
+    for (int line = firstLine; line < lastLine; ++line) {
+        const double *apMean = lockedApertureMean_line(line);
+        if (!apMean) continue;
+        const double *c0 = clpbuffer[0].pixel[line];
+        const double *c1 = clpbuffer[1].pixel[line];
+        const double *c2 = dims3 ? clpbuffer[2].pixel[line] : nullptr;
+        if (!c0 || !c1) continue;
+
+        detectLurchSteps(apMean, width, irescale, invIreScale, 1.0, runs);
+        std::fill(mask.begin(), mask.end(), 0);
+        for (const LurchStepRun &run : runs) {
+            if (run.suppressed || run.gate <= 0.0) continue;
+            const int x0 = std::max(0, (int)std::floor(run.edge) - 6);
+            const int x1 = std::min(width - 1, (int)std::ceil(run.edge) + 6);
+            for (int x = x0; x <= x1; ++x) mask[x] = 1;
+        }
+
+        for (int x = 0; x < width; ++x) {
+            const int e = mask[x];
+            const double d21 =
+                std::fabs(c1[left + x] - c0[left + x]) * invIreScale;
+            ++ln[e];
+            ld21[e] += d21;
+            if (c2)
+                ld32[e] += std::fabs(c2[left + x] - c1[left + x]) * invIreScale;
+            if (d21 < 0.1) ++lex[e];
+            if (d21 < 0.5) ++lnear[e];
+        }
+    }
+    g_edgeFate.merge(ln, ld21, ld32, lex, lnear, dims3);
 }
 
 void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,

@@ -380,7 +380,16 @@ public:
 	// or cross-line signal; 1D is downstream's safe retreat. Adjacent lines
 	// may CONFIRM (phase, luma contrast); the P12 subtraction that briefly
 	// consumed this measurement was withdrawn for violating that law.
+	// Also profiles the error per run: peak|cm| vs step height (scale law),
+	// shape correlation r against the anticipated doublet, amplitude beta.
 	void probeEdgePairClassMap(int line);
+
+	// Downstream-fate probe (LDCD_PROBE_EDGEFATE). MEASUREMENT ONLY. After
+	// 2D/3D have run, measures how far the comb moved the carrier off its 1D
+	// source at lurch footprints vs everywhere else, and how often it
+	// effectively passed 1D through -- locating which consumer owns the edge
+	// pixels the evidence handoff must inform.
+	void probeEdgeFate(int dimensions);
 
 	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
 	// demodulated aperture views can bound the chroma at a luma step. Reads

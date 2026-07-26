@@ -297,6 +297,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             continue;
         }
 
+        // Edge-fate probe (measurement only; inert unless LDCD_PROBE_EDGEFATE):
+        // current's 1D/2D/3D scalar planes are all final at this point.
+        current->probeEdgeFate(configuration.dimensions);
+
         /*
          * Output path.
          *
