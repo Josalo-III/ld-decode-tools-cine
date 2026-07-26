@@ -358,6 +358,14 @@ public:
 	// consumes lockedCornerLeak_flat, so the render is unchanged.
 	void buildCornerLeak();
 
+	// Coarse-residual pool and its consumers, shared by the bucket and locked
+	// paths (neither needs burst-lock rotation and both are cheap). buildAperture
+	// Means fills the sliding four-sample means; applyCarrierFeasibilityHull
+	// clamps a carrier row (carrierAtLeft[x] is the carrier at sample left+x)
+	// into the range those means permit, sending the excess to luma.
+	void buildApertureMeans();
+	void applyCarrierFeasibilityHull(int line, double *carrierAtLeft);
+
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
 	void buildCarrierRetracted();

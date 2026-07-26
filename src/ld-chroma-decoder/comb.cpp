@@ -499,14 +499,15 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             else
                 lockedLumaSharp_flat.clear();
             lockedLumaHDeltaIRE_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
-            // Collected pool: sliding four-sample aperture means. Unconditional
-            // -- it is a running sum (O(1)/sample) and it is the raw material
-            // for the coarse-residual parallax, which is a default-path client.
-            // lockedLumaSharp is derived from it rather than rebuilding it.
-            lockedApertureMean_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedCornerLeak_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaCacheValid = false;
         }
+        // Collected pool: sliding four-sample aperture means. UNCONDITIONAL --
+        // it is a running sum (O(1)/sample), and both the locked coarse-residual
+        // parallax AND the bucket-path carrier feasibility hull consume it, so
+        // it must exist without phaseCompensation. buildApertureMeans() fills it
+        // from split1D (which runs on every path, before phaseLocked).
+        lockedApertureMean_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
         // Preclean ring is only needed for Frame/FVF in locked mode.
         if (needFrameIQ) {
             for (int s = 0; s < 3; ++s) {
@@ -661,6 +662,22 @@ void Comb::FrameBuffer::split1D()
     if (left >= right || firstLine >= lastLine)
         return;
 
+    // Fill the coarse-residual aperture-mean pool for every path here, before
+    // phaseLocked runs, so the locked path reads the same values and the bucket
+    // path can consume it for the carrier feasibility hull below.
+    buildApertureMeans();
+
+    // Bucket-path carrier feasibility hull. Rotation-free and O(width), so
+    // there is no reason to deny it to the cheap path -- but it changes output,
+    // so it is opt-in (LDCD_BUCKET_HULL=1) until validated, and it is confined
+    // to the bucket path (the locked path clamps inside buildCornerLeak on the
+    // corrected carrier instead). The clamp is the SAME shared helper.
+    static const bool bucketHull = []{
+        const char *s = std::getenv("LDCD_BUCKET_HULL");
+        return s && std::atoi(s) != 0;              // default OFF: bucket unchanged
+    }();
+    const bool applyBucketHull = bucketHull && !configuration.phaseCompensation;
+
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *src = rawbuffer.data() + line * fullWidth;
         double *dst        = clpbuffer[0].pixel[line];
@@ -670,6 +687,9 @@ void Comb::FrameBuffer::split1D()
             int hp2 = h + 2; if (hp2 >= right)  hp2 = right - 1 - (hp2 - right);
             dst[h] = ((double)src[h] - 0.5 * ((double)src[hm2] + (double)src[hp2])) * 0.5;
         }
+
+        if (applyBucketHull)
+            applyCarrierFeasibilityHull(line, dst + left);
     }
 }
 

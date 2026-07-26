@@ -206,43 +206,10 @@ void Comb::FrameBuffer::phaseLocked()
                 }
             }
 
-            // ---- Collected pool: sliding four-sample aperture means --------
-            // apMean[v] = mean(raw[left+v .. left+v+3]), indexed by aperture
-            // START, so the legal apertures covering sample x are
-            // v in {x-3, x-2, x-1, x}.  Published unfiltered: no sharpening,
-            // no gate, no absolute value -- consumers own the decisions.
-            //
-            // A legal carrier sums to zero over ANY legal four-sample window,
-            // so each mean is that window's LUMA mean exactly; the divergence
-            // between apertures covering one sample is therefore pure luma with
-            // the carrier removed exactly.  That is the coarse-residual
-            // parallax, and it is why this must not be pre-digested here.
-            //
-            // Running sum: O(1) per sample, so it is built for every locked
-            // frame rather than only under --luma-witness.
+            // The coarse-residual aperture-mean pool is built once for every
+            // path by buildApertureMeans() (from split1D, before this runs);
+            // read it here for the sharpened boxcar below.
             double *apMean = lockedApertureMean_line(line);
-            const int lastStart = width - 4;
-            if (apMean && width >= 4) {
-                double sum4 = (double)rawLine[left + 0] + (double)rawLine[left + 1]
-                            + (double)rawLine[left + 2] + (double)rawLine[left + 3];
-                for (int xi = 0; xi <= lastStart; ++xi) {
-                    apMean[xi] = 0.25 * sum4;
-                    if (xi < lastStart)
-                        sum4 += (double)rawLine[left + xi + 4]
-                              - (double)rawLine[left + xi];
-                }
-                // Tail: no legal aperture starts here. Hold the last real mean
-                // so the buffer stays readable; consumers needing "a real
-                // aperture started here" must respect xi <= width-4.
-                for (int xi = lastStart + 1; xi < width; ++xi)
-                    apMean[xi] = apMean[lastStart];
-            } else if (apMean) {
-                double avg = 0.0;
-                for (int xi = 0; xi < width; ++xi)
-                    avg += (double)rawLine[left + xi];
-                avg /= std::max(1, width);
-                for (int xi = 0; xi < width; ++xi) apMean[xi] = avg;
-            }
 
             if (!buildSharp)
                 continue;
@@ -255,6 +222,7 @@ void Comb::FrameBuffer::phaseLocked()
             }
             // Derived FROM the pool above, not a private rebuild.
             const double *boxcar = apMean;
+            const int lastStart = width - 4;   // last legal aperture start
 
             // Register the even four-sample means at integer xi by averaging
             // the two half-sample apertures on either side.  Their combination
@@ -861,6 +829,85 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
 // the leak returns to luma and Y + chroma == raw exactly.
 // ---------------------------------------------------------------------------
 
+// Fill the sliding four-sample aperture-mean pool for every active line.
+//
+// apMean[v] = mean(raw[left+v .. left+v+3]), indexed by aperture START, so the
+// legal apertures covering sample x are v in {x-3, x-2, x-1, x}. Published
+// unfiltered: no sharpening, no gate, no absolute value -- consumers own the
+// decisions. A legal carrier sums to zero over ANY legal four-sample window, so
+// each mean is that window's LUMA mean exactly; the divergence between the
+// apertures covering one sample is therefore pure luma with the carrier removed
+// exactly (the coarse-residual parallax), and each mean also bounds the carrier
+// at every sample it covers (the feasibility hull). Running sum, O(1)/sample.
+//
+// Built from split1D so it exists on EVERY path (bucket and locked) without
+// burst-lock rotation; phaseLocked and buildCornerLeak read the same pool.
+void Comb::FrameBuffer::buildApertureMeans()
+{
+    if (lockedApertureMean_flat.empty()) return;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int fullWidth = videoParameters.fieldWidth;
+    const int width     = right - left;
+    if (left >= right || firstLine >= lastLine) return;
+
+    const int lastStart = width - 4;
+    for (int line = firstLine; line < lastLine; ++line) {
+        double *apMean = lockedApertureMean_line(line);
+        if (!apMean) continue;
+        const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+        if (width >= 4) {
+            double sum4 = (double)rawLine[left + 0] + (double)rawLine[left + 1]
+                        + (double)rawLine[left + 2] + (double)rawLine[left + 3];
+            for (int xi = 0; xi <= lastStart; ++xi) {
+                apMean[xi] = 0.25 * sum4;
+                if (xi < lastStart)
+                    sum4 += (double)rawLine[left + xi + 4]
+                          - (double)rawLine[left + xi];
+            }
+            // Tail: no legal aperture starts here. Hold the last real mean so
+            // the buffer stays readable; consumers needing "a real aperture
+            // started here" must respect xi <= width-4.
+            for (int xi = lastStart + 1; xi < width; ++xi)
+                apMean[xi] = apMean[lastStart];
+        } else {
+            double avg = 0.0;
+            for (int xi = 0; xi < width; ++xi)
+                avg += (double)rawLine[left + xi];
+            avg /= std::max(1, width);
+            for (int xi = 0; xi < width; ++xi) apMean[xi] = avg;
+        }
+    }
+}
+
+// Clamp a carrier row into the coarse-residual feasible range, in place.
+// carrierAtLeft[x] is the carrier estimate at sample left+x, x in [0,width).
+// The excess leaves the carrier; the caller decides where it lands (the bucket
+// path lets luma = raw - chroma absorb it downstream, the locked path folds it
+// back into the leak). RESTRICTS only -- a real carrier over real luma already
+// lies inside [floor, ceiling], so only impossible carrier is moved. Rotation-
+// free and O(width): the feasibility hull is a default-path client.
+void Comb::FrameBuffer::applyCarrierFeasibilityHull(int line,
+                                                    double *carrierAtLeft)
+{
+    if (!carrierAtLeft) return;
+    const double *apMean = lockedApertureMean_line(line);
+    if (!apMean) return;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int fullWidth = videoParameters.fieldWidth;
+    const int width     = right - left;
+    if (width <= 0) return;
+    const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+    for (int x = 0; x < width; ++x) {
+        const auto rng = lddecode::carrierFeasibleRange(
+            (double)rawLine[left + x], apMean, x, width);
+        carrierAtLeft[x] = std::clamp(carrierAtLeft[x], rng.floor, rng.ceiling);
+    }
+}
+
 // Deconvolution depth. Van Cittert converges slowest near fSC by design; more
 // iterations claim more of the near-fSC neighbourhood. Measured: the strong-edge
 // saturation DIPS then RECOVERS as this rises (a PARTIAL doublet subtraction
@@ -1161,24 +1208,25 @@ void Comb::FrameBuffer::buildCornerLeak()
         // bound the carrier INDEPENDENTLY, from the luma side where compact
         // content is lawful (luma is never bandlimited): carrier must lie in
         // [raw - max_v apMean, raw - min_v apMean] over the covering apertures.
-        // Clamp the emitted carrier (bp - leak) into that range and send the
-        // excess to luma by ADDING to the leak; both bounds are applied so an
-        // oscillating carrier is not rectified. This RESTRICTS, never averages.
-        // v1 is unguarded: the dark-side ceiling is clean but the pixel luma
-        // floor can be violated at a lone dark sample, which would clip legal
-        // carrier -- the decomposed metric (satRet/hueRot) is what reveals it.
+        // Clamp the emitted carrier (bp - leak) into that range and fold the
+        // excess back into the leak (so it lands in luma via Y = raw - chroma);
+        // both bounds are applied so an oscillating carrier is not rectified.
+        // The clamp itself is the shared applyCarrierFeasibilityHull(), which
+        // the bucket path also calls -- here it acts on the emitted carrier and
+        // the difference is backed out into leakRow. v1 is unguarded: the dark-
+        // side ceiling is clean but the pixel luma floor can be violated at a
+        // lone dark sample, which would clip legal carrier -- the decomposed
+        // metric (satRet/hueRot) is what reveals it.
         static const bool hullEnabled = []{
             const char *s = std::getenv("LDCD_CORNER_HULL");
             return !s || std::atoi(s) != 0;         // default ON when leak runs
         }();
         if (hullEnabled && apMean) {
-            for (int x = 0; x < width; ++x) {
-                const auto rng = lddecode::carrierFeasibleRange(
-                    (double)rawLine[left + x], apMean, x, width);
-                const double chroma  = bpLine[x] - leakRow[x];
-                const double clamped = std::clamp(chroma, rng.floor, rng.ceiling);
-                leakRow[x] += (chroma - clamped);   // excess carrier -> luma
-            }
+            for (int x = 0; x < width; ++x)
+                notchAdj[x] = bpLine[x] - leakRow[x];   // emitted carrier
+            applyCarrierFeasibilityHull(line, notchAdj.data());
+            for (int x = 0; x < width; ++x)
+                leakRow[x] = bpLine[x] - notchAdj[x];   // excess -> leak -> luma
         }
     }
 
