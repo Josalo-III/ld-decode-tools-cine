@@ -908,6 +908,69 @@ void Comb::FrameBuffer::applyCarrierFeasibilityHull(int line,
     }
 }
 
+// Coarse-residual parallax for one line. For each sample, demodulate the four
+// covering aperture residuals (raw - apMean) on the grammar phase, envelope-
+// smooth each, then take the spread across the four over their mean magnitude.
+// A legal carrier is aperture-invariant (nulls in every legal four-window), so
+// the four views agree and the ratio is low; moving luma shifts them apart and
+// the ratio is high. Because it reads four-sample windows, it resolves compact
+// colour that a wide coherent window would average away.
+void Comb::FrameBuffer::apertureParallaxLine(
+        int line,
+        std::vector<double> &vI, std::vector<double> &vQ,
+        std::vector<double> &sI, std::vector<double> &sQ,
+        double *ratioOut) const
+{
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int fullWidth = videoParameters.fieldWidth;
+    const int width     = right - left;
+    if (width <= 0 || !ratioOut) return;
+    for (int x = 0; x < width; ++x) ratioOut[x] = 1.0;   // unknown => act
+    const double *apMean = lockedApertureMean_line(line);
+    if (!apMean) return;
+    const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+    const int lastStart = width - 4;
+    for (int k = 0; k < 4; ++k) {
+        for (int x = 0; x < width; ++x) {
+            const int v = std::clamp(x - (3 - k), 0, std::max(0, lastStart));
+            const double r = (double)rawLine[left + x] - apMean[v];
+            const int ph = carrierSampleClass(line, left + x);
+            vI[size_t(k) * width + x] = 2.0 * r * sin4fsc(ph);
+            vQ[size_t(k) * width + x] = 2.0 * r * cos4fsc(ph);
+        }
+    }
+    // 3-sample smooth per view (envelope extraction after demod).
+    for (int k = 0; k < 4; ++k) {
+        const double *pi = &vI[size_t(k) * width];
+        const double *pq = &vQ[size_t(k) * width];
+        double *oi = &sI[size_t(k) * width];
+        double *oq = &sQ[size_t(k) * width];
+        for (int x = 0; x < width; ++x) {
+            const int a = std::max(0, x - 1), b = std::min(width - 1, x + 1);
+            oi[x] = (pi[a] + pi[x] + pi[b]) / 3.0;
+            oq[x] = (pq[a] + pq[x] + pq[b]) / 3.0;
+        }
+    }
+    for (int x = 0; x < width; ++x) {
+        double mi = 0.0, mq = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            mi += sI[size_t(k) * width + x];
+            mq += sQ[size_t(k) * width + x];
+        }
+        mi *= 0.25; mq *= 0.25;
+        double div = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            const double di = sI[size_t(k) * width + x] - mi;
+            const double dq = sQ[size_t(k) * width + x] - mq;
+            div += std::hypot(di, dq);
+        }
+        div *= 0.25;
+        const double mag = std::hypot(mi, mq);
+        ratioOut[x] = div / std::max(mag, 1e-6);
+    }
+}
+
 // Deconvolution depth. Van Cittert converges slowest near fSC by design; more
 // iterations claim more of the near-fSC neighbourhood. Measured: the strong-edge
 // saturation DIPS then RECOVERS as this rises (a PARTIAL doublet subtraction
@@ -986,48 +1049,8 @@ void Comb::FrameBuffer::buildCornerLeak()
             notch[x] = (double)rawLine[left + x] - bpLine[x];
 
         // ---- Parallax: does this carrier-band energy null in every aperture?
-        std::fill(ratio.begin(), ratio.end(), 1.0);   // unknown => act
-        if (apMean) {
-            const int lastStart = width - 4;
-            for (int k = 0; k < 4; ++k) {
-                for (int x = 0; x < width; ++x) {
-                    const int v = std::clamp(x - (3 - k), 0, std::max(0, lastStart));
-                    const double r = (double)rawLine[left + x] - apMean[v];
-                    const int ph = carrierSampleClass(line, left + x);
-                    vI[size_t(k) * width + x] = 2.0 * r * sin4fsc(ph);
-                    vQ[size_t(k) * width + x] = 2.0 * r * cos4fsc(ph);
-                }
-            }
-            // 3-sample smooth per view (envelope extraction after demod).
-            for (int k = 0; k < 4; ++k) {
-                const double *pi = &vI[size_t(k) * width];
-                const double *pq = &vQ[size_t(k) * width];
-                double *oi = &sI[size_t(k) * width];
-                double *oq = &sQ[size_t(k) * width];
-                for (int x = 0; x < width; ++x) {
-                    const int a = std::max(0, x - 1), b = std::min(width - 1, x + 1);
-                    oi[x] = (pi[a] + pi[x] + pi[b]) / 3.0;
-                    oq[x] = (pq[a] + pq[x] + pq[b]) / 3.0;
-                }
-            }
-            for (int x = 0; x < width; ++x) {
-                double mi = 0.0, mq = 0.0;
-                for (int k = 0; k < 4; ++k) {
-                    mi += sI[size_t(k) * width + x];
-                    mq += sQ[size_t(k) * width + x];
-                }
-                mi *= 0.25; mq *= 0.25;
-                double div = 0.0;
-                for (int k = 0; k < 4; ++k) {
-                    const double di = sI[size_t(k) * width + x] - mi;
-                    const double dq = sQ[size_t(k) * width + x] - mq;
-                    div += std::hypot(di, dq);
-                }
-                div *= 0.25;
-                const double mag = std::hypot(mi, mq);
-                ratio[x] = div / std::max(mag, 1e-6);
-            }
-        }
+        // Shared with the cross-color detector's carrier-legality veto.
+        apertureParallaxLine(line, vI, vQ, sI, sQ, ratio.data());
 
         // ---- Gate: parallax alone. Multiplies KAPPA (a luma-domain quantity),
         // never the carrier, so it cannot manufacture sidebands.
@@ -2334,10 +2357,22 @@ void Comb::FrameBuffer::measurePostCombImpurity()
         return s && std::atoi(s) != 0;
     }();
 
+    // Coarse-residual carrier-legality veto (opt-in): where the aperture
+    // parallax confirms legal carrier, pull gA down so the detector stops
+    // desaturating compact colour it mistook for contamination. Default off so
+    // the authoritative impurity is byte-identical when disabled.
+    static const bool ccParallax = []{
+        const char *s = std::getenv("LDCD_CC_PARALLAX");
+        return s && std::atoi(s) != 0;
+    }();
+
     std::vector<double> demI(width), demQ(width);
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
     std::vector<double> lawI(width), lawQ(width);   // encoder-band envelope
+    std::vector<double> pvI(size_t(4) * width), pvQ(size_t(4) * width);
+    std::vector<double> psI(size_t(4) * width), psQ(size_t(4) * width);
+    std::vector<double> parRatio(width);            // aperture parallax ratio
 
     for (int line = firstLine; line < lastLine; ++line) {
         const double *combLine = clpbuffer[srcBuf].pixel[line];
@@ -2373,6 +2408,9 @@ void Comb::FrameBuffer::measurePostCombImpurity()
             lddecode::projectExpressibleChromaEnvelope(
                 demQ.data(), nullptr, width, lawQ.data());
         }
+
+        if (ccParallax)
+            apertureParallaxLine(line, pvI, pvQ, psI, psQ, parRatio.data());
 
         for (int rel = 0; rel < width; ++rel) {
             const double ZwI = centeredEvenWeightMean(
@@ -2416,6 +2454,19 @@ void Comb::FrameBuffer::measurePostCombImpurity()
                     2.0 * std::hypot(ifI, ifQ) * invIreScale;
                 if (crossMag > kImpurityFloorIRE && actualMag > kImpurityFloorIRE)
                     gA = std::max(gA, clamp01(crossMag / actualMag));
+            }
+
+            // Carrier-legality veto: where the aperture parallax says this
+            // carrier-band energy NULLS in every legal four-window (low ratio),
+            // it is legal carrier -- including compact colour a wide coherent
+            // window would smear -- so pull gA down. Where it fails to null
+            // (high ratio), it is moving luma and gA passes. The ramp reuses the
+            // corner-leak parallax thresholds (the same physical question).
+            if (ccParallax) {
+                const double keep = clamp01(
+                    (parRatio[rel] - kCornerParallaxSoft) /
+                    (kCornerParallaxHard - kCornerParallaxSoft));
+                gA *= keep;
             }
 
             // The post-comb read is authoritative for CCR targeting. The

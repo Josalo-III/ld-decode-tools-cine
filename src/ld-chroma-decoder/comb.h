@@ -365,6 +365,16 @@ public:
 	// into the range those means permit, sending the excess to luma.
 	void buildApertureMeans();
 	void applyCarrierFeasibilityHull(int line, double *carrierAtLeft);
+	// Coarse-residual parallax for one line: ratioOut[x] is the spread of the
+	// four covering aperture residuals over their mean magnitude. Low = the
+	// carrier-band energy nulls in every legal aperture (legal carrier); high =
+	// it fails to null (moving luma). Aperture-local, so it resolves compact
+	// colour where a wide coherent window smears. Scratch vI/vQ/sI/sQ are
+	// caller-owned, each sized 4*width; ratioOut sized width.
+	void apertureParallaxLine(int line,
+	                          std::vector<double> &vI, std::vector<double> &vQ,
+	                          std::vector<double> &sI, std::vector<double> &sQ,
+	                          double *ratioOut) const;
 
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
