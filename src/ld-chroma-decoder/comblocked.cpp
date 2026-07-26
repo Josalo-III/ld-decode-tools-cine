@@ -4738,7 +4738,7 @@ struct TandemProbe {
         ++nAccept;
         ++nAccPar[parity & 1];
         sumDe += de; sumAbsDe += std::fabs(de); sumRatio += ratio;
-        const int wi = (w < 0.8) ? 0 : (w < 1.3) ? 1 : (w < 2.0) ? 2 : 3;
+        const int wi = (w < 2.2) ? 0 : (w < 2.7) ? 1 : (w < 3.4) ? 2 : 3;
         ++wHist[wi];
     }
 
@@ -4758,7 +4758,7 @@ struct TandemProbe {
         if (nAccept > 0)
             std::fprintf(stderr,
                 "[TANDEM] accepted: de mean %+.2f  |de| mean %.2f px  "
-                "err/err0 mean %.2f  widths 0.6:%ld 1.0:%ld 1.6:%ld 2.4:%ld  "
+                "err/err0 mean %.2f  widths 2.0:%ld 2.4:%ld 3.0:%ld 3.8:%ld  "
                 "parity even:%ld odd:%ld\n",
                 sumDe / nAccept, sumAbsDe / nAccept, sumRatio / nAccept,
                 wHist[0], wHist[1], wHist[2], wHist[3],
@@ -4917,7 +4917,18 @@ void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
             return err;
         };
 
-        static constexpr double kWidths[4] = {0.6, 1.0, 1.6, 2.4};
+        // CAPTURE-CHAIN WIDTH LAW. Only aliased edges are ever abrupt: every
+        // natural transition arrives through the chain's lowpass as a
+        // gradient, even if only over ~2 px. A sub-2px ramp is therefore an
+        // IMPOSSIBLE hypothesis and is excluded from the family -- not
+        // penalized, absent -- so the emitted Y transition can never exceed
+        // chain sharpness. (The earlier family reached down to 0.6 and the
+        // fit skewed there after the split: with amplitude pinned, plateau-
+        // level error can only be absorbed by width, so amplitude error
+        // ALIASES INTO SHARPNESS and the emission manufactures near-Nyquist
+        // luma the chain could not have delivered.) A genuinely sharper-than-
+        // law edge simply fits worse and abstains to 1D, per doctrine.
+        static constexpr double kWidths[4] = {2.0, 2.4, 3.0, 3.8};
         const double eLo = run.edge - 2.0, eHi = run.edge + 2.0;
         double bestRatio = 1e300, bestE = run.edge, bestW = 0.0;
         for (double e = eLo; e <= eHi + 1e-9; e += 0.25) {
