@@ -375,6 +375,11 @@ public:
 	                          std::vector<double> &vI, std::vector<double> &vQ,
 	                          std::vector<double> &sI, std::vector<double> &sQ,
 	                          double *ratioOut) const;
+	// Steep-edge doublet corrector: subtract the known -0.25*D2Y leak at luma
+	// steps, amplitude and location from the lurch step-solve on the coarse
+	// residuals (chroma-free), shape confirmed/vetoed by the notch (advisory).
+	// Rotation-free; acts in place on the emitted 1D carrier (both paths).
+	void applyEdgeDoublet(int line, double *carrierAtLeft);
 
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.

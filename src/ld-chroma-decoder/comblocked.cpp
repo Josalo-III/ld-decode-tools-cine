@@ -1538,6 +1538,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
         }
 
+        // Steep-edge doublet: withdraw the known -0.25*D2Y leak at luma steps
+        // from the emitted carrier (self-gated; inert unless LDCD_EDGE_DOUBLET).
+        // bpLine[rel] is the carrier at sample left+rel, i.e. carrierAtLeft.
+        applyEdgeDoublet(line, bpLine);
+
         // Pass 1.5: coarse-residual feasibility repair for locked 1D.
         //
         // The ordinary 1D bandpass remains the source authority; every scanner
@@ -4575,17 +4580,29 @@ void Comb::FrameBuffer::produceY()
 //
 // `prior` is blended in place; `gateOut` (optional) reports per-pixel
 // sharpening activity so a consumer can stand down its own edge correction.
-void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
-                                                int meanCount,
-                                                int width,
-                                                double *prior,
-                                                double *gateOut,
-                                                double gateGain) const
-{
-    if (gateOut && width > 0)
-        std::fill(gateOut, gateOut + width, 0.0);
+// One detected luma step in the coarse aperture-mean sequence.
+struct LurchStepRun {
+    int a = 0;
+    int b = 0;
+    double edge = 0.0;         // sub-sample edge location, means coordinate
+    double stepSamples = 0.0;  // SIGNED step height, sample units
+    double stepAbsIRE = 0.0;   // |step|, IRE
+    double gate = 0.0;         // snap/confidence gate in [0,1]
+    bool suppressed = false;   // ringing/overshoot fragment beside a stronger run
+};
 
-    if (!means || !prior || meanCount < 6 || width <= 0)
+// Detect luma step runs in the coarse aperture-mean sequence -- the difference
+// facts that own HF (a legal carrier is aperture-invariant, so a same-sign run
+// of D across straddling windows is a luma step; a chroma envelope edge
+// alternates sign and is rejected). Shared by the witness coarse-sharpener and
+// the steep-edge doublet corrector so both read one step model. gateGain sweeps
+// the snap aggressiveness.
+static void detectLurchSteps(const double *means, int meanCount,
+                             double irescale, double invIreScale,
+                             double gateGain, std::vector<LurchStepRun> &runs)
+{
+    runs.clear();
+    if (!means || meanCount < 6)
         return;
 
     const auto smoothStep01 = [](double t) {
@@ -4596,18 +4613,7 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
     // Per-window movement floor: a confirmed step of >= ~1.2 IRE moves each
     // straddling window by >= ~0.3 IRE.
     const double dThreshSamples = 0.30 * irescale;
-
     const int dCount = meanCount - 1;
-
-    struct StepRun {
-        int a = 0;
-        int b = 0;
-        double edge = 0.0;
-        double stepAbsIRE = 0.0;
-        double gate = 0.0;
-        bool suppressed = false;
-    };
-    std::vector<StepRun> runs;
 
     int s = 0;
     while (s < dCount) {
@@ -4637,8 +4643,6 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
         const double stepSamples =
             means[std::min(b + 1, meanCount - 1)] - means[a];
         const double stepIRE = std::fabs(stepSamples) * invIreScale;
-        // gateGain sweeps the snap aggressiveness: <1 softens the contour
-        // (weaker steps stay on the boxcar ramp), >1 snaps weaker steps too.
         const double gate =
             std::clamp(smoothStep01((stepIRE - 1.25) / 2.75) * gateGain,
                        0.0, 1.0);
@@ -4658,10 +4662,11 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
         const double centroid =
             (wSum > 1e-12) ? (wPos / wSum) : 0.5 * (double)(a + b);
 
-        StepRun run;
+        LurchStepRun run;
         run.a = a;
         run.b = b;
         run.edge = centroid + 2.5;
+        run.stepSamples = stepSamples;
         run.stepAbsIRE = stepIRE;
         run.gate = gate;
         runs.push_back(run);
@@ -4690,6 +4695,110 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
             }
         }
     }
+}
+
+// Subtract the known steep-edge leak doublet from the emitted 1D carrier.
+//
+// At a luma step the bandpass reads -0.25*D2Y as false carrier -- a fixed
+// doublet scaled by step height (the "known profile"). The corner leak drove
+// this from the notch, which is chroma-contaminated at coincident edges (the
+// parked lesson). Here the AMPLITUDE and LOCATION come from the lurch step-solve
+// on the coarse aperture means, which is carrier-free by construction, and the
+// NOTCH is advisory only: it confirms a real coincident sharp edge and vetoes
+// where it disagrees, but never sets the amplitude. Neither signal suffices
+// alone -- lurch has the clean amplitude but a step template, the notch has the
+// sharp shape but a corrupt amplitude -- so the doublet is lurch's height at
+// lurch's edge, admitted in proportion to the notch's least-squares agreement.
+void Comb::FrameBuffer::applyEdgeDoublet(int line, double *carrierAtLeft)
+{
+    static const bool enabled = []{
+        const char *s = std::getenv("LDCD_EDGE_DOUBLET");
+        return s && std::atoi(s) != 0;
+    }();
+    if (!enabled || !carrierAtLeft) return;
+
+    const double *apMean = lockedApertureMean_line(line);
+    if (!apMean) return;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int fullWidth = videoParameters.fieldWidth;
+    const int width     = right - left;
+    if (width < 8) return;
+    const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+
+    std::vector<LurchStepRun> runs;
+    detectLurchSteps(apMean, width, irescale, invIreScale, 1.0, runs);
+    if (runs.empty()) return;
+
+    std::vector<double> leak(width, 0.0);
+    std::vector<double> pred(width, 0.0);   // per-run predicted doublet
+    std::vector<double> ntch(width, 0.0);   // per-run notch doublet
+
+    for (const LurchStepRun &run : runs) {
+        if (run.suppressed || run.gate <= 0.0) continue;
+
+        // Clean, chroma-free levels flanking the step and its signed height.
+        const int ia = std::clamp(run.a, 0, width - 1);
+        const int ib = std::clamp(run.b + 1, 0, width - 1);
+        const double lo = apMean[ia];
+        const double hi = apMean[ib];
+        const double e  = run.edge;                 // sample coordinate
+
+        // Forward model on a sharpened step at e: pred = -0.25 * D2{Ystep}.
+        auto Ystep = [&](int j) { return ((double)j < e) ? lo : hi; };
+        const int x0 = std::clamp((int)std::floor(e) - 3, 0, width - 1);
+        const int x1 = std::clamp((int)std::ceil(e) + 3, 0, width - 1);
+        std::fill(pred.begin() + x0, pred.begin() + x1 + 1, 0.0);
+        std::fill(ntch.begin() + x0, ntch.begin() + x1 + 1, 0.0);
+        for (int x = x0; x <= x1; ++x) {
+            const double d2Y = Ystep(x - 2) - 2.0 * Ystep(x) + Ystep(x + 2);
+            pred[x] = -0.25 * d2Y;
+            // Notch = raw - emitted carrier; its stride-2 second difference is
+            // the notch's own (chroma-contaminated) leak doublet.
+            auto notch = [&](int j) {
+                const int jc = std::clamp(j, 0, width - 1);
+                return (double)rawLine[left + jc] - carrierAtLeft[jc];
+            };
+            ntch[x] = -0.25 * (notch(x - 2) - 2.0 * notch(x) + notch(x + 2));
+        }
+
+        // Advisory admission: least-squares scale of pred present in the notch
+        // doublet. ~1 = notch confirms the edge cleanly; >1 = chroma-inflated
+        // (clamped, so we never over-subtract); <=0 = absent or opposite (veto).
+        double sPN = 0.0, sPP = 0.0;
+        for (int x = x0; x <= x1; ++x) { sPN += pred[x] * ntch[x]; sPP += pred[x] * pred[x]; }
+        const double proj = (sPP > 1e-12) ? (sPN / sPP) : 0.0;
+        const double confirm = std::clamp(proj, 0.0, 1.0);
+
+        const double w = run.gate * confirm;
+        if (w <= 0.0) continue;
+        for (int x = x0; x <= x1; ++x)
+            leak[x] += pred[x] * w;
+    }
+
+    for (int x = 0; x < width; ++x)
+        carrierAtLeft[x] -= leak[x];
+}
+
+void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
+                                                int meanCount,
+                                                int width,
+                                                double *prior,
+                                                double *gateOut,
+                                                double gateGain) const
+{
+    if (gateOut && width > 0)
+        std::fill(gateOut, gateOut + width, 0.0);
+
+    if (!means || !prior || meanCount < 6 || width <= 0)
+        return;
+
+    std::vector<LurchStepRun> runs;
+    detectLurchSteps(means, meanCount, irescale, invIreScale, gateGain, runs);
+    if (runs.empty())
+        return;
+
+    using StepRun = LurchStepRun;
 
     // Apply the strongest surviving run per pixel, always blending from the
     // unsharpened base so overlapping runs never compound.

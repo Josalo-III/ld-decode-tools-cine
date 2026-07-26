@@ -690,6 +690,12 @@ void Comb::FrameBuffer::split1D()
 
         if (applyBucketHull)
             applyCarrierFeasibilityHull(line, dst + left);
+
+        // Steep-edge doublet correction on the bucket carrier (self-gated;
+        // inert unless LDCD_EDGE_DOUBLET). Only the bucket path applies it here;
+        // the locked path applies it on its own bandpass in buildPhaseCorrected1D.
+        if (!configuration.phaseCompensation)
+            applyEdgeDoublet(line, dst + left);
     }
 }
 
