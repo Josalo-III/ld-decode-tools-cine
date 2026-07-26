@@ -892,6 +892,11 @@ void Comb::FrameBuffer::split1D()
     // path can consume it for the carrier feasibility hull below.
     buildApertureMeans();
 
+    // Canonical lurch step runs, one detection per line per frame from the
+    // pool above. Consumers (witness sharpener, edge probes, the coming 2D
+    // threshold work) read these instead of privately re-running the scan.
+    buildLurchStepRuns();
+
     // Bucket-path carrier feasibility hull. Rotation-free and O(width), so
     // there is no reason to deny it to the cheap path -- but it changes output,
     // so it is opt-in (LDCD_BUCKET_HULL=1) until validated, and it is confined

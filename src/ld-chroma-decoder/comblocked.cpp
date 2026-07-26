@@ -233,8 +233,9 @@ void Comb::FrameBuffer::phaseLocked()
                 const int s1 = std::clamp(xi - 1, 0, lastStart);
                 sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
             }
-            lurchSharpenCoarsePrior(boxcar, width - 3, width,
-                                    sharp, gateScratch.data(), sharpLevel);
+            // Canonical runs (built once in split1D); apply-only here.
+            applyLurchSteps(lurchStepRuns_line(line), boxcar, width - 3,
+                            width, sharpLevel, sharp, gateScratch.data());
         }
         lockedLumaCacheValid = true;
     }
@@ -4587,26 +4588,19 @@ void Comb::FrameBuffer::produceY()
 //
 // `prior` is blended in place; `gateOut` (optional) reports per-pixel
 // sharpening activity so a consumer can stand down its own edge correction.
-// One detected luma step in the coarse aperture-mean sequence.
-struct LurchStepRun {
-    int a = 0;
-    int b = 0;
-    double edge = 0.0;         // sub-sample edge location, means coordinate
-    double stepSamples = 0.0;  // SIGNED step height, sample units
-    double stepAbsIRE = 0.0;   // |step|, IRE
-    double gate = 0.0;         // snap/confidence gate in [0,1]
-    bool suppressed = false;   // ringing/overshoot fragment beside a stronger run
-};
+// (LurchStepRun itself lives in comb.h -- it is production data now.)
 
-// Detect luma step runs in the coarse aperture-mean sequence -- the difference
-// facts that own HF (a legal carrier is aperture-invariant, so a same-sign run
-// of D across straddling windows is a luma step; a chroma envelope edge
-// alternates sign and is rejected). Shared by the witness coarse-sharpener and
-// the steep-edge doublet corrector so both read one step model. gateGain sweeps
-// the snap aggressiveness.
+// Detect luma step runs in a coarse mean sequence -- the difference facts
+// that own HF (a legal carrier is aperture-invariant, so a same-sign run of
+// D across straddling windows is a luma step; a chroma envelope edge
+// alternates sign and is rejected). Gates are stored at UNIT gain; consumers
+// scale (clamp(gate*gain,0,1) reproduces any detection-time gain exactly).
+// Canonical runs on the shared aperture pool come from buildLurchStepRuns();
+// this stays callable directly for OTHER mean sequences (e.g. the carrier
+// fit's winFloor), which are different quantities, not duplication.
 static void detectLurchSteps(const double *means, int meanCount,
                              double irescale, double invIreScale,
-                             double gateGain, std::vector<LurchStepRun> &runs)
+                             std::vector<LurchStepRun> &runs)
 {
     runs.clear();
     if (!means || meanCount < 6)
@@ -4650,9 +4644,7 @@ static void detectLurchSteps(const double *means, int meanCount,
         const double stepSamples =
             means[std::min(b + 1, meanCount - 1)] - means[a];
         const double stepIRE = std::fabs(stepSamples) * invIreScale;
-        const double gate =
-            std::clamp(smoothStep01((stepIRE - 1.25) / 2.75) * gateGain,
-                       0.0, 1.0);
+        const double gate = smoothStep01((stepIRE - 1.25) / 2.75);
         if (gate <= 0.0)
             continue;
 
@@ -4701,6 +4693,36 @@ static void detectLurchSteps(const double *means, int meanCount,
                 break;
             }
         }
+    }
+}
+
+// Fill the canonical per-line lurch run lists from the shared aperture pool:
+// ONE detection per line per frame, unit gain, meanCount = width-3 (the real
+// aperture starts). Every consumer -- the witness coarse-sharpener, the edge
+// probes, and the coming 2D threshold work -- reads these instead of privately
+// re-running the scan. Runs on every path from split1D, right after the pool
+// itself is built; O(width) per line, so the default path pays noise.
+void Comb::FrameBuffer::buildLurchStepRuns()
+{
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int width     = right - left;
+
+    if ((int)lurchStepRuns.size() < lastLine)
+        lurchStepRuns.resize(lastLine);
+    for (auto &rowRuns : lurchStepRuns)
+        rowRuns.clear();
+
+    if (width < 8 || firstLine >= lastLine || lockedApertureMean_flat.empty())
+        return;
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        const double *apMean = lockedApertureMean_line(line);
+        if (!apMean) continue;
+        detectLurchSteps(apMean, width - 3, irescale, invIreScale,
+                         lurchStepRuns[line]);
     }
 }
 
@@ -4927,8 +4949,7 @@ void Comb::FrameBuffer::probeEdgePairClassMap(int line)
     const int width     = right - left;
     if (width < 16) return;
 
-    std::vector<LurchStepRun> runs;
-    detectLurchSteps(apMean, width, irescale, invIreScale, 1.0, runs);
+    const std::vector<LurchStepRun> &runs = lurchStepRuns_line(line);
     long gated = 0;
     for (const LurchStepRun &run : runs)
         if (!run.suppressed && run.gate > 0.0) ++gated;
@@ -5048,17 +5069,14 @@ void Comb::FrameBuffer::probeEdgeFate(int dimensions)
     long   lex[2]   = {0, 0};
     long   lnear[2] = {0, 0};
 
-    std::vector<LurchStepRun> runs;
     std::vector<std::uint8_t> mask(width);
     for (int line = firstLine; line < lastLine; ++line) {
-        const double *apMean = lockedApertureMean_line(line);
-        if (!apMean) continue;
         const double *c0 = clpbuffer[0].pixel[line];
         const double *c1 = clpbuffer[1].pixel[line];
         const double *c2 = dims3 ? clpbuffer[2].pixel[line] : nullptr;
         if (!c0 || !c1) continue;
 
-        detectLurchSteps(apMean, width, irescale, invIreScale, 1.0, runs);
+        const std::vector<LurchStepRun> &runs = lurchStepRuns_line(line);
         std::fill(mask.begin(), mask.end(), 0);
         for (const LurchStepRun &run : runs) {
             if (run.suppressed || run.gate <= 0.0) continue;
@@ -5089,15 +5107,30 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
                                                 double *gateOut,
                                                 double gateGain) const
 {
+    if (!means || meanCount < 6 || width <= 0) {
+        if (gateOut && width > 0)
+            std::fill(gateOut, gateOut + width, 0.0);
+        return;
+    }
+
+    std::vector<LurchStepRun> runs;
+    detectLurchSteps(means, meanCount, irescale, invIreScale, runs);
+    applyLurchSteps(runs, means, meanCount, width, gateGain, prior, gateOut);
+}
+
+// The application half of the lurch sharpener, split out so consumers of the
+// CANONICAL run lists (buildLurchStepRuns) apply them without re-detecting.
+// gateGain scales the stored unit-gain gates: clamp(gate*gain,0,1) is exactly
+// the value detection at that gain would have produced.
+void Comb::FrameBuffer::applyLurchSteps(const std::vector<LurchStepRun> &runs,
+                                        const double *means, int meanCount,
+                                        int width, double gateGain,
+                                        double *prior, double *gateOut) const
+{
     if (gateOut && width > 0)
         std::fill(gateOut, gateOut + width, 0.0);
 
-    if (!means || !prior || meanCount < 6 || width <= 0)
-        return;
-
-    std::vector<LurchStepRun> runs;
-    detectLurchSteps(means, meanCount, irescale, invIreScale, gateGain, runs);
-    if (runs.empty())
+    if (!means || !prior || meanCount < 6 || width <= 0 || runs.empty())
         return;
 
     using StepRun = LurchStepRun;
@@ -5126,6 +5159,7 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
     for (const StepRun &run : runs) {
         if (run.suppressed)
             continue;
+        const double g = std::clamp(run.gate * gateGain, 0.0, 1.0);
 
         const int xiFirst =
             std::clamp((int)std::floor(run.edge) - 4, 0, width - 1);
@@ -5133,7 +5167,7 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
             std::clamp((int)std::ceil(run.edge) + 3, 0, width - 1);
 
         for (int xi = xiFirst; xi <= xiLast; ++xi) {
-            if (run.gate <= localGate[xi])
+            if (g <= localGate[xi])
                 continue;
 
             // One window of margin beyond the detected run: threshold
@@ -5147,8 +5181,8 @@ void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
             if (anchorContaminated(side))
                 continue;
 
-            localGate[xi] = run.gate;
-            prior[xi] = base[xi] * (1.0 - run.gate) + means[side] * run.gate;
+            localGate[xi] = g;
+            prior[xi] = base[xi] * (1.0 - g) + means[side] * g;
         }
     }
 

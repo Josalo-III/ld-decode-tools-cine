@@ -39,6 +39,25 @@
 #include "decoder.h"
 #include "sourcefield.h"
 
+// One detected luma step in a coarse aperture-mean sequence (the lurch
+// step-solve's output). PRODUCTION DATA: built once per line per frame from
+// the shared aperture pool (buildLurchStepRuns) and consumed by the witness
+// coarse-sharpener, the edge probes, and (next) the 2D threshold revisit --
+// one scan, many readers, per the no-duplicate-math standard.
+//
+// `gate` is stored at UNIT gain (the raw smoothstep of step size); consumers
+// apply their own gain as clamp(gate * gain, 0, 1), which is exactly the
+// value the detector would have produced at that gain.
+struct LurchStepRun {
+    int a = 0;
+    int b = 0;
+    double edge = 0.0;         // sub-sample edge location, means coordinate
+    double stepSamples = 0.0;  // SIGNED step height, sample units
+    double stepAbsIRE = 0.0;   // |step|, IRE
+    double gate = 0.0;         // unit-gain confidence gate in [0,1]
+    bool suppressed = false;   // ringing/overshoot fragment beside a stronger run
+};
+
 class Comb
 {
 public:
@@ -364,6 +383,19 @@ public:
 	// clamps a carrier row (carrierAtLeft[x] is the carrier at sample left+x)
 	// into the range those means permit, sending the excess to luma.
 	void buildApertureMeans();
+	// Fill lurchStepRuns from the aperture pool, one detection per line per
+	// frame (meanCount = width-3, the real aperture starts), unit gain.
+	void buildLurchStepRuns();
+	inline const std::vector<LurchStepRun> &lurchStepRuns_line(int line) const {
+		static const std::vector<LurchStepRun> kEmpty;
+		if (line < 0 || size_t(line) >= lurchStepRuns.size()) return kEmpty;
+		return lurchStepRuns[line];
+	}
+	// Apply detected runs to a coarse prior (the snap-to-plateau step of the
+	// lurch sharpener); gateGain scales the stored unit-gain gates.
+	void applyLurchSteps(const std::vector<LurchStepRun> &runs,
+	                     const double *means, int meanCount, int width,
+	                     double gateGain, double *prior, double *gateOut) const;
 	void applyCarrierFeasibilityHull(int line, double *carrierAtLeft);
 	// Coarse-residual parallax for one line: ratioOut[x] is the spread of the
 	// four covering aperture residuals over their mean magnitude. Low = the
@@ -917,6 +949,12 @@ private:
 	// Built unconditionally (a running sum, O(1) per sample) because it has
 	// default-path clients, not "just in case".
 	std::vector<double> lockedApertureMean_flat;
+	// Canonical per-line lurch step runs, built from the pool above by
+	// buildLurchStepRuns() (split1D, every path) at unit gain. Like the pool
+	// it is a MEASUREMENT published raw: consumers scale the gate and make
+	// their own decisions. Indexed by frame line; empty vector when the line
+	// carries no runs (or is outside the active region).
+	std::vector<std::vector<LurchStepRun>> lurchStepRuns;
 	// Predicted 1D corner leak, raw units, same geometry as
 	// locked1DRawBandpass. chroma = bp - leak, and Y = raw - chroma, so the
 	// removed leak RETURNS to luma and Y + chroma == raw exactly (the
