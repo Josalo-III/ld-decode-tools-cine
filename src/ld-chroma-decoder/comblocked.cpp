@@ -938,55 +938,6 @@ void Comb::FrameBuffer::buildCornerLeak()
         for (int x = 0; x < width; ++x)
             notch[x] = (double)rawLine[left + x] - bpLine[x];
 
-        // Contamination runs BOTH ways, and correcting only one is what made
-        // thin straps worse:
-        //     bp    = chroma + leak      (luma  -> carrier band)  <- corrected
-        //     notch = Y      - leak + N{chroma}  (chroma -> notch) <- was NOT
-        // N = I - B has response cos^2(w), which is zero only AT fSC; a compact
-        // colour feature has a fast envelope with content away from band centre,
-        // so N{chroma} is significant there, D2{notch} picks up chroma-derived
-        // curvature, and the recovered leak is wrong. A wrong leak shows up as
-        // carrier-rate ALTERNATION IN LUMA, because Y = notch + leak and the
-        // identity notch = Y - leak means a CORRECT leak reconstructs the sharp
-        // luma exactly, with no alternation. Alternation in Y is therefore
-        // direct proof of mis-estimation, and is the metric to watch.
-        //
-        // So estimate the chroma, remove its notch-band image from the notch,
-        // and re-solve. Two outer rounds suffice (the second correction is an
-        // order smaller).
-        std::fill(kappa.begin(), kappa.end(), 0.0);
-        for (int outer = 0; outer < kCornerOuterRounds; ++outer) {
-            // notch corrected for the chroma that leaks INTO it.
-            for (int x = 0; x < width; ++x) notchAdj[x] = notch[x];
-            if (outer > 0) {
-                // chroma = bp - leak, with the current leak estimate.
-                for (int x = 0; x < width; ++x)
-                    chromaEst[x] = bpLine[x] + 0.25 * kappa[x];
-                // N{chroma} = chroma - B{chroma}: the part of the chroma that
-                // survives into the notch band and masquerades as luma.
-                for (int x = 0; x < width; ++x) {
-                    const int m2 = std::clamp(x - 2, 0, width - 1);
-                    const int p2 = std::clamp(x + 2, 0, width - 1);
-                    const double b = 0.50 * chromaEst[x]
-                                   - 0.25 * (chromaEst[m2] + chromaEst[p2]);
-                    notchAdj[x] -= (chromaEst[x] - b);
-                }
-            }
-            std::fill(mObs.begin(), mObs.end(), 0.0);
-            for (int x = 2; x < width - 2; ++x)
-                mObs[x] = notchAdj[x - 2] - 2.0 * notchAdj[x] + notchAdj[x + 2];
-
-            // Van Cittert deconvolution of S. Error propagates as
-            // (I - S) = sin^2, so this stalls at fSC by construction and never
-            // claims that mode.
-            std::fill(kappa.begin(), kappa.end(), 0.0);
-            for (int it = 0; it < kCornerLeakIters; ++it) {
-                applyS(kappa, sKappa);
-                for (int x = 0; x < width; ++x)
-                    kappa[x] += (mObs[x] - sKappa[x]);
-            }
-        }
-
         // ---- Parallax: does this carrier-band energy null in every aperture?
         std::fill(ratio.begin(), ratio.end(), 1.0);   // unknown => act
         if (apMean) {
@@ -1101,6 +1052,60 @@ void Comb::FrameBuffer::buildCornerLeak()
                 acc += w * gate[o]; wsum += w;
             }
             gateSmooth[x] = (wsum > 0.0) ? acc / wsum : gate[x];
+        }
+
+        // Contamination runs BOTH ways, and correcting only one is what made
+        // thin straps worse:
+        //     bp    = chroma + leak      (luma  -> carrier band)  <- corrected
+        //     notch = Y      - leak + N{chroma}  (chroma -> notch) <- was NOT
+        // N = I - B has response cos^2(w), which is zero only AT fSC; a compact
+        // colour feature has a fast envelope with content away from band centre,
+        // so N{chroma} is significant there, D2{notch} picks up chroma-derived
+        // curvature, and the recovered leak is wrong. A wrong leak shows up as
+        // carrier-rate ALTERNATION IN LUMA, because Y = notch + leak and the
+        // identity notch = Y - leak means a CORRECT leak reconstructs the sharp
+        // luma exactly, with no alternation. Alternation in Y is therefore
+        // direct proof of mis-estimation, and is the metric to watch.
+        //
+        // So estimate the chroma, remove its notch-band image from the notch,
+        // and re-solve. Two outer rounds suffice (the second correction is an
+        // order smaller). The gate is now known BEFORE this loop, so the
+        // contamination correction reasons about the chroma that ACTUALLY
+        // ships -- bp + 0.25*gate*kappa, the gated leak that gets returned to
+        // luma -- rather than the ungated solve it used to subtract. (The
+        // envExcess term is not yet folded into chromaEst; that coupling is the
+        // Phase-2 single-estimator recurrence.)
+        std::fill(kappa.begin(), kappa.end(), 0.0);
+        for (int outer = 0; outer < kCornerOuterRounds; ++outer) {
+            // notch corrected for the chroma that leaks INTO it.
+            for (int x = 0; x < width; ++x) notchAdj[x] = notch[x];
+            if (outer > 0) {
+                // chroma = bp - leak, with the current GATED leak estimate.
+                for (int x = 0; x < width; ++x)
+                    chromaEst[x] = bpLine[x] + 0.25 * gateSmooth[x] * kappa[x];
+                // N{chroma} = chroma - B{chroma}: the part of the chroma that
+                // survives into the notch band and masquerades as luma.
+                for (int x = 0; x < width; ++x) {
+                    const int m2 = std::clamp(x - 2, 0, width - 1);
+                    const int p2 = std::clamp(x + 2, 0, width - 1);
+                    const double b = 0.50 * chromaEst[x]
+                                   - 0.25 * (chromaEst[m2] + chromaEst[p2]);
+                    notchAdj[x] -= (chromaEst[x] - b);
+                }
+            }
+            std::fill(mObs.begin(), mObs.end(), 0.0);
+            for (int x = 2; x < width - 2; ++x)
+                mObs[x] = notchAdj[x - 2] - 2.0 * notchAdj[x] + notchAdj[x + 2];
+
+            // Van Cittert deconvolution of S. Error propagates as
+            // (I - S) = sin^2, so this stalls at fSC by construction and never
+            // claims that mode.
+            std::fill(kappa.begin(), kappa.end(), 0.0);
+            for (int it = 0; it < kCornerLeakIters; ++it) {
+                applyS(kappa, sKappa);
+                for (int x = 0; x < width; ++x)
+                    kappa[x] += (mObs[x] - sKappa[x]);
+            }
         }
         for (int x = 0; x < width; ++x)
             kappa[x] *= gateSmooth[x];
