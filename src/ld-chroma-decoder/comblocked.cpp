@@ -971,11 +971,18 @@ void Comb::FrameBuffer::apertureParallaxLine(
     }
 }
 
-// Deconvolution depth. Van Cittert converges slowest near fSC by design; more
-// iterations claim more of the near-fSC neighbourhood. Measured: the strong-edge
-// saturation DIPS then RECOVERS as this rises (a PARTIAL doublet subtraction
-// leaves a residue that cancels chroma; a converged one restores it).
-static constexpr int    kCornerLeakIters      = 60;
+// RECOVERY PROFILE depth n, not a convergence tolerance. The Van Cittert
+// iteration kappa += (m - S{kappa}) propagates error as (I - S)^n = sin^2n(w),
+// so after n rounds the recovered fraction at frequency w is 1 - sin^2n(w):
+// zero AT fSC always (the mode is never claimed -- the fSC null is a
+// single-line law), approaching 1 elsewhere. n therefore chooses HOW MUCH of
+// the near-fSC neighbourhood is claimed, and the worst-case noise gain of the
+// implied inverse is bounded by n itself (G_n <= n) -- there is no tuning
+// constant hiding here, only a claimed-bandwidth/noise trade. Measured: the
+// strong-edge saturation DIPS then RECOVERS as n rises (a PARTIAL doublet
+// subtraction leaves a residue that cancels chroma; a converged one restores
+// it).
+static constexpr int    kCornerRecoveryDepth  = 60;
 // Outer rounds of the two-way contamination fix (see buildCornerLeak).
 static constexpr int    kCornerOuterRounds    = 2;
 // Parallax ratio: below soft the energy nulls in every aperture like legal
@@ -1201,7 +1208,7 @@ void Comb::FrameBuffer::buildCornerLeak()
             // (I - S) = sin^2, so this stalls at fSC by construction and never
             // claims that mode.
             std::fill(kappa.begin(), kappa.end(), 0.0);
-            for (int it = 0; it < kCornerLeakIters; ++it) {
+            for (int it = 0; it < kCornerRecoveryDepth; ++it) {
                 applyS(kappa, sKappa);
                 for (int x = 0; x < width; ++x)
                     kappa[x] += (mObs[x] - sKappa[x]);
