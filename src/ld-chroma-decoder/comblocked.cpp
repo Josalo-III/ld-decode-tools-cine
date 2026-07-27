@@ -95,6 +95,80 @@ inline double coarseSharpLevel()
     return level;
 }
 
+// Transfer-knee stats (LDCD_PROBE_KNEE=1). Measurement only. Comb inherits
+// 1D's bandwidth limits: fine-detail AMPLITUDE is stripped from 1D and its
+// descendants -- a transfer-curve divergence at the top of the scale, HF
+// only. This measures that curve directly: at pixels where the carrier-band
+// energy is PROVEN not-carrier (carrierIllegalProof high), the retracted
+// top is trustworthy luma amplitude; bin |comb top| against |retracted top|
+// and the bin where the ratio departs from unity IS the knee -- the
+// measured point at which comb's HF stops being trusted, which the coming
+// roll-off keys to. Sign-flip fraction per bin rides along for the
+// grammar-side sign fix (the taps own the sign).
+struct KneeProbe {
+    std::mutex mu;
+    static constexpr int kBins = 10;
+    // Bin edges on |retracted top| in IRE.
+    static constexpr double kEdge[kBins] =
+        {1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 1e9};
+    long   n[kBins]       = {};
+    double sumRef[kBins]  = {};
+    double sumComb[kBins] = {};
+    long   nFlip[kBins]   = {};
+
+    static bool on()
+    {
+        static const bool v = []{
+            const char *s = std::getenv("LDCD_PROBE_KNEE");
+            return s && std::atoi(s) != 0;
+        }();
+        return v;
+    }
+
+    void sample(double refTopIRE, double combTopIRE)
+    {
+        const double aRef = std::fabs(refTopIRE);
+        int b = 0;
+        while (b < kBins - 1 && aRef >= kEdge[b]) ++b;
+        std::lock_guard<std::mutex> lk(mu);
+        ++n[b];
+        sumRef[b]  += aRef;
+        sumComb[b] += std::fabs(combTopIRE);
+        // Sign flip only counts where both carry real amplitude.
+        if (aRef > 1.0 && std::fabs(combTopIRE) > 1.0 &&
+            refTopIRE * combTopIRE < 0.0)
+            ++nFlip[b];
+    }
+
+    ~KneeProbe()
+    {
+        if (!on()) return;
+        long total = 0;
+        for (int b = 0; b < kBins; ++b) total += n[b];
+        if (total <= 0) return;
+        std::fprintf(stderr,
+            "\n[KNEE] proven-luma pixels %ld  (|retrTop| bins, IRE)\n"
+            "[KNEE]   bin        n     ref    comb   comb/ref  flip%%\n",
+            total);
+        for (int b = 0; b < kBins; ++b) {
+            if (n[b] <= 0) continue;
+            const double inv = 1.0 / (double)n[b];
+            const double mRef = sumRef[b] * inv, mComb = sumComb[b] * inv;
+            std::fprintf(stderr,
+                "[KNEE]  %5.1f-%-5.1f %8ld %6.2f %7.2f %9.3f %6.1f\n",
+                b ? kEdge[b - 1] : 0.0,
+                kEdge[b] > 1e8 ? 99.0 : kEdge[b],
+                n[b], mRef, mComb,
+                mRef > 1e-9 ? mComb / mRef : 0.0,
+                100.0 * (double)nFlip[b] * inv);
+        }
+    }
+};
+
+constexpr double KneeProbe::kEdge[KneeProbe::kBins];
+
+KneeProbe g_kneeProbe;
+
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
@@ -3817,6 +3891,22 @@ void Comb::FrameBuffer::produceY()
                             : candidateFourMeanAt(plane, h);
                     return coarse + fourMean + top;
                 };
+                // Transfer-knee probe (measurement only; inert unless
+                // LDCD_PROBE_KNEE): at proven-luma pixels the retracted top
+                // is trustworthy amplitude; bin comb's top against it.
+                if (KneeProbe::on() && retractedRow && analysisRow) {
+                    const double proofK = lddecode::carrierIllegalProof(
+                        (double)analysisRow[xi].carrierConformance,
+                        (double)analysisRow[xi].conformanceSupportFraction);
+                    if (proofK >= 0.7) {
+                        const double rT = candidateTopAt(1, h);
+                        const double cT = candidateTopAt(0, h);
+                        if (std::isfinite(rT) && std::isfinite(cT))
+                            g_kneeProbe.sample(rT * invIreScale,
+                                               cT * invIreScale);
+                    }
+                }
+
                 const int verticalStep = verticalStepAt(xi);
                 const ProduceYNeighborRows &northRows =
                     northRowsForStep(verticalStep);
