@@ -4260,6 +4260,47 @@ void Comb::FrameBuffer::produceY()
                         (kHighChromaHardIRE - kHighChromaSoftIRE),
                     0.0, 1.0) * (1.0 - illegalProof);
 
+                // Darkest-choice penalty: comb's weak impulse highlights.
+                // At a genuine luma peak comb rounds AND darkens; retracted
+                // keeps the peak. Composited per-pixel the two make a visible
+                // mosaic, and the dark side is the wrong side there. The
+                // roster's DARKEST candidate pays a near-DQ penalty in
+                // proportion to the evidence that the peak is real luma
+                // (illegal-proof or the star/impulse channel) and bright
+                // (raw's own top band) -- and pays NOTHING where the energy
+                // is legal carrier, where the most-subtracted candidate is
+                // usually the correct one (otherwise this term would be
+                // reverse-boldness and re-select carrier). Gentle by gating,
+                // strong by magnitude: comb stays out of these spots without
+                // the election being starved elsewhere.
+                constexpr double kDarkestPenaltyIRE = 4.0;
+                constexpr double kPeakSoftIRE = 8.0;
+                constexpr double kPeakHardIRE = 20.0;
+                int darkestIdx = 0;
+                double darkestPenalty = 0.0;
+                if (baseNIn > 1) {
+                    int brightestIdx = 0;
+                    for (int k = 1; k < baseNIn; ++k) {
+                        if (inHF[k] < inHF[darkestIdx]) darkestIdx = k;
+                        if (inHF[k] > inHF[brightestIdx]) brightestIdx = k;
+                    }
+                    auto rawComplete = [&](int hk) {
+                        return (double)rawLine[hk];
+                    };
+                    const double rawTopIRE = std::fabs(
+                        completeTopAt(rawComplete, coarseRow, h)) * invIreScale;
+                    const double peakT = std::clamp(
+                        (rawTopIRE - kPeakSoftIRE) /
+                            (kPeakHardIRE - kPeakSoftIRE),
+                        0.0, 1.0);
+                    const double lumaPeakGate =
+                        std::max(illegalProof, impulseT) * peakT;
+                    const double spread =
+                        inHF[brightestIdx] - inHF[darkestIdx];
+                    darkestPenalty = lumaPeakGate *
+                        std::min(spread, kDarkestPenaltyIRE * irescale);
+                }
+
                 double resultHF = inHF[0];
                 {
                     double bestCost = 1e300;
@@ -4299,6 +4340,8 @@ void Comb::FrameBuffer::produceY()
                             cost += chromaT * kHighChromaDemoteIRE * irescale -
                                     impulseT * kImpulseRetractedBiasIRE *
                                         irescale;
+                        if (k == darkestIdx && k < baseNIn && baseNIn > 1)
+                            cost += darkestPenalty;
                         if (k < 3) {
                             diagContinuation[k] = proximity01;
                             diagRetained[k] = legality * invIreScale;
