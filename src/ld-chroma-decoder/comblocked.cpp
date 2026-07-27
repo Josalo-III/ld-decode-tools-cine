@@ -5620,22 +5620,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
     const auto &T       = configuration.tunables;
-    static const double parallaxRepairMaxDeltaIRE = []{
-        const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
-        return s ? std::atof(s) : 0.35;
-    }();
-    static const int crDiagLine = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int crDiagC0 = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_C0");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int crDiagC1 = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_C1");
-        return s ? std::atoi(s) : -1;
-    }();
 
     if (width <= 0 || firstLine >= lastLine)
         return;
@@ -6393,104 +6377,27 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     }
                 }
 
-                auto finalizeCarrierSample = [&](double candidateI) {
-                    double sample = candidateI * basisI[xi] + modelQ * basisQ[xi];
-
-                    if (parallax.valid) {
-                        constexpr double SAMPLE_DISC_SOFT_IRE = 1.5;
-                        constexpr double SAMPLE_DISC_HARD_IRE = 5.0;
-                        constexpr double CONTEXT_SOFT_IRE = 3.0;
-                        constexpr double CONTEXT_HARD_IRE = 12.0;
-
-                        const double sampleDisagreementIRE =
-                            std::fabs(sample - parallax.commonSample) * invIreScale;
-                        const double disagreementGate = smoothStep01(
-                            (sampleDisagreementIRE - SAMPLE_DISC_SOFT_IRE) /
-                            std::max(1e-9, SAMPLE_DISC_HARD_IRE - SAMPLE_DISC_SOFT_IRE));
-                        const double contextIRE =
-                            std::max(parallax.yCurvatureIRE,
-                                     0.5 * parallax.ySpreadIRE);
-                        const double contextGate = smoothStep01(
-                            (contextIRE - CONTEXT_SOFT_IRE) /
-                            std::max(1e-9, CONTEXT_HARD_IRE - CONTEXT_SOFT_IRE));
-
-                        // The per-pixel floor residual is not a replacement model;
-                        // it is a witness that can pull a bad window IQ fit back
-                        // toward what all legal Y floors say at this sample.
-                        const double sampleTrust =
-                            std::clamp(parallax.sampleCoherence, 0.0, 1.0);
-                        const double sampleAnchor =
-                            std::min(0.85,
-                                     disagreementGate *
-                                     sampleTrust *
-                                     (0.25 + 0.75 * contextGate));
-
-                        sample = sample * (1.0 - sampleAnchor) +
-                                 parallax.commonSample * sampleAnchor;
-                    }
-
-                    if (residualTightenSupport > 0.0)
-                        sample = std::clamp(sample, residualCarrierLo, residualCarrierHi);
-
-                    return std::clamp(sample, -maxCarrierSamples, maxCarrierSamples);
-                };
-
-                const double baselineModelI = modelI;
-                const double baselineCf = finalizeCarrierSample(baselineModelI);
-                double cf = baselineCf;
-
-                // Consume the same short-fit-selected residual feasibility that
-                // repaired locked 1D. The four-view fit remains the retraction
-                // candidate, but where it falls outside a discriminating,
-                // moving-supported subset it receives the same small bounded
-                // correction. Shared diagnostics constrain this application;
-                // no residual or fit sample is substituted wholesale.
-                bool sharedConstraintApplied = false;
-                double sharedDelta = 0.0;
-                const auto &sharedResidual = analysisRow[xi].residual;
-                const int sharedSurvivors = sharedResidual.survivorCount();
-                const bool sharedUseful =
-                    partWeight[xi] > 0.0 &&
-                    sharedResidual.valid &&
-                    sharedSurvivors > 0 &&
-                    sharedSurvivors < sharedResidual.optionCount &&
-                    sharedResidual.movingCompatible;
-                if (sharedUseful &&
-                    !(cf >= sharedResidual.survivorLo &&
-                      cf <= sharedResidual.survivorHi))
-                {
-                    const double target = std::clamp(
-                        cf,
-                        sharedResidual.survivorLo,
-                        sharedResidual.survivorHi);
-                    const double maxDelta =
-                        std::max(0.0, parallaxRepairMaxDeltaIRE) * irescale;
-                    sharedDelta = std::clamp(
-                        target - cf,
-                        -maxDelta,
-                        maxDelta);
-                    cf += sharedDelta;
-                    sharedConstraintApplied = sharedDelta != 0.0;
-                }
-
-                if (crDiagLine == line && crDiagC0 >= 0 &&
-                    xi >= crDiagC0 &&
-                    xi <= (crDiagC1 < 0 ? crDiagC0 : crDiagC1))
-                {
-                    std::fprintf(stderr,
-                        "CARRIERRETRACTREPAIR line=%d rel=%d before=%.6f "
-                        "after=%.6f applied=%d deltaIRE=%.6f "
-                        "optionCount=%d survivorCount=%d survivorLo=%.6f "
-                        "survivorHi=%.6f movingCompatible=%d\n",
-                        line, xi, baselineCf, cf,
-                        sharedConstraintApplied ? 1 : 0,
-                        sharedDelta * invIreScale,
-                        static_cast<int>(sharedResidual.optionCount),
-                        sharedSurvivors,
-                        sharedResidual.survivorLo,
-                        sharedResidual.survivorHi,
-                        sharedResidual.movingCompatible ? 1 : 0);
-                }
+                // The model sample is the four-view model remodulated on the
+                // grammar basis, then RESTRICTED: the residual-consensus
+                // range and the amplitude ceiling remove impossible values
+                // and nothing else. Two operations that used to sit between
+                // remod and publication were deleted as UNLAWFUL under the
+                // coarse-residual law (statistics and range-restriction only
+                // -- never blend, never average, never output):
+                //   * the commonSample anchor blend pulled the waveform
+                //     toward a consensus of the coarse-residual VALUES --
+                //     averaged coarse residuals becoming output;
+                //   * the survivor-extent move treated the interval between
+                //     discrete survivors as a legal continuum, which the
+                //     analysis contract forbids in as many words ("the
+                //     unobserved values between them do not become legal").
+                // Measured before removal (LDCD_PROBE_OFFGRID): the fit's
+                // span, rotation, and jitter were already the cleanest in
+                // the tree -- nothing real leaned on either operation.
+                double cf = modelI * basisI[xi] + modelQ * basisQ[xi];
+                if (residualTightenSupport > 0.0)
+                    cf = std::clamp(cf, residualCarrierLo, residualCarrierHi);
+                cf = std::clamp(cf, -maxCarrierSamples, maxCarrierSamples);
 
                 carrierFit[xi] = cf;
                 flattened[xi] = rawWhole[xi] - cf;
