@@ -7149,17 +7149,28 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     // ---------------------------------------------------------------
     // Which carrier model the published view withdraws:
     //
-    //   corroborated (default) — raw - w·carrierFit: the x-lawful fit scaled
-    //       by the envelope-scale schedule corroboration.  Withdraws only
-    //       what BOTH halves of the encoder law certify: expressible
-    //       bandwidth (the fit, via feasibleband.h) and observed on-schedule
-    //       alternation (w).  In-band luma is expressible but does not
-    //       alternate, so it fails the second test and stays in Y; w is
-    //       envelope-smooth, so the product stays in-band.
-    //   native   (LDCD_RETRACTED_SOURCE=native) — raw - carrierFit: the
-    //       bandwidth law alone.  Withdraws the full expressible component,
-    //       in-band luma included (measured, cube box: 3.22 IRE withdrawn,
-    //       40% of it lawful).
+    // PEDESTAL LAW (user, 2026-07-26): every election candidate rides the
+    // SAME BASIS — raw minus a FULL, COMMITTED carrier subtraction.  The
+    // candidates differ by WHICH carrier model they subtract, never by HOW
+    // MUCH of it.  The previous default (raw - w·carrierFit) scaled the
+    // subtraction by the corroboration, so the candidate's baseline floated
+    // by (1-w)·fit relative to the roster — at w→0 it stood a full legal-
+    // carrier lobe above every other candidate and won bright pixels on
+    // that pedestal alone (the >100 IRE speck population, ~40% of it
+    // schedule-LEGAL kept energy).  Feasibility cannot catch it: |raw - Y|
+    // ~= 0 at passthrough is maximally feasible.  Scaling the withdrawal
+    // was also a second confidence hedge on a promoted model: the fit is
+    // already schedule-aware through the graded participation weights, and
+    // since P14 it is hull-bounded, so full subtraction cannot over-
+    // withdraw beyond what the legal Y floors permit.  Corroboration stays
+    // EVIDENCE (admission/scoring); it is no longer a subtraction gain.
+    //
+    //   native (default) — raw - carrierFit: the full hull-bounded lawful
+    //       fit.  In-band luma the schedule refused never entered the fit
+    //       (graded participation), so the grid detail survives HERE, in
+    //       the model, not via a downstream haircut.
+    //   corr (LDCD_RETRACTED_SOURCE=corr) — raw - w·carrierFit: the retired
+    //       floating-pedestal product, kept as an A/B escape only.
     //   promoted (LDCD_RETRACTED_SOURCE=promoted) — raw - combedCarrier:
     //       Pass 2's per-pixel confiscation policy (measured: the most
     //       lawful share of the old products, 71%, but rendered as a
@@ -7172,12 +7183,14 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     static const int retractedSource = []{
         const char *s = std::getenv("LDCD_RETRACTED_SOURCE");
         if (!s)
+            return 1;
+        if (s[0] == 'c')
             return 0;
         if (s[0] == 'n')
             return 1;
         if (s[0] == 'p')
             return 2;
-        return 0;
+        return 1;
     }();
 
     for (int line = firstLine; line < lastLine; ++line) {
