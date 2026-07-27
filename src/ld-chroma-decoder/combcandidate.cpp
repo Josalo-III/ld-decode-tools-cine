@@ -390,6 +390,219 @@ struct FieldBCedeProbe {
 
 FieldBCedeProbe gCedeProbe;
 
+// ========================= LDCD_PROBE_FRAMEB ===============================
+// Frame B engagement/throttle census. Frame B's job is to cancel the
+// vertically-invariant image-locked alien -- the 1D debris that stands in
+// columns -- and its authority is a product of four terms:
+//     pull = clamp(0.5 * combStrength * reachAuthority, 0, 0.5) * midLicense
+// so any one of them at zero silences it. This reports which term is binding,
+// split by leg symmetry: sym -> 0 IS the signature class (alien vertically
+// invariant, midpoint safe and needed); sym -> 1 is diagonal advance, where
+// refusal is correct. Windowed with the LDCD_PROBE_CEDE envs.
+struct FrameBProbe {
+    bool enabled = false;
+    int l0 = 0, l1 = 1 << 30, c0 = 0, c1 = 1 << 30;
+    long frameIdx = 0;
+    int lastLine = -1;
+
+    // bucket 0: sym < 0.35 (signature class), 1: 0.35-0.70, 2: >= 0.70
+    struct Bucket {
+        long n = 0, noPartner = 0, capBound = 0;
+        double sumReachBase = 0, sumExempt = 0, sumReach = 0;
+        double sumMidLic = 0, sumPull = 0, sumEffective = 0;
+        double sumDeltaIRE = 0, sumMovedIRE = 0;
+        long midLicZero = 0, reachZero = 0;
+    } b[3];
+
+    FrameBProbe()
+    {
+        enabled = std::getenv("LDCD_PROBE_FRAMEB") != nullptr;
+        auto envInt = [](const char *n, int f) {
+            const char *s = std::getenv(n); return s ? std::atoi(s) : f;
+        };
+        l0 = envInt("LDCD_PROBE_CEDE_L0", 0);
+        l1 = envInt("LDCD_PROBE_CEDE_L1", 1 << 30);
+        c0 = envInt("LDCD_PROBE_CEDE_C0", 0);
+        c1 = envInt("LDCD_PROBE_CEDE_C1", 1 << 30);
+    }
+
+    Bucket alienB[3];   // same split, restricted to a clear alien signature
+    long noSymEvidence = 0, noSymEvidenceAlien = 0;
+
+    // Restricted to STRONG IMAGE VERTICALS (large carrier-free lateral luma
+    // step): the columns where 1D debris stands and interfield is supposed to
+    // cancel it. This is also exactly where the bevel/cross-colour throttle
+    // collapses reach, so the terms are reported separately here.
+    Bucket vertB[3];
+    double vSumReachBase = 0, vSumExempt = 0, vSumReach = 0;
+    long vN = 0;
+
+    // Standing vs alternating decomposition of the blind 1D bandpass at the
+    // Frame B (+-1) and Field B (+-2) geometries. Real chroma ALTERNATES
+    // between carrier-opposite lines; the bandpass leak of a vertical luma
+    // edge is IDENTICAL on every line (same D^2 Y), i.e. STANDING -- and a
+    // standing carrier-band component is invisible to a difference comb:
+    // center - neighbor = 0. If standing energy dominates at strong image
+    // verticals, the un-cancelled 74% is not an authority problem at all.
+    double vAlt1 = 0, vStand1 = 0, vAlt2 = 0, vStand2 = 0; long vBpN = 0;
+    double oAlt1 = 0, oStand1 = 0, oAlt2 = 0, oStand2 = 0; long oBpN = 0;
+
+    void noteBp(bool vertical, double alt1, double stand1,
+                double alt2, double stand2)
+    {
+        if (vertical) { vAlt1 += alt1; vStand1 += stand1;
+                        vAlt2 += alt2; vStand2 += stand2; vBpN++; }
+        else          { oAlt1 += alt1; oStand1 += stand1;
+                        oAlt2 += alt2; oStand2 += stand2; oBpN++; }
+    }
+
+    void note(double sym, bool havePartner, double reachBase, double exempt,
+              double reach, double midLic, double pull, double deltaIRE,
+              double movedIRE, bool capBound, double aGate, bool symMeasured,
+              double hLumaIRE)
+    {
+        const int bi = sym < 0.35 ? 0 : (sym < 0.70 ? 1 : 2);
+        if (hLumaIRE > 14.0) {
+            Bucket &V = vertB[bi];
+            V.n++;
+            if (havePartner) {
+                vN++;
+                vSumReachBase += reachBase; vSumExempt += exempt;
+                vSumReach += reach;
+                V.sumMidLic += midLic; V.sumPull += pull;
+                V.sumEffective += pull * midLic;
+                V.sumDeltaIRE += deltaIRE; V.sumMovedIRE += movedIRE;
+                if (midLic <= 1e-9) V.midLicZero++;
+                if (reach <= 1e-9) V.reachZero++;
+            } else {
+                V.noPartner++;
+            }
+        }
+        if (!symMeasured) {
+            noSymEvidence++;
+            if (aGate > 0.5) noSymEvidenceAlien++;
+        }
+        if (aGate > 0.5) {
+            Bucket &A = alienB[bi];
+            A.n++;
+            if (havePartner) {
+                A.sumMidLic += midLic; A.sumPull += pull;
+                A.sumEffective += pull * midLic;
+                A.sumDeltaIRE += deltaIRE; A.sumMovedIRE += movedIRE;
+                if (midLic <= 1e-9) A.midLicZero++;
+            } else {
+                A.noPartner++;
+            }
+        }
+        Bucket &B = b[bi];
+        B.n++;
+        if (!havePartner) { B.noPartner++; return; }
+        B.sumReachBase += reachBase; B.sumExempt += exempt; B.sumReach += reach;
+        B.sumMidLic += midLic; B.sumPull += pull;
+        B.sumEffective += pull * midLic;
+        B.sumDeltaIRE += deltaIRE; B.sumMovedIRE += movedIRE;
+        if (midLic <= 1e-9) B.midLicZero++;
+        if (reach <= 1e-9) B.reachZero++;
+        if (capBound) B.capBound++;
+    }
+
+    void flush()
+    {
+        long tot = b[0].n + b[1].n + b[2].n;
+        if (tot <= 0) { frameIdx++; return; }
+        static const char *names[3] = { "sym<0.35 SIGNATURE", "sym 0.35-0.70   ",
+                                        "sym>=0.70 diagonal" };
+        std::fprintf(stderr, "[FRAMEB f=%ld ln=%d-%d col=%d-%d] px=%ld\n",
+                     frameIdx, l0, std::min(l1, 9999), c0, std::min(c1, 9999), tot);
+        for (int i = 0; i < 3; ++i) {
+            const Bucket &B = b[i];
+            if (B.n == 0) continue;
+            const long eng = B.n - B.noPartner;
+            const double e = eng > 0 ? 1.0 / eng : 0.0;
+            std::fprintf(stderr,
+                "  %s %5.1f%% of px | noPartner %5.1f%% | reachBase %.2f "
+                "exempt %.2f reach %.2f | midLic %.2f (zero %5.1f%%) | "
+                "pull %.3f eff %.3f | delta %5.2f moved %5.2f IRE (%4.1f%%) "
+                "cap %4.1f%%\n",
+                names[i], 100.0 * B.n / tot, 100.0 * B.noPartner / B.n,
+                B.sumReachBase * e, B.sumExempt * e, B.sumReach * e,
+                B.sumMidLic * e, 100.0 * B.midLicZero * e,
+                B.sumPull * e, B.sumEffective * e,
+                B.sumDeltaIRE * e, B.sumMovedIRE * e,
+                B.sumDeltaIRE > 0 ? 100.0 * B.sumMovedIRE / B.sumDeltaIRE : 0.0,
+                100.0 * B.capBound * e);
+        }
+        const long alienTot = alienB[0].n + alienB[1].n + alienB[2].n;
+        std::fprintf(stderr,
+            "  [alien signature aGate>0.5] %.1f%% of px | "
+            "no-sym-evidence %.1f%% of frame (%.1f%% of alien px)\n",
+            100.0 * alienTot / tot,
+            100.0 * noSymEvidence / tot,
+            alienTot > 0 ? 100.0 * noSymEvidenceAlien / alienTot : 0.0);
+        for (int i = 0; i < 3; ++i) {
+            const Bucket &A = alienB[i];
+            if (A.n == 0) continue;
+            const long eng = A.n - A.noPartner;
+            const double e = eng > 0 ? 1.0 / eng : 0.0;
+            std::fprintf(stderr,
+                "    %s %5.1f%% | midLic %.2f (zero %5.1f%%) | eff %.3f | "
+                "delta %5.2f moved %5.2f IRE (%4.1f%%)\n",
+                names[i], 100.0 * A.n / std::max(1L, alienTot),
+                A.sumMidLic * e, 100.0 * A.midLicZero * e, A.sumEffective * e,
+                A.sumDeltaIRE * e, A.sumMovedIRE * e,
+                A.sumDeltaIRE > 0 ? 100.0 * A.sumMovedIRE / A.sumDeltaIRE : 0.0);
+        }
+        const long vTot = vertB[0].n + vertB[1].n + vertB[2].n;
+        if (vTot > 0) {
+            const double ve = vN > 0 ? 1.0 / vN : 0.0;
+            std::fprintf(stderr,
+                "  [STRONG IMAGE VERTICAL hLuma>14 IRE] %.1f%% of px | "
+                "reachBase %.2f exempt %.2f reach %.2f\n",
+                100.0 * vTot / tot,
+                vSumReachBase * ve, vSumExempt * ve, vSumReach * ve);
+            for (int i = 0; i < 3; ++i) {
+                const Bucket &V = vertB[i];
+                if (V.n == 0) continue;
+                const long eng = V.n - V.noPartner;
+                const double e = eng > 0 ? 1.0 / eng : 0.0;
+                std::fprintf(stderr,
+                    "    %s %5.1f%% | midLic %.2f (zero %5.1f%%) | eff %.3f | "
+                    "delta %5.2f moved %5.2f IRE (%4.1f%%) | reachZero %4.1f%%\n",
+                    names[i], 100.0 * V.n / vTot,
+                    V.sumMidLic * e, 100.0 * V.midLicZero * e,
+                    V.sumEffective * e, V.sumDeltaIRE * e, V.sumMovedIRE * e,
+                    V.sumDeltaIRE > 0 ? 100.0 * V.sumMovedIRE / V.sumDeltaIRE : 0.0,
+                    100.0 * V.reachZero * e);
+            }
+        }
+        if (vBpN > 0 && oBpN > 0) {
+            std::fprintf(stderr,
+                "  bandpass split @verticals: +-1 alt %.2f stand %.2f (%.0f%% standing) | "
+                "+-2 alt %.2f stand %.2f (%.0f%% standing)\n"
+                "  bandpass split off-vert:   +-1 alt %.2f stand %.2f (%.0f%% standing) | "
+                "+-2 alt %.2f stand %.2f (%.0f%% standing)\n",
+                vAlt1 / vBpN, vStand1 / vBpN,
+                100.0 * vStand1 / std::max(1e-9, vAlt1 + vStand1),
+                vAlt2 / vBpN, vStand2 / vBpN,
+                100.0 * vStand2 / std::max(1e-9, vAlt2 + vStand2),
+                oAlt1 / oBpN, oStand1 / oBpN,
+                100.0 * oStand1 / std::max(1e-9, oAlt1 + oStand1),
+                oAlt2 / oBpN, oStand2 / oBpN,
+                100.0 * oStand2 / std::max(1e-9, oAlt2 + oStand2));
+        }
+        frameIdx++;
+        for (Bucket &B : b) B = Bucket();
+        for (Bucket &A : alienB) A = Bucket();
+        for (Bucket &V : vertB) V = Bucket();
+        vSumReachBase = vSumExempt = vSumReach = 0.0; vN = 0;
+        vAlt1 = vStand1 = vAlt2 = vStand2 = 0.0; vBpN = 0;
+        oAlt1 = oStand1 = oAlt2 = oStand2 = 0.0; oBpN = 0;
+        noSymEvidence = noSymEvidenceAlien = 0;
+    }
+};
+
+FrameBProbe gFrameBProbe;
+
 } // namespace
 
 void Comb::FrameBuffer::invalidateCombTapCache()
@@ -1847,22 +2060,28 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     }
     static long fb2Px, fb2TwoLeg, fb2OneLeg, fb2Cede, fb2Ctr, fb2Hold;
     static long fb2BoundaryLegs, fb2LumaZeroLegs, fb2IllegalLegs, fb2OuterSplit;
+    static long fb2StandPx; static double fb2StandSumIRE, fb2StandMaxIRE;
     static int fb2LastLine = -1;
     if (gCedeProbe.enabled) {
         if (lineNumber < fb2LastLine && fb2Px > 0) {
             std::fprintf(stderr,
                 "[FB2 ln=%d-%d col=%d-%d] px=%ld  two %.1f%% one %.1f%% "
                 "cede %.1f%% ctr %.1f%% hold %.1f%%  legs: boundary %.1f%% "
-                "lumaZero %.1f%% illegal %.1f%% outerSplit %.1f%%\n",
+                "lumaZero %.1f%% illegal %.1f%% outerSplit %.1f%%\n"
+                "  standing-sub at ceded px: %.1f%% of px, mean %.2f max %.2f IRE\n",
                 gCedeProbe.l0, std::min(gCedeProbe.l1, 9999),
                 gCedeProbe.c0, std::min(gCedeProbe.c1, 9999), fb2Px,
                 100.0 * fb2TwoLeg / fb2Px, 100.0 * fb2OneLeg / fb2Px,
                 100.0 * fb2Cede / fb2Px, 100.0 * fb2Ctr / fb2Px,
                 100.0 * fb2Hold / fb2Px,
                 50.0 * fb2BoundaryLegs / fb2Px, 50.0 * fb2LumaZeroLegs / fb2Px,
-                50.0 * fb2IllegalLegs / fb2Px, 100.0 * fb2OuterSplit / fb2Px);
+                50.0 * fb2IllegalLegs / fb2Px, 100.0 * fb2OuterSplit / fb2Px,
+                100.0 * fb2StandPx / fb2Px,
+                fb2StandPx > 0 ? fb2StandSumIRE / fb2StandPx : 0.0,
+                fb2StandMaxIRE);
             fb2Px = fb2TwoLeg = fb2OneLeg = fb2Cede = fb2Ctr = fb2Hold = 0;
             fb2BoundaryLegs = fb2LumaZeroLegs = fb2IllegalLegs = fb2OuterSplit = 0;
+            fb2StandPx = 0; fb2StandSumIRE = fb2StandMaxIRE = 0.0;
         }
         fb2LastLine = lineNumber;
     }
@@ -1955,11 +2174,41 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
 
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
+        double standingSubIRE = 0.0;
 
         double output;
         std::uint8_t reason;
         if (!useUp && !useDown) {
+            // Ceded output: the 1D carrier -- MINUS its provably-illegal
+            // standing component, bounded by the leak evidence.
+            //
+            // Any leg difference cancels a line-invariant (standing) carrier
+            // component by construction, so two-leg and one-leg outputs never
+            // carry it. Only this path can hand it through. But standing
+            // carrier at the anti-phase +-2 geometry is not expressible as
+            // encoder chroma (it would be vertical chroma at the alternation
+            // frequency itself); measured on the beach sentinel it is the
+            // bandpass leak of vertical luma edges -- 38% of carrier-band
+            // energy at strong image verticals vs 12% elsewhere -- and the
+            // +-1 midpoint downstream is structurally blind to it, so
+            // whatever passes here survives to the render.
+            //
+            // The naive standing estimate 0.5*(center + mean(legs)) also
+            // reads a REAL vertical chroma boundary as standing (chroma that
+            // fails to continue is line-variant in truth but not in this
+            // scalar), so the subtraction is capped by the same measured
+            // leak-transfer bound used for the verdicts: kappa*h*gate at
+            // corroborated lurch columns, zero where there is no luma-step
+            // evidence. A chroma boundary keeps everything the luma step
+            // cannot explain.
             output = center;
+            if (hgAt[rel] > 0.0f && haveU && haveD) {
+                const double sEst = 0.5 * (center + 0.5 * (up + down));
+                const double cap = kKappa * hgAt[rel] * irescale;
+                const double sSub = std::clamp(sEst, -cap, cap);
+                output = center - sSub;
+                standingSubIRE = sSub * invIreScale;
+            }
             reason = (upBoundary || downBoundary)
                 ? FieldBReasonCede : FieldBReasonCenter;
         } else {
@@ -2032,6 +2281,12 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 region.upDownHueDifferenceDeg >= 20.0 &&
                 region.upDownDifferenceIRE >= bound)
                 fb2OuterSplit++;
+            if (standingSubIRE != 0.0) {
+                fb2StandPx++;
+                fb2StandSumIRE += std::fabs(standingSubIRE);
+                fb2StandMaxIRE = std::max(fb2StandMaxIRE,
+                                          std::fabs(standingSubIRE));
+            }
         }
     }
 
@@ -2600,6 +2855,12 @@ void Comb::FrameBuffer::computeFrameBLine(
         1.0,
         lddecode::CarrierSignFrame::Grid4fsc);
 
+    if (gFrameBProbe.enabled) {
+        if (line < gFrameBProbe.lastLine)
+            gFrameBProbe.flush();
+        gFrameBProbe.lastLine = line;
+    }
+
     const auto &T = configuration.tunables;
 
     const double combStrength =
@@ -3086,6 +3347,14 @@ void Comb::FrameBuffer::computeFrameBLine(
 
         std::complex<double> Zout = Zc;
 
+        // LDCD_PROBE_FRAMEB census (measurement only).
+        const bool fbProbeThis = gFrameBProbe.enabled &&
+            line >= gFrameBProbe.l0 && line <= gFrameBProbe.l1 &&
+            x >= gFrameBProbe.c0 && x <= gFrameBProbe.c1;
+        double probeReachBase = 0.0, probeExempt = 0.0, probeReach = 0.0;
+        double probeMidLic = 0.0, probePull = 0.0, probeDeltaIRE = 0.0;
+        bool probeEngaged = false, probeCapBound = false;
+
         // Estimator (2): plain ±1 interfield midpoint — the grail law, one
         // combine for both regimes, now operating from the alien-retracted
         // center.  Per project_frameb_comb_must_run: when a legal partner
@@ -3217,6 +3486,7 @@ void Comb::FrameBuffer::computeFrameBLine(
                     deltaIRE > 1e-9)
                 {
                     delta *= effectiveMaxDeltaIRE / deltaIRE;
+                    probeCapBound = true;
                 }
 
                 // Reach selected and weighted the target above. Do not apply the
@@ -3285,6 +3555,14 @@ void Comb::FrameBuffer::computeFrameBLine(
                     0.5);
                 Zout = Zc + delta * (pull * midLicense);
 
+                probeEngaged = true;
+                probeReachBase = baseReachAuthority;
+                probeExempt = crossColorExempt;
+                probeReach = reachAuthority;
+                probeMidLic = midLicense;
+                probePull = pull;
+                probeDeltaIRE = deltaIRE;
+
                 diagPull = pull;
                 diagDeltaIRE = deltaIRE;
                 diagTargetMagIRE = cmag(target) * invIreScale;
@@ -3296,6 +3574,55 @@ void Comb::FrameBuffer::computeFrameBLine(
                     Zout = Zc;
                 }
             }
+        }
+
+        static const bool dumpFbMap = std::getenv("LDCD_DUMP_FBMAP") != nullptr;
+        if (fbProbeThis && dumpFbMap) {
+            std::fprintf(stderr, "FBMAP %d %d %.3f %.1f %.2f %.3f\n",
+                line, x,
+                x < (int)scratch_fbLegSymmetry.size()
+                    ? scratch_fbLegSymmetry[x] : 1.0,
+                x < (int)reachTapLine.hLumaDeltaIRE.size()
+                    ? reachTapLine.hLumaDeltaIRE[x] : 0.0,
+                x < (int)scratch_fbAlienGate.size()
+                    ? scratch_fbAlienGate[x] : 0.0,
+                probeMidLic);
+        }
+        if (fbProbeThis) {
+            // Blind-bandpass standing/alternating split at both comb
+            // geometries. Absolute h coordinates; guarded to active lines.
+            const int h = left + x;
+            const int lastL = videoParameters.lastActiveFrameLine;
+            const int firstL = videoParameters.firstActiveFrameLine;
+            if (line - 2 >= firstL && line + 2 < lastL) {
+                const double b0 = clpbuffer[0].pixel[line][h];
+                const double m1 = 0.5 * (clpbuffer[0].pixel[line - 1][h] +
+                                         clpbuffer[0].pixel[line + 1][h]);
+                const double m2 = 0.5 * (clpbuffer[0].pixel[line - 2][h] +
+                                         clpbuffer[0].pixel[line + 2][h]);
+                const double hIRE =
+                    x < (int)reachTapLine.hLumaDeltaIRE.size()
+                        ? reachTapLine.hLumaDeltaIRE[x] : 0.0;
+                gFrameBProbe.noteBp(hIRE > 14.0,
+                    0.5 * std::fabs(b0 - m1) * invIreScale,
+                    0.5 * std::fabs(b0 + m1) * invIreScale,
+                    0.5 * std::fabs(b0 - m2) * invIreScale,
+                    0.5 * std::fabs(b0 + m2) * invIreScale);
+            }
+        }
+        if (fbProbeThis) {
+            const double sym = x < (int)scratch_fbLegSymmetry.size()
+                ? scratch_fbLegSymmetry[x] : 1.0;
+            const double aG = x < (int)scratch_fbAlienGate.size()
+                ? scratch_fbAlienGate[x] : 0.0;
+            const double dOppIRE = x < (int)scratch_fbPairDiff.size()
+                ? cmag(scratch_fbPairDiff[x]) * invIreScale : 0.0;
+            gFrameBProbe.note(sym, probeEngaged, probeReachBase, probeExempt,
+                              probeReach, probeMidLic, probePull, probeDeltaIRE,
+                              cmag(Zout - Zc) * invIreScale, probeCapBound,
+                              aG, dOppIRE > 0.75,
+                              x < (int)reachTapLine.hLumaDeltaIRE.size()
+                                  ? reachTapLine.hLumaDeltaIRE[x] : 0.0);
         }
 
         // Graceful failure at highlights.  No magnitude clamp here: cmag(Zout)

@@ -1170,6 +1170,46 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         probeLine0 >= 0 && probeLine1 >= probeLine0 &&
         probeC0 >= 0 && probeC1 >= probeC0;
 
+    // LDCD_PROBE_FVF: aggregate election census. The question Frame B's work
+    // depends on is not "how often does the frame model win" but "how often
+    // does it win WHERE IT DIFFERS" -- a frame win at a pixel where both
+    // candidates agree delivers nothing. Windowed with the LDCD_PROBE_CEDE
+    // envs; reports at each frame wrap.
+    static const bool censusFvf = std::getenv("LDCD_PROBE_FVF") != nullptr;
+    static const auto cEnv = [](const char *n, int f) {
+        const char *s = std::getenv(n); return s ? std::atoi(s) : f;
+    };
+    static const int cL0 = cEnv("LDCD_PROBE_CEDE_L0", 0);
+    static const int cL1 = cEnv("LDCD_PROBE_CEDE_L1", 1 << 30);
+    static const int cC0 = cEnv("LDCD_PROBE_CEDE_C0", 0);
+    static const int cC1 = cEnv("LDCD_PROBE_CEDE_C1", 1 << 30);
+    static long cN, cFrame, cDiffN, cDiffFrame, cBigN, cBigFrame;
+    static double cSumDiffIRE, cSumDeliveredIRE;
+    static int cLastLine = -1;
+    static long cFrameIdx = 0;
+    const bool censusThisLine =
+        censusFvf && line >= cL0 && line <= cL1;
+    if (censusFvf) {
+        if (line < cLastLine && cN > 0) {
+            std::fprintf(stderr,
+                "[FVFCENSUS f=%ld ln=%d-%d col=%d-%d] px=%ld  frame wins %.1f%%\n"
+                "  where candidates differ >0.5 IRE: %.1f%% of px, frame wins %.1f%%\n"
+                "  where they differ >2.0 IRE:       %.1f%% of px, frame wins %.1f%%\n"
+                "  mean |frame-field| %.2f IRE, mean delivered by the choice %.2f IRE\n",
+                cFrameIdx, cL0, std::min(cL1, 9999), cC0, std::min(cC1, 9999),
+                cN, 100.0 * cFrame / cN,
+                100.0 * cDiffN / cN,
+                cDiffN > 0 ? 100.0 * cDiffFrame / cDiffN : 0.0,
+                100.0 * cBigN / cN,
+                cBigN > 0 ? 100.0 * cBigFrame / cBigN : 0.0,
+                cSumDiffIRE / cN, cSumDeliveredIRE / cN);
+            cFrameIdx++;
+            cN = cFrame = cDiffN = cDiffFrame = cBigN = cBigFrame = 0;
+            cSumDiffIRE = cSumDeliveredIRE = 0.0;
+        }
+        cLastLine = line;
+    }
+
     // Radius of the horizontal neighbor window used in cross-domain estimation.
     // Kept local: this is not a tunable in the current header.
     const int  NEIGH_RAD        = 2;
@@ -2032,6 +2072,19 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 lumFA * invI,
                 lumFB * invI,
                 lumFR * invI);
+        }
+        if (censusThisLine && rel >= cC0 && rel <= cC1) {
+            const double fieldBest = (scoreA <= scoreB) ? FA : FB;
+            const double dIRE = std::fabs(FR - fieldBest) * invI;
+            const bool frameWon = (idx == 2);
+            cN++;
+            if (frameWon) cFrame++;
+            cSumDiffIRE += dIRE;
+            // What the election actually delivered relative to always taking
+            // the field model: zero unless the frame model won.
+            if (frameWon) cSumDeliveredIRE += dIRE;
+            if (dIRE > 0.5) { cDiffN++; if (frameWon) cDiffFrame++; }
+            if (dIRE > 2.0) { cBigN++;  if (frameWon) cBigFrame++; }
         }
         if      (idx == 2) frameCountTotal++;
         else if (idx == 0 || idx == 1) fieldCountTotal++;
