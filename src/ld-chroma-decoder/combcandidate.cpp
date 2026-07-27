@@ -470,6 +470,35 @@ struct FrameBProbe {
     // alien signature so real vertical chroma difference does not dominate.
     double kX = 0, kY = 0, kXX = 0, kXY = 0, kYY = 0; long kN = 0;
 
+    // Sub-sample REGISTRATION between the centre line and each +-1 leg,
+    // estimated from carrier-free aperture means only. At a true image
+    // vertical the luma at a given x is the same on every line, so any
+    // difference is a horizontal shift: delta ~= (Yleg - Yc) / (dY/dx).
+    // Split by centre-line parity because under progressive telecine the
+    // +-1 legs are the OTHER field -- a field-to-field registration error
+    // must therefore alternate sign with parity, while a genuine image
+    // slope does not.
+    double rgUpSum[2] = {0,0}, rgDnSum[2] = {0,0};
+    double rgUpAbs = 0, rgDnAbs = 0;
+    long rgN[2] = {0,0};
+    // Does leg disagreement track the lateral GRADIENT (registration) or the
+    // CURVATURE (leak)? Correlate |pairDiff| against each.
+    double rgGX = 0, rgGY = 0, rgGXX = 0, rgGXY = 0, rgGYY = 0; long rgGN = 0;
+
+    void noteReg(int parity, double dUp, double dDn)
+    {
+        const int p = parity & 1;
+        rgUpSum[p] += dUp; rgDnSum[p] += dDn;
+        rgUpAbs += std::fabs(dUp); rgDnAbs += std::fabs(dDn);
+        rgN[p]++;
+    }
+
+    void noteGrad(double absGrad, double pairIRE)
+    {
+        rgGX += absGrad; rgGY += pairIRE; rgGXX += absGrad * absGrad;
+        rgGXY += absGrad * pairIRE; rgGYY += pairIRE * pairIRE; rgGN++;
+    }
+
     void noteKappa(double d2sum, double pairIRE)
     {
         kX += d2sum; kY += pairIRE; kXX += d2sum * d2sum;
@@ -618,6 +647,28 @@ struct FrameBProbe {
                 100.0 * acN / acAllN,
                 acN > 0 ? acSum / acN : 0.0, acMax);
         }
+        if (rgN[0] + rgN[1] > 2) {
+            const long n0 = std::max(1L, rgN[0]), n1 = std::max(1L, rgN[1]);
+            const long nt = rgN[0] + rgN[1];
+            std::fprintf(stderr,
+                "  registration @verticals (samples, carrier-free luma):\n"
+                "    parity0 up %+.4f dn %+.4f (n=%ld) | parity1 up %+.4f dn %+.4f (n=%ld)\n"
+                "    mean |shift| up %.4f dn %.4f | parity-alternating component up %+.4f dn %+.4f\n",
+                rgUpSum[0]/n0, rgDnSum[0]/n0, rgN[0],
+                rgUpSum[1]/n1, rgDnSum[1]/n1, rgN[1],
+                rgUpAbs/nt, rgDnAbs/nt,
+                0.5*(rgUpSum[0]/n0 - rgUpSum[1]/n1),
+                0.5*(rgDnSum[0]/n0 - rgDnSum[1]/n1));
+        }
+        if (rgGN > 2) {
+            const double mx = rgGX/rgGN, my = rgGY/rgGN;
+            const double vxx = rgGXX/rgGN - mx*mx, vyy = rgGYY/rgGN - my*my;
+            const double vxy = rgGXY/rgGN - mx*my;
+            std::fprintf(stderr,
+                "  |pairDiff| vs lateral GRADIENT: slope %.3f r=%.3f (mean |grad| %.1f IRE/sample)\n",
+                vxx > 1e-9 ? vxy/vxx : 0.0,
+                (vxx > 1e-9 && vyy > 1e-9) ? vxy/std::sqrt(vxx*vyy) : 0.0, mx);
+        }
         if (kN > 2) {
             const double mx = kX / kN, my = kY / kN;
             const double vxx = kXX / kN - mx * mx;
@@ -663,6 +714,9 @@ struct FrameBProbe {
         vAsymSum = vD2Sum = vPairSum = 0.0; vAsymN = vAsymHi = 0;
         acSum = acMax = 0.0; acN = acAllN = 0;
         kX = kY = kXX = kXY = kYY = 0.0; kN = 0;
+        rgUpSum[0]=rgUpSum[1]=rgDnSum[0]=rgDnSum[1]=0.0;
+        rgUpAbs=rgDnAbs=0.0; rgN[0]=rgN[1]=0;
+        rgGX=rgGY=rgGXX=rgGXY=rgGYY=0.0; rgGN=0;
         vAlt1 = vStand1 = vAlt2 = vStand2 = 0.0; vBpN = 0;
         oAlt1 = oStand1 = oAlt2 = oStand2 = 0.0; oBpN = 0;
         noSymEvidence = noSymEvidenceAlien = 0;
@@ -2893,6 +2947,26 @@ void Comb::FrameBuffer::computeFrameBLine(
     const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
     const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
 
+    // LDCD_FB_RAW_LEGS=1: diagnostic A/B. Feed the +-1 legs from the locked
+    // 1D source instead of the Field B preclean, to test whether the measured
+    // leg asymmetry (3.8 IRE, ~10x what luma curvature predicts) is
+    // manufactured by the preclean's own per-column decisions rather than
+    // being a property of the image.
+    static const bool rawLegs = []{
+        const char *s = std::getenv("LDCD_FB_RAW_LEGS");
+        return s && std::atoi(s) != 0;
+    }();
+    if (rawLegs) {
+        if (haveUpLine) {
+            const double *r = locked1DSource_line(line - 1);
+            if (r) precleanUp = r;
+        }
+        if (haveDnLine) {
+            const double *r = locked1DSource_line(line + 1);
+            if (r) precleanDn = r;
+        }
+    }
+
     // Raw rows for the reconstructed-luma feasibility bound at the output.
     const quint16 *rawCenterRow = rawbuffer.constData() + line * videoParameters.fieldWidth;
     const quint16 *rawUpRow = haveUpLine
@@ -3698,6 +3772,21 @@ void Comb::FrameBuffer::computeFrameBLine(
                                 ? scratch_fbAlienGate[x] : 0.0;
                             if (aGk > 0.5)
                                 gFrameBProbe.noteKappa(d2u + d2d, pairIRE);
+
+                            const double *amCr = lockedApertureMean_line(line);
+                            if (amCr && x >= 1 && x + 1 < meansCount) {
+                                const double grad =
+                                    0.5 * (amCr[x + 1] - amCr[x - 1]) * invIreScale;
+                                if (std::fabs(grad) > 3.0) {
+                                    const double yU = amU[x] * invIreScale;
+                                    const double yD = amD[x] * invIreScale;
+                                    const double yC = amCr[x] * invIreScale;
+                                    gFrameBProbe.noteReg(line,
+                                                         (yU - yC) / grad,
+                                                         (yD - yC) / grad);
+                                }
+                                gFrameBProbe.noteGrad(std::fabs(grad), pairIRE);
+                            }
                         }
                     }
                 }
