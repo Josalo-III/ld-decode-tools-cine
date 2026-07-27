@@ -2465,6 +2465,47 @@ void Comb::FrameBuffer::split2D()
 
     if (width <= 0 || firstLine >= lastLine) return;
 
+    // LDCD_DUMP_1DDIAG=1: dump raw / blind-bandpass / locked-1D scalars over
+    // the LDCD_PROBE_CEDE window, one text block per line per frame, for the
+    // demod-smear signature analysis (the white-then-black doublet the
+    // locked path renders at chroma-envelope steps and the bucket path does
+    // not). Measurement only; parse offline.
+    {
+        static const bool dump1d = std::getenv("LDCD_DUMP_1DDIAG") != nullptr;
+        if (dump1d && configuration.phaseCompensation) {
+            static const auto dEnv = [](const char *n, int f) {
+                const char *s = std::getenv(n); return s ? std::atoi(s) : f;
+            };
+            static const int dL0 = dEnv("LDCD_PROBE_CEDE_L0", firstLine);
+            static const int dL1 = dEnv("LDCD_PROBE_CEDE_L1", lastLine - 1);
+            static const int dC0 = dEnv("LDCD_PROBE_CEDE_C0", 0);
+            static const int dC1 = dEnv("LDCD_PROBE_CEDE_C1", width - 1);
+            static long dumpFrame = 0;
+            const int c0 = std::max(0, dC0), c1 = std::min(width - 1, dC1);
+            for (int line = std::max(firstLine, dL0);
+                 line <= std::min(lastLine - 1, dL1); ++line) {
+                const quint16 *raw =
+                    rawbuffer.data() + line * videoParameters.fieldWidth;
+                const double *bp = clpbuffer[0].pixel[line];
+                const double *locked = locked1DSource_line(line);
+                if (!locked) continue;
+                std::fprintf(stderr, "1DDIAG f=%ld ln=%d c0=%d irescale=%.4f\n",
+                             dumpFrame, line, c0, irescale);
+                for (int pass = 0; pass < 3; ++pass) {
+                    std::fprintf(stderr, pass == 0 ? "RAW" : pass == 1 ? "BP" : "LK");
+                    for (int rel = c0; rel <= c1; ++rel) {
+                        const double v = pass == 0 ? (double)raw[left + rel]
+                                       : pass == 1 ? bp[left + rel]
+                                       : locked[rel];
+                        std::fprintf(stderr, " %.1f", v);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            dumpFrame++;
+        }
+    }
+
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
         static const bool useLockedRawBandpassLine = [] {
             const char *s = std::getenv("LD_LINE_USE_LOCKED_RAW_BANDPASS");
