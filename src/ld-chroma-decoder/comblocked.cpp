@@ -4577,8 +4577,20 @@ void Comb::FrameBuffer::produceY()
                             ? std::max(0.0, std::fabs(inHF[k]) -
                                             std::fabs(combTopHere))
                             : 0.0;
+                        // Early-transition slope (user, 2026-07-27): the
+                        // comb-to-challenger handoff must occur while the
+                        // candidates still nearly agree, hiding the seam. At
+                        // unit slope the reward only overcame comb's
+                        // neighbour advantage after the surplus was already
+                        // large, so the flip landed mid-divergence and drew a
+                        // visible step along rising edges. Doubling the slope
+                        // halves the surplus at which the flip happens; the
+                        // cap is unchanged, so large-surplus behaviour is
+                        // identical.
+                        constexpr double kEarlyHandoffSlope = 2.0;
                         const double legality =
-                            illegalProof * std::min(extra, imagePrefCap);
+                            illegalProof * std::min(kEarlyHandoffSlope * extra,
+                                                    imagePrefCap);
                         cost -= legality;
                         // Cross-colour return evidence helps only to the
                         // degree the image supports the candidate, as before.

@@ -2493,14 +2493,18 @@ void Comb::FrameBuffer::split2D()
                 const double *bp = clpbuffer[0].pixel[line];
                 const double *locked = locked1DSource_line(line);
                 if (!locked) continue;
+                const float *fit = carrierFit_line(line);
                 std::fprintf(stderr, "1DDIAG f=%ld ln=%d c0=%d irescale=%.4f\n",
                              dumpFrame, line, c0, irescale);
-                for (int pass = 0; pass < 3; ++pass) {
-                    std::fprintf(stderr, pass == 0 ? "RAW" : pass == 1 ? "BP" : "LK");
+                for (int pass = 0; pass < 4; ++pass) {
+                    if (pass == 3 && !fit) break;
+                    std::fprintf(stderr, pass == 0 ? "RAW" : pass == 1 ? "BP"
+                                       : pass == 2 ? "LK" : "FIT");
                     for (int rel = c0; rel <= c1; ++rel) {
                         const double v = pass == 0 ? (double)raw[left + rel]
                                        : pass == 1 ? bp[left + rel]
-                                       : locked[rel];
+                                       : pass == 2 ? locked[rel]
+                                       : (double)fit[rel];
                         std::fprintf(stderr, " %.1f", v);
                     }
                     std::fprintf(stderr, "\n");
