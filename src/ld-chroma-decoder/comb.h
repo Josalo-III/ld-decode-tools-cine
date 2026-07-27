@@ -396,6 +396,15 @@ public:
 	void applyLurchSteps(const std::vector<LurchStepRun> &runs,
 	                     const double *means, int meanCount, int width,
 	                     double gateGain, double *prior, double *gateOut) const;
+	// Vertical snap corroboration: the lurch-snap was the last per-line hard
+	// quantizer -- run.edge jitters +-0.5-1 px line to line on texture noise
+	// and saw-tooths bright vertical contours. For each run with a matching
+	// run (same step sign, within kLurchMatchPx) on BOTH adjacent lines, the
+	// snap edge becomes the MEDIAN-OF-THREE -- an order statistic, a
+	// selection among measured values, never a mean. One or no matches leave
+	// the line's own edge standing. Returns an adjusted COPY for the snap
+	// consumers; the canonical lists stay raw measurement.
+	std::vector<LurchStepRun> corroborateLurchEdges(int line) const;
 	void applyCarrierFeasibilityHull(int line, double *carrierAtLeft);
 	// Coarse-residual parallax for one line: ratioOut[x] is the spread of the
 	// four covering aperture residuals over their mean magnitude. Low = the

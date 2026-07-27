@@ -431,8 +431,12 @@ void Comb::FrameBuffer::phaseLocked()
                 const int s1 = std::clamp(xi - 1, 0, lastStart);
                 sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
             }
-            // Canonical runs (built once in split1D); apply-only here.
-            applyLurchSteps(lurchStepRuns_line(line), boxcar, width - 3,
+            // Canonical runs (built once in split1D), edges vertically
+            // corroborated (median-of-three) so the snap stops sawing
+            // bright vertical contours; apply-only here.
+            const std::vector<LurchStepRun> corrRuns =
+                corroborateLurchEdges(line);
+            applyLurchSteps(corrRuns, boxcar, width - 3,
                             width, sharpLevel, sharp, gateScratch.data());
         }
         lockedLumaCacheValid = true;
@@ -4975,6 +4979,44 @@ void Comb::FrameBuffer::buildLurchStepRuns()
     }
 }
 
+// See comb.h. The vertical partner step mirrors the election's Y-geometry
+// rule: immediately adjacent lines wherever the cadence allows the frame-
+// vertical model, same-field +-2 otherwise.
+std::vector<LurchStepRun> Comb::FrameBuffer::corroborateLurchEdges(int line) const
+{
+    std::vector<LurchStepRun> runs = lurchStepRuns_line(line);
+    if (runs.empty()) return runs;
+
+    constexpr double kLurchMatchPx = 1.5;
+    const int step = carrierFrameVerticalAllowed(line) ? 1 : 2;
+    const auto &up = lurchStepRuns_line(line - step);
+    const auto &dn = lurchStepRuns_line(line + step);
+
+    auto matchEdge = [&](const std::vector<LurchStepRun> &nbr,
+                         const LurchStepRun &run, double &edgeOut) -> bool {
+        double bestD = kLurchMatchPx;
+        bool found = false;
+        for (const LurchStepRun &o : nbr) {
+            if (o.suppressed) continue;
+            if ((o.stepSamples > 0.0) != (run.stepSamples > 0.0)) continue;
+            const double d = std::fabs(o.edge - run.edge);
+            if (d <= bestD) { bestD = d; edgeOut = o.edge; found = true; }
+        }
+        return found;
+    };
+
+    for (LurchStepRun &run : runs) {
+        if (run.suppressed) continue;
+        double eu, ed;
+        if (!matchEdge(up, run, eu) || !matchEdge(dn, run, ed))
+            continue;                       // no full vertical company
+        const double e = run.edge;
+        // median of three, by selection
+        run.edge = std::max(std::min(eu, e), std::min(std::max(eu, e), ed));
+    }
+    return runs;
+}
+
 // Reverse-engineering stats for the pair disentangle (LDCD_PROBE_DISENT=1).
 // Measurement only. The per-class map is the point: the leak's demod hue is
 // set by (x mod 4, lineFlip), so the SAME luma edge presents a different
@@ -5901,8 +5943,11 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             // Lurch preconditioner: sharpen the prior before the carrier fit
             // consumes it, so step energy stays out of raw - refinedY and
             // never enters the carrier band. Canonical runs (built once in
-            // split1D on the same pool); apply-only here.
-            applyLurchSteps(lurchStepRuns_line(line), winFloor.data(),
+            // split1D on the same pool), edges vertically corroborated;
+            // apply-only here.
+            const std::vector<LurchStepRun> corrRuns =
+                corroborateLurchEdges(line);
+            applyLurchSteps(corrRuns, winFloor.data(),
                             meanCount, width, 1.0, refinedY, nullptr);
 
             for (int s = 0; s < meanCount; ++s) {
