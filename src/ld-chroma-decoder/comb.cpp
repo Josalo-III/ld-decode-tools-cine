@@ -330,6 +330,40 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
              configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple))
             current->overlayMap(*previous, *next);
 
+        // LDCD_DUMP_CADMAP=1: one machine-readable line per output frame --
+        // film-frame letters, cadence ids, edit flags, and source field
+        // sequence numbers -- so per-frame probe statistics and per-frame
+        // render metrics can be joined on the true cadence identity instead
+        // of modular guesswork. Interleaves with the probe blocks in decode
+        // order on stderr.
+        {
+            static const bool dumpCadMap = std::getenv("LDCD_DUMP_CADMAP") != nullptr;
+            if (dumpCadMap) {
+                int cidT = -1000, cidB = -1000, seqT = -1, seqB = -1;
+                bool edT = false, edB = false;
+                if (fieldIndex < inputFields.size()) {
+                    cidT = inputFields[fieldIndex].field.cinemap.cadenceId;
+                    edT  = inputFields[fieldIndex].field.cinemap.isEditBoundary;
+                    seqT = inputFields[fieldIndex].field.seqNo;
+                }
+                if (fieldIndex + 1 < inputFields.size()) {
+                    cidB = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
+                    edB  = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
+                    seqB = inputFields[fieldIndex + 1].field.seqNo;
+                }
+                auto letter = [](int cid) -> char {
+                    if (cid == lddecode::kCadenceVideo) return 'i';
+                    if (cid == lddecode::kCadenceProgressive) return 'p';
+                    return cadenceKnown(cid) ? cadenceFilmLetter(cid) : '?';
+                };
+                std::fprintf(stderr,
+                    "CADMAP out=%d cidT=%d cidB=%d letT=%c letB=%c "
+                    "editT=%d editB=%d seqT=%d seqB=%d\n",
+                    frameIndex, cidT, cidB, letter(cidT), letter(cidB),
+                    (int)edT, (int)edB, seqT, seqB);
+            }
+        }
+
         // --- Visual Debug Overlays: Cadence / Film vs Video ------------------------
         if (configuration.debugCadence) {
             FrameCanvas canvas(componentFrames[frameIndex], videoParameters);
@@ -2496,6 +2530,18 @@ void Comb::FrameBuffer::split2D()
                 const float *fit = carrierFit_line(line);
                 std::fprintf(stderr, "1DDIAG f=%ld ln=%d c0=%d irescale=%.4f\n",
                              dumpFrame, line, c0, irescale);
+                // Colourburst columns (absolute h 40..130): per-line burst
+                // phase for field-to-field jitter correlation studies.
+                static const bool dumpBurst =
+                    std::getenv("LDCD_DUMP_1DDIAG_BURST") != nullptr;
+                if (dumpBurst) {
+                    std::fprintf(stderr, "BST");
+                    const int b0 = std::max(0, 40);
+                    const int b1 = std::min(left, 130);
+                    for (int hh = b0; hh < b1; ++hh)
+                        std::fprintf(stderr, " %u", (unsigned)raw[hh]);
+                    std::fprintf(stderr, "\n");
+                }
                 for (int pass = 0; pass < 4; ++pass) {
                     if (pass == 3 && !fit) break;
                     std::fprintf(stderr, pass == 0 ? "RAW" : pass == 1 ? "BP"
