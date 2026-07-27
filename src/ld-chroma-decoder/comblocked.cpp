@@ -6808,10 +6808,9 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         };
 
         long bridgedWindows = 0;
-        for (int line = bridgeOn ? firstLine : lastLine;
-             line < lastLine; ++line) {
+        auto bridgeLine = [&](int line) {
             const CombCarrierGrammar *gL = carrierGrammarLine(line);
-            if (!gL || !gL->grammarLocked) continue;
+            if (!gL || !gL->grammarLocked) return;
             const double *bpL = locked1DRawBandpass_line(line);
             float *fitL = carrierFit_flat.data()
                           + static_cast<size_t>(line) * demodWidth;
@@ -6819,7 +6818,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                               + static_cast<size_t>(line) * demodWidth;
             const double maxCarrierL =
                 std::max(24.0, gL->carrierScale * 5.0) * irescale;
-            if (!bpL) continue;
+            if (!bpL) return;
 
             double bIL[4], bQL[4];
             lineBasis(gL, bIL, bQL);
@@ -6921,6 +6920,19 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 }
                 ++bridgedWindows;
             }
+        };
+        if (bridgeOn) {
+            // Two sweeps, top-down then bottom-up: a window bridged in one
+            // sweep becomes a QUALIFYING PARTNER for the adjacent line later
+            // in sweep order, so cures cascade through multi-line dropout
+            // clusters from both intact boundary lines inward. Still
+            // selection under evidence at every step -- the cascade extends
+            // only where each adoption beats the collapsed fit on this
+            // line's own raw bandpass window.
+            for (int line = firstLine; line < lastLine; ++line)
+                bridgeLine(line);
+            for (int line = lastLine - 1; line >= firstLine; --line)
+                bridgeLine(line);
         }
         if (bridgeOn && std::getenv("LDCD_PROBE_OFFGRID"))
             std::fprintf(stderr, "[BRIDGE] windows adopted: %ld\n",
