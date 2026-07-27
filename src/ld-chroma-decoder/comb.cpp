@@ -2530,14 +2530,20 @@ void Comb::FrameBuffer::split2D()
                 const float *fit = carrierFit_line(line);
                 std::fprintf(stderr, "1DDIAG f=%ld ln=%d c0=%d irescale=%.4f\n",
                              dumpFrame, line, c0, irescale);
-                // Colourburst columns (absolute h 40..130): per-line burst
-                // phase for field-to-field jitter correlation studies.
+                // Colourburst columns from the METADATA window, not a guess:
+                // the first attempt hardcoded h 40..130, caught sync-edge
+                // energy, and measured deterministic line structure instead
+                // of jitter. The header carries the window bounds so the
+                // offline estimator knows exactly what it was given.
                 static const bool dumpBurst =
                     std::getenv("LDCD_DUMP_1DDIAG_BURST") != nullptr;
-                if (dumpBurst) {
-                    std::fprintf(stderr, "BST");
-                    const int b0 = std::max(0, 40);
-                    const int b1 = std::min(left, 130);
+                if (dumpBurst &&
+                    videoParameters.colourBurstStart >= 0 &&
+                    videoParameters.colourBurstEnd >
+                        videoParameters.colourBurstStart) {
+                    const int b0 = std::max(0, videoParameters.colourBurstStart);
+                    const int b1 = std::min(left, videoParameters.colourBurstEnd);
+                    std::fprintf(stderr, "BST b0=%d b1=%d", b0, b1);
                     for (int hh = b0; hh < b1; ++hh)
                         std::fprintf(stderr, " %u", (unsigned)raw[hh]);
                     std::fprintf(stderr, "\n");
