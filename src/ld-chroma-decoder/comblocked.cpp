@@ -4362,8 +4362,12 @@ void Comb::FrameBuffer::produceY()
                 // usually the correct one (otherwise this term would be
                 // reverse-boldness and re-select carrier). Gentle by gating,
                 // strong by magnitude: comb stays out of these spots without
-                // the election being starved elsewhere.
-                constexpr double kDarkestPenaltyIRE = 4.0;
+                // the election being starved elsewhere. The penalty rides the
+                // FULL roster spread (user, post knee measurement): the
+                // measured stripped-content transfer is comb ~= 1.5+0.25*ref,
+                // a 20+ IRE divergence at real peaks, so a fixed cap was the
+                // binding constraint against the physics. Gentleness lives in
+                // the gate, not a cap.
                 constexpr double kPeakSoftIRE = 8.0;
                 constexpr double kPeakHardIRE = 20.0;
                 int darkestIdx = 0;
@@ -4387,8 +4391,7 @@ void Comb::FrameBuffer::produceY()
                         std::max(illegalProof, impulseT) * peakT;
                     const double spread =
                         inHF[brightestIdx] - inHF[darkestIdx];
-                    darkestPenalty = lumaPeakGate *
-                        std::min(spread, kDarkestPenaltyIRE * irescale);
+                    darkestPenalty = lumaPeakGate * spread;
                 }
 
                 double resultHF = inHF[0];
