@@ -2182,28 +2182,22 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     }
     static long fb2Px, fb2TwoLeg, fb2OneLeg, fb2Cede, fb2Ctr, fb2Hold;
     static long fb2BoundaryLegs, fb2LumaZeroLegs, fb2IllegalLegs, fb2OuterSplit;
-    static long fb2StandPx; static double fb2StandSumIRE, fb2StandMaxIRE;
     static int fb2LastLine = -1;
     if (gCedeProbe.enabled) {
         if (lineNumber < fb2LastLine && fb2Px > 0) {
             std::fprintf(stderr,
                 "[FB2 ln=%d-%d col=%d-%d] px=%ld  two %.1f%% one %.1f%% "
                 "cede %.1f%% ctr %.1f%% hold %.1f%%  legs: boundary %.1f%% "
-                "lumaZero %.1f%% illegal %.1f%% outerSplit %.1f%%\n"
-                "  standing-sub at ceded px: %.1f%% of px, mean %.2f max %.2f IRE\n",
+                "lumaZero %.1f%% illegal %.1f%% outerSplit %.1f%%\n",
                 gCedeProbe.l0, std::min(gCedeProbe.l1, 9999),
                 gCedeProbe.c0, std::min(gCedeProbe.c1, 9999), fb2Px,
                 100.0 * fb2TwoLeg / fb2Px, 100.0 * fb2OneLeg / fb2Px,
                 100.0 * fb2Cede / fb2Px, 100.0 * fb2Ctr / fb2Px,
                 100.0 * fb2Hold / fb2Px,
                 50.0 * fb2BoundaryLegs / fb2Px, 50.0 * fb2LumaZeroLegs / fb2Px,
-                50.0 * fb2IllegalLegs / fb2Px, 100.0 * fb2OuterSplit / fb2Px,
-                100.0 * fb2StandPx / fb2Px,
-                fb2StandPx > 0 ? fb2StandSumIRE / fb2StandPx : 0.0,
-                fb2StandMaxIRE);
+                50.0 * fb2IllegalLegs / fb2Px, 100.0 * fb2OuterSplit / fb2Px);
             fb2Px = fb2TwoLeg = fb2OneLeg = fb2Cede = fb2Ctr = fb2Hold = 0;
             fb2BoundaryLegs = fb2LumaZeroLegs = fb2IllegalLegs = fb2OuterSplit = 0;
-            fb2StandPx = 0; fb2StandSumIRE = fb2StandMaxIRE = 0.0;
         }
         fb2LastLine = lineNumber;
     }
@@ -2215,76 +2209,6 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     if (probeLine) {
         probeReason.assign(width, 0);
         probeBand.assign(width, 0);
-    }
-
-    // ---- Multicolumn (band-uniform) verdicts -- DEFAULT ON ----------------
-    // User verdict 2026-07-27 (second pass): per-column decisions inside a
-    // chroma-boundary band manufacture the bikini fishboning / vertical
-    // lapel error class -- neighbouring columns answering the same boundary
-    // question differently render as an interleave of manufactured colours,
-    // and the errors reach the election. Dealbreaker. Field B is therefore
-    // the ERROR COMB: each contiguous boundary-band run takes ONE verdict
-    // per leg (aggregate evidence vs the aggregate leak bound, band-wide
-    // legality), clean over detailed. Aggregation also lifts the verdict
-    // out of the per-column noise floor (bare-column meanD 4-5 IRE sits AT
-    // the thresholds; a run average does not).
-    //
-    // Per-column stays reachable as LDCD_FB2_BANDUNIFORM=0: it is the
-    // candidate "detail comb" policy, intended to move to a SEPARATE
-    // election candidate (Field A taking the per-column baton) so detail
-    // and error-freedom compete in the election, not inside one comb.
-    static const bool useBandUniform = []{
-        const char *s = std::getenv("LDCD_FB2_BANDUNIFORM");
-        return !s || std::atoi(s) != 0;
-    }();
-
-    std::vector<std::uint8_t> inBandRun, bandUpAdmit, bandDownAdmit;
-    if (useBandUniform) {
-        inBandRun.assign(width, 0);
-        bandUpAdmit.assign(width, 0);
-        bandDownAdmit.assign(width, 0);
-        int x = 0;
-        while (x < width) {
-            const auto &r0 =
-                x < static_cast<int>(tapLine.intrafieldRegionReach.size())
-                    ? tapLine.intrafieldRegionReach[x] : unknownRegion;
-            if (!r0.chromaBoundaryBand) { ++x; continue; }
-            int xe = x;
-            while (xe < width) {
-                const auto &r =
-                    xe < static_cast<int>(tapLine.intrafieldRegionReach.size())
-                        ? tapLine.intrafieldRegionReach[xe] : unknownRegion;
-                if (!r.chromaBoundaryBand) break;
-                ++xe;
-            }
-            double sumUp = 0.0, sumDown = 0.0, sumBound = 0.0;
-            int nUp = 0, nDown = 0, n = 0;
-            bool upLegalAll = true, downLegalAll = true;
-            for (int i = x; i < xe; ++i) {
-                const auto &r =
-                    i < static_cast<int>(tapLine.intrafieldRegionReach.size())
-                        ? tapLine.intrafieldRegionReach[i] : unknownRegion;
-                sumBound += kBaseIRE + kKappa * hgAt[i];
-                ++n;
-                if (r.upDifferenceIRE > 0.0) { sumUp += r.upDifferenceIRE; ++nUp; }
-                if (r.downDifferenceIRE > 0.0) { sumDown += r.downDifferenceIRE; ++nDown; }
-                if (!(haveU && tapLine.pairU2[i].reachLegalGate > 0.0))
-                    upLegalAll = false;
-                if (!(haveD && tapLine.pairD2[i].reachLegalGate > 0.0))
-                    downLegalAll = false;
-            }
-            const double meanBound = n > 0 ? sumBound / n : kBaseIRE;
-            const bool upAdmit = upLegalAll &&
-                !(nUp > 0 && sumUp / nUp >= meanBound);
-            const bool downAdmit = downLegalAll &&
-                !(nDown > 0 && sumDown / nDown >= meanBound);
-            for (int i = x; i < xe; ++i) {
-                inBandRun[i] = 1;
-                bandUpAdmit[i] = upAdmit ? 1 : 0;
-                bandDownAdmit[i] = downAdmit ? 1 : 0;
-            }
-            x = xe;
-        }
     }
 
     for (int rel = 0; rel < width; ++rel) {
@@ -2364,60 +2288,27 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 wUp = 0.0;
         }
 
-        // Inside a boundary band the run's single verdict replaces every
-        // per-column content decision -- a column may not hold a private
-        // opinion along an edge.
-        if (useBandUniform && !inBandRun.empty() && inBandRun[rel]) {
-            wUp = bandUpAdmit[rel] ? 1.0 : 0.0;
-            wDown = bandDownAdmit[rel] ? 1.0 : 0.0;
+        // A chroma-boundary band cedes to center. Both evidence-driven
+        // reclaims of band territory were built and failed on real renders:
+        // per-column verdicts manufacture the fishboning/lapel interleave,
+        // and band-wide admission manufactures lateral mixing across the
+        // boundary (bikini diagonal, 2026-07-27). The band's original law
+        // stands -- one region, one render, and that render is the 1D.
+        // Detail at boundaries is a job for a separate election candidate,
+        // not for this comb.
+        if (region.chromaBoundaryBand) {
+            wUp = 0.0;
+            wDown = 0.0;
         }
 
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
-        double standingSubIRE = 0.0;
 
         double output;
         std::uint8_t reason;
         if (!useUp && !useDown) {
-            // Ceded output: the 1D carrier -- MINUS its provably-illegal
-            // standing component, bounded by the leak evidence.
-            //
-            // Any leg difference cancels a line-invariant (standing) carrier
-            // component by construction, so two-leg and one-leg outputs never
-            // carry it. Only this path can hand it through. But standing
-            // carrier at the anti-phase +-2 geometry is not expressible as
-            // encoder chroma (it would be vertical chroma at the alternation
-            // frequency itself); measured on the beach sentinel it is the
-            // bandpass leak of vertical luma edges -- 38% of carrier-band
-            // energy at strong image verticals vs 12% elsewhere -- and the
-            // +-1 midpoint downstream is structurally blind to it, so
-            // whatever passes here survives to the render.
-            //
-            // The naive standing estimate 0.5*(center + mean(legs)) also
-            // reads a REAL vertical chroma boundary as standing (chroma that
-            // fails to continue is line-variant in truth but not in this
-            // scalar), so the subtraction is capped by the same measured
-            // leak-transfer bound used for the verdicts: kappa*h*gate at
-            // corroborated lurch columns, zero where there is no luma-step
-            // evidence. A chroma boundary keeps everything the luma step
-            // cannot explain.
-            // LDCD_FB_NOSTAND=1: diagnostic A/B, disables the standing-leak
-            // subtraction so its contribution to render texture can be judged
-            // in one variable.
-            static const bool noStand = []{
-                const char *s = std::getenv("LDCD_FB_NOSTAND");
-                return s && std::atoi(s) != 0;
-            }();
             output = center;
-            if (!noStand && hgAt[rel] > 0.0f && haveU && haveD) {
-                const double sEst = 0.5 * (center + 0.5 * (up + down));
-                const double cap = kKappa * hgAt[rel] * irescale;
-                const double sSub = std::clamp(sEst, -cap, cap);
-                output = center - sSub;
-                standingSubIRE = sSub * invIreScale;
-            }
-            reason = (upBoundary || downBoundary ||
-                      (useBandUniform && !inBandRun.empty() && inBandRun[rel]))
+            reason = (upBoundary || downBoundary || region.chromaBoundaryBand)
                 ? FieldBReasonCede : FieldBReasonCenter;
         } else {
             const double denom = wUp + wDown;
@@ -2489,12 +2380,6 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 region.upDownHueDifferenceDeg >= 20.0 &&
                 region.upDownDifferenceIRE >= bound)
                 fb2OuterSplit++;
-            if (standingSubIRE != 0.0) {
-                fb2StandPx++;
-                fb2StandSumIRE += std::fabs(standingSubIRE);
-                fb2StandMaxIRE = std::max(fb2StandMaxIRE,
-                                          std::fabs(standingSubIRE));
-            }
         }
     }
 
