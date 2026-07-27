@@ -169,6 +169,130 @@ constexpr double KneeProbe::kEdge[KneeProbe::kBins];
 
 KneeProbe g_kneeProbe;
 
+// Off-grid leakage stats (LDCD_PROBE_OFFGRID=1). Measurement only. Stage 1
+// of the fit reset: a carrier waveform belongs to the span of the grammar
+// basis over every legal 4-sample window (the two quadrature waveforms span
+// the whole fSC subspace; off-span = DC + 2fSC content, which no lawful
+// carrier may carry). The per-sample scalar surgeries between the fit's
+// basis exit and publication push the emitted carrier out of that span, so
+// raw - fit carries OFF-GRID alternations the election cannot compare with
+// comb's on-grid residue. This measures the off-span energy fraction per
+// published carrier source, binned by window amplitude; the differential
+// against comb under the identical operator is the honest read (lawful
+// envelope motion leaks a little in any 4-sample window for every source).
+struct OffGridProbe {
+    std::mutex mu;
+    // [source: 0=fit 1=comb 2=locked1D][amplitude bin: <5, 5-15, >=15 IRE]
+    long   n[3][3]      = {};
+    double sumOff[3][3] = {};
+    double sumTot[3][3] = {};
+
+    static bool on()
+    {
+        static const bool v = []{
+            const char *s = std::getenv("LDCD_PROBE_OFFGRID");
+            return s && std::atoi(s) != 0;
+        }();
+        return v;
+    }
+
+    void sample(int src, int bin, double off, double tot)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ++n[src][bin];
+        sumOff[src][bin] += off;
+        sumTot[src][bin] += tot;
+    }
+
+    // Phase half: position, not span. A wrong-phase carrier is perfectly
+    // in-span; what damages the election is the fit's carrier sitting off
+    // POSITION -- rotated against the physical scalar and jittering window
+    // to window. Measured at strong windows only.
+    long   nPh = 0;
+    double sumDPhase = 0.0, sumAbsDPhase = 0.0;   // fit vs comb, radians
+    long   nJit[3] = {};
+    double sumJit[3] = {};                        // per-source |dphase/window|
+
+    void phasePair(double dphase)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ++nPh;
+        sumDPhase += dphase;
+        sumAbsDPhase += std::fabs(dphase);
+    }
+
+    void jitter(int src, double dphase)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ++nJit[src];
+        sumJit[src] += std::fabs(dphase);
+    }
+
+    // Dropout half: strong-window stats exclude exactly the failure the beam
+    // sheet showed -- windows where the fit's amplitude COLLAPSES while comb
+    // still carries the chroma. Split by the legality proof: at proven-
+    // illegal energy the "dropout" is the fit correctly refusing what comb
+    // wrongly models (virtuous); at legal carrier it is lost lock (the
+    // defect the reset must cure).
+    long nStrong[2] = {}, nDrop[2] = {};   // [0]=legal-ish, [1]=proven illegal
+
+    void dropout(bool fitDropped, bool provenIllegal)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ++nStrong[provenIllegal ? 1 : 0];
+        if (fitDropped) ++nDrop[provenIllegal ? 1 : 0];
+    }
+
+    ~OffGridProbe()
+    {
+        if (!on()) return;
+        static const char *kSrc[3] = {"fit      ", "comb     ", "locked1D "};
+        static const char *kBin[3] = {"<5 IRE ", "5-15   ", ">=15   "};
+        bool any = false;
+        for (int s = 0; s < 3 && !any; ++s)
+            for (int b = 0; b < 3; ++b)
+                if (n[s][b]) { any = true; break; }
+        if (!any) return;
+        std::fprintf(stderr,
+            "\n[OFFGRID] off-span energy fraction of the published carrier "
+            "(4-sample grammar-basis windows)\n");
+        for (int s = 0; s < 3; ++s) {
+            std::fprintf(stderr, "[OFFGRID] %s", kSrc[s]);
+            for (int b = 0; b < 3; ++b) {
+                if (n[s][b] > 0 && sumTot[s][b] > 1e-9)
+                    std::fprintf(stderr, "  %s%5.2f%% (n=%ld)", kBin[b],
+                                 100.0 * sumOff[s][b] / sumTot[s][b],
+                                 n[s][b]);
+                else
+                    std::fprintf(stderr, "  %s    --", kBin[b]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        if (nPh > 0)
+            std::fprintf(stderr,
+                "[OFFGRID] phase(fit vs comb) strong windows: mean %+.1f deg  "
+                "|mean| %.1f deg  (n=%ld)\n",
+                sumDPhase / nPh * 180.0 / M_PI,
+                sumAbsDPhase / nPh * 180.0 / M_PI, nPh);
+        static const char *kSrc2[3] = {"fit", "comb", "locked1D"};
+        for (int s = 0; s < 3; ++s)
+            if (nJit[s] > 0)
+                std::fprintf(stderr,
+                    "[OFFGRID] phase jitter %s: %.1f deg/window (n=%ld)\n",
+                    kSrc2[s], sumJit[s] / nJit[s] * 180.0 / M_PI, nJit[s]);
+        if (nStrong[0] + nStrong[1] > 0)
+            std::fprintf(stderr,
+                "[OFFGRID] fit amplitude dropout at comb-strong windows: "
+                "legal %.1f%% (n=%ld)  proven-illegal %.1f%% (n=%ld)\n",
+                nStrong[0] ? 100.0 * (double)nDrop[0] / (double)nStrong[0] : 0.0,
+                nStrong[0],
+                nStrong[1] ? 100.0 * (double)nDrop[1] / (double)nStrong[1] : 0.0,
+                nStrong[1]);
+    }
+};
+
+OffGridProbe g_offGrid;
+
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
@@ -3248,6 +3372,10 @@ void Comb::FrameBuffer::produceY()
     const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
 
+    // Off-grid leakage probe (measurement only; inert unless
+    // LDCD_PROBE_OFFGRID). All published carriers exist by this point.
+    probeOffGrid();
+
     // ---- HF-election diagnostic probe (no output influence) ----
     // Column/line gated per-pixel dump of the produceY HF luma election:
     // candidate roster + planes, self/neighbor/decision anchors, the winner,
@@ -5216,6 +5344,104 @@ void Comb::FrameBuffer::probeEdgePairClassMap(int line)
             std::fabs(cm) * invIreScale,
             std::fabs(2.0 * cm * sin4fsc(ph)) * invIreScale,
             std::fabs(2.0 * cm * cos4fsc(ph)) * invIreScale);
+    }
+}
+
+// Off-grid leakage of the published carriers (LDCD_PROBE_OFFGRID).
+// Measurement only. See OffGridProbe for what the numbers decide.
+void Comb::FrameBuffer::probeOffGrid()
+{
+    if (!OffGridProbe::on()) return;
+
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int width     = right - left;
+    if (width < 8 || firstLine >= lastLine) return;
+
+    const double floorTot = (0.5 * irescale) * (0.5 * irescale) * 4.0;
+
+    for (int line = firstLine; line < lastLine && line < demodLines; ++line) {
+        const CombCarrierGrammar *grammar = carrierGrammarLine(line);
+        if (!grammar || !grammar->grammarLocked) continue;
+        double bI4[4], bQ4[4];
+        for (int p = 0; p < 4; ++p) {
+            bI4[p] = (double)grammar->demodLUTTi[p];
+            bQ4[p] = (double)grammar->demodLUTTq[p];
+        }
+
+        const float  *fitRow  = carrierRetractedValid
+            ? carrierFit_line(line) : nullptr;
+        const double *combRow = lockedCarrierComposite_line(line);
+        const double *oneDRow = locked1DSource_line(line);
+        const lddecode::CarrierAnalysisRecord *anRow =
+            carrierAnalysis_line(line);
+
+        const double strongIRE = 8.0;
+        double lastPhase[3];
+        bool   havePhase[3] = {false, false, false};
+
+        for (int x = 0; x + 3 < width; x += 2) {
+            double Sii = 0, Siq = 0, Sqq = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int cls = carrierSampleClass(line, left + x + k);
+                Sii += bI4[cls] * bI4[cls];
+                Siq += bI4[cls] * bQ4[cls];
+                Sqq += bQ4[cls] * bQ4[cls];
+            }
+            const double det = Sii * Sqq - Siq * Siq;
+            if (std::fabs(det) < 1e-12) continue;
+
+            double phase[3];
+            bool   strong[3] = {false, false, false};
+            double amp[3] = {0.0, 0.0, 0.0};
+            auto solve = [&](int src, auto at) {
+                double SiY = 0, SqY = 0, Stt = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int cls = carrierSampleClass(line, left + x + k);
+                    const double v = at(x + k);
+                    SiY += bI4[cls] * v; SqY += bQ4[cls] * v; Stt += v * v;
+                }
+                amp[src] = std::sqrt(Stt * 0.25) * invIreScale;
+                if (Stt < floorTot) return;
+                const double p = ( Sqq * SiY - Siq * SqY) / det;
+                const double q = (-Siq * SiY + Sii * SqY) / det;
+                const double off = std::max(0.0, Stt - (p * SiY + q * SqY));
+                g_offGrid.sample(src, amp[src] < 5.0 ? 0 : amp[src] < 15.0 ? 1 : 2,
+                                 off, Stt);
+                if (amp[src] >= strongIRE) {
+                    phase[src] = std::atan2(q, p);
+                    strong[src] = true;
+                }
+            };
+            if (fitRow)  solve(0, [&](int xi) { return (double)fitRow[xi]; });
+            if (combRow) solve(1, [&](int xi) { return combRow[xi]; });
+            if (oneDRow) solve(2, [&](int xi) { return oneDRow[xi]; });
+
+            auto wrapPi = [](double a) {
+                while (a >  M_PI) a -= 2.0 * M_PI;
+                while (a < -M_PI) a += 2.0 * M_PI;
+                return a;
+            };
+            if (strong[0] && strong[1])
+                g_offGrid.phasePair(wrapPi(phase[0] - phase[1]));
+            if (fitRow && combRow && amp[1] >= strongIRE) {
+                const bool provenIllegal = anRow &&
+                    lddecode::carrierIllegalProof(
+                        (double)anRow[x + 1].carrierConformance,
+                        (double)anRow[x + 1].conformanceSupportFraction)
+                        >= 0.7;
+                g_offGrid.dropout(amp[0] < 0.5 * amp[1], provenIllegal);
+            }
+            for (int s = 0; s < 3; ++s) {
+                if (!strong[s]) { havePhase[s] = false; continue; }
+                if (havePhase[s])
+                    g_offGrid.jitter(s, wrapPi(phase[s] - lastPhase[s]));
+                lastPhase[s] = phase[s];
+                havePhase[s] = true;
+            }
+        }
     }
 }
 

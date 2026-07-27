@@ -423,6 +423,12 @@ public:
 	// pixels the evidence handoff must inform.
 	void probeEdgeFate(int dimensions);
 
+	// Off-grid leakage probe (LDCD_PROBE_OFFGRID). MEASUREMENT ONLY. Stage 1
+	// of the fit reset: fraction of each published carrier's energy outside
+	// the grammar-basis span per 4-sample window (off-span = DC + 2fSC,
+	// which no lawful carrier can carry).
+	void probeOffGrid();
+
 	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
 	// demodulated aperture views can bound the chroma at a luma step. Reads
 	// state only; writes nothing and changes no output. See comb.cpp.
