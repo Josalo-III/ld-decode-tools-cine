@@ -3339,6 +3339,9 @@ void Comb::FrameBuffer::produceY()
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
             const float *alienRow = regionAlienPartner_line(line);
+            // Star/impulse facts (single producer: compactLumaExcursionEvidence)
+            // for the impulse-seniority bias in the election scoring.
+            const AttributionEvidence *attribRow = attributionEvidence_line(line);
             // Retracted-admission mode (isolation switch for the cube/beach
             // A/B).  Default: conflicted fits admit retracted only with
             // neighbour spatial support.  LD_RETRACTED_ADMIT=trust restores
@@ -3661,6 +3664,12 @@ void Comb::FrameBuffer::produceY()
                 line >= 0 && line < (int)fvfMetrics.size() &&
                 (int)fvfMetrics[line].size() >= width;
             auto verticalStepAt = [&](int xi) {
+                // In Y the carrier phase no longer matters, so vertical
+                // evidence uses the IMMEDIATELY adjacent picture line whenever
+                // the cadence says the frame is progressive (telecine) --
+                // spacing was a carrier-relation concern, not a luma one.
+                if (carrierFrameVerticalAllowed(line))
+                    return 1;
                 if (variantFvf && haveFvfLine)
                     return fvfMetrics[line][xi].frameModel ? 1 : 2;
                 return variantFrameRegime ? 1 : 2;
@@ -3721,12 +3730,9 @@ void Comb::FrameBuffer::produceY()
             };
 
             // ld-disc-stacker primitives (mode 3/6), specialised for the small
-            // candidate set. medoid = robust self-center; closest = reconcile a
-            // nomination to it. closestImage nominates the candidate nearest a
-            // neighbour, with carrier-basis cleanliness as a capped penalty and
-            // image-supported HF as a separately capped preference.  The image
-            // preference is deliberately not a carrier classifier: it asks only
-            // whether a candidate's luma HF continues into the local picture.
+            // candidate set. medoid = robust self-center (agreement fast path
+            // and the no-neighbour fallback); closest reconciles a nomination
+            // to it. The full election scoring lives inline below.
             auto medoidD = [](const double *a, int n) -> double {
                 if (n == 1) return a[0];
                 if (n == 2) return 0.5 * (a[0] + a[1]);
@@ -3743,44 +3749,6 @@ void Comb::FrameBuffer::produceY()
                 for (int i = 1; i < n; ++i)
                     if (std::fabs(target - a[i]) < std::fabs(target - best))
                         best = a[i];
-                return best;
-            };
-            auto closestImageD = [](const double *a, const double *carrierCleanliness,
-                                    const double *imagePref,
-                                    const double *crossColorReturnEvidence,
-                                    int n,
-                                    int referenceCount,
-                                    double target, double phaseCap,
-                                    double imageCap) -> double {
-                double sw[3];
-                const int refN = std::clamp(referenceCount, 1, n);
-                for (int i = 0; i < refN; ++i)
-                    sw[i] = carrierCleanliness[i];
-                for (int i = 0; i < refN; ++i)
-                    for (int j = i + 1; j < refN; ++j)
-                        if (sw[j] < sw[i]) std::swap(sw[i], sw[j]);
-                const double medianW = sw[refN / 2];
-                double best = a[0]; double bestCost = 1e300;
-                for (int i = 0; i < n; ++i) {
-                    double dist = std::fabs(target - a[i]);
-                    if (medianW > 0.0)
-                        dist += (std::max(0.0, medianW - carrierCleanliness[i]) /
-                                 medianW) * phaseCap;
-                    const double imageSupport =
-                        std::clamp(imagePref[i], 0.0, 1.0);
-                    dist -= imageSupport * imageCap;
-                    // This term is already an evidence-bounded carrier
-                    // reduction in sample units, but it is fit/aperture
-                    // evidence, not image geometry. Compact coloured edges can
-                    // make the return fit look locally successful while the
-                    // luma it publishes does not continue in the picture. Let
-                    // it help only to the degree the ordinary image tally
-                    // supports the candidate, so returned Y can cede cleanly at
-                    // those boundaries.
-                    dist -= imageSupport *
-                        std::max(0.0, crossColorReturnEvidence[i]);
-                    if (dist < bestCost) { bestCost = dist; best = a[i]; }
-                }
                 return best;
             };
 
@@ -4074,12 +4042,19 @@ void Comb::FrameBuffer::produceY()
                     }
                 }
 
-                // Inlier DQ around the center.
+                // Feasibility is the only DQ (stated doctrine, now enforced).
+                // The former inlier gate (|cand - center| <= inlierTol around
+                // a medoid that ties to comb on a 2-candidate roster) was a
+                // second centrist filter: it ejected the detailed candidate at
+                // exactly the pixels where it differed enough to matter, so
+                // the election's scoring never saw the contest. Outliers are
+                // bounded by the scoring itself -- a candidate far from every
+                // adjacent neighbour pays its full distance as cost.
                 int inIdx[3];
                 int nIn = 0;
                 for (int k = 0; k < nCand; ++k)
-                    if (std::fabs(candY[k] - center) <= inlierTol)
-                        inIdx[nIn++] = k;
+                    inIdx[nIn++] = k;
+                (void)center;
                 // The named cross-colour mask, rather than distance from the
                 // base center, admits returned Y. A distance gate here removes
                 // exactly the strong HF that the return exists to recover.
@@ -4199,14 +4174,52 @@ void Comb::FrameBuffer::produceY()
                                     retractedRow,
                                     coarseRow, coarseRow, h + 1);
 
-                // Positive image evidence for the elected top in the selected
-                // decomposition coordinate. The one selected coarse is already
-                // the LF output platform; it is never an election contestant.
-                double imagePref[3] = {0.0, 0.0, 0.0};
-                // Diagnostic-only split of imagePref into its two factors, so
-                // a dump can tell "the image did not support this candidate"
-                // (continuation ~ 0) from "this candidate carried no extra
-                // detail to support" (retained ~ 0).  Never read by policy.
+                // ---- Election scoring: neighbour boost + legality. ----
+                // (2026-07-26 redesign, user-directed.)
+                //
+                // The anchor machinery (medoid self-anchor averaged with an
+                // inlier-MEAN neighbour anchor) was a CENTRIST instrument:
+                // after boldness was removed (correctly -- it selected
+                // carrier) no pro-detail term remained, and softness became
+                // the election's default. The elected output left the sharp
+                // candidates' quality off to the side.
+                //
+                //   * NEIGHBOUR BOOST, not anchor. Each candidate's base cost
+                //     is its distance to the NEAREST immediately adjacent
+                //     neighbour top (E/W +-1; N/S +-1 wherever the cadence
+                //     allows frame-vertical -- in Y, carrier phase no longer
+                //     matters, so there is no spacing). Proximity to a real
+                //     neighbour value lowers cost; no mean is formed anywhere.
+                //   * LEGALITY is the pro-detail term, replacing boldness.
+                //     Retained HF above comb's top earns preference only in
+                //     proportion to the per-pixel PROOF that the energy
+                //     cannot be carrier (carrierIllegalProof on the
+                //     registered conformance). Detail wins only where it is
+                //     provably luma; dot crawl is provably carrier and earns
+                //     nothing. Legal-schedule errors remain -- some errors
+                //     are legal -- but the rest are cut down.
+                //   * Carrier-basis cleanliness stays as the capped caution.
+                //   * IMPULSE SENIORITY: at star/impulse pixels (the single
+                //     lumaImpulseRisk producer, kept as-is -- its job is
+                //     rescuing stars mangled by comb) retracted outranks comb
+                //     by a small bias.
+                //   * HIGH-CHROMA DEMOTION: retracted is demoted where the
+                //     measured chroma is strong (the tractor-beam checkers),
+                //     until the retracted product is clean there.
+                const double imagePrefCap =
+                    std::max(0.0, configuration.tunables.PRODUCE_Y_HF_IMAGE_PREFERENCE_IRE)
+                    * irescale;
+                const double proxTol =
+                    std::max(0.5, configuration.tunables.PRODUCE_Y_HF_CONTINUATION_IRE)
+                    * irescale;
+                constexpr double kImpulseRetractedBiasIRE = 1.0;
+                constexpr double kHighChromaSoftIRE      = 10.0;
+                constexpr double kHighChromaHardIRE      = 20.0;
+                constexpr double kHighChromaDemoteIRE    = 1.5;
+
+                // Diagnostics for the pyDiag dump: proximity01 and the earned
+                // legality reward (IRE) take the retired continuation/retained
+                // slots; the decision anchor is retired (no anchor exists).
                 double diagContinuation[3] = {
                     std::numeric_limits<double>::quiet_NaN(),
                     std::numeric_limits<double>::quiet_NaN(),
@@ -4217,116 +4230,87 @@ void Comb::FrameBuffer::produceY()
                     std::numeric_limits<double>::quiet_NaN(),
                     std::numeric_limits<double>::quiet_NaN()
                 };
-                if (nDir > 0) {
-                    double imageHF[3];
-                    for (int k = 0; k < nIn; ++k)
-                        imageHF[k] = inHF[k];
-
-                    double minMag = std::fabs(imageHF[0]);
-                    double maxMag = minMag;
-                    for (int k = 1; k < baseNIn; ++k) {
-                        const double m = std::fabs(imageHF[k]);
-                        minMag = std::min(minMag, m);
-                        maxMag = std::max(maxMag, m);
-                    }
-                    const double magSpan = maxMag - minMag;
-                    const double continuationTol =
-                        std::max(0.5, configuration.tunables.PRODUCE_Y_HF_CONTINUATION_IRE)
-                        * irescale;
-                    for (int k = 0; k < nIn; ++k) {
-                        double continuation = 0.0;
-                        for (int d = 0; d < nDir; ++d) {
-                            const double match = 1.0 -
-                                std::clamp(std::fabs(imageHF[k] - dirImageHF[d]) /
-                                           continuationTol, 0.0, 1.0);
-                            continuation = std::max(continuation, match);
-                        }
-                        const double retained = (magSpan > 1e-9)
-                            ? std::clamp((std::fabs(imageHF[k]) - minMag) /
-                                         magSpan, 0.0, 1.0)
-                            : 0.0;
-                        // BOLDNESS IS NOT EVIDENCE.
-                        //
-                        // imagePref used to be continuation * retained, where
-                        // `retained` is a pure magnitude RANK within the
-                        // roster. Measured on the Borg cube, that made the
-                        // product 88.7% just "which candidate is boldest"
-                        // (argmax(imagePref) == argmax(retained) 88.7%, vs
-                        // == argmax(continuation) only 24.6%): a boldness rank
-                        // wearing a near-constant 0.75 multiplier, presented
-                        // as image evidence.
-                        //
-                        // That is the wrong instrument for this band. The
-                        // largest |top| is not the most detailed candidate --
-                        // it is usually the one that kept the most CARRIER.
-                        // On the cube the retracted plane carries 92% of raw's
-                        // fSC energy (10.10 of 10.99) while its 2fSC content,
-                        // the bin where carrier cannot exist, is no better
-                        // than the other clean hypotheses. Rewarding boldness therefore buys
-                        // dot crawl and calls it detail, and it manufactures
-                        // 2fSC by selecting discontinuously: +12.5% above the
-                        // raw ceiling when boldness breaks ties, against +4.1%
-                        // when cleanliness does.
-                        //
-                        // Continuation alone is kept: it asks only whether a
-                        // candidate's HF continues into the local picture,
-                        // which is a statement about the image rather than
-                        // about the candidate's amplitude. `retained` is
-                        // retained (sic) for the diagnostic dump so the
-                        // decomposition stays visible.
-                        imagePref[k] = continuation;
-                        diagContinuation[k] = continuation;
-                        diagRetained[k] = retained;
-                    }
-                }
-
-                // Each neighbour nominates a real candidate. Carrier-basis
-                // cleanliness can caution; image continuation can affirm HF.
-                // Both terms are capped, so neither can defeat a large
-                // geometric disagreement with the neighbour.
-                const double imagePrefCap =
-                    std::max(0.0, configuration.tunables.PRODUCE_Y_HF_IMAGE_PREFERENCE_IRE)
-                    * irescale;
-                double noms[4]; int nNom = 0;
-                for (int d = 0; d < nDir; ++d)
-                    noms[nNom++] = closestImageD(
-                        inHF, inCarrierCleanliness, imagePref,
-                        inCrossColorReturnEvidence, nIn, baseNIn,
-                        dirHF[d],
-                        phasePenSamp, imagePrefCap);
-
-                double resultHF;
                 double diagNeighborAnchor = std::numeric_limits<double>::quiet_NaN();
-                double diagDecisionAnchor = std::numeric_limits<double>::quiet_NaN();
-                if (nNom > 0) {
-                    const double neighborSelection = closestD(noms, nNom, selfAnchor);
-                    // Mode-3 smart mean supplies the neighbour-side anchor.
-                    double s = 0.0; int c = 0;
-                    for (int k = 0; k < nIn; ++k)
-                        if (std::fabs(inHF[k] - neighborSelection) <= inlierTol) {
-                            s += inHF[k]; ++c;
+                const double diagDecisionAnchor = std::numeric_limits<double>::quiet_NaN();
+
+                // Capped-caution reference: median cleanliness of the base set.
+                double sw[3];
+                const int refN = std::clamp(baseNIn, 1, nIn);
+                for (int i = 0; i < refN; ++i)
+                    sw[i] = inCarrierCleanliness[i];
+                std::sort(sw, sw + refN);
+                const double medianW = sw[refN / 2];
+
+                const double combTopHere = candidateTopAt(0, h);
+                const double illegalProof = analysisRow
+                    ? lddecode::carrierIllegalProof(
+                          (double)analysisRow[xi].carrierConformance,
+                          (double)analysisRow[xi].conformanceSupportFraction)
+                    : 0.0;
+                const double impulseT = attribRow
+                    ? std::clamp(attribRow[xi].facts.lumaImpulseRisk, 0.0, 1.0)
+                    : 0.0;
+                // High chroma means LEGAL carrier energy. The raw remaining-
+                // carrier magnitude also counts confiscated illegal luma (the
+                // grid), which would demote retracted exactly where it should
+                // win; the illegal-proof share is excluded.
+                const double chromaT = std::clamp(
+                    (remainingCarrierMagnitudeOf(0, h) * invIreScale -
+                     kHighChromaSoftIRE) /
+                        (kHighChromaHardIRE - kHighChromaSoftIRE),
+                    0.0, 1.0) * (1.0 - illegalProof);
+
+                double resultHF = inHF[0];
+                {
+                    double bestCost = 1e300;
+                    for (int k = 0; k < nIn; ++k) {
+                        const int plane =
+                            (k < baseNIn) ? candPlane[inIdx[k]] : 4;
+                        // Neighbour boost: nearest adjacent top. With no
+                        // usable neighbour, the medoid stands in as the sole
+                        // fallback reference.
+                        double nd = 1e300, nv = selfAnchor;
+                        for (int d = 0; d < nDir; ++d) {
+                            const double dd = std::fabs(inHF[k] - dirHF[d]);
+                            if (dd < nd) { nd = dd; nv = dirHF[d]; }
                         }
-                    const double neighborAnchor = (c > 0) ? s / c : neighborSelection;
-                    // Reconcile the mode-6 self/neighbor anchors, then close
-                    // the election onto an actual candidate.  Returning the
-                    // anchor average here would manufacture a softened value
-                    // after the image preference had selected sharper HF.
-                    const double decisionAnchor = 0.5 * (selfAnchor + neighborAnchor);
-                    diagNeighborAnchor = neighborAnchor;
-                    diagDecisionAnchor = decisionAnchor;
-                    resultHF = closestImageD(
-                        inHF, inCarrierCleanliness, imagePref,
-                        inCrossColorReturnEvidence, nIn, baseNIn,
-                        decisionAnchor,
-                        phasePenSamp, imagePrefCap);
-                } else {
-                    // With no spatial nomination, still close onto a real
-                    // candidate. The medoid/mean is an anchor, not an output.
-                    resultHF = closestImageD(
-                        inHF, inCarrierCleanliness, imagePref,
-                        inCrossColorReturnEvidence, nIn, baseNIn,
-                        selfAnchor,
-                        phasePenSamp, imagePrefCap);
+                        if (nDir == 0)
+                            nd = std::fabs(inHF[k] - selfAnchor);
+                        const double proximity01 =
+                            1.0 - std::clamp(nd / proxTol, 0.0, 1.0);
+
+                        double cost = nd;
+                        if (medianW > 0.0)
+                            cost += (std::max(0.0,
+                                         medianW - inCarrierCleanliness[k]) /
+                                     medianW) * phasePenSamp;
+                        const double extra = std::isfinite(combTopHere)
+                            ? std::max(0.0, std::fabs(inHF[k]) -
+                                            std::fabs(combTopHere))
+                            : 0.0;
+                        const double legality =
+                            illegalProof * std::min(extra, imagePrefCap);
+                        cost -= legality;
+                        // Cross-colour return evidence helps only to the
+                        // degree the image supports the candidate, as before.
+                        cost -= proximity01 *
+                            std::max(0.0, inCrossColorReturnEvidence[k]);
+                        if (plane == 1)
+                            cost += chromaT * kHighChromaDemoteIRE * irescale -
+                                    impulseT * kImpulseRetractedBiasIRE *
+                                        irescale;
+                        if (k < 3) {
+                            diagContinuation[k] = proximity01;
+                            diagRetained[k] = legality * invIreScale;
+                        }
+                        // Strict < keeps roster order as the neutral
+                        // tie-break: coherent comb stays senior on ties.
+                        if (cost < bestCost) {
+                            bestCost = cost;
+                            resultHF = inHF[k];
+                            diagNeighborAnchor = nv;
+                        }
+                    }
                 }
 
                 const int winnerPlane = planeForTop(resultHF);
@@ -4409,8 +4393,9 @@ void Comb::FrameBuffer::produceY()
                         rawComplete, coarseRow, h) / irescale;
                     const int returnedIndex = returnedAdmitted
                         ? nIn - 1 : -1;
-                    const double returnedImagePref = returnedIndex >= 0
-                        ? imagePref[returnedIndex]
+                    const double returnedImagePref =
+                        (returnedIndex >= 0 && returnedIndex < 3)
+                        ? diagContinuation[returnedIndex]
                         : std::numeric_limits<double>::quiet_NaN();
                     const double returnedCcEvidence = returnedIndex >= 0
                         ? inCrossColorReturnEvidence[returnedIndex] / irescale
@@ -4447,12 +4432,12 @@ void Comb::FrameBuffer::produceY()
                                             "%.2f ", inCrossColorReturnEvidence[k] / irescale);
                     if (cep == 0) { ccEvStr[0] = '-'; ccEvStr[1] = 0; }
                     else ccEvStr[cep ? cep - 1 : 0] = 0;
-                    // Image evidence per admitted candidate, and its two
-                    // factors. imgPref = cont * retn.
+                    // Image evidence per admitted candidate: proximity01 (the
+                    // neighbour-boost factor) now fills the imgPref slot.
                     char imgStr[64]; int ip = 0;
-                    for (int k = 0; k < baseNIn && ip < 60; ++k)
+                    for (int k = 0; k < baseNIn && ip < 60 && k < 3; ++k)
                         ip += std::snprintf(imgStr + ip, sizeof(imgStr) - ip,
-                                            "%.3f ", imagePref[k]);
+                                            "%.3f ", diagContinuation[k]);
                     if (ip == 0) { imgStr[0] = '-'; imgStr[1] = 0; }
                     else imgStr[ip ? ip - 1 : 0] = 0;
                     char contStr[64]; int cnp = 0;
