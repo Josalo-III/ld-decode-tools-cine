@@ -6737,6 +6737,197 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         return;
 
     // ---------------------------------------------------------------
+    // Pass 1.75: vertical amplitude continuity for the fit (the beam fix).
+    //
+    // Measured (LDCD_PROBE_OFFGRID): on LEGAL carrier the fit holds lock on
+    // 95.7% (cube) / 99.9% (beach) of comb-strong windows -- the dropouts
+    // cluster on fast diagonal envelopes crossing texture (the tractor
+    // beam), where one 4-sample window's normal equations lose the carrier
+    // while the SAME COLUMN one line away holds it. Each dropout leaves the
+    // full lobe in retracted Y as a checker patch.
+    //
+    // The bridge is SELECTION UNDER EVIDENCE, never averaging: at a window
+    // whose fit amplitude collapsed while the canonical raw bandpass is
+    // strong and the energy is NOT proven-illegal (the grid's virtuous
+    // refusals stay refused), each grammar-locked vertical neighbour's fit
+    // is converted along the compatible rotation path -- partner locked
+    // frame -> common 4fsc -> this line's locked frame, through the burst
+    // phasors -- and remodulated on THIS line's basis. The candidate that
+    // explains this line's own raw bandpass window better than the
+    // collapsed fit does (and better than the other partner) is adopted
+    // whole. Adopted samples are then RESTRICTED as always: residual-
+    // consensus range and amplitude ceiling. No qualifying partner => the
+    // dropout stands -- an honest hole, never a synthetic patch.
+    //
+    // flatFloor at bridged windows still reflects the pre-bridge fit
+    // (sparse; revisit if Pass 2's gates misbehave at bridged columns).
+    // Kill switch for A/B only: LDCD_FIT_BRIDGE=0.
+    {
+        static const bool bridgeOn = []{
+            const char *s = std::getenv("LDCD_FIT_BRIDGE");
+            return !s || std::atoi(s) != 0;
+        }();
+        static const double kBridgeRawStrongIRE = 8.0;
+        static const double kBridgeCollapse     = 0.4;
+        static const double kBridgePartnerHold  = 0.6;
+
+        std::vector<std::uint8_t> bridged(width);
+        auto lineBasis = [&](const CombCarrierGrammar *g, double *bI, double *bQ) {
+            for (int p = 0; p < 4; ++p) {
+                bI[p] = remodLockedToShiftedComposite(
+                    1.0, 0.0, p, g->burstCos, g->burstSin,
+                    spLUT_locked, cpLUT_locked);
+                bQ[p] = remodLockedToShiftedComposite(
+                    0.0, 1.0, p, g->burstCos, g->burstSin,
+                    spLUT_locked, cpLUT_locked);
+            }
+        };
+        // 4-sample window LS demod on a line basis; every window holds each
+        // class once, so the normal matrix is the same for all windows.
+        auto windowIQ = [&](const float *row, int x, int line,
+                            const double *bI, const double *bQ,
+                            double Sii, double Siq, double Sqq,
+                            double &io, double &qo) -> bool {
+            double SiY = 0.0, SqY = 0.0;
+            for (int k = 0; k < 4; ++k) {
+                const int cls = carrierSampleClass(line, left + x + k);
+                SiY += bI[cls] * (double)row[x + k];
+                SqY += bQ[cls] * (double)row[x + k];
+            }
+            const double det = Sii * Sqq - Siq * Siq;
+            if (std::fabs(det) < 1e-12) return false;
+            io = ( Sqq * SiY - Siq * SqY) / det;
+            qo = (-Siq * SiY + Sii * SqY) / det;
+            return true;
+        };
+        auto winRmsIRE = [&](const auto *row, int x) {
+            double e = 0.0;
+            for (int k = 0; k < 4; ++k)
+                e += (double)row[x + k] * (double)row[x + k];
+            return std::sqrt(e * 0.25) * invIreScale;
+        };
+
+        long bridgedWindows = 0;
+        for (int line = bridgeOn ? firstLine : lastLine;
+             line < lastLine; ++line) {
+            const CombCarrierGrammar *gL = carrierGrammarLine(line);
+            if (!gL || !gL->grammarLocked) continue;
+            const double *bpL = locked1DRawBandpass_line(line);
+            float *fitL = carrierFit_flat.data()
+                          + static_cast<size_t>(line) * demodWidth;
+            const auto *anL = carrierAnalysis_flat.data()
+                              + static_cast<size_t>(line) * demodWidth;
+            const double maxCarrierL =
+                std::max(24.0, gL->carrierScale * 5.0) * irescale;
+            if (!bpL) continue;
+
+            double bIL[4], bQL[4];
+            lineBasis(gL, bIL, bQL);
+            double SiiL = 0, SiqL = 0, SqqL = 0;
+            for (int p = 0; p < 4; ++p) {
+                SiiL += bIL[p] * bIL[p];
+                SiqL += bIL[p] * bQL[p];
+                SqqL += bQL[p] * bQL[p];
+            }
+
+            const int partnerStep = carrierFrameVerticalAllowed(line) ? 1 : 2;
+            std::fill(bridged.begin(), bridged.end(), std::uint8_t{0});
+
+            for (int x = 0; x + 3 < width; ++x) {
+                if (bridged[x]) continue;
+                const double rawAmp = winRmsIRE(bpL, x);
+                if (rawAmp < kBridgeRawStrongIRE) continue;
+                if (winRmsIRE(fitL, x) >= kBridgeCollapse * rawAmp) continue;
+                if (lddecode::carrierIllegalProof(
+                        (double)anL[x + 1].carrierConformance,
+                        (double)anL[x + 1].conformanceSupportFraction) >= 0.7)
+                    continue;
+
+                double errOwn = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    const double d = bpL[x + k] - (double)fitL[x + k];
+                    errOwn += d * d;
+                }
+
+                double bestErr = errOwn;
+                double bestC[4];
+                bool haveBest = false;
+                for (int dp = -partnerStep; dp <= partnerStep;
+                     dp += 2 * partnerStep) {
+                    const int lp = line + dp;
+                    if (lp < firstLine || lp >= lastLine) continue;
+                    const CombCarrierGrammar *gP = carrierGrammarLine(lp);
+                    if (!gP || !gP->grammarLocked) continue;
+                    const double *bpP = locked1DRawBandpass_line(lp);
+                    const float *fitP = carrierFit_flat.data()
+                                        + static_cast<size_t>(lp) * demodWidth;
+                    const auto *anP = carrierAnalysis_flat.data()
+                                      + static_cast<size_t>(lp) * demodWidth;
+                    if (!bpP) continue;
+                    // Partner must HOLD lock on its own raw band, lawfully.
+                    const double rawAmpP = winRmsIRE(bpP, x);
+                    if (rawAmpP < kBridgeRawStrongIRE) continue;
+                    if (winRmsIRE(fitP, x) < kBridgePartnerHold * rawAmpP)
+                        continue;
+                    if (lddecode::carrierIllegalProof(
+                            (double)anP[x + 1].carrierConformance,
+                            (double)anP[x + 1].conformanceSupportFraction)
+                            >= 0.7)
+                        continue;
+
+                    double bIP[4], bQP[4];
+                    lineBasis(gP, bIP, bQP);
+                    double SiiP = 0, SiqP = 0, SqqP = 0;
+                    for (int p = 0; p < 4; ++p) {
+                        SiiP += bIP[p] * bIP[p];
+                        SiqP += bIP[p] * bQP[p];
+                        SqqP += bQP[p] * bQP[p];
+                    }
+                    double iP, qP;
+                    if (!windowIQ(fitP, x, lp, bIP, bQP,
+                                  SiiP, SiqP, SqqP, iP, qP))
+                        continue;
+                    // Compatible rotation path: partner locked -> 4fsc ->
+                    // this line's locked frame.
+                    double i4, q4, iL, qL;
+                    lockedTo4fsc(iP, qP, gP->burstCos, gP->burstSin, i4, q4);
+                    fourfscToLocked(i4, q4, gL->burstCos, gL->burstSin,
+                                    iL, qL);
+                    double c[4];
+                    double err = 0.0;
+                    for (int k = 0; k < 4; ++k) {
+                        const int cls = carrierSampleClass(line, left + x + k);
+                        c[k] = iL * bIL[cls] + qL * bQL[cls];
+                        const double d = bpL[x + k] - c[k];
+                        err += d * d;
+                    }
+                    if (err < bestErr) {
+                        bestErr = err;
+                        for (int k = 0; k < 4; ++k) bestC[k] = c[k];
+                        haveBest = true;
+                    }
+                }
+                if (!haveBest) continue;
+
+                for (int k = 0; k < 4; ++k) {
+                    double nv = bestC[k];
+                    const auto &pp = anL[x + k].parallax;
+                    if (pp.residualValid)
+                        nv = std::clamp(nv, (double)pp.residualLo,
+                                            (double)pp.residualHi);
+                    nv = std::clamp(nv, -maxCarrierL, maxCarrierL);
+                    fitL[x + k] = static_cast<float>(nv);
+                    bridged[x + k] = 1;
+                }
+                ++bridgedWindows;
+            }
+        }
+        if (bridgeOn && std::getenv("LDCD_PROBE_OFFGRID"))
+            std::fprintf(stderr, "[BRIDGE] windows adopted: %ld\n",
+                         bridgedWindows);
+    }
+
+    // ---------------------------------------------------------------
     // RETIRED: the locked-1D repair return path.
     //
     // This used to add `locked1DParallaxRepairDelta` into carrierFit, to keep
