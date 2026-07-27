@@ -2211,6 +2211,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         probeBand.assign(width, 0);
     }
 
+    // Publish band membership for downstream band-uniform laws (Y election).
+    std::uint8_t *bandOut = chromaBoundaryBand_line(lineNumber);
+
     for (int rel = 0; rel < width; ++rel) {
         const double rawCenter = tapLine.tap0[rel].raw;
         const double center = tapLine.tap0[rel].comp;
@@ -2287,6 +2290,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             else
                 wUp = 0.0;
         }
+
+        if (bandOut) bandOut[rel] = region.chromaBoundaryBand ? 1 : 0;
 
         // A chroma-boundary band cedes to center. Both evidence-driven
         // reclaims of band territory were built and failed on real renders:

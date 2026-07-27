@@ -890,6 +890,10 @@ private:
 	std::vector<double> scratch_frameBReachUp;
 	std::vector<double> scratch_frameBReachDown;
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;
+	// Chroma-boundary band membership per sample, published by Field B's
+	// region consumption for downstream band-uniform laws (the Y election's
+	// band cede). 1 = inside a chromaBoundaryBand run on that line.
+	std::vector<std::uint8_t> chromaBoundaryBand_flat;
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
 		//
 		// locked1DSource_flat is the locked-path video 1D scalar, declared as
@@ -1109,6 +1113,18 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    fieldBDecisionReason_flat.empty()) return nullptr;
 		return fieldBDecisionReason_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline std::uint8_t *chromaBoundaryBand_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    chromaBoundaryBand_flat.empty()) return nullptr;
+		return chromaBoundaryBand_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const std::uint8_t *chromaBoundaryBand_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    chromaBoundaryBand_flat.empty()) return nullptr;
+		return chromaBoundaryBand_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	inline CombCarrierGrammar *carrierGrammarLine(int line) {

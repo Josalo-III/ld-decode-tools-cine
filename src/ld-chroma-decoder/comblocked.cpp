@@ -3542,6 +3542,7 @@ void Comb::FrameBuffer::produceY()
                     ? coarseFloor_line(line)
                     : nullptr;
             const double *oneDRow = locked1DSource_line(line); // may be null
+            const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
             const float *alienRow = regionAlienPartner_line(line);
@@ -4527,7 +4528,29 @@ void Comb::FrameBuffer::produceY()
                 }
 
                 double resultHF = inHF[0];
-                {
+                // Y-election band cede. Measured at the bikini-diagonal teeth
+                // (2026-07-27): inside a chroma-boundary band every candidate's
+                // top deviates by up to ~11 IRE from mono -- none is
+                // trustworthy -- and the per-column winner flips comb/retracted
+                // 46/54, a decision interleave at maximal spread. That
+                // interleave IS the witness fishboning, the same crime as the
+                // Field B per-column verdicts, relocated to the Y election.
+                // A boundary band takes ONE decision: the comb candidate (the
+                // error-comb chain: Field B ceded to 1D there, so this is the
+                // soft, artifact-free reconstruction). Scoring resumes outside
+                // bands. Field-B-less variants (line) publish no band plane
+                // and are unaffected.
+                bool bandCede = false;
+                if (bandRow && bandRow[xi]) {
+                    for (int k = 0; k < baseNIn; ++k) {
+                        if (candPlane[inIdx[k]] == 0) {
+                            resultHF = inHF[k];
+                            bandCede = true;
+                            break;
+                        }
+                    }
+                }
+                if (!bandCede) {
                     double bestCost = 1e300;
                     for (int k = 0; k < nIn; ++k) {
                         const int plane =

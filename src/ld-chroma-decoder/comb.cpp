@@ -479,6 +479,10 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             w2d_frame_weight.assign(lines, std::vector<float>(width, 0.0f));
             fieldBDecisionReason_flat.assign(size_t(lines + 1) * size_t(width), FieldBReasonNone);
         }
+        // Band membership feeds the Y election's band cede on every locked
+        // decode that builds Field B; it must not depend on showMap.
+        if (wantLocked)
+            chromaBoundaryBand_flat.assign(size_t(lines + 1) * size_t(width), 0);
         // FVF-only data and scratch.
         if (wantFvf) {
             w2d_fieldA_gate.assign(lines, std::vector<double>(width, 1.0f));
