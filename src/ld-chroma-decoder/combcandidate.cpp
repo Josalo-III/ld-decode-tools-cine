@@ -2217,6 +2217,76 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         probeBand.assign(width, 0);
     }
 
+    // ---- Multicolumn (band-uniform) verdicts -- DEFAULT ON ----------------
+    // User verdict 2026-07-27 (second pass): per-column decisions inside a
+    // chroma-boundary band manufacture the bikini fishboning / vertical
+    // lapel error class -- neighbouring columns answering the same boundary
+    // question differently render as an interleave of manufactured colours,
+    // and the errors reach the election. Dealbreaker. Field B is therefore
+    // the ERROR COMB: each contiguous boundary-band run takes ONE verdict
+    // per leg (aggregate evidence vs the aggregate leak bound, band-wide
+    // legality), clean over detailed. Aggregation also lifts the verdict
+    // out of the per-column noise floor (bare-column meanD 4-5 IRE sits AT
+    // the thresholds; a run average does not).
+    //
+    // Per-column stays reachable as LDCD_FB2_BANDUNIFORM=0: it is the
+    // candidate "detail comb" policy, intended to move to a SEPARATE
+    // election candidate (Field A taking the per-column baton) so detail
+    // and error-freedom compete in the election, not inside one comb.
+    static const bool useBandUniform = []{
+        const char *s = std::getenv("LDCD_FB2_BANDUNIFORM");
+        return !s || std::atoi(s) != 0;
+    }();
+
+    std::vector<std::uint8_t> inBandRun, bandUpAdmit, bandDownAdmit;
+    if (useBandUniform) {
+        inBandRun.assign(width, 0);
+        bandUpAdmit.assign(width, 0);
+        bandDownAdmit.assign(width, 0);
+        int x = 0;
+        while (x < width) {
+            const auto &r0 =
+                x < static_cast<int>(tapLine.intrafieldRegionReach.size())
+                    ? tapLine.intrafieldRegionReach[x] : unknownRegion;
+            if (!r0.chromaBoundaryBand) { ++x; continue; }
+            int xe = x;
+            while (xe < width) {
+                const auto &r =
+                    xe < static_cast<int>(tapLine.intrafieldRegionReach.size())
+                        ? tapLine.intrafieldRegionReach[xe] : unknownRegion;
+                if (!r.chromaBoundaryBand) break;
+                ++xe;
+            }
+            double sumUp = 0.0, sumDown = 0.0, sumBound = 0.0;
+            int nUp = 0, nDown = 0, n = 0;
+            bool upLegalAll = true, downLegalAll = true;
+            for (int i = x; i < xe; ++i) {
+                const auto &r =
+                    i < static_cast<int>(tapLine.intrafieldRegionReach.size())
+                        ? tapLine.intrafieldRegionReach[i] : unknownRegion;
+                sumBound += kBaseIRE + kKappa * hgAt[i];
+                ++n;
+                if (r.upDifferenceIRE > 0.0) { sumUp += r.upDifferenceIRE; ++nUp; }
+                if (r.downDifferenceIRE > 0.0) { sumDown += r.downDifferenceIRE; ++nDown; }
+                if (!(haveU && tapLine.pairU2[i].reachLegalGate > 0.0))
+                    upLegalAll = false;
+                if (!(haveD && tapLine.pairD2[i].reachLegalGate > 0.0))
+                    downLegalAll = false;
+            }
+            const double meanBound = n > 0 ? sumBound / n : kBaseIRE;
+            const bool upAdmit = upLegalAll &&
+                !(nUp > 0 && sumUp / nUp >= meanBound);
+            const bool downAdmit = downLegalAll &&
+                !(nDown > 0 && sumDown / nDown >= meanBound);
+            for (int i = x; i < xe; ++i) {
+                inBandRun[i] = 1;
+                bandUpAdmit[i] = upAdmit ? 1 : 0;
+                bandDownAdmit[i] = downAdmit ? 1 : 0;
+            }
+            x = xe;
+        }
+    }
+
     for (int rel = 0; rel < width; ++rel) {
         const double rawCenter = tapLine.tap0[rel].raw;
         const double center = tapLine.tap0[rel].comp;
@@ -2294,6 +2364,14 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 wUp = 0.0;
         }
 
+        // Inside a boundary band the run's single verdict replaces every
+        // per-column content decision -- a column may not hold a private
+        // opinion along an edge.
+        if (useBandUniform && !inBandRun.empty() && inBandRun[rel]) {
+            wUp = bandUpAdmit[rel] ? 1.0 : 0.0;
+            wDown = bandDownAdmit[rel] ? 1.0 : 0.0;
+        }
+
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
         double standingSubIRE = 0.0;
@@ -2323,15 +2401,23 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             // corroborated lurch columns, zero where there is no luma-step
             // evidence. A chroma boundary keeps everything the luma step
             // cannot explain.
+            // LDCD_FB_NOSTAND=1: diagnostic A/B, disables the standing-leak
+            // subtraction so its contribution to render texture can be judged
+            // in one variable.
+            static const bool noStand = []{
+                const char *s = std::getenv("LDCD_FB_NOSTAND");
+                return s && std::atoi(s) != 0;
+            }();
             output = center;
-            if (hgAt[rel] > 0.0f && haveU && haveD) {
+            if (!noStand && hgAt[rel] > 0.0f && haveU && haveD) {
                 const double sEst = 0.5 * (center + 0.5 * (up + down));
                 const double cap = kKappa * hgAt[rel] * irescale;
                 const double sSub = std::clamp(sEst, -cap, cap);
                 output = center - sSub;
                 standingSubIRE = sSub * invIreScale;
             }
-            reason = (upBoundary || downBoundary)
+            reason = (upBoundary || downBoundary ||
+                      (useBandUniform && !inBandRun.empty() && inBandRun[rel]))
                 ? FieldBReasonCede : FieldBReasonCenter;
         } else {
             const double denom = wUp + wDown;
