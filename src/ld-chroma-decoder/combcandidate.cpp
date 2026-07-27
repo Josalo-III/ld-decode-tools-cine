@@ -447,6 +447,42 @@ struct FrameBProbe {
     double vAlt1 = 0, vStand1 = 0, vAlt2 = 0, vStand2 = 0; long vBpN = 0;
     double oAlt1 = 0, oStand1 = 0, oAlt2 = 0, oStand2 = 0; long oBpN = 0;
 
+    // Up/down leak asymmetry at verticals, from the carrier-free aperture
+    // means: the alternating alien per line follows that line's lateral
+    // luma curvature (leak = -0.25 * D^2_2 Y), so the +-1 midpoint's
+    // residual fraction is |D2up - D2dn| / (D2up + D2dn). If this ratio is
+    // large, a_up != a_dn and the midpoint CANNOT null the alien -- the
+    // 29% delivery is then a model limit, not a licence problem.
+    double vAsymSum = 0, vD2Sum = 0, vPairSum = 0; long vAsymN = 0, vAsymHi = 0;
+    double acSum = 0, acMax = 0; long acN = 0, acAllN = 0;
+
+    void noteAsymCorr(double ire)
+    {
+        acAllN++;
+        if (ire > 0.0) { acN++; acSum += ire; acMax = std::max(acMax, ire); }
+    }
+
+    // kappa_FB regression: |pairDiff| (IQ IRE, = the alien SUM the +-1 pair
+    // exposes) against (D2u + D2d) (composite IRE, the luma prediction of
+    // that same sum). The slope carries BOTH the leak transfer and the
+    // fullSignedIQ-vs-composite scale factor, which is exactly what the
+    // residual predictor needs. Restricted to strong verticals with a clear
+    // alien signature so real vertical chroma difference does not dominate.
+    double kX = 0, kY = 0, kXX = 0, kXY = 0, kYY = 0; long kN = 0;
+
+    void noteKappa(double d2sum, double pairIRE)
+    {
+        kX += d2sum; kY += pairIRE; kXX += d2sum * d2sum;
+        kXY += d2sum * pairIRE; kYY += pairIRE * pairIRE; kN++;
+    }
+
+    void noteAsym(double r, double d2SumIRE, double pairIRE)
+    {
+        vAsymSum += r; vD2Sum += d2SumIRE; vPairSum += pairIRE;
+        vAsymN++;
+        if (r > 0.5) vAsymHi++;
+    }
+
     void noteBp(bool vertical, double alt1, double stand1,
                 double alt2, double stand2)
     {
@@ -575,6 +611,35 @@ struct FrameBProbe {
                     100.0 * V.reachZero * e);
             }
         }
+        if (acAllN > 0) {
+            std::fprintf(stderr,
+                "  leak-asymmetry correction: fired on %.1f%% of px, "
+                "mean %.2f max %.2f IRE\n",
+                100.0 * acN / acAllN,
+                acN > 0 ? acSum / acN : 0.0, acMax);
+        }
+        if (kN > 2) {
+            const double mx = kX / kN, my = kY / kN;
+            const double vxx = kXX / kN - mx * mx;
+            const double vyy = kYY / kN - my * my;
+            const double vxy = kXY / kN - mx * my;
+            const double slope = vxx > 1e-9 ? vxy / vxx : 0.0;
+            const double r = (vxx > 1e-9 && vyy > 1e-9)
+                ? vxy / std::sqrt(vxx * vyy) : 0.0;
+            std::fprintf(stderr,
+                "  kappa_FB regression (n=%ld): |pairDiff| = %.3f * (D2u+D2d) "
+                "+ %.2f  | r=%.3f  | meanD2sum %.1f meanPair %.2f IRE\n",
+                kN, slope, my - slope * mx, r, mx, my);
+        }
+        if (vAsymN > 0) {
+            std::fprintf(stderr,
+                "  leak asymmetry @verticals: mean |D2u-D2d|/(D2u+D2d) %.2f "
+                "(r>0.5: %.0f%%) | mean D2 sum %.1f IRE | mean |pairDiff| %.2f IRE | "
+                "predicted midpoint delivery %.0f%%\n",
+                vAsymSum / vAsymN, 100.0 * vAsymHi / vAsymN,
+                vD2Sum / vAsymN, vPairSum / vAsymN,
+                100.0 * (1.0 - vAsymSum / vAsymN));
+        }
         if (vBpN > 0 && oBpN > 0) {
             std::fprintf(stderr,
                 "  bandpass split @verticals: +-1 alt %.2f stand %.2f (%.0f%% standing) | "
@@ -595,6 +660,9 @@ struct FrameBProbe {
         for (Bucket &A : alienB) A = Bucket();
         for (Bucket &V : vertB) V = Bucket();
         vSumReachBase = vSumExempt = vSumReach = 0.0; vN = 0;
+        vAsymSum = vD2Sum = vPairSum = 0.0; vAsymN = vAsymHi = 0;
+        acSum = acMax = 0.0; acN = acAllN = 0;
+        kX = kY = kXX = kXY = kYY = 0.0; kN = 0;
         vAlt1 = vStand1 = vAlt2 = vStand2 = 0.0; vBpN = 0;
         oAlt1 = oStand1 = oAlt2 = oStand2 = 0.0; oBpN = 0;
         noSymEvidence = noSymEvidenceAlien = 0;
@@ -3342,6 +3410,7 @@ void Comb::FrameBuffer::computeFrameBLine(
                 diagSigma = alienSign;
                 diagAlienGate = aGate;
                 diagCorrIRE = cmag(corr) * invIreScale;
+
             }
         }
 
@@ -3608,6 +3677,30 @@ void Comb::FrameBuffer::computeFrameBLine(
                     0.5 * std::fabs(b0 + m1) * invIreScale,
                     0.5 * std::fabs(b0 - m2) * invIreScale,
                     0.5 * std::fabs(b0 + m2) * invIreScale);
+                if (hIRE > 14.0) {
+                    const double *amU = lockedApertureMean_line(line - 1);
+                    const double *amD = lockedApertureMean_line(line + 1);
+                    const int meansCount = width - 3;
+                    if (amU && amD && x >= 2 && x + 2 < meansCount) {
+                        const double d2u = std::fabs(
+                            amU[x - 2] - 2.0 * amU[x] + amU[x + 2]) * invIreScale;
+                        const double d2d = std::fabs(
+                            amD[x - 2] - 2.0 * amD[x] + amD[x + 2]) * invIreScale;
+                        if (d2u + d2d > 2.0) {
+                            const double pairIRE =
+                                x < (int)scratch_fbPairDiff.size()
+                                    ? cmag(scratch_fbPairDiff[x]) * invIreScale
+                                    : 0.0;
+                            gFrameBProbe.noteAsym(
+                                std::fabs(d2u - d2d) / (d2u + d2d),
+                                d2u + d2d, pairIRE);
+                            const double aGk = x < (int)scratch_fbAlienGate.size()
+                                ? scratch_fbAlienGate[x] : 0.0;
+                            if (aGk > 0.5)
+                                gFrameBProbe.noteKappa(d2u + d2d, pairIRE);
+                        }
+                    }
+                }
             }
         }
         if (fbProbeThis) {
