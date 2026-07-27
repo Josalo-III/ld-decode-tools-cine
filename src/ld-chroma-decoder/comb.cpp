@@ -2437,6 +2437,117 @@ void Comb::FrameBuffer::split2D()
         return;
     }
 
+    // LDCD_OLD_SPLIT2D=1: diagnostic A/B only. Runs the classic ld-decode
+    // adaptive 2D kernel (pre-locked, pre-region-grammar) verbatim on the
+    // blind 1D bandpass, bypassing every modern protection. Purpose: render
+    // the UNPROTECTED error catalogue (e.g. the bikini-bottom upper shadow)
+    // that the chroma-boundary band was installed to quash, so the 2D
+    // threshold revisit can compare against what the guards actually buy.
+    static const bool oldSplit2D = []{
+        const char *s = std::getenv("LDCD_OLD_SPLIT2D");
+        return s && std::atoi(s) != 0;
+    }();
+    if (oldSplit2D) {
+        // Branch statistics for the rebuild study, windowed with the same
+        // envs as the cede probe (LDCD_PROBE_CEDE + _L0/_L1/_C0/_C1).
+        static const bool oldStats = std::getenv("LDCD_PROBE_CEDE") != nullptr;
+        static const auto envInt = [](const char *name, int fallback) {
+            const char *s = std::getenv(name);
+            return s ? std::atoi(s) : fallback;
+        };
+        static const int pL0 = envInt("LDCD_PROBE_CEDE_L0", 0);
+        static const int pL1 = envInt("LDCD_PROBE_CEDE_L1", 1 << 30);
+        static const int pC0 = envInt("LDCD_PROBE_CEDE_C0", 0);
+        static const int pC1 = envInt("LDCD_PROBE_CEDE_C1", 1 << 30);
+        static long o2FrameIdx = 0;
+        long nPx = 0, nTwoLeg = 0, nOneLeg = 0, nFallback = 0, nNone = 0;
+        double sumKp = 0.0, sumKn = 0.0, sumSc = 0.0;
+        long nScHot = 0;  // sc > 1.5: weak coherence being amplified
+
+        static constexpr double blackLine[MAX_WIDTH] = {0};
+        for (int lineNumber = firstLine; lineNumber < lastLine; lineNumber++) {
+            const double *previousLine = blackLine;
+            if (lineNumber - 2 >= firstLine)
+                previousLine = clpbuffer[0].pixel[lineNumber - 2];
+            const double *currentLine = clpbuffer[0].pixel[lineNumber];
+            const double *nextLine = blackLine;
+            if (lineNumber + 2 < lastLine)
+                nextLine = clpbuffer[0].pixel[lineNumber + 2];
+
+            for (int h = left; h < right; h++) {
+                double kp, kn;
+
+                kp  = fabs(fabs(currentLine[h]) - fabs(previousLine[h]));
+                kp += fabs(fabs(currentLine[h - 1]) - fabs(previousLine[h - 1]));
+                kp -= (fabs(currentLine[h]) + fabs(previousLine[h - 1])) * .10;
+                kn  = fabs(fabs(currentLine[h]) - fabs(nextLine[h]));
+                kn += fabs(fabs(currentLine[h - 1]) - fabs(nextLine[h - 1]));
+                kn -= (fabs(currentLine[h]) + fabs(nextLine[h - 1])) * .10;
+
+                const double kRange = 45 * irescale;
+                kp = qBound(0.0, 1 - (kp / kRange), 1.0);
+                kn = qBound(0.0, 1 - (kn / kRange), 1.0);
+
+                double sc = 1.0;
+                int branch;  // diagnostic only: 1 two-leg, 2 one-leg, 3 fallback-similar, 4 none
+
+                if ((kn > 0) || (kp > 0)) {
+                    if (kn > (3 * kp)) kp = 0;
+                    else if (kp > (3 * kn)) kn = 0;
+
+                    sc = (2.0 / (kn + kp));
+                    if (sc < 1.0) sc = 1.0;
+                    branch = (kp > 0 && kn > 0) ? 1 : 2;
+                } else {
+                    if ((fabs(fabs(previousLine[h]) - fabs(nextLine[h])) -
+                         fabs((nextLine[h] + previousLine[h]) * .2)) <= 0) {
+                        kn = kp = 1;
+                        branch = 3;
+                    } else {
+                        branch = 4;
+                    }
+                }
+
+                double tc1;
+                tc1  = ((currentLine[h] - previousLine[h]) * kp * sc);
+                tc1 += ((currentLine[h] - nextLine[h]) * kn * sc);
+                tc1 /= 4;
+
+                clpbuffer[1].pixel[lineNumber][h] = tc1;
+
+                if (oldStats &&
+                    lineNumber >= pL0 && lineNumber <= pL1 &&
+                    (h - left) >= pC0 && (h - left) <= pC1)
+                {
+                    nPx++;
+                    sumKp += kp; sumKn += kn; sumSc += sc;
+                    if (sc > 1.5) nScHot++;
+                    if (branch == 1) nTwoLeg++;
+                    else if (branch == 2) nOneLeg++;
+                    else if (branch == 3) nFallback++;
+                    else nNone++;
+                }
+            }
+            if (writeWeights && lineNumber < (int)w2d_frame_weight.size())
+                std::fill(w2d_frame_weight[lineNumber].begin(),
+                          w2d_frame_weight[lineNumber].end(), 0.0f);
+        }
+        if (oldStats && nPx > 0) {
+            std::fprintf(stderr,
+                "[OLD2D f=%ld ln=%d-%d col=%d-%d] px=%ld  "
+                "twoLeg %.1f%% oneLeg %.1f%% fallback %.1f%% none %.1f%%  "
+                "kp %.2f kn %.2f sc %.2f scHot(>1.5) %.1f%%\n",
+                o2FrameIdx, pL0, std::min(pL1, 9999), pC0, std::min(pC1, 9999),
+                nPx,
+                100.0 * nTwoLeg / nPx, 100.0 * nOneLeg / nPx,
+                100.0 * nFallback / nPx, 100.0 * nNone / nPx,
+                sumKp / nPx, sumKn / nPx, sumSc / nPx,
+                100.0 * nScHot / nPx);
+        }
+        o2FrameIdx++;
+        return;
+    }
+
     // The preclean ring is populated on demand below with Field B output, then
     // reused by Frame A as a second-stage scalar cancellation source.
     precleanRingLine = { -1, -1, -1 };

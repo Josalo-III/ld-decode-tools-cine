@@ -130,15 +130,6 @@ static inline double compactLumaExcursionEvidence(
 
 namespace {
 
-struct FieldBTapPolicy {
-    double upWeight = 0.0;
-    double downWeight = 0.0;
-    double centerCede = 0.0;
-};
-
-constexpr std::uint8_t FieldBCedeCenter       = 1u << 0;
-constexpr std::uint8_t FieldBCedeBoundaryBand = 1u << 1;
-
 constexpr std::uint8_t FieldACedeCenter       = 1u << 0;
 constexpr std::uint8_t FieldACedeStrongAsym   = 1u << 1;
 
@@ -187,213 +178,6 @@ std::uint8_t fieldARegionCedeFlags(
     return flags;
 }
 
-std::uint8_t fieldBRegionCedeFlags(
-    const CombContentReach::IntrafieldRegionReach &region)
-{
-    using R = CombContentReach::RegionRelation;
-
-    std::uint8_t flags = 0;
-
-    // The expanded band remains valid even when this particular column had
-    // no independently measurable center/leg region relationship.
-    if (region.chromaBoundaryBand) {
-        flags |= FieldBCedeCenter |
-                 FieldBCedeBoundaryBand;
-    }
-
-    if (!region.valid)
-        return flags;
-
-    const bool upDifferent = region.up == R::DifferentRegion;
-    const bool downDifferent = region.down == R::DifferentRegion;
-    const bool upSame = region.up == R::SameRegion;
-    const bool downSame = region.down == R::SameRegion;
-    const bool upAlien = region.up == R::AlienCancel;
-    const bool downAlien = region.down == R::AlienCancel;
-    const bool upContinues = upSame || upAlien;
-    const bool downContinues = downSame || downAlien;
-
-    if (region.centerIsland)
-        flags |= FieldBCedeCenter;
-
-    if (region.strongAsym)
-        flags |= FieldBCedeCenter;
-        
-    if ((upDifferent && !downContinues) ||
-        (downDifferent && !upContinues))
-        flags |= FieldBCedeCenter;
-
-    constexpr double strongSameMax = 3.25;
-    constexpr double weakSameMax = 4.25;
-    constexpr double rejectMin = 5.25;
-    constexpr double rejectGap = 2.25;
-    auto credibleOneSide = [&](double sameDiff, double rejectDiff) {
-        return sameDiff <= strongSameMax ||
-            (sameDiff <= weakSameMax && rejectDiff >= rejectMin &&
-             rejectDiff - sameDiff >= rejectGap);
-    };
-    if (upDifferent && downSame &&
-        !credibleOneSide(region.downDifferenceIRE, region.upDifferenceIRE))
-        flags |= FieldBCedeCenter;
-    if (downDifferent && upSame &&
-        !credibleOneSide(region.upDifferenceIRE, region.downDifferenceIRE))
-        flags |= FieldBCedeCenter;
-
-    // No cancellation opportunity.  Field B cancels center against a WEIGHTED
-    // MIX of its two legs, so the method presupposes the legs share a chroma
-    // to cancel against.  When they carry different colours that mix is a
-    // colour present on NEITHER line, and differencing center against it
-    // manufactures the boundary zipper -- whatever center itself happens to
-    // be.  The opportunity is a property of the LEGS; center's own
-    // relationship to either of them cannot create one.
-    //
-    // Every other cede path here is keyed on center-vs-leg separation
-    // (centerIsland, the strongAsym band, the credibleOneSide tests, and the
-    // evaluator's destructiveFieldBTriplet, which requires centerSeparated).
-    // A center sitting ON the boundary is a blend, hence close to at least one
-    // leg, so it escaped all of them -- and where the boundary is chroma-only
-    // the lateral hEdge test in resolveFieldBPolicy never fires either.
-    //
-    // AlienCancel is SELF-EXEMPTING and needs no special case: anti-aligned
-    // partners are each ~= -center, so after relation alignment they agree
-    // with EACH OTHER and cannot trip this test.  That is precisely what keeps
-    // the vertical-alternation cancellation intact -- the class this comb
-    // exists to remove is the class whose legs agree.
-    //
-    // Mirrors the evaluator's own hue law (kDifferentHueDeg) so the file keeps
-    // one definition of "different colour"; outerComparable is the validity
-    // fact and must gate the read.
-    constexpr double kOuterDifferentHueDeg = 20.0;
-    if (region.outerComparable &&
-        region.upDownHueDifferenceDeg >= kOuterDifferentHueDeg)
-        flags |= FieldBCedeCenter;
-
-    // Field B is the aggressive two-line alternative. AlienCancel is direct
-    // evidence that this leg can remove center contamination; unlike Field A,
-    // it does not require a second admitted leg to authorize that operation.
-    return flags;
-}
-
-FieldBTapPolicy resolveFieldBPolicy(
-    const CombContentReach::IntrafieldRegionReach &region,
-    std::uint8_t cedeFlags,
-    double upWeight,
-    double downWeight,
-    double horizontalLumaDeltaIRE,
-    double horizontalLumaEdgeThresholdIRE,
-    double upCoarseLumaDeltaIRE,
-    double downCoarseLumaDeltaIRE)
-{
-    using R = CombContentReach::RegionRelation;
-    FieldBTapPolicy out;
-    out.upWeight = std::clamp(upWeight, 0.0, 1.0);
-    out.downWeight = std::clamp(downWeight, 0.0, 1.0);
-
-    auto fullCede = [&]() -> FieldBTapPolicy {
-        out.upWeight = 0.0;
-        out.downWeight = 0.0;
-        out.centerCede = 1.0;
-        return out;
-    };
-
-    constexpr double edgeLo = 6.0;
-    constexpr double edgeHi = 20.0;
-    constexpr double hardBreak = 14.0;
-    const double dUp = std::max(0.0, upCoarseLumaDeltaIRE);
-    const double dDn = std::max(0.0, downCoarseLumaDeltaIRE);
-    const double lumaUp = std::clamp((dUp - edgeLo) / (edgeHi - edgeLo), 0.0, 1.0);
-    const double lumaDn = std::clamp((dDn - edgeLo) / (edgeHi - edgeLo), 0.0, 1.0);
-
-    if (cedeFlags & FieldBCedeCenter) return fullCede();
-
-    const double edgeThresh = std::max(1.0, horizontalLumaEdgeThresholdIRE);
-    const double hEdge = std::clamp(
-        (horizontalLumaDeltaIRE - 0.45 * edgeThresh) / (0.55 * edgeThresh),
-        0.0, 1.0);
-
-    auto finish = [&]() -> FieldBTapPolicy {
-        if (dUp >= hardBreak) out.upWeight = 0.0;
-        if (dDn >= hardBreak) out.downWeight = 0.0;
-        out.upWeight *= (1.0 - 0.65 * lumaUp);
-        out.downWeight *= (1.0 - 0.65 * lumaDn);
-        return out;
-    };
-
-    if (!region.valid)
-        return hEdge > 0.0 ? fullCede() : finish();
-
-    const bool upSame = region.up == R::SameRegion;
-    const bool downSame = region.down == R::SameRegion;
-    const bool upDifferent = region.up == R::DifferentRegion;
-    const bool downDifferent = region.down == R::DifferentRegion;
-    const bool upAlien = region.up == R::AlienCancel;
-    const bool downAlien = region.down == R::AlienCancel;
-    const bool upContinues = upSame || upAlien;
-    const bool downContinues = downSame || downAlien;
-
-    if (region.centerIsland || region.strongAsym) return fullCede();
-
-    if (upContinues) out.upWeight = 1.0;
-    if (downContinues) out.downWeight = 1.0;
-    if (downDifferent && upContinues) out.downWeight = 0.0;
-    else if (upDifferent && downContinues) out.upWeight = 0.0;
-    // A lone AlienCancel leg remains authoritative in Field B. Physical
-    // legality and the per-leg coarse-luma break below are its guards.
-
-    if (upSame && downSame) {
-        const double nearDiff = std::min(region.upDifferenceIRE,
-                                         region.downDifferenceIRE);
-        const double farDiff = std::max(region.upDifferenceIRE,
-                                        region.downDifferenceIRE);
-        const double gap = farDiff - nearDiff;
-        const bool upNear = region.upDifferenceIRE <= region.downDifferenceIRE;
-        if (gap > 0.85) {
-            const double ratio = farDiff / std::max(nearDiff, 0.50);
-            const bool oneLeg = gap >= 3.75 ||
-                (farDiff >= 4.25 && ratio >= 2.35);
-            if (oneLeg) {
-                out.upWeight = upNear ? 1.0 : 0.0;
-                out.downWeight = upNear ? 0.0 : 1.0;
-            } else {
-                const double t = std::clamp((gap - 1.0) / (3.25 - 1.0), 0.0, 1.0);
-                const double farScale = 1.0 - 0.70 * t;
-                if (upNear) { out.upWeight = 1.0; out.downWeight *= farScale; }
-                else { out.upWeight *= farScale; out.downWeight = 1.0; }
-            }
-        }
-    }
-
-    if (hEdge > 0.0 && !upContinues && !downContinues)
-        return fullCede();
-
-    if (hEdge > 0.0 && region.upDownDifferenceIRE > 8.0) {
-        const bool preferUp = region.upDifferenceIRE <= region.downDifferenceIRE;
-        const double best = std::min(region.upDifferenceIRE, region.downDifferenceIRE);
-        const double worst = std::max(region.upDifferenceIRE, region.downDifferenceIRE);
-        const double gap = worst - best;
-        const double ratio = worst > 1e-9 ? best / worst : 1.0;
-        const bool hardPreferUp = preferUp &&
-            ((region.upDifferenceIRE < 3.5 && region.downDifferenceIRE > 6.0) ||
-             (best < 4.5 && gap > 2.5 && ratio < 0.55));
-        const bool hardPreferDown = !preferUp &&
-            ((region.downDifferenceIRE < 3.5 && region.upDifferenceIRE > 6.0) ||
-             (best < 4.5 && gap > 2.5 && ratio < 0.55));
-        const bool allowOneSide =
-            (preferUp && upContinues && downDifferent) ||
-            (!preferUp && downContinues && upDifferent);
-        if ((hardPreferUp || hardPreferDown) && !allowOneSide)
-            return fullCede();
-        if (hardPreferUp) {
-            out.downWeight = 0.0;
-            out.upWeight = std::max(out.upWeight, 0.40 + 0.60 * hEdge);
-        } else if (hardPreferDown) {
-            out.upWeight = 0.0;
-            out.downWeight = std::max(out.downWeight, 0.40 + 0.60 * hEdge);
-        }
-    }
-    return finish();
-}
-
 double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
                         bool up)
 {
@@ -401,6 +185,210 @@ double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
     const double trust = up ? mc.upTrust : mc.downTrust;
     return 0.25 + 0.75 * std::clamp(trust, 0.0, 1.0);
 }
+
+// ========================= LDCD_PROBE_CEDE =================================
+// Zone-scoped Field B cede-attribution probe for the 2D threshold revisit.
+// Measurement only: per pixel, which gate stood the comb down (region cause
+// bits + policy branch), and whether a vertically corroborated lurch step run
+// covers the column -- i.e. whether the coarse delta the gate keyed on is an
+// EXPLAINED luma edge. Reports P(cede | evidence) vs P(cede | bare) per frame
+// over an optional line/column window (LDCD_PROBE_CEDE_L0/L1/C0/C1).
+// Single accumulator: run with -t 1.
+struct FieldBCedeProbe {
+    bool enabled = false;
+    int l0 = 0, l1 = 1 << 30, c0 = 0, c1 = 1 << 30;
+    long frameIdx = 0;
+    int lastLine = -1;
+
+    long px = 0;
+    long reasonCounts[8] = {};
+    long cededPx = 0;
+    long regionCauseCounts[8] = {};   // indexed by cause-bit position 1..6
+    long policyCauseCounts[6] = {};
+    long coveredPx = 0;
+    long cededCovered = 0;
+    long cededBare = 0;
+    double cededCoveredHSum = 0.0, cededCoveredHMax = 0.0;
+    double wSumCovered = 0.0, wSumBare = 0.0;
+    long rolloffPx = 0, rolloffCovered = 0, rolloffHardPx = 0;
+    long recovPx = 0, recovCovered = 0;
+    // Seed/verdict attribution vs lurch coverage: is the region evaluator's
+    // Different/seed density itself keyed to explained luma edges?
+    long seedCovered = 0, seedBare = 0;
+    long diffCovered = 0, diffBare = 0;
+    long asymCovered = 0, asymBare = 0;
+
+    // Leak-transfer (kappa) regression: per chroma bin (center envelope IRE
+    // <4 / 4-12 / >=12), the region evaluator's measured per-leg differenceIRE
+    // against corroborated step height h at covered columns, vs the bare
+    // baseline. Samples are (leg, pixel) pairs where the evaluator actually
+    // measured a difference (differenceIRE > 0).
+    struct KappaBin {
+        long nBare = 0; double sumDBare = 0.0;
+        long nCov = 0; double sumDCov = 0.0, sumH = 0.0, sumHD = 0.0, sumH2 = 0.0;
+        long diffVCov = 0, diffVBare = 0;  // Different-verdict count per class
+        void reset() { *this = KappaBin(); }
+    };
+    KappaBin kappaBins[3];
+
+    static int chromaBin(double envIRE)
+    { return envIRE < 4.0 ? 0 : (envIRE < 12.0 ? 1 : 2); }
+
+    FieldBCedeProbe()
+    {
+        enabled = std::getenv("LDCD_PROBE_CEDE") != nullptr;
+        auto envInt = [](const char *name, int fallback) {
+            const char *s = std::getenv(name);
+            return s ? std::atoi(s) : fallback;
+        };
+        l0 = envInt("LDCD_PROBE_CEDE_L0", 0);
+        l1 = envInt("LDCD_PROBE_CEDE_L1", 1 << 30);
+        c0 = envInt("LDCD_PROBE_CEDE_C0", 0);
+        c1 = envInt("LDCD_PROBE_CEDE_C1", 1 << 30);
+    }
+
+    // Band-uniformity: inside a chroma-boundary band the doctrine requires ONE
+    // render for the whole region (grail chain #3). Column-to-column decision
+    // changes inside a band ARE the per-column interleave that manufactures
+    // edge beading, so the switching rate is the direct instrument for it --
+    // unlike alternation energy, which cannot see a manufactured colour.
+    long bandPx = 0, bandSwitches = 0, bandRuns = 0;
+    long freePx = 0, freeSwitches = 0;
+
+    void noteBandUniformity(const std::uint8_t *reason,
+                            const std::uint8_t *inBand,
+                            int width)
+    {
+        if (!enabled || !reason || !inBand) return;
+        const int lo = std::max(0, c0);
+        const int hi = std::min(width - 1, c1);
+        for (int x = lo; x <= hi; ++x) {
+            const bool band = inBand[x] != 0;
+            if (band) {
+                bandPx++;
+                if (x == lo || inBand[x - 1] == 0) bandRuns++;
+                else if (reason[x] != reason[x - 1]) bandSwitches++;
+            } else {
+                freePx++;
+                if (x > lo && inBand[x - 1] == 0 &&
+                    reason[x] != reason[x - 1]) freeSwitches++;
+            }
+        }
+    }
+
+    void flush()
+    {
+        if (px <= 0 && bandPx <= 0) { frameIdx++; return; }
+        if (px <= 0) {
+            // Rebuilt path: only the shared band-uniformity instrument runs.
+            std::fprintf(stderr,
+                "[CEDE f=%ld ln=%d-%d col=%d-%d] (rebuilt)\n"
+                "  band uniformity: inBand %.1f%% | switches/inBandPx %.3f "
+                "(%.2f per band run) | outside-band switches/px %.3f\n",
+                frameIdx, l0, std::min(l1, 9999), c0, std::min(c1, 9999),
+                100.0 * bandPx / std::max(1L, bandPx + freePx),
+                double(bandSwitches) / bandPx,
+                bandRuns > 0 ? double(bandSwitches) / bandRuns : 0.0,
+                freePx > 0 ? double(freeSwitches) / freePx : 0.0);
+            frameIdx++;
+            bandPx = bandSwitches = bandRuns = 0;
+            freePx = freeSwitches = 0;
+            return;
+        }
+        const double inv = 100.0 / px;
+        const double invCede = cededPx > 0 ? 100.0 / cededPx : 0.0;
+        std::fprintf(stderr,
+            "[CEDE f=%ld ln=%d-%d col=%d-%d] px=%ld\n"
+            "  reasons%%: ctr %.1f cede %.1f blnd %.1f 1leg %.1f recv %.1f hold %.1f\n"
+            "  region causes (%%ceded): band %.1f island %.1f asym %.1f diff %.1f "
+            "1legfail %.1f hue %.1f\n"
+            "  policy causes (%%ceded): flags %.1f invEdge %.1f islasym %.1f "
+            "edgeNoCont %.1f hard %.1f\n",
+            frameIdx, l0, std::min(l1, 9999), c0, std::min(c1, 9999), px,
+            reasonCounts[2] * inv, reasonCounts[3] * inv, reasonCounts[1] * inv,
+            reasonCounts[4] * inv, reasonCounts[5] * inv, reasonCounts[6] * inv,
+            regionCauseCounts[1] * invCede, regionCauseCounts[2] * invCede,
+            regionCauseCounts[3] * invCede, regionCauseCounts[4] * invCede,
+            regionCauseCounts[5] * invCede, regionCauseCounts[6] * invCede,
+            policyCauseCounts[1] * invCede, policyCauseCounts[2] * invCede,
+            policyCauseCounts[3] * invCede, policyCauseCounts[4] * invCede,
+            policyCauseCounts[5] * invCede);
+        const long barePx = px - coveredPx;
+        std::fprintf(stderr,
+            "  lurch: covered %.1f%% | P(cede|cov) %.1f%% vs P(cede|bare) %.1f%% | "
+            "ceded&cov h mean %.2f max %.2f IRE\n"
+            "  wSum(mean): cov %.2f bare %.2f | rolloff>0.25: %.1f%% "
+            "(P(cov|rolloff)=%.1f%%) hard: %.1f%% | recovery %.1f%% (cov %.1f%%)\n",
+            coveredPx * inv,
+            coveredPx > 0 ? 100.0 * cededCovered / coveredPx : 0.0,
+            barePx > 0 ? 100.0 * cededBare / barePx : 0.0,
+            cededCovered > 0 ? cededCoveredHSum / cededCovered : 0.0,
+            cededCoveredHMax,
+            coveredPx > 0 ? wSumCovered / coveredPx : 0.0,
+            barePx > 0 ? wSumBare / barePx : 0.0,
+            rolloffPx * inv,
+            rolloffPx > 0 ? 100.0 * rolloffCovered / rolloffPx : 0.0,
+            rolloffHardPx * inv,
+            recovPx * inv,
+            recovPx > 0 ? 100.0 * recovCovered / recovPx : 0.0);
+        std::fprintf(stderr,
+            "  verdict density: P(seed|cov) %.1f%% vs P(seed|bare) %.1f%% | "
+            "P(diff|cov) %.1f%% vs bare %.1f%% | P(asym|cov) %.1f%% vs bare %.1f%%\n",
+            coveredPx > 0 ? 100.0 * seedCovered / coveredPx : 0.0,
+            barePx > 0 ? 100.0 * seedBare / barePx : 0.0,
+            coveredPx > 0 ? 100.0 * diffCovered / coveredPx : 0.0,
+            barePx > 0 ? 100.0 * diffBare / barePx : 0.0,
+            coveredPx > 0 ? 100.0 * asymCovered / coveredPx : 0.0,
+            barePx > 0 ? 100.0 * asymBare / barePx : 0.0);
+        std::fprintf(stderr,
+            "  band uniformity: inBand %.1f%% | switches/inBandPx %.3f "
+            "(%.2f per band run) | outside-band switches/px %.3f\n",
+            100.0 * bandPx / std::max(1L, bandPx + freePx),
+            bandPx > 0 ? double(bandSwitches) / bandPx : 0.0,
+            bandRuns > 0 ? double(bandSwitches) / bandRuns : 0.0,
+            freePx > 0 ? double(freeSwitches) / freePx : 0.0);
+        static const char *binNames[3] = { "env<4", "env4-12", "env>=12" };
+        for (int bi = 0; bi < 3; ++bi) {
+            const KappaBin &K = kappaBins[bi];
+            double slope = 0.0, meanH = 0.0;
+            if (K.nCov > 1) {
+                meanH = K.sumH / K.nCov;
+                const double meanD = K.sumDCov / K.nCov;
+                const double varH = K.sumH2 / K.nCov - meanH * meanH;
+                if (varH > 1e-9)
+                    slope = (K.sumHD / K.nCov - meanH * meanD) / varH;
+            }
+            std::fprintf(stderr,
+                "  kappa[%s]: bare n=%ld meanD %.2f (diffV %.1f%%) | "
+                "cov n=%ld meanD %.2f meanH %.2f slope %.3f (diffV %.1f%%)\n",
+                binNames[bi],
+                K.nBare, K.nBare > 0 ? K.sumDBare / K.nBare : 0.0,
+                K.nBare > 0 ? 100.0 * K.diffVBare / K.nBare : 0.0,
+                K.nCov, K.nCov > 0 ? K.sumDCov / K.nCov : 0.0,
+                meanH, slope,
+                K.nCov > 0 ? 100.0 * K.diffVCov / K.nCov : 0.0);
+        }
+        frameIdx++;
+        px = 0;
+        std::fill(std::begin(reasonCounts), std::end(reasonCounts), 0L);
+        cededPx = 0;
+        std::fill(std::begin(regionCauseCounts), std::end(regionCauseCounts), 0L);
+        std::fill(std::begin(policyCauseCounts), std::end(policyCauseCounts), 0L);
+        coveredPx = cededCovered = cededBare = 0;
+        cededCoveredHSum = cededCoveredHMax = 0.0;
+        wSumCovered = wSumBare = 0.0;
+        rolloffPx = rolloffCovered = rolloffHardPx = 0;
+        recovPx = recovCovered = 0;
+        seedCovered = seedBare = 0;
+        diffCovered = diffBare = 0;
+        asymCovered = asymBare = 0;
+        bandPx = bandSwitches = bandRuns = 0;
+        freePx = freeSwitches = 0;
+        for (KappaBin &K : kappaBins) K.reset();
+    }
+};
+
+FieldBCedeProbe gCedeProbe;
 
 } // namespace
 
@@ -1040,7 +1028,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         // differencing `comp` reads a chroma-AMPLITUDE transition as a luma
         // edge.  That is maximal at exactly the saturated garment boundaries
         // where the comb is needed most, and every hEdge consumer (Field A
-        // cede, Field B resolveFieldBPolicy, Frame, FVF) then cedes to 1D,
+        // cede, Field B leg admission, Frame, FVF) then cedes to 1D,
         // which renders back what the comb was cancelling.
         //
         // The dual of that fact is the fix: `raw - comp` is a LUMA estimate in
@@ -1739,9 +1727,51 @@ void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
     computeFieldBLine(tapLine, outFieldLine, outReasonLine);
 }
 
+
+// ============================== FIELD B ====================================
+// Ground-up rebuild, promoted 2026-07-27 after the beach sentinel battery.
+// It replaced a policy that ceded 79-93% of pixels to 1D on program material
+// and therefore rendered ~1D everywhere; this one combs by default and stands
+// down only on named physical evidence.
+//
+// Measured premises (2026-07-26, beach s1x11 battery):
+//   - The predecessor ceded 79-93% of pixels through the chroma-boundary
+//     band blanket and rendered ~1D (alternation within 2-3% of line).
+//   - The old adaptive comb cancels 25-45% of line-alternating chroma error
+//     but never stands down (two-leg 100%), paying +40% Y-alternation at
+//     boundaries and luma detail.
+//   - Region verdicts at lurch-covered columns carry a leak term of
+//     kappa*h (kappa ~= 0.35 measured, 0.45 conservative) and the bare-column
+//     noise floor sits at 4-5 IRE, at the legacy thresholds themselves.
+//
+// Stance: COMB BY DEFAULT (the interiors were never the problem). A leg is
+// excluded only by:
+//   - grammar illegality (absolute, reachLegalGate), or
+//   - a Different-region verdict whose measured differenceIRE clears the
+//     evidence floor kBase PLUS the leak bound kappa*h*gate at columns under
+//     a vertically corroborated lurch run, or
+//   - a per-leg coarse-luma break (the Y-alternation guard), from which an
+//     AlienCancel leg is exempt: raw-identical legs share the center's leak
+//     and cancel it exactly.
+// Legs proven different from EACH OTHER (no shared chroma to cancel) render
+// one-sided with the nearer leg instead of blending a colour present on
+// neither line. Full cede to 1D only when no leg survives.
+//
+// Vertical taps come mirror-resolved from the tap system, so the active
+// top/bottom lines comb against the inward partner instead of black --
+// no jagged first/last bands.
+//
+// RENDER GRANULARITY: per column. The band-uniform alternative (one verdict
+// for a whole chroma-boundary band, which by construction cannot interleave)
+// was built and measured -- it removes the 5.6-11.3 decision switches per
+// band run that manufacture edge beading -- but the per-column render was
+// preferred on the canonical sentinel and showed no crawl in motion. If edge
+// beading ever returns, the switching rate inside a band is the instrument
+// that sees it (LDCD_PROBE_CEDE), and band-uniform verdicts are the remedy;
+// alternation energy is blind to that class. See git history for the pass.
 void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
-                                           double *outFieldLine,
-                                           std::uint8_t *outReasonLine)
+                                          double *outFieldLine,
+                                          std::uint8_t *outReasonLine)
 {
     const int width =
         videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
@@ -1752,29 +1782,24 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     if (width <= 0 || !outFieldLine)
         return;
 
-    if (lineNumber < first || lineNumber >= last) {
+    if (lineNumber < first || lineNumber >= last ||
+        static_cast<int>(tapLine.tap0.size()) < width) {
         std::fill(outFieldLine, outFieldLine + width, 0.0);
         if (outReasonLine)
             std::fill(outReasonLine, outReasonLine + width, FieldBReasonNone);
         return;
     }
 
-    const bool haveCenter = static_cast<int>(tapLine.tap0.size()) >= width;
-    const bool haveVertical =
-        tapLine.haveU2 && tapLine.haveD2 &&
+    const bool haveU =
+        tapLine.haveU2 &&
         static_cast<int>(tapLine.tapU2.size()) >= width &&
+        static_cast<int>(tapLine.pairU2.size()) >= width;
+    const bool haveD =
+        tapLine.haveD2 &&
         static_cast<int>(tapLine.tapD2.size()) >= width &&
-        static_cast<int>(tapLine.pairU2.size()) >= width &&
         static_cast<int>(tapLine.pairD2.size()) >= width;
 
-    if (!haveCenter) {
-        std::fill(outFieldLine, outFieldLine + width, 0.0);
-        if (outReasonLine)
-            std::fill(outReasonLine, outReasonLine + width, FieldBReasonNone);
-        return;
-    }
-
-    if (!haveVertical) {
+    if (!haveU && !haveD) {
         for (int rel = 0; rel < width; ++rel)
             outFieldLine[rel] = tapLine.tap0[rel].comp;
         if (outReasonLine)
@@ -1782,193 +1807,173 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         return;
     }
 
-    static const bool dumpFB = std::getenv("LDCD_DUMP_FB") != nullptr;
-    static const int dumpFBL0 = []{ const char *s = std::getenv("LDCD_DUMP_FB_L0"); return s ? std::atoi(s) : 0; }();
-    static const int dumpFBL1 = []{ const char *s = std::getenv("LDCD_DUMP_FB_L1"); return s ? std::atoi(s) : 0; }();
-    static const int dumpFBC0 = []{ const char *s = std::getenv("LDCD_DUMP_FB_C0"); return s ? std::atoi(s) : 0; }();
-    static const int dumpFBC1 = []{ const char *s = std::getenv("LDCD_DUMP_FB_C1"); return s ? std::atoi(s) : 0; }();
+    // Boundary-evidence floor and leak transfer.
+    //
+    // kBaseIRE sits above the region evaluator's measured bare-column
+    // difference noise floor (4-5 IRE on program material) so a verdict must
+    // clear the noise it is made of. kKappa is the conservative end of the
+    // measured leak-transfer slope (0.26-0.46 across five zones and three
+    // chroma bins, pooled ~0.35): each IRE of corroborated along-line step
+    // height contributes this much spurious separation to the evaluator's
+    // per-leg difference, so it must be cleared on top of the floor.
+    constexpr double kBaseIRE = 6.0;
+    constexpr double kKappa = 0.45;
 
-    // =========================== RED LABEL ================================
-    // FIELD B MAINTENANCE RULE
-    //
-    // DO NOT FIX PICTURE-CONTENT PROBLEMS BY ADDING CODE HERE.
-    //
-    // Field B owns its leg selection and center-cede policy. Reach supplies
-    // legality and observations; no other comb prepares Field B's answer.
-    // =====================================================================
+    // Per-column leak bound contribution from vertically corroborated
+    // along-line step runs: max h*gate over covering runs (means coordinate
+    // v spans rel v..v+3).
+    std::vector<float> hgAt(width, 0.0f);
+    for (const LurchStepRun &run : corroborateLurchEdges(lineNumber)) {
+        if (run.suppressed) continue;
+        const double g = std::clamp(run.gate, 0.0, 1.0);
+        if (g <= 0.0) continue;
+        const float hg = static_cast<float>(run.stepAbsIRE * g);
+        const int xa = std::max(0, run.a);
+        const int xb = std::min(width - 1, run.b + 3);
+        for (int x = xa; x <= xb; ++x)
+            hgAt[x] = std::max(hgAt[x], hg);
+    }
 
     const float *centerRepairStrength =
         locked1DParallaxRepairStrength_line(lineNumber);
 
+    // Decision-mix counters under the shared probe envs ([FB2] report).
+    const bool probeLine = gCedeProbe.enabled &&
+        lineNumber >= gCedeProbe.l0 && lineNumber <= gCedeProbe.l1;
+    if (gCedeProbe.enabled) {
+        if (lineNumber < gCedeProbe.lastLine)
+            gCedeProbe.flush();
+        gCedeProbe.lastLine = lineNumber;
+    }
+    static long fb2Px, fb2TwoLeg, fb2OneLeg, fb2Cede, fb2Ctr, fb2Hold;
+    static long fb2BoundaryLegs, fb2LumaZeroLegs, fb2IllegalLegs, fb2OuterSplit;
+    static int fb2LastLine = -1;
+    if (gCedeProbe.enabled) {
+        if (lineNumber < fb2LastLine && fb2Px > 0) {
+            std::fprintf(stderr,
+                "[FB2 ln=%d-%d col=%d-%d] px=%ld  two %.1f%% one %.1f%% "
+                "cede %.1f%% ctr %.1f%% hold %.1f%%  legs: boundary %.1f%% "
+                "lumaZero %.1f%% illegal %.1f%% outerSplit %.1f%%\n",
+                gCedeProbe.l0, std::min(gCedeProbe.l1, 9999),
+                gCedeProbe.c0, std::min(gCedeProbe.c1, 9999), fb2Px,
+                100.0 * fb2TwoLeg / fb2Px, 100.0 * fb2OneLeg / fb2Px,
+                100.0 * fb2Cede / fb2Px, 100.0 * fb2Ctr / fb2Px,
+                100.0 * fb2Hold / fb2Px,
+                50.0 * fb2BoundaryLegs / fb2Px, 50.0 * fb2LumaZeroLegs / fb2Px,
+                50.0 * fb2IllegalLegs / fb2Px, 100.0 * fb2OuterSplit / fb2Px);
+            fb2Px = fb2TwoLeg = fb2OneLeg = fb2Cede = fb2Ctr = fb2Hold = 0;
+            fb2BoundaryLegs = fb2LumaZeroLegs = fb2IllegalLegs = fb2OuterSplit = 0;
+        }
+        fb2LastLine = lineNumber;
+    }
+
+    using RR = CombContentReach::RegionRelation;
+    const CombContentReach::IntrafieldRegionReach unknownRegion;
+
+    std::vector<std::uint8_t> probeReason, probeBand;
+    if (probeLine) {
+        probeReason.assign(width, 0);
+        probeBand.assign(width, 0);
+    }
+
     for (int rel = 0; rel < width; ++rel) {
         const double rawCenter = tapLine.tap0[rel].raw;
-        const double rawUp = tapLine.tapU2[rel].raw;
-        const double rawDown = tapLine.tapD2[rel].raw;
         const double center = tapLine.tap0[rel].comp;
-        const double up = tapLine.tapU2[rel].comp;
-        const double down = tapLine.tapD2[rel].comp;
+        const double rawUp = haveU ? tapLine.tapU2[rel].raw : 0.0;
+        const double up = haveU ? tapLine.tapU2[rel].comp : 0.0;
+        const double rawDown = haveD ? tapLine.tapD2[rel].raw : 0.0;
+        const double down = haveD ? tapLine.tapD2[rel].comp : 0.0;
 
-        const CombContentReach::IntrafieldRegionReach unknownRegion;
-        const auto &region = rel < (int)tapLine.intrafieldRegionReach.size()
-            ? tapLine.intrafieldRegionReach[rel] : unknownRegion;
+        const auto &region =
+            rel < static_cast<int>(tapLine.intrafieldRegionReach.size())
+                ? tapLine.intrafieldRegionReach[rel] : unknownRegion;
 
-        const std::uint8_t cedeFlags =
-            fieldBRegionCedeFlags(region);
-            
-        // Vector size is not evidence: an absent neighbour row is filled from
-        // the centre, so the deltas below would read a flat zero -- "no luma
-        // break anywhere" -- and silently license every context test.
+        const bool upLegal =
+            haveU && tapLine.pairU2[rel].reachLegalGate > 0.0;
+        const bool downLegal =
+            haveD && tapLine.pairD2[rel].reachLegalGate > 0.0;
+
+        const double bound = kBaseIRE + kKappa * hgAt[rel];
+
+        // A Different verdict stands only above the evidence floor plus the
+        // leak bound; below it the measured difference is explainable as the
+        // 1D bandpass leak of a corroborated luma step (or texture noise),
+        // and the comb proceeds.
+        const bool upBoundary =
+            region.up == RR::DifferentRegion &&
+            region.upDifferenceIRE >= bound;
+        const bool downBoundary =
+            region.down == RR::DifferentRegion &&
+            region.downDifferenceIRE >= bound;
+
+        // Per-leg coarse-luma break: the Y-alternation guard. A leg whose
+        // carrier-free luma departs from center carries a different bandpass
+        // leak, and combing it moves that difference into Y. AlienCancel legs
+        // are exempt (raw-identical content shares the leak).
         const bool haveCoarse =
             tapLine.coarseLumaValid &&
-            rel < (int)tapLine.coarse0IRE.size() &&
-            rel < (int)tapLine.coarseU2IRE.size() &&
-            rel < (int)tapLine.coarseD2IRE.size();
+            rel < static_cast<int>(tapLine.coarse0IRE.size()) &&
+            rel < static_cast<int>(tapLine.coarseU2IRE.size()) &&
+            rel < static_cast<int>(tapLine.coarseD2IRE.size());
+        constexpr double kLumaLo = 6.0;
+        constexpr double kLumaHi = 20.0;
+        constexpr double kLumaHardBreak = 14.0;
+        auto lumaGate = [&](double deltaIRE, bool alien) {
+            if (alien) return 1.0;
+            if (deltaIRE >= kLumaHardBreak) return 0.0;
+            const double t = std::clamp(
+                (deltaIRE - kLumaLo) / (kLumaHi - kLumaLo), 0.0, 1.0);
+            return 1.0 - 0.65 * t;
+        };
         const double upCoarseDelta = haveCoarse
-            ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]) : 0.0;
+            ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel])
+            : 0.0;
         const double downCoarseDelta = haveCoarse
-            ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]) : 0.0;
-        const double hLumaDelta = rel < (int)tapLine.hLumaDeltaIRE.size()
-            ? tapLine.hLumaDeltaIRE[rel] : 0.0;
-        const double hEdgeThreshold =
-            std::max(1.0, configuration.tunables.FIELD_LUMA_EDGE_THRESH_IRE);
+            ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel])
+            : 0.0;
 
-        FieldBTapPolicy policy = resolveFieldBPolicy(
-            region, cedeFlags,
-            tapLine.pairU2[rel].weight,
-            tapLine.pairD2[rel].weight,
-            hLumaDelta, hEdgeThreshold,
-            upCoarseDelta, downCoarseDelta);
+        double wUp = (upLegal && !upBoundary)
+            ? lumaGate(upCoarseDelta, region.up == RR::AlienCancel)
+            : 0.0;
+        double wDown = (downLegal && !downBoundary)
+            ? lumaGate(downCoarseDelta, region.down == RR::AlienCancel)
+            : 0.0;
 
-        const auto &mc = tapLine.movingCoarseContour[rel];
-        policy.upWeight *= tapLine.pairU2[rel].reachLegalGate *
-                           fieldContourGate(mc, true);
-        policy.downWeight *= tapLine.pairD2[rel].reachLegalGate *
-                             fieldContourGate(mc, false);
-
-        double wUp = std::clamp(policy.upWeight, 0.0, 1.0);
-        double wDown = std::clamp(policy.downWeight, 0.0, 1.0);
-        double cede = std::clamp(policy.centerCede, 0.0, 1.0);
-        bool policyRecovered = false;
-
-        // A region cede is normally a structural verdict: the center has no
-        // admitted same-region partner (or lies in a nearby strong-asymmetry
-        // band).  Agreement between the two neighbours proves only that they
-        // belong together; it does not prove that either belongs with center.
-        //
-        // The one exception is the region evaluator's explicit two-sided
-        // AlienCancel verdict *inside a carrier-free image context*.  The
-        // verdict comes from sharp raw-identical +/-2 evidence on an energetic
-        // center: vertically coherent luma such as the Borg-cube grid, for
-        // which the field difference is the exact cancellation operation.
-        // Near-carrier grid detail is flat both laterally and across the +/-2
-        // coarse-luma rows; garment hems and other real region boundaries are
-        // not.  Requiring tight context in both directions prevents an
-        // accidental AlienCancel classification from reopening the bikini /
-        // briefs zipper while still allowing the cube recovery away from a
-        // real contour.  Fail closed when the coarse rows are unavailable:
-        // bypassing a structural verdict requires positive luma evidence.
-        using RegionRelation = CombContentReach::RegionRelation;
-        const bool twoSidedAlienCancel =
-            region.up == RegionRelation::AlienCancel &&
-            region.down == RegionRelation::AlienCancel;
-        const bool lateralContextIntact =
-            hLumaDelta < 0.45 * hEdgeThreshold;
-        constexpr double kStructuralOverrideContextIRE = 3.5;
-        const bool verticalContextIntact =
-            haveCoarse &&
-            upCoarseDelta < kStructuralOverrideContextIRE &&
-            downCoarseDelta < kStructuralOverrideContextIRE;
-        const bool provenLumaCancellation =
-            twoSidedAlienCancel &&
-            lateralContextIntact &&
-            verticalContextIntact;
-        const bool boundaryBandCede =
-            (cedeFlags & FieldBCedeBoundaryBand) != 0;
-        
-        const bool structuralRegionCede =
-            boundaryBandCede ||
-            (((cedeFlags & FieldBCedeCenter) != 0) &&
-             !provenLumaCancellation);
-             
-        // Field B's decisive two-leg recovery. A policy refusal must not
-        // strand 1D residue when the complete ±2 method agrees on a single
-        // neighbor estimate and the carrier-free luma service says the three
-        // lines still share a context. This is intentionally not Field A's
-        // ±4 contour/refinement method: it uses only Field B's two legs.
-        constexpr double kPairConsensusIRE = 3.5;
-        constexpr double kContextIntactIRE = 10.0;
-        const double pairAgreementIRE = std::fabs(up - down) * invIreScale;
-        const bool upLegal = tapLine.pairU2[rel].reachLegalGate > 0.0;
-        const bool downLegal = tapLine.pairD2[rel].reachLegalGate > 0.0;
-        const bool pairLegal = upLegal && downLegal;
-        const bool upContextIntact =
-            !haveCoarse || upCoarseDelta < kContextIntactIRE;
-        const bool downContextIntact =
-            !haveCoarse || downCoarseDelta < kContextIntactIRE;
-        const bool contextIntact = upContextIntact && downContextIntact;
-        const bool pairConsensus =
-            pairLegal && contextIntact && pairAgreementIRE <= kPairConsensusIRE;
-        if (!structuralRegionCede && pairConsensus &&
-            (cede > 0.0 || (wUp + wDown) <= 1e-9))
+        // Legs proven different from each other offer no common chroma to
+        // cancel: render one-sided with the nearer leg. Magnitude-bounded so
+        // a leak-manufactured outer difference cannot split a real pair.
+        if (wUp > 0.0 && wDown > 0.0 &&
+            region.outerComparable &&
+            region.upDownHueDifferenceDeg >= 20.0 &&
+            region.upDownDifferenceIRE >= bound)
         {
-            wUp = 1.0;
-            wDown = 1.0;
-            cede = 0.0;
-            policyRecovered = true;
-        } else if (!structuralRegionCede && cede > 0.0) {
-            // Content uncertainty is not authority to preserve 1D. Field B
-            // must still return its best physically valid ±2 answer. Restore
-            // the raw two-line weights independently on each intact side;
-            // only grammar illegality or a coarse-luma context break may keep
-            // that side out. This is the aggressive policy that makes Field B
-            // a useful alternative to Field A's contour/refinement method.
-            const double fallbackUp = upLegal && upContextIntact
-                ? std::max(0.10, tapLine.pairU2[rel].weight) *
-                    fieldContourGate(mc, true)
-                : 0.0;
-            const double fallbackDown = downLegal && downContextIntact
-                ? std::max(0.10, tapLine.pairD2[rel].weight) *
-                    fieldContourGate(mc, false)
-                : 0.0;
-            if (fallbackUp > 1e-9 || fallbackDown > 1e-9) {
-                wUp = std::clamp(fallbackUp, 0.0, 1.0);
-                wDown = std::clamp(fallbackDown, 0.0, 1.0);
-                cede = 0.0;
-                policyRecovered = true;
-            }
+            if (region.upDifferenceIRE <= region.downDifferenceIRE)
+                wDown = 0.0;
+            else
+                wUp = 0.0;
         }
 
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
 
-        double output = center;
-        std::uint8_t reason =
-            (cede >= 1.0) ? FieldBReasonCede : FieldBReasonCenter;
-
-        if ((useUp || useDown) && cede < 1.0) {
+        double output;
+        std::uint8_t reason;
+        if (!useUp && !useDown) {
+            output = center;
+            reason = (upBoundary || downBoundary)
+                ? FieldBReasonCede : FieldBReasonCenter;
+        } else {
             const double denom = wUp + wDown;
-
-            // Weighted opposite-phase neighbor estimate, then cancellation
-            // against center.  Normalizing by denom means accepted evidence
-            // always combs at FULL strength: the weights choose the vertical
-            // estimate (equal, tilted, or one-legged), never the output
-            // amplitude.  Output-strength reduction happens exclusively
-            // through the policy's explicit centerCede below.
-            const double neighbor =
-                (up * wUp + down * wDown) / denom;
-
+            const double neighbor = (up * wUp + down * wDown) / denom;
             const double combed = 0.5 * (center - neighbor);
 
-            // A difference comb is not bounded to the carrier interval of its
-            // inputs: center=5 and leg=3 legitimately produce (5-3)/2=1.
-            // Clamping that result back to [3,5] is not a safety check; it is
-            // an under-comb. The half-difference is amplitude-bounded by
-            // construction. Retain only the reconstructed-luma feasibility
-            // bound from the raw samples that actually participated.
+            // Physical feasibility only: the half-difference is amplitude-
+            // bounded by construction; retain the reconstructed-luma bound
+            // from the raw samples that participated.
             const double yCenter = rawCenter - center;
             const double yUp = rawUp - up;
             const double yDown = rawDown - down;
-            const double bounded = (useUp && useDown)
+            output = (useUp && useDown)
                 ? clampCarrierToInputLumaRange(
                     combed, rawCenter, { yCenter, yUp, yDown }, center)
                 : (useUp
@@ -1976,48 +1981,23 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                         combed, rawCenter, { yCenter, yUp }, center)
                     : clampCarrierToInputLumaRange(
                         combed, rawCenter, { yCenter, yDown }, center));
-            output = bounded * (1.0 - cede) + center * cede;
-            output = (useUp && useDown)
-                ? clampCarrierToInputLumaRange(
-                    output, rawCenter, { yCenter, yUp, yDown }, center)
-                : (useUp
-                    ? clampCarrierToInputLumaRange(
-                        output, rawCenter, { yCenter, yUp }, center)
-                    : clampCarrierToInputLumaRange(
-                        output, rawCenter, { yCenter, yDown }, center));
-            // Once Field B admits a single leg, 0.5*(center-leg) is the
-            // method's complete two-sample cancellation solution. Pulling it
-            // back toward center here merely preserves the 1D error that the
-            // comb was selected to remove. The physical carrier/luma bounds
-            // above remain the feasibility guard.
-            reason = policyRecovered
-                ? FieldBReasonRecovery
-                : (cede >= 0.5)
-                ? FieldBReasonCede
-                : ((useUp && useDown)
-                    ? FieldBReasonBlend
-                    : FieldBReasonOneLeg);
-		}
+            reason = (useUp && useDown)
+                ? FieldBReasonBlend : FieldBReasonOneLeg;
+        }
 
         if (!std::isfinite(output)) {
             output = center;
             reason = FieldBReasonCenter;
         }
 
-        // Pass 1.5 may already have moved the 1D center into a certified
-        // residual-compatible subset. Recombining that repaired sample with
-        // unrepaired ±2 legs can put the rejected rolling-band component back.
-        // The published strength records the AMOUNT of an actual bounded move
-        // relative to its cap; it is not confidence. Once the repair was
-        // applied, the repaired center is source authority at this sample.
-        // Scaling the hold by move size would let Field B recombine most of a
-        // small-but-certified correction away.
+        // Certified Pass 1.5 repairs are source authority at this sample;
+        // recombining them with unrepaired legs would reinstate the rejected
+        // component. Same law as the legacy path.
         const double appliedRepair = centerRepairStrength
             ? std::clamp(static_cast<double>(centerRepairStrength[rel]), 0.0, 1.0)
             : 0.0;
-        const double repairHold = appliedRepair > 0.0 ? 1.0 : 0.0;
-        if (repairHold > 0.0) {
-            output = output * (1.0 - repairHold) + center * repairHold;
+        if (appliedRepair > 0.0) {
+            output = center;
             reason = FieldBReasonRepairHold;
         }
 
@@ -2025,36 +2005,38 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         if (outReasonLine)
             outReasonLine[rel] = reason;
 
-        if (dumpFB && lineNumber >= dumpFBL0 && lineNumber <= dumpFBL1 &&
-            rel >= dumpFBC0 && rel <= dumpFBC1)
-        {
-            const char *tag =
-                (reason == FieldBReasonCede)      ? "cede" :
-                (reason == FieldBReasonCenter)    ? "ctr " :
-                (reason == FieldBReasonBlend)     ? "blnd" :
-                (reason == FieldBReasonOneLeg)    ? "1leg" :
-                (reason == FieldBReasonRecovery)  ? "recv" :
-                (reason == FieldBReasonRepairHold)? "hold" : "??? ";
-            const double centerIRE = center * invIreScale;
-            const double outputIRE = output * invIreScale;
-            const double combedIRE = (useUp || useDown)
-                ? 0.5 * (center - (up * wUp + down * wDown) / (wUp + wDown)) * invIreScale
-                : centerIRE;
-            std::fprintf(stderr,
-                "[FB] ln=%d c=%d %s  1d=%.2f comb=%.2f out=%.2f  "
-                "lgU=%.2f lgD=%.2f cede=%.2f  "
-                "flags=%02x recov=%d pcons=%d  "
-                "outerHue=%.1f outerCmp=%d\n",
-                lineNumber, rel, tag,
-                centerIRE, combedIRE, outputIRE,
-                tapLine.pairU2[rel].reachLegalGate,
-                tapLine.pairD2[rel].reachLegalGate,
-                cede,
-                cedeFlags, (int)policyRecovered, (int)pairConsensus,
-                region.upDownHueDifferenceDeg,
-                (int)region.outerComparable);
+        if (probeLine) {
+            probeReason[rel] = reason;
+            probeBand[rel] = region.chromaBoundaryBand ? 1 : 0;
+        }
+
+        if (probeLine && rel >= gCedeProbe.c0 && rel <= gCedeProbe.c1) {
+            fb2Px++;
+            if (reason == FieldBReasonBlend) fb2TwoLeg++;
+            else if (reason == FieldBReasonOneLeg) fb2OneLeg++;
+            else if (reason == FieldBReasonCede) fb2Cede++;
+            else if (reason == FieldBReasonRepairHold) fb2Hold++;
+            else fb2Ctr++;
+            if (upBoundary) fb2BoundaryLegs++;
+            if (downBoundary) fb2BoundaryLegs++;
+            if (upLegal && !upBoundary &&
+                lumaGate(upCoarseDelta, region.up == RR::AlienCancel) <= 0.0)
+                fb2LumaZeroLegs++;
+            if (downLegal && !downBoundary &&
+                lumaGate(downCoarseDelta, region.down == RR::AlienCancel) <= 0.0)
+                fb2LumaZeroLegs++;
+            if (!upLegal) fb2IllegalLegs++;
+            if (!downLegal) fb2IllegalLegs++;
+            if ((useUp != useDown) &&
+                region.outerComparable &&
+                region.upDownHueDifferenceDeg >= 20.0 &&
+                region.upDownDifferenceIRE >= bound)
+                fb2OuterSplit++;
         }
     }
+
+    if (probeLine)
+        gCedeProbe.noteBandUniformity(probeReason.data(), probeBand.data(), width);
 }
 
 
