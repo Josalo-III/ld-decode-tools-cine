@@ -714,6 +714,49 @@ void markIntrafieldChromaBoundaryBand(
     }
 }
 
+void markVerticalChromaBoundaryBand(
+    std::vector<std::uint8_t> &flat,
+    int stride,
+    int width,
+    int firstLine,
+    int lastLine,
+    int radius)
+{
+    const int nLines = lastLine - firstLine;
+    if (nLines <= 0 || width <= 0)
+        return;
+
+    radius = std::max(0, radius);
+
+    // Snapshot: the horizontal pass already wrote its result into `flat`,
+    // and dilating from an already-dilated neighbour would let one seed
+    // line spread without bound down the column instead of by `radius`.
+    std::vector<std::uint8_t> seed(
+        flat.begin() + size_t(firstLine) * stride,
+        flat.begin() + size_t(lastLine) * stride);
+
+    for (int x = 0; x < width; ++x) {
+        int activeSeeds = 0;
+        const int initialHi = std::min(nLines - 1, radius);
+        for (int ln = 0; ln <= initialHi; ++ln) {
+            if (seed[size_t(ln) * stride + x])
+                ++activeSeeds;
+        }
+
+        for (int ln = 0; ln < nLines; ++ln) {
+            flat[size_t(firstLine + ln) * stride + x] = activeSeeds > 0;
+
+            const int leaving = ln - radius;
+            const int entering = ln + radius + 1;
+
+            if (leaving >= 0 && seed[size_t(leaving) * stride + x])
+                --activeSeeds;
+            if (entering < nLines && seed[size_t(entering) * stride + x])
+                ++activeSeeds;
+        }
+    }
+}
+
 MovingCoarseContour evaluateMovingCoarseContour(double centerCoarse,
                                                 double up2Coarse,
                                                 double down2Coarse,

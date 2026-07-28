@@ -260,6 +260,24 @@ void markIntrafieldChromaBoundaryBand(
     std::vector<IntrafieldRegionReach> &row,
     int radius);
 
+// Vertical companion to markIntrafieldChromaBoundaryBand. The horizontal
+// pass dilates chromaBoundaryBand within one line only; each line's band is
+// otherwise decided independently, so a boundary sitting near the seed
+// threshold can flip on/off line to line -- a jagged ("treeline") edge on
+// every consumer that ceded uniformly per line (Field B's cede-to-center,
+// the Y-election's band cede). Call once per field after every line's band
+// has been written into `flat`, before any downstream consumer reads it.
+// OR-dilates in place along the line axis per column, radius lines each
+// side, using a snapshot of the input so already-dilated lines cannot
+// compound into their neighbours' windows.
+void markVerticalChromaBoundaryBand(
+    std::vector<std::uint8_t> &flat,
+    int stride,
+    int width,
+    int firstLine,
+    int lastLine,
+    int radius);
+
 IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const std::complex<double> &center,
     const std::complex<double> &up,

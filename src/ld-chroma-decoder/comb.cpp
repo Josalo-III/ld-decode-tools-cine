@@ -2956,6 +2956,19 @@ void Comb::FrameBuffer::split2D()
         }
     }
 
+    // Vertical companion to the per-line horizontal dilation
+    // (combcandidate.cpp's markIntrafieldChromaBoundaryBand call): every
+    // line's chromaBoundaryBand was decided independently above, so a
+    // boundary near the seed threshold could flip line to line -- a jagged
+    // edge on every consumer that reads the published flat plane and treats
+    // it as one uniform region (produceY's band cede; Field B's own cede
+    // above already committed per-line before this pass runs and is
+    // unaffected). Run once per field, after every line in this field has
+    // written its bit, before produceY reads it.
+    if (!chromaBoundaryBand_flat.empty()) {
+        CombContentReach::markVerticalChromaBoundaryBand(
+            chromaBoundaryBand_flat, demodWidth, width, firstLine, lastLine, 1);
+    }
 }
 
 // 3D temporal adaptive
