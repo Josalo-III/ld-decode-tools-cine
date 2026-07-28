@@ -3705,7 +3705,6 @@ void Comb::FrameBuffer::produceY()
             };
 
             // Election tolerances (IRE -> samples).
-            const double agreeTol   = 2.0 * irescale; // agreement early-out band
             const double inlierTol  = 4.0 * irescale; // medoid inlier gate
             const double phasePenSamp =
                 std::max(0.0, configuration.tunables.PRODUCE_Y_PHASE_PENALTY_IRE)
@@ -4277,67 +4276,6 @@ void Comb::FrameBuffer::produceY()
                     tallyHull(rawH, Y[h], 6 /* no legal top */, h, 0.0, combY);
                     continue;
                 }
-                // Establish the base population without the derived return.
-                double lo = candY[0], hi = candY[0], sum = candY[0];
-                for (int k = 1; k < nCand; ++k) {
-                    lo = std::min(lo, candY[k]);
-                    hi = std::max(hi, candY[k]);
-                    sum += candY[k];
-                }
-                const double baseMean = sum / nCand;
-                const double baseMedian = medoidD(candY, nCand);
-                const bool baseAgrees = hi - lo <= agreeTol;
-                
-                // The agreement center is an anchor, not an output. Close it
-                // onto an actual candidate so reconstruction uses that
-                // candidate's own four-sample coarse/basis. Strict comparison
-                // preserves roster order as the neutral tie-break, so coherent
-                // comb remains senior when two candidates straddle the anchor
-                // equally.
-                int baseWinnerIdx = 0;
-                for (int k = 1; k < nCand; ++k) {
-                    if (std::fabs(candY[k] - baseMedian) <
-                        std::fabs(candY[baseWinnerIdx] - baseMedian))
-                    {
-                        baseWinnerIdx = k;
-                    }
-                }
-                
-                if (baseAgrees && !returnedFeasible) {
-                    const int baseWinnerPlane = candPlane[baseWinnerIdx];
-                    const double baseWinnerTop = candY[baseWinnerIdx];
-                
-                    Y[h] = reconstructTop(
-                        baseWinnerPlane,
-                        baseWinnerTop);
-                
-                    if (dumpHull) {
-                        tallyHull(
-                            rawH,
-                            Y[h],
-                            baseWinnerPlane,
-                            h,
-                            candidateFourMeanAt(0, h) -
-                                candidateFourMeanAt(baseWinnerPlane, h),
-                            planeY(baseWinnerPlane, h));
-                    }
-                    tallyRetr(rawH, baseWinnerPlane, combY, planeY(1, h), h,
-                              analysisRow ? &analysisRow[xi] : nullptr);
-                    continue;
-                }
-                // Robust center: medoid (min sum of absolute distances).
-                double center = baseMean;
-                if (!baseAgrees) {
-                    center = candY[0];
-                    double bestTot = 1e300;
-                    for (int i = 0; i < nCand; ++i) {
-                        double t = 0.0;
-                        for (int j = 0; j < nCand; ++j)
-                            t += std::fabs(candY[i] - candY[j]);
-                        if (t < bestTot) { bestTot = t; center = candY[i]; }
-                    }
-                }
-
                 // Feasibility is the only DQ (stated doctrine, now enforced).
                 // The former inlier gate (|cand - center| <= inlierTol around
                 // a medoid that ties to comb on a 2-candidate roster) was a
@@ -4346,11 +4284,19 @@ void Comb::FrameBuffer::produceY()
                 // the election's scoring never saw the contest. Outliers are
                 // bounded by the scoring itself -- a candidate far from every
                 // adjacent neighbour pays its full distance as cost.
+                //
+                // A prior "base agreement" early-out used to commit outright
+                // to the medoid-nearest candidate's own plane whenever the
+                // base tops sat within agreeTol of each other -- bypassing
+                // the blend on a coarser, differently-scaled metric than the
+                // one the blend actually scores on (user, 2026-07-28: "the
+                // medoid isn't that great, we shouldn't allow it to govern").
+                // Removed: every base candidate now always reaches the cost
+                // loop and the confidence-alpha blend below, agreeing or not.
                 int inIdx[3];
                 int nIn = 0;
                 for (int k = 0; k < nCand; ++k)
                     inIdx[nIn++] = k;
-                (void)center;
                 // The named cross-colour mask, rather than distance from the
                 // base center, admits returned Y. A distance gate here removes
                 // exactly the strong HF that the return exists to recover.
@@ -4558,31 +4504,36 @@ void Comb::FrameBuffer::produceY()
 
                 // Darkest-choice penalty: comb's weak impulse highlights.
                 // At a genuine luma peak comb rounds AND darkens; retracted
-                // keeps the peak. Composited per-pixel the two make a visible
-                // mosaic, and the dark side is the wrong side there. The
-                // roster's DARKEST candidate pays a near-DQ penalty in
-                // proportion to the evidence that the peak is real luma
-                // (illegal-proof or the star/impulse channel) and bright
-                // (raw's own top band) -- and pays NOTHING where the energy
-                // is legal carrier, where the most-subtracted candidate is
-                // usually the correct one (otherwise this term would be
-                // reverse-boldness and re-select carrier). Gentle by gating,
-                // strong by magnitude: comb stays out of these spots without
-                // the election being starved elsewhere. The penalty rides the
-                // FULL roster spread (user, post knee measurement): the
-                // measured stripped-content transfer is comb ~= 1.5+0.25*ref,
-                // a 20+ IRE divergence at real peaks, so a fixed cap was the
-                // binding constraint against the physics. Gentleness lives in
-                // the gate, not a cap.
+                // keeps the peak, so the roster's DARKEST candidate is the
+                // wrong one there, in proportion to the evidence that the
+                // peak is real luma (illegal-proof or the star/impulse
+                // channel) and bright (raw's own top band) -- and it pays
+                // NOTHING where the energy is legal carrier, where the
+                // most-subtracted candidate is usually the correct one
+                // (otherwise this term would be reverse-boldness and
+                // re-select carrier).
+                //
+                // Weight-space reform (user, 2026-07-28, at the beam
+                // highlight join): the argmin-era form charged the gate
+                // TIMES the roster spread -- big enough to always flip the
+                // winner, and safe when only ordering mattered. Feeding
+                // alpha, spread is an inter-candidate DISTANCE modulating
+                // the mixing proportion, and at a highlight over dense
+                // chroma that distance is the comb/retracted divergence
+                // itself -- distance x difference in the render, the exact
+                // product the blend-weight doctrine forbids, visible as the
+                // join band. The evidence gate is already normalised, so it
+                // enters as a multiplicative weight factor (1 - gate) on
+                // the darkest candidate instead: smooth demotion along the
+                // evidence ramp, a true veto at full proof, and the
+                // candidates' distances nowhere in the weight.
                 constexpr double kPeakSoftIRE = 8.0;
                 constexpr double kPeakHardIRE = 20.0;
                 int darkestIdx = 0;
-                double darkestPenalty = 0.0;
+                double darkestVetoGate = 0.0;
                 if (baseNIn > 1) {
-                    int brightestIdx = 0;
                     for (int k = 1; k < baseNIn; ++k) {
                         if (inHF[k] < inHF[darkestIdx]) darkestIdx = k;
-                        if (inHF[k] > inHF[brightestIdx]) brightestIdx = k;
                     }
                     auto rawComplete = [&](int hk) {
                         return (double)rawLine[hk];
@@ -4593,11 +4544,8 @@ void Comb::FrameBuffer::produceY()
                         (rawTopIRE - kPeakSoftIRE) /
                             (kPeakHardIRE - kPeakSoftIRE),
                         0.0, 1.0);
-                    const double lumaPeakGate =
+                    darkestVetoGate =
                         std::max(illegalProof, impulseT) * peakT;
-                    const double spread =
-                        inHF[brightestIdx] - inHF[darkestIdx];
-                    darkestPenalty = lumaPeakGate * spread;
                 }
 
                 double resultHF = inHF[0];
@@ -4692,8 +4640,6 @@ void Comb::FrameBuffer::produceY()
                             cost += chromaT * kHighChromaDemoteIRE * irescale -
                                     impulseT * kImpulseRetractedBiasIRE *
                                         irescale;
-                        if (k == darkestIdx && k < baseNIn && baseNIn > 1)
-                            cost += darkestPenalty;
                         if (k < 3) {
                             diagContinuation[k] = proximity01;
                             diagRetained[k] = legality * invIreScale;
@@ -4712,8 +4658,10 @@ void Comb::FrameBuffer::produceY()
                             (k < baseNIn) ? candPlane[inIdx[k]] : 4;
                         const double yk = reconstructTop(plane, inHF[k]);
                         if (!std::isfinite(yk)) continue;
-                        const double w =
+                        double w =
                             std::exp(-(costs[k] - bestCost) / blendTau);
+                        if (k == darkestIdx && k < baseNIn && baseNIn > 1)
+                            w *= 1.0 - darkestVetoGate;
                         blendNum += w * yk;
                         blendDen += w;
                     }
