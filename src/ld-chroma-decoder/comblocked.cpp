@@ -4623,6 +4623,25 @@ void Comb::FrameBuffer::produceY()
                         }
                     }
                 }
+                // Confidence-alpha blend (user direction): the per-pixel
+                // WINNER flip between candidates -- comb/retracted measured
+                // 46/54 at boundary teeth, and frame-to-frame flips render
+                // as strobing on detail -- is the same per-pixel-decision
+                // artifact family as the Field B beading. The election's
+                // cost terms stay exactly as they are (they carry the image
+                // shaping: neighbour boost, legality, impulse seniority,
+                // darkest-peak penalty), but they now shape ALPHA instead of
+                // electing one winner: Y = sum w_k * reconstruct_k with
+                // w = exp(-(cost-min)/tau). A decisive cost gap still yields
+                // alpha ~= 1 (tau matched to the cost scale), so commitment
+                // survives where evidence is clear and blending concentrates
+                // where ambiguity -- and hence the strobing -- lives.
+                // Vetoes remain binary and upstream: admission, feasibility
+                // DQ, and the chroma-boundary band cede.
+                double blendNum = 0.0, blendDen = 0.0;
+                constexpr double kBlendTauIRE = 0.75;
+                const double blendTau = kBlendTauIRE * irescale;
+                double costs[4];
                 if (!bandCede) {
                     double bestCost = 1e300;
                     for (int k = 0; k < nIn; ++k) {
@@ -4679,6 +4698,7 @@ void Comb::FrameBuffer::produceY()
                             diagContinuation[k] = proximity01;
                             diagRetained[k] = legality * invIreScale;
                         }
+                        if (k < 4) costs[k] = cost;
                         // Strict < keeps roster order as the neutral
                         // tie-break: coherent comb stays senior on ties.
                         if (cost < bestCost) {
@@ -4687,10 +4707,22 @@ void Comb::FrameBuffer::produceY()
                             diagNeighborAnchor = nv;
                         }
                     }
+                    for (int k = 0; k < nIn && k < 4; ++k) {
+                        const int plane =
+                            (k < baseNIn) ? candPlane[inIdx[k]] : 4;
+                        const double yk = reconstructTop(plane, inHF[k]);
+                        if (!std::isfinite(yk)) continue;
+                        const double w =
+                            std::exp(-(costs[k] - bestCost) / blendTau);
+                        blendNum += w * yk;
+                        blendDen += w;
+                    }
                 }
 
                 const int winnerPlane = planeForTop(resultHF);
-                Y[h] = reconstructTop(winnerPlane, resultHF);
+                Y[h] = (!bandCede && blendDen > 1e-12)
+                    ? blendNum / blendDen
+                    : reconstructTop(winnerPlane, resultHF);
                 if (consDump) {
                     // Bucket writes Y and chroma from ONE scalar:
                     //   Y = raw - val, chroma = demod(val)  => Y + chroma == raw.
