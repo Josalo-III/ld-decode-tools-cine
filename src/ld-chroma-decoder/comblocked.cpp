@@ -3510,6 +3510,120 @@ void anchorMatchEdges(const std::vector<AnchorRun> &a,
 
 } // namespace
 
+// ==== Anchor ceiling: regional carrier-amplitude bound from the exact
+// channel (user direction, 2026-07-28: "I didn't want to interpolate the
+// non-anchors, just constrain them with the bandwidth"). ====
+//
+// Per covered line the exact envelope certifies the carrier amplitude;
+// pooling it over a lateral window (max-dilate, so the bound can only be
+// generous) and padding by the measured transfer margins (amplitude p90
+// ~1.5 IRE intra-frame) yields a REGIONAL ceiling: an amplitude no legal
+// carrier in this neighbourhood exceeds. Uncovered lines inside an
+// anchored frame take the max of the covered lines bracketing them
+// (coverage is every other frame line there). Frames with no coverage
+// publish no plane and every consumer stays inert -- cross-frame
+// authority waits for the confirm-only machinery (45% of edges lapse
+// across film frames; a bound must not pretend otherwise). Samples the
+// error-corrector DENIED contribute nothing. The plane carries BOUNDS,
+// never values -- nothing from it is ever rendered.
+void Comb::FrameBuffer::buildAnchorCeiling()
+{
+    anchorCeiling_flat.clear();
+    if (exactCarrier_flat.empty()) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int fullWidth = videoParameters.fieldWidth;
+    if (right - left <= 8 || firstLine >= lastLine || fullWidth <= 0) return;
+
+    // Pooling radius sits just above the measured intra-frame edge-transfer
+    // p90 (4 px): wide enough that anchor drift cannot fake a violation,
+    // tight enough that a gray strut keeps its own low ceiling instead of
+    // inheriting a neighbour's colour. Margins from the measured amplitude
+    // drift (p90 1.5 IRE); floor covers the exact channel's noise envelope.
+    constexpr int    kLatRadius     = 8;    // lateral pooling half-window
+    constexpr double kMarginRel     = 0.10; // relative pad
+    constexpr double kMarginAbsIRE  = 1.5;  // absolute pad
+    constexpr double kFloorIRE      = 2.5;  // authority floor (noise env)
+
+    const double inf = std::numeric_limits<double>::infinity();
+    // Pooled per-line envelope rows, +inf where no authority.
+    std::vector<std::vector<double>> pooled(lastLine);
+    std::vector<double> env(fullWidth, std::numeric_limits<double>::quiet_NaN());
+    bool anyCovered = false;
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *ex = exactCarrierRow(line);
+        if (!ex) continue;
+        int nFinite = 0;
+        for (int h = left; h < right; ++h) {
+            const float a = ex[h];
+            const float b = (h + 1 < right) ? ex[h + 1] : a;
+            if (std::isfinite(a) && std::isfinite(b)) {
+                env[h] = std::hypot((double)a, (double)b) * invIreScale;
+                ++nFinite;
+            } else {
+                env[h] = std::numeric_limits<double>::quiet_NaN();
+            }
+        }
+        if (nFinite < (right - left) / 2) continue;
+        anyCovered = true;
+
+        auto &row = pooled[line];
+        row.assign(fullWidth, inf);
+        // Sliding max over +-kLatRadius, NaN-aware (denied samples give no
+        // authority; a window with too little coverage stays +inf).
+        for (int h = left; h < right; ++h) {
+            double m = 0.0; int nv = 0;
+            const int a = std::max(left, h - kLatRadius);
+            const int b = std::min(right - 1, h + kLatRadius);
+            for (int j = a; j <= b; ++j) {
+                if (std::isfinite(env[j])) { m = std::max(m, env[j]); ++nv; }
+            }
+            if (nv >= (b - a + 1) / 2)
+                row[h] = std::max(kFloorIRE,
+                                  m * (1.0 + kMarginRel) + kMarginAbsIRE);
+        }
+    }
+
+    if (!anyCovered) return;
+
+    anchorCeiling_flat.assign((size_t)lastLine * fullWidth,
+                              std::numeric_limits<float>::infinity());
+    for (int line = firstLine; line < lastLine; ++line) {
+        float *out = anchorCeiling_flat.data() + (size_t)line * fullWidth;
+        // This line's authority: its own pooled row, else the max of the
+        // covered rows within +-2 (the bracketing covered lines).
+        const std::vector<double> *src[3] = {nullptr, nullptr, nullptr};
+        if (!pooled[line].empty()) src[0] = &pooled[line];
+        else {
+            if (line - 1 >= firstLine && !pooled[line - 1].empty())
+                src[1] = &pooled[line - 1];
+            if (line + 1 < lastLine && !pooled[line + 1].empty())
+                src[2] = &pooled[line + 1];
+            if (!src[1] && line - 2 >= firstLine && !pooled[line - 2].empty())
+                src[1] = &pooled[line - 2];
+            if (!src[2] && line + 2 < lastLine && !pooled[line + 2].empty())
+                src[2] = &pooled[line + 2];
+        }
+        if (!src[0] && !src[1] && !src[2]) continue;
+        for (int h = left; h < right; ++h) {
+            double c = src[0] ? (*src[0])[h] : 0.0;
+            if (!src[0]) {
+                // An uncovered line is bounded only where EVERY bracketing
+                // covered line grants authority; the bound is their max.
+                double c1 = src[1] ? (*src[1])[h] : inf;
+                double c2 = src[2] ? (*src[2])[h] : inf;
+                if (!std::isfinite(c1) || !std::isfinite(c2)) { c = inf; }
+                else c = std::max(c1, c2);
+            }
+            out[h] = (float)c;
+        }
+    }
+}
+
 void Comb::FrameBuffer::probeExactAnchors()
 {
     static const bool anchorOn = []{
@@ -3697,6 +3811,10 @@ void Comb::FrameBuffer::produceY()
     // frame-to-frame -- the margins the anchor tether needs.
     probeExactAnchors();
 
+    // Anchor ceiling: pooled regional amplitude bound from the exact
+    // channel. Cheap no-op on frames without coverage.
+    buildAnchorCeiling();
+
     // ---- HF-election diagnostic probe (no output influence) ----
     // Column/line gated per-pixel dump of the produceY HF luma election:
     // candidate roster + planes, self/neighbor/decision anchors, the winner,
@@ -3861,6 +3979,7 @@ void Comb::FrameBuffer::produceY()
             const double *oneDRow = locked1DSource_line(line); // may be null
             const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
             const float *dsExactRow = exactCarrierRow(line);
+            const float *anchorRow = anchorCeilingRow(line);
             const float *dsHDeltaRow = lockedLumaHDeltaIRE_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
@@ -4947,6 +5066,20 @@ void Comb::FrameBuffer::produceY()
                             diagNeighborAnchor = nv;
                         }
                     }
+                    // Anchor authority (user direction, 2026-07-28): where
+                    // the exact channel granted a regional amplitude
+                    // ceiling, a candidate whose implied carrier
+                    // (raw - complete Y) exceeds it is claiming carrier the
+                    // anchors certify cannot exist there. The excess enters
+                    // as a normalised weight factor -- authority in the
+                    // scoring, per the weight doctrine, never a hard cut --
+                    // and the bound was max-pooled + margin-padded, so
+                    // legal carrier never pays. Inert wherever no plane or
+                    // no authority (+inf).
+                    constexpr double kAnchorTauIRE = 1.5;
+                    const double anchorCeilIRE =
+                        anchorRow ? (double)anchorRow[h]
+                                  : std::numeric_limits<double>::infinity();
                     for (int k = 0; k < nIn && k < 4; ++k) {
                         const int plane =
                             (k < baseNIn) ? candPlane[inIdx[k]] : 4;
@@ -4956,6 +5089,16 @@ void Comb::FrameBuffer::produceY()
                             std::exp(-(costs[k] - bestCost) / blendTau);
                         if (k == darkestIdx && k < baseNIn && baseNIn > 1)
                             w *= 1.0 - darkestVetoGate;
+                        if (std::isfinite(anchorCeilIRE)) {
+                            const double complete = (k < baseNIn)
+                                ? planeY(candPlane[inIdx[k]], h)
+                                : returnedY;
+                            const double cIRE =
+                                std::fabs(rawH - complete) * invIreScale;
+                            const double excess = cIRE - anchorCeilIRE;
+                            if (excess > 0.0)
+                                w *= std::exp(-excess / kAnchorTauIRE);
+                        }
                         wDiag[k] = w;
                         blendNum += w * yk;
                         blendDen += w;

@@ -1132,6 +1132,21 @@ private:
 		return exactCarrier_flat.data() + (size_t)line * w;
 	}
 
+	// Anchor ceiling (IRE, full fieldWidth geometry like exactCarrier):
+	// regional carrier-amplitude bound pooled from the exact channel's
+	// envelope on covered lines, laterally max-dilated and margin-padded.
+	// +inf = no anchor authority at this sample. Bounds, never values:
+	// non-anchored samples are CONSTRAINED, not interpolated.
+	std::vector<float> anchorCeiling_flat;
+	inline const float *anchorCeilingRow(int line) const {
+		if (line < 0 || anchorCeiling_flat.empty()) return nullptr;
+		const int w = videoParameters.fieldWidth;
+		if (w <= 0 || (size_t)(line + 1) * w > anchorCeiling_flat.size())
+			return nullptr;
+		return anchorCeiling_flat.data() + (size_t)line * w;
+	}
+	void buildAnchorCeiling();
+
 	inline std::uint8_t *chromaBoundaryBand_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    chromaBoundaryBand_flat.empty()) return nullptr;
