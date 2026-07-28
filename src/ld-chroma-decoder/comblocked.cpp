@@ -3438,6 +3438,240 @@ void Comb::FrameBuffer::filterIQLocked()
     }
 }
 
+// ==== Exact-carrier anchor extraction + transfer-error probe ====
+// LDCD_PROBE_ANCHOR=1, run -t 1. Measurement only.
+//
+// The (D-S)/2 exact channel certifies, on covered lines, where compact
+// colour starts and stops and at what amplitude -- conservation facts,
+// not estimates. Before any estimator may be TETHERED to those anchors,
+// the tether needs measured margins: how far does a run's edge and
+// amplitude drift per covered-line step (intra-field, the +-2-frame-line
+// vertical coherence of one anchored field) and per anchored-frame step
+// (cross-letter, A->C = two film frames of motion)? This probe extracts
+// carrier runs from the exact envelope (hysteresis threshold, sub-pixel
+// edges) and prints per-frame aggregates of both transfer errors. The
+// p90s ARE the dilation margins the anchor consumers must grant.
+namespace {
+
+struct AnchorRun {
+    double x0 = 0.0, x1 = 0.0;           // sub-pixel active-column edges
+    double ampMean = 0.0, ampPeak = 0.0; // IRE
+};
+
+struct AnchorFrameStore {
+    std::vector<std::vector<AnchorRun>> runsByLine;
+    int parity = -1;
+    long frameIdx = -1;
+};
+AnchorFrameStore g_anchorPrev;
+long g_anchorFrameCounter = 0;
+
+double anchorPct(std::vector<double> &v, double q)
+{
+    if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+    const size_t k = std::min(v.size() - 1,
+                              (size_t)(q * (double)(v.size() - 1) + 0.5));
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k];
+}
+
+// Anchor = an EDGE (where compact colour starts or stops), so transfer
+// is graded edge-to-edge: each edge matches the nearest same-polarity
+// edge on the partner line within a window, or counts as unmatched (a
+// topology event -- run merge/split, object end -- not a drift). Grading
+// runs against runs conflated the two and blew up the tails.
+void anchorMatchEdges(const std::vector<AnchorRun> &a,
+                      const std::vector<AnchorRun> &b,
+                      std::vector<double> &dEdge,
+                      std::vector<double> &damp,
+                      long &nUnmatched)
+{
+    constexpr double kMatchPx = 6.0;
+    for (const AnchorRun &ra : a) {
+        for (int pol = 0; pol < 2; ++pol) {
+            const double ea = pol ? ra.x1 : ra.x0;
+            double best = kMatchPx;
+            const AnchorRun *bm = nullptr;
+            for (const AnchorRun &rb : b) {
+                const double eb = pol ? rb.x1 : rb.x0;
+                const double d = std::fabs(eb - ea);
+                if (d < best) { best = d; bm = &rb; }
+            }
+            if (bm) {
+                dEdge.push_back(best);
+                if (pol == 0)
+                    damp.push_back(std::fabs(ra.ampMean - bm->ampMean));
+            } else {
+                ++nUnmatched;
+            }
+        }
+    }
+}
+
+} // namespace
+
+void Comb::FrameBuffer::probeExactAnchors()
+{
+    static const bool anchorOn = []{
+        const char *s = std::getenv("LDCD_PROBE_ANCHOR");
+        return s && std::atoi(s) != 0;
+    }();
+    if (!anchorOn) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+    if (width <= 8) return;
+
+    constexpr double kOnIRE  = 3.0;  // run ignition
+    constexpr double kOffIRE = 2.0;  // run extension (hysteresis)
+    constexpr int    kMinRun = 4;
+
+    std::vector<std::vector<AnchorRun>> runsByLine(lastLine);
+    std::vector<double> env(width);
+    int nCovered = 0, nRuns = 0, parity = -1;
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *ex = exactCarrierRow(line);
+        if (!ex) continue;
+        int nFinite = 0;
+        for (int xi = 0; xi < width; ++xi) {
+            const int h = left + xi;
+            const float a = ex[h];
+            const float b = (xi + 1 < width) ? ex[h + 1] : a;
+            if (std::isfinite(a) && std::isfinite(b)) {
+                env[xi] = std::hypot((double)a, (double)b) * invIreScale;
+                ++nFinite;
+            } else {
+                env[xi] = 0.0;
+            }
+        }
+        if (nFinite < width / 2) continue;
+        ++nCovered;
+        parity = line & 1;
+
+        // 5-tap smooth of the envelope.
+        std::vector<double> sm(width);
+        for (int xi = 0; xi < width; ++xi) {
+            double s = 0.0; int n = 0;
+            for (int k = -2; k <= 2; ++k) {
+                const int j = xi + k;
+                if (j >= 0 && j < width) { s += env[j]; ++n; }
+            }
+            sm[xi] = s / std::max(1, n);
+        }
+
+        auto &runs = runsByLine[line];
+        int xi = 0;
+        while (xi < width) {
+            if (sm[xi] < kOnIRE) { ++xi; continue; }
+            int e = xi;
+            while (e + 1 < width && sm[e + 1] >= kOffIRE) ++e;
+            if (e - xi + 1 >= kMinRun) {
+                AnchorRun r;
+                // Sub-pixel edges: crossing of kOff below the first/above
+                // the last sample when a neighbour exists.
+                r.x0 = xi;
+                if (xi > 0 && sm[xi] > sm[xi - 1] + 1e-9)
+                    r.x0 = xi - 1 + (kOffIRE - sm[xi - 1]) /
+                                        (sm[xi] - sm[xi - 1]);
+                r.x1 = e;
+                if (e + 1 < width && sm[e] > sm[e + 1] + 1e-9)
+                    r.x1 = e + (sm[e] - kOffIRE) / (sm[e] - sm[e + 1]);
+                double s = 0.0, p = 0.0;
+                for (int j = xi; j <= e; ++j) {
+                    s += sm[j]; p = std::max(p, sm[j]);
+                }
+                r.ampMean = s / (e - xi + 1);
+                r.ampPeak = p;
+                runs.push_back(r);
+                ++nRuns;
+            }
+            xi = e + 1;
+        }
+    }
+
+    const long fIdx = g_anchorFrameCounter++;
+    if (nCovered == 0) {
+        std::fprintf(stderr, "ANCHOR f=%ld no coverage\n", fIdx);
+        return;
+    }
+
+    // Strong-run view: genuine compact colour, not threshold-skimming
+    // fragments. Weak wide runs at the ignition threshold have noise-set
+    // edges and mismatch freely; the tether will be calibrated on runs
+    // whose amplitude proves an object.
+    constexpr double kStrongIRE = 8.0;
+    std::vector<std::vector<AnchorRun>> strongByLine(lastLine);
+    int nStrong = 0;
+    for (int line = firstLine; line < lastLine; ++line)
+        for (const AnchorRun &r : runsByLine[line])
+            if (r.ampPeak >= kStrongIRE) {
+                strongByLine[line].push_back(r);
+                ++nStrong;
+            }
+
+    // Intra-field transfer: covered line pairs two frame lines apart.
+    auto intraStats = [&](const std::vector<std::vector<AnchorRun>> &byLine,
+                          std::vector<double> &dE, std::vector<double> &damp,
+                          long &unm) {
+        for (int line = firstLine; line + 2 < lastLine; ++line) {
+            if (byLine[line].empty() || byLine[line + 2].empty()) continue;
+            anchorMatchEdges(byLine[line], byLine[line + 2], dE, damp, unm);
+        }
+    };
+    std::vector<double> iDe, iDamp, sDe, sDamp;
+    long iUnm = 0, sUnm = 0;
+    intraStats(runsByLine, iDe, iDamp, iUnm);
+    intraStats(strongByLine, sDe, sDamp, sUnm);
+    auto c0 = iDe, ca = iDamp, s0 = sDe, sa = sDamp;
+    std::fprintf(stderr,
+        "ANCHOR f=%ld lines=%d runs=%d(strong %d) parity=%d  "
+        "intra edges n=%zu unm=%.0f%% dE %.2f/%.2f damp %.2f/%.2f  "
+        "STRONG n=%zu unm=%.0f%% dE %.2f/%.2f damp %.2f/%.2f",
+        fIdx, nCovered, nRuns, nStrong, parity,
+        iDe.size(), 100.0 * iUnm / std::max<size_t>(1, iDe.size() + iUnm),
+        anchorPct(c0, 0.5), anchorPct(iDe, 0.9),
+        anchorPct(ca, 0.5), anchorPct(iDamp, 0.9),
+        sDe.size(), 100.0 * sUnm / std::max<size_t>(1, sDe.size() + sUnm),
+        anchorPct(s0, 0.5), anchorPct(sDe, 0.9),
+        anchorPct(sa, 0.5), anchorPct(sDamp, 0.9));
+
+    // Cross-letter transfer vs the previous anchored frame (strong runs).
+    if (g_anchorPrev.frameIdx >= 0 &&
+        (int)g_anchorPrev.runsByLine.size() == lastLine) {
+        std::vector<double> xDe, xDamp;
+        long xUnm = 0;
+        for (int line = firstLine; line < lastLine; ++line) {
+            if (strongByLine[line].empty()) continue;
+            // Same line if the parities match, else the covered neighbour.
+            const int pl = (g_anchorPrev.parity == (line & 1))
+                ? line
+                : ((line + 1 < lastLine &&
+                    !g_anchorPrev.runsByLine[line + 1].empty())
+                       ? line + 1 : line - 1);
+            if (pl < 0 || pl >= lastLine) continue;
+            if (g_anchorPrev.runsByLine[pl].empty()) continue;
+            anchorMatchEdges(strongByLine[line], g_anchorPrev.runsByLine[pl],
+                             xDe, xDamp, xUnm);
+        }
+        auto d0 = xDe, da = xDamp;
+        std::fprintf(stderr,
+            "  cross(strong) n=%zu unm=%.0f%% dE %.2f/%.2f damp %.2f/%.2f",
+            xDe.size(),
+            100.0 * xUnm / std::max<size_t>(1, xDe.size() + xUnm),
+            anchorPct(d0, 0.5), anchorPct(xDe, 0.9),
+            anchorPct(da, 0.5), anchorPct(xDamp, 0.9));
+    }
+    std::fprintf(stderr, "\n");
+
+    g_anchorPrev.runsByLine = std::move(strongByLine);
+    g_anchorPrev.parity = parity;
+    g_anchorPrev.frameIdx = fIdx;
+}
+
 void Comb::FrameBuffer::produceY()
 {
     if (!configuration.phaseCompensation) return;
@@ -3456,6 +3690,12 @@ void Comb::FrameBuffer::produceY()
     // Off-grid leakage probe (measurement only; inert unless
     // LDCD_PROBE_OFFGRID). All published carriers exist by this point.
     probeOffGrid();
+
+    // Exact-carrier anchor probe (measurement only; inert unless
+    // LDCD_PROBE_ANCHOR). Extracts compact-colour runs from the exact
+    // channel and grades their transfer error line-to-line and
+    // frame-to-frame -- the margins the anchor tether needs.
+    probeExactAnchors();
 
     // ---- HF-election diagnostic probe (no output influence) ----
     // Column/line gated per-pixel dump of the produceY HF luma election:

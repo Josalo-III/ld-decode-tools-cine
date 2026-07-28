@@ -472,6 +472,9 @@ public:
 
 	void adjustY();         // Bucket path
 	void produceY();        // Product path
+	// Exact-carrier anchor extraction + transfer-error probe
+	// (LDCD_PROBE_ANCHOR=1, run -t 1). Measurement only.
+	void probeExactAnchors();
 	void doCNR();
 	void doYNR();
 	void transformIQ(double chromaGain, double chromaPhase);
