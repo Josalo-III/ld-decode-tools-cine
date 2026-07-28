@@ -72,6 +72,30 @@ namespace {
     // (motion, edit, mis-pairing). Reject the pair when the outlier
     // fraction exceeds cfg.dgMaxOutlierFrac and no merge occurs.
     //
+    // Per-sample error correction (user design, 2026-07-28): whole-merge
+    // rejection stays for GROSS mismatch (a large share of the image
+    // differs -- the merge would hurt more than help). For the minor
+    // disagreements that survive the gate (dropouts, disc errors), the
+    // out-of-band residual localises the error and the COMPLEMENT field
+    // arbitrates which twin is wrong: the twin more dissimilar to the
+    // average of the comp pixels above and below is held to be the error,
+    // and the other twin's data stands. Phase law of the comparison: the
+    // comp lines bracketing a def line both carry carrier ANTIPHASE to the
+    // def line (adjacent frame lines are 180 degrees; the two comp
+    // neighbours are mutually cophased), so the raw comp average R is a
+    // fair reference for SPARE directly, while DEF must be compared to R
+    // with its carrier flipped -- 2*boxcar(R) - R, the boxcar being
+    // carrier-free. Without the flip the test is biased toward spare
+    // wherever carrier is vertically coherent, which would re-insert
+    // 180-degree carrier through the arbitration (the old dotted-beam bug
+    // by another door). Errors can be luma or colour; the comparison sees
+    // both because it is per-sample against a phase-matched reference.
+    // Repair at an error sample: the good twin supplies its half of the
+    // conservation pair, the carrier is refilled from the nearest valid
+    // same-phase samples (+-4k, one full cycle apart -- lawful under the
+    // bandwidth law), and the exact-carrier side channel is DENIED within
+    // the BP aperture of any error (no conservation fact there).
+    //
     // Emits the exact-carrier side channel: exact = merged - Lhat = BP(chat),
     // the carrier of the emitted sample as a conservation fact.
     static bool mergeDgPairWithSanity(const LdDecodeMetaData::VideoParameters& vp,
@@ -80,7 +104,6 @@ namespace {
                                      SourceField& spare,
                                      SourceField& comp)
     {
-        (void)comp;
 
         const int width = vp.fieldWidth;
         if (width <= 0) return false;
@@ -198,18 +221,140 @@ namespace {
         }
 
         // Pass 2: merged = Lhat + BP(chat); emit the exact-carrier channel.
+        // Minor-disagreement error correction runs per line before emission.
         def.dgExactCarrier.fill(std::numeric_limits<float>::quiet_NaN(), samples);
         quint16* defw = reinterpret_cast<quint16*>(def.data.data());
+
+        const bool haveComp = comp.data.size() == def.data.size();
+        const quint16* compp = haveComp
+            ? reinterpret_cast<const quint16*>(comp.data.constData())
+            : nullptr;
+        // Comp field lines bracketing def line lf (interlace geometry).
+        const bool defIsTop = def.field.isFirstField;
+
+        std::vector<std::uint8_t> errMask(width), denyExact(width);
+        std::vector<double> chatFix(width), lhatFix(width), bpFix(width);
+        long long nErrTotal = 0, nDefBad = 0, nSpareBad = 0;
+
         for (int lf = y0; lf < y1; ++lf) {
             buildLine(lf);
             quint16* out = defw + (size_t)lf * width;
+
+            // Error localisation: broadband twin disagreement.
+            bool anyErr = false;
             for (int h = activeLeft; h < activeRight; ++h) {
-                const double m = lhat[h] + bp[h];
-                out[h] = clampU16(m);
-                def.dgExactCarrier[(size_t)lf * width + h] =
-                    static_cast<float>((double)out[h] - lhat[h]);
+                errMask[h] = std::fabs(chat[h] - bp[h]) > outlierThreshCode;
+                if (errMask[h]) anyErr = true;
+            }
+
+            if (anyErr && haveComp) {
+                const int cUp = std::clamp(defIsTop ? lf - 1 : lf, 0, height - 1);
+                const int cDn = std::clamp(defIsTop ? lf : lf + 1, 0, height - 1);
+                const quint16* ru = compp + (size_t)cUp * width;
+                const quint16* rd = compp + (size_t)cDn * width;
+                auto R = [&](int h) {
+                    h = std::clamp(h, activeLeft, activeRight - 1);
+                    return 0.5 * ((double)ru[h] + (double)rd[h]);
+                };
+                // Phase-balanced carrier-free mean of R at h (0.5,1,1,1,0.5)/4.
+                auto Rmean = [&](int h) {
+                    return (0.5 * R(h - 2) + R(h - 1) + R(h) + R(h + 1) +
+                            0.5 * R(h + 2)) * 0.25;
+                };
+
+                std::copy(chat.begin(), chat.end(), chatFix.begin());
+                std::copy(lhat.begin(), lhat.end(), lhatFix.begin());
+
+                // Carrier refill at error samples from the nearest valid
+                // samples one or more full cycles away (same phase class).
+                auto chatRefill = [&](int h) -> double {
+                    for (int k = 4; k <= 16; k += 4) {
+                        const int a = h - k, b = h + k;
+                        const bool va = a >= activeLeft && !errMask[a];
+                        const bool vb = b < activeRight && !errMask[b];
+                        if (va && vb) return 0.5 * (chat[a] + chat[b]);
+                        if (va) return chat[a];
+                        if (vb) return chat[b];
+                    }
+                    return 0.0;
+                };
+
+                // Arbitrate per error RUN (majority over the run): the twin
+                // more dissimilar to the phase-matched comp reference is
+                // the error.
+                int h = activeLeft;
+                while (h < activeRight) {
+                    if (!errMask[h]) { ++h; continue; }
+                    int rEnd = h;
+                    while (rEnd + 1 < activeRight && errMask[rEnd + 1]) ++rEnd;
+                    double eDef = 0.0, eSpare = 0.0;
+                    const quint16* dl = defp + (size_t)lf * width;
+                    const quint16* sl = sparep + (size_t)lf * width;
+                    for (int x = h; x <= rEnd; ++x) {
+                        const double r = R(x);
+                        const double refSpare = r;                 // cophased
+                        const double refDef = 2.0 * Rmean(x) - r;  // flipped
+                        eDef += std::fabs((double)dl[x] - refDef);
+                        eSpare += std::fabs((double)sl[x] - refSpare);
+                    }
+                    const bool badIsDef = eDef > eSpare;
+                    for (int x = h; x <= rEnd; ++x) {
+                        const double cf = chatRefill(x);
+                        chatFix[x] = cf;
+                        lhatFix[x] = badIsDef
+                            ? (double)sl[x] + cf   // spare = L - c
+                            : (double)dl[x] - cf;  // def   = L + c
+                    }
+                    nErrTotal += rEnd - h + 1;
+                    if (badIsDef) nDefBad += rEnd - h + 1;
+                    else          nSpareBad += rEnd - h + 1;
+                    h = rEnd + 1;
+                }
+
+                // Rebuild the carrier-band filter over the repaired chat.
+                auto atF = [&](int x) {
+                    return chatFix[std::clamp(x, activeLeft, activeRight - 1)];
+                };
+                for (int x = activeLeft; x < activeRight; ++x) {
+                    bpFix[x] = kT0 * chatFix[x] +
+                               kT2 * (atF(x - 2) + atF(x + 2)) +
+                               kT4 * (atF(x - 4) + atF(x + 4));
+                }
+
+                // The exact channel is a conservation fact; deny it within
+                // the BP aperture of any repaired sample.
+                std::fill(denyExact.begin(), denyExact.end(), std::uint8_t(0));
+                for (int x = activeLeft; x < activeRight; ++x) {
+                    if (!errMask[x]) continue;
+                    for (int k = -4; k <= 4; ++k) {
+                        const int xx = x + k;
+                        if (xx >= activeLeft && xx < activeRight)
+                            denyExact[xx] = 1;
+                    }
+                }
+
+                for (int x = activeLeft; x < activeRight; ++x) {
+                    const double m = lhatFix[x] + bpFix[x];
+                    out[x] = clampU16(m);
+                    if (!denyExact[x])
+                        def.dgExactCarrier[(size_t)lf * width + x] =
+                            static_cast<float>((double)out[x] - lhatFix[x]);
+                }
+                continue;
+            }
+
+            for (int h2 = activeLeft; h2 < activeRight; ++h2) {
+                const double m = lhat[h2] + bp[h2];
+                out[h2] = clampU16(m);
+                def.dgExactCarrier[(size_t)lf * width + h2] =
+                    static_cast<float>((double)out[h2] - lhat[h2]);
             }
         }
+
+        if (dsDebug && nErrTotal > 0)
+            std::fprintf(stderr,
+                "DSREF-FIX seq=%d nerr=%lld defBad=%lld spareBad=%lld\n",
+                def.field.seqNo, nErrTotal, nDefBad, nSpareBad);
 
         return true;
     }
