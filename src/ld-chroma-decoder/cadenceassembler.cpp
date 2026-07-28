@@ -23,56 +23,6 @@
 
 namespace {
 
-    struct BurstInfo { double bsin; double bcos; };
-    
-    static inline BurstInfo detectBurstForDgMerge(const quint16 *lineData,
-                                                  const LdDecodeMetaData::VideoParameters &vp)
-    {
-        double bsin = 0.0, bcos = 0.0;
-        for (int i = vp.colourBurstStart; i < vp.colourBurstEnd; ++i) {
-            const double s = lineData[i];
-            bsin += s * sin4fsc(i);
-            bcos += s * cos4fsc(i);
-        }
-        const int len = vp.colourBurstEnd - vp.colourBurstStart;
-        if (len > 0) {
-            const double invLen = 1.0 / len;
-            bsin *= invLen;
-            bcos *= invLen;
-        }
-        double mag = std::sqrt(bsin * bsin + bcos * bcos);
-        if (mag > 1e-9) {
-            const double invMag = 1.0 / mag;
-            bsin *= invMag;
-            bcos *= invMag;
-        } else {
-            bsin = 0.0;
-            bcos = 1.0;
-        }
-        return {bsin, bcos};
-    }
-    
-    static inline BurstInfo combineDefWeightedBasis(const BurstInfo& defB,
-                                                   const BurstInfo& spareB)
-    {
-        double bsin = 2.0 * defB.bsin + spareB.bsin;
-        double bcos = 2.0 * defB.bcos + spareB.bcos;
-        const double mag = std::sqrt(bsin*bsin + bcos*bcos);
-        if (mag > 1e-12) { bsin /= mag; bcos /= mag; }
-        else { bsin = 0.0; bcos = 1.0; }
-        return {bsin, bcos};
-    }
-    
-    static inline void demodIQ(double v, int h, double bcos, double bsin,
-                               double& outI, double& outQ)
-    {
-        const double lsin = v * sin4fsc(h) * 2.0;
-        const double lcos = v * cos4fsc(h) * 2.0;
-        outI = (lsin * bcos - lcos * bsin);
-        outQ = (lsin * bsin + lcos * bcos);
-    }
-    
-    static inline double hypot2(double a, double b) { return std::sqrt(a*a + b*b); }
     
     static inline quint16 clampU16(double v)
     {
@@ -99,98 +49,108 @@ namespace {
     
     // Merge a doplGang A/C spare field into its definitional partner.
     //
-    // The merge is performed in IQ (demodulated chroma) space rather than
-    // raw pixel space because the spare field carries a 180°-shifted subcarrier
-    // relative to the definitional field. A direct pixel average would cancel
-    // chroma; demodulating to IQ first allows the two fields' chroma to be
-    // compared and averaged coherently.
+    // The def and spare are twin captures of the same film field with
+    // opposite subcarrier phase, so per sample the conservation identities
+    // hold exactly:
+    //     luma    Lhat = (def + spare) / 2
+    //     carrier chat = (def - spare) / 2   -- already in DEF phase
+    // No burst detection, demodulation, or sign decision is needed: chat IS
+    // the def-phase carrier by construction. The merged sample is
+    //     merged = Lhat + BP(chat)
+    // where BP is a linear-phase carrier-band filter (taps at 0/+-2/+-4)
+    // with H(fsc) = H(fsc +- 1.3 MHz) = 1 and H(DC) = H(2fsc) = 0. Signal
+    // content is preserved on both sides of the split -- carrier-band luma
+    // (thin lines) stays in Lhat while the carrier stays in BP(chat), which
+    // a single capture cannot separate -- and twin noise is averaged (-3 dB)
+    // everywhere outside the carrier band. There is deliberately no
+    // per-sample branch: an earlier form selected raw def-or-spare samples
+    // by IQ distance to a complement reference, which inserted 180-degree-
+    // shifted spare carrier into saturated chroma (dotted tractor beam).
     //
-    // Pass 1 counts how many samples differ by more than the outlier threshold
-    // in IQ distance. If the outlier fraction exceeds cfg.dgMaxOutlierFrac the
-    // pair is rejected (the fields are not genuine twins) and no merge occurs.
+    // Sanity (pass 1): for true twins the out-of-band part of chat is pure
+    // twin noise, so |chat - BP(chat)| above threshold marks real mismatch
+    // (motion, edit, mis-pairing). Reject the pair when the outlier
+    // fraction exceeds cfg.dgMaxOutlierFrac and no merge occurs.
     //
-    // Pass 2 performs the actual merge: where the def and spare agree within
-    // threshold, their raw pixels are averaged directly. Where they disagree,
-    // the complement field lines immediately above and below are demodulated
-    // and the def/spare sample closer to that reference is kept, discarding
-    // the other.
+    // Emits the exact-carrier side channel: exact = merged - Lhat = BP(chat),
+    // the carrier of the emitted sample as a conservation fact.
     static bool mergeDgPairWithSanity(const LdDecodeMetaData::VideoParameters& vp,
                                      const CadenceAssembler::Configuration& cfg,
                                      SourceField& def,
                                      SourceField& spare,
                                      SourceField& comp)
     {
+        (void)comp;
+
         const int width = vp.fieldWidth;
         if (width <= 0) return false;
 
         // SourceField::data is QVector<quint16>: size() is the SAMPLE count.
-        // The previous form treated it as a byte buffer and divided by
-        // sizeof(quint16), so the geometry guard below always tripped and
-        // the merge was silently dead -- every spare fell through to
-        // baseline release and no def was ever averaged.
+        // (A previous form treated it as a byte buffer and divided by
+        // sizeof(quint16); the geometry guard below then always tripped and
+        // the merge was silently dead.)
         if (def.data.size() != spare.data.size()) return false;
-        if (def.data.size() != comp.data.size()) return false;
         if (def.data.size() <= 0) return false;
 
         const int samples = def.data.size();
         if ((samples % width) != 0) return false;
-    
+
         const int height = samples / width;
         if (height <= 0) return false;
-    
-        int activeLeft  = vp.activeVideoStart;
-        int activeRight = vp.activeVideoEnd;
-    
-        // Clamp active window to buffer width.
-        activeLeft  = std::clamp(activeLeft,  0, width);
-        activeRight = std::clamp(activeRight, 0, width);
+
+        int activeLeft  = std::clamp(vp.activeVideoStart, 0, width);
+        int activeRight = std::clamp(vp.activeVideoEnd,   0, width);
         if (activeLeft >= activeRight) return false;
-    
-        const int y0     = std::clamp(def.getFirstActiveLine(vp),   0, height);
-        const int y1     = std::clamp(def.getLastActiveLine(vp),    0, height);
-        const int compY0 = std::clamp(comp.getFirstActiveLine(vp),  0, height);
-        const int compY1 = std::clamp(comp.getLastActiveLine(vp),   0, height);
-        if (y0 >= y1 || compY0 >= compY1) return false;
-    
+
+        const int y0 = std::clamp(def.getFirstActiveLine(vp), 0, height);
+        const int y1 = std::clamp(def.getLastActiveLine(vp),  0, height);
+        if (y0 >= y1) return false;
+
         const double ireScale = (vp.white16bIre - vp.black16bIre) / 100.0;
         if (!(ireScale > 0.0)) return false;
-    
-        // Threshold expressed in sample/code units (same space as input pixels).
         const double outlierThreshCode = cfg.dgOutlierThreshIre * ireScale;
         const double maxOutlierFrac    = std::clamp(cfg.dgMaxOutlierFrac, 0.0, 1.0);
         if (!(outlierThreshCode >= 0.0)) return false;
-    
-        // In this pipeline's demodIQ (as used by dg merge), IQ distance is 2x code distance:
-        // lsin/lcos have factor 2.0 and sin/cos are unit magnitude -> |dIQ| = 2*|dv|.
-        const double outlierThreshIQ = 2.0 * outlierThreshCode;
-    
+
+        // Carrier-band filter: unity at fsc and at fsc +- 1.3 MHz, zero at
+        // DC and 2fsc (solved exactly for 4fsc sampling).
+        constexpr double kT0 = 0.676462;
+        constexpr double kT2 = -0.250000;
+        constexpr double kT4 = -0.088231;
+
         const quint16* defp   = reinterpret_cast<const quint16*>(def.data.constData());
         const quint16* sparep = reinterpret_cast<const quint16*>(spare.data.constData());
-        const quint16* compp  = reinterpret_cast<const quint16*>(comp.data.constData());
-    
-        std::int64_t total    = 0;
-        std::int64_t outliers = 0;
-    
-        // Pass 1: Analyze (cheap twin sanity in the same "code-derived" space via outlierThreshIQ)
-        for (int lf = y0; lf < y1; ++lf) {
-            const quint16* defLine   = defp   + lf * width;
-            const quint16* spareLine = sparep + lf * width;
-    
-            const BurstInfo bDef   = detectBurstForDgMerge(defLine, vp);
-            const BurstInfo bSpare = detectBurstForDgMerge(spareLine, vp);
-            const BurstInfo b      = combineDefWeightedBasis(bDef, bSpare);
-    
+
+        std::vector<double> chat(width), lhat(width), bp(width);
+
+        auto buildLine = [&](int lf) {
+            const quint16* dl = defp   + (size_t)lf * width;
+            const quint16* sl = sparep + (size_t)lf * width;
+            for (int h = 0; h < width; ++h) {
+                const double d = (double)dl[h];
+                const double sv = (double)sl[h];
+                lhat[h] = 0.5 * (d + sv);
+                chat[h] = 0.5 * (d - sv);
+            }
+            auto at = [&](int h) {
+                return chat[std::clamp(h, activeLeft, activeRight - 1)];
+            };
             for (int h = activeLeft; h < activeRight; ++h) {
-                double ID, QD, IS, QS;
-                demodIQ((double)defLine[h],   h, b.bcos, b.bsin, ID, QD);
-                demodIQ((double)spareLine[h], h, b.bcos, b.bsin, IS, QS);
-    
-                // IQ-distance threshold (equivalent to code-distance threshold)
-                if (hypot2(ID - IS, QD - QS) > outlierThreshIQ) outliers++;
+                bp[h] = kT0 * chat[h] +
+                        kT2 * (at(h - 2) + at(h + 2)) +
+                        kT4 * (at(h - 4) + at(h + 4));
+            }
+        };
+
+        // Pass 1: twin sanity on the out-of-band residual of chat.
+        std::int64_t total = 0, outliers = 0;
+        for (int lf = y0; lf < y1; ++lf) {
+            buildLine(lf);
+            for (int h = activeLeft; h < activeRight; ++h) {
+                if (std::fabs(chat[h] - bp[h]) > outlierThreshCode) outliers++;
                 total++;
             }
         }
-    
         if (total <= 0) return false;
         const double outlierFrac = double(outliers) / double(total);
         static const bool dsDebug = std::getenv("LDCD_PROBE_DSREF") != nullptr;
@@ -203,73 +163,21 @@ namespace {
         if (dsDebug)
             std::fprintf(stderr, "DSREF-MERGE accept seq=%d frac=%.3f\n",
                          def.field.seqNo, outlierFrac);
-    
-        // Pass 2: Merge
-        quint16* defw   = reinterpret_cast<quint16*>(def.data.data());
-        quint16* sparew = reinterpret_cast<quint16*>(spare.data.data());
-        const bool defIsFirst = def.field.isFirstField;
 
-        // Exact-carrier side channel: the twin sum is exact luma and the twin
-        // difference exact carrier (same film content, opposite subcarrier),
-        // so the carrier of whatever this merge emits is known exactly:
-        //     exact = outv - (def + spare)/2
-        // Captured per sample BEFORE the buffers are overwritten. This is the
-        // only place in the pipeline where the carrier is a conservation fact
-        // rather than an estimate; downstream it is evidence/calibration
-        // only (half-line coverage must never render directly).
+        // Pass 2: merged = Lhat + BP(chat); emit the exact-carrier channel.
         def.dgExactCarrier.fill(std::numeric_limits<float>::quiet_NaN(), samples);
-    
+        quint16* defw = reinterpret_cast<quint16*>(def.data.data());
         for (int lf = y0; lf < y1; ++lf) {
-            quint16* defLine   = defw   + lf * width;
-            quint16* spareLine = sparew + lf * width;
-    
-            const BurstInfo bDef   = detectBurstForDgMerge(defLine, vp);
-            const BurstInfo bSpare = detectBurstForDgMerge(spareLine, vp);
-            const BurstInfo b      = combineDefWeightedBasis(bDef, bSpare);
-    
-            int compLfUp = defIsFirst ? (lf - 1) : lf;
-            int compLfDn = defIsFirst ? lf       : (lf + 1);
-            compLfUp = std::clamp(compLfUp, compY0, compY1 - 1);
-            compLfDn = std::clamp(compLfDn, compY0, compY1 - 1);
-    
-            const quint16* compUpLine = compp + compLfUp * width;
-            const quint16* compDnLine = compp + compLfDn * width;
-    
+            buildLine(lf);
+            quint16* out = defw + (size_t)lf * width;
             for (int h = activeLeft; h < activeRight; ++h) {
-                double ID, QD, IS, QS;
-                demodIQ((double)defLine[h],   h, b.bcos, b.bsin, ID, QD);
-                demodIQ((double)spareLine[h], h, b.bcos, b.bsin, IS, QS);
-    
-                const double dDS_IQ = hypot2(ID - IS, QD - QS);
-    
-                quint16 outv = 0;
-                if (dDS_IQ <= outlierThreshIQ) {
-                    outv = clampU16(0.5 * ((double)defLine[h] + (double)spareLine[h]));
-                } else {
-                    double IU, QU, IDn, QDn;
-                    demodIQ((double)compUpLine[h], h, b.bcos, b.bsin, IU,  QU);
-                    demodIQ((double)compDnLine[h], h, b.bcos, b.bsin, IDn, QDn);
-    
-                    if ((IU * IDn + QU * QDn) < 0.0) { IDn = -IDn; QDn = -QDn; }
-    
-                    const double IR = 0.5 * (IU + IDn);
-                    const double QR = 0.5 * (QU + QDn);
-    
-                    const double dDef = hypot2(ID - IR, QD - QR);
-                    const double dSp  = hypot2(IS - IR, QS - QR);
-    
-                    outv = (dDef <= dSp) ? defLine[h] : spareLine[h];
-                }
-    
-                def.dgExactCarrier[lf * width + h] = static_cast<float>(
-                    (double)outv -
-                    0.5 * ((double)defLine[h] + (double)spareLine[h]));
-
-                defLine[h]   = outv;
-                spareLine[h] = outv;
+                const double m = lhat[h] + bp[h];
+                out[h] = clampU16(m);
+                def.dgExactCarrier[(size_t)lf * width + h] =
+                    static_cast<float>((double)out[h] - lhat[h]);
             }
         }
-    
+
         return true;
     }
 
