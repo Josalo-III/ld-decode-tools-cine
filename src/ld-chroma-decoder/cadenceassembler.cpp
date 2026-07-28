@@ -8,6 +8,10 @@
  * This file is part of ld-decode-tools.
  ******************************************************************************/
 #include "cadenceassembler.h"
+
+#include <limits>
+#include <cstdio>
+#include <cstdlib>
 #include "cadencedefs.h"
 #include "combmath.h"
 #include "tbc/logging.h"
@@ -118,16 +122,17 @@ namespace {
     {
         const int width = vp.fieldWidth;
         if (width <= 0) return false;
-    
-        // Treat SourceField::data as a raw byte buffer of 16-bit samples.
-        constexpr int bytesPerSample = int(sizeof(quint16));
-    
+
+        // SourceField::data is QVector<quint16>: size() is the SAMPLE count.
+        // The previous form treated it as a byte buffer and divided by
+        // sizeof(quint16), so the geometry guard below always tripped and
+        // the merge was silently dead -- every spare fell through to
+        // baseline release and no def was ever averaged.
         if (def.data.size() != spare.data.size()) return false;
         if (def.data.size() != comp.data.size()) return false;
         if (def.data.size() <= 0) return false;
-        if ((def.data.size() % bytesPerSample) != 0) return false;
-    
-        const int samples = def.data.size() / bytesPerSample;
+
+        const int samples = def.data.size();
         if ((samples % width) != 0) return false;
     
         const int height = samples / width;
@@ -188,12 +193,31 @@ namespace {
     
         if (total <= 0) return false;
         const double outlierFrac = double(outliers) / double(total);
-        if (outlierFrac > maxOutlierFrac) return false;
+        static const bool dsDebug = std::getenv("LDCD_PROBE_DSREF") != nullptr;
+        if (outlierFrac > maxOutlierFrac) {
+            if (dsDebug)
+                std::fprintf(stderr, "DSREF-MERGE reject seq=%d frac=%.3f\n",
+                             def.field.seqNo, outlierFrac);
+            return false;
+        }
+        if (dsDebug)
+            std::fprintf(stderr, "DSREF-MERGE accept seq=%d frac=%.3f\n",
+                         def.field.seqNo, outlierFrac);
     
         // Pass 2: Merge
         quint16* defw   = reinterpret_cast<quint16*>(def.data.data());
         quint16* sparew = reinterpret_cast<quint16*>(spare.data.data());
         const bool defIsFirst = def.field.isFirstField;
+
+        // Exact-carrier side channel: the twin sum is exact luma and the twin
+        // difference exact carrier (same film content, opposite subcarrier),
+        // so the carrier of whatever this merge emits is known exactly:
+        //     exact = outv - (def + spare)/2
+        // Captured per sample BEFORE the buffers are overwritten. This is the
+        // only place in the pipeline where the carrier is a conservation fact
+        // rather than an estimate; downstream it is evidence/calibration
+        // only (half-line coverage must never render directly).
+        def.dgExactCarrier.fill(std::numeric_limits<float>::quiet_NaN(), samples);
     
         for (int lf = y0; lf < y1; ++lf) {
             quint16* defLine   = defw   + lf * width;
@@ -237,6 +261,10 @@ namespace {
                     outv = (dDef <= dSp) ? defLine[h] : spareLine[h];
                 }
     
+                def.dgExactCarrier[lf * width + h] = static_cast<float>(
+                    (double)outv -
+                    0.5 * ((double)defLine[h] + (double)spareLine[h]));
+
                 defLine[h]   = outv;
                 spareLine[h] = outv;
             }
@@ -397,7 +425,13 @@ bool CadenceAssembler::orderPairForComb(SourceField& a, SourceField& b) const
 
 bool CadenceAssembler::mergeDgPairWithSanityWrapper(SourceField& def, SourceField& spare, SourceField& comp)
 {
-    return mergeDgPairWithSanity(videoParameters, config, def, spare, comp);
+    static const bool dsDebug = std::getenv("LDCD_PROBE_DSREF") != nullptr;
+    const bool ok = mergeDgPairWithSanity(videoParameters, config, def, spare, comp);
+    if (dsDebug)
+        std::fprintf(stderr, "DSREF-WRAP def=%d spare=%d ok=%d plane=%d\n",
+                     def.field.seqNo, spare.field.seqNo, (int)ok,
+                     (int)def.dgExactCarrier.size());
+    return ok;
 }
 
 // Forced cadence start offset helper

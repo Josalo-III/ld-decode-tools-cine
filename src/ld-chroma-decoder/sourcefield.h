@@ -33,6 +33,17 @@ struct SourceField {
     LdDecodeMetaData::Field field;
     SourceVideo::Data data;
     qint32 capturePartnerSeqNo = -1;  // seqNo of the other field in the original TBC frame
+    // Exact-carrier side channel from the cadence assembler's dG merge.
+    // For a def field whose spare twin passed the merge sanity check, this
+    // holds, per sample, the carrier of the EMITTED (merged) sample:
+    //     exact = merged - (def + spare)/2
+    // The twin sum is exact luma and the twin difference exact carrier by
+    // conservation (same film content, opposite subcarrier), so this is a
+    // measurement, not an estimate. Empty when no twin existed or sanity
+    // failed; NaN outside the processed active region. Consumers must treat
+    // it as evidence/calibration only -- it covers half the lines of A/C
+    // film frames and would alternate if rendered directly.
+    QVector<float> dgExactCarrier;
     // Cadence identity remains in field.cinemap for diagnostics, but fallback
     // work must not use that identity as permission for FVF's progressive
     // frame regime. Guarded frame candidates remain part of the field regime.

@@ -105,6 +105,57 @@ inline double coarseSharpLevel()
 // measured point at which comb's HF stops being trusted, which the coming
 // roll-off keys to. Sign-flip fraction per bin rides along for the
 // grammar-side sign fix (the taps own the sign).
+// (D-S)/2 referee (LDCD_PROBE_DSREF=1): grades every carrier estimator
+// against the assembler's exact-carrier side channel on covered lines.
+// The confiscation ledger: error vs exact truth, split flat / detail
+// (hLumaDelta >= 6 IRE), per frame. Thread-safe use: run -t 1.
+struct DsRefProbe {
+    static bool on()
+    {
+        static const bool v = std::getenv("LDCD_PROBE_DSREF") != nullptr;
+        return v;
+    }
+    struct Est {
+        long n = 0;
+        double sumAbs = 0, sum = 0, sumSq = 0, maxAbs = 0;
+        void add(double eIRE)
+        {
+            if (!std::isfinite(eIRE)) return;
+            n++; sumAbs += std::fabs(eIRE); sum += eIRE; sumSq += eIRE * eIRE;
+            maxAbs = std::max(maxAbs, std::fabs(eIRE));
+        }
+    };
+    // [flat=0 / detail=1][estimator: 0=1D 1=comb 2=fit 3=retracted]
+    Est e[2][4];
+    long covered = 0;
+    long frameIdx = 0;
+
+    void flush()
+    {
+        static const char *nm[4] = { "1D", "comb", "fit", "retr" };
+        if (covered > 0) {
+            std::fprintf(stderr, "[DSREF f=%ld] covered px=%ld\n", frameIdx, covered);
+            for (int b = 0; b < 2; ++b) {
+                std::fprintf(stderr, "  %s:", b ? "detail" : "flat  ");
+                for (int k = 0; k < 4; ++k) {
+                    const Est &E = e[b][k];
+                    if (E.n == 0) { std::fprintf(stderr, "  %s n=0", nm[k]); continue; }
+                    std::fprintf(stderr,
+                        "  %s |e| %.2f bias %+.2f rms %.2f max %.1f (n=%ld)",
+                        nm[k], E.sumAbs / E.n, E.sum / E.n,
+                        std::sqrt(E.sumSq / E.n), E.maxAbs, E.n);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        frameIdx++;
+        covered = 0;
+        for (int b = 0; b < 2; ++b) for (int k = 0; k < 4; ++k) e[b][k] = Est();
+    }
+};
+
+DsRefProbe g_dsRefProbe;
+
 struct KneeProbe {
     std::mutex mu;
     static constexpr int kBins = 10;
@@ -3543,6 +3594,8 @@ void Comb::FrameBuffer::produceY()
                     : nullptr;
             const double *oneDRow = locked1DSource_line(line); // may be null
             const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
+            const float *dsExactRow = exactCarrierRow(line);
+            const float *dsHDeltaRow = lockedLumaHDeltaIRE_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
             const float *alienRow = regionAlienPartner_line(line);
@@ -3975,6 +4028,26 @@ void Comb::FrameBuffer::produceY()
                 } else {
                     const double c = clpLine[h];
                     combY = std::isfinite(c) ? rawH - c : rawH;
+                }
+
+                // (D-S)/2 referee: grade every estimator against the exact
+                // carrier wherever the side channel covers this sample.
+                // Before any early-out so coverage is complete.
+                if (DsRefProbe::on() && dsExactRow &&
+                    std::isfinite(dsExactRow[h])) {
+                    const double ex = dsExactRow[h];
+                    const double hd = dsHDeltaRow ? dsHDeltaRow[xi] : 0.0;
+                    const int bin = hd >= 6.0 ? 1 : 0;
+                    g_dsRefProbe.covered++;
+                    if (oneDRow && std::isfinite(oneDRow[xi]))
+                        g_dsRefProbe.e[bin][0].add((oneDRow[xi] - ex) * invIreScale);
+                    g_dsRefProbe.e[bin][1].add((rawH - combY - ex) * invIreScale);
+                    const float *fitRowDs = carrierFit_line(line);
+                    if (fitRowDs && std::isfinite(fitRowDs[xi]))
+                        g_dsRefProbe.e[bin][2].add((fitRowDs[xi] - ex) * invIreScale);
+                    if (retractedRow && std::isfinite(retractedRow[xi]))
+                        g_dsRefProbe.e[bin][3].add(
+                            (rawH - (double)retractedRow[xi] - ex) * invIreScale);
                 }
 
                 const double ccReturn = ccMaskRow
@@ -4855,8 +4928,10 @@ void Comb::FrameBuffer::produceY()
             retrBrightTotal, retrBrightBySchedule[0],
             retrBrightBySchedule[1], retrBrightBySchedule[2]);
     }
-}
 
+    if (DsRefProbe::on())
+        g_dsRefProbe.flush();
+}
 // Lurch preconditioner for the coarse luma prior.
 //
 // The legal 4-sample means cancel carrier, but they are boxcars: a luma step

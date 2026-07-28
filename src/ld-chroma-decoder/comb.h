@@ -890,6 +890,10 @@ private:
 	std::vector<double> scratch_frameBReachUp;
 	std::vector<double> scratch_frameBReachDown;
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;
+	// Exact-carrier side channel (full fieldWidth per frame line, NaN =
+	// absent). Filled by loadFields from the assembler's dG-merge twin
+	// conservation on covered lines; evidence/calibration only.
+	std::vector<float> exactCarrier_flat;
 	// Chroma-boundary band membership per sample, published by Field B's
 	// region consumption for downstream band-uniform laws (the Y election's
 	// band cede). 1 = inside a chromaBoundaryBand run on that line.
@@ -1113,6 +1117,14 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    fieldBDecisionReason_flat.empty()) return nullptr;
 		return fieldBDecisionReason_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+
+	inline const float *exactCarrierRow(int line) const {
+		if (line < 0 || exactCarrier_flat.empty()) return nullptr;
+		const int w = videoParameters.fieldWidth;
+		if (w <= 0 || (size_t)(line + 1) * w > exactCarrier_flat.size())
+			return nullptr;
+		return exactCarrier_flat.data() + (size_t)line * w;
 	}
 
 	inline std::uint8_t *chromaBoundaryBand_line(int line) {

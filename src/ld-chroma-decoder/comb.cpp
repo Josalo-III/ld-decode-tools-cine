@@ -644,6 +644,28 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         fieldLine++;
     }
 
+    // Exact-carrier side channel: interleave the fields' planes on the same
+    // mapping as rawbuffer (frame line 2k = first field line k, 2k+1 =
+    // second). NaN everywhere a field carried no plane.
+    {
+        const int fw = videoParameters.fieldWidth;
+        exactCarrier_flat.assign((size_t)frameHeight * fw,
+                                 std::numeric_limits<float>::quiet_NaN());
+        auto copyPlane = [&](const QVector<float> &src, int frameParity) {
+            if (src.isEmpty()) return;
+            qint32 fl = 0;
+            for (qint32 frameLine = frameParity; frameLine < frameHeight;
+                 frameLine += 2, ++fl) {
+                if ((fl + 1) * fw > src.size()) break;
+                std::copy(src.constData() + (size_t)fl * fw,
+                          src.constData() + (size_t)(fl + 1) * fw,
+                          exactCarrier_flat.data() + (size_t)frameLine * fw);
+            }
+        };
+        copyPlane(firstField.dgExactCarrier, 0);
+        copyPlane(secondField.dgExactCarrier, 1);
+    }
+
     heldSeq1 = firstField.field.seqNo;
     heldSeq2 = secondField.field.seqNo;
 
