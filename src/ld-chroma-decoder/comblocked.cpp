@@ -84,6 +84,26 @@ inline double centeredEvenWeightMean(const double *values,
 //   <=0         : disable the witness lurch for an A/B.
 //   > 0         : scale the lurch snap gate (<1 gentler, >1 snaps weaker
 //                 steps too).
+// Structural carrier-amplitude ceiling, measured (2026-07-28) instead of
+// guessed. Legal chroma amplitude maxes at 36 IRE on GGV-1069 colour bars
+// (SMPTE f6000 and full-height f22000 agree; red/blue bars are the peak)
+// and 32 IRE on the most saturated program material measured (Gilgol
+// bikini zone: raw carrier envelope 31.7, conservation-exact channel 32.2
+// -- two independent instruments). carrierScale is the burst correlation
+// magnitude (~half the 20 IRE burst amplitude, so ~10 IRE at spec): the
+// multiplier maps it to the measured 36 IRE encoder maximum plus a small
+// margin, and the floor carries the same absolute bound onto weak-burst
+// lines. The previous max(24, scale*5) put the operative ceiling near 50
+// IRE -- 40% above anything the encoder can emit -- so apparent carrier
+// in the 36..50 IRE band was never being excluded as the luma it must be.
+inline double maxCarrierAmpIREFromScale(double carrierScale)
+{
+    constexpr double kCarrierMaxPerBurstScale = 3.8; // 38 IRE at spec burst
+    constexpr double kCarrierMaxFloorIRE      = 38.0;
+    return std::max(kCarrierMaxFloorIRE,
+                    carrierScale * kCarrierMaxPerBurstScale);
+}
+
 inline double coarseSharpLevel()
 {
     static const double level = []{
@@ -3620,11 +3640,12 @@ void Comb::FrameBuffer::produceY()
             // Structural carrier-amplitude ceiling (samples): I/Q are bounded
             // sinusoids, so apparent carrier beyond this must be luma. Used as
             // the feasibility DQ. Same bound buildCarrierRetracted clamps with.
+            // Measured limits (bars/beach) -- see maxCarrierAmpIREFromScale.
             const CombCarrierGrammar *grammarLine =
                 carrierGrammarLine(line);
-            const double maxCarrierAmpSamples = grammarLine
-                ? std::max(24.0, grammarLine->carrierScale * 5.0) * irescale
-                : 24.0 * irescale;
+            const double maxCarrierAmpSamples =
+                maxCarrierAmpIREFromScale(
+                    grammarLine ? grammarLine->carrierScale : 0.0) * irescale;
 
             // Checks the emitted band splice against the same hull the
             // election applies to candidates -- candidate feasibility says
@@ -6031,7 +6052,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         const double bcos = grammar->burstCos;
         const double bsin = grammar->burstSin;
         const double maxCarrierSamples =
-            std::max(24.0, grammar->carrierScale * 5.0) * irescale;
+            maxCarrierAmpIREFromScale(grammar->carrierScale) * irescale;
 
         // basisI/Q at position h depend only on the carrier sample class
         // given the line's burst phasor and locked basis.  The class is the
@@ -7023,7 +7044,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             const auto *anL = carrierAnalysis_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
             const double maxCarrierL =
-                std::max(24.0, gL->carrierScale * 5.0) * irescale;
+                maxCarrierAmpIREFromScale(gL->carrierScale) * irescale;
             if (!bpL) return;
 
             double bIL[4], bQL[4];
