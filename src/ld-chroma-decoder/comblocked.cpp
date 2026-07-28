@@ -85,21 +85,27 @@ inline double centeredEvenWeightMean(const double *values,
 //   > 0         : scale the lurch snap gate (<1 gentler, >1 snaps weaker
 //                 steps too).
 // Structural carrier-amplitude ceiling, measured (2026-07-28) instead of
-// guessed. Legal chroma amplitude maxes at 36 IRE on GGV-1069 colour bars
-// (SMPTE f6000 and full-height f22000 agree; red/blue bars are the peak)
-// and 32 IRE on the most saturated program material measured (Gilgol
-// bikini zone: raw carrier envelope 31.7, conservation-exact channel 32.2
-// -- two independent instruments). carrierScale is the burst correlation
-// magnitude (~half the 20 IRE burst amplitude, so ~10 IRE at spec): the
-// multiplier maps it to the measured 36 IRE encoder maximum plus a small
-// margin, and the floor carries the same absolute bound onto weak-burst
-// lines. The previous max(24, scale*5) put the operative ceiling near 50
-// IRE -- 40% above anything the encoder can emit -- so apparent carrier
-// in the 36..50 IRE band was never being excluded as the luma it must be.
+// guessed. The measured range ledger:
+//   - GGV-1069 colour bars: 36 IRE max (SMPTE f6000 and full-height
+//     f22000 agree) -- the BROADCAST-LEGAL maximum.
+//   - Most saturated camera-scene material (Gilgol bikini zone): 32 IRE
+//     (raw envelope 31.7, conservation-exact channel 32.2).
+//   - Optical-composite EFFECTS run far hotter: the tractor beam measures
+//     72 IRE on the conservation-exact (D-S)/2 channel -- real carrier,
+//     no estimation. A bars-derived 38 IRE ceiling visibly aliased the
+//     beam (and the pre-existing 50 IRE bound was already clipping its
+//     top 0.8% of samples).
+// A hull may encode impossibles ONLY, so the GLOBAL bound must clear the
+// hottest real carrier this material contains: 75 IRE nominal, burst-
+// scaled. One global limit cannot discriminate a range this wide (legal
+// carrier spans ~1 IRE on gray struts to 72 IRE on the beam); regional
+// discrimination belongs to a pooled exact-channel ceiling, not to this
+// constant. carrierScale is the burst correlation magnitude (~10 IRE at
+// spec burst).
 inline double maxCarrierAmpIREFromScale(double carrierScale)
 {
-    constexpr double kCarrierMaxPerBurstScale = 3.8; // 38 IRE at spec burst
-    constexpr double kCarrierMaxFloorIRE      = 38.0;
+    constexpr double kCarrierMaxPerBurstScale = 7.5; // 75 IRE at spec burst
+    constexpr double kCarrierMaxFloorIRE      = 75.0;
     return std::max(kCarrierMaxFloorIRE,
                     carrierScale * kCarrierMaxPerBurstScale);
 }
