@@ -4047,6 +4047,39 @@ void Comb::FrameBuffer::produceY()
                     if (retractedRow && std::isfinite(retractedRow[xi]))
                         g_dsRefProbe.e[bin][3].add(
                             (rawH - (double)retractedRow[xi] - ex) * invIreScale);
+                    // Zone-restricted per-sample dump (LDCD_DUMP_DSZONE_*,
+                    // run -t 1): the exact value and each estimator's signed
+                    // error in IRE, one text line per covered sample, for
+                    // offline per-line grading of a region (pillar work).
+                    static const auto zEnv = [](const char *n) {
+                        const char *s = std::getenv(n);
+                        return s ? std::atoi(s) : -1;
+                    };
+                    static const int zL0 = zEnv("LDCD_DUMP_DSZONE_L0");
+                    static const int zL1 = zEnv("LDCD_DUMP_DSZONE_L1");
+                    static const int zC0 = zEnv("LDCD_DUMP_DSZONE_C0");
+                    static const int zC1 = zEnv("LDCD_DUMP_DSZONE_C1");
+                    if (zL0 >= 0 && line >= zL0 && line <= zL1 &&
+                        xi >= zC0 && xi <= zC1) {
+                        const double e1 =
+                            (oneDRow && std::isfinite(oneDRow[xi]))
+                                ? (oneDRow[xi] - ex) * invIreScale
+                                : std::numeric_limits<double>::quiet_NaN();
+                        const double ef =
+                            (fitRowDs && std::isfinite(fitRowDs[xi]))
+                                ? (fitRowDs[xi] - ex) * invIreScale
+                                : std::numeric_limits<double>::quiet_NaN();
+                        const double er =
+                            (retractedRow && std::isfinite(retractedRow[xi]))
+                                ? (rawH - (double)retractedRow[xi] - ex) *
+                                      invIreScale
+                                : std::numeric_limits<double>::quiet_NaN();
+                        std::fprintf(stderr,
+                            "DSZONE line=%d xi=%d hd=%.1f ex=%.2f "
+                            "e1D=%.2f eComb=%.2f eFit=%.2f eRetr=%.2f\n",
+                            line, xi, hd, ex * invIreScale,
+                            e1, (rawH - combY - ex) * invIreScale, ef, er);
+                    }
                 }
 
                 const double ccReturn = ccMaskRow
