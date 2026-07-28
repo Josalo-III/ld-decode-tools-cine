@@ -5083,6 +5083,28 @@ void Comb::FrameBuffer::buildLurchStepRuns()
         detectLurchSteps(apMean, width - 3, irescale, invIreScale,
                          lurchStepRuns[line]);
     }
+
+    // Disposable per-line edge dump (LDCD_DUMP_LURCH_L0/L1/C0/C1, run -t 1):
+    // raw pre-corroboration edges with line phase class, for measuring
+    // vertical edge scatter and its phase correlation. Zero cost when unset.
+    static const int luL0 = []{ const char *s = std::getenv("LDCD_DUMP_LURCH_L0"); return s ? std::atoi(s) : -1; }();
+    static const int luL1 = []{ const char *s = std::getenv("LDCD_DUMP_LURCH_L1"); return s ? std::atoi(s) : -1; }();
+    static const int luC0 = []{ const char *s = std::getenv("LDCD_DUMP_LURCH_C0"); return s ? std::atoi(s) : -1; }();
+    static const int luC1 = []{ const char *s = std::getenv("LDCD_DUMP_LURCH_C1"); return s ? std::atoi(s) : -1; }();
+    if (luL0 >= 0 && luC0 >= 0) {
+        for (int line = std::max(firstLine, luL0);
+             line < std::min(lastLine, luL1 + 1); ++line) {
+            for (const LurchStepRun &run : lurchStepRuns[line]) {
+                if (run.edge < luC0 || run.edge > luC1) continue;
+                std::fprintf(stderr,
+                    "LURCH line=%d flip=%d edge=%.3f stepIRE=%.2f gate=%.2f "
+                    "a=%d b=%d sup=%d\n",
+                    line, carrierLineFlip(line), run.edge,
+                    run.stepSamples * invIreScale, run.gate,
+                    run.a, run.b, run.suppressed ? 1 : 0);
+            }
+        }
+    }
 }
 
 // See comb.h. The vertical partner step mirrors the election's Y-geometry
