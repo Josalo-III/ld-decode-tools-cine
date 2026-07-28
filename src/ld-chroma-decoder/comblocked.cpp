@@ -3529,6 +3529,7 @@ void anchorMatchEdges(const std::vector<AnchorRun> &a,
 void Comb::FrameBuffer::buildAnchorCeiling()
 {
     anchorCeiling_flat.clear();
+    anchorCoveredLine.clear();
     if (exactCarrier_flat.empty()) return;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -3589,6 +3590,10 @@ void Comb::FrameBuffer::buildAnchorCeiling()
     }
 
     if (!anyCovered) return;
+
+    anchorCoveredLine.assign(lastLine, 0);
+    for (int line = firstLine; line < lastLine; ++line)
+        if (!pooled[line].empty()) anchorCoveredLine[line] = 1;
 
     anchorCeiling_flat.assign((size_t)lastLine * fullWidth,
                               std::numeric_limits<float>::infinity());
@@ -4801,6 +4806,15 @@ void Comb::FrameBuffer::produceY()
                 // vertical step, E/W at ±1 sample). Keep them separate: a line
                 // or edge may continue in one direction while legitimately
                 // crossing a transition in another.
+                //
+                // NOTE on twin pinning (user direction, 2026-07-28): a
+                // distance-scaling weight on the pinned N/S testimony was
+                // built and measured INERT here -- it only re-ranks which
+                // neighbour anchors the boost, and cannot move the blend
+                // toward the pinned value when no candidate already sits
+                // near it (referee unchanged; comp-vs-bracket residual
+                // 1.93->1.96 IRE). Pinning needs a value-level lever;
+                // anchorLinePinned() is the infrastructure awaiting it.
                 double dirHF[4], dirImageHF[4]; int nDir = 0;
                 auto appendDirection = [&](const quint16 *rawP,
                                            const double *ccP,

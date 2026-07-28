@@ -1145,6 +1145,13 @@ private:
 			return nullptr;
 		return anchorCeiling_flat.data() + (size_t)line * w;
 	}
+	// 1 = this frame line is a merged-twin (exact-covered) line: PINNED.
+	// Empty on frames without coverage.
+	std::vector<std::uint8_t> anchorCoveredLine;
+	inline bool anchorLinePinned(int line) const {
+		return line >= 0 && line < (int)anchorCoveredLine.size() &&
+		       anchorCoveredLine[line] != 0;
+	}
 	void buildAnchorCeiling();
 
 	inline std::uint8_t *chromaBoundaryBand_line(int line) {
