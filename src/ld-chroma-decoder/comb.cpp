@@ -3067,6 +3067,13 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     for (int i = 0; i < NUM_CANDIDATES; ++i)
         invalidateCandidate(i);
 
+    // LDCD_3D_TEMPORAL_GRAMMAR=1: temporal-grammar candidate rules (see
+    // getCandidate). Default OFF preserves the historical gate behaviour.
+    static const bool temporalGrammar3D = []{
+        const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
+        return e && std::atoi(e) != 0;
+    }();
+
     // 1D/2D Candidates (always available via this frame)
     c[CAND_LEFT]   = getCandidate(lineNumber, h, *this, lineNumber,     h - 2, 0.0);
     src[CAND_LEFT] = this;
@@ -3087,7 +3094,20 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     // Previous and next field candidates are evaluated independently. A valid
     // previous-field candidate does not require a symmetric next-field candidate.
     if (frameVerticalAllowed && lineNumber - 1 >= videoParameters.firstActiveFrameLine) {
-        if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber - 1)) {
+        if (temporalGrammar3D) {
+            // Cross-frame first: the temporal grammar legalizes it per line
+            // with the correct sign; self-frame is the fallback.
+            c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
+                                              previousFrame, lineNumber - 1, h,
+                                              FIELD_BONUS);
+            src[CAND_PREV_FIELD] = &previousFrame;
+            if (c[CAND_PREV_FIELD].penalty >= 1000.0) {
+                c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
+                                                  *this, lineNumber - 1, h,
+                                                  FIELD_BONUS);
+                src[CAND_PREV_FIELD] = this;
+            }
+        } else if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber - 1)) {
             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
                                               previousFrame, lineNumber - 1, h,
                                               FIELD_BONUS);
@@ -3102,7 +3122,18 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
 
     // --- Next Field ---
     if (frameVerticalAllowed && lineNumber + 1 < videoParameters.lastActiveFrameLine) {
-        if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber + 1)) {
+        if (temporalGrammar3D) {
+            c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
+                                              nextFrame, lineNumber + 1, h,
+                                              FIELD_BONUS);
+            src[CAND_NEXT_FIELD] = &nextFrame;
+            if (c[CAND_NEXT_FIELD].penalty >= 1000.0) {
+                c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
+                                                  *this, lineNumber + 1, h,
+                                                  FIELD_BONUS);
+                src[CAND_NEXT_FIELD] = this;
+            }
+        } else if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber + 1)) {
             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
                                               nextFrame, lineNumber + 1, h,
                                               FIELD_BONUS);
@@ -3120,7 +3151,13 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     // Same-line previous/next-frame candidates are only legal when the carrier
     // line relation matches. If the phase relation differs, the temporal center
     // candidate is invalid rather than merely expensive.
-    if (carrierLineFlip(lineNumber) == previousFrame.carrierLineFlip(lineNumber)) {
+    if (temporalGrammar3D ||
+        carrierLineFlip(lineNumber) == previousFrame.carrierLineFlip(lineNumber)) {
+        // Temporal grammar decides legality and sign inside getCandidate.
+        // Historical note: the equal-lineFlip pre-gate combined with the
+        // reach check's Opposite-only requirement kept this candidate
+        // permanently dead; with the env unset that dead state is preserved
+        // as the baseline.
         c[CAND_PREV_FRAME] = getCandidate(lineNumber, h,
                                           previousFrame, lineNumber, h,
                                           FRAME_BONUS);
@@ -3130,7 +3167,8 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     }
 
     // --- Temporal Frame Center: Next Frame ---
-    if (carrierLineFlip(lineNumber) == nextFrame.carrierLineFlip(lineNumber)) {
+    if (temporalGrammar3D ||
+        carrierLineFlip(lineNumber) == nextFrame.carrierLineFlip(lineNumber)) {
         c[CAND_NEXT_FRAME] = getCandidate(lineNumber, h,
                                           nextFrame, lineNumber, h,
                                           FRAME_BONUS);

@@ -4077,8 +4077,48 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
          lddecode::CombReachUse::ScalarSignCompare,
          scalarReachSource()});
 
-    if (!phaseReach.allowScalarSignCompare ||
-        phaseReach.carrierRelation != lddecode::CarrierPhaseRelation::Opposite) {
+    // Temporal grammar: the signed relation is absolute (lineFlip derives
+    // from metadata fieldPhaseIDs), so cross-frame replies are temporally
+    // correct. BOTH definite relations are usable by the temporal comb:
+    //   Opposite -> partner scalar carries -C: (base - s)/2 combs.
+    //   Same     -> partner scalar carries +C: negate the stored sample so
+    //               the same downstream math (base - (-s))/2 averages.
+    // Quadrature/unknown remains illegal. The previous form demanded
+    // Opposite while getBestCandidate's frame pre-gate demanded equal
+    // lineFlips (= Same): mutually exclusive, so the frame-axis temporal
+    // comb never ran, and cross-frame field work existed only on the
+    // alternating lines where the heuristics happened to align -- the
+    // line-parity striping on cadence material.
+    // LDCD_3D_TEMPORAL_GRAMMAR=1 enables the temporal-grammar candidate
+    // rules (both relations legal, sign-folded samples, Same-relation bias).
+    // Default OFF: the chroma gain is real but per-pixel temporal ACCEPTANCE
+    // (the hull guard) still varies line-to-line at dense verticals, which
+    // measured net-worse on Y than the old dead-gate state on A/C frames.
+    // The acceptance-uniformity pass is the remaining design work.
+    static const bool temporalGrammar = []{
+        const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
+        return e && std::atoi(e) != 0;
+    }();
+    double relationSign;
+    if (!phaseReach.allowScalarSignCompare) {
+        result.penalty = 1000.0;
+        result.yPen    = 1000.0;
+        result.iqPen   = 0.0;
+        return result;
+    }
+    if (phaseReach.carrierRelation == lddecode::CarrierPhaseRelation::Opposite) {
+        relationSign = 1.0;
+    } else if (temporalGrammar &&
+               phaseReach.carrierRelation == lddecode::CarrierPhaseRelation::Same) {
+        relationSign = -1.0;
+        // Averaging (Same) keeps the mean 1D leak that combing (Opposite)
+        // cancels. Without this bias the operation class alternates by line
+        // parity against a mixed-phase partner (the assembled B's
+        // neighbours), re-manufacturing line-parity texture. Bias the
+        // election toward an Opposite partner wherever one exists; the
+        // Same-averager still fills where nothing better is offered.
+        adjustPenalty += 3.0;
+    } else {
         result.penalty = 1000.0;
         result.yPen    = 1000.0;
         result.iqPen   = 0.0;
@@ -4088,14 +4128,15 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     const int hh = clampH(h);
 
     // 1D sample: locked path reads the phase-corrected blind bandpass;
-    // bucket path reads clpbuffer[0] directly.
+    // bucket path reads clpbuffer[0] directly. relationSign folds the
+    // carrier relation in so every consumer keeps Opposite-form math.
     const double *lockedRow = frameBuffer.configuration.phaseCompensation
         ? frameBuffer.locked1DSource_line(lineNumber) : nullptr;
 
     if (lockedRow && (hh - left) >= 0 && (hh - left) < (right - left)) {
-        result.sample = lockedRow[hh - left];
+        result.sample = relationSign * lockedRow[hh - left];
     } else {
-        result.sample = frameBuffer.bucketScalar1D_line(lineNumber)[hh];
+        result.sample = relationSign * frameBuffer.bucketScalar1D_line(lineNumber)[hh];
     }
 
     // --- Luma Penalty with Neighbor Shaping ---
