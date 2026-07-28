@@ -164,6 +164,39 @@ namespace {
             std::fprintf(stderr, "DSREF-MERGE accept seq=%d frac=%.3f\n",
                          def.field.seqNo, outlierFrac);
 
+        // Twin-agreement audit (LDCD_DUMP_TWIN_L0/L1/C0/C1, field-line and
+        // FULL-raw-column coordinates; run -t 1). The (D-S)/2 channel is a
+        // carrier measurement ONLY where the twins share content: the BP
+        // makes the emitted value carrier-BAND by construction, so band
+        // structure alone proves nothing. The out-of-band residual
+        // |chat - BP(chat)| is the honest witness -- for true twins it is
+        // just twin noise, and where content differs (a video-rate element
+        // composited over film-rate frames, say) it is large and the
+        // "carrier" reading there is a content difference in disguise.
+        {
+            static const auto tEnv = [](const char *n) {
+                const char *s = std::getenv(n); return s ? std::atoi(s) : -1;
+            };
+            static const int tL0 = tEnv("LDCD_DUMP_TWIN_L0");
+            static const int tL1 = tEnv("LDCD_DUMP_TWIN_L1");
+            static const int tC0 = tEnv("LDCD_DUMP_TWIN_C0");
+            static const int tC1 = tEnv("LDCD_DUMP_TWIN_C1");
+            if (tL0 >= 0 && tC0 >= 0) {
+                for (int lf = std::max(y0, tL0); lf < std::min(y1, tL1 + 1); ++lf) {
+                    buildLine(lf);
+                    for (int h = std::max(activeLeft, tC0);
+                         h < std::min(activeRight, tC1 + 1); ++h) {
+                        std::fprintf(stderr,
+                            "TWIN seq=%d lf=%d h=%d lhat=%.1f chat=%.2f "
+                            "bp=%.2f oob=%.2f ire=%.4f\n",
+                            def.field.seqNo, lf, h, lhat[h],
+                            chat[h] / ireScale, bp[h] / ireScale,
+                            (chat[h] - bp[h]) / ireScale, ireScale);
+                    }
+                }
+            }
+        }
+
         // Pass 2: merged = Lhat + BP(chat); emit the exact-carrier channel.
         def.dgExactCarrier.fill(std::numeric_limits<float>::quiet_NaN(), samples);
         quint16* defw = reinterpret_cast<quint16*>(def.data.data());
