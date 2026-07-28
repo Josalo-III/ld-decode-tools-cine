@@ -4549,28 +4549,21 @@ void Comb::FrameBuffer::produceY()
                 }
 
                 double resultHF = inHF[0];
-                // Y-election band cede. Measured at the bikini-diagonal teeth
-                // (2026-07-27): inside a chroma-boundary band every candidate's
-                // top deviates by up to ~11 IRE from mono -- none is
-                // trustworthy -- and the per-column winner flips comb/retracted
-                // 46/54, a decision interleave at maximal spread. That
-                // interleave IS the witness fishboning, the same crime as the
-                // Field B per-column verdicts, relocated to the Y election.
-                // A boundary band takes ONE decision: the comb candidate (the
-                // error-comb chain: Field B ceded to 1D there, so this is the
-                // soft, artifact-free reconstruction). Scoring resumes outside
-                // bands. Field-B-less variants (line) publish no band plane
-                // and are unaffected.
-                bool bandCede = false;
-                if (bandRow && bandRow[xi]) {
-                    for (int k = 0; k < baseNIn; ++k) {
-                        if (candPlane[inIdx[k]] == 0) {
-                            resultHF = inHF[k];
-                            bandCede = true;
-                            break;
-                        }
-                    }
-                }
+                // The Y-election band cede is REMOVED (user, 2026-07-28).
+                // It hard-picked the comb candidate inside chromaBoundaryBand
+                // to kill the bikini-diagonal per-column winner interleave
+                // (2026-07-27), an artifact of the winner-take-all era that
+                // the confidence-alpha blend obviates: alpha varies smoothly
+                // where candidates tie, so there is no per-column flip left
+                // to suppress. And the cede was measured blanketing the
+                // entire cube face (band seeds fire on dense alternating
+                // detail everywhere -- thin struts against shadow meet the
+                // DifferentRegion definition), silencing the blend and the
+                // retracted candidate exactly where retracted is the solid
+                // image (probe 2026-07-28: bandCede 99-100% of face px,
+                // comb top D2-RMS letter-alternating 7.8/4.9, retracted
+                // stable ~6.2). The band plane stays published (Field B's
+                // own settled cede is upstream and unaffected).
                 // Confidence-alpha blend (user direction): the per-pixel
                 // WINNER flip between candidates -- comb/retracted measured
                 // 46/54 at boundary teeth, and frame-to-frame flips render
@@ -4584,13 +4577,14 @@ void Comb::FrameBuffer::produceY()
                 // alpha ~= 1 (tau matched to the cost scale), so commitment
                 // survives where evidence is clear and blending concentrates
                 // where ambiguity -- and hence the strobing -- lives.
-                // Vetoes remain binary and upstream: admission, feasibility
-                // DQ, and the chroma-boundary band cede.
+                // Vetoes remain binary and upstream: admission and the
+                // feasibility DQ.
                 double blendNum = 0.0, blendDen = 0.0;
                 constexpr double kBlendTauIRE = 0.75;
                 const double blendTau = kBlendTauIRE * irescale;
                 double costs[4];
-                if (!bandCede) {
+                double wDiag[4] = {0.0, 0.0, 0.0, 0.0};
+                {
                     double bestCost = 1e300;
                     for (int k = 0; k < nIn; ++k) {
                         const int plane =
@@ -4662,13 +4656,14 @@ void Comb::FrameBuffer::produceY()
                             std::exp(-(costs[k] - bestCost) / blendTau);
                         if (k == darkestIdx && k < baseNIn && baseNIn > 1)
                             w *= 1.0 - darkestVetoGate;
+                        wDiag[k] = w;
                         blendNum += w * yk;
                         blendDen += w;
                     }
                 }
 
                 const int winnerPlane = planeForTop(resultHF);
-                Y[h] = (!bandCede && blendDen > 1e-12)
+                Y[h] = (blendDen > 1e-12)
                     ? blendNum / blendDen
                     : reconstructTop(winnerPlane, resultHF);
                 if (consDump) {
@@ -4808,6 +4803,21 @@ void Comb::FrameBuffer::produceY()
                                             "%.3f ", diagRetained[k]);
                     if (rtp == 0) { retnStr[0] = '-'; retnStr[1] = 0; }
                     else retnStr[rtp ? rtp - 1 : 0] = 0;
+                    // Blend-weight view: normalised alpha per roster slot
+                    // (positional with roster=[...]; the derived return is
+                    // the trailing slot when admitted), plus the two
+                    // election downgrade gates acting on this pixel.
+                    char wStr[64]; int wp2 = 0;
+                    const double wSumDiag =
+                        wDiag[0] + wDiag[1] + wDiag[2] + wDiag[3];
+                    for (int k = 0; k < nIn && k < 4 && wp2 < 60; ++k)
+                        wp2 += std::snprintf(wStr + wp2, sizeof(wStr) - wp2,
+                                            "%.3f ",
+                                            wSumDiag > 1e-12
+                                                ? wDiag[k] / wSumDiag
+                                                : 0.0);
+                    if (wp2 == 0) { wStr[0] = '-'; wStr[1] = 0; }
+                    else wStr[wp2 ? wp2 - 1 : 0] = 0;
                     std::fprintf(stderr,
                         "PYDIAG line=%d h=%d xi=%d vstep=%d combOK=%d "
                         "1Dexcl=%d nCand=%d roster=[%s] clean=[%s] "
@@ -4818,6 +4828,8 @@ void Comb::FrameBuffer::produceY()
                         "monoTop=%.2f combTop=%.2f retrTop=%.2f nativeTop=%.2f "
                         "oneDTop=%.2f retnTop=%.2f "
                         "retnImg=%.3f retnCcEv=%.2f "
+                        "alpha=[%s] chromaT=%.3f dkGate=%.3f dkPlane=%d "
+                        "band=%d "
                         "nbrImgTop=[%s]\n",
                         line, h, xi, verticalStep, combOK ? 1 : 0,
                         (combOK && oneDRow) ? 1 : 0, nCand, roster, cleanStr,
@@ -4828,7 +4840,11 @@ void Comb::FrameBuffer::produceY()
                         combMiddle / irescale, combPlatformResidual,
                         ccMeasuredHere, ccReturn, monoTop, combTop, retrTop,
                         nativeTop, oneDTop,
-                        retnTop, returnedImagePref, returnedCcEvidence, nbr);
+                        retnTop, returnedImagePref, returnedCcEvidence,
+                        wStr, chromaT, darkestVetoGate,
+                        (baseNIn > 1) ? candPlane[inIdx[darkestIdx]] : -1,
+                        (bandRow && bandRow[xi]) ? 1 : 0,
+                        nbr);
                 }
             }
         } else if (carrierComp) {
