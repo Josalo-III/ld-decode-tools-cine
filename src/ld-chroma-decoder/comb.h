@@ -515,12 +515,14 @@ private:
 	struct TemporalCandidateSamples {
 		struct Sample {
 			double value = 0.0;
+			double penalty = 1000.0;   // election confidence for alpha blending
 			bool valid = false;
 		};
 		Sample previousField;
 		Sample nextField;
 		Sample previousFrame;
 		Sample nextFrame;
+		double best2DPenalty = 1000.0; // best spatial/1D-2D member's penalty
 	};
 	const LdDecodeMetaData::VideoParameters &videoParameters;
 	const Configuration &configuration;

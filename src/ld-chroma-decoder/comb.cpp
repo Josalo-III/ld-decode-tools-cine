@@ -2995,6 +2995,77 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 base1d = bucketScalar1D_line(line)[h0];
             }
         
+            // LDCD_3D_TEMPORAL_GRAMMAR=1: confidence-alpha blend (user
+            // direction). Winner-take-all flips per pixel/line/frame at
+            // decision boundaries, rendering as stripes and temporal
+            // strobing -- the per-pixel-decision artifact family for the
+            // third time. A continuous blend has no decision boundary:
+            // alpha derives from election CONFIDENCE (penalties -- never
+            // inter-candidate distance, per the blend-weight doctrine),
+            // sharpened so a clearly-best member takes alpha ~= 1 and
+            // blending concentrates where genuine ambiguity (and hence the
+            // strobing) lives. Vetoes remain binary: bounds/legality inside
+            // getCandidate, and the 2D-anchored hull per member here --
+            // a convex blend of hull-passing members cannot leave the hull.
+            static const bool blend3D = []{
+                const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
+                return e && std::atoi(e) != 0;
+            }();
+            if (blend3D) {
+                const double ref2d = clpbuffer[1].pixel[line][h];
+                const double slack = std::max(
+                    0.0, configuration.tunables.TEMPORAL_HULL_SLACK_IRE) * irescale;
+
+                // Members: the 2D value plus each surviving temporal output.
+                struct Member { double out; double penalty; };
+                Member m[5];
+                int nM = 0;
+                if (std::isfinite(ref2d))
+                    m[nM++] = { ref2d, temporalSamples.best2DPenalty };
+                auto addTemporal = [&](const TemporalCandidateSamples::Sample &sm,
+                                       double bound) {
+                    if (!sm.valid) return;
+                    const double out = (base1d - sm.value) * 0.5;
+                    if (!std::isfinite(out)) return;
+                    // Hull veto: a temporal member may not stray beyond the
+                    // 2D anchor by more than the slack plus the opposite
+                    // member's agreement is not required -- the anchor is
+                    // the 2D estimate itself.
+                    if (std::isfinite(ref2d) &&
+                        std::fabs(out - ref2d) > bound)
+                        return;
+                    m[nM++] = { out, sm.penalty };
+                };
+                // Per-member veto: a fixed IRE cap on departure from the
+                // 2D anchor (impossibility-style; never a function of local
+                // amplitude, which would make it a distance gate).
+                const double memberBound = slack + 6.0 * irescale;
+                addTemporal(temporalSamples.previousField, memberBound);
+                addTemporal(temporalSamples.nextField, memberBound);
+                addTemporal(temporalSamples.previousFrame, memberBound);
+                addTemporal(temporalSamples.nextFrame, memberBound);
+
+                if (nM > 0) {
+                    // Confidence -> alpha: softmax on -penalty. Temperature
+                    // matched to the bonus scale (LINE/FIELD/FRAME bonuses
+                    // are -2..-5), so a ~3-point penalty gap is decisive.
+                    constexpr double kTau = 1.5;
+                    double pMin = m[0].penalty;
+                    for (int k = 1; k < nM; ++k)
+                        pMin = std::min(pMin, m[k].penalty);
+                    double wSum = 0.0, acc = 0.0;
+                    for (int k = 0; k < nM; ++k) {
+                        const double w =
+                            std::exp(-(m[k].penalty - pMin) / kTau);
+                        acc += w * m[k].out;
+                        wSum += w;
+                    }
+                    if (wSum > 1e-12)
+                        clpbuffer[2].pixel[line][h] = acc / wSum;
+                }
+                continue;
+            }
+
             if (bestIndex < CAND_PREV_FIELD) {
                  // Best is 1D/2D; keep pre-filled 2D value
                  // clpbuffer[2] already contains clpbuffer[1]
@@ -3249,6 +3320,7 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         auto exportSample = [&](int idx,
                                 TemporalCandidateSamples::Sample &out) {
             out.value = c[idx].sample;
+            out.penalty = c[idx].penalty;
             out.valid = src[idx] != nullptr && c[idx].penalty < 1000.0 &&
                         std::isfinite(c[idx].sample);
         };
@@ -3256,6 +3328,10 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         exportSample(CAND_NEXT_FIELD, temporalSamples->nextField);
         exportSample(CAND_PREV_FRAME, temporalSamples->previousFrame);
         exportSample(CAND_NEXT_FRAME, temporalSamples->nextFrame);
+        double b2 = 1000.0;
+        for (int i = 0; i < CAND_PREV_FIELD; ++i)
+            b2 = std::min(b2, c[i].penalty);
+        temporalSamples->best2DPenalty = b2;
     }
 
     bestSample = c[bestIndex].sample;
