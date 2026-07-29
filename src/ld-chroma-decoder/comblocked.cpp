@@ -8431,6 +8431,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             ? anchorAltCarrier_flat.data()
                   + static_cast<size_t>(line) * demodWidth
             : nullptr;
+        (void)altRowPub;
+        const float *exRowPub = exactCarrierRow(line);
 
         for (int xi = 0; xi < width; ++xi) {
             double carrier;
@@ -8441,12 +8443,25 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             case 2:
                 carrier = static_cast<double>(combRowPub[xi]);
                 break;
-            case 3:
-                // Anchor-alternate; the fit stands on unanchored frames.
-                carrier = altRowPub
-                    ? static_cast<double>(altRowPub[xi])
+            case 3: {
+                // CERTIFIED CARRIER, used as itself (user, 2026-07-28:
+                // "we already have a carrier... the merged fields can
+                // cancel to luma or carrier with a sign flip"). On a
+                // twin-covered sample (def - spare)/2 IS the carrier as a
+                // conservation fact -- there is nothing to estimate, scale
+                // or fit. The previous form here multiplied the FIT by a
+                // regression gain against the exact channel, which left
+                // every one of the fit's phase errors intact (a scalar
+                // cannot rotate a phasor) and so left un-subtracted carrier
+                // in Y on saturated colour: the compact-colour checker.
+                // The fit stands only where the side channel is absent.
+                const float ex = exRowPub ? exRowPub[left + xi]
+                                          : std::numeric_limits<float>::quiet_NaN();
+                carrier = std::isfinite(ex)
+                    ? static_cast<double>(ex)
                     : static_cast<double>(fitRowPub[xi]);
                 break;
+            }
             default:
                 carrier = static_cast<double>(wRowPub[xi]) *
                           static_cast<double>(fitRowPub[xi]);
