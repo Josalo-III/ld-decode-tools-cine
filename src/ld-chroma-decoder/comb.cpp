@@ -2982,8 +2982,167 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
     auto clampH = [&](int idx)->int { return std::clamp(idx, left, right - 1); };
 
+    static const bool blend3D = []{
+        const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
+        return e && std::atoi(e) != 0;
+    }();
+
+    // ---- Acceptance uniformity (user-directed, 2026-07-28) ----
+    //
+    // The parked failure of the temporal grammar was line-to-line striping,
+    // and its mechanism is now named: getCandidate biases a Same-relation
+    // partner by +3.0 against an Opposite one, and WHICH relation a line
+    // gets alternates with line parity. So the temporal SHARE of the blend
+    // alternated by line -- adjacent lines received different AMOUNTS of
+    // temporal correction. That is the uniform-render law again, in the
+    // acceptance rather than the values.
+    //
+    // The cure follows this codebase's own precedent (the cross-colour
+    // suppression verdict is vertically mixed and laterally boxcar'd into
+    // an envelope before it scales any chroma, so suppression cannot
+    // alias): decide per pixel, then make the DECISION STRENGTH spatially
+    // coherent before it acts. Pass 1 computes each pixel's temporal mean
+    // and its raw share; pass 2 smooths the SHARE FIELD -- a weight, never
+    // the composite -- with a vertical [1,2,1] (which weights the two
+    // parities equally, so a parity-alternating share cannot survive it)
+    // and a lateral boxcar of about one carrier cycle; then it blends.
+    // Members still face their binary vetoes in pass 1 (getCandidate
+    // legality, the 2D-anchored hull), and a convex blend of hull-passing
+    // members stays inside the hull.
+    if (blend3D) {
+        const int width = right - left;
+        if (width <= 0 || firstLine >= lastLine) return;
+        const size_t n = static_cast<size_t>(lastLine) * static_cast<size_t>(width);
+        std::vector<float> shareRaw(n, 0.0f), tMean(n, 0.0f), ref(n, 0.0f);
+
+        const double slack = std::max(
+            0.0, configuration.tunables.TEMPORAL_HULL_SLACK_IRE) * irescale;
+        const double memberBound = slack + 6.0 * irescale;
+        constexpr double kTau = 1.5;
+
+        for (int line = firstLine; line < lastLine; ++line) {
+            const double *lockedRow = configuration.phaseCompensation
+                ? locked1DSource_line(line) : nullptr;
+            for (int h = left; h < right; ++h) {
+                const size_t idx =
+                    static_cast<size_t>(line) * width + (h - left);
+                const double ref2d = clpbuffer[1].pixel[line][h];
+                ref[idx]   = static_cast<float>(ref2d);
+                tMean[idx] = static_cast<float>(ref2d);
+                if (!std::isfinite(ref2d)) continue;
+
+                qint32 bestIndex; double bestSample;
+                TemporalCandidateSamples ts;
+                getBestCandidate(line, h, previousFrame, nextFrame,
+                                 bestIndex, bestSample, &ts);
+
+                const int h0 = clampH(h);
+                const int rel0 = h0 - left;
+                const double base1d = (lockedRow && rel0 >= 0)
+                    ? lockedRow[rel0]
+                    : bucketScalar1D_line(line)[h0];
+
+                double outs[4], pens[4];
+                int nT = 0;
+                auto admit = [&](const TemporalCandidateSamples::Sample &sm) {
+                    if (nT >= 4 || !sm.valid) return;
+                    const double out = (base1d - sm.value) * 0.5;
+                    if (!std::isfinite(out)) return;
+                    if (std::fabs(out - ref2d) > memberBound) return;
+                    outs[nT] = out; pens[nT] = sm.penalty; ++nT;
+                };
+                admit(ts.previousField);
+                admit(ts.nextField);
+                admit(ts.previousFrame);
+                admit(ts.nextFrame);
+                if (nT == 0) continue;
+
+                double pMin = ts.best2DPenalty;
+                for (int k = 0; k < nT; ++k) pMin = std::min(pMin, pens[k]);
+
+                const double w2d =
+                    std::exp(-(ts.best2DPenalty - pMin) / kTau);
+                double wT = 0.0, accT = 0.0;
+                for (int k = 0; k < nT; ++k) {
+                    const double w = std::exp(-(pens[k] - pMin) / kTau);
+                    accT += w * outs[k];
+                    wT   += w;
+                }
+                if (wT > 1e-12 && std::isfinite(w2d)) {
+                    tMean[idx]    = static_cast<float>(accT / wT);
+                    shareRaw[idx] = static_cast<float>(wT / (wT + w2d));
+                }
+            }
+        }
+
+        // Share diagnostics (LDCD_PROBE_SHARE=1): does the acceptance
+        // strength actually alternate by parity, and how often are temporal
+        // members admitted at all?
+        static const bool probeShare = []{
+            const char *e = std::getenv("LDCD_PROBE_SHARE");
+            return e && std::atoi(e) != 0;
+        }();
+        if (probeShare) {
+            double sEven = 0, sOdd = 0; long nEven = 0, nOdd = 0, nNonZero = 0;
+            double altSum = 0; long altN = 0;
+            for (int line = firstLine; line < lastLine; ++line) {
+                const float *s0 = shareRaw.data() + (size_t)line * width;
+                for (int x = 0; x < width; ++x) {
+                    if (s0[x] > 0.0f) ++nNonZero;
+                    if (line & 1) { sOdd += s0[x]; ++nOdd; }
+                    else          { sEven += s0[x]; ++nEven; }
+                }
+                if (line + 1 < lastLine) {
+                    const float *s1 = shareRaw.data() + (size_t)(line + 1) * width;
+                    for (int x = 0; x < width; ++x) {
+                        altSum += std::fabs((double)s0[x] - (double)s1[x]);
+                        ++altN;
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                "[SHARE] admitted %.1f%%  mean even %.3f odd %.3f (gap %.3f)  "
+                "line-to-line |dShare| %.3f\n",
+                100.0 * nNonZero / std::max<long>(1, nEven + nOdd),
+                nEven ? sEven / nEven : 0.0, nOdd ? sOdd / nOdd : 0.0,
+                std::fabs((nEven ? sEven / nEven : 0.0) -
+                          (nOdd ? sOdd / nOdd : 0.0)),
+                altN ? altSum / altN : 0.0);
+        }
+
+        // Pass 2: vertical [1,2,1] then lateral boxcar on the SHARE.
+        constexpr int kLatRadius = 4;
+        std::vector<float> shareV(n, 0.0f);
+        for (int line = firstLine; line < lastLine; ++line) {
+            const int lu = std::max(firstLine, line - 1);
+            const int ld = std::min(lastLine - 1, line + 1);
+            const float *su = shareRaw.data() + (size_t)lu * width;
+            const float *s0 = shareRaw.data() + (size_t)line * width;
+            const float *sd = shareRaw.data() + (size_t)ld * width;
+            float *out = shareV.data() + (size_t)line * width;
+            for (int x = 0; x < width; ++x)
+                out[x] = 0.25f * (su[x] + 2.0f * s0[x] + sd[x]);
+        }
+        for (int line = firstLine; line < lastLine; ++line) {
+            const float *sv = shareV.data() + (size_t)line * width;
+            const float *tm = tMean.data() + (size_t)line * width;
+            const float *rf = ref.data() + (size_t)line * width;
+            for (int x = 0; x < width; ++x) {
+                double acc = 0.0; int cnt = 0;
+                const int a = std::max(0, x - kLatRadius);
+                const int b = std::min(width - 1, x + kLatRadius);
+                for (int j = a; j <= b; ++j) { acc += sv[j]; ++cnt; }
+                const double s = std::clamp(acc / std::max(1, cnt), 0.0, 1.0);
+                const double v = (1.0 - s) * (double)rf[x] + s * (double)tm[x];
+                if (std::isfinite(v))
+                    clpbuffer[2].pixel[line][left + x] = v;
+            }
+        }
+        return;
+    }
+
     for (int line = firstLine; line < lastLine; ++line) {
-        
+
         for (int h = left; h < right; ++h) {
             const int rel = h - left;
         
@@ -3008,77 +3167,6 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 base1d = bucketScalar1D_line(line)[h0];
             }
         
-            // LDCD_3D_TEMPORAL_GRAMMAR=1: confidence-alpha blend (user
-            // direction). Winner-take-all flips per pixel/line/frame at
-            // decision boundaries, rendering as stripes and temporal
-            // strobing -- the per-pixel-decision artifact family for the
-            // third time. A continuous blend has no decision boundary:
-            // alpha derives from election CONFIDENCE (penalties -- never
-            // inter-candidate distance, per the blend-weight doctrine),
-            // sharpened so a clearly-best member takes alpha ~= 1 and
-            // blending concentrates where genuine ambiguity (and hence the
-            // strobing) lives. Vetoes remain binary: bounds/legality inside
-            // getCandidate, and the 2D-anchored hull per member here --
-            // a convex blend of hull-passing members cannot leave the hull.
-            static const bool blend3D = []{
-                const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
-                return e && std::atoi(e) != 0;
-            }();
-            if (blend3D) {
-                const double ref2d = clpbuffer[1].pixel[line][h];
-                const double slack = std::max(
-                    0.0, configuration.tunables.TEMPORAL_HULL_SLACK_IRE) * irescale;
-
-                // Members: the 2D value plus each surviving temporal output.
-                struct Member { double out; double penalty; };
-                Member m[5];
-                int nM = 0;
-                if (std::isfinite(ref2d))
-                    m[nM++] = { ref2d, temporalSamples.best2DPenalty };
-                auto addTemporal = [&](const TemporalCandidateSamples::Sample &sm,
-                                       double bound) {
-                    if (!sm.valid) return;
-                    const double out = (base1d - sm.value) * 0.5;
-                    if (!std::isfinite(out)) return;
-                    // Hull veto: a temporal member may not stray beyond the
-                    // 2D anchor by more than the slack plus the opposite
-                    // member's agreement is not required -- the anchor is
-                    // the 2D estimate itself.
-                    if (std::isfinite(ref2d) &&
-                        std::fabs(out - ref2d) > bound)
-                        return;
-                    m[nM++] = { out, sm.penalty };
-                };
-                // Per-member veto: a fixed IRE cap on departure from the
-                // 2D anchor (impossibility-style; never a function of local
-                // amplitude, which would make it a distance gate).
-                const double memberBound = slack + 6.0 * irescale;
-                addTemporal(temporalSamples.previousField, memberBound);
-                addTemporal(temporalSamples.nextField, memberBound);
-                addTemporal(temporalSamples.previousFrame, memberBound);
-                addTemporal(temporalSamples.nextFrame, memberBound);
-
-                if (nM > 0) {
-                    // Confidence -> alpha: softmax on -penalty. Temperature
-                    // matched to the bonus scale (LINE/FIELD/FRAME bonuses
-                    // are -2..-5), so a ~3-point penalty gap is decisive.
-                    constexpr double kTau = 1.5;
-                    double pMin = m[0].penalty;
-                    for (int k = 1; k < nM; ++k)
-                        pMin = std::min(pMin, m[k].penalty);
-                    double wSum = 0.0, acc = 0.0;
-                    for (int k = 0; k < nM; ++k) {
-                        const double w =
-                            std::exp(-(m[k].penalty - pMin) / kTau);
-                        acc += w * m[k].out;
-                        wSum += w;
-                    }
-                    if (wSum > 1e-12)
-                        clpbuffer[2].pixel[line][h] = acc / wSum;
-                }
-                continue;
-            }
-
             if (bestIndex < CAND_PREV_FIELD) {
                  // Best is 1D/2D; keep pre-filled 2D value
                  // clpbuffer[2] already contains clpbuffer[1]
