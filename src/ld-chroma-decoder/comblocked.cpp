@@ -8335,6 +8335,34 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     if (retractedSource == 3)
         certComp.assign(width, std::numeric_limits<double>::quiet_NaN());
 
+    // Region-local ladder dump (LDCD_DUMP_RLAD=1, box via _R0/_R1/_C0/_C1
+    // in output-row / active-column coords; run -t 1). One line per sample:
+    // which rung stood, what each estimator said, and the certified
+    // brackets with their grammar signs. Diagnostic only -- the user's
+    // direction (2026-07-29): the certified fields' exact shade is the
+    // truth reference for diagnosing the comp-line estimators in thorny
+    // areas where carrier and HF luma resist separation.
+    static const bool dumpRlad = []{
+        const char *e = std::getenv("LDCD_DUMP_RLAD");
+        return e && std::atoi(e) != 0;
+    }();
+    static const auto rladEnvInt = [](const char *name, int dflt) {
+        const char *e = std::getenv(name);
+        return e ? std::atoi(e) : dflt;
+    };
+    static const int rladR0 = rladEnvInt("LDCD_DUMP_RLAD_R0", 0);
+    static const int rladR1 = rladEnvInt("LDCD_DUMP_RLAD_R1", 1 << 20);
+    static const int rladC0 = rladEnvInt("LDCD_DUMP_RLAD_C0", 0);
+    static const int rladC1 = rladEnvInt("LDCD_DUMP_RLAD_C1", 1 << 20);
+    static long g_rladFrame = 0;
+    const long rladFrame = dumpRlad ? g_rladFrame++ : 0;
+    if (dumpRlad)
+        std::fprintf(stderr, "RLADH f=%ld firstLine=%d left=%d ire=%.5f\n",
+                     rladFrame, firstLine, left, irescale);
+    std::vector<double> certBpDbg;  // BP(R) BEFORE the witness, diag only
+    if (dumpRlad)
+        certBpDbg.assign(width, std::numeric_limits<double>::quiet_NaN());
+
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine =
             rawbuffer.data() + static_cast<size_t>(line) * videoParameters.fieldWidth;
@@ -8348,14 +8376,17 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                               + static_cast<size_t>(line) * demodWidth;
 
         const float *exRowPub = exactCarrierRow(line);
+        const float *exU = (line - 1 >= firstLine)
+            ? exactCarrierRow(line - 1) : nullptr;
+        const float *exD = (line + 1 < lastLine)
+            ? exactCarrierRow(line + 1) : nullptr;
 
         if (retractedSource == 3) {
             std::fill(certComp.begin(), certComp.end(),
                       std::numeric_limits<double>::quiet_NaN());
-            const float *exU = (line - 1 >= firstLine)
-                ? exactCarrierRow(line - 1) : nullptr;
-            const float *exD = (line + 1 < lastLine)
-                ? exactCarrierRow(line + 1) : nullptr;
+            if (dumpRlad)
+                std::fill(certBpDbg.begin(), certBpDbg.end(),
+                          std::numeric_limits<double>::quiet_NaN());
             if (exU && exD) {
                 const quint16 *rawU = rawbuffer.data()
                     + static_cast<size_t>(line - 1) * videoParameters.fieldWidth;
@@ -8391,6 +8422,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     const double bp = kT0 * taps[0] +
                                       kT2 * (taps[1] + taps[2]) +
                                       kT4 * (taps[3] + taps[4]);
+                    if (dumpRlad) certBpDbg[xi] = bp;  // pre-witness, diag only
                     if (std::fabs(R[xi] - bp) > oobThresh) continue;
                     certComp[xi] = bp;
                 }
@@ -8416,12 +8448,53 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 // certified product exists.
                 const float ex = exRowPub ? exRowPub[left + xi]
                                           : std::numeric_limits<float>::quiet_NaN();
-                if (std::isfinite(ex))
+                char rung;
+                if (std::isfinite(ex)) {
                     carrier = static_cast<double>(ex);
-                else if (std::isfinite(certComp[xi]))
+                    rung = 'e';
+                } else if (std::isfinite(certComp[xi])) {
                     carrier = certComp[xi];
-                else
+                    rung = 'c';
+                } else {
                     carrier = static_cast<double>(fitRowPub[xi]);
+                    rung = 'f';
+                }
+                if (dumpRlad) {
+                    const int row = line - firstLine;
+                    if (row >= rladR0 && row < rladR1 &&
+                        xi >= rladC0 && xi < rladC1) {
+                        const int h = left + xi;
+                        int sU = 0, sD = 0;
+                        const CombCarrierGrammar *gC = carrierGrammarLine(line);
+                        const CombCarrierGrammar *gU = carrierGrammarLine(line - 1);
+                        const CombCarrierGrammar *gD = carrierGrammarLine(line + 1);
+                        if (gC && gU) {
+                            const auto r = lddecode::carrierGrammarSignedPhaseRelation(gC, h, gU, h);
+                            if (r == lddecode::CarrierPhaseRelation::Opposite) sU = -1;
+                            else if (r == lddecode::CarrierPhaseRelation::Same) sU = 1;
+                        }
+                        if (gC && gD) {
+                            const auto r = lddecode::carrierGrammarSignedPhaseRelation(gC, h, gD, h);
+                            if (r == lddecode::CarrierPhaseRelation::Opposite) sD = -1;
+                            else if (r == lddecode::CarrierPhaseRelation::Same) sD = 1;
+                        }
+                        const double inv = 1.0 / irescale;
+                        std::fprintf(stderr,
+                            "RLAD f=%ld r=%d x=%d g=%c car=%.3f fit=%.3f "
+                            "cc=%.3f bp=%.3f ex=%.3f eu=%.3f ed=%.3f su=%d sd=%d "
+                            "raw=%.2f\n",
+                            rladFrame, row, xi, rung,
+                            carrier * inv, (double)fitRowPub[xi] * inv,
+                            certComp[xi] * inv, certBpDbg[xi] * inv,
+                            (double)ex * inv,
+                            exU ? (double)exU[h] * inv
+                                : std::numeric_limits<double>::quiet_NaN(),
+                            exD ? (double)exD[h] * inv
+                                : std::numeric_limits<double>::quiet_NaN(),
+                            sU, sD,
+                            (double)rawLine[h] * inv);
+                    }
+                }
                 break;
             }
             default:
