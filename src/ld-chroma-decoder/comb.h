@@ -1145,20 +1145,6 @@ private:
 			return nullptr;
 		return anchorCeiling_flat.data() + (size_t)line * w;
 	}
-	// Anchor-alternate carrier (demod geometry): the fit, regionally
-	// recalibrated by regression against the exact channel on covered
-	// samples (cross-validated by covered-line halves), applied
-	// frame-uniformly. Valid only on anchored frames.
-	std::vector<float> anchorAltCarrier_flat;
-	bool anchorAltValid = false;
-	inline const float *anchorAltRow(int line) const {
-		if (!anchorAltValid || demodWidth <= 0 || line < 0 ||
-		    line >= demodLines || anchorAltCarrier_flat.empty())
-			return nullptr;
-		return anchorAltCarrier_flat.data() +
-		       static_cast<size_t>(line) * demodWidth;
-	}
-
 	// 1 = this frame line is a merged-twin (exact-covered) line: PINNED.
 	// Empty on frames without coverage.
 	std::vector<std::uint8_t> anchorCoveredLine;

@@ -151,19 +151,22 @@ struct DsRefProbe {
             maxAbs = std::max(maxAbs, std::fabs(eIRE));
         }
     };
-    // [flat=0 / detail=1][estimator: 0=1D 1=comb 2=fit 3=retracted 4=alt]
-    Est e[2][5];
+    // [flat=0 / detail=1][estimator: 0=1D 1=comb 2=fit 3=retracted]
+    // NOTE: in the default (anchor) retracted mode the retr column is
+    // SELF-REFERENTIAL on covered samples (retracted == exact there);
+    // grade that mode by saturation-restricted fSC-in-Y instead.
+    Est e[2][4];
     long covered = 0;
     long frameIdx = 0;
 
     void flush()
     {
-        static const char *nm[5] = { "1D", "comb", "fit", "retr", "alt" };
+        static const char *nm[4] = { "1D", "comb", "fit", "retr" };
         if (covered > 0) {
             std::fprintf(stderr, "[DSREF f=%ld] covered px=%ld\n", frameIdx, covered);
             for (int b = 0; b < 2; ++b) {
                 std::fprintf(stderr, "  %s:", b ? "detail" : "flat  ");
-                for (int k = 0; k < 5; ++k) {
+                for (int k = 0; k < 4; ++k) {
                     const Est &E = e[b][k];
                     if (E.n == 0) { std::fprintf(stderr, "  %s n=0", nm[k]); continue; }
                     std::fprintf(stderr,
@@ -176,7 +179,7 @@ struct DsRefProbe {
         }
         frameIdx++;
         covered = 0;
-        for (int b = 0; b < 2; ++b) for (int k = 0; k < 5; ++k) e[b][k] = Est();
+        for (int b = 0; b < 2; ++b) for (int k = 0; k < 4; ++k) e[b][k] = Est();
     }
 };
 
@@ -4453,10 +4456,6 @@ void Comb::FrameBuffer::produceY()
                     if (retractedRow && std::isfinite(retractedRow[xi]))
                         g_dsRefProbe.e[bin][3].add(
                             (rawH - (double)retractedRow[xi] - ex) * invIreScale);
-                    const float *altRowDs = anchorAltRow(line);
-                    if (altRowDs && std::isfinite(altRowDs[xi]))
-                        g_dsRefProbe.e[bin][4].add(
-                            ((double)altRowDs[xi] - ex) * invIreScale);
                     // Zone-restricted per-sample dump (LDCD_DUMP_DSZONE_*,
                     // run -t 1): the exact value and each estimator's signed
                     // error in IRE, one text line per covered sample, for
@@ -8286,10 +8285,21 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     // downstream consumer — centre and vertical neighbours alike — sees the
     // same selection, so the election is fed a consistent product rather
     // than a mixture.
+    //   anchor (DEFAULT, promoted 2026-07-28 on render judgement: A/C
+    //       great, D good, B soft -- the remaining softness is the
+    //       no-coverage letters riding the fit, the open cross-frame
+    //       transfer work) -- the certified-carrier ladder below:
+    //       covered sample -> (def-spare)/2 as itself; comp sample ->
+    //       certified-luma vertical comb where its out-of-band witness
+    //       passes; fit only where no certified product exists. On
+    //       material without dG coverage every sample falls through to
+    //       the fit, i.e. exactly the old default.
+    //   native (LDCD_RETRACTED_SOURCE=native) -- raw - carrierFit
+    //       everywhere: the pre-anchor default, kept as the A/B escape.
     static const int retractedSource = []{
         const char *s = std::getenv("LDCD_RETRACTED_SOURCE");
         if (!s)
-            return 1;
+            return 3;
         if (s[0] == 'a')
             return 3;
         if (s[0] == 'c')
@@ -8298,122 +8308,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
             return 1;
         if (s[0] == 'p')
             return 2;
-        return 1;
+        return 3;
     }();
-
-    // ---- Anchor-alternate carrier (user direction, 2026-07-28: "we build
-    // a fictional carrier from fits and other interventions. The 'true
-    // carrier' from the anchors can be the basis of an alternate"). ----
-    //
-    // The fit is the best fiction (referee: 1.82 IRE at detail) but it
-    // systematically overclaims where carrier is scarce (pillar: claims
-    // 2.6 IRE against a true 1.2). Regression of the exact channel
-    // against the published fit over covered samples, per region, yields
-    // a calibrated regional gain g = <fit,exact>/<fit,fit>; the alternate
-    // is g_region * fit, applied FRAME-UNIFORMLY to both parities (learn
-    // on covered, apply everywhere -- the parity-safe consumption shape).
-    // Cross-validation: two gain grids from alternating covered lines;
-    // a covered line is always served by the grid that excluded it, so
-    // the referee's grade is out-of-sample. Tiles 64x32 with bilinear
-    // interpolation between tile centres; thin tiles fall back to the
-    // frame-global gain. Valid on anchored frames only (the mode falls
-    // back to the fit elsewhere -- a frame-alternating hedge that is
-    // acceptable for A/B grading but must be resolved by cross-frame
-    // gain transfer before promotion).
-    anchorAltValid = false;
-    if (!exactCarrier_flat.empty()) {
-        constexpr int kTx = 64, kTy = 32, kMinN = 128;
-        const int gx = (width + kTx - 1) / kTx;
-        const int gy = (lastLine + kTy - 1) / kTy;
-        // [half][tile] sums; half 2 = combined
-        std::vector<double> sBE(3 * gx * gy, 0.0), sBB(3 * gx * gy, 0.0);
-        std::vector<long>   sN(3 * gx * gy, 0);
-        double gBE[3] = {0, 0, 0}, gBB[3] = {0, 0, 0};
-        long gN[3] = {0, 0, 0};
-        std::vector<std::uint8_t> lineCovered(lastLine, 0);
-        for (int line = firstLine; line < lastLine; ++line) {
-            const float *exR = exactCarrierRow(line);
-            if (!exR) continue;
-            const float *fitR = carrierFit_flat.data()
-                                + static_cast<size_t>(line) * demodWidth;
-            const int half = (line >> 1) & 1;
-            const int ty = line / kTy;
-            long nLine = 0;
-            for (int xi = 0; xi < width; ++xi) {
-                const float e = exR[left + xi];
-                const float b = fitR[xi];
-                if (!std::isfinite(e) || !std::isfinite(b)) continue;
-                const int t = ty * gx + xi / kTx;
-                const double be = (double)b * e, bb = (double)b * b;
-                sBE[half * gx * gy + t] += be;
-                sBB[half * gx * gy + t] += bb;
-                sN[half * gx * gy + t]++;
-                sBE[2 * gx * gy + t] += be;
-                sBB[2 * gx * gy + t] += bb;
-                sN[2 * gx * gy + t]++;
-                gBE[half] += be; gBB[half] += bb; gN[half]++;
-                gBE[2] += be; gBB[2] += bb; gN[2]++;
-                ++nLine;
-            }
-            if (nLine >= width / 2) lineCovered[line] = 1;
-        }
-        if (gN[2] >= 4 * kMinN) {
-            auto gainOf = [&](int half, int t) -> double {
-                double be, bb; long n;
-                be = sBE[half * gx * gy + t]; bb = sBB[half * gx * gy + t];
-                n = sN[half * gx * gy + t];
-                if (n < kMinN) {
-                    be = sBE[2 * gx * gy + t]; bb = sBB[2 * gx * gy + t];
-                    n = sN[2 * gx * gy + t];
-                }
-                if (n < kMinN) {
-                    be = gBE[half]; bb = gBB[half]; n = gN[half];
-                }
-                if (n < kMinN || bb <= 1e-9) {
-                    be = gBE[2]; bb = gBB[2];
-                }
-                if (bb <= 1e-9) return 1.0;
-                return std::clamp(be / bb, 0.0, 1.3);
-            };
-            // Per-half gain grids at tile centres, then bilinear apply.
-            std::vector<double> grid(3 * gx * gy);
-            for (int half = 0; half < 3; ++half)
-                for (int t = 0; t < gx * gy; ++t)
-                    grid[half * gx * gy + t] = gainOf(half, t);
-            auto gAt = [&](int half, double ly, double lx) -> double {
-                // tile-centre coordinates
-                const double fy = std::clamp(
-                    (ly - 0.5 * kTy) / kTy, 0.0, (double)(gy - 1));
-                const double fx = std::clamp(
-                    (lx - 0.5 * kTx) / kTx, 0.0, (double)(gx - 1));
-                const int y0t = (int)fy, x0t = (int)fx;
-                const int y1t = std::min(gy - 1, y0t + 1);
-                const int x1t = std::min(gx - 1, x0t + 1);
-                const double ay = fy - y0t, ax = fx - x0t;
-                const double *G = grid.data() + half * gx * gy;
-                const double v00 = G[y0t * gx + x0t], v01 = G[y0t * gx + x1t];
-                const double v10 = G[y1t * gx + x0t], v11 = G[y1t * gx + x1t];
-                return (1 - ay) * ((1 - ax) * v00 + ax * v01) +
-                       ay * ((1 - ax) * v10 + ax * v11);
-            };
-            anchorAltCarrier_flat.assign(
-                static_cast<size_t>(demodLines) * demodWidth, 0.0f);
-            for (int line = firstLine; line < lastLine; ++line) {
-                const float *fitR = carrierFit_flat.data()
-                                    + static_cast<size_t>(line) * demodWidth;
-                float *altR = anchorAltCarrier_flat.data()
-                              + static_cast<size_t>(line) * demodWidth;
-                // Covered lines are served by the OPPOSITE half's grid
-                // (out-of-sample); uncovered lines by the combined grid.
-                const int half =
-                    lineCovered[line] ? 1 - ((line >> 1) & 1) : 2;
-                for (int xi = 0; xi < width; ++xi)
-                    altR[xi] = static_cast<float>(
-                        gAt(half, line, xi) * (double)fitR[xi]);
-            }
-            anchorAltValid = true;
-        }
-    }
 
     // Certified-luma vertical comb for the COMP lines in anchor mode (user,
     // 2026-07-28: the reform used the certified CARRIER on covered lines and
