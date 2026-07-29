@@ -4106,17 +4106,29 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         result.iqPen   = 0.0;
         return result;
     }
+    // A Same-relation partner cannot yield carrier AT ALL: with equal phase
+    // the difference cancels the CARRIER and leaves a luma difference, so
+    // the sign-folded form is a temporal AVERAGE, not a comb -- it keeps the
+    // mean 1D leak that combing cancels. Admitting it alongside Opposite
+    // therefore runs two different physical operations on alternating lines,
+    // which is the line-parity striping that kept this whole path parked
+    // (measured 2026-07-28: acceptance was already uniform at 99.8%/share
+    // 0.95 and smoothing it changed nothing -- the stripes were in the
+    // VALUES, i.e. in the operation class). Opposite is the only path to a
+    // carrier product; content agreement is already gated by the 2D
+    // similarity curve (AGREEMENT_REWARD_*) in getBestCandidate, which is
+    // what makes a cross-frame Opposite partner honest where the picture is
+    // static. LDCD_3D_SAME_RELATION=1 restores the old averaging branch for
+    // A/B only.
+    static const bool allowSameRelation = []{
+        const char *e = std::getenv("LDCD_3D_SAME_RELATION");
+        return e && std::atoi(e) != 0;
+    }();
     if (phaseReach.carrierRelation == lddecode::CarrierPhaseRelation::Opposite) {
         relationSign = 1.0;
-    } else if (temporalGrammar &&
+    } else if (temporalGrammar && allowSameRelation &&
                phaseReach.carrierRelation == lddecode::CarrierPhaseRelation::Same) {
         relationSign = -1.0;
-        // Averaging (Same) keeps the mean 1D leak that combing (Opposite)
-        // cancels. Without this bias the operation class alternates by line
-        // parity against a mixed-phase partner (the assembled B's
-        // neighbours), re-manufacturing line-parity texture. Bias the
-        // election toward an Opposite partner wherever one exists; the
-        // Same-averager still fills where nothing better is offered.
         adjustPenalty += 3.0;
     } else {
         result.penalty = 1000.0;
