@@ -5530,6 +5530,100 @@ static void detectLurchSteps(const double *means, int meanCount,
     }
 }
 
+// Sample-resolution step detector on CERTIFIED luma (Lhat = raw - exact,
+// covered lines only). The aperture detector above fuses same-sign corners
+// closer than ~4 px and lets ringing suppression eat close opposite pairs
+// -- the one-corner-per-4-px limit. Lhat needs no aperture: it is already
+// carrier-free by conservation, so steps resolve at sample resolution and
+// the limit does not exist here. Detection thresholds mirror the aperture
+// detector's IRE scale; the per-sample difference threshold is higher
+// (0.60 vs 0.30 IRE) because samples do not enjoy the window's 4x
+// averaging. NaN-tolerant: a NaN sample ends any run.
+static void detectCertifiedLurchSteps(const double *lhat, int count,
+                                      double irescale, double invIreScale,
+                                      std::vector<LurchStepRun> &runs)
+{
+    runs.clear();
+    if (!lhat || count < 6)
+        return;
+
+    const auto smoothStep01 = [](double t) {
+        t = std::clamp(t, 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
+    };
+
+    const double dThresh = 0.60 * irescale;
+    const int dCount = count - 1;
+
+    int s = 0;
+    while (s < dCount) {
+        if (!std::isfinite(lhat[s]) || !std::isfinite(lhat[s + 1])) {
+            ++s;
+            continue;
+        }
+        const double d0 = lhat[s + 1] - lhat[s];
+        if (std::fabs(d0) < dThresh) {
+            ++s;
+            continue;
+        }
+        const bool positive = d0 > 0.0;
+        const int a = s;
+        int b = s;
+        while (b + 1 < dCount) {
+            if (!std::isfinite(lhat[b + 2])) break;
+            const double dn = lhat[b + 2] - lhat[b + 1];
+            if (std::fabs(dn) < dThresh || (dn > 0.0) != positive)
+                break;
+            ++b;
+        }
+        s = b + 1;
+
+        // A sample-resolution step spans 1-2 differences; longer is a ramp.
+        const int runLength = b - a + 1;
+        if (runLength > 3)
+            continue;
+
+        const double stepSamples = lhat[b + 1] - lhat[a];
+        const double stepIRE = std::fabs(stepSamples) * invIreScale;
+        const double gate = smoothStep01((stepIRE - 1.25) / 2.75);
+        if (gate <= 0.0)
+            continue;
+
+        double wSum = 0.0, wPos = 0.0;
+        for (int k = a; k <= b; ++k) {
+            const double w = std::fabs(lhat[k + 1] - lhat[k]);
+            wSum += w;
+            wPos += w * (double)k;
+        }
+        const double centroid =
+            (wSum > 1e-12) ? (wPos / wSum) : 0.5 * (double)(a + b);
+
+        LurchStepRun run;
+        run.a = a;
+        run.b = b;
+        run.edge = centroid + 0.5;   // d[k] sits between samples k, k+1
+        run.stepSamples = stepSamples;
+        run.stepAbsIRE = stepIRE;
+        run.gate = gate;
+        run.certified = true;
+        runs.push_back(run);
+    }
+
+    // Same ringing rule as the aperture detector, in sample units.
+    for (size_t i = 0; i < runs.size(); ++i) {
+        for (size_t j = 0; j < runs.size(); ++j) {
+            if (i == j) continue;
+            const int gap = (runs[i].a > runs[j].b)
+                ? runs[i].a - runs[j].b
+                : runs[j].a - runs[i].b;
+            if (gap <= 3 && runs[j].stepAbsIRE >= 2.5 * runs[i].stepAbsIRE) {
+                runs[i].suppressed = true;
+                break;
+            }
+        }
+    }
+}
+
 // Fill the canonical per-line lurch run lists from the shared aperture pool:
 // ONE detection per line per frame, unit gain, meanCount = width-3 (the real
 // aperture starts). Every consumer -- the witness coarse-sharpener, the edge
@@ -5559,6 +5653,154 @@ void Comb::FrameBuffer::buildLurchStepRuns()
                          lurchStepRuns[line]);
     }
 
+    // CERTIFIED LUMA FACTS (user, 2026-07-29: "Lurch: yes, this is a big
+    // priority, the 1 corner per 4 pixel limit can be broken"). On covered
+    // lines Lhat = raw - exact is per-sample certified luma; its steps are
+    // facts, consumed as facts (never calibration). Three parity-lawful
+    // moves -- the parity law says exact consumption must reach both
+    // parities together, and it has bitten twice this arc:
+    //   1. REPOSITION: a covered line's aperture run within tolerance of a
+    //      certified step takes the certified sub-sample edge.
+    //   2. (in corroborateLurchEdges) comp lines bracketed by two
+    //      certified partners snap to their MEAN -- the certified
+    //      interpolation -- instead of median-of-three.
+    //   3. INSERTION, always as a vertical TRIPLE: a certified step the
+    //      aperture missed on line L, matched by a certified step on
+    //      L+2, inserts runs on L, L+1 (interpolated) and L+2 together --
+    //      corner density rises on both parities at once, never on one.
+    // A/B escape LDCD_LURCH_CERT=0; default ON. Uncovered frames untouched.
+    static const bool lurchCert = []{
+        const char *e = std::getenv("LDCD_LURCH_CERT");
+        return !(e && std::atoi(e) == 0);
+    }();
+    if (lurchCert && frameHasExactCoverage()) {
+        constexpr double kCertMatchPx = 1.5;
+        std::vector<std::vector<LurchStepRun>> certMissed(lastLine);
+        // Pending common-mode corrections per (line, run index): a comp
+        // run bracketed by two covered lines receives a delta from each;
+        // they must AVERAGE, not stack.
+        std::vector<std::vector<std::pair<double, int>>> pend(lastLine);
+        std::vector<double> lhat(width);
+        std::vector<LurchStepRun> certRuns;
+        for (int line = firstLine; line < lastLine; ++line) {
+            const float *ex = exactCarrierRow(line);
+            if (!ex) continue;
+            const quint16 *rawLine = rawbuffer.data()
+                + static_cast<size_t>(line) * videoParameters.fieldWidth;
+            int nFinite = 0;
+            for (int xi = 0; xi < width; ++xi) {
+                const float e = ex[left + xi];
+                if (std::isfinite(e)) {
+                    lhat[xi] = static_cast<double>(rawLine[left + xi]) -
+                               static_cast<double>(e);
+                    ++nFinite;
+                } else {
+                    lhat[xi] = std::numeric_limits<double>::quiet_NaN();
+                }
+            }
+            if (nFinite < 16) continue;
+            detectCertifiedLurchSteps(lhat.data(), width, irescale,
+                                      invIreScale, certRuns);
+            for (const LurchStepRun &cr : certRuns) {
+                if (cr.suppressed) continue;
+                bool matched = false;
+                for (LurchStepRun &ar : lurchStepRuns[line]) {
+                    if (ar.suppressed) continue;
+                    if ((ar.stepSamples > 0.0) != (cr.stepSamples > 0.0))
+                        continue;
+                    if (std::fabs(ar.edge - cr.edge) > kCertMatchPx)
+                        continue;
+                    // COHERENT repositioning (the parity law's third
+                    // lesson this arc, caught by the straightness dump):
+                    // moving only the covered line to truth breaks
+                    // line-to-line consistency, because adjacent aperture
+                    // detections share systematic bias -- truth on one
+                    // parity + bias on the other IS alternation (scatter
+                    // 0.384 -> 0.437 px, strut lineAlt +3%). So the
+                    // certified CORRECTION delta propagates to the
+                    // vertically-matched comp runs above and below at the
+                    // same time: every line moves together, common-mode,
+                    // and the shared detector bias is what the delta
+                    // cancels.
+                    const double delta = cr.edge - ar.edge;
+                    ar.edge = cr.edge;          // the certified position
+                    ar.gate = std::max(ar.gate, cr.gate);
+                    ar.certified = true;
+                    for (int nl = line - 1; nl <= line + 1; nl += 2) {
+                        if (nl < firstLine || nl >= lastLine) continue;
+                        auto &rowRuns = lurchStepRuns[nl];
+                        if (pend[nl].size() < rowRuns.size())
+                            pend[nl].resize(rowRuns.size(), {0.0, 0});
+                        for (size_t ri = 0; ri < rowRuns.size(); ++ri) {
+                            LurchStepRun &mr = rowRuns[ri];
+                            if (mr.suppressed || mr.certified) continue;
+                            if ((mr.stepSamples > 0.0) !=
+                                (cr.stepSamples > 0.0)) continue;
+                            if (std::fabs(mr.edge - (cr.edge - delta)) >
+                                kCertMatchPx) continue;
+                            pend[nl][ri].first += delta;
+                            pend[nl][ri].second += 1;
+                            break;
+                        }
+                    }
+                    matched = true;
+                    break;
+                }
+                if (!matched)
+                    certMissed[line].push_back(cr);
+            }
+        }
+        // Apply the averaged common-mode corrections.
+        for (int line = firstLine; line < lastLine; ++line) {
+            auto &rowRuns = lurchStepRuns[line];
+            for (size_t ri = 0; ri < pend[line].size() &&
+                                ri < rowRuns.size(); ++ri) {
+                if (pend[line][ri].second > 0)
+                    rowRuns[ri].edge += pend[line][ri].first /
+                                        pend[line][ri].second;
+            }
+        }
+
+        // Insertion as vertical triples (move 3).
+        for (int line = firstLine; line + 2 < lastLine; ++line) {
+            for (LurchStepRun &r : certMissed[line]) {
+                if (r.suppressed) continue;   // reused as consumed marker
+                LurchStepRun *o = nullptr;
+                for (LurchStepRun &c : certMissed[line + 2]) {
+                    if (c.suppressed) continue;
+                    if ((c.stepSamples > 0.0) != (r.stepSamples > 0.0))
+                        continue;
+                    if (std::fabs(c.edge - r.edge) > kCertMatchPx) continue;
+                    o = &c;
+                    break;
+                }
+                if (!o) continue;
+                // The comp line between them must not already carry an
+                // aperture run here (it would double-report the corner).
+                bool compHasIt = false;
+                for (const LurchStepRun &m : lurchStepRuns[line + 1]) {
+                    if (m.suppressed) continue;
+                    if (std::fabs(m.edge - 0.5 * (r.edge + o->edge)) <=
+                        kCertMatchPx) { compHasIt = true; break; }
+                }
+                LurchStepRun mid;
+                mid.edge = 0.5 * (r.edge + o->edge);
+                mid.stepSamples = 0.5 * (r.stepSamples + o->stepSamples);
+                mid.stepAbsIRE = 0.5 * (r.stepAbsIRE + o->stepAbsIRE);
+                mid.gate = std::min(r.gate, o->gate);
+                mid.certified = true;
+                mid.a = std::max(0, (int)mid.edge - 2);
+                mid.b = std::min(width - 4, (int)mid.edge + 1);
+                lurchStepRuns[line].push_back(r);
+                if (!compHasIt)
+                    lurchStepRuns[line + 1].push_back(mid);
+                lurchStepRuns[line + 2].push_back(*o);
+                o->suppressed = true;         // consumed
+                r.suppressed = true;
+            }
+        }
+    }
+
     // Disposable per-line edge dump (LDCD_DUMP_LURCH_L0/L1/C0/C1, run -t 1):
     // raw pre-corroboration edges with line phase class, for measuring
     // vertical edge scatter and its phase correlation. Zero cost when unset.
@@ -5573,10 +5815,11 @@ void Comb::FrameBuffer::buildLurchStepRuns()
                 if (run.edge < luC0 || run.edge > luC1) continue;
                 std::fprintf(stderr,
                     "LURCH line=%d flip=%d edge=%.3f stepIRE=%.2f gate=%.2f "
-                    "a=%d b=%d sup=%d\n",
+                    "a=%d b=%d sup=%d cert=%d\n",
                     line, carrierLineFlip(line), run.edge,
                     run.stepSamples * invIreScale, run.gate,
-                    run.a, run.b, run.suppressed ? 1 : 0);
+                    run.a, run.b, run.suppressed ? 1 : 0,
+                    run.certified ? 1 : 0);
             }
         }
     }
@@ -5596,14 +5839,18 @@ std::vector<LurchStepRun> Comb::FrameBuffer::corroborateLurchEdges(int line) con
     const auto &dn = lurchStepRuns_line(line + step);
 
     auto matchEdge = [&](const std::vector<LurchStepRun> &nbr,
-                         const LurchStepRun &run, double &edgeOut) -> bool {
+                         const LurchStepRun &run, double &edgeOut,
+                         bool &certOut) -> bool {
         double bestD = kLurchMatchPx;
         bool found = false;
         for (const LurchStepRun &o : nbr) {
             if (o.suppressed) continue;
             if ((o.stepSamples > 0.0) != (run.stepSamples > 0.0)) continue;
             const double d = std::fabs(o.edge - run.edge);
-            if (d <= bestD) { bestD = d; edgeOut = o.edge; found = true; }
+            if (d <= bestD) {
+                bestD = d; edgeOut = o.edge; certOut = o.certified;
+                found = true;
+            }
         }
         return found;
     };
@@ -5611,8 +5858,17 @@ std::vector<LurchStepRun> Comb::FrameBuffer::corroborateLurchEdges(int line) con
     for (LurchStepRun &run : runs) {
         if (run.suppressed) continue;
         double eu, ed;
-        if (!matchEdge(up, run, eu) || !matchEdge(dn, run, ed))
+        bool cu = false, cd = false;
+        if (!matchEdge(up, run, eu, cu) || !matchEdge(dn, run, ed, cd))
             continue;                       // no full vertical company
+        if (cu && cd && !run.certified) {
+            // Both partners carry certified positions: their mean is the
+            // certified interpolation, strictly better information than
+            // this line's own aperture centroid. The comp line inherits
+            // the anchors -- both parities improve together.
+            run.edge = 0.5 * (eu + ed);
+            continue;
+        }
         const double e = run.edge;
         // median of three, by selection
         run.edge = std::max(std::min(eu, e), std::min(std::max(eu, e), ed));

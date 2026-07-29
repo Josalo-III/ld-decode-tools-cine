@@ -56,6 +56,7 @@ struct LurchStepRun {
     double stepAbsIRE = 0.0;   // |step|, IRE
     double gate = 0.0;         // unit-gain confidence gate in [0,1]
     bool suppressed = false;   // ringing/overshoot fragment beside a stronger run
+    bool certified = false;    // edge position from certified luma (raw - exact)
 };
 
 class Comb
