@@ -651,6 +651,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         const int fw = videoParameters.fieldWidth;
         exactCarrier_flat.assign((size_t)frameHeight * fw,
                                  std::numeric_limits<float>::quiet_NaN());
+        exactCoverageCache = -1;   // recompute for the newly held frame
         auto copyPlane = [&](const QVector<float> &src, int frameParity) {
             if (src.isEmpty()) return;
             qint32 fl = 0;
@@ -2984,7 +2985,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
     static const bool blend3D = []{
         const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
-        return e && std::atoi(e) != 0;
+        return !(e && std::atoi(e) == 0);
     }();
 
     // ---- Acceptance uniformity (user-directed, 2026-07-28) ----
@@ -3214,6 +3215,31 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         }
     }
 }
+// True when this frame holds any dG twin-certified carrier. Sampled
+// rather than exhaustive: coverage is a whole-field property, so a sparse
+// probe over the active lines settles it. Cached per held frame.
+bool Comb::FrameBuffer::frameHasExactCoverage() const
+{
+    if (exactCoverageCache >= 0)
+        return exactCoverageCache != 0;
+    exactCoverageCache = 0;
+    if (!exactCarrier_flat.empty()) {
+        const int firstLine = videoParameters.firstActiveFrameLine;
+        const int lastLine  = videoParameters.lastActiveFrameLine;
+        const int left      = videoParameters.activeVideoStart;
+        const int right     = videoParameters.activeVideoEnd;
+        for (int line = firstLine; line < lastLine && !exactCoverageCache;
+             ++line) {
+            const float *row = exactCarrierRow(line);
+            if (!row) continue;
+            for (int h = left; h < right; h += 32) {
+                if (std::isfinite(row[h])) { exactCoverageCache = 1; break; }
+            }
+        }
+    }
+    return exactCoverageCache != 0;
+}
+
 // 3D Election
 void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                                          const FrameBuffer &previousFrame,
@@ -3241,9 +3267,15 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
 
     // LDCD_3D_TEMPORAL_GRAMMAR=1: temporal-grammar candidate rules (see
     // getCandidate). Default OFF preserves the historical gate behaviour.
+    // Temporal grammar is LIVE (user approval 2026-07-28, render-judged:
+    // "it looked good - and B was less of an outlier"). The historical
+    // striping was the Same/Opposite operation-class mix, now refused in
+    // getCandidate; what remains is the correct fix for the contradictory
+    // gates that kept the frame axis dead. LDCD_3D_TEMPORAL_GRAMMAR=0
+    // restores the old pre-gates for A/B.
     static const bool temporalGrammar3D = []{
         const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
-        return e && std::atoi(e) != 0;
+        return !(e && std::atoi(e) == 0);
     }();
 
     // 1D/2D Candidates (always available via this frame)
@@ -3347,6 +3379,31 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         src[CAND_NEXT_FRAME] = &nextFrame;
     } else {
         invalidateCandidate(CAND_NEXT_FRAME);
+    }
+
+    // --- Uncovered-frame deference (user, 2026-07-28: "perhaps B could
+    // have a small penalty in getBestCandidate for current candidates") ---
+    //
+    // A frame with no dG twin coverage (B and D letters, and all
+    // non-cadence material) carries an estimated carrier everywhere, while
+    // its A/C neighbours carry the conservation-exact one. Where such a
+    // frame sits beside a covered neighbour, its own spatial candidates
+    // are the weaker testimony, so they pay a small penalty and the
+    // temporal candidates drawn from certified neighbours become cheaper.
+    //
+    // This is DIFFERENTIAL, which is why it can act where the earlier
+    // per-sample "certified source bonus" could not: that bonus applied
+    // uniformly to every same-frame candidate and cancelled in the argmin.
+    // Inert by construction when neither neighbour is covered, when this
+    // frame is itself covered, and on material with no coverage at all.
+    if (!frameHasExactCoverage() &&
+        (previousFrame.frameHasExactCoverage() ||
+         nextFrame.frameHasExactCoverage())) {
+        static constexpr double UNCOVERED_SELF_PENALTY = 1.0;
+        for (int i = 0; i < NUM_CANDIDATES; ++i) {
+            if (src[i] != this || c[i].penalty >= 1000.0) continue;
+            c[i].penalty += UNCOVERED_SELF_PENALTY;
+        }
     }
 
     // --- Agreement Reward Shaping ---

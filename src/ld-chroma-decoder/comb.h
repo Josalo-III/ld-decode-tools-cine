@@ -1154,6 +1154,11 @@ private:
 	}
 	void buildAnchorCeiling();
 
+	// True when this frame holds any dG twin-certified carrier. Cheap
+	// sampled probe, cached per held frame (reset in loadFields()).
+	mutable int exactCoverageCache = -1;
+	bool frameHasExactCoverage() const;
+
 	inline std::uint8_t *chromaBoundaryBand_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    chromaBoundaryBand_flat.empty()) return nullptr;
