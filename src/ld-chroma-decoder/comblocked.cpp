@@ -8403,12 +8403,26 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     const double ld = (double)rawD[left + xi] - (double)ed;
                     R[xi] = (double)rawLine[left + xi] - 0.5 * (lu + ld);
                 }
-                // Merge-identical carrier-band FIR; out-of-band witness.
+                // Merge-identical carrier-band FIR. The out-of-band residual
+                // is now EVIDENCE, not a router (user, 2026-07-29: "if we're
+                // doing a blend, that should be a penalty that goes to
+                // alpha, not a binary cutoff"). The old cut interleaved comb
+                // and fit per sample along the strut -- two ~5 IRE-
+                // disagreeing renders alternating down a vertical feature
+                // WAS the pillar wobble; and on the very samples where the
+                // residual fired, the comb still beat the fit (4.72 vs 5.30
+                // IRE vs certified truth), so the comb's weight floors at
+                // parity: the residual can say "trust me less", never
+                // "trust the fit more".
                 constexpr double kT0 = 0.676462;
                 constexpr double kT2 = -0.250000;
                 constexpr double kT4 = -0.088231;
-                constexpr double kOobIRE = 4.0;
-                const double oobThresh = kOobIRE * irescale;
+                constexpr double kOobTauIRE = 2.0;   // e-fold of the alpha
+                constexpr double kOobCutIRE = 4.0;   // escape-mode old cut
+                std::vector<double> bpV(width,
+                    std::numeric_limits<double>::quiet_NaN());
+                std::vector<double> resV(width,
+                    std::numeric_limits<double>::quiet_NaN());
                 for (int xi = 0; xi < width; ++xi) {
                     bool ok = true;
                     double taps[5];
@@ -8422,9 +8436,129 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     const double bp = kT0 * taps[0] +
                                       kT2 * (taps[1] + taps[2]) +
                                       kT4 * (taps[3] + taps[4]);
-                    if (dumpRlad) certBpDbg[xi] = bp;  // pre-witness, diag only
-                    if (std::fabs(R[xi] - bp) > oobThresh) continue;
-                    certComp[xi] = bp;
+                    if (dumpRlad) certBpDbg[xi] = bp;  // pre-alpha, diag only
+                    bpV[xi] = bp;
+                    resV[xi] = std::fabs(R[xi] - bp);
+                }
+
+                // Escapes for A/B only, both default ON:
+                //   LDCD_OOB_ALPHA=0  -- restore the binary cut
+                //   LDCD_PHASE_SNAP=0 -- disable the working-space snap
+                static const bool oobAlpha = []{
+                    const char *e = std::getenv("LDCD_OOB_ALPHA");
+                    return !(e && std::atoi(e) == 0);
+                }();
+                static const bool phaseSnap = []{
+                    const char *e = std::getenv("LDCD_PHASE_SNAP");
+                    return !(e && std::atoi(e) == 0);
+                }();
+
+                // Confidence-alpha merge of the two comp-line estimators.
+                std::vector<double> est(width);
+                for (int xi = 0; xi < width; ++xi) {
+                    const double fit = static_cast<double>(fitRowPub[xi]);
+                    if (!std::isfinite(bpV[xi])) { est[xi] = fit; continue; }
+                    double wc;
+                    if (oobAlpha)
+                        wc = 0.5 + 0.5 * std::exp(-resV[xi] /
+                                                  (kOobTauIRE * irescale));
+                    else
+                        wc = (resV[xi] <= kOobCutIRE * irescale) ? 1.0 : 0.0;
+                    est[xi] = wc * bpV[xi] + (1.0 - wc) * fit;
+                }
+
+                // Phase alignment in the 4fsc working space (user: "we
+                // generally rotate all candidates in an election into the
+                // same working space... the candidates in the Y election
+                // need to have their phases aligned before it gets baked
+                // in"). MEASURED basis (LDCD_DUMP_RLAD, 2026-07-29): the
+                // true carrier holds phase down the strut (vertical
+                // coherence 0.907 across covered lines), while the fit's
+                // phase error is spatially incoherent (rms 52 deg at real
+                // carrier, line-to-line ANTI-correlated) -- so the
+                // certified brackets are the phase reference and the local
+                // estimator keeps only its amplitude:
+                //     carrier = |est| * bAlign / |bAlign|
+                // per short window, where bAlign is the grammar-sign-
+                // aligned bracket mean. The snap fades in with reference
+                // amplitude (phase of a near-zero carrier is meaningless,
+                // a clamp on an impossible) and is skipped where the
+                // bracket window is incomplete.
+                if (phaseSnap) {
+                    std::vector<double> bAlign(width,
+                        std::numeric_limits<double>::quiet_NaN());
+                    const CombCarrierGrammar *gC = carrierGrammarLine(line);
+                    const CombCarrierGrammar *gU = carrierGrammarLine(line - 1);
+                    const CombCarrierGrammar *gD = carrierGrammarLine(line + 1);
+                    if (gC && gU && gD) {
+                        for (int xi = 0; xi < width; ++xi) {
+                            const int h = left + xi;
+                            const float eu = exU[h];
+                            const float ed = exD[h];
+                            if (!std::isfinite(eu) || !std::isfinite(ed))
+                                continue;
+                            const auto rU =
+                                lddecode::carrierGrammarSignedPhaseRelation(
+                                    gC, h, gU, h);
+                            const auto rD =
+                                lddecode::carrierGrammarSignedPhaseRelation(
+                                    gC, h, gD, h);
+                            double sU, sD;
+                            if (rU == lddecode::CarrierPhaseRelation::Opposite)
+                                sU = -1.0;
+                            else if (rU == lddecode::CarrierPhaseRelation::Same)
+                                sU = 1.0;
+                            else continue;
+                            if (rD == lddecode::CarrierPhaseRelation::Opposite)
+                                sD = -1.0;
+                            else if (rD == lddecode::CarrierPhaseRelation::Same)
+                                sD = 1.0;
+                            else continue;
+                            bAlign[xi] = 0.5 * (sU * (double)eu +
+                                                sD * (double)ed);
+                        }
+                    }
+                    constexpr int kSnapHalf = 4;        // window [-3,+4], W=8
+                    // The phase reference was validated at >=2 IRE (vertical
+                    // coherence 0.907); below that the bracket's phase is
+                    // noise and snapping toward it costs Y (measured: fade
+                    // from 0.25 IRE gave back the alpha reform's D2 win).
+                    constexpr double kSnapAmpTauIRE = 3.0;
+                    constexpr double kSnapAmpMinIRE = 1.0;
+                    for (int xi = 3; xi < width - kSnapHalf; ++xi) {
+                        double eI = 0.0, eQ = 0.0, rI = 0.0, rQ = 0.0;
+                        bool ok = true;
+                        for (int k = xi - 3; k <= xi + kSnapHalf && ok; ++k) {
+                            const double b = bAlign[k];
+                            if (!std::isfinite(b)) { ok = false; break; }
+                            static const int cB[4] = { 1, 0, -1, 0 };
+                            static const int sB[4] = { 0, 1, 0, -1 };
+                            const int ph = k & 3;
+                            eI += est[k] * cB[ph]; eQ += est[k] * sB[ph];
+                            rI += b * cB[ph];      rQ += b * sB[ph];
+                        }
+                        if (!ok) continue;
+                        // I/Q sums over W=8 carry ~4x the waveform
+                        // amplitude; 0.25 normalizes for the IRE
+                        // thresholds. The ratio needs no normalization.
+                        const double aRefRaw = std::hypot(rI, rQ);
+                        const double aRef = aRefRaw * 0.25;
+                        if (aRef < kSnapAmpMinIRE * irescale) continue;
+                        const double aEstRaw = std::hypot(eI, eQ);
+                        const double snapped = (aEstRaw / aRefRaw) * bAlign[xi];
+                        // Ramp from the floor, continuous at it -- a step in
+                        // a blend weight is a contour.
+                        const double sf = 1.0 - std::exp(
+                            -(aRef - kSnapAmpMinIRE * irescale) /
+                             (kSnapAmpTauIRE * irescale));
+                        certComp[xi] = sf * snapped + (1.0 - sf) * est[xi];
+                    }
+                    for (int xi = 0; xi < width; ++xi)
+                        if (!std::isfinite(certComp[xi]))
+                            certComp[xi] = est[xi];
+                } else {
+                    for (int xi = 0; xi < width; ++xi)
+                        certComp[xi] = est[xi];
                 }
             }
         }
