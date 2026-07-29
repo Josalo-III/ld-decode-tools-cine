@@ -1056,6 +1056,24 @@ private:
 		return locked1DSource_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
+	// ANCHORED 1D (user, 2026-07-29: "do the replacement coming out of
+	// 1D. This way the positives will propagate through comb just as the
+	// SNR benefits from the merge did"). The retraction ladder's carrier
+	// -- exact on covered lines, certified comb elsewhere -- published as
+	// the comb stages' preferred 1D-out plane on covered frames. The TRUE
+	// locked1DSource stays intact and keeps serving produceY's 1D
+	// election candidate and the CCR source: 1D REMAINS THE SAFE RETREAT
+	// structurally, because those consumers never see this plane.
+	std::vector<double> anchored1DSource_flat;
+	bool anchored1DValid = false;
+	inline const double *combSource1D_line(int line) const {
+		if (anchored1DValid && demodWidth > 0 && line >= 0 &&
+		    line < demodLines && !anchored1DSource_flat.empty())
+			return anchored1DSource_flat.data() +
+			       static_cast<size_t>(line) * demodWidth;
+		return locked1DSource_line(line);
+	}
+
 	inline const double *locked1DSource_line(int line) const {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    locked1DSource_flat.empty()) return nullptr;

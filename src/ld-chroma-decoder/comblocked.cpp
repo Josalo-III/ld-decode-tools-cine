@@ -9153,6 +9153,32 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
 
     carrierRetractedValid = true;
 
+    // Publish the anchored 1D-out plane (covered frames, mode 3 only;
+    // uniform per frame -- validity is a frame property, never per line).
+    // A/B escape LDCD_ANCHOR_1D=0.
+    static const bool anchor1D = []{
+        const char *e = std::getenv("LDCD_ANCHOR_1D");
+        return !(e && std::atoi(e) == 0);
+    }();
+    anchored1DValid = false;
+    if (anchor1D && !analysisOnly && retractedSource == 3 &&
+        frameHasExactCoverage()) {
+        anchored1DSource_flat.assign(
+            static_cast<size_t>(demodLines) * demodWidth, 0.0);
+        for (int line = firstLine; line < lastLine; ++line) {
+            const quint16 *rawLine = rawbuffer.data()
+                + static_cast<size_t>(line) * videoParameters.fieldWidth;
+            const float *retr = carrierRetracted_flat.data()
+                + static_cast<size_t>(line) * demodWidth;
+            double *dst = anchored1DSource_flat.data()
+                + static_cast<size_t>(line) * demodWidth;
+            for (int xi = 0; xi < width; ++xi)
+                dst[xi] = static_cast<double>(rawLine[left + xi]) -
+                          static_cast<double>(retr[xi]);
+        }
+        anchored1DValid = true;
+    }
+
     if (dumpDead) {
         auto pct = [](long long a, long long b) {
             return b > 0 ? 100.0 * static_cast<double>(a)

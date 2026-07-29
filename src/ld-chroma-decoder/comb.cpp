@@ -662,6 +662,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         exactCarrier_flat.assign((size_t)frameHeight * fw,
                                  std::numeric_limits<float>::quiet_NaN());
         exactCoverageCache = -1;   // recompute for the newly held frame
+        anchored1DValid = false;   // stale plane must not survive reuse
         auto copyPlane = [&](const QVector<float> &src, int frameParity) {
             if (src.isEmpty()) return;
             qint32 fl = 0;
@@ -2610,7 +2611,7 @@ void Comb::FrameBuffer::split2D()
             if (configuration.phaseCompensation) {
                 lockedRow = useLockedRawBandpassLine
                     ? locked1DRawBandpass_line(line)
-                    : locked1DSource_line(line);
+                    : combSource1D_line(line);
             }
             if (lockedRow) {
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = lockedRow[rel];
@@ -2825,7 +2826,7 @@ void Comb::FrameBuffer::split2D()
             if ((int)scratch_lateralLine.size() < width)
                 scratch_lateralLine.resize(width);
             if (configuration.phaseCompensation) {
-                const double *lockedRow = locked1DSource_line(line);
+                const double *lockedRow = combSource1D_line(line);
                 if (lockedRow) {
                     std::copy(lockedRow, lockedRow + width, scratch_lateralLine.begin());
                 }
@@ -3033,7 +3034,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
         for (int line = firstLine; line < lastLine; ++line) {
             const double *lockedRow = configuration.phaseCompensation
-                ? locked1DSource_line(line) : nullptr;
+                ? combSource1D_line(line) : nullptr;
             for (int h = left; h < right; ++h) {
                 const size_t idx =
                     static_cast<size_t>(line) * width + (h - left);
@@ -3170,7 +3171,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             const int rel0 = h0 - left;
             double base1d;
             const double *lockedRow = configuration.phaseCompensation
-                ? locked1DSource_line(line) : nullptr;
+                ? combSource1D_line(line) : nullptr;
             if (lockedRow && rel0 >= 0)
             {
                 base1d = lockedRow[rel0];
