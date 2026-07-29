@@ -1138,14 +1138,29 @@ void Comb::FrameBuffer::buildApertureMeans()
         double *apMean = lockedApertureMean_line(line);
         if (!apMean) continue;
         const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
+        // dG-certified luma (user direction, 2026-07-28: "when [lurch] is
+        // finding a luma edge, we have some fields where that's not in
+        // doubt"). Each mean's contract is "that window's LUMA mean
+        // exactly" -- true for stationary carrier, broken by the partial-
+        // window leak at edges. On twin-covered lines raw - exact IS the
+        // luma, so subtracting the exact carrier honours the contract
+        // exactly where it used to fail: lurch edges, the coarse-residual
+        // hull, and the witness coarse all read certified luma there.
+        const float *exRow = exactCarrierRow(line);
+        auto src = [&](int xi) -> double {
+            const double r = (double)rawLine[left + xi];
+            if (exRow) {
+                const float e = exRow[left + xi];
+                if (std::isfinite(e)) return r - (double)e;
+            }
+            return r;
+        };
         if (width >= 4) {
-            double sum4 = (double)rawLine[left + 0] + (double)rawLine[left + 1]
-                        + (double)rawLine[left + 2] + (double)rawLine[left + 3];
+            double sum4 = src(0) + src(1) + src(2) + src(3);
             for (int xi = 0; xi <= lastStart; ++xi) {
                 apMean[xi] = 0.25 * sum4;
                 if (xi < lastStart)
-                    sum4 += (double)rawLine[left + xi + 4]
-                          - (double)rawLine[left + xi];
+                    sum4 += src(xi + 4) - src(xi);
             }
             // Tail: no legal aperture starts here. Hold the last real mean so
             // the buffer stays readable; consumers needing "a real aperture
