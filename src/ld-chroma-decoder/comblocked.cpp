@@ -8415,6 +8415,30 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         }
     }
 
+    // Certified-luma vertical comb for the COMP lines in anchor mode (user,
+    // 2026-07-28: the reform used the certified CARRIER on covered lines and
+    // left the comps with the fit -- "I wonder if the reform of retracted
+    // didn't make full use of the 'real luma' we have available from the
+    // certified fields"). The conservation pair supplies both halves: on
+    // covered lines Lhat = raw - exact is certified luma, CARRIER-FREE, so
+    // a comp line combed against its two certified brackets has no phase
+    // relation to honour at all:
+    //     R = raw_comp - (Lhat_up + Lhat_dn)/2 = C_comp + (L_comp - L_avg)
+    // All shared luma -- the strong lateral structure whose partial-window
+    // leak drives every estimator's error -- cancels EXACTLY; what remains
+    // is the carrier plus only the comp line's own vertical-detail
+    // deviation. The merge's own carrier-band filter (unity at fSC and
+    // +-1.3 MHz, zero at DC/2fSC) then takes the carrier, and the
+    // out-of-band residual |R - BP(R)| is the same honest witness the twin
+    // merge uses: where it is large the bracket assumption failed (real
+    // vertical detail / chroma boundary) and the fit stands for that
+    // sample. This narrows the covered/uncovered quality gap from the comp
+    // side -- the convergent direction -- rather than special-casing
+    // covered lines further.
+    std::vector<double> certComp;
+    if (retractedSource == 3)
+        certComp.assign(width, std::numeric_limits<double>::quiet_NaN());
+
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine =
             rawbuffer.data() + static_cast<size_t>(line) * videoParameters.fieldWidth;
@@ -8427,12 +8451,55 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
         float *retractedRow = carrierRetracted_flat.data()
                               + static_cast<size_t>(line) * demodWidth;
 
-        const float *altRowPub = anchorAltValid
-            ? anchorAltCarrier_flat.data()
-                  + static_cast<size_t>(line) * demodWidth
-            : nullptr;
-        (void)altRowPub;
         const float *exRowPub = exactCarrierRow(line);
+
+        if (retractedSource == 3) {
+            std::fill(certComp.begin(), certComp.end(),
+                      std::numeric_limits<double>::quiet_NaN());
+            const float *exU = (line - 1 >= firstLine)
+                ? exactCarrierRow(line - 1) : nullptr;
+            const float *exD = (line + 1 < lastLine)
+                ? exactCarrierRow(line + 1) : nullptr;
+            if (exU && exD) {
+                const quint16 *rawU = rawbuffer.data()
+                    + static_cast<size_t>(line - 1) * videoParameters.fieldWidth;
+                const quint16 *rawD = rawbuffer.data()
+                    + static_cast<size_t>(line + 1) * videoParameters.fieldWidth;
+                // R = comp composite minus the certified-luma bracket mean.
+                std::vector<double> R(width,
+                    std::numeric_limits<double>::quiet_NaN());
+                for (int xi = 0; xi < width; ++xi) {
+                    const float eu = exU[left + xi];
+                    const float ed = exD[left + xi];
+                    if (!std::isfinite(eu) || !std::isfinite(ed)) continue;
+                    const double lu = (double)rawU[left + xi] - (double)eu;
+                    const double ld = (double)rawD[left + xi] - (double)ed;
+                    R[xi] = (double)rawLine[left + xi] - 0.5 * (lu + ld);
+                }
+                // Merge-identical carrier-band FIR; out-of-band witness.
+                constexpr double kT0 = 0.676462;
+                constexpr double kT2 = -0.250000;
+                constexpr double kT4 = -0.088231;
+                constexpr double kOobIRE = 4.0;
+                const double oobThresh = kOobIRE * irescale;
+                for (int xi = 0; xi < width; ++xi) {
+                    bool ok = true;
+                    double taps[5];
+                    static const int off[5] = { 0, -2, 2, -4, 4 };
+                    for (int k = 0; k < 5 && ok; ++k) {
+                        const int j = std::clamp(xi + off[k], 0, width - 1);
+                        taps[k] = R[j];
+                        if (!std::isfinite(taps[k])) ok = false;
+                    }
+                    if (!ok) continue;
+                    const double bp = kT0 * taps[0] +
+                                      kT2 * (taps[1] + taps[2]) +
+                                      kT4 * (taps[3] + taps[4]);
+                    if (std::fabs(R[xi] - bp) > oobThresh) continue;
+                    certComp[xi] = bp;
+                }
+            }
+        }
 
         for (int xi = 0; xi < width; ++xi) {
             double carrier;
@@ -8444,22 +8511,21 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                 carrier = static_cast<double>(combRowPub[xi]);
                 break;
             case 3: {
-                // CERTIFIED CARRIER, used as itself (user, 2026-07-28:
-                // "we already have a carrier... the merged fields can
-                // cancel to luma or carrier with a sign flip"). On a
-                // twin-covered sample (def - spare)/2 IS the carrier as a
-                // conservation fact -- there is nothing to estimate, scale
-                // or fit. The previous form here multiplied the FIT by a
-                // regression gain against the exact channel, which left
-                // every one of the fit's phase errors intact (a scalar
-                // cannot rotate a phasor) and so left un-subtracted carrier
-                // in Y on saturated colour: the compact-colour checker.
-                // The fit stands only where the side channel is absent.
+                // CERTIFIED CARRIER, used as itself (user: "we already have
+                // a carrier... the merged fields can cancel to luma or
+                // carrier with a sign flip"). Covered sample: (def-spare)/2
+                // IS the carrier, a conservation fact. Comp sample: the
+                // certified-luma vertical comb above, where its out-of-band
+                // witness passed. The fit stands only where neither
+                // certified product exists.
                 const float ex = exRowPub ? exRowPub[left + xi]
                                           : std::numeric_limits<float>::quiet_NaN();
-                carrier = std::isfinite(ex)
-                    ? static_cast<double>(ex)
-                    : static_cast<double>(fitRowPub[xi]);
+                if (std::isfinite(ex))
+                    carrier = static_cast<double>(ex);
+                else if (std::isfinite(certComp[xi]))
+                    carrier = certComp[xi];
+                else
+                    carrier = static_cast<double>(fitRowPub[xi]);
                 break;
             }
             default:
