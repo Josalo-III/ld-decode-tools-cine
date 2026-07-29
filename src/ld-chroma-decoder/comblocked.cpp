@@ -6374,10 +6374,16 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
 
     // Temporal fade is stricter than vertical: the reference is a film
     // frame away, so demand more of its amplitude before trusting its
-    // phase; and the local estimator here is the fit alone, so its
-    // amplitude rides the certified ratio hull.
+    // phase; and the local estimator's amplitude rides the certified
+    // ratio hull.
     constexpr double kTSnapAmpMinIRE = 2.0;
     constexpr double kTSnapAmpTauIRE = 4.0;
+
+    // A/B escape only (LDCD_TEMPORAL_COMB=0); default ON.
+    static const bool temporalComb = []{
+        const char *e = std::getenv("LDCD_TEMPORAL_COMB");
+        return !(e && std::atoi(e) == 0);
+    }();
 
     const auto relSign = [](const CombCarrierGrammar *ga, int h,
                             const CombCarrierGrammar *gb) {
@@ -6439,6 +6445,97 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                       static_cast<double>(retractedRow[xi]);
             out[xi] = std::numeric_limits<double>::quiet_NaN();
         }
+
+        // TEMPORAL CERTIFIED-LUMA COMB (user, 2026-07-29: approved as the
+        // second estimator for the uncovered comp lines -- "giving
+        // uncovered comp lines a real second estimator"). The cadence
+        // geometry makes it DIRECT: the two covered neighbours carry
+        // opposite parities, so every line here has a same-row certified
+        // luma Lhat = raw_nb - exact_nb in exactly one neighbour. Then
+        //     R = raw_this - Lhat_nb = C_this + (L_this - L_nb)
+        // -- the luma error is purely temporal (motion), no vertical
+        // mixing enters at any point. The merge FIR takes the carrier and
+        // the out-of-band residual |R - BP(R)| is the motion witness,
+        // feeding the same confidence alpha as the vertical comb (a
+        // penalty to alpha, never a cutoff).
+        if (temporalComb) {
+            // PARITY LAW: exact consumption must reach both parities
+            // together. A direct-only reference alternates source film
+            // frames line-by-line (even lines from prev, odd from next)
+            // and any motion becomes a LINE-ALTERNATING luma error --
+            // measured +9.4% pillar lineAlt in the v1 build. So every
+            // line's Lhat draws from BOTH neighbours symmetrically:
+            // direct same-line from the parity that covers it, bracket
+            // mean from the other; motion error goes common-mode.
+            std::vector<double> R(width,
+                std::numeric_limits<double>::quiet_NaN());
+            std::vector<double> lhatSum(width, 0.0);
+            std::vector<int> lhatN(width, 0);
+            for (int side = 0; side < 2; ++side) {
+                const FrameBuffer *fb = nb[side];
+                if (!fb) continue;
+                const float *pex0 = fb->exactCarrierRow(line);
+                const float *pexU = (line - 1 >= firstLine)
+                    ? fb->exactCarrierRow(line - 1) : nullptr;
+                const float *pexD = (line + 1 < lastLine)
+                    ? fb->exactCarrierRow(line + 1) : nullptr;
+                const quint16 *rawNb = fb->rawbuffer.data()
+                    + static_cast<size_t>(line) * videoParameters.fieldWidth;
+                const quint16 *rawNbU = fb->rawbuffer.data()
+                    + static_cast<size_t>(std::max(line - 1, 0)) *
+                      videoParameters.fieldWidth;
+                const quint16 *rawNbD = fb->rawbuffer.data()
+                    + static_cast<size_t>(std::min(line + 1,
+                            videoParameters.lastActiveFrameLine - 1)) *
+                      videoParameters.fieldWidth;
+                for (int xi = 0; xi < width; ++xi) {
+                    const int h = left + xi;
+                    if (pex0 && std::isfinite(pex0[h])) {
+                        lhatSum[xi] += static_cast<double>(rawNb[h]) -
+                                       static_cast<double>(pex0[h]);
+                        lhatN[xi] += 1;
+                    } else if (pexU && pexD &&
+                               std::isfinite(pexU[h]) &&
+                               std::isfinite(pexD[h])) {
+                        const double lu = static_cast<double>(rawNbU[h]) -
+                                          static_cast<double>(pexU[h]);
+                        const double ld = static_cast<double>(rawNbD[h]) -
+                                          static_cast<double>(pexD[h]);
+                        lhatSum[xi] += 0.5 * (lu + ld);
+                        lhatN[xi] += 1;
+                    }
+                }
+            }
+            // Both sides or nothing: a one-sided reference re-creates the
+            // frame-source alternation the symmetric build exists to
+            // prevent (stream edges lose the comb, keeping snap-only).
+            const int needSides = (nb[0] && nb[1]) ? 2 : 1;
+            for (int xi = 0; xi < width; ++xi) {
+                if (lhatN[xi] < needSides) continue;
+                R[xi] = static_cast<double>(rawLine[left + xi]) -
+                        lhatSum[xi] / lhatN[xi];
+            }
+            constexpr double kOobTauIRE = 2.0;
+            for (int xi = 0; xi < width; ++xi) {
+                bool ok = true;
+                double taps[5];
+                static const int off[5] = { 0, -2, 2, -4, 4 };
+                for (int k = 0; k < 5 && ok; ++k) {
+                    const int j = std::clamp(xi + off[k], 0, width - 1);
+                    taps[k] = R[j];
+                    if (!std::isfinite(taps[k])) ok = false;
+                }
+                if (!ok) continue;
+                const double bp = 0.676462 * taps[0] +
+                                  -0.250000 * (taps[1] + taps[2]) +
+                                  -0.088231 * (taps[3] + taps[4]);
+                const double res = std::fabs(R[xi] - bp);
+                const double wc = 0.5 + 0.5 * std::exp(
+                    -res / (kOobTauIRE * irescale));
+                est[xi] = wc * bp + (1.0 - wc) * est[xi];
+            }
+        }
+
         ldcdApplyPhaseSnap(est, tAlign, out, width, irescale,
                            kTSnapAmpMinIRE, kTSnapAmpTauIRE, true);
         for (int xi = 0; xi < width; ++xi)
