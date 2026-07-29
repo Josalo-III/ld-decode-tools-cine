@@ -6246,6 +6246,207 @@ void Comb::FrameBuffer::applyLurchSteps(const std::vector<LurchStepRun> &runs,
 // buildCarrierRetractionStage() then performs four-view carrier/Y attribution,
 // line-to-line cancellation on carrierFit, and raw - combedCarrier to produce
 // the flattened carrier-retracted view.
+// Retracted-view mode resolution and the shared working-space phase snap.
+// File-scope because two stages consume them: the load-time retraction
+// build (vertical certified reference, covered frames) and the output-time
+// temporal refinement (two-sided certified reference, uncovered frames).
+static int ldcdRetractedSourceMode()
+{
+    static const int mode = []{
+        const char *s = std::getenv("LDCD_RETRACTED_SOURCE");
+        if (!s)
+            return 3;
+        if (s[0] == 'a')
+            return 3;
+        if (s[0] == 'c')
+            return 0;
+        if (s[0] == 'n')
+            return 1;
+        if (s[0] == 'p')
+            return 2;
+        return 3;
+    }();
+    return mode;
+}
+
+static bool ldcdPhaseSnapOn()
+{
+    static const bool on = []{
+        const char *e = std::getenv("LDCD_PHASE_SNAP");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+static bool ldcdPhaseSnapTemporalOn()
+{
+    static const bool on = []{
+        const char *e = std::getenv("LDCD_PHASE_SNAP_T");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+// Working-space snap: per W=8 window the estimator keeps its amplitude and
+// takes the reference's phase, fading in above the amplitude floor (the
+// phase of a near-zero carrier is meaningless -- a clamp on an
+// impossible). est and out must not alias: windows read est after earlier
+// out writes. clampRatio bounds |est|/|ref| to [0.5, 2.0] -- used when est
+// is the fit alone, whose window amplitude is wild (ratio p10 0.45 / p90
+// 4.1 vs truth): the reference is CERTIFIED carrier, so an estimator
+// amplitude far outside its neighbourhood is estimator failure, not
+// content. A hull on the impossible, not a value substitution.
+static void ldcdApplyPhaseSnap(const std::vector<double> &est,
+                               const std::vector<double> &ref,
+                               std::vector<double> &out,
+                               int width, double irescale,
+                               double ampMinIRE, double ampTauIRE,
+                               bool clampRatio)
+{
+    constexpr int kSnapHalf = 4;            // window [-3,+4], W=8
+    for (int xi = 3; xi < width - kSnapHalf; ++xi) {
+        double eI = 0.0, eQ = 0.0, rI = 0.0, rQ = 0.0;
+        bool ok = true;
+        for (int k = xi - 3; k <= xi + kSnapHalf && ok; ++k) {
+            const double b = ref[k];
+            if (!std::isfinite(b)) { ok = false; break; }
+            static const int cB[4] = { 1, 0, -1, 0 };
+            static const int sB[4] = { 0, 1, 0, -1 };
+            const int ph = k & 3;
+            eI += est[k] * cB[ph]; eQ += est[k] * sB[ph];
+            rI += b * cB[ph];      rQ += b * sB[ph];
+        }
+        if (!ok) continue;
+        // I/Q sums over W=8 carry ~4x the waveform amplitude; 0.25
+        // normalizes for the IRE thresholds. The ratio needs no
+        // normalization.
+        const double aRefRaw = std::hypot(rI, rQ);
+        const double aRef = aRefRaw * 0.25;
+        if (aRef < ampMinIRE * irescale) continue;
+        const double aEstRaw = std::hypot(eI, eQ);
+        double ratio = aEstRaw / aRefRaw;
+        if (clampRatio) ratio = std::clamp(ratio, 0.5, 2.0);
+        const double snapped = ratio * ref[xi];
+        // Ramp from the floor, continuous at it -- a step in a blend
+        // weight is a contour.
+        const double sf = 1.0 - std::exp(
+            -(aRef - ampMinIRE * irescale) /
+             (ampTauIRE * irescale));
+        out[xi] = sf * snapped + (1.0 - sf) * est[xi];
+    }
+    for (int xi = 0; xi < width; ++xi)
+        if (!std::isfinite(out[xi]))
+            out[xi] = est[xi];
+}
+
+// TEMPORAL PHASE INTERPOLATION for uncovered frames (user, 2026-07-29:
+// "if we're correcting phase every other frame the other frames should
+// come along by an interpolated amount; phase has a slow enough rate
+// change that we should be getting close with that"). The uncovered half
+// of the stream is where the fit stands alone -- the frames the vertical
+// certified snap never reached. Runs at current-time with BOTH temporal
+// neighbours loaded: each covered neighbour contributes a sign-aligned
+// reference (direct same-line where its parity covers it, bracket mean
+// otherwise; grammar relations are exact cross-frame from absolute
+// fieldPhaseIDs), and their mean IS the interpolation. Amplitude stays
+// local; only PHASE transfers, the coordinate that survives content
+// change best. Escapes: inert under LDCD_PHASE_SNAP=0 or
+// LDCD_PHASE_SNAP_T=0.
+void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
+                                                const FrameBuffer *nextF)
+{
+    if (!carrierRetractedValid) return;
+    if (ldcdRetractedSourceMode() != 3) return;
+    if (!ldcdPhaseSnapOn() || !ldcdPhaseSnapTemporalOn()) return;
+    if (frameHasExactCoverage()) return;
+    const FrameBuffer *nb[2] = {
+        (prevF && prevF->frameHasExactCoverage()) ? prevF : nullptr,
+        (nextF && nextF->frameHasExactCoverage()) ? nextF : nullptr,
+    };
+    if (!nb[0] && !nb[1]) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+    if (width <= 0) return;
+
+    // Temporal fade is stricter than vertical: the reference is a film
+    // frame away, so demand more of its amplitude before trusting its
+    // phase; and the local estimator here is the fit alone, so its
+    // amplitude rides the certified ratio hull.
+    constexpr double kTSnapAmpMinIRE = 2.0;
+    constexpr double kTSnapAmpTauIRE = 4.0;
+
+    const auto relSign = [](const CombCarrierGrammar *ga, int h,
+                            const CombCarrierGrammar *gb) {
+        if (!ga || !gb) return 0.0;
+        const auto r =
+            lddecode::carrierGrammarSignedPhaseRelation(ga, h, gb, h);
+        if (r == lddecode::CarrierPhaseRelation::Opposite) return -1.0;
+        if (r == lddecode::CarrierPhaseRelation::Same) return 1.0;
+        return 0.0;
+    };
+
+    std::vector<double> tAlign(width), est(width), out(width);
+    for (int line = firstLine; line < lastLine; ++line) {
+        const quint16 *rawLine = rawbuffer.data()
+            + static_cast<size_t>(line) * videoParameters.fieldWidth;
+        float *retractedRow = carrierRetracted_flat.data()
+            + static_cast<size_t>(line) * demodWidth;
+        const CombCarrierGrammar *gC = carrierGrammarLine(line);
+
+        std::fill(tAlign.begin(), tAlign.end(),
+                  std::numeric_limits<double>::quiet_NaN());
+        for (int side = 0; side < 2; ++side) {
+            const FrameBuffer *fb = nb[side];
+            if (!fb) continue;
+            const float *pex0 = fb->exactCarrierRow(line);
+            const float *pexU = (line - 1 >= firstLine)
+                ? fb->exactCarrierRow(line - 1) : nullptr;
+            const float *pexD = (line + 1 < lastLine)
+                ? fb->exactCarrierRow(line + 1) : nullptr;
+            const CombCarrierGrammar *pg0 = fb->carrierGrammarLine(line);
+            const CombCarrierGrammar *pgU = fb->carrierGrammarLine(line - 1);
+            const CombCarrierGrammar *pgD = fb->carrierGrammarLine(line + 1);
+            for (int xi = 0; xi < width; ++xi) {
+                const int h = left + xi;
+                double ref = std::numeric_limits<double>::quiet_NaN();
+                if (pex0 && std::isfinite(pex0[h])) {
+                    const double s0 = relSign(gC, h, pg0);
+                    if (s0 != 0.0)
+                        ref = s0 * static_cast<double>(pex0[h]);
+                }
+                if (!std::isfinite(ref) && pexU && pexD &&
+                    std::isfinite(pexU[h]) && std::isfinite(pexD[h])) {
+                    const double sU = relSign(gC, h, pgU);
+                    const double sD = relSign(gC, h, pgD);
+                    if (sU != 0.0 && sD != 0.0)
+                        ref = 0.5 * (sU * static_cast<double>(pexU[h]) +
+                                     sD * static_cast<double>(pexD[h]));
+                }
+                if (!std::isfinite(ref)) continue;
+                // Mean of available neighbour references = the
+                // interpolation (one-sided hold at stream edges).
+                tAlign[xi] = std::isfinite(tAlign[xi])
+                    ? 0.5 * (tAlign[xi] + ref) : ref;
+            }
+        }
+
+        for (int xi = 0; xi < width; ++xi) {
+            est[xi] = static_cast<double>(rawLine[left + xi]) -
+                      static_cast<double>(retractedRow[xi]);
+            out[xi] = std::numeric_limits<double>::quiet_NaN();
+        }
+        ldcdApplyPhaseSnap(est, tAlign, out, width, irescale,
+                           kTSnapAmpMinIRE, kTSnapAmpTauIRE, true);
+        for (int xi = 0; xi < width; ++xi)
+            retractedRow[xi] = static_cast<float>(
+                static_cast<double>(rawLine[left + xi]) - out[xi]);
+    }
+}
+
 void Comb::FrameBuffer::buildCarrierRetracted()
 {
     buildCarrierRetractionStage(false);
@@ -8296,20 +8497,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     //       the fit, i.e. exactly the old default.
     //   native (LDCD_RETRACTED_SOURCE=native) -- raw - carrierFit
     //       everywhere: the pre-anchor default, kept as the A/B escape.
-    static const int retractedSource = []{
-        const char *s = std::getenv("LDCD_RETRACTED_SOURCE");
-        if (!s)
-            return 3;
-        if (s[0] == 'a')
-            return 3;
-        if (s[0] == 'c')
-            return 0;
-        if (s[0] == 'n')
-            return 1;
-        if (s[0] == 'p')
-            return 2;
-        return 3;
-    }();
+    const int retractedSource = ldcdRetractedSourceMode();
 
     // Certified-luma vertical comb for the COMP lines in anchor mode (user,
     // 2026-07-28: the reform used the certified CARRIER on covered lines and
@@ -8362,6 +8550,21 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
     std::vector<double> certBpDbg;  // BP(R) BEFORE the witness, diag only
     if (dumpRlad)
         certBpDbg.assign(width, std::numeric_limits<double>::quiet_NaN());
+
+    // Escapes for A/B only, both default ON:
+    //   LDCD_OOB_ALPHA=0  -- restore the binary OOB cut
+    //   LDCD_PHASE_SNAP=0 -- disable the working-space snap
+    static const bool oobAlpha = []{
+        const char *e = std::getenv("LDCD_OOB_ALPHA");
+        return !(e && std::atoi(e) == 0);
+    }();
+    const bool phaseSnap = ldcdPhaseSnapOn();
+    // The phase reference was validated at >=2 IRE (vertical coherence
+    // 0.907); below that its phase is noise and snapping toward it costs
+    // Y (measured: fading from 0.25 IRE gave back the alpha reform's D2
+    // win).
+    constexpr double kSnapAmpTauIRE = 3.0;
+    constexpr double kSnapAmpMinIRE = 1.0;
 
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine =
@@ -8441,18 +8644,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                     resV[xi] = std::fabs(R[xi] - bp);
                 }
 
-                // Escapes for A/B only, both default ON:
-                //   LDCD_OOB_ALPHA=0  -- restore the binary cut
-                //   LDCD_PHASE_SNAP=0 -- disable the working-space snap
-                static const bool oobAlpha = []{
-                    const char *e = std::getenv("LDCD_OOB_ALPHA");
-                    return !(e && std::atoi(e) == 0);
-                }();
-                static const bool phaseSnap = []{
-                    const char *e = std::getenv("LDCD_PHASE_SNAP");
-                    return !(e && std::atoi(e) == 0);
-                }();
-
                 // Confidence-alpha merge of the two comp-line estimators.
                 std::vector<double> est(width);
                 for (int xi = 0; xi < width; ++xi) {
@@ -8518,44 +8709,10 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly)
                                                 sD * (double)ed);
                         }
                     }
-                    constexpr int kSnapHalf = 4;        // window [-3,+4], W=8
-                    // The phase reference was validated at >=2 IRE (vertical
-                    // coherence 0.907); below that the bracket's phase is
-                    // noise and snapping toward it costs Y (measured: fade
-                    // from 0.25 IRE gave back the alpha reform's D2 win).
-                    constexpr double kSnapAmpTauIRE = 3.0;
-                    constexpr double kSnapAmpMinIRE = 1.0;
-                    for (int xi = 3; xi < width - kSnapHalf; ++xi) {
-                        double eI = 0.0, eQ = 0.0, rI = 0.0, rQ = 0.0;
-                        bool ok = true;
-                        for (int k = xi - 3; k <= xi + kSnapHalf && ok; ++k) {
-                            const double b = bAlign[k];
-                            if (!std::isfinite(b)) { ok = false; break; }
-                            static const int cB[4] = { 1, 0, -1, 0 };
-                            static const int sB[4] = { 0, 1, 0, -1 };
-                            const int ph = k & 3;
-                            eI += est[k] * cB[ph]; eQ += est[k] * sB[ph];
-                            rI += b * cB[ph];      rQ += b * sB[ph];
-                        }
-                        if (!ok) continue;
-                        // I/Q sums over W=8 carry ~4x the waveform
-                        // amplitude; 0.25 normalizes for the IRE
-                        // thresholds. The ratio needs no normalization.
-                        const double aRefRaw = std::hypot(rI, rQ);
-                        const double aRef = aRefRaw * 0.25;
-                        if (aRef < kSnapAmpMinIRE * irescale) continue;
-                        const double aEstRaw = std::hypot(eI, eQ);
-                        const double snapped = (aEstRaw / aRefRaw) * bAlign[xi];
-                        // Ramp from the floor, continuous at it -- a step in
-                        // a blend weight is a contour.
-                        const double sf = 1.0 - std::exp(
-                            -(aRef - kSnapAmpMinIRE * irescale) /
-                             (kSnapAmpTauIRE * irescale));
-                        certComp[xi] = sf * snapped + (1.0 - sf) * est[xi];
-                    }
-                    for (int xi = 0; xi < width; ++xi)
-                        if (!std::isfinite(certComp[xi]))
-                            certComp[xi] = est[xi];
+                    ldcdApplyPhaseSnap(est, bAlign, certComp,
+                                       width, irescale,
+                                       kSnapAmpMinIRE, kSnapAmpTauIRE,
+                                       false);
                 } else {
                     for (int xi = 0; xi < width; ++xi)
                         certComp[xi] = est[xi];

@@ -446,6 +446,8 @@ public:
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
 	void buildCarrierRetracted();
+	void refineRetractedTemporal(const FrameBuffer *prevF,
+	                             const FrameBuffer *nextF);
 	void outputDiagnosticFrame();
 
 	void lurchSharpenCoarsePrior(const double *means,

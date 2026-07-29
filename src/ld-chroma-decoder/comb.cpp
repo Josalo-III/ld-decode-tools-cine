@@ -289,6 +289,16 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                                          configuration.diagnosticOnly());
         current->setComponentFrame(componentFrames[frameIndex]);
 
+        // Two-sided temporal phase interpolation for UNCOVERED frames'
+        // retracted view: possible only here, once both temporal
+        // neighbours are loaded (the retracted consumers -- produceY and
+        // the diagnostic output -- all run at current-time, so refining
+        // now is safe by construction).
+        if (configuration.phaseCompensation && configuration.lumaWitness)
+            current->refineRetractedTemporal(
+                previous->holdsRealFrame() ? previous.get() : nullptr,
+                next->holdsRealFrame() ? next.get() : nullptr);
+
         // Diagnostic fast path: witness/carrier analysis is complete before
         // the comb/election render stages below. Publish the selected signal
         // directly as monochrome output and skip the normal render path.
