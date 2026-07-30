@@ -357,6 +357,30 @@ int main(int argc, char* argv[])
         "Manual cadence override as fieldStart-fieldEnd:cadenceId, using field numbers as shown by ld-analyse. May be repeated. cadenceId is the first field's cadenceId; known IDs advance through the NTSC cadence sequence.",
         "override");
 
+    QCommandLineOption dgProbeOpt(
+        QStringList() << "dg-probe",
+        "Instrument: dump the per-pair dG twin measurement for every same-parity d=2 pair in a field range, as CSV on stdout. Range spec is fieldStart-fieldEnd. Read-only: no solve, no metadata write.",
+        "range");
+
+    QCommandLineOption dgFloorOpt(
+        QStringList() << "dg-floor",
+        "Instrument: measure the disc's own twin/noise floor and report it. Value is an optional comma-separated list of field ranges (a-b,c-d) whose duty is then reported at both operating points; pass 'none' for calibration only. Read-only: no solve, no metadata write.",
+        "ranges");
+
+    QCommandLineOption combAxesOpt(
+        QStringList() << "comb-axes",
+        "Instrument: per-frame comb measured within the frame and across the frame boundary, as CSV. Range spec is fieldStart-fieldEnd. Separates real inter-field motion from vertical image detail. Read-only.",
+        "range");
+
+    QCommandLineOption benchCombOpt(
+        QStringList() << "bench-comb",
+        "Instrument: relative cost of notch vs lips over identical frames. Range spec is fieldStart-fieldEnd.",
+        "range");
+
+    parser.addOption(benchCombOpt);
+    parser.addOption(combAxesOpt);
+    parser.addOption(dgFloorOpt);
+    parser.addOption(dgProbeOpt);
     parser.addOption(reverseOpt);
     parser.addOption(cineOpt);
     parser.addOption(tvOpt);
@@ -430,6 +454,72 @@ int main(int argc, char* argv[])
     if (!disc) {
         qCritical("Error: failed to load disc metadata.");
         return 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // --dg-floor / --dg-probe: read-only instruments, run before any mode and exit
+    // -------------------------------------------------------------------------
+    if (parser.isSet(benchCombOpt)) {
+        const auto parts = parser.value(benchCombOpt).split('-', Qt::SkipEmptyParts);
+        bool okA = false, okB = false;
+        const int startField = (parts.size() == 2) ? parts.at(0).toInt(&okA) : 0;
+        const int endField   = (parts.size() == 2) ? parts.at(1).toInt(&okB) : 0;
+        if (!okA || !okB || startField < 1 || endField <= startField) {
+            qCritical("Error: --bench-comb expects fieldStart-fieldEnd");
+            return 1;
+        }
+
+        CineMap solver(disc.get(), policy);
+        return solver.benchComb(disc->getTbcPath(), startField, endField) > 0 ? 0 : 1;
+    }
+
+    if (parser.isSet(combAxesOpt)) {
+        const auto parts = parser.value(combAxesOpt).split('-', Qt::SkipEmptyParts);
+        bool okA = false, okB = false;
+        const int startField = (parts.size() == 2) ? parts.at(0).toInt(&okA) : 0;
+        const int endField   = (parts.size() == 2) ? parts.at(1).toInt(&okB) : 0;
+        if (!okA || !okB || startField < 1 || endField <= startField) {
+            qCritical("Error: --comb-axes expects fieldStart-fieldEnd");
+            return 1;
+        }
+
+        CineMap solver(disc.get(), policy);
+        solver.setDecisionTraceEnabled(decisionTraceEnabled);
+        const int rows = solver.probeCombAxes(disc->getTbcPath(), startField, endField);
+        return rows > 0 ? 0 : 1;
+    }
+
+    if (parser.isSet(dgFloorOpt)) {
+        QString ranges = parser.value(dgFloorOpt);
+        if (ranges.compare("none", Qt::CaseInsensitive) == 0) ranges.clear();
+
+        CineMap solver(disc.get(), policy);
+        solver.setDecisionTraceEnabled(decisionTraceEnabled);
+        const int ok = solver.probeDgFloor(disc->getTbcPath(), ranges);
+        return ok > 0 ? 0 : 1;
+    }
+
+    if (parser.isSet(dgProbeOpt)) {
+        const QString spec = parser.value(dgProbeOpt);
+        const auto parts = spec.split('-', Qt::SkipEmptyParts);
+        if (parts.size() != 2) {
+            qCritical("Error: --dg-probe expects fieldStart-fieldEnd");
+            return 1;
+        }
+        bool okA = false, okB = false;
+        const int startField = parts.at(0).toInt(&okA);
+        const int endField   = parts.at(1).toInt(&okB);
+        if (!okA || !okB || startField < 1 || endField <= startField) {
+            qCritical("Error: --dg-probe range is not a valid ascending field range");
+            return 1;
+        }
+
+        CineMap solver(disc.get(), policy);
+        solver.setDecisionTraceEnabled(decisionTraceEnabled);
+        const int rows = solver.probeDgRange(disc->getTbcPath(), startField, endField);
+        qInfo().noquote() << QString("dG probe emitted %1 pair(s) over fields [%2..%3].")
+                             .arg(rows).arg(startField).arg(endField);
+        return rows > 0 ? 0 : 1;
     }
 
     if (!parser.isSet(overrideOnlyOpt)) {

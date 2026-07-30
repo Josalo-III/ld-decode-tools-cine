@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <QElapsedTimer>
 #include <limits>
 #include <optional>
 #include "tbc/logging.h"
@@ -188,8 +190,14 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
             PhaseRun run = solveSegment(sv, segStart, segEnd, cache, mixedness);
 
             if (run.type != PhaseRun::Type::Pulldown32) {
-                classifyAsInterlaced(segStart, segEnd, mixedness);
-                classifyAsProgressive(segStart, segEnd, mixedness);
+                // Failing to lock a phase is not evidence of video. Ask the twin
+                // census to positively rule film out before writing either video
+                // sentinel; where it cannot, leave the span unknown for the healer
+                // to bridge, which is what "solve in the dark" is for.
+                if (filmRuledOut(sv, segStart, segEnd)) {
+                    classifyAsInterlaced(segStart, segEnd, mixedness);
+                    classifyAsProgressive(segStart, segEnd, mixedness);
+                }
             }
 
             solvedSegments.push_back({segStart, segEnd, run, mixedness});
@@ -354,8 +362,16 @@ double CineMap::scoreSpecificPhase(const std::vector<FrameMixedness>& mixed, int
     double avgMixed = (mixedCount > 0) ? (mixedSum / mixedCount) : 0.0;
     double avgClean = (cleanCount > 0) ? (cleanSum / cleanCount) : 0.0;
 
-    // Returns Contrast. Positive = good fit.
-    return (avgMixed - avgClean);
+    // Normalised contrast in [-1, 1]. Positive = good fit.
+    //
+    // This was a raw difference, which silently carried the units of whatever metric
+    // fed it — so the healer's fixed acceptance bar meant one thing under notch and
+    // something else entirely under lips. As a ratio it means the same thing under
+    // any metric: the share of the total that separates the expected-mixed positions
+    // from the expected-clean ones. A perfect 3:2 fit approaches 1, a wrong phase 0.
+    const double total = avgMixed + avgClean;
+    if (total <= 1e-9) return 0.0;
+    return (avgMixed - avgClean) / total;
 }
 
 void CineMap::computeLumaLine_Bucket(const uint16_t* rawLine,
@@ -997,9 +1013,11 @@ void CineMap::solveCavFallback(SourceVideo& sv)
 // 2 in 5 pulldown/mixed frame detection
 
 // We try to provide the solver with the location of the AB and BC frames using two field comparisons
-// We create a per-frame mixedness score from these and compare the scores, 
-// seeking a 2-high, 3-low pattern. Notch is the cheap default, if we get the pattern, we're done
-// else the more expensive Lips test is run, which is additive with Notch for mixedness 
+// We create a per-frame mixedness score from these and compare the scores,
+// seeking a 2-high, 3-low pattern. Lips owns that score: it masks the image's own
+// vertical detail per pixel, so it answers "does this frame comb" rather than "does
+// this frame have vertical structure". Notch is retained for instruments only — it
+// has no production caller, and measured, it was also the SLOWER of the two.
 
 double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width, int height) const
 {
@@ -1192,15 +1210,22 @@ CineMap::computeFrameMixedness(SourceVideo& sv, int segStart, int segEnd)
     int endFrame   = frameIndexForField(segEnd);
     if (startFrame < 0 || endFrame < 0) return results;
 
-    tbcDebugStream() << "  Computing mixedness (Notch && Lips) for frames"
+    tbcDebugStream() << "  Computing mixedness (Lips) for frames"
              << startFrame << "-" << endFrame;
 
-    // Tunables for combining Notch and Lips
-    const double NOTCH_LOW_FLOOR   = 0.01;  // below this: essentially no comb
-    const double NOTCH_HELP_BEGIN  = 0.02;  // start letting Lips help
-    const double NOTCH_HELP_END    = 0.10;  // above this: Notch is strong enough alone
-    const double LIPS_WEIGHT       = 1.0;   // how strongly Lips adds when in help region
-
+    // Lips owns mixedness.
+    //
+    // It masks the image's own vertical detail per pixel — metric = temporalDiff -
+    // max(spatialDetail, noiseFloor), accumulated only where positive — so it answers
+    // "does this frame comb" rather than "does this frame have vertical structure".
+    // A detailed progressive frame reads ~zero here where notch read whatever its
+    // edges amounted to, which is what used to paint such shots as 59.94i.
+    //
+    // Notch previously ran first as a cheap prefilter, consulting lips only in a
+    // middle band and skipping it entirely once notch exceeded 0.10 — i.e. bypassing
+    // the detail mask in exactly the case where detail was the likely cause of the
+    // large reading. Measured, lips is also the CHEAPER operator (0.69-0.84x notch
+    // over three discs), so the tiering cost accuracy and bought nothing.
     for (int fi = startFrame; fi <= endFrame; ++fi) {
         if (m_disc->isPadded(fi)) continue;
 
@@ -1208,32 +1233,8 @@ CineMap::computeFrameMixedness(SourceVideo& sv, int segStart, int segEnd)
         int f2 = m_disc->getSecondFieldNumber(fi + 1);
         if (f1 < 1 || f2 < 1) continue;
 
-        // 1. Base mixedness from Notch (general‑purpose comb detector)
-        double notch = calculateNotchScore(sv, f1, f2,
-                                           vp.fieldWidth, vp.fieldHeight);
-
-        double score = 0.0;
-
-        if (notch <= NOTCH_LOW_FLOOR) {
-            // Below the low floor, we treat this frame as effectively clean
-            // from a mixedness perspective. No Lips call here.
-            score = notch;
-        } else if (notch >= NOTCH_HELP_END) {
-            // Strong Notch signal: accept as is, no Lips needed.
-            score = notch;
-        } else {
-            // Middle band: Notch sees *something*, but not decisively.
-            // Call Lips and add its contribution on top of Notch.
-            double lips = calculateLipsScore(sv, f1, f2,
-                                             vp.fieldWidth, vp.fieldHeight);
-
-            // "AND" flavour: Lips can't resurrect a dead frame (since we are
-            // only here when Notch>NOTCH_LOW_FLOOR), but it can *boost*
-            // frames where Notch is modest.
-            score = notch + LIPS_WEIGHT * lips;
-        }
-
-        results.push_back({fi, score});
+        results.push_back({fi,
+            calculateLipsScore(sv, f1, f2, vp.fieldWidth, vp.fieldHeight)});
     }
 
     return results;
@@ -1445,8 +1446,9 @@ void CineMap::collectClvTwinPairsFromMixedness(
     if (!m_disc || !m_md) return;
     if (mixed.size() < 2) return;
 
-    // threshold choice can be tuned; this just finds "clearly mixed" frames
-    constexpr double THRESH_MIXED = 0.03;
+    // "Clearly mixed" frames. Same per-frame comb question the classifiers ask, so
+    // it reads the same constant rather than carrying its own notch-scaled one.
+    constexpr double THRESH_MIXED = LIPS_COMB;
 
     const int nFrames = m_disc->getNumberOfFrames();
 
@@ -1562,29 +1564,570 @@ double CineMap::dgDiffIre(SourceVideo& sv, int seqA, int seqB, int width, int he
     return result;
 }
 
-double CineMap::demodTwinDiffCached(SourceVideo& sv, int seq1, int seq2, int width, int height)
+const CineMap::TwinDemod& CineMap::demodTwinCached(SourceVideo& sv, int seq1, int seq2, int width, int height)
 {
-    if (!m_md) return 1000.0;
-    if (seq1 < 1 || seq2 < 1) return 1000.0;
+    static const TwinDemod invalid{};
+
+    if (!m_md) return invalid;
+    if (seq1 < 1 || seq2 < 1) return invalid;
 
     TwinDemodCacheKey key{ std::min(seq1, seq2), std::max(seq1, seq2) };
 
     auto it = m_twinDemodCache.find(key);
     if (it != m_twinDemodCache.end()) return it->second;
 
-    double d = calculateDemodulatedFieldDiff(sv, key.a, key.b, width, height);
-    m_twinDemodCache.emplace(key, d);
-    return d;
+    TwinDemod d = calculateDemodulatedFieldDiff(sv, key.a, key.b, width, height);
+    return m_twinDemodCache.emplace(key, d).first->second;
 }
 
-double CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, int width, int height)
+double CineMap::demodTwinDiffCached(SourceVideo& sv, int seq1, int seq2, int width, int height)
 {
-    if (!m_md || f1 < 1 || f2 < 1 || width <= 0 || height <= 0) return 1000.0;
+    return demodTwinCached(sv, seq1, seq2, width, height).grainIre;
+}
+
+int CineMap::benchComb(const QString& tbcFilePath, int startField, int endField)
+{
+    if (!m_md || !m_disc) return 0;
+
+    SourceVideo sv;
+    if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) {
+        qWarning() << "Failed to open TBC file";
+        return 0;
+    }
+
+    const auto& vp = m_md->getVideoParameters();
+    const int startFrame = frameIndexForField(startField);
+    const int endFrame   = frameIndexForField(endField);
+    if (startFrame < 0 || endFrame < 0) return 0;
+
+    // Collect the frames first so both operators see exactly the same work.
+    std::vector<std::pair<int,int>> frames;
+    for (int fi = startFrame; fi < endFrame; ++fi) {
+        if (m_disc->isPadded(fi)) continue;
+        const int f1 = m_disc->getFirstFieldNumber(fi + 1);
+        const int f2 = m_disc->getSecondFieldNumber(fi + 1);
+        if (f1 < 1 || f2 < 1) continue;
+        frames.emplace_back(f1, f2);
+    }
+    if (frames.empty()) return 0;
+
+    // SourceVideo caches fields (QCache, maxCost 100), so whichever operator ran
+    // first would otherwise absorb all the field I/O and look slow. Warm the cache
+    // first, and keep the frame count inside the cache so neither pass pays eviction.
+    const size_t maxFrames = 45;   // 90 fields, under the 100-field cache
+    if (frames.size() > maxFrames) frames.resize(maxFrames);
+    for (const auto& fr : frames) {
+        (void)sv.getVideoField(fr.first);
+        (void)sv.getVideoField(fr.second);
+    }
+
+    // Two timed passes over identical work, plus a repeat to expose run-to-run noise.
+    QElapsedTimer t;
+    double notchNs = 0.0, lipsNs = 0.0;
+    constexpr int REPS = 3;
+
+    for (int rep = 0; rep < REPS; ++rep) {
+        t.start();
+        for (const auto& fr : frames)
+            (void)calculateNotchScore(sv, fr.first, fr.second, vp.fieldWidth, vp.fieldHeight);
+        notchNs += t.nsecsElapsed();
+
+        t.start();
+        for (const auto& fr : frames)
+            (void)calculateLipsScore(sv, fr.first, fr.second, vp.fieldWidth, vp.fieldHeight);
+        lipsNs += t.nsecsElapsed();
+    }
+
+    const double n = static_cast<double>(frames.size()) * REPS;
+    const double notchUs = notchNs / n / 1000.0;
+    const double lipsUs  = lipsNs  / n / 1000.0;
+
+    printf("frames=%d reps=%d (field cache warm)\n"
+           "notch  %8.1f us/frame\n"
+           "lips   %8.1f us/frame\n"
+           "ratio  %8.2fx  (lips / notch)\n",
+           static_cast<int>(frames.size()), REPS, notchUs, lipsUs,
+           (notchUs > 0.0) ? (lipsUs / notchUs) : 0.0);
+
+    // Cold-cache cost of the field reads alone, for scale: this is what BOTH
+    // operators sit on top of, and it is paid once per field regardless of which
+    // one runs, so it dilutes any compute-side difference between them.
+    sv.close();
+    SourceVideo sv2;
+    if (sv2.open(tbcFilePath, m_disc->getVideoFieldLength())) {
+        t.start();
+        for (const auto& fr : frames) {
+            (void)sv2.getVideoField(fr.first);
+            (void)sv2.getVideoField(fr.second);
+        }
+        const double ioUs = t.nsecsElapsed() / static_cast<double>(frames.size()) / 1000.0;
+        printf("field I/O %7.1f us/frame (2 fields, cold)\n", ioUs);
+        printf("  => notch+I/O %.1f us, lips+I/O %.1f us, effective ratio %.2fx\n",
+               notchUs + ioUs, lipsUs + ioUs,
+               (notchUs + ioUs > 0.0) ? ((lipsUs + ioUs) / (notchUs + ioUs)) : 0.0);
+    }
+
+    fflush(stdout);
+    return 1;
+}
+
+int CineMap::probeCombAxes(const QString& tbcFilePath, int startField, int endField)
+{
+    if (!m_md || !m_disc) return 0;
+
+    SourceVideo sv;
+    if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) {
+        qWarning() << "Failed to open TBC file";
+        return 0;
+    }
+
+    const auto& vp = m_md->getVideoParameters();
+
+    int startFrame = frameIndexForField(startField);
+    int endFrame   = frameIndexForField(endField);
+    if (startFrame < 0 || endFrame < 0) return 0;
+
+    // lips alongside notch: lips already discounts the image's own vertical detail
+    // per-pixel (metric = temporalDiff - max(spatialDetail, noiseFloor), accumulated
+    // only where positive), so it is the sparse operator for this axis while notch is
+    // the dense one. computeFrameMixedness skips lips whenever notch >= 0.10 on the
+    // assumption that a large notch is self-evident — the case this column tests.
+    printf("frame,f1,f2,cad,notchWithin,notchAcross,ratio,lipsWithin,lipsAcross\n");
+
+    int rows = 0;
+    for (int fi = startFrame; fi < endFrame; ++fi) {
+        if (m_disc->isPadded(fi) || m_disc->isPadded(fi + 1)) continue;
+
+        const int f1 = m_disc->getFirstFieldNumber(fi + 1);
+        const int f2 = m_disc->getSecondFieldNumber(fi + 1);
+        const int n1 = m_disc->getFirstFieldNumber(fi + 2);
+        if (f1 < 1 || f2 < 1 || n1 < 1) continue;
+
+        const double within = calculateNotchScore(sv, f1, f2, vp.fieldWidth, vp.fieldHeight);
+        const double across = calculateNotchScore(sv, n1, f2, vp.fieldWidth, vp.fieldHeight);
+        const double lipsW  = calculateLipsScore(sv, f1, f2, vp.fieldWidth, vp.fieldHeight);
+        const double lipsA  = calculateLipsScore(sv, n1, f2, vp.fieldWidth, vp.fieldHeight);
+
+        printf("%d,%d,%d,%d,%.5f,%.5f,%.4f,%.5f,%.5f\n",
+               fi, f1, f2, m_md->getField(f1).cinemap.cadenceId,
+               within, across,
+               (across > 1e-9) ? (within / across) : 0.0,
+               lipsW, lipsA);
+        rows++;
+    }
+
+    fflush(stdout);
+    return rows;
+}
+
+const CineMap::NoiseFloor& CineMap::calibrateTwinFloor(SourceVideo& sv)
+{
+    if (m_noiseFloor.valid || !m_md || !m_disc) return m_noiseFloor;
+
+    const auto& vp = m_md->getVideoParameters();
+    const int hardMax = computeHardMaxField();
+    if (hardMax < 8) return m_noiseFloor;
+
+    // Blocks of consecutive pairs, spread evenly. Consecutive pairs within a block
+    // share fields, so a block costs far less than its pair count suggests, and a
+    // block is what gives floor-sitting content a chance to show itself: a telecined
+    // block contains ~1 twin per 5 frames, a static block is all floor, a block of
+    // pure motion contains none and reports its own level instead.
+    constexpr int WANT_BLOCKS = 48;
+    constexpr int BLOCK_PAIRS = 16;
+
+    const int stride = std::max(BLOCK_PAIRS + 2, (hardMax - 2) / WANT_BLOCKS);
+
+    std::vector<double> blockMin;
+    blockMin.reserve(WANT_BLOCKS);
+    int pairsMeasured = 0;
+
+    for (int start = 1; start + 2 <= hardMax; start += stride) {
+        double lo = std::numeric_limits<double>::max();
+
+        for (int a = start; a < start + BLOCK_PAIRS && a + 2 <= hardMax; ++a) {
+            const int b = a + 2;
+
+            auto fa = m_md->getField(a);
+            auto fb = m_md->getField(b);
+            if (fa.pad || fb.pad) continue;
+            if (fa.isFirstField != fb.isFirstField) continue;
+            if (boundaryBetween(a, b)) continue;
+
+            const TwinDemod m = demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+            if (!m.valid) continue;
+
+            pairsMeasured++;
+            if (m.grainIre < lo) lo = m.grainIre;
+        }
+
+        if (lo < std::numeric_limits<double>::max()) blockMin.push_back(lo);
+    }
+
+    if (blockMin.size() < 8) return m_noiseFloor;
+
+    std::sort(blockMin.begin(), blockMin.end());
+    auto pct = [&](double p) {
+        const size_t k = static_cast<size_t>(std::llround(p * (blockMin.size() - 1)));
+        return blockMin[std::min(k, blockMin.size() - 1)];
+    };
+
+    m_noiseFloor.blocks = static_cast<int>(blockMin.size());
+    m_noiseFloor.pairs  = pairsMeasured;
+    m_noiseFloor.p10    = pct(0.10);
+    m_noiseFloor.p25    = pct(0.25);
+    m_noiseFloor.median = pct(0.50);
+    m_noiseFloor.ire    = m_noiseFloor.p10;
+
+    int agree = 0;
+    for (double v : blockMin) {
+        if (v >= m_noiseFloor.ire * 0.8 && v <= m_noiseFloor.ire * 1.2) agree++;
+    }
+    m_noiseFloor.concentration = static_cast<double>(agree) / blockMin.size();
+
+    // bPSNR cross-check only. Recorded so a wildly-off calibration is visible; it
+    // must never scale the floor (measured to make the estimate worse).
+    const double black = (vp.black16bIre > 0) ? vp.black16bIre : 0.0;
+    const double white = (vp.white16bIre > black) ? vp.white16bIre : 65535.0;
+    double bp = 0.0;
+    int bpN = 0;
+    for (int f = 1; f <= hardMax; f += std::max(1, hardMax / 400)) {
+        const double v = m_md->getFieldVitsMetrics(f).bPSNR;
+        if (v > 0.1) { bp += v; bpN++; }
+    }
+    if (bpN > 0) {
+        m_noiseFloor.bpsnrIre = (65535.0 / std::pow(10.0, (bp / bpN) / 20.0))
+                              * (100.0 / (white - black));
+    }
+
+    m_noiseFloor.valid = (m_noiseFloor.ire > 0.0);
+    return m_noiseFloor;
+}
+
+bool CineMap::filmRuledOut(SourceVideo& sv, int segStart, int segEnd)
+{
+    const NoiseFloor& nf = calibrateTwinFloor(sv);
+    if (!nf.valid) return false;          // no floor measured: cannot rule anything out
+
+    int hits = 0, pairs = 0;
+    double quiet = 0.0;
+    std::vector<int> hitFields;
+
+    // Geometry operating point: the tight floor. The generous one deliberately
+    // over-admits so a twin is never missed, but those extra hits are not twins and
+    // scatter across offsets, diluting the very concentration being measured.
+    const double dutyG = twinDuty(sv, segStart, segEnd,
+                                  nf.ire * FLOOR_MULT_GEOMETRY,
+                                  &hits, &pairs, &quiet, &hitFields);
+
+    const int possible = std::max(0, segEnd - segStart - 1);
+    const double coverage = (possible > 0)
+                          ? (static_cast<double>(pairs) / possible) : 0.0;
+    if (coverage < MIN_TAG_COVERAGE) return false;   // dark, not video
+
+    // Everything at the floor is the absence of information, not evidence of video:
+    // a static passage's field difference is pure noise whether it is film or not.
+    if (dutyG >= 0.80) return false;
+
+    const double conc = cycleConcentration(hitFields);
+    const bool ruledOut = (conc < CYCLE_CONCENTRATION_MIN);
+
+    if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString("CineMap decision: FILM_CENSUS fields [%1..%2] floor=%3 pairs=%4 coverage=%5 dutyGeo=%6 hits=%7 conc=%8 filmRuledOut=%9")
+               .arg(segStart).arg(segEnd)
+               .arg(nf.ire, 0, 'f', 4).arg(pairs)
+               .arg(coverage, 0, 'f', 3)
+               .arg(dutyG, 0, 'f', 3).arg(hits)
+               .arg(conc, 0, 'f', 3)
+               .arg(ruledOut ? "yes" : "no");
+    }
+
+    return ruledOut;
+}
+
+double CineMap::cycleConcentration(const std::vector<int>& hitFields) const
+{
+    if (!m_md || hitFields.size() < 4) return 0.0;
+
+    // Histogram the hits by offset within the 10-field (5-frame) cadence cycle.
+    int bucket[10] = {0};
+    for (int f : hitFields) {
+        int o = f % 10;
+        if (o < 0) o += 10;
+        bucket[o]++;
+    }
+
+    // Best pair of offsets five apart. Opposite parity follows from a 5-field
+    // offset in an undisrupted sequence; pads can break that, so confirm rather
+    // than assume by checking a representative hit from each half.
+    double best = 0.0;
+    for (int o = 0; o < 5; ++o) {
+        const int paired = bucket[o] + bucket[o + 5];
+        if (paired == 0) continue;
+
+        if (bucket[o] > 0 && bucket[o + 5] > 0) {
+            int a = -1, b = -1;
+            for (int f : hitFields) {
+                const int m = ((f % 10) + 10) % 10;
+                if (m == o && a < 0) a = f;
+                if (m == o + 5 && b < 0) b = f;
+            }
+            if (a > 0 && b > 0
+                && m_md->getField(a).isFirstField == m_md->getField(b).isFirstField) {
+                continue;   // same parity: not a 3:2 twin pair
+            }
+        }
+
+        best = std::max(best, static_cast<double>(paired) / hitFields.size());
+    }
+
+    return best;
+}
+
+double CineMap::twinDuty(SourceVideo& sv,
+                         int startField,
+                         int endField,
+                         double floorIre,
+                         int* outHits,
+                         int* outPairs,
+                         double* outQuietestIre,
+                         std::vector<int>* outHitFields)
+{
+    if (outHits) *outHits = 0;
+    if (outPairs) *outPairs = 0;
+    if (outQuietestIre) *outQuietestIre = 0.0;
+    if (outHitFields) outHitFields->clear();
+    if (!m_md || floorIre <= 0.0) return 0.0;
+
+    const auto& vp = m_md->getVideoParameters();
+    const int total = m_md->getNumberOfFields();
+    startField = std::max(1, startField);
+    endField   = std::min(total, endField);
+
+    int hits = 0, pairs = 0;
+    double quietest = std::numeric_limits<double>::max();
+
+    for (int a = startField; a + 2 <= endField; ++a) {
+        const int b = a + 2;
+
+        auto fa = m_md->getField(a);
+        auto fb = m_md->getField(b);
+        if (fa.pad || fb.pad) continue;
+        if (fa.isFirstField != fb.isFirstField) continue;
+
+        const TwinDemod m = demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+        if (!m.valid) continue;
+
+        pairs++;
+        if (m.grainIre < quietest) quietest = m.grainIre;
+        if (m.grainIre < floorIre) {
+            hits++;
+            if (outHitFields) outHitFields->push_back(a);
+        }
+    }
+
+    if (outHits) *outHits = hits;
+    if (outPairs) *outPairs = pairs;
+    if (outQuietestIre && quietest < std::numeric_limits<double>::max())
+        *outQuietestIre = quietest;
+
+    return (pairs > 0) ? (static_cast<double>(hits) / pairs) : 0.0;
+}
+
+int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges)
+{
+    if (!m_md || !m_disc) return 0;
+
+    SourceVideo sv;
+    if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) {
+        qWarning() << "Failed to open TBC file";
+        return 0;
+    }
+
+    const NoiseFloor& nf = calibrateTwinFloor(sv);
+    if (!nf.valid) {
+        qWarning() << "Twin floor calibration failed (too few usable blocks).";
+        return 0;
+    }
+
+    printf("floor=%.4f IRE  (blockMin p10=%.4f p25=%.4f median=%.4f)  "
+           "concentration=%.3f  blocks=%d  pairs=%d  bpsnrIre=%.4f  ratio=%.3f\n",
+           nf.ire, nf.p10, nf.p25, nf.median, nf.concentration,
+           nf.blocks, nf.pairs, nf.bpsnrIre,
+           (nf.bpsnrIre > 0.0) ? (nf.ire / nf.bpsnrIre) : 0.0);
+
+    if (nf.concentration < 0.20) {
+        printf("WARNING: block minima do not concentrate — no sharp floor found; "
+               "treat this calibration as unproven\n");
+    }
+
+    if (ranges.isEmpty()) {
+        fflush(stdout);
+        return 1;
+    }
+
+    printf("\n%-16s %6s %6s %6s %8s %8s %8s %8s %5s  %s\n",
+           "range", "pairs", "cover", "quiet", "q/floor", "dutyGeo", "dutyRec",
+           "hitsRec", "conc", "read");
+
+    int reported = 0;
+    for (const QString& spec : ranges.split(',', Qt::SkipEmptyParts)) {
+        const auto parts = spec.split('-', Qt::SkipEmptyParts);
+        if (parts.size() != 2) continue;
+        bool okA = false, okB = false;
+        const int lo = parts.at(0).toInt(&okA);
+        const int hi = parts.at(1).toInt(&okB);
+        if (!okA || !okB || hi <= lo) continue;
+
+        int hitsG = 0, hitsR = 0, pairs = 0;
+        double quiet = 0.0;
+        std::vector<int> hitFieldsG, hitFieldsR;
+        const double dutyG = twinDuty(sv, lo, hi, nf.ire * FLOOR_MULT_GEOMETRY,
+                                      &hitsG, &pairs, &quiet, &hitFieldsG);
+        const double dutyR = twinDuty(sv, lo, hi, nf.ire * FLOOR_MULT_RECALL,
+                                      &hitsR, &pairs, &quiet, &hitFieldsR);
+
+        // Each question reads its own operating point. "All floor, so no
+        // information" reads the TIGHT point: there, static sits at 100% while
+        // telecine sits near the 1/5 that 3:2 predicts, whereas the generous point
+        // inflates a low-motion telecine shot to ~57% and crowds that boundary.
+        // Presence reads the generous point plus the cycle-concentration test.
+        // margin (quietest pair over the floor) is reported for confidence but no
+        // longer gates anything: under preponderance the tag is decided by which
+        // regime dominates, not by how emphatic the negative is.
+
+        // A denial must never be confused with an absence of data. For real film,
+        // motion cannot hide a twin — the twin's difference is noise by construction,
+        // so motion only raises the NON-twin pairs and improves the contrast. The one
+        // way genuine film shows no twins is that the twins are missing from the data:
+        // pads, dropouts, boundaries. That is darkness, and darkness must bridge
+        // rather than deny, so an under-sampled range is not allowed to deny however
+        // large its margin looks.
+        constexpr double MIN_DENY_COVERAGE = 0.75;
+
+        const int possible = std::max(0, hi - lo - 1);
+        const double coverage = (possible > 0)
+                              ? (static_cast<double>(pairs) / possible) : 0.0;
+
+        const double margin = (nf.ire > 0.0) ? (quiet / nf.ire) : 0.0;
+        // Concentration reads the TIGHT point, per the operating-point split: the
+        // generous floor deliberately over-admits so a twin is never missed, but the
+        // extra hits are not twins and scatter across offsets, diluting the very
+        // structure being measured. Geometry gets the clean hits, recall gets the
+        // liberal ones.
+        const double conc = cycleConcentration(hitFieldsG);
+        const bool cadenced = conc >= CYCLE_CONCENTRATION_MIN;
+
+        // "All floor" must be tested at BOTH points. The tight point catches dead
+        // static (every pair literally at the floor); the generous point catches
+        // near-static, whose pairs sit just above the floor at 1.2-1.9x and would
+        // otherwise slip through and read as twins on the strength of an incidental
+        // cycle. Low-motion telecine reaches only ~57% at the generous point, so an
+        // 80% line still separates it from near-static's 83-98%.
+        const bool allFloor = (dutyG >= 0.80) || (dutyR >= 0.80);
+
+        // Solve for the preponderance: the output regime is whichever covers the
+        // BIGGEST PICTURE AREA. A composite carries more than one regime at once and
+        // no single tag can serve all of it, so the dominant one wins outright — if
+        // that is a film cadence we solve for that cadence, even though video
+        // elements are present in the same shot. Video is not a safe default here; it
+        // is simply what holds the most area when no film cadence dominates.
+        //
+        // The remaining elements are recovered by the user in second and third passes
+        // via chroma decoder's --set-cadence, for which this solve is the background
+        // plate. De-compositing inside the decoder is future work.
+        //
+        // No uncertain state survives here. Escalation belongs to the solve ladder,
+        // not to the tag: every terminal read is an assertion.
+        const char* read =
+              (coverage < MIN_DENY_COVERAGE && !cadenced) ? "dark (insufficient sample)"
+            : allFloor                                    ? "no information (all floor)"
+            : cadenced                                    ? "CADENCE (solve for it)"
+            : "video (preponderance)";
+
+        printf("%-16s %6d %5.0f%% %6.2f %8.2f %7.1f%% %7.1f%% %8d %6.2f  %s\n",
+               qPrintable(spec), pairs, coverage * 100.0, quiet, margin,
+               dutyG * 100.0, dutyR * 100.0, hitsR, conc, read);
+        reported++;
+    }
+
+    fflush(stdout);
+    return reported;
+}
+
+int CineMap::probeDgRange(const QString& tbcFilePath, int startField, int endField)
+{
+    if (!m_md || !m_disc) return 0;
+
+    SourceVideo sv;
+    if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) {
+        qWarning() << "Failed to open TBC file";
+        return 0;
+    }
+
+    const auto& vp = m_md->getVideoParameters();
+    const int total = m_md->getNumberOfFields();
+
+    startField = std::max(1, startField);
+    endField   = std::min(total, endField);
+
+    // bPSNR and the field phase IDs travel with each row: the twin floor is set by
+    // the disc's noise, not by content, and the d=2 180-degree premise is a
+    // recorded fact (phaseB - phaseA == 2 mod 4) rather than an assumption.
+    printf("seqA,seqB,frameA,parity,cadA,roleA,phA,phB,bpsnr,noiseIre,"
+           "grainIre,dCarr,sCarr,q,dCoh,sCoh,qCoh\n");
+
+    const double black = (vp.black16bIre > 0) ? vp.black16bIre : 0.0;
+    const double white = (vp.white16bIre > black) ? vp.white16bIre : 65535.0;
+    const double scaleToIre = 100.0 / (white - black);
+
+    int rows = 0;
+    for (int a = startField; a + 2 <= endField; ++a) {
+        const int b = a + 2;
+
+        auto fa = m_md->getField(a);
+        auto fb = m_md->getField(b);
+        if (fa.pad || fb.pad) continue;
+        if (fa.isFirstField != fb.isFirstField) continue;   // d=2 is same-parity by construction
+
+        const TwinDemod m = demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+        if (!m.valid) continue;
+
+        // Local single-field video-noise amplitude implied by bPSNR. A twin's field
+        // difference contains only noise, so this sets the floor the twin state sits at.
+        double bpsnr = 0.5 * (m_md->getFieldVitsMetrics(a).bPSNR
+                            + m_md->getFieldVitsMetrics(b).bPSNR);
+        const double noiseIre = (bpsnr > 0.1)
+                              ? (65535.0 / std::pow(10.0, bpsnr / 20.0)) * scaleToIre
+                              : 0.0;
+
+        printf("%d,%d,%d,%s,%d,%s,%d,%d,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+               a, b,
+               (a + 1) / 2,
+               fa.isFirstField ? "first" : "second",
+               fa.cinemap.cadenceId,
+               fa.cinemap.pulldownRole.isEmpty() ? "-" : qPrintable(fa.cinemap.pulldownRole),
+               fa.fieldPhaseID, fb.fieldPhaseID,
+               bpsnr, noiseIre,
+               m.grainIre, m.dCarrierIre, m.sCarrierIre, m.q(),
+               m.dCohIre, m.sCohIre, m.qCoh());
+        rows++;
+    }
+
+    fflush(stdout);
+    return rows;
+}
+
+CineMap::TwinDemod CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, int width, int height)
+{
+    TwinDemod out;
+    if (!m_md || f1 < 1 || f2 < 1 || width <= 0 || height <= 0) return out;
     const auto vp = m_md->getVideoParameters();
 
     auto d1 = sv.getVideoField(f1);
     auto d2 = sv.getVideoField(f2);
-    if (d1.size() < width * height || d2.size() < width * height) return 1000.0;
+    if (d1.size() < width * height || d2.size() < width * height) return out;
 
     const uint16_t* p1 = reinterpret_cast<const uint16_t*>(d1.constData());
     const uint16_t* p2 = reinterpret_cast<const uint16_t*>(d2.constData());
@@ -1607,8 +2150,22 @@ double CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, i
     // survive the windowed I/Q estimate, so it stays in the residual. We then measure
     // the ENERGY (RMS) of D minus that tone: a true twin -> grain cancels -> residual
     // collapses to the noise floor; animated grain survives as extra energy.
+    //
+    // The 180-degree relation that makes the tone double in D also makes it CANCEL
+    // in the sum S = field1 + field2, so the same pass measures a second, independent
+    // channel (see TwinDemod). D's coherent tone is the MEAN chroma C1+C2' — until now
+    // discarded as nuisance, it is the power meter for the test. S's coherent tone is
+    // the chroma DIFFERENCE C1-C2', which is zero for a twin no matter how much colour
+    // is present. Both magnitudes come from the same quadrature estimate, so the second
+    // channel costs one more prefix-sum pass over data already in hand.
     constexpr int N = 8;        // window length in samples (2 carrier cycles)
     constexpr int H = N / 2;
+
+    // Coherent pooling run length. Chroma phase is near-constant across a run this
+    // short, so its (I,Q) vectors add; fine luma detail that lands in the subcarrier
+    // band has rapidly varying phase and averages down. That matters most for S,
+    // whose broadband part is the MEAN luma (large) rather than a luma difference.
+    constexpr int R = 16;
 
     const double black = (vp.black16bIre > 0) ? vp.black16bIre : 0.0;
     const double white = (vp.white16bIre > 0) ? vp.white16bIre : 65535.0;
@@ -1617,9 +2174,15 @@ double CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, i
     double sumSq = 0.0;
     uint64_t count = 0;
 
-    std::vector<double> D(width);
+    double dCarrSq = 0.0, sCarrSq = 0.0;   // per-sample RMS accumulators
+    double dCohSq  = 0.0, sCohSq  = 0.0;   // coherently-pooled accumulators
+    uint64_t cohCount = 0;
+
+    std::vector<double> D(width), S(width);
     std::vector<double> sI(width), sQ(width);   // signed quadrature projections of D
+    std::vector<double> tI(width), tQ(width);   // ... and of S
     std::vector<double> PI(width + 1), PQ(width + 1); // prefix sums for sliding window
+    std::vector<double> QI(width + 1), QQ(width + 1);
 
     for (int y = yStart; y < yEnd; y += yStep) {
         const uint16_t* l1 = p1 + y * width;
@@ -1628,20 +2191,26 @@ double CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, i
         // Field difference and its 4fsc quadrature samples. cos(pi*x/2) is nonzero
         // only on even x (+/-1); sin only on odd x. So sI carries even samples, sQ odd.
         for (int x = 0; x < width; ++x) {
-            const double d = static_cast<double>(l1[x]) - static_cast<double>(l2[x]);
+            const double a = static_cast<double>(l1[x]);
+            const double b = static_cast<double>(l2[x]);
+            const double d = a - b;
+            const double s = a + b;
             D[x] = d;
+            S[x] = s;
             switch (x & 3) {
-                case 0: sI[x] =  d; sQ[x] = 0.0; break;
-                case 1: sI[x] = 0.0; sQ[x] =  d; break;
-                case 2: sI[x] = -d; sQ[x] = 0.0; break;
-                default: sI[x] = 0.0; sQ[x] = -d; break;
+                case 0: sI[x] =  d; sQ[x] = 0.0; tI[x] =  s; tQ[x] = 0.0; break;
+                case 1: sI[x] = 0.0; sQ[x] =  d; tI[x] = 0.0; tQ[x] =  s; break;
+                case 2: sI[x] = -d; sQ[x] = 0.0; tI[x] = -s; tQ[x] = 0.0; break;
+                default: sI[x] = 0.0; sQ[x] = -d; tI[x] = 0.0; tQ[x] = -s; break;
             }
         }
 
-        PI[0] = 0.0; PQ[0] = 0.0;
+        PI[0] = 0.0; PQ[0] = 0.0; QI[0] = 0.0; QQ[0] = 0.0;
         for (int x = 0; x < width; ++x) {
             PI[x + 1] = PI[x] + sI[x];
             PQ[x + 1] = PQ[x] + sQ[x];
+            QI[x + 1] = QI[x] + tI[x];
+            QQ[x + 1] = QQ[x] + tQ[x];
         }
 
         for (int x = startX; x < endX; ++x) {
@@ -1666,11 +2235,50 @@ double CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2, i
             const double grain = D[x] - carrier;
             sumSq += grain * grain;
             count++;
+
+            // Sum-channel quadrature over the same window: the chroma difference.
+            const double IhatS = (evens > 0) ? (QI[hi] - QI[lo]) / evens : 0.0;
+            const double QhatS = (odds  > 0) ? (QQ[hi] - QQ[lo]) / odds  : 0.0;
+
+            dCarrSq += Ihat  * Ihat  + Qhat  * Qhat;
+            sCarrSq += IhatS * IhatS + QhatS * QhatS;
+        }
+
+        // Coherent pooling: average the (I,Q) vectors over a run, then take the
+        // magnitude. Chroma survives; random-phase luma leak averages down.
+        for (int x0 = startX; x0 + R <= endX; x0 += R) {
+            double dIsum = 0.0, dQsum = 0.0, sIsum = 0.0, sQsum = 0.0;
+            for (int x = x0; x < x0 + R; ++x) {
+                const int lo = std::max(0, x - H);
+                const int hi = std::min(width, x + H);
+                const int evens = ((hi + 1) >> 1) - ((lo + 1) >> 1);
+                const int odds  = (hi - lo) - evens;
+
+                dIsum += (evens > 0) ? (PI[hi] - PI[lo]) / evens : 0.0;
+                dQsum += (odds  > 0) ? (PQ[hi] - PQ[lo]) / odds  : 0.0;
+                sIsum += (evens > 0) ? (QI[hi] - QI[lo]) / evens : 0.0;
+                sQsum += (odds  > 0) ? (QQ[hi] - QQ[lo]) / odds  : 0.0;
+            }
+            const double inv = 1.0 / static_cast<double>(R);
+            dIsum *= inv; dQsum *= inv; sIsum *= inv; sQsum *= inv;
+
+            dCohSq += dIsum * dIsum + dQsum * dQsum;
+            sCohSq += sIsum * sIsum + sQsum * sQsum;
+            cohCount++;
         }
     }
 
-    if (count == 0) return 1000.0;
-    return std::sqrt(sumSq / count) * scaleToIre;   // RMS of carrier-stripped grain, in IRE
+    if (count == 0) return out;
+
+    out.grainIre    = std::sqrt(sumSq   / count) * scaleToIre;  // RMS carrier-stripped grain, IRE
+    out.dCarrierIre = std::sqrt(dCarrSq / count) * scaleToIre;
+    out.sCarrierIre = std::sqrt(sCarrSq / count) * scaleToIre;
+    if (cohCount > 0) {
+        out.dCohIre = std::sqrt(dCohSq / cohCount) * scaleToIre;
+        out.sCohIre = std::sqrt(sCohSq / cohCount) * scaleToIre;
+    }
+    out.valid = true;
+    return out;
 }
 
 double CineMap::calculateBoostedDemodDiff(SourceVideo& sv, int f1, int f2, int width, int height)
@@ -1782,14 +2390,27 @@ double CineMap::twinConfidence(SourceVideo& sv, int seqA, int seqB, TwinConfDeta
     if (!m_md) return 0.0;
     const auto& vp = m_md->getVideoParameters();
 
-    d.diffIn = demodTwinDiffCached(sv, seqA, seqB, vp.fieldWidth, vp.fieldHeight);
+    {
+        // Copy out by value: demodTwinCached returns a reference into the cache,
+        // which the neighbour lookups below may rehash.
+        const TwinDemod in = demodTwinCached(sv, seqA, seqB, vp.fieldWidth, vp.fieldHeight);
+        d.diffIn  = in.grainIre;
+        d.qIn     = in.qCoh();
+        d.powerIn = in.dCohIre;
+    }
     d.threshAbs = getAdaptiveTwinThreshold(seqA, seqB);
 
     const int totalFields = m_md->getNumberOfFields();
-    if (seqA - 2 >= 1 && !boundaryBetween(seqA - 2, seqA))
-        d.diffPre = demodTwinDiffCached(sv, seqA - 2, seqA, vp.fieldWidth, vp.fieldHeight);
-    if (seqB + 2 <= totalFields && !boundaryBetween(seqB, seqB + 2))
-        d.diffPost = demodTwinDiffCached(sv, seqB, seqB + 2, vp.fieldWidth, vp.fieldHeight);
+    if (seqA - 2 >= 1 && !boundaryBetween(seqA - 2, seqA)) {
+        const TwinDemod pre = demodTwinCached(sv, seqA - 2, seqA, vp.fieldWidth, vp.fieldHeight);
+        d.diffPre = pre.grainIre;
+        d.qPre    = pre.qCoh();
+    }
+    if (seqB + 2 <= totalFields && !boundaryBetween(seqB, seqB + 2)) {
+        const TwinDemod post = demodTwinCached(sv, seqB, seqB + 2, vp.fieldWidth, vp.fieldHeight);
+        d.diffPost = post.grainIre;
+        d.qPost    = post.qCoh();
+    }
 
     if (d.diffPre < 900.0 && d.diffPost < 900.0) d.neighborActivity = std::min(d.diffPre, d.diffPost);
     else if (d.diffPre < 900.0) d.neighborActivity = d.diffPre;
@@ -2470,6 +3091,35 @@ CineMap::scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
     const double p90 = percentile(0.90);
     const double denom = std::max(1e-9, (p90 - p10));
 
+    // ABSOLUTE silence gate, and it must come BEFORE the percentile stretch.
+    //
+    // The stretch below rescales whatever spread exists into [0,1], so it cannot
+    // tell "no comb anywhere" from "comb varies" — it manufactures a pattern from a
+    // noise floor. That was survivable while mixedness was notch, whose floor is the
+    // image's own vertical structure and therefore never small. Lips goes properly to
+    // zero on clean content, so without this gate the stretch amplifies pure
+    // numerical noise into confident locks.
+    //
+    // Lips is what makes an absolute test legitimate here: it is a residual measured
+    // AFTER masking vertical detail and after subtracting its own noise floor, so its
+    // zero means "no comb", not merely "no structure". Measured over 40 windows on
+    // four discs, locks conjured from noise topped out at max lips 0.028 while every
+    // genuine lock had max lips >= 0.189 — this sits in that gap.
+    if (percentile(1.0) < LIPS_SILENCE) {
+        run.type = PhaseRun::Type::Unknown;
+        run.reason = "silence";
+
+        if (m_decisionTraceEnabled) {
+            qInfo().noquote()
+                << QString("CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 result=unknown reason=silence maxLips=%4 threshold=%5")
+                   .arg(startField).arg(endField).arg(numFrames)
+                   .arg(percentile(1.0), 0, 'f', 6)
+                   .arg(LIPS_SILENCE, 0, 'f', 4);
+        }
+
+        return run;
+    }
+
     if ((p90 - p10) < 1e-6) {
         run.type = PhaseRun::Type::Unknown;
         run.reason = "flat-mixedness";
@@ -3057,10 +3707,13 @@ void CineMap::classifyAsInterlaced(int segStartField,
 
     const int spanFields = segEndField - segStartField + 1;
 
-    // Heuristic: fraction of "highly mixed" frames in this segment
+    // Fraction of frames that actually comb. On lips this is a real question about
+    // inter-field motion: the image's own vertical detail has already been masked
+    // out per pixel, so a detailed progressive frame scores ~zero here where notch
+    // scored whatever its edges amounted to.
     int highMixedFrames = 0;
     for (const auto& m : mixedness) {
-        if (m.score > 0.05) { // tunable, > ~very low comb
+        if (m.score > LIPS_COMB) {
             highMixedFrames++;
         }
     }
@@ -3106,15 +3759,23 @@ void CineMap::classifyAsProgressive(int segStartField,
     if (segStartField >= segEndField) return;
     if (mixedness.empty()) return;
 
-    // Heuristic: mixedness is near zero across the whole segment.
-    double maxMixed = 0.0;
+    // Fraction of frames that comb — the mirror of classifyAsInterlaced's test, and
+    // deliberately a fraction rather than a maximum. A max-based test lets a single
+    // frame veto a whole span, and the frame it usually trips on is the cut at the
+    // shot boundary, whose two fields genuinely straddle different content. A shot of
+    // unique progressive film frames should read ~zero on lips throughout its body
+    // regardless of what happens at its ends.
+    int combedFrames = 0;
     for (const auto& m : mixedness) {
-        if (m.score > maxMixed) maxMixed = m.score;
+        if (m.score > LIPS_COMB) combedFrames++;
     }
+    const double fracCombed = mixedness.empty()
+        ? 0.0
+        : static_cast<double>(combedFrames) / static_cast<double>(mixedness.size());
 
-    // Tunable: "near zero". This should be below any practical comb threshold.
-    if (maxMixed > 0.01) {
-        // There is some comb; not comfortable calling the whole span 29.97p.
+    // Require the span to be overwhelmingly comb-free. The gap either side is wide:
+    // classifyAsInterlaced needs >= 0.40 to call 59.94i.
+    if (fracCombed > 0.10) {
         return;
     }
 
