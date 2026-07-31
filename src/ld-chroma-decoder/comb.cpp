@@ -239,6 +239,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
 
             next->split1D();
 
+            // Star-law evidence (produceY license): built for every loaded
+            // buffer so temporal neighbours can pool it. Needs only
+            // rawbuffer + the exact channel, both ready at load.
+            next->buildStarEvidence();
+
             if (configuration.phaseCompensation) {
                 next->phaseLocked();
                 next->buildCarrierAnalysis(
@@ -249,7 +254,8 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
                 if (configuration.lumaWitness)
-                    next->buildCarrierRetracted();
+                    next->buildCarrierRetracted(
+                        current->holdsRealFrame() ? current.get() : nullptr);
             }
 
             if (!configuration.diagnosticOnly())
@@ -299,6 +305,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 previous->holdsRealFrame() ? previous.get() : nullptr,
                 next->holdsRealFrame() ? next.get() : nullptr);
 
+
         // Diagnostic fast path: witness/carrier analysis is complete before
         // the comb/election render stages below. Publish the selected signal
         // directly as monochrome output and skip the normal render path.
@@ -318,9 +325,13 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          */
         if (configuration.phaseCompensation) {
             current->measurePostCombImpurity();
-            current->splitIQlocked();
+            current->splitIQlocked(
+                previous->holdsRealFrame() ? previous.get() : nullptr,
+                next->holdsRealFrame() ? next.get() : nullptr);
             current->doCNR();
-            current->produceY();
+            current->produceY(
+                previous->holdsRealFrame() ? previous.get() : nullptr,
+                next->holdsRealFrame() ? next.get() : nullptr);
             current->filterIQLocked();
             current->doYNR();
             current->transformIQ(configuration.chromaGain,
@@ -616,9 +627,11 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             // neither the memory nor the second pass.
             if (configuration.tunables.CC_SUPPRESSION_WEIGHT > 0.0) {
                 lockedCcMaskRaw_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
+                ccDetectorVerdict_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
                 lockedCcMask_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             } else {
                 lockedCcMaskRaw_flat.clear();
+                ccDetectorVerdict_flat.clear();
                 lockedCcMask_flat.clear();
             }
             regionSamePartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
@@ -663,6 +676,10 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
                                  std::numeric_limits<float>::quiet_NaN());
         exactCoverageCache = -1;   // recompute for the newly held frame
         anchored1DValid = false;   // stale plane must not survive reuse
+        starEvidenceBuilt = false; // star license evidence follows the frame
+        syncIncFirst  = firstField.dgSyncIncrement;
+        syncIncSecond = secondField.dgSyncIncrement;
+        certifiedLineCache.clear(); // per-line certified verdicts likewise
         auto copyPlane = [&](const QVector<float> &src, int frameParity) {
             if (src.isEmpty()) return;
             qint32 fl = 0;
@@ -2839,7 +2856,26 @@ void Comb::FrameBuffer::split2D()
             }
         }
 
-        if (needFrameACompute) {
+        if (needFrameACompute &&
+            certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
+            // Certified cede (CONSTRUCTION, upstream of every election):
+            // on a def line the Frame A candidate IS the center. The 4fsc
+            // IQ pair comes from the stage-1 locked products of the same
+            // certified scalar, so attribution consumers see one story.
+            const double *center = locked1DSource_line(line);
+            const float *cI4 = locked1DTI4fsc_line(line);
+            const float *cQ4 = locked1DTQ4fsc_line(line);
+            frameAIQ.assign(width, std::complex<double>(0.0, 0.0));
+            if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
+                scratch_frameAAdaptiveIQComposite.resize(width);
+            for (int rel = 0; rel < width; ++rel) {
+                scratch_frameAAdaptiveIQComposite[rel] =
+                    center ? center[rel] : 0.0;
+                if (cI4 && cQ4)
+                    frameAIQ[rel] = std::complex<double>(
+                        (double)cI4[rel], (double)cQ4[rel]);
+            }
+        } else if (needFrameACompute) {
             computeFrameALine(line, frameAIQ);
             if ((int)scratch_frameAAdaptiveIQComposite.size() < width)
                 scratch_frameAAdaptiveIQComposite.resize(width);
@@ -2966,6 +3002,7 @@ void Comb::FrameBuffer::split2D()
                 }
             }
         }
+
     }
 
     // Vertical companion to the per-line horizontal dilation
@@ -3033,6 +3070,10 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         constexpr double kTau = 1.5;
 
         for (int line = firstLine; line < lastLine; ++line) {
+            // Certified cede (construction): no temporal members are even
+            // evaluated on def lines; their share stays zero.
+            if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
+                continue;
             const double *lockedRow = configuration.phaseCompensation
                 ? combSource1D_line(line) : nullptr;
             for (int h = left; h < right; ++h) {
@@ -3136,6 +3177,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 out[x] = 0.25f * (su[x] + 2.0f * s0[x] + sd[x]);
         }
         for (int line = firstLine; line < lastLine; ++line) {
+            if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
+                continue;   // certified cede: the 2D seed (= center) stands
             const float *sv = shareV.data() + (size_t)line * width;
             const float *tm = tMean.data() + (size_t)line * width;
             const float *rf = ref.data() + (size_t)line * width;
@@ -3154,6 +3197,10 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
     }
 
     for (int line = firstLine; line < lastLine; ++line) {
+        // Certified cede (construction): temporal machinery stands down on
+        // def lines; the seeded 2D value (= center) stands.
+        if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
+            continue;
 
         for (int h = left; h < right; ++h) {
             const int rel = h - left;
@@ -3225,6 +3272,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             }
         }
     }
+
 }
 // True when this frame holds any dG twin-certified carrier. Sampled
 // rather than exhaustive: coverage is a whole-field property, so a sparse

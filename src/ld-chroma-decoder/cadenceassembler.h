@@ -57,12 +57,36 @@ public:
                  );
 
     void push(const QVector<SourceField>& newFields);
+
+    // Sync-tone tracker: sequential per-region alpha-beta on the certified
+    // regional phase, fed at each dG merge (the anchor), twin-integrity
+    // gated, cut-reset. Predictions are stamped on every emitted field as
+    // INCREMENTS since the previous anchor -- convention-free at the
+    // consumer, which composes them with its own in-batch anchor
+    // measurement.
+    struct SyncTrk {
+        bool valid = false;
+        double zI = 1.0, zQ = 0.0;   // phase state at last anchor
+        double omega = 0.0;          // rad per field
+        double missEwma = 0.5;       // rad, innovation magnitude history
+    };
     void flush();
     bool hasWork() const;
     QVector<WorkItem> popWork();
 
 private:
 	std::function<void(qint32)> onFieldReleasedToBaseline;
+    std::vector<SyncTrk> syncTrk;
+    SyncTrk syncGlobal;
+    int syncRegX = 0, syncRegY = 0;
+    long syncAnchorSeq = -1;
+    long syncCuts = 0;
+    void syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
+                           const std::vector<double>& regI,
+                           const std::vector<double>& regQ,
+                           const std::vector<long>& regN,
+                           double ireScale);
+    void syncStamp(SourceField& f) const;
     LdDecodeMetaData::VideoParameters videoParameters;
     Configuration config;
     std::deque<SourceField> window;

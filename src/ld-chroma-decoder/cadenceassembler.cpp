@@ -102,7 +102,11 @@ namespace {
                                      const CadenceAssembler::Configuration& cfg,
                                      SourceField& def,
                                      SourceField& spare,
-                                     SourceField& comp)
+                                     SourceField& comp,
+                                     std::vector<double>* outRegI = nullptr,
+                                     std::vector<double>* outRegQ = nullptr,
+                                     std::vector<long>* outRegN = nullptr,
+                                     double* outTwinDriftDeg = nullptr)
     {
 
         const int width = vp.fieldWidth;
@@ -236,6 +240,36 @@ namespace {
         std::vector<double> chatFix(width), lhatFix(width), bpFix(width);
         long long nErrTotal = 0, nDefBad = 0, nSpareBad = 0;
 
+        // Twin phase capture (LDCD_DUMP_MERGEPH; tracker feed to follow).
+        // BURST-RELATIVE carrier phase per capture: burst and carrier are
+        // both fsc, so (carrier phase - own burst phase) is a pure number
+        // per capture, comparable across any stream positions with no
+        // lattice bookkeeping. The def/spare pair is the same picture at
+        // two capture moments, so the difference of their burst-relative
+        // phases is a MOTION-FREE sample of the sequence drift -- the
+        // anticipation curve's slope measured by conservation, not
+        // estimated by tracking. (Anchor density alone would not have
+        // warranted this; the exact derivative does.)
+        static const bool mergePhDump =
+            std::getenv("LDCD_DUMP_MERGEPH") != nullptr;
+        double phCI = 0, phCQ = 0;             // pooled chat IQ (def coords)
+        double phDBI = 0, phDBQ = 0, phSBI = 0, phSBQ = 0; // burst pools
+        long phN = 0;
+        // Regional pools for the sync tracker (same lattice the decoder's
+        // grids use: field-line row / 16, active-sample col / 128).
+        const int srX = (activeRight - activeLeft +
+                         SourceField::kSyncRegCols - 1) /
+                        SourceField::kSyncRegCols;
+        const int srY = (height + SourceField::kSyncRegLines - 1) /
+                        SourceField::kSyncRegLines;
+        std::vector<double> srI((size_t)srX * srY, 0.0),
+                            srQ((size_t)srX * srY, 0.0);
+        std::vector<long> srN((size_t)srX * srY, 0);
+        const int pbL = std::clamp(vp.colourBurstStart, 0, width);
+        const int pbR = std::clamp(vp.colourBurstEnd, 0, width);
+        static const double phCB[4] = { 1, 0, -1, 0 };
+        static const double phSB[4] = { 0, 1, 0, -1 };
+
         for (int lf = y0; lf < y1; ++lf) {
             buildLine(lf);
             quint16* out = defw + (size_t)lf * width;
@@ -245,6 +279,42 @@ namespace {
             for (int h = activeLeft; h < activeRight; ++h) {
                 errMask[h] = std::fabs(chat[h] - bp[h]) > outlierThreshCode;
                 if (errMask[h]) anyErr = true;
+            }
+
+            // Phase capture: pooled carrier (clean samples) + each
+            // capture's own burst. Field lines are carrier-cophased
+            // (455.0 cycles per field-line pitch), so the pools are
+            // coherent with the plain sample-class basis.
+            {
+                // Consecutive FIELD rows are consecutive scan lines:
+                // 227.5 cycles apart, so the carrier flips 180 degrees per
+                // row. Sign the pools by row parity or they cancel (first
+                // build measured 0.02 IRE pooled amplitude -- pure
+                // cancellation residue).
+                const double rs = (lf & 1) ? -1.0 : 1.0;
+                const quint16* dl = defp + (size_t)lf * width;
+                const quint16* sl = sparep + (size_t)lf * width;
+                const size_t srRow =
+                    (size_t)(lf / SourceField::kSyncRegLines) * srX;
+                for (int h = activeLeft; h < activeRight; ++h) {
+                    if (errMask[h]) continue;
+                    const int ph = h & 3;
+                    const double ci = rs * chat[h] * phCB[ph];
+                    const double cq = rs * chat[h] * phSB[ph];
+                    phCI += ci;
+                    phCQ += cq;
+                    phN++;
+                    const size_t r = srRow +
+                        (h - activeLeft) / SourceField::kSyncRegCols;
+                    srI[r] += ci; srQ[r] += cq; srN[r]++;
+                }
+                for (int h = pbL; h < pbR; ++h) {
+                    const int ph = h & 3;
+                    phDBI += rs * (double)dl[h] * phCB[ph];
+                    phDBQ += rs * (double)dl[h] * phSB[ph];
+                    phSBI += rs * (double)sl[h] * phCB[ph];
+                    phSBQ += rs * (double)sl[h] * phSB[ph];
+                }
             }
 
             if (anyErr && haveComp) {
@@ -355,6 +425,60 @@ namespace {
             std::fprintf(stderr,
                 "DSREF-FIX seq=%d nerr=%lld defBad=%lld spareBad=%lld\n",
                 def.field.seqNo, nErrTotal, nDefBad, nSpareBad);
+
+        // Sync tracker feed: regional pools derotated by the def capture's
+        // own burst (burst-relative phase; slow burst wander must not alias
+        // as carrier drift), plus the twin integrity differential.
+        if (outRegI && outRegQ && outRegN) {
+            const double bm = std::hypot(phDBI, phDBQ);
+            const double buI = bm > 1e-9 ? phDBI / bm : 1.0;
+            const double buQ = bm > 1e-9 ? phDBQ / bm : 0.0;
+            outRegI->assign(srI.size(), 0.0);
+            outRegQ->assign(srQ.size(), 0.0);
+            *outRegN = srN;
+            for (size_t r = 0; r < srI.size(); ++r) {
+                (*outRegI)[r] = srI[r] * buI + srQ[r] * buQ;
+                (*outRegQ)[r] = srQ[r] * buI - srI[r] * buQ;
+            }
+        }
+        if (outTwinDriftDeg && phN > 0) {
+            const double aDef2 = std::atan2(phCQ, phCI);
+            const double aSp2  = std::atan2(-phCQ, -phCI);
+            const double bDef2 = std::atan2(phDBQ, phDBI);
+            const double bSp2  = std::atan2(phSBQ, phSBI);
+            double dd = ((aSp2 - bSp2) - (aDef2 - bDef2)) * 180.0 / M_PI;
+            while (dd > 180.0) dd -= 360.0;
+            while (dd < -180.0) dd += 360.0;
+            *outTwinDriftDeg = dd;
+        }
+
+        if (mergePhDump && phN > 0) {
+            // def carrier is chat; spare carrier is -chat sample-for-sample.
+            // Each referenced to its OWN burst; the difference of the two
+            // burst-relative phases (mod the fixed sequence offset) is the
+            // motion-free drift sample.
+            const double degC = 180.0 / M_PI;
+            const double aDef = std::atan2(phCQ, phCI);
+            const double aSp  = std::atan2(-phCQ, -phCI);
+            const double bDef = std::atan2(phDBQ, phDBI);
+            const double bSp  = std::atan2(phSBQ, phSBI);
+            double relD = (aDef - bDef) * degC;
+            double relS = (aSp - bSp) * degC;
+            auto wrap = [](double d) {
+                while (d > 180.0) d -= 360.0;
+                while (d < -180.0) d += 360.0;
+                return d;
+            };
+            const double drift = wrap(relS - relD);
+            const double ampIRE =
+                std::hypot(phCI, phCQ) / std::max(1L, phN) / ireScale;
+            std::fprintf(stderr,
+                "MERGEPH defSeq=%d spSeq=%d dt=%d relDef=%.2f relSp=%.2f "
+                "drift=%.3f deg amp=%.2f IRE n=%ld\n",
+                def.field.seqNo, spare.field.seqNo,
+                spare.field.seqNo - def.field.seqNo,
+                wrap(relD), wrap(relS), drift, ampIRE, phN);
+        }
 
         return true;
     }
@@ -478,6 +602,159 @@ void CadenceAssembler::flush()
 
 bool CadenceAssembler::hasWork() const { return !workQueue.empty(); }
 
+// Sync-tone tracker update at a dG anchor. Alpha-beta on per-region
+// (phase, rate); twin-integrity gate (a pair whose captures disagree is
+// distrusted wholesale); cut reset on frame-median innovation.
+void CadenceAssembler::syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
+                                         const std::vector<double>& regI,
+                                         const std::vector<double>& regQ,
+                                         const std::vector<long>& regN,
+                                         double ireScale)
+{
+    static const bool dbg = std::getenv("LDCD_DUMP_SYNCTRK") != nullptr;
+    const int nReg = (int)regI.size();
+    if (nReg <= 0) return;
+    if ((int)syncTrk.size() != nReg) {
+        syncTrk.assign(nReg, SyncTrk());
+        syncAnchorSeq = -1;
+    }
+    if (std::fabs(twinDriftDeg) > 1.0) {
+        if (dbg)
+            std::fprintf(stderr,
+                "[SYNCTRK seq=%d] twin integrity fail (%.2f deg) -- pair "
+                "distrusted\n", anchorSeq, twinDriftDeg);
+        return;
+    }
+    constexpr double kAlpha = 0.5, kBeta = 0.12;
+    const double dt = syncAnchorSeq >= 0
+        ? (double)(anchorSeq - syncAnchorSeq) : 0.0;
+    const double floorRaw = 2.0 * ireScale;
+    std::vector<double> misses;
+    for (int r = 0; r < nReg; ++r) {
+        if (regN[r] < 64) continue;
+        if (std::hypot(regI[r], regQ[r]) / regN[r] < floorRaw) continue;
+        SyncTrk &T = syncTrk[r];
+        if (!T.valid || dt <= 0.0 || dt > 8.0) continue;
+        const double th = T.omega * dt;
+        const double pI = T.zI * std::cos(th) - T.zQ * std::sin(th);
+        const double pQ = T.zQ * std::cos(th) + T.zI * std::sin(th);
+        misses.push_back(std::fabs(std::atan2(
+            regQ[r] * pI - regI[r] * pQ, regI[r] * pI + regQ[r] * pQ)));
+    }
+    bool cut = false;
+    if (!misses.empty()) {
+        std::sort(misses.begin(), misses.end());
+        cut = misses[misses.size() / 2] > 35.0 * M_PI / 180.0;
+    }
+    if (cut) {
+        for (SyncTrk &T : syncTrk) T.valid = false;
+        syncCuts++;
+    }
+    for (int r = 0; r < nReg; ++r) {
+        if (regN[r] < 64) continue;
+        if (std::hypot(regI[r], regQ[r]) / regN[r] < floorRaw) continue;
+        SyncTrk &T = syncTrk[r];
+        const double m = std::hypot(regI[r], regQ[r]);
+        if (!T.valid || dt <= 0.0 || dt > 8.0) {
+            T.zI = regI[r] / m; T.zQ = regQ[r] / m;
+            T.omega = 0.0; T.missEwma = 0.5; T.valid = true;
+            continue;
+        }
+        const double th = T.omega * dt;
+        const double pI = T.zI * std::cos(th) - T.zQ * std::sin(th);
+        const double pQ = T.zQ * std::cos(th) + T.zI * std::sin(th);
+        const double err = std::atan2(regQ[r] * pI - regI[r] * pQ,
+                                      regI[r] * pI + regQ[r] * pQ);
+        T.missEwma = 0.7 * T.missEwma + 0.3 * std::fabs(err);
+        T.omega = std::clamp(T.omega + kBeta * err / dt, -0.10, 0.10);
+        const double corr = th + kAlpha * err;
+        const double cI = T.zI * std::cos(corr) - T.zQ * std::sin(corr);
+        const double cQ = T.zQ * std::cos(corr) + T.zI * std::sin(corr);
+        const double mz = std::hypot(cI, cQ);
+        T.zI = cI / mz; T.zQ = cQ / mz;
+    }
+    // Global tone: pooled across all usable regions -- the coordinate with
+    // measurable signal (regional increments are zero-mean noise on the
+    // beach; the +-6 deg segment curve is global).
+    {
+        double gI = 0, gQ = 0;
+        for (int r = 0; r < nReg; ++r) {
+            if (regN[r] < 64) continue;
+            if (std::hypot(regI[r], regQ[r]) / regN[r] < floorRaw) continue;
+            gI += regI[r]; gQ += regQ[r];
+        }
+        const double gm = std::hypot(gI, gQ);
+        if (gm > 1e-9) {
+            SyncTrk &T = syncGlobal;
+            if (!T.valid || dt <= 0.0 || dt > 8.0) {
+                T.zI = gI / gm; T.zQ = gQ / gm;
+                T.omega = 0.0; T.missEwma = 0.2; T.valid = true;
+            } else {
+                const double th = T.omega * dt;
+                const double pI = T.zI * std::cos(th) - T.zQ * std::sin(th);
+                const double pQ = T.zQ * std::cos(th) + T.zI * std::sin(th);
+                const double err = std::atan2(gQ * pI - gI * pQ,
+                                              gI * pI + gQ * pQ);
+                T.missEwma = 0.7 * T.missEwma + 0.3 * std::fabs(err);
+                T.omega = std::clamp(T.omega + 0.25 * err / dt, -0.05, 0.05);
+                const double corr2 = th + 0.6 * err;
+                const double cI = T.zI * std::cos(corr2) - T.zQ * std::sin(corr2);
+                const double cQ = T.zQ * std::cos(corr2) + T.zI * std::sin(corr2);
+                const double mz = std::hypot(cI, cQ);
+                T.zI = cI / mz; T.zQ = cQ / mz;
+            }
+        }
+    }
+    syncAnchorSeq = anchorSeq;
+    if (dbg)
+        std::fprintf(stderr,
+            "[SYNCTRK seq=%d] dt=%.0f usable=%zu cut=%d cuts=%ld\n",
+            anchorSeq, dt, misses.size(), (int)cut, syncCuts);
+}
+
+// Stamp a field with the tracker's predicted rotation since the previous
+// anchor, per region, plus confidence. Increments, never absolutes: the
+// consumer composes with its own in-batch anchor measurement, so a fixed
+// convention offset between assembler and decoder space cancels; the
+// end-to-end probe measures the handedness.
+void CadenceAssembler::syncStamp(SourceField& f) const
+{
+    f.dgSyncIncrement.clear();
+    if (syncAnchorSeq < 0 || syncTrk.empty()) return;
+    const long dt = (long)f.field.seqNo - syncAnchorSeq;
+    if (dt < 0 || dt > 8) return;
+    // Layout header: [globalOmega (rad/field), globalConf, dtFields,
+    // reserved], then per-region [omega, conf] pairs. Rates, not
+    // increments: the consumer multiplies by its own dt, and validation
+    // can compare rates across any sampling.
+    f.dgSyncIncrement.resize(4 + (int)syncTrk.size() * 2);
+    {
+        const SyncTrk &G = syncGlobal;
+        double gconf = 0.0;
+        if (G.valid) {
+            gconf = std::clamp(1.0 - G.missEwma / (15.0 * M_PI / 180.0),
+                               0.0, 1.0);
+            if (dt > 5) gconf *= 0.5;
+        }
+        f.dgSyncIncrement[0] = (float)(G.valid ? G.omega : 0.0);
+        f.dgSyncIncrement[1] = (float)gconf;
+        f.dgSyncIncrement[2] = (float)dt;
+        f.dgSyncIncrement[3] = 0.0f;
+    }
+    for (size_t r = 0; r < syncTrk.size(); ++r) {
+        const SyncTrk &T = syncTrk[r];
+        double conf = 0.0;
+        if (T.valid) {
+            conf = std::clamp(1.0 - T.missEwma / (30.0 * M_PI / 180.0),
+                              0.0, 1.0);
+            if (dt > 5) conf *= 0.5;
+        }
+        f.dgSyncIncrement[4 + (int)r * 2]     =
+            (float)(T.valid ? T.omega : 0.0);
+        f.dgSyncIncrement[4 + (int)r * 2 + 1] = (float)conf;
+    }
+}
+
 QVector<CadenceAssembler::WorkItem> CadenceAssembler::popWork()
 {
     QVector<WorkItem> out;
@@ -512,7 +789,18 @@ bool CadenceAssembler::orderPairForComb(SourceField& a, SourceField& b) const
 bool CadenceAssembler::mergeDgPairWithSanityWrapper(SourceField& def, SourceField& spare, SourceField& comp)
 {
     static const bool dsDebug = std::getenv("LDCD_PROBE_DSREF") != nullptr;
-    const bool ok = mergeDgPairWithSanity(videoParameters, config, def, spare, comp);
+    std::vector<double> regI, regQ;
+    std::vector<long> regN;
+    double twinDrift = 999.0;
+    const bool ok = mergeDgPairWithSanity(videoParameters, config, def, spare,
+                                          comp, &regI, &regQ, &regN,
+                                          &twinDrift);
+    if (ok) {
+        const double ireScale =
+            (videoParameters.white16bIre - videoParameters.black16bIre) / 100.0;
+        syncTrackerUpdate(def.field.seqNo, twinDrift, regI, regQ, regN,
+                          ireScale);
+    }
     if (dsDebug)
         std::fprintf(stderr, "DSREF-WRAP def=%d spare=%d ok=%d plane=%d\n",
                      def.field.seqNo, spare.field.seqNo, (int)ok,
@@ -616,6 +904,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         wi.filmLabel          = label;
         wi.f1                 = std::move(f1);
         wi.f2                 = std::move(f2);
+        syncStamp(wi.f1);
+        syncStamp(wi.f2);
         workQueue.push_back(std::move(wi));
     };
 
@@ -967,7 +1257,9 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
                 wi.f2 = std::move(def);
                 wi.invertedFieldOrder = false;
 
-                workQueue.push_back(std::move(wi));
+                syncStamp(wi.f1);
+        syncStamp(wi.f2);
+        workQueue.push_back(std::move(wi));
 
                 return true;
             }
@@ -1062,6 +1354,8 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
         wi.filmLabel          = '?';
         wi.f1                 = std::move(a);
         wi.f2                 = std::move(b);
+        syncStamp(wi.f1);
+        syncStamp(wi.f2);
         workQueue.push_back(std::move(wi));
 
         return true;
@@ -1156,7 +1450,9 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
     wi.f1 = std::move(fA);
     wi.f2 = std::move(fB);
     wi.invertedFieldOrder = false;
-    workQueue.push_back(std::move(wi));
+    syncStamp(wi.f1);
+        syncStamp(wi.f2);
+        workQueue.push_back(std::move(wi));
 
     return true;
 }
@@ -1215,6 +1511,8 @@ bool CadenceAssembler::tryEmitPassthroughAtCursor(bool flushMode, bool force)
     wi.f2                 = std::move(b);
     wi.invertedFieldOrder = false;
 
-    workQueue.push_back(std::move(wi));
+    syncStamp(wi.f1);
+        syncStamp(wi.f2);
+        workQueue.push_back(std::move(wi));
     return true;
 }

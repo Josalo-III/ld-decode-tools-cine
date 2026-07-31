@@ -366,7 +366,8 @@ public:
 	// grammar + harvested bandpass supply the frame-axis conformance test).
 	// This is the comb's own 3D structure. Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
-	void buildCarrierRetractionStage(bool analysisOnly);
+	void buildCarrierRetractionStage(bool analysisOnly,
+	                                 const FrameBuffer *prevF = nullptr);
 
 	// Corner-leak corrector. The locked bandpass reads luma CURVATURE as false
 	// carrier: leak[x] = -0.25 * (Y[x-2] - 2Y[x] + Y[x+2]), exactly. A
@@ -446,7 +447,32 @@ public:
 
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
-	void buildCarrierRetracted();
+	void buildCarrierRetracted(const FrameBuffer *prevF = nullptr);
+	// Sync-tone actuator: on UNCOVERED frames, rotate the FIT's carrier
+	// phase toward the tracker reference (in-batch covered anchor advanced
+	// by the shipped rate). The fit is a MODEL product — rotating it is
+	// lawful — and the rotation is the exact 4fsc quadrature identity
+	// (cos d·s + sin d·q, q[h] = 0.5(s[h-1]-s[h+1])), an all-pass phase
+	// shift at fsc: no demod/remod round-trip, no waveform substitution.
+	// Delta is region-pooled, confidence-scaled, bilinearly smoothed —
+	// no per-sample decisions. Escape LDCD_CERT_TONE=0.
+	void applyToneToFit(const FrameBuffer *prevF);
+	// REMOVED (user, 2026-07-30: "you are not dismantling score field vs
+	// frame"): a stage that phase-snapped the ELECTED scalar post-election
+	// -- an output-side rewrite of the election's verdict, the same
+	// unlawful shape as the earlier election-output cede, and rejected for
+	// the same reason. Temporal corrections enter as CANDIDATE or head
+	// construction or not at all; refineRetractedTemporal is lawful
+	// because it refines a candidate the Y election then adjudicates.
+	// Shared two-sided certified temporal reference (sign-aligned,
+	// direct-or-bracket per side, mean across sides). One implementation:
+	// the retracted refinement and the elected-scalar refinement both call
+	// here.
+	void buildTemporalCertReference(const FrameBuffer *prevF,
+	                                const FrameBuffer *nextF, int line,
+	                                std::vector<double> &tAlign,
+	                                std::vector<double> *sidePrev = nullptr,
+	                                std::vector<double> *sideNext = nullptr) const;
 	void refineRetractedTemporal(const FrameBuffer *prevF,
 	                             const FrameBuffer *nextF);
 	void outputDiagnosticFrame();
@@ -468,13 +494,73 @@ public:
 
 	void splitIQ();         // Bucket
 	void phaseLocked();  // prepares locked-path LO / basis etc.
-	void splitIQlocked();   // Product (burst-locked)
+	// Product (burst-locked). Neighbours serve ONLY the cross-colour
+	// fact-audit (detectors-trade-for-truth law): off-lattice mask
+	// firings are weighted by how much of their claimed return the
+	// nearest covered facts honoured.
+	void splitIQlocked(const FrameBuffer *prevF = nullptr,
+	                   const FrameBuffer *nextF = nullptr);
 
 	void filterIQ();
 	void filterIQLocked();
 
 	void adjustY();         // Bucket path
-	void produceY();        // Product path
+	// Product path. Optional temporal neighbours serve ONLY the star-law
+	// license (uncovered frames inherit certified star evidence from their
+	// covered neighbours); everything else in produceY is current-time.
+	void produceY(const FrameBuffer *prevF = nullptr,
+	              const FrameBuffer *nextF = nullptr);
+
+	// ---- Star law (produceY) ----
+	// A black-white-black transient inside 4 px over black flanks cannot
+	// be legal carrier (the encoder bandlimits chroma to 1.3 MHz; a legal
+	// envelope cannot rise and fall in ~5.5 samples at 4fSC), so the
+	// lawful subtrahend there is ZERO: Y = raw composite. The signature
+	// is read from the composite's own shape; the LICENSE to act is
+	// regional, pooled from certified evidence (|ex| at signature sites
+	// on covered lines -- noise floor licenses, real carrier denies,
+	// because a sub-cycle compact-colour pop is composite-indistinguishable
+	// from a star and only truth can split the scenes). Runs under EVERY
+	// configuration of the locked path -- the fix is a produceY law, not
+	// a mode.
+	double starSignatureAt(const quint16 *rawLine, int h, double *flankOut,
+	                       double *flankLOut = nullptr,
+	                       double *flankROut = nullptr) const;
+
+	// ---- Certified-field anchoring (user design, 2026-07-30) ----
+	// "I don't see a future where one signal wins it. 1D should be
+	// selectively replaced with certified fields at the def positions, and
+	// both Field and Frame combs should cede to center on those fields."
+	// Three stages, one escape (LDCD_CERT_1D=0 disables; =1 head only,
+	// =2 head + field/frame construction cede, default 3 = + temporal):
+	//   1. buildPhaseCorrected1D pass 3a: the 1D scalar IS the certified
+	//      carrier on def lines (per-sample repair holes keep the model).
+	//      Every derived product — demod caches, clpbuffer[0], CCR notch,
+	//      produceY's 1D candidate — inherits truth at the head.
+	//   2. COMB CONSTRUCTION cede (computeFieldALine / computeFieldBLine /
+	//      computeFrameBLine / the Frame A build): on def lines every
+	//      candidate is CONSTRUCTED as the center — upstream of all three
+	//      elections, which run untouched. This is what the comp lines'
+	//      one-way comb actually reads: preclean and partner consumers get
+	//      the certified center, not a comb-mangled copy of it.
+	//   3. split3D construction: temporal members are not evaluated on def
+	//      lines; the seeded 2D (= center) stands.
+	// This is the completion of lesson #1 from the twin-field doc: head
+	// injection alone DOUBLED chroma line-alternation because the combs
+	// kept mixing exact against model across parities — the cede is the
+	// half that was missing.
+	static int certifiedOneDLevel();      // env-resolved once
+	bool certifiedDefLine(int line) const; // any finite exact sample in active
+	mutable std::vector<qint8> certifiedLineCache; // -1 unknown / 0 / 1
+	void buildStarEvidence();   // idempotent per loadFields
+	// Sync-tone increments shipped by the assembler (per field; see
+	// SourceField::dgSyncIncrement). Kept per source field; consumers
+	// compose with their own in-batch anchor measurement.
+	QVector<float> syncIncFirst, syncIncSecond;
+	std::vector<float>  starEvidenceSum;  // per region: sum |ex| IRE at sites
+	std::vector<qint32> starEvidenceCnt;
+	int starRegionsX = 0, starRegionsY = 0;
+	bool starEvidenceBuilt = false;
 	// Exact-carrier anchor extraction + transfer-error probe
 	// (LDCD_PROBE_ANCHOR=1, run -t 1). Measurement only.
 	void probeExactAnchors();
@@ -755,6 +841,33 @@ private:
 	// the passband (shredded colour on both sides of a hue boundary).  The
 	// envelope may vary no faster than the chroma it gates.  Allocated only
 	// when --cross-color-return is engaged.
+	// Detector's own pre-fact verdict, retained even where the published
+	// mask is the conservation fact — the audit grades the DETECTOR, and a
+	// fact grading itself is vacuous.
+	std::vector<float> ccDetectorVerdict_flat;
+	// Regional fact-audit of the detector (built in splitIQlocked pass 2,
+	// consumed by produceY's Y-return ONLY — the suppression duty keeps
+	// the full mask; auditing it with Y-return honesty squelched
+	// legitimate suppression, the two-duties conflict measured +10%
+	// covered chroma alternation).
+	std::vector<float> ccAuditW_flat;
+	int ccAuditNX = 0, ccAuditNY = 0;
+	// Band-revoked residue with an affirmed luma claim (attributiondefs
+	// bandResidueLumaClaim), in composite units: w·(src − legalCarrier)
+	// per sample on uncovered frames, zero elsewhere. Built in
+	// splitIQlocked's legal-band application stage; consumed by produceY
+	// as a VALUE folded into the returned-Y candidate — never written
+	// into carrierComp (the elected scalar is ONE object; a second,
+	// numerically different copy inside the election rendered as dot
+	// fringing at garment edges, 2026-07-31).
+	std::vector<float> bandResidueY_flat;
+	inline const float *bandResidueY_line(int line) const {
+		if (bandResidueY_flat.empty() || demodWidth <= 0 ||
+		    line < 0 || line >= demodLines)
+			return nullptr;
+		return bandResidueY_flat.data() +
+		       static_cast<size_t>(line) * demodWidth;
+	}
 	std::vector<float> lockedCcMaskRaw_flat;
 	std::vector<float> lockedCcMask_flat;
 	// Schedule-rejected (alien) vertical partner evidence [0,1] per pixel: 1
@@ -1072,6 +1185,18 @@ private:
 			return anchored1DSource_flat.data() +
 			       static_cast<size_t>(line) * demodWidth;
 		return locked1DSource_line(line);
+	}
+
+	// Fact-family carrier for the RENDERED chroma demod on covered
+	// frames -- both parities of the same plane: exact (chat) on covered
+	// lines, the certified-comb rung on comp lines. Null on uncovered
+	// frames, so consumers fall back to the elected comb unchanged.
+	inline const double *anchoredCarrier_line(int line) const {
+		if (anchored1DValid && demodWidth > 0 && line >= 0 &&
+		    line < demodLines && !anchored1DSource_flat.empty())
+			return anchored1DSource_flat.data() +
+			       static_cast<size_t>(line) * demodWidth;
+		return nullptr;
 	}
 
 	inline const double *locked1DSource_line(int line) const {
@@ -1501,6 +1626,16 @@ private:
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    carrierImpurity_flat.empty()) return nullptr;
 		return carrierImpurity_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* ccDetectorVerdict_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    ccDetectorVerdict_flat.empty()) return nullptr;
+		return ccDetectorVerdict_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline float* ccDetectorVerdict_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    ccDetectorVerdict_flat.empty()) return nullptr;
+		return ccDetectorVerdict_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 	inline float* lockedCcMaskRaw_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||

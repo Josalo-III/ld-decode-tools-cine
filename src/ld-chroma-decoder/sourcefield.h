@@ -44,6 +44,18 @@ struct SourceField {
     // it as evidence/calibration only -- it covers half the lines of A/C
     // film frames and would alternate if rendered directly.
     QVector<float> dgExactCarrier;
+
+    // Sync-tone tracker payload (cadence assembler -> decoder head).
+    // Per-region [predicted rotation since the previous dG anchor (rad),
+    // confidence 0..1], row-major over field-raster regions of
+    // kSyncRegLines x kSyncRegCols. Region row r covers frame lines
+    // 32r..32r+31 (16 field lines); region col c covers active samples
+    // 128c..128c+127 -- the same lattice the decoder's star/sync grids
+    // use, so no remapping is needed at consumption. Empty = no tracker
+    // authority for this field.
+    static constexpr int kSyncRegLines = 16;
+    static constexpr int kSyncRegCols  = 128;
+    QVector<float> dgSyncIncrement;
     // Cadence identity remains in field.cinemap for diagnostics, but fallback
     // work must not use that identity as permission for FVF's progressive
     // frame regime. Guarded frame candidates remain part of the field regime.

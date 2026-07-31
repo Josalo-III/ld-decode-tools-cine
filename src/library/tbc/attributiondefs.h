@@ -424,6 +424,43 @@ inline CarrierResidualDiagnostics analyzeCarrierResidualOptions(
     return out;
 }
 
+// Encoder band-legality revocation (the bandwidth law).  Chroma was
+// bandlimited (nominally 1.3 MHz) BEFORE modulation, so demod-envelope
+// energy outside the legal band cannot be chroma — its chroma claim is
+// revoked by law, no detector consulted.  The revocation is ONE-SIDED: it
+// unclaims chroma; it never asserts luma.  Measured on certified material
+// (2026-07-31): the exact carrier is band-clean beyond 1.3 MHz, and the
+// revoked residue is mostly broadband capture noise — reassigning it to Y
+// without evidence follows raw's noise into the quieter luma.  So the
+// residue moves to Y only on AFFIRMATIVE luma evidence (a temporal
+// certified-luma witness, a star signature, certified continuation);
+// revoked-but-unwitnessed energy is uncertainClaim and abstains — the
+// silent discard is the correct verdict for it, not a loss to be fixed.
+//
+// The witness contract is precision-first ("real chroma is never claimed
+// as luma"): an admissible witness may under-fire freely (abstention is
+// its correct failure mode) but must rarely fire falsely.  A temporal
+// certified-luma tween measured precision 0.70 / claimed-magnitude 0.84
+// at double the deployed pitch — admissible as a WEIGHT, never a value.
+struct BandRevokedResidueEvidence {
+    double residueIRE = 0.0;       // out-of-legal-band envelope magnitude
+    double witnessMatchIRE = 0.0;  // witness luma structure at this site
+    double witnessSupport = 0.0;   // witness quality [0,1], precision-first
+};
+
+// Decision layer: the luma claim a band-revoked residue may assert, in
+// [0,1] of the residue.  min() caps the claim at what the witness actually
+// saw (a witness cannot license more energy than it observed), and the
+// support factor scales authority without ever inverting abstention into
+// assertion.  Zero witness -> zero claim -> the residue abstains.
+inline double bandResidueLumaClaim(const BandRevokedResidueEvidence &e)
+{
+    if (e.residueIRE <= 1e-9)
+        return 0.0;
+    const double match = std::min(e.witnessMatchIRE, e.residueIRE);
+    return clamp01(match / e.residueIRE) * clamp01(e.witnessSupport);
+}
+
 struct CarrierImpurityEvidence {
     double narrowMagIRE = 0.0;
     double wideMagIRE = 0.0;

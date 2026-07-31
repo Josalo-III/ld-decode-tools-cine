@@ -1689,6 +1689,18 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
 
     if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
+    // Certified cede (CONSTRUCTION): on a def line the Field A candidate IS
+    // the center -- the certified 1D. The twin capture already separated
+    // this field; a comb can only mix truth with a model. Upstream of every
+    // election, so preclean consumers and attribution read the same story.
+    if (certifiedOneDLevel() >= 2 && certifiedDefLine(tapLine.cacheLine)) {
+        const double *center = locked1DSource_line(tapLine.cacheLine);
+        if (center) {
+            std::copy(center, center + width, outFieldLine);
+            return;
+        }
+    }
+
     const auto  &T   = configuration.tunables;
     const double invI = invIreScale;
     const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
@@ -2058,6 +2070,18 @@ void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
         return;
     }
 
+    // Certified cede (construction): see computeFieldALine.
+    if (certifiedOneDLevel() >= 2 && certifiedDefLine(lineNumber)) {
+        const double *center = locked1DSource_line(lineNumber);
+        if (center) {
+            std::copy(center, center + width, outFieldLine);
+            if (outReasonLine)
+                std::fill(outReasonLine, outReasonLine + width,
+                          (std::uint8_t)FieldBReasonCede);
+            return;
+        }
+    }
+
     const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
     computeFieldBLine(tapLine, outFieldLine, outReasonLine);
 }
@@ -2116,6 +2140,19 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
 
     if (width <= 0 || !outFieldLine)
         return;
+
+    // Certified cede (construction): see computeFieldALine.
+    if (certifiedOneDLevel() >= 2 && lineNumber >= first &&
+        lineNumber < last && certifiedDefLine(lineNumber)) {
+        const double *center = locked1DSource_line(lineNumber);
+        if (center) {
+            std::copy(center, center + width, outFieldLine);
+            if (outReasonLine)
+                std::fill(outReasonLine, outReasonLine + width,
+                          (std::uint8_t)FieldBReasonCede);
+            return;
+        }
+    }
 
     if (lineNumber < first || lineNumber >= last ||
         static_cast<int>(tapLine.tap0.size()) < width) {
@@ -2481,6 +2518,25 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     const bool haveUpLine = verticalAllowed && (line - 1 >= first);
     const bool haveDnLine = verticalAllowed && (line + 1 <  last);
 
+    // HQ-leg treatment (user, 2026-07-30: "certified legs are ideally
+    // positioned for comb as no other"). A certified leg removes half the
+    // comb's unknowns: its luma AND carrier are conservation facts, so every
+    // trust-based discount below -- phase alignment toward the center, the
+    // correlation ramp, hue projection, the coherence strength gate -- is
+    // vestigial against it. Those cautions exist because a MODEL leg's
+    // carrier can lie; a certified leg cannot. Content-based gates (the
+    // vertical-transition selector, reach legality, disGate) remain: they
+    // answer "is the image continuous here", which certification does not
+    // decide. Escape LDCD_CERT_LEGS=0 (active only with LDCD_CERT_1D >= 2).
+    static const bool certLegsOn = []{
+        const char *e = std::getenv("LDCD_CERT_LEGS");
+        return !(e && std::atoi(e) == 0);
+    }();
+    const bool upCert = certLegsOn && certifiedOneDLevel() >= 2 &&
+                        haveUpLine && certifiedDefLine(line - 1);
+    const bool dnCert = certLegsOn && certifiedOneDLevel() >= 2 &&
+                        haveDnLine && certifiedDefLine(line + 1);
+
     // Signed correlation in [-1..1].  Caller supplies pre-computed magnitudes
     // to avoid recomputing hypot per call site.
     auto corrSignedMags = [&](const std::complex<double> &a,
@@ -2542,15 +2598,25 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
 
     std::copy(centerIQ.begin(), centerIQ.begin() + width, outFrameIQ.begin());
 
-    // Column-local phase alignment.
+    // Column-local phase alignment. A certified leg is never aligned toward
+    // the center: its phase is exact, and rotating truth toward a model
+    // estimate is the alignment running backwards.
     for (int x = 0; x < width; ++x) {
-        upIQ[x] = applyColumnPhaseAlignment(centerIQ[x], upIQ[x], invI, phaseAlignLimits);
-        dnIQ[x] = applyColumnPhaseAlignment(centerIQ[x], dnIQ[x], invI, phaseAlignLimits);
+        if (!upCert)
+            upIQ[x] = applyColumnPhaseAlignment(centerIQ[x], upIQ[x], invI, phaseAlignLimits);
+        if (!dnCert)
+            dnIQ[x] = applyColumnPhaseAlignment(centerIQ[x], dnIQ[x], invI, phaseAlignLimits);
     }
 
     // ------------------------------------------------------------
     // Combine (soft signed contributions + boundary-aware asymmetry)
     // ------------------------------------------------------------
+    // NOTE (user, 2026-07-30): the comp-line bracket phase rotation was
+    // briefly candidate-local here and was MOVED TO THE HEAD (stage 1b in
+    // buildPhaseCorrected1D) -- "Frame B is equally important" and a
+    // candidate-local rotation cannot reach it. The centerIQ arriving here
+    // already carries bracket phase on comp lines of covered frames.
+
     for (int x = 0; x < width; ++x) {
         const std::complex<double> Z0 = centerIQ[x];
         const double a0 = cmag(Z0);
@@ -2621,14 +2687,14 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         // correlation that fully passes the adaptive-strength gate.
         {
             const double agreeThresh = std::clamp(T.FRAME_IQ_COH_PASS_CORR, 0.0, 1.0);
-            const bool upAgrees = useUp && (corrUp >= agreeThresh);
-            const bool dnAgrees = useDn && (corrDn >= agreeThresh);
+            const bool upAgrees = useUp && (upCert || corrUp >= agreeThresh);
+            const bool dnAgrees = useDn && (dnCert || corrDn >= agreeThresh);
             const double a0sq = a0 * a0;
 
-            if (upAgrees && !dnAgrees && useDn && a0sq > 1e-18) {
+            if (upAgrees && !dnAgrees && useDn && !dnCert && a0sq > 1e-18) {
                 const double proj = dotIQ(ZDnRaw, Z0) / a0sq;
                 ZDnRaw = Z0 * proj;
-            } else if (dnAgrees && !upAgrees && useUp && a0sq > 1e-18) {
+            } else if (dnAgrees && !upAgrees && useUp && !upCert && a0sq > 1e-18) {
                 const double proj = dotIQ(ZUpRaw, Z0) / a0sq;
                 ZUpRaw = Z0 * proj;
             }
@@ -2642,26 +2708,27 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         std::complex<double> Zsum = Z0;
         double wsum = 1.0;
 
-        if (useUp) {
+        auto legContrib = [&](bool cert, const std::complex<double> &Zn,
+                              double an, double reach) {
             std::complex<double> contrib;
             double w;
-            softAlignBoth(Z0, ZUpRaw, a0, aUp, contrib, w);
-            w *= upReach;
-            if (w > 0.0) {
-                Zsum += contrib * upReach;
-                wsum += w;
+            if (cert) {
+                // Certified leg: the correlation RAMP is a trust instrument
+                // and does not apply; the sign is content (a genuine hue
+                // reversal must not be averaged as agreement).
+                const double c = corrSignedMags(Z0, Zn, a0, an);
+                contrib = (c >= 0.0) ? Zn : -Zn;
+                w = 1.0;
+            } else {
+                softAlignBoth(Z0, Zn, a0, an, contrib, w);
             }
-        }
-        if (useDn) {
-            std::complex<double> contrib;
-            double w;
-            softAlignBoth(Z0, ZDnRaw, a0, aDn, contrib, w);
-            w *= dnReach;
-            if (w > 0.0) {
-                Zsum += contrib * dnReach;
-                wsum += w;
+            if (w * reach > 0.0) {
+                Zsum += contrib * reach;
+                wsum += w * reach;
             }
-        }
+        };
+        if (useUp) legContrib(upCert, ZUpRaw, aUp, upReach);
+        if (useDn) legContrib(dnCert, ZDnRaw, aDn, dnReach);
 
         std::complex<double> Zframe = Zsum / wsum;
 
@@ -2690,6 +2757,10 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
             ? (coh - cohStart) / (cohPass - cohStart)
             : (coh >= cohPass ? 1.0 : 0.0);
         cohGate = std::clamp(cohGate, 0.0, 1.0);
+        // A certified leg's participation is not a confidence question;
+        // only the content gate (disGate) may back the comb off it.
+        if ((useUp && upCert) || (useDn && dnCert))
+            cohGate = 1.0;
 
         const double disagreementStart = 5.0;
         const double disagreementFull = 18.0;
@@ -2870,6 +2941,21 @@ void Comb::FrameBuffer::computeFrameBLine(
 
     outFrameIQ.resize(width);
     outFrameScalar.resize(width);
+
+    // Certified cede (construction): on a def line the Frame B candidate IS
+    // the center; IQ from the stage-1 locked products of the same scalar.
+    if (certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
+        const double *center = locked1DSource_line(line);
+        const float *cI4 = locked1DTI4fsc_line(line);
+        const float *cQ4 = locked1DTQ4fsc_line(line);
+        for (int rel = 0; rel < width; ++rel) {
+            outFrameScalar[rel] = center ? center[rel] : 0.0;
+            outFrameIQ[rel] = std::complex<double>(
+                cI4 ? (double)cI4[rel] : 0.0,
+                cQ4 ? (double)cQ4[rel] : 0.0);
+        }
+        return;
+    }
 
     auto clearFrameOutputs = [&]() {
         std::fill(outFrameIQ.begin(), outFrameIQ.end(),
