@@ -215,7 +215,7 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
 
     // 4. Continuity & intra-segment healing pass
     qInfo() << "Running Continuity Healer...";
-    int healedCount = healContinuity(solvedSegments, cache);
+    int healedCount = healContinuity(sv, solvedSegments, cache);
     qInfo() << "Healer refined" << healedCount << "segments/spans.";
 
     // 5. Final paint using healed results
@@ -3370,22 +3370,49 @@ CineMap::PhaseRun CineMap::solveSegment(SourceVideo& sv,
     const int  mixedPhase = mixednessLocked ? run.phaseOffset : -1;
     const double mixedConf = mixednessLocked ? run.confidence : 0.0;
 
-    // 2. Pattern harvest at the mixedness-candidate phase (side effect: writes
-    //    confident twin pairs to doplGang). Counts confirmatory pairs at the
-    //    predicted sites. The count enters the election as a bonus at the
-    //    candidate phase; pattern by itself does not render a decision —
-    //    pattern's fallback is brute force no matter what the path.
-    int patternPairs = 0;
-    if (mixednessLocked) {
-        patternPairs = harvestTwinsByPattern(sv, segStartField, segEndField,
-                                             run.phaseOffset, cache);
+    // 2. Pattern harvest — the cheap fast-out. It checks only the ~2 sites per
+    //    5-frame cycle that a candidate phase predicts, instead of every d=2 pair
+    //    in the segment, and writes what it confirms to doplGang.
+    //
+    //    It runs on any phase mixedness can NAME, not only one it could lock.
+    //    Checking a proposed phase cheaply is exactly how an unsure proposal should
+    //    be adjudicated, and that is the case where a fast-out is worth the most.
+    //    Previously this was gated on a lock, so the fast path could never fire when
+    //    it was needed and brute force ran regardless.
+    int patternCandidatePhase = mixedPhase;
+    if (patternCandidatePhase < 0 && mixInformative) {
+        int bestMix = -1;
+        double bestMixScore = 0.0;
+        for (int p = 0; p < 5; ++p) {
+            if (mixVec[p] > bestMixScore) { bestMixScore = mixVec[p]; bestMix = p; }
+        }
+        patternCandidatePhase = bestMix;   // stays -1 if nothing scored positive
     }
 
-    // 3. Brute-force dG signal — always run, produces dgVec via the A/C
-    //    geometry election in tryLockByDgGeometry. Restricted to d=2:
-    //    classifyTwinAC_strict requires hi==lo+2; d=4/6 can't form geometry.
-    std::vector<TwinEdge> harvested =
-        harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2);
+    int patternPairs = 0;
+    if (patternCandidatePhase >= 0) {
+        patternPairs = harvestTwinsByPattern(sv, segStartField, segEndField,
+                                             patternCandidatePhase, cache);
+    }
+
+    // 3. Brute force is the FALLBACK, not the default. It is the wholesale
+    //    operation — every d=2 pair in the segment — so it runs only when pattern
+    //    came up short of the ~1-twin-per-5-frames that 3:2 predicts. A pattern
+    //    that found its twins has already established the cadence, and paying for
+    //    the wholesale pass on top of it buys nothing.
+    //
+    //    Restricted to d=2: classifyTwinAC_strict requires hi==lo+2, so d=4/6
+    //    cannot form geometry.
+    const int segFramesForPattern = std::max(1, (segEndField - segStartField + 1) / 2);
+    const int expectedPatternPairs = std::max(1, segFramesForPattern / 5);
+    const bool patternSufficed =
+        (patternPairs >= std::max(1, (expectedPatternPairs + 1) / 2));
+
+    int harvestedEdges = 0;
+    if (!patternSufficed) {
+        harvestedEdges = static_cast<int>(
+            harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2).size());
+    }
 
     DgLock lock;
     QString geomRejectReason;
@@ -3421,15 +3448,19 @@ CineMap::PhaseRun CineMap::solveSegment(SourceVideo& sv,
     if (mixInformative) { for (int i = 0; i < 5; ++i) combined[i] += mixN[i]; signalSources++; }
     if (dgInformative)  { for (int i = 0; i < 5; ++i) combined[i] += dgN[i];  signalSources++; }
 
-    // Pattern bonus at the mixedness-candidate phase: confirmatory evidence
-    // at predicted sites adds weight to that phase, calibrated against the
+    // Pattern bonus at the phase pattern actually tested: confirmatory evidence at
+    // predicted sites adds weight to that phase, calibrated against the
     // ~1-per-5-frames expected twin rate. Capped at 1.0 (same scale as one
     // normalized signal contribution).
-    if (mixednessLocked && patternPairs > 0) {
-        const int segFrames = std::max(1, (segEndField - segStartField + 1) / 2);
-        const int expectedPatternPairs = std::max(1, segFrames / 5);
-        const double patternBonus = std::min(1.0, double(patternPairs) / double(expectedPatternPairs));
-        combined[mixedPhase] += patternBonus;
+    //
+    // Keyed to patternCandidatePhase rather than to a locked mixedness phase, since
+    // pattern now also runs on named-but-unlocked candidates. The bonus remains
+    // one-sided — only the tested phase can earn it — which is why pattern is a
+    // fast-out and not a vote: the election proper is mixVec + dgVec.
+    if (patternCandidatePhase >= 0 && patternPairs > 0) {
+        const double patternBonus =
+            std::min(1.0, double(patternPairs) / double(expectedPatternPairs));
+        combined[patternCandidatePhase] += patternBonus;
     }
 
     int bestP = -1;
@@ -3483,18 +3514,18 @@ CineMap::PhaseRun CineMap::solveSegment(SourceVideo& sv,
         QString sources;
         if (mixInformative) sources += "mix";
         if (dgInformative)  sources += sources.isEmpty() ? "dg" : "+dg";
-        if (mixednessLocked && patternPairs > 0)
+        if (patternCandidatePhase >= 0 && patternPairs > 0)
             sources += sources.isEmpty() ? "pattern" : "+pattern";
         if (sources.isEmpty()) sources = "none";
 
         qInfo().noquote()
-            << QString("CineMap decision: SEGMENT_ELECT fields [%1..%2] sources=%3 mixedPhase=%4 mixedConf=%5 patternPairs=%6 harvestedEdges=%7 mixN={%8} dgN={%9} combined={%10} bestPhase=%11 bestScore=%12 secondBest=%13 margin=%14 floor=%15 result=%16")
+            << QString("CineMap decision: SEGMENT_ELECT fields [%1..%2] sources=%3 patternPhase=%4 mixedConf=%5 patternPairs=%6/%17 patternSufficed=%18 bruteEdges=%7 mixN={%8} dgN={%9} combined={%10} bestPhase=%11 bestScore=%12 secondBest=%13 margin=%14 floor=%15 result=%16")
                .arg(segStartField).arg(segEndField)
                .arg(sources)
-               .arg(mixedPhase)
+               .arg(patternCandidatePhase)
                .arg(mixedConf, 0, 'f', 3)
                .arg(patternPairs)
-               .arg(harvested.size())
+               .arg(harvestedEdges)
                .arg(vecStr(mixN, bestP))
                .arg(vecStr(dgN,  bestP))
                .arg(vecStr(combined, bestP))
@@ -3503,7 +3534,9 @@ CineMap::PhaseRun CineMap::solveSegment(SourceVideo& sv,
                .arg(secondC > -1e8 ? secondC : 0.0, 0, 'f', 4)
                .arg(margin, 0, 'f', 4)
                .arg(marginFloor, 0, 'f', 4)
-               .arg(hasWinner ? "lock" : (signalSources == 0 ? "no-signals" : "no-clear-combined-winner"));
+               .arg(hasWinner ? "lock" : (signalSources == 0 ? "no-signals" : "no-clear-combined-winner"))
+               .arg(expectedPatternPairs)
+               .arg(patternSufficed ? "yes(brute skipped)" : "no(brute ran)");
 
         qInfo().noquote()
             << QString("CineMap summary: SEGMENT fields [%1..%2] mixedness=%3 final=%4 conf=%5 source=evidence-additive(%6)")
@@ -3943,7 +3976,69 @@ void CineMap::detectAndEncodeInvertedCadenceRuns()
     }
 }
 
-int CineMap::healContinuity(std::vector<SegmentResult>& segments,
+double CineMap::verifyPhaseByTwins(SourceVideo& sv,
+                                   int segStart,
+                                   int segEnd,
+                                   int phaseOffset,
+                                   const SegmentCaptureCache& cache)
+{
+    if (!m_md || !m_disc) return -1.0;
+
+    const NoiseFloor& nf = calibrateTwinFloor(sv);
+    if (!nf.valid) return -1.0;
+
+    int startFrameIdx = -1, fStart = -1, fEnd = -1;
+    for (int s = segStart; s <= segEnd; ++s) {
+        if (cache.validSeq(s)) { startFrameIdx = fStart = cache.cap[s].frameIndex; break; }
+    }
+    for (int s = segEnd; s >= segStart; --s) {
+        if (cache.validSeq(s)) { fEnd = cache.cap[s].frameIndex; break; }
+    }
+    if (startFrameIdx < 0 || fEnd < 0) return -1.0;
+
+    const auto& vp = m_md->getVideoParameters();
+    const double floorIre = nf.ire * FLOOR_MULT_RECALL;
+
+    int sites = 0, hits = 0;
+
+    // The same site geometry pattern harvest uses: within the 5-frame cycle, pos 0
+    // carries the AA first-field twin and pos 2 the BC second-field twin.
+    for (int fi = fStart; fi <= fEnd; ++fi) {
+        if (m_disc->isPadded(fi)) continue;
+        if (fi + 1 > fEnd || m_disc->isPadded(fi + 1)) continue;
+
+        int pos = (fi - startFrameIdx + phaseOffset) % 5;
+        if (pos < 0) pos += 5;
+        if (pos != 0 && pos != 2) continue;
+
+        const int a = (pos == 0) ? m_disc->getFirstFieldNumber(fi + 1)
+                                 : m_disc->getSecondFieldNumber(fi + 1);
+        const int b = (pos == 0) ? m_disc->getFirstFieldNumber(fi + 2)
+                                 : m_disc->getSecondFieldNumber(fi + 2);
+        if (a < 1 || b < 1) continue;
+        if (a < segStart || a > segEnd || b < segStart || b > segEnd) continue;
+
+        const TwinDemod m = demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+        if (!m.valid) continue;
+
+        sites++;
+        if (m.grainIre < floorIre) hits++;
+    }
+
+    if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString("CineMap decision: PHASE_VERIFY fields [%1..%2] phase=%3 frames=[%4..%5] sites=%6 hits=%7 floor=%8")
+               .arg(segStart).arg(segEnd).arg(phaseOffset)
+               .arg(fStart).arg(fEnd).arg(sites).arg(hits)
+               .arg(floorIre, 0, 'f', 4);
+    }
+
+    if (sites < 2) return -1.0;   // no power: darkness, not a rejection
+    return static_cast<double>(hits) / sites;
+}
+
+int CineMap::healContinuity(SourceVideo& sv,
+                            std::vector<SegmentResult>& segments,
                             const SegmentCaptureCache& cache)
 {
     int changes = 0;
@@ -4012,17 +4107,33 @@ int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                     (next.run.phaseOffset - (startB - startA)) % 5;
                 if (projectedPhase < 0) projectedPhase += 5;
 
+                // Verify the projection against the twin sites it names. Where that
+                // test has power it decides, because it checks the actual claim; the
+                // mixedness fit only asks whether the phase looks plausible, and it
+                // was the criterion that let cadences extend into non-film. Where it
+                // has no power the span is dark, and darkness presumes — that is what
+                // solve-in-the-dark is for — so the fit still carries it.
+                const double twinFit = verifyPhaseByTwins(sv,
+                                                          curr.startField,
+                                                          curr.endField,
+                                                          projectedPhase,
+                                                          cache);
+
                 double fitScore =
                     scoreSpecificPhase(curr.mixedness,
                                        projectedPhase,
                                        curr.startField,
                                        cache);
 
-                if (fitScore > 0.15) {
+                const bool accept = (twinFit >= 0.0) ? (twinFit >= PHASE_VERIFY_MIN)
+                                                     : (fitScore > 0.15);
+
+                if (accept) {
                     qInfo() << "Healer: Back-projected phase"
                             << projectedPhase
                             << "into segment" << (i + 1)
-                            << "(Conf:" << fitScore << ")";
+                            << (twinFit >= 0.0 ? "(twins:" : "(mixedness fit:")
+                            << (twinFit >= 0.0 ? twinFit : fitScore) << ")";
 
                     demoteSegmentRange(curr, 0.4);
 
@@ -4050,17 +4161,29 @@ int CineMap::healContinuity(std::vector<SegmentResult>& segments,
                     (curr.run.phaseOffset + (startB - startA)) % 5;
                 if (projectedPhase < 0) projectedPhase += 5;
 
+                // Same rule as the back-projection: the twin sites the phase names
+                // decide where they can be measured, mixedness presumes where dark.
+                const double twinFit = verifyPhaseByTwins(sv,
+                                                          next.startField,
+                                                          next.endField,
+                                                          projectedPhase,
+                                                          cache);
+
                 double fitScore =
                     scoreSpecificPhase(next.mixedness,
                                        projectedPhase,
                                        next.startField,
                                        cache);
 
-                if (fitScore > 0.15) {
+                const bool accept = (twinFit >= 0.0) ? (twinFit >= PHASE_VERIFY_MIN)
+                                                     : (fitScore > 0.15);
+
+                if (accept) {
                     qInfo() << "Healer: Forward-projected phase"
                             << projectedPhase
                             << "into segment" << (i + 2)
-                            << "(Conf:" << fitScore << ")";
+                            << (twinFit >= 0.0 ? "(twins:" : "(mixedness fit:")
+                            << (twinFit >= 0.0 ? twinFit : fitScore) << ")";
 
                     demoteSegmentRange(next, 0.4);
 

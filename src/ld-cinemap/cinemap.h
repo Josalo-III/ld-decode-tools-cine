@@ -554,7 +554,28 @@ private:
                                int segEndField,
                                const std::vector<FrameMixedness>& mixedness);
 
-    int healContinuity(std::vector<SegmentResult>& segments,
+    // Fraction of the twin sites a phase PREDICTS that actually sit at the floor.
+    //
+    // A projected phase names the pairs that must be twins — roughly two per 5-frame
+    // cycle — so it can be checked directly instead of asking mixedness whether it
+    // looks plausible. One measurement per site against the generous floor, which for
+    // a sub-60-field rescue is a dozen or so pairs, nearly all of them already cached.
+    //
+    // Returns -1.0 when the test had no power (too few measurable sites), which is
+    // darkness and must fall back to presumption rather than reject.
+    double verifyPhaseByTwins(SourceVideo& sv,
+                              int segStart,
+                              int segEnd,
+                              int phaseOffset,
+                              const SegmentCaptureCache& cache);
+
+    // Majority of predicted sites must actually be twins. Perfect telecine gives 1.0;
+    // this leaves room for dropouts and pad fields without admitting a phase whose
+    // predicted sites are mostly empty.
+    static constexpr double PHASE_VERIFY_MIN = 0.50;
+
+    int healContinuity(SourceVideo& sv,
+                       std::vector<SegmentResult>& segments,
                        const SegmentCaptureCache& cache);
 
     void demoteCadenceRange(int startSeq, int endSeq, double newMaxConf);
