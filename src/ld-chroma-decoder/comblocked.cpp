@@ -223,7 +223,13 @@ struct CcRefProbe {
     // Which of these predicts the leak, and which is the noise, is the whole
     // question -- a mask driven by an uninformative read is the noisiest
     // election participant by construction.
-    enum Read { RgA = 0, REdge, RRegion, RGrammar, RLurch, RMask, NREADS };
+    // RDev (2026-08-02) is the LIVE committed-verdict read: the anchored
+    // delta devIRE mapped to [0,1] as devIRE / (2*cutoff), so bin center
+    // 0.5 sits at the shipping cutoff and the per-bin ideal-m curve IS the
+    // cutoff sweep. The gA/edge/lurch columns grade retired reads, kept for
+    // contrast.
+    enum Read { RgA = 0, REdge, RRegion, RGrammar, RLurch, RMask, RDev,
+                NREADS };
     static constexpr int kBins = 5;
     static constexpr double kFireEps = 0.01;
     // Fixed-scalar sweep: what a constant return fraction would have scored.
@@ -676,7 +682,8 @@ struct CcRefProbe {
         static const char *dn[2] = { "flat  ", "detail" };
         static const char *fn[2] = { "silent", "fired " };
         static const char *rn[NREADS] =
-            { "gA     ", "edge   ", "regKeep", "gPass  ", "lurch  ", "mask   " };
+            { "gA     ", "edge   ", "regKeep", "gPass  ", "lurch  ",
+              "mask   ", "dev    " };
         if (covered > 0) {
             std::fprintf(stderr, "[CCREF f=%ld] covered px=%ld\n",
                          frameIdx, covered);
@@ -1678,10 +1685,15 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
             }
 
             for (int rel = 0; rel < width; ++rel) {
-                const int w0 = std::clamp(rel, 0, width - 4);
+                // Centered 5-tap, half-weight ends (integer centroid): the
+                // old [rel, rel+3] window registered every conformance
+                // verdict 1.5 samples right of the sample it judged.
                 double e0 = 0.0;
-                for (int k = 0; k < 4; ++k)
-                    e0 += bp0[w0 + k] * bp0[w0 + k];
+                for (int k = -2; k <= 2; ++k) {
+                    const int j = std::clamp(rel + k, 0, width - 1);
+                    const double w = (k == -2 || k == 2) ? 0.5 : 1.0;
+                    e0 += w * bp0[j] * bp0[j];
+                }
                 if (e0 < energyFloor) {
                     if (dumpConf)
                         ++cBelowFloor;
@@ -1697,9 +1709,11 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                     const double *bpP = axes[a];
                     double dot = 0.0;
                     double eP = 0.0;
-                    for (int k = 0; k < 4; ++k) {
-                        dot += bp0[w0 + k] * bpP[w0 + k];
-                        eP  += bpP[w0 + k] * bpP[w0 + k];
+                    for (int k = -2; k <= 2; ++k) {
+                        const int j = std::clamp(rel + k, 0, width - 1);
+                        const double w = (k == -2 || k == 2) ? 0.5 : 1.0;
+                        dot += w * bp0[j] * bpP[j];
+                        eP  += w * bpP[j] * bpP[j];
                     }
                     if (eP < energyFloor)
                         continue;
@@ -2480,16 +2494,21 @@ static void ldcdSideCoherenceAlpha(const std::vector<double> &a,
     static const int cB[4] = { 1, 0, -1, 0 };
     static const int sB[4] = { 0, 1, 0, -1 };
     std::fill(alpha.begin(), alpha.end(), 0.0);
-    for (int xi = 3; xi < width - kSnapHalf; ++xi) {
+    // Centered 9-tap, half-weight ends (the 6f502ec integer-centroid
+    // convention): the old [-3,+4] window carried a +0.5 centroid that
+    // biased WHERE the alpha opens by half a sample at envelope edges.
+    for (int xi = kSnapHalf; xi < width - kSnapHalf; ++xi) {
         double aI = 0, aQ = 0, bI = 0, bQ = 0;
         bool ok = true;
-        for (int k = xi - 3; k <= xi + kSnapHalf && ok; ++k) {
+        for (int k = xi - kSnapHalf; k <= xi + kSnapHalf && ok; ++k) {
             if (!std::isfinite(a[k]) || !std::isfinite(b[k])) {
                 ok = false; break;
             }
+            const double w =
+                (k == xi - kSnapHalf || k == xi + kSnapHalf) ? 0.5 : 1.0;
             const int ph = k & 3;
-            aI += a[k] * cB[ph]; aQ += a[k] * sB[ph];
-            bI += b[k] * cB[ph]; bQ += b[k] * sB[ph];
+            aI += w * a[k] * cB[ph]; aQ += w * a[k] * sB[ph];
+            bI += w * b[k] * cB[ph]; bQ += w * b[k] * sB[ph];
         }
         if (!ok) continue;
         const double ma = std::hypot(aI, aQ);
@@ -3379,6 +3398,28 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             (certifiedOneDLevel() >= 1 && frameHasExactCoverage())
                 ? exactCarrierRow(line)
                 : nullptr;
+        // Referee repair (2026-08-02): stash the PRE-head estimator so the
+        // truth referees' "1D" column grades the model, not the fact it was
+        // replaced by. Probe-only; never consumed by render/decisions.
+        static const bool refereeStashOn = []{
+            return std::getenv("LDCD_PROBE_DSREF") != nullptr ||
+                   std::getenv("LDCD_PROBE_CCREF") != nullptr ||
+                   std::getenv("LDCD_PROBE_ANTGRADE") != nullptr ||
+                   std::getenv("LDCD_PROBE_TWEEN") != nullptr;
+        }();
+        float *preHeadRow = nullptr;
+        if (refereeStashOn && certExRow) {
+            // Reset at the first covered line so a reused buffer never
+            // serves a previous frame's estimator values.
+            if (probePreHead1D_flat.size() !=
+                    static_cast<size_t>(demodLines) * demodWidth ||
+                line == first)
+                probePreHead1D_flat.assign(
+                    static_cast<size_t>(demodLines) * demodWidth,
+                    std::numeric_limits<float>::quiet_NaN());
+            preHeadRow = probePreHead1D_flat.data() +
+                static_cast<size_t>(line) * demodWidth;
+        }
 
         // Stage 1b -- comp-line HEAD phase snap (user, 2026-07-30: "move the
         // snap earlier... Frame B is equally important"). On comp lines of
@@ -3432,6 +3473,8 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const int h = left + rel;
             const int phase = carrierSampleClass(line, h);
             double source = restrainedLine[rel];
+            if (preHeadRow)
+                preHeadRow[rel] = static_cast<float>(source);
             if (certExRow && std::isfinite(certExRow[h]))
                 source = (double)certExRow[h];
 
@@ -3809,6 +3852,23 @@ static constexpr double kCcLurchHardIRE = 4.0;
 // obeys internally.
 static constexpr double kCcCarrierFloorIRE = 2.0;
 
+// Committed-verdict cutoff (2026-08-02): the measured disagreement between
+// the elected carrier and the anchored (anticipation-corrected) carrier, in
+// IRE, below which the return bails and above which it commits fully.
+// Confidence never sets a level; this is the single bail threshold. Sits at
+// the noise-pedestal floor -- below kCcCarrierFloorIRE the "disagreement" is
+// the capture's own noise, not confiscated luma (CCREF, 2026-07-30).
+// LDCD_CC_CUTOFF overrides for A/B.
+static constexpr double kCcCommitCutoffIRE = kCcCarrierFloorIRE;
+
+// Fallback witness thresholds where no anchored plane exists (--dg-discard,
+// non-cadence sources). gA's referee-endorsed regime starts at 0.40 (CCREF:
+// anti-informative 0.2-0.4, superb above); regionKeep past 0.5 is a
+// positively same-region vertical partner = a colour boundary, stand down.
+// Binary predicates, never scales.
+static constexpr double kCcFallbackGALo = 0.40;
+static constexpr double kCcFallbackRegionKeepMax = 0.5;
+
 void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                                       const FrameBuffer *nextF)
 {
@@ -3821,6 +3881,11 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
     const int srcBuf    = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
 
     if (width <= 0 || firstLine >= lastLine) return;
+
+    // Star classification is a split decision: establish the licensed
+    // raw-domain footprint before publishing any elected carrier.  The same
+    // immutable footprint is consumed by produceY and the final IQ renderer.
+    buildStarFootprint(prevF, nextF);
 
     if (!basisLockedInit) {
         double Ce = 1.0, Se = 0.0;
@@ -4395,6 +4460,18 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
         }
     }
 
+    // Disposable dev-envelope census (LDCD_PROBE_CCDEV=1, engaged runs
+    // only): one atomic line per frame -- the committed detector's
+    // measured-disagreement distribution, to adjudicate the self-blinding
+    // hypothesis (quiet frames: anchored tracks the same alias the
+    // elected carrier carries, so dev sits under the cutoff with the
+    // cross-colour still standing).
+    static const bool ccDevOn = std::getenv("LDCD_PROBE_CCDEV") != nullptr;
+    static const bool ccRefDevOn =
+        std::getenv("LDCD_PROBE_CCREF") != nullptr;
+    std::vector<float> ccDevSamples;
+    long ccDevMaskN = 0, ccDevAnchN = 0;
+
     for (int line = firstLine; line < lastLine; ++line) {
         const double *src = clpbuffer[srcBuf].pixel[line];
 
@@ -4431,24 +4508,6 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
 
         const float *impRow = carrierImpurity_line(line);
         const float *sameRegionRow = regionSamePartner_line(line);
-        const float *hDeltaRow = lockedLumaHDeltaIRE_line(line);
-        // Pixel-accurate notch luma (raw - 1D bandpass) for the cross-color
-        // edge read only: sharper than the coarse ±2-on-lockedLumaSmooth
-        // service, which localizes edges to ~2 columns and leaves diagonals
-        // aliased. The shared lockedLumaHDeltaIRE service is left untouched for
-        // its reach/FVF clients.
-        const quint16 *ccRawLine =
-            rawbuffer.data() + static_cast<size_t>(line) * videoParameters.fieldWidth;
-        const double *ccSrc1D = locked1DSource_line(line);
-        // Detectors-trade-for-truth (user law, 2026-07-30: "the minute we
-        // can stop guessing, we do"): the certified carrier for this line,
-        // consumed below as VERDICT (covered samples) and as detector INPUT
-        // (true luma for the edge read). Escape LDCD_CC_FACTS=0.
-        static const bool ccFactsOn = []{
-            const char *e = std::getenv("LDCD_CC_FACTS");
-            return !(e && std::atoi(e) == 0);
-        }();
-        const float *ccExRow = ccFactsOn ? exactCarrierRow(line) : nullptr;
         // NOTE (renderer fact, 2026-07-31): a fact-family demod of the
         // RENDERED product planes was built here and measured inert --
         // filterIQLocked renders colour as demod(raw - Y), the exact
@@ -4456,14 +4515,33 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
         // covered-frame chroma win is carried by the Y facts plus the
         // suppression retirement (ccRetired, pass 2). Removed; do not
         // rebuild a product-side chroma path.
-        const lddecode::CarrierAnalysisRecord *analysisRow =
-            carrierAnalysis_line(line);
-        // ±2 same-field conformance context for the boundary/desert split
-        // (see the transfer policy below).
-        const lddecode::CarrierAnalysisRecord *analysisUpRow =
-            (line - 2 >= firstLine) ? carrierAnalysis_line(line - 2) : nullptr;
-        const lddecode::CarrierAnalysisRecord *analysisDnRow =
-            (line + 2 < lastLine) ? carrierAnalysis_line(line + 2) : nullptr;
+        //
+        // CCR evidence upgrade (2026-08-02): the anticipation-corrected
+        // carrier (anchored plane -- certified facts on covered frames,
+        // the causal chain on uncovered ones) is the detector's reference.
+        // Where it exists, disagreement between the elected carrier and
+        // the anchored carrier is MEASURED contamination in IRE, and the
+        // notch edge read, grammar proofs, and concert gate it replaced
+        // are deleted, not layered under.
+        const double *ccAnchRow = (anchored1DValid &&
+            anchored1DSource_flat.size() ==
+                static_cast<size_t>(demodLines) * demodWidth)
+            ? anchored1DSource_flat.data() +
+                  static_cast<size_t>(line) * demodWidth
+            : nullptr;
+        // Detector reference pair (2026-08-02, round 2): the OBSERVATION
+        // side is the untouched locked 1D -- the safe retreat, which the
+        // construction law guarantees no comb/echo signal ever enters --
+        // never the elected carrier. Measured failure that forced this:
+        // the tap fact-injection pulled the elected carrier toward the
+        // anchored story, collapsing |elected - anchored| and blinding the
+        // committed verdict while the alias-conforming cross-colour (which
+        // combing cannot cancel) still stood: the strong frames' -53%
+        // chroma fell to -4%. 1D-vs-anchored is immune to every future
+        // comb change: alias and stolen luma live in the 1D and not in the
+        // anchored model (fires); legal chroma lives identically in both
+        // (bails).
+        const double *ccObs1D = locked1DSource_line(line);
 
         if (prodIRow)    std::fill(prodIRow, prodIRow + width, 0.0f);
         if (prodQRow)    std::fill(prodQRow, prodQRow + width, 0.0f);
@@ -4531,158 +4609,67 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                 ? std::clamp((double)sameRegionRow[xi], 0.0, 1.0)
                 : 0.0;
 
-            // Two reads with DIFFERENT guards, because their failure modes
-            // are mirror images.  One law over both: suppression may never
-            // exceed measured evidence (the cap), so ccWeight redistributes
-            // what was found but cannot manufacture.
+            // COMMITTED VERDICT (user law, 2026-08-02). Evidence confidence
+            // cannot be expected to correlate with truth, so confidence
+            // never sets a level: one cutoff below which the operation
+            // bails, full commit above it. A committed operation returns a
+            // clear result pro or con; a hedged one shelters the defect it
+            // should expose. The evidence-ceiling cap and both analog
+            // reads' level-setting retire together (research phase: data
+            // over shelter). RETGRADE conviction that forced this: 77.5%
+            // of the un-recovered theft budget sat where the old mask
+            // idled below its own scaling (quiet/partial flat sites), and
+            // gA is anti-informative in exactly that regime (CCREF bins
+            // 0.2-0.4).
             //
-            // Aperture read: gA * (1 - regionKeep), NOT proof-gated.  gA is
-            // the only witness against alias-conforming cross-colour (the
-            // chain-link fence): that energy INVERTS across ±2 like legal
-            // carrier -- that is exactly why the comb passes it as chroma --
-            // so no conformance-based proof can ever convict it intra-field,
-            // and proof-gating this read let the fence confetti through
-            // untouched.  Its guard against real-chroma ringing (gA reads
-            // 0.3-0.6 at genuine chroma texture and edges) is regionKeep's
-            // same-hue vertical continuity.
-            //
-            // Edge read: min(edgeRamp, proof), proof-REQUIRED.  edgeRamp
-            // (the 1D vertical-contrast service) is an edge detector by
-            // construction, so ungated it desaturates every garment
-            // boundary with a luma step (bikini against bright sand).  The
-            // proof has two grades over the bandpass conformance:
-            //   * strict carrierIllegalProof(): energy decisively MATCHING
-            //     where the schedule demands inversion is luma by law --
-            //     vertical strokes convict on the ±2 axes alone;
-            //   * ambient carrierTrust() complement, confined to legality
-            //     DESERTS: the ambiguous middle holds both genuine hue
-            //     boundaries (correlation windows straddle two hues, worst
-            //     near-complementary: cyan fabric against skin fakes
-            //     "fails to invert") and in-field diagonal detail.
-            //     Conformance cannot split them, vertical context can: a
-            //     hue boundary is a thin ambiguous band BETWEEN
-            //     certified-legal regions and inherits their protection
-            //     (carrierLegalProof at ±2, per-column); diagonal detail
-            //     sits where nothing certifies legal and stays actionable.
-            // Notch edge: raw - 1D bandpass, differenced at ±2 (same carrier
-            // phase, so the carrier cancels while the un-smoothed luma keeps a
-            // per-pixel edge). This is the "go back to notch for pixel
-            // accuracy" read; its residual-carrier leak in saturated colour is
-            // held by the grammar-pass exemption below. Falls back to the
-            // shared smooth service if the notch inputs are unavailable.
-            double hDeltaIRE = 0.0;
-            if (ccRawLine && ccSrc1D) {
-                const int xm = std::max(0, xi - 2);
-                const int xp = std::min(width - 1, xi + 2);
-                // Input trade: raw - ex IS luma on covered samples; the
-                // notch stays only where no fact exists.
-                const double notchM =
-                    (ccExRow && std::isfinite(ccExRow[left + xm]))
-                        ? (double)ccRawLine[left + xm] -
-                              (double)ccExRow[left + xm]
-                        : (double)ccRawLine[left + xm] - ccSrc1D[xm];
-                const double notchP =
-                    (ccExRow && std::isfinite(ccExRow[left + xp]))
-                        ? (double)ccRawLine[left + xp] -
-                              (double)ccExRow[left + xp]
-                        : (double)ccRawLine[left + xp] - ccSrc1D[xp];
-                hDeltaIRE = std::fabs(notchP - notchM) * invIreScale;
-            } else if (hDeltaRow) {
-                hDeltaIRE = (double)hDeltaRow[xi];
-            }
-            const double edgeRamp = std::clamp(
-                (hDeltaIRE - kCcEdgeSoftIRE) /
-                    (kCcEdgeHardIRE - kCcEdgeSoftIRE),
-                0.0, 1.0);
-
-            // Burden of proof is on the CHROMA: it proves it is not luma ONLY
-            // by passing carrier-grammar (carrierLegalProof). The former
-            // "prove the energy is illegal" gate (carrierIllegalProof + the
-            // carrierTrust complement) is deleted -- that inverted burden is a
-            // rebellious shape that mutes the suppression on exactly the
-            // diagonals the Luma Delta must act on. The luma edge (edgeRamp)
-            // convicts by default; a pixel is spared ONLY where its own chroma
-            // -- or a same-column +/-2 neighbour's, so a thin real hue boundary
-            // inherits its legal regions' grammar proof -- is grammar-certified
-            // legal. In-field diagonal cross-color certifies nowhere and stays
-            // actionable.
-            double grammarPass = 0.0;
-            if (analysisRow) {
-                grammarPass = lddecode::carrierLegalProof(
-                    (double)analysisRow[xi].carrierConformance,
-                    (double)analysisRow[xi].conformanceSupportFraction);
-            }
-            grammarPass = std::max(grammarPass, std::max(
-                analysisUpRow
-                    ? lddecode::carrierLegalProof(
-                          (double)analysisUpRow[xi].carrierConformance,
-                          (double)analysisUpRow[xi].conformanceSupportFraction)
-                    : 0.0,
-                analysisDnRow
-                    ? lddecode::carrierLegalProof(
-                          (double)analysisDnRow[xi].carrierConformance,
-                          (double)analysisDnRow[xi].conformanceSupportFraction)
-                    : 0.0));
-
-            // Concert edge gate (LDCD_CCR_CONCERT): replace the binary
-            // schedule veto (1 - grammarPass) with a carrier-free lurch
-            // confirmation.  The veto spared the whole legal-carrier strap and
-            // let the 1D bead survive on it (measured: CCR acted 0.00 across
-            // h=376-401 while the true skin->strap edge sat under it); the
-            // lurch gate instead fires the notch edge exactly where luma is
-            // moving through the aperture and stays dark in the saturated
-            // interior where the notch edge is pure carrier leak.
-            static const bool ccrConcert = []{
-                const char *s = std::getenv("LDCD_CCR_CONCERT");
-                return s && std::atoi(s) != 0;
+            // Where the anchored plane exists the verdict is a MEASUREMENT:
+            // the elected carrier's disagreement with the anticipation-
+            // corrected carrier, in IRE. The gA aperture read remains the
+            // witness only where no anchored plane exists (--dg-discard,
+            // non-cadence sources: the chain-link fence regime it was
+            // built for), applied as a binary predicate, never a scale.
+            static const double ccCommitCutoffIRE = []{
+                const char *s = std::getenv("LDCD_CC_CUTOFF");
+                return s ? std::atof(s) : kCcCommitCutoffIRE;
             }();
-            double edgeGate = 1.0 - grammarPass;
-            if (ccrConcert) {
-                const double lurchIRE = analysisRow
-                    ? (double)analysisRow[xi].residual.maxAbsMembershipIRE
-                    : 0.0;
-                edgeGate = std::clamp(
-                    (lurchIRE - kCcLurchSoftIRE) /
-                        (kCcLurchHardIRE - kCcLurchSoftIRE),
-                    0.0, 1.0);
+            double lumaWeight = 0.0;
+            double devIRE = -1.0;
+            if (ccAnchRow && ccObs1D) {
+                // |delta| oscillates at the carrier; its envelope is the
+                // max over ±2 samples (1.25 cycles at 4fSC).
+                const int am = std::max(0, xi - 2);
+                const int ap = std::min(width - 1, xi + 2);
+                double devPeak = 0.0;
+                for (int k = am; k <= ap; ++k)
+                    devPeak = std::max(devPeak,
+                        std::fabs(finiteOrZero(ccObs1D[k]) -
+                                  ccAnchRow[k]));
+                devIRE = devPeak * invIreScale;
+                if (devIRE >= ccCommitCutoffIRE)
+                    lumaWeight = std::min(ccWeight, 1.0);
+            } else if (gA >= kCcFallbackGALo &&
+                       regionKeep < kCcFallbackRegionKeepMax) {
+                lumaWeight = std::min(ccWeight, 1.0);
             }
-            // PROVEN-REGIME RESTRAINT (CCREF conviction, 2026-07-30).
-            // The certified referee graded both reads against exact truth:
-            //   gA ideal-m by bin: 0.215 / 0.088 / 0.659 / 0.943 / 0.939 —
-            //     ANTI-informative at 0.2-0.4 (we applied 0.22 where truth
-            //     wanted 0.09); superb above 0.4.
-            //   edge ideal-m:      0.405 / 0.318 / 0.349 / 0.339 / 0.656 —
-            //     no discrimination below its top bin, yet it drove m to
-            //     0.39-0.49 there. Strong luma verticals live in exactly
-            //     that regime: the read fires on silhouettes and the
-            //     returned raw checkerboards Y.
-            // Each read keeps authority only where truth endorsed it; a
-            // read with no discrimination does not act on its own. Covered
-            // lines are unaffected (Y consumes the fact as a value) and the
-            // regional audit still grades every uncovered firing.
-            // Default mode 2: the edge read does not act (no discrimination
-            // in any bin once amplitude coincidence is discounted; it was
-            // the silhouette checkerboard engine), gA acts from 0.40 where
-            // the referee measured it informative. Modes for A/B:
-            // 0 = old aggression, 1 = kneed edge read, 3 = gA 0.55.
-            static const int ccProven = []{
-                const char *s = std::getenv("LDCD_CC_PROVEN");
-                return s ? std::atoi(s) : 2;
-            }();
-            const double gALo = (ccProven >= 3) ? 0.55 : 0.40;
-            const double gAProven = (ccProven >= 1)
-                ? std::clamp((gA - gALo) / 0.15, 0.0, 1.0) : 1.0;
-            const double apertureRead = gA * gAProven * (1.0 - regionKeep);
-            const double edgeRaw = edgeRamp * edgeGate;
-            const double edgeProven =
-                (ccProven >= 2) ? 0.0
-                : (ccProven >= 1)
-                    ? std::clamp((edgeRaw - 0.60) / 0.30, 0.0, 1.0) : 1.0;
-            const double edgeRead = edgeRaw * edgeProven;
-            const double ccEvidence = std::max(gA, edgeRead);
-            double lumaWeight = std::clamp(
-                std::max(apertureRead, edgeRead) * ccWeight,
-                0.0, ccEvidence);
+            if (ccDevOn) {
+                ++ccDevMaskN;
+                if (devIRE >= 0.0) {
+                    ++ccDevAnchN;
+                    ccDevSamples.push_back((float)devIRE);
+                }
+            }
+            // CCREF live-read plane (referee repair): the committed
+            // verdict's own measurement, published so the truth referee
+            // grades the read that actually decides.
+            if (ccRefDevOn) {
+                if (probeCcDevIRE_flat.size() !=
+                    static_cast<size_t>(demodLines) * demodWidth)
+                    probeCcDevIRE_flat.assign(
+                        static_cast<size_t>(demodLines) * demodWidth,
+                        std::numeric_limits<float>::quiet_NaN());
+                probeCcDevIRE_flat[static_cast<size_t>(line) * demodWidth +
+                                   xi] = (float)devIRE;
+            }
 
             // The detector's own verdict, stashed for the off-lattice
             // audit BEFORE any fact overrides it.
@@ -4706,38 +4693,11 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
             // through the regional audit below; the Y side consumes the
             // fact as a VALUE in produceY.
 
-            // CARRIER-PRESENCE CONDITION (EXPERIMENT: LDCD_CC_AMPGATE).
-            // A return may only act where there is carrier to return.
-            //
-            // Below the impurity floor the CCREF referee shows the apparent
-            // leak is a NOISE PEDESTAL, not confiscated luma: C and ex share
-            // the capture's noise, so S(C·leak)/S(C²) tends to 0.5 there with
-            // zero cross-colour present. Returning it pushes the capture's own
-            // noise into Y -- and Lhat carries half the noise of raw, so
-            // following raw in the dark is a downgrade. Rendered, that is
-            // lifted black and softened sub-cycle star impulses (user, cube
-            // segment: "bottom range is deeper and little stars crisper" with
-            // the return's reach reduced).
-            //
-            // This is a CONSISTENCY fix, not a new threshold. The aperture
-            // read already obeys this floor internally -- gA is identically
-            // zero below kImpurityFloorIRE. The EDGE read obeys nothing: a
-            // star in empty space presents a large luma delta with no legal
-            // carrier to certify against, so edgeGate opens fully and the mask
-            // fires hard exactly where there is no carrier at all. The ramp
-            // reaches full authority precisely where the aperture read is
-            // permitted to speak.
-            static const bool ccAmpGate = []{
-                const char *s = std::getenv("LDCD_CC_AMPGATE");
-                return s && std::atoi(s) != 0;
-            }();
-            if (ccAmpGate) {
-                const double envIRE = analysisRow
-                    ? (double)analysisRow[xi].fit.shortMagnitudeIRE
-                    : 0.0;
-                constexpr double half = 0.5 * kCcCarrierFloorIRE;
-                lumaWeight *= std::clamp((envIRE - half) / half, 0.0, 1.0);
-            }
+            // Noise-pedestal restraint is inherited, not re-gated: the
+            // commit cutoff sits at the pedestal floor (kCcCarrierFloorIRE
+            // -- below it C and ex share the capture's noise, CCREF
+            // 2026-07-30), so the committed verdict cannot fire on the
+            // dark-noise class the old LDCD_CC_AMPGATE experiment guarded.
 
             // The verdict is NOT applied here.  Applied per-sample it carries
             // regionKeep's hard flips and gA's ring chatter at pixel pitch --
@@ -4749,22 +4709,18 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
             if (maskRawRow)
                 maskRawRow[xi] = (float)lumaWeight;
 
-            // Disposable CCR-path dump (env-gated): shows which read drives
-            // lumaWeight at a chosen strap line, so we can see whether the
-            // aperture (gA) path shadows the edge concert.
+            // Disposable CCR-path dump (env-gated): the committed verdict's
+            // inputs at a chosen line/column range.
             static const int ccL  = []{ const char *s=std::getenv("LDCD_DUMP_CC_L");  return s?std::atoi(s):-1; }();
             static const int ccC0 = []{ const char *s=std::getenv("LDCD_DUMP_CC_C0"); return s?std::atoi(s):-1; }();
             static const int ccC1 = []{ const char *s=std::getenv("LDCD_DUMP_CC_C1"); return s?std::atoi(s):-1; }();
             if (line == ccL && (int)(h - left) >= ccC0 && (int)(h - left) <= ccC1) {
-                const double lurchIRE = analysisRow
-                    ? (double)analysisRow[xi].residual.maxAbsMembershipIRE : 0.0;
                 std::fprintf(stderr,
-                    "[CC] line=%d h=%d gA=%.2f regKeep=%.2f edgeRamp=%.2f "
-                    "gPass=%.2f lurch=%.2f edgeGate=%.2f aperRead=%.2f "
-                    "edgeRead=%.2f lumaW=%.2f drive=%s\n",
-                    line, h, gA, regionKeep, edgeRamp, grammarPass, lurchIRE,
-                    edgeGate, apertureRead, edgeRead, lumaWeight,
-                    apertureRead >= edgeRead ? "APER" : "EDGE");
+                    "[CC] line=%d h=%d anch=%d devIRE=%.2f cutoff=%.2f "
+                    "gA=%.2f regKeep=%.2f lumaW=%.2f drive=%s\n",
+                    line, h, ccAnchRow ? 1 : 0, devIRE, ccCommitCutoffIRE,
+                    gA, regionKeep, lumaWeight,
+                    ccAnchRow ? "ANCH" : "FALLBACK");
             }
 
             const float prodI = (float)finiteOrZero(ti * giProduct);
@@ -4776,6 +4732,33 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
             scratch_preI[xi] = prodI;
             scratch_preQ[xi] = prodQ;
         }
+    }
+
+    if (ccDevOn && ccDevMaskN > 0) {
+        double p[5] = {0, 0, 0, 0, 0};
+        double fired = 0.0;
+        if (!ccDevSamples.empty()) {
+            std::sort(ccDevSamples.begin(), ccDevSamples.end());
+            const double q[5] = {0.25, 0.50, 0.75, 0.90, 0.99};
+            for (int i = 0; i < 5; ++i)
+                p[i] = ccDevSamples[std::min(
+                    ccDevSamples.size() - 1,
+                    (size_t)(q[i] * ccDevSamples.size()))];
+            static const double cut = []{
+                const char *s = std::getenv("LDCD_CC_CUTOFF");
+                return s ? std::atof(s) : kCcCommitCutoffIRE;
+            }();
+            fired = (double)(ccDevSamples.end() -
+                std::lower_bound(ccDevSamples.begin(),
+                                 ccDevSamples.end(), (float)cut)) /
+                (double)ccDevSamples.size();
+        }
+        std::fprintf(stderr,
+            "[CCDEV] seq=%d covered=%d anchFrac=%.3f n=%ld "
+            "p25=%.2f p50=%.2f p75=%.2f p90=%.2f p99=%.2f firedFrac=%.3f\n",
+            (int)heldSeq1, frameHasExactCoverage() ? 1 : 0,
+            (double)ccDevAnchN / (double)ccDevMaskN, ccDevAnchN,
+            p[0], p[1], p[2], p[3], p[4], fired);
     }
 
     // Pass 2 (engaged when cross-color return is nonzero): band-limit the
@@ -4982,8 +4965,12 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
         // parity is treated alone. The detector verdict planes and the
         // regional audit above keep running: covered frames remain the
         // audit source that grades the uncovered frames' firings.
+        // True coverage test, not the anchored-plane proxy: the plane now
+        // publishes on uncovered frames too (anticipated rung), and the
+        // retirement premise -- false colour excluded at construction --
+        // holds only where construction consumed FACTS.
         const bool ccRetired =
-            chromaFactsOn && anchoredCarrier_line(firstLine) != nullptr;
+            chromaFactsOn && frameHasExactCoverage();
 
         for (int line = firstLine; line < lastLine; ++line) {
             const float *r0 = lockedCcMaskRaw_line(line);
@@ -5010,6 +4997,37 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
             const lddecode::CarrierAnalysisRecord *analysisDnRow =
                 (line + 2 < lastLine) ? carrierAnalysis_line(line + 2)
                                       : nullptr;
+
+            // Delta-value return: anchored carrier + this line's demod LUT
+            // (same recipe as pass 1) so a fired site's coherent products
+            // can be rebuilt from the lawful carrier below.
+            const double *anchProdRow = anchored1DValid
+                ? anchored1DSource_flat.data() +
+                      static_cast<size_t>(line) * demodWidth
+                : nullptr;
+            double lutTi2[4] = {0, 0, 0, 0}, lutTq2[4] = {0, 0, 0, 0};
+            const double giProduct2 = configuration.gi_product;
+            const double gqProduct2 = configuration.gq_product;
+            if (anchProdRow) {
+                const CombCarrierGrammar *g2 = carrierGrammarLine(line);
+                if (g2 && g2->grammarLocked) {
+                    for (int i = 0; i < 4; ++i) {
+                        lutTi2[i] = finiteOrZero((double)g2->demodLUTTi[i]);
+                        lutTq2[i] = finiteOrZero((double)g2->demodLUTTq[i]);
+                    }
+                } else {
+                    const double bc2 = g2 && g2->grammarLocked
+                        ? g2->burstCos : 1.0;
+                    const double bs2 = g2 && g2->grammarLocked
+                        ? g2->burstSin : 0.0;
+                    fusedDemodLUT(bc2, bs2, spLUT_locked, cpLUT_locked,
+                                  lutTi2, lutTq2);
+                    for (int i = 0; i < 4; ++i) {
+                        lutTi2[i] = finiteOrZero(lutTi2[i]);
+                        lutTq2[i] = finiteOrZero(lutTq2[i]);
+                    }
+                }
+            }
 
             auto grammarPassAt = [&](int xi) {
                 double legal = analysisRow
@@ -5120,14 +5138,13 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                 // aperture override as a unit; per-sample gating here would
                 // amplitude-modulate chroma at fSC and recreate the very
                 // transition checkerboard this envelope is meant to avoid.
-                const int cycleStart = (width >= 4)
-                    ? std::clamp(xi - 1, 0, width - 4)
-                    : 0;
-                const int cycleCount = std::min(4, width);
+                // Symmetric 5-sample cycle unit (integer centroid; the
+                // old [xi-1, xi+2] unit gated half a sample right).
                 double cycleLegal = 0.0;
-                for (int k = 0; k < cycleCount; ++k)
+                for (int k = -2; k <= 2; ++k)
                     cycleLegal = std::max(
-                        cycleLegal, grammarPassAt(cycleStart + k));
+                        cycleLegal,
+                        grammarPassAt(std::clamp(xi + k, 0, width - 1)));
 
                 // ADJUDICATION (replaces the strongApertureOverride,
                 // 2026-07-31). Where the detector's luma claim conflicts
@@ -5149,8 +5166,23 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                      cycleLegal * auditSuppAt(line, xi);
 
                 out[xi] = (float)m;
-                if (prodIRow) prodIRow[xi] = (float)(prodIRow[xi] * (1.0 - m));
-                if (prodQRow) prodQRow[xi] = (float)(prodQRow[xi] * (1.0 - m));
+                // Delta-value return (2026-08-02), coherent renderer's half
+                // of the one policy: a fired site's products come from the
+                // ANCHORED (lawful) carrier, not from amplitude-killing the
+                // elected one. Fallback (no anchored plane) keeps the kill.
+                if (prodIRow && prodQRow) {
+                    if (anchProdRow) {
+                        const int ph = carrierSampleClass(line, left + xi);
+                        const double a = anchProdRow[xi];
+                        prodIRow[xi] = (float)((1.0 - m) * prodIRow[xi] +
+                            m * a * lutTi2[ph] * giProduct2);
+                        prodQRow[xi] = (float)((1.0 - m) * prodQRow[xi] +
+                            m * a * lutTq2[ph] * gqProduct2);
+                    } else {
+                        prodIRow[xi] = (float)(prodIRow[xi] * (1.0 - m));
+                        prodQRow[xi] = (float)(prodQRow[xi] * (1.0 - m));
+                    }
+                }
             }
         }
     }
@@ -5176,8 +5208,9 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
     // across frames, and a covered frame (which skips the legal-band pass)
     // must not serve a stale residue plane to produceY on its comp lines.
     bandResidueY_flat.assign((size_t)demodLines * demodWidth, 0.0f);
+    // True coverage test, not the anchored-plane proxy (see ccRetired).
     const bool legalFrameCovered =
-        chromaFactsOn && anchoredCarrier_line(firstLine) != nullptr;
+        chromaFactsOn && frameHasExactCoverage();
     // Probe mode also enters on COVERED frames -- measurement only, no
     // writes: with exact truth in hand, grade whether band-limiting the
     // elected carrier moves it toward or away from ex ([LEGALREF]).
@@ -5513,12 +5546,12 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                         // fSC and manufactures the very checker it fights).
                         const float *pfRow = proofPlane.data() +
                             (size_t)(line - firstLine) * width;
-                        const int cyc0 = (width >= 4)
-                            ? std::clamp(xi - 1, 0, width - 4) : 0;
+                        // Symmetric 5-sample cycle unit (see cycleLegal).
                         double cycleProof = 0.0;
-                        for (int k = 0; k < std::min(4, width); ++k)
+                        for (int k = -2; k <= 2; ++k)
                             cycleProof = std::max(
-                                cycleProof, (double)pfRow[cyc0 + k]);
+                                cycleProof, (double)pfRow[
+                                    std::clamp(xi + k, 0, width - 1)]);
                         const double wc = w * (1.0 - cycleProof);
                         if (wc <= 0.0) continue;
                         br[xi] = (float)(wc *
@@ -5560,6 +5593,39 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                 refN[1] ? refLeg[1] / refN[1] / irescale : 0.0,
                 refN[1] ? refExOOB[1] / refN[1] / irescale : 0.0,
                 refN[1]);
+    }
+
+    // Final split authority for licensed stars.  Earlier passes may have
+    // measured, returned, or legal-band-shaped this carrier; none of those
+    // estimates may survive the exact-evidence license.  Keep the footprint
+    // itself for complementary Y; filterIQLocked then applies its normal
+    // aperture to the resulting raw - Y zero, with no special post-filter
+    // shape.
+    if (starFootprintBuilt &&
+        starFootprint_flat.size() >=
+            static_cast<size_t>(frameHeight) * demodWidth) {
+        for (int line = firstLine; line < lastLine; ++line) {
+            const std::uint8_t *star = starFootprint_flat.data() +
+                static_cast<size_t>(line) * demodWidth;
+            double *carrier = lockedCarrierComposite_line(line);
+            float *prodI = lockedProductI_line(line);
+            float *prodQ = lockedProductQ_line(line);
+            float *maskRaw = lockedCcMaskRaw_line(line);
+            float *mask = lockedCcMask_line(line);
+            for (int xi = 0; xi < width; ++xi) {
+                if (!star[xi]) continue;
+                starSplitZeroSamples++;
+                if (carrier) carrier[xi] = 0.0;
+                if (prodI) prodI[xi] = 0.0f;
+                if (prodQ) prodQ[xi] = 0.0f;
+                // A zero split cannot subsequently request anchored-carrier
+                // return through the cross-colour policy.
+                if (mask && mask[xi] > 0.0f)
+                    starAnchoredReturnBlocked++;
+                if (maskRaw) maskRaw[xi] = 0.0f;
+                if (mask) mask[xi] = 0.0f;
+            }
+        }
     }
 }
 
@@ -5667,7 +5733,18 @@ void Comb::FrameBuffer::filterIQLocked()
         // splitIQlocked already published (in-field +/-2 vertical mix + lateral
         // boxcar). One policy, computed once; this renderer only applies it, so
         // the suppression cannot alias here.
+        //
+        // Delta-value return (2026-08-02): where the anchored plane exists,
+        // a fired site's chroma renders from the ANCHORED (lawful) carrier
+        // instead of being amplitude-killed -- the mask returns the measured
+        // contamination to Y, and the lawful part keeps rendering as colour.
+        // Without an anchored plane the old suppression (kill by envelope)
+        // stands, matching the fallback verdict's semantics.
         const float *maskRow = lockedCcMask_line(line);
+        const double *anchRow = anchored1DValid
+            ? anchored1DSource_flat.data() +
+                  static_cast<size_t>(line) * demodWidth
+            : nullptr;
         const double giProduct = configuration.gi_product;
         const double gqProduct = configuration.gq_product;
 
@@ -5678,9 +5755,55 @@ void Comb::FrameBuffer::filterIQLocked()
             const double m = maskRow
                 ? std::clamp((double)maskRow[i], 0.0, 1.0)
                 : 0.0;
-            const double alphaEff = 1.0 - m;
-            scratch_preI[i] = (chroma * lutTi[ph]) * giProduct * alphaEff;
-            scratch_preQ[i] = (chroma * lutTq[ph]) * gqProduct * alphaEff;
+            const double chromaEff = anchRow
+                ? (1.0 - m) * chroma + m * anchRow[i]
+                : (1.0 - m) * chroma;
+            scratch_preI[i] = (chromaEff * lutTi[ph]) * giProduct;
+            scratch_preQ[i] = (chromaEff * lutTq[ph]) * gqProduct;
+        }
+
+        // Integer-centred image cancellation (2026-08-01): the RENDER demod
+        // was the last consumer left product-raw when 6f502ec registered
+        // the measurement paths at the integer carrier sample.  A 4fsc
+        // product carries a 2fSC image; the LPFs below reject it on flat
+        // fields, but at sharp edges (and the certified family sharpens Y,
+        // whose complement this is) the image's sidebands leak under the
+        // stopband and render as edge-locked chroma asymmetry -- observed
+        // as the smear left of the luma on covered frames.  Same symmetric
+        // 3-tap the fix installed everywhere else: no fractional delay, no
+        // new registration convention.  Escape LDCD_RENDER_IC=0.
+        {
+            static const bool renderIC = []{
+                const char *e = std::getenv("LDCD_RENDER_IC");
+                return !(e && std::atoi(e) == 0);
+            }();
+            if (renderIC && width >= 2) {
+                if ((int)scratch_preI_ext.size() < width)
+                    scratch_preI_ext.resize(width);
+                if ((int)scratch_preQ_ext.size() < width)
+                    scratch_preQ_ext.resize(width);
+                std::copy(scratch_preI.begin(), scratch_preI.begin() + width,
+                          scratch_preI_ext.begin());
+                std::copy(scratch_preQ.begin(), scratch_preQ.begin() + width,
+                          scratch_preQ_ext.begin());
+                // centeredCarrierProduct3 carries the measurement paths'
+                // x2 product-recovery gain (0.5a + b + 0.5c: baseband gain
+                // 2, null at 2fSC).  The render chain has its own amplitude
+                // convention, so the image cancellation must be UNITY at
+                // baseband -- without the 0.5 the whole picture rendered
+                // at double saturation (measured x1.93 flat on the GGV
+                // colour bars; user-reported as excess saturation).
+                for (int i = 0; i < width; ++i) {
+                    const int im = std::max(0, i - 1);
+                    const int ip = std::min(width - 1, i + 1);
+                    scratch_preI[i] = 0.5 * centeredCarrierProduct3(
+                        scratch_preI_ext[im], scratch_preI_ext[i],
+                        scratch_preI_ext[ip]);
+                    scratch_preQ[i] = 0.5 * centeredCarrierProduct3(
+                        scratch_preQ_ext[im], scratch_preQ_ext[i],
+                        scratch_preQ_ext[ip]);
+                }
+            }
         }
 
         constexpr double lockedPreRot =
@@ -5706,6 +5829,34 @@ void Comb::FrameBuffer::filterIQLocked()
         for (int i = 0; i < pad; ++i) {
             preIext[pad + width + i] = rightI;
             preQext[pad + width + i] = rightQ;
+        }
+
+        // ENCODER-MATCHED MODE (A/B: LDCD_RENDER_FEASIBLE=1). The tailored
+        // FIRs below remove noise outside each component's legal trace, which
+        // is their PURPOSE -- but a 21-tap kernel also spreads every chroma
+        // transition (~18 px on Q), and that width is a knock-on, not design
+        // (user, 2026-08-01). This mode instead applies the ENCODER'S OWN
+        // 9-tap uvFilter (feasibleband.h, 1.3 MHz) to both axes: the same
+        // primitive the carrier model already uses, so what it removes is
+        // exactly what the encoder could not have modulated -- cleaning the
+        // components mindfully of the NTSC spec rather than by a chosen
+        // cutoff. Must be judged on BOTH axes at once: cross-colour admitted
+        // (GGV monochrome bars) AND transition width.
+        static const bool feasibleMode = []{
+            const char *e = std::getenv("LDCD_RENDER_FEASIBLE");
+            return e && std::atoi(e) != 0;
+        }();
+        if (feasibleMode) {
+            std::vector<double> outI(width), outQ(width);
+            lddecode::projectExpressibleChromaEnvelope(
+                scratch_preI.data(), nullptr, width, outI.data());
+            lddecode::projectExpressibleChromaEnvelope(
+                scratch_preQ.data(), nullptr, width, outQ.data());
+            for (int i = 0; i < width; ++i) {
+                Irow[left + i] = outI[i];
+                Qrow[left + i] = outQ[i];
+            }
+            continue;
         }
 
         // Both axes are evaluated by symmetric look-around at the same output
@@ -6091,7 +6242,17 @@ static constexpr int    kStarRegLines        = 32;
 static constexpr int    kStarRegCols         = 128;
 static constexpr double kStarPeakMinIRE      = 10.0;
 static constexpr double kStarFlankAgreeIRE   = 6.0;
-static constexpr double kStarBlackCeilIRE    = 20.0;
+// The decoder's IRE convention already places black at 0.  7.5 IRE is the
+// historical NTSC setup pedestal and is itself a visibly faded black here;
+// retain it only as a generous noise/fade ceiling.  The former 20 IRE limit
+// admitted low-luminance coloured regions (the Borg tractor beam) as space.
+static constexpr double kStarBlackCeilIRE    = 7.5;
+// A dark coloured background can satisfy the luma-black test.  Two raw
+// composite cycles on each side of the compact event provide a phase-free
+// continuity veto: a real carrier run persists through the star, while black
+// space has no phasor to agree.  This is abstention only, never carrier source.
+static constexpr double kStarCarrierRunMinIRE = 2.0;
+static constexpr double kStarCarrierRunCosMin = 0.80;
 // License thresholds: certified |ex| at signature sites. Measured noise
 // floor 0.4-0.9 IRE where the law holds absolutely (battle 0.64, Kira 0.53);
 // the compact-colour failure scenes pool 2.4-3.0 (temple, dark interior).
@@ -6102,17 +6263,23 @@ static constexpr int    kStarLicenseFrameMinN  = 20;
 
 int Comb::FrameBuffer::certifiedOneDLevel()
 {
-    // DEFAULT OFF (user verdict on the beach render, 2026-07-30: the
-    // anchors' quality against unimproved between-frames reads as
-    // discrediting alternation — "the only path to restoration through
-    // this software is reversion"). The whole anchoring family — head
-    // replacement, construction cede, HQ legs, head phase snap, tone —
-    // is OPT-IN (LDCD_CERT_1D=1..3) until the between-frames reach
-    // anchor quality. PROMOTION GATE: anchors ship only WITH their
-    // between-frame closure, never ahead of it.
+    // DEFAULT ON, full family (promoted 2026-08-01, user directive on the
+    // Emissary title bevel). The contract: certified defs CEDE to center —
+    // their separation is already perfect and any comb can only mix truth
+    // with a model — and comp pixels comb vigorously with the perfect legs
+    // the defs give them. Measured on the title bevel: covered-frame
+    // chroma alternation 31.4/29.4 -> 8.3/8.0 (-73%), visually near-clean.
+    // The former promotion gate (beach 2026-07-30: anchors-vs-between-
+    // frames contrast reads as discrediting alternation) was re-adjudicated
+    // by the user: the uncovered frames are the same if not better — the
+    // certified frames just show them up more — and that contrast does not
+    // justify hiding the feature. Between-frame closure (cross-frame
+    // transfer of the certified split on static content) remains the open
+    // successor arc, pursued WITH the family live, not ahead of it.
+    // LDCD_CERT_1D=0..3 remains as the A/B escape only.
     static const int level = []{
         const char *s = std::getenv("LDCD_CERT_1D");
-        if (!s) return 0;
+        if (!s) return 3;
         const int v = std::atoi(s);
         return std::clamp(v, 0, 3);
     }();
@@ -6138,6 +6305,33 @@ bool Comb::FrameBuffer::certifiedDefLine(int line) const
     return c != 0;
 }
 
+// Anticipated lattice: on an uncovered frame holding the chain, the lines
+// where the reference plane carries DIRECT tween luma (the chain source's
+// def parity). These are the strong lines of the B/D direct/bracket pair,
+// and the lattice-keyed cede keys on them. Under --dg-discard no chain
+// ever forms, so this is structurally false and every consumer reverts to
+// pre-campaign behaviour.
+bool Comb::FrameBuffer::anticipatedDefLine(int line) const
+{
+    if (certifiedOneDLevel() == 0) return false;
+    if (antRefAge < 1) return false;         // covered frames age 0; no chain -1
+    if (line < 0 || line >= frameHeight) return false;
+    if (antRefLuma_flat.size() !=
+        static_cast<size_t>(frameHeight) * demodWidth) return false;
+    if ((int)anticipatedLineCache.size() != frameHeight)
+        anticipatedLineCache.assign(frameHeight, -1);
+    qint8 &c = anticipatedLineCache[line];
+    if (c >= 0) return c != 0;
+    c = 0;
+    const float *row = antRefLuma_flat.data()
+        + static_cast<size_t>(line) * demodWidth;
+    const int width = videoParameters.activeVideoEnd -
+                      videoParameters.activeVideoStart;
+    for (int xi = 0; xi < width; ++xi)
+        if (std::isfinite(row[xi])) { c = 1; break; }
+    return c != 0;
+}
+
 // Composite-shape star signature at h. Returns peak IRE over the flank mean
 // (0 = no signature); flank outputs are raw-scale. The single source of the
 // shape test: the actuator, the evidence build and the CCREF probe all call
@@ -6145,8 +6339,10 @@ bool Comb::FrameBuffer::certifiedDefLine(int line) const
 double Comb::FrameBuffer::starSignatureAt(const quint16 *rawLine, int h,
                                           double *flankOut,
                                           double *flankLOut,
-                                          double *flankROut) const
+                                          double *flankROut,
+                                          bool *carrierRunVetoOut) const
 {
+    if (carrierRunVetoOut) *carrierRunVetoOut = false;
     const int left  = videoParameters.activeVideoStart;
     const int right = videoParameters.activeVideoEnd;
     if (h - 5 < left || h + 5 >= right) return 0.0;
@@ -6163,6 +6359,43 @@ double Comb::FrameBuffer::starSignatureAt(const quint16 *rawLine, int h,
     if (dev2IRE > 0.4 * peakIRE) return 0.0;
     if ((flank - (double)videoParameters.black16bIre) * inv >
         kStarBlackCeilIRE) return 0.0;   // stars in black space, narrowly
+
+    // Raw-domain carrier continuity.  Each side is eight samples (two whole
+    // 4fSC cycles), outside both the five-sample star event and its black
+    // return triplets.  Full cycles cancel DC exactly.  Absolute sample class
+    // is used only to compare the two sides on this same line; no burst hue,
+    // 1D estimate, demodulated colour, or output phase enters the decision.
+    if (h - 13 >= left && h + 13 < right) {
+        auto sidePhasor = [&](int k0, double &i, double &q) {
+            static constexpr double c4[4] = { 1.0, 0.0, -1.0, 0.0 };
+            static constexpr double s4[4] = { 0.0, 1.0, 0.0, -1.0 };
+            i = 0.0;
+            q = 0.0;
+            for (int k = k0; k < k0 + 8; ++k) {
+                const int ph = (h + k) & 3;
+                const double v = rw(k);
+                i += v * c4[ph];
+                q += v * s4[ph];
+            }
+            // 2/N recovers the sinusoid's peak amplitude for N=8.
+            i *= 0.25;
+            q *= 0.25;
+        };
+        double li = 0.0, lq = 0.0, ri = 0.0, rq = 0.0;
+        sidePhasor(-13, li, lq); // h-13 .. h-6
+        sidePhasor(6, ri, rq);   // h+6  .. h+13
+        const double la = std::hypot(li, lq);
+        const double ra = std::hypot(ri, rq);
+        if (la * inv >= kStarCarrierRunMinIRE &&
+            ra * inv >= kStarCarrierRunMinIRE) {
+            const double coherence =
+                (li * ri + lq * rq) / std::max(1e-12, la * ra);
+            if (coherence >= kStarCarrierRunCosMin) {
+                if (carrierRunVetoOut) *carrierRunVetoOut = true;
+                return 0.0;
+            }
+        }
+    }
     if (flankOut)  *flankOut  = flank;
     if (flankLOut) *flankLOut = flankL;
     if (flankROut) *flankROut = flankR;
@@ -6172,7 +6405,7 @@ double Comb::FrameBuffer::starSignatureAt(const quint16 *rawLine, int h,
 // Certified star evidence, pooled regionally. Covered frames only produce
 // evidence; every frame builds the (possibly empty) grid so neighbours can
 // pool without shape checks. Idempotent per load.
-void Comb::FrameBuffer::buildStarEvidence()
+void Comb::FrameBuffer::buildStarEvidence() const
 {
     if (starEvidenceBuilt) return;
     starEvidenceBuilt = true;
@@ -6203,6 +6436,175 @@ void Comb::FrameBuffer::buildStarEvidence()
     }
 }
 
+// Build the one authoritative star footprint before the elected carrier is
+// published.  Exact evidence licenses the raw-domain signature; neither the
+// comb result nor a demodulated hue participates in the decision.  The mask is
+// subsequently consumed by both halves of the split: zero carrier here and
+// raw luma in produceY().
+void Comb::FrameBuffer::buildStarFootprint(const FrameBuffer *prevF,
+                                           const FrameBuffer *nextF)
+{
+    if (starFootprintBuilt) return;
+    starFootprintBuilt = true;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+
+    starFootprint_flat.assign(
+        static_cast<size_t>(frameHeight) * demodWidth, 0);
+    starLicensedRegions = 0;
+    starSignatureCenters = 0;
+    starLicensedCenters = 0;
+    starSubstitutedSamples = 0;
+    starExtendedCenters = 0;
+    starAddedSamples = 0;
+    starAddedExactN = 0;
+    starCarrierRunVetoes = 0;
+    starSplitZeroSamples = 0;
+    starAnchoredReturnBlocked = 0;
+    starUsedPrevEvidence = false;
+    starUsedNextEvidence = false;
+    starAddedExactSum = 0.0;
+    starAddedExactMax = 0.0;
+
+    static const bool starFixOn = []{
+        const char *s = std::getenv("LDCD_STAR_FIX");
+        return !(s && std::atoi(s) == 0);
+    }();
+    static const bool starFixDump =
+        std::getenv("LDCD_DUMP_STARFIX") != nullptr;
+    if (width <= 0 || firstLine >= lastLine || demodWidth < width)
+        return;
+
+    // Evidence is a per-load cache, so it is const-safe to prepare on the
+    // temporal witnesses while deciding the current frame's license.
+    buildStarEvidence();
+    if (prevF) prevF->buildStarEvidence();
+    if (nextF) nextF->buildStarEvidence();
+
+    std::vector<std::uint8_t> license;
+    bool anyLicense = false;
+    if (starFixOn && starRegionsX > 0) {
+        const int nReg = starRegionsX * starRegionsY;
+        std::vector<double> evSum(nReg, 0.0);
+        std::vector<long> evCnt(nReg, 0);
+        auto addFrom = [&](const FrameBuffer *f) -> bool {
+            if (!f || !f->starEvidenceBuilt ||
+                f->starRegionsX != starRegionsX ||
+                f->starRegionsY != starRegionsY) return false;
+            for (int r = 0; r < nReg; ++r) {
+                evSum[r] += f->starEvidenceSum[r];
+                evCnt[r] += f->starEvidenceCnt[r];
+            }
+            return true;
+        };
+        if (frameHasExactCoverage()) addFrom(this);
+        else if (!hasSceneSplit) {
+            // Edit flags mark the first field of the new scene.  Never let a
+            // regional class license borrow from the opposite side of that
+            // boundary: frame 165 of the Borg excerpt inherited tractor-beam
+            // carrier from the preceding shot and lost every black-space star
+            // for exactly one frame.  Within a shot the original two-sided
+            // rule remains; at a boundary the one same-shot witness suffices.
+            if (!isSceneStart)
+                starUsedPrevEvidence = addFrom(prevF);
+            if (!(nextF && nextF->isSceneStart))
+                starUsedNextEvidence = addFrom(nextF);
+        }
+
+        double total = 0.0;
+        long totalN = 0;
+        for (int r = 0; r < nReg; ++r) {
+            total += evSum[r];
+            totalN += evCnt[r];
+        }
+        const bool frameLicense =
+            totalN >= kStarLicenseFrameMinN &&
+            total / totalN <= kStarLicenseFrameIRE;
+        license.assign(nReg, 0);
+        for (int r = 0; r < nReg; ++r) {
+            const bool licensed =
+                evCnt[r] >= kStarLicenseRegionMinN
+                    ? evSum[r] / evCnt[r] <= kStarLicenseRegionIRE
+                    : frameLicense;
+            license[r] = licensed ? 1 : 0;
+            if (licensed) {
+                anyLicense = true;
+                starLicensedRegions++;
+            }
+        }
+    }
+
+    if (!anyLicense && !starFixDump) return;
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        const quint16 *rawLine = rawbuffer.data() +
+            static_cast<size_t>(line) * videoParameters.fieldWidth;
+        const float *exact = exactCarrierRow(line);
+        std::uint8_t *footprint = starFootprint_flat.data() +
+            static_cast<size_t>(line) * demodWidth;
+        for (int h = left + 5; h < right - 5; ++h) {
+            double flankL = 0.0, flankR = 0.0;
+            bool carrierRunVeto = false;
+            const double peakIRE = starSignatureAt(
+                rawLine, h, nullptr, &flankL, &flankR, &carrierRunVeto);
+            if (carrierRunVeto) {
+                starCarrierRunVetoes++;
+                continue;
+            }
+            if (peakIRE <= 0.0) continue;
+            starSignatureCenters++;
+
+            const size_t region =
+                static_cast<size_t>(line / kStarRegLines) * starRegionsX +
+                (h - left) / kStarRegCols;
+            if (!anyLicense || region >= license.size() || !license[region])
+                continue;
+            starLicensedCenters++;
+
+            int leftReturn = -3, rightReturn = 3;
+            double leftErr = std::fabs(
+                static_cast<double>(rawLine[h + leftReturn]) - flankL);
+            double rightErr = std::fabs(
+                static_cast<double>(rawLine[h + rightReturn]) - flankR);
+            for (int k = -4; k >= -5; --k) {
+                const double e = std::fabs(
+                    static_cast<double>(rawLine[h + k]) - flankL);
+                if (e < leftErr) { leftErr = e; leftReturn = k; }
+            }
+            for (int k = 4; k <= 5; ++k) {
+                const double e = std::fabs(
+                    static_cast<double>(rawLine[h + k]) - flankR);
+                if (e < rightErr) { rightErr = e; rightReturn = k; }
+            }
+            const int runLo = leftReturn + 1;
+            const int runHi = rightReturn - 1;
+            if (runLo < -2 || runHi > 2) starExtendedCenters++;
+
+            for (int k = runLo; k <= runHi; ++k) {
+                const int xi = h + k - left;
+                footprint[xi] = 1;
+                starSubstitutedSamples++;
+                if (k < -2 || k > 2) {
+                    starAddedSamples++;
+                    if (exact && std::isfinite(exact[h + k])) {
+                        const double exIRE =
+                            std::fabs(static_cast<double>(exact[h + k])) /
+                            irescale;
+                        starAddedExactSum += exIRE;
+                        starAddedExactMax = std::max(starAddedExactMax,
+                                                     exIRE);
+                        starAddedExactN++;
+                    }
+                }
+            }
+        }
+    }
+}
+
 void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                                  const FrameBuffer *nextF)
 {
@@ -6219,19 +6621,11 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
 
-    // ---- Star law: build the regional license ----
-    // Region evidence outranks the frame verdict (a region that certifies
-    // carrier at its signature sites is denied even in a licensed frame);
-    // sparse regions fall back to the frame verdict; no evidence anywhere
-    // (non-telecine material, batch edges) -> no license, behaviour
-    // unchanged. A/B escape LDCD_STAR_FIX=0.
-    static const bool starFixOn = []{
-        const char *s = std::getenv("LDCD_STAR_FIX");
-        return !(s && std::atoi(s) == 0);
-    }();
+    // splitIQlocked owns the star decision.  produceY only consumes its
+    // published zero-carrier footprint as the complementary raw-luma value.
     static const bool starFixDump =
         std::getenv("LDCD_DUMP_STARFIX") != nullptr;
-    buildStarEvidence();   // idempotent; no-op cost when already built
+    buildStarFootprint(prevF, nextF); // idempotent safety for direct callers
 
     // Sync-tone stability probe: pool def lines' working-space certified IQ
     // per region and hand the frame to the tracker premise test.
@@ -6425,44 +6819,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             }
         }
     }
-    std::vector<std::uint8_t> starLicense;
-    bool starAnyLicense = false;
-    long starLicensedRegions = 0, starSubstituted = 0;
-    if (starFixOn && starRegionsX > 0) {
-        const int nReg = starRegionsX * starRegionsY;
-        std::vector<double> evSum(nReg, 0.0);
-        std::vector<long>   evCnt(nReg, 0);
-        auto addFrom = [&](const FrameBuffer *f) {
-            if (!f || !f->starEvidenceBuilt ||
-                f->starRegionsX != starRegionsX ||
-                f->starRegionsY != starRegionsY) return;
-            for (int r = 0; r < nReg; ++r) {
-                evSum[r] += f->starEvidenceSum[r];
-                evCnt[r] += f->starEvidenceCnt[r];
-            }
-        };
-        // Covered frames consume their own certified evidence; uncovered
-        // frames inherit from BOTH temporal neighbours (two-sided, matching
-        // the temporal-interpolation lesson: one-sided inheritance is a
-        // parity hazard).
-        if (frameHasExactCoverage()) addFrom(this);
-        else { addFrom(prevF); addFrom(nextF); }
-        double totS = 0; long totN = 0;
-        for (int r = 0; r < nReg; ++r) { totS += evSum[r]; totN += evCnt[r]; }
-        const bool frameLicense =
-            totN >= kStarLicenseFrameMinN &&
-            totS / totN <= kStarLicenseFrameIRE;
-        starLicense.assign(nReg, 0);
-        for (int r = 0; r < nReg; ++r) {
-            const bool lic =
-                evCnt[r] >= kStarLicenseRegionMinN
-                    ? evSum[r] / evCnt[r] <= kStarLicenseRegionIRE
-                    : frameLicense;
-            starLicense[r] = lic ? 1 : 0;
-            if (lic) { starAnyLicense = true; starLicensedRegions++; }
-        }
-    }
-
     // Off-grid leakage probe (measurement only; inert unless
     // LDCD_PROBE_OFFGRID). All published carriers exist by this point.
     probeOffGrid();
@@ -6483,6 +6839,109 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // the regime vertical step, and whether the clean 1D candidate was
     // roster-excluded.  Enable with LDCD_PY_L0/L1 (frame line range) and
     // LDCD_PY_C0/C1 (active-picture column range, i.e. h - left).  Run -t 1.
+    // ---- LDCD_PROBE_YCAND: per-CANDIDATE grading against certified luma ----
+    // User question (2026-08-01): "we've established that there's still some
+    // HF Y left on the table -- do you see low-hanging fruit in pulling more
+    // HF Y from comb, witness or return?"  At covered samples Ltrue = raw -
+    // exact is fact, so every candidate can be graded individually, and the
+    // ORACLE bound (per-pixel best candidate) sizes exactly how much fidelity
+    // the election is leaving behind.  Run HELD OUT (LDCD_CERT_1D=0).
+    static const bool yCandOn = std::getenv("LDCD_PROBE_YCAND") != nullptr;
+    double candErr[5] = {0,0,0,0,0};
+    long   candN[5]   = {0,0,0,0,0};
+    double candSlopeY[5] = {0,0,0,0,0}, candSlopeT[5] = {0,0,0,0,0};
+    long   candSlopeN[5] = {0,0,0,0,0};
+    double electErr = 0.0, oracleErr = 0.0; long electN = 0;
+    long oracleWin[5] = {0,0,0,0,0};
+    // ---- LDCD_PROBE_RETHULL: is the return hull clamping GOOD values? ----
+    // User challenge (2026-08-02): "Retracted has such better stats than
+    // comb that I would need a tiebreaker to award it to comb before I'd
+    // take it from retracted. Do you have a confirmation that retracted is
+    // in the wrong on those differences?" -- correct: the hull's segment
+    // [comb, raw] has BOTH endpoints defined by comb, so it encodes "comb's
+    // carrier claim is right", which is an assumption, not an impossible
+    // (the carrier is signed; if comb's sign or magnitude is wrong the true
+    // luma lies outside). Graded here against certified truth on def lines:
+    // pre-hull vs post-hull distance to raw - exact, over all fired samples
+    // and over the binding subset. Run in SHIPPING config with
+    // LDCD_CHROMA_FACTS=0 (so return is not retired on covered frames).
+    static const bool retHullProbeOn =
+        std::getenv("LDCD_PROBE_RETHULL") != nullptr;
+    double hfPickErr = 0, hfChanceSum = 0;
+    long hfPickN = 0, hfPickHit = 0;
+    double rhPre = 0, rhPost = 0, rhBindPre = 0, rhBindPost = 0;
+    long rhN = 0, rhBindN = 0, rhBindDef = 0;
+    // Return-delivery sub-ledger (see the split below).
+    constexpr double kRetDeliverIRE = 0.5;
+    double ractElect = 0, ractRet = 0, ractComb = 0, ractRetr = 0;
+    double ractPos = 0, ractProxRet = 0, ractEvRet = 0;
+    long ractProxN = 0;
+    long ractN = 0, ractRetrN = 0, ractPosN = 0, ractRetBetter = 0;
+
+    // ---- LDCD_PROBE_RETIMPACT: quantify return's impact on UNCOVERED
+    // frames, where no certified fact exists to grade against (YCAND/YCERT
+    // are structurally blind there). User (2026-08-01): "you have tested
+    // uncovered frames with other tools and held back certified at other
+    // times. Please quantify return's impact." Reference: the antRefLuma
+    // chain (Pass 1.7's tween, validated TRUTH-GRADE on static content
+    // earlier this session -- ANTGRADE box: 0.78 IRE mean|err|, corr +0.997
+    // vs certified truth at the title bevel), read DIRECTLY here since
+    // produceY and buildCarrierRetractionStage share the same FrameBuffer.
+    // Direct-tier samples only (antRefLuma_flat[line] itself finite, not
+    // the vertical-bracket fallback) -- the higher-confidence tier. This is
+    // an APPROXIMATE reference, not fact: report it as such, and expect
+    // motion to degrade it (the ghost lesson) rather than treat 0 error as
+    // certification. Independent of LDCD_CERT_1D/_TONE (reads the chain
+    // plane directly); meaningful only where antRefAge>=1 (chain reached
+    // this frame) and NOT frameHasExactCoverage() (this frame is itself
+    // uncovered -- the population the fact-based probes cannot reach).
+    static const bool retImpactOn =
+        std::getenv("LDCD_PROBE_RETIMPACT") != nullptr;
+    double riErrSum = 0.0; long riN = 0;
+    double riAbsYSum = 0.0;   // mean |Y - raw| at graded sites: content scale
+
+    // ---- LDCD_PROBE_RETGRADE: grade return against CERTIFIED TRUTH, on
+    // the OLD (uncertified) carrier -- user's design (2026-08-01): "if
+    // return is run on the old dg-discard carrier of the def, we have our
+    // measure against certified." True --dg-discard is an assembler-time
+    // (ld-cinemap) flag, not available at decode time; the equivalent here
+    // is LDCD_CERT_1D=0 (comb computes its own estimate instead of ceding
+    // to exact) PLUS LDCD_CHROMA_FACTS=0 (the suppression mask does not
+    // retire to zero on covered frames -- ccRetired depends on frame
+    // coverage, not on CERT_1D, so without this second gate return is a
+    // silent no-op here regardless of CERT_1D, as measured on the cube).
+    // Both held out together put return in EXACTLY the regime it operates
+    // in everywhere else (ordinary carrier, no certification) -- but on
+    // def lines, where truth exists to grade it. Run this probe TWICE
+    // (--cross-color-return 0 and 1.0) and pair by frame index externally:
+    // eOff - eOn > 0 means return recovered luma 1D's bandpass stole;
+    // < 0 is a false positive (return moved AWAY from truth).
+    // dsExactRow must be read directly (certifiedDefLine() short-circuits
+    // to false whenever certifiedOneDLevel()==0).
+    static const bool retGradeOn =
+        std::getenv("LDCD_PROBE_RETGRADE") != nullptr;
+    double rgErrSum = 0.0, rgErrSqSum = 0.0, rgSignedSum = 0.0;
+    long rgN = 0;
+    // Residual-budget decomposition (user, 2026-08-01: "figure out what the
+    // best thread to pull on might be to get at that 88%"): cells of
+    // [mask state x site class]. maskBin: 0 = quiet (<0.05), 1 = partial
+    // (0.05-0.5), 2 = strong (>0.5) -- with return OFF the mask plane is
+    // all-zero (not built), so bins 1-2 populate only in the ON run; the
+    // OFF/ON comparison per SITE CLASS gives recovery, the ON run's mask
+    // bins split the residual into fired-but-undershot vs never-fired.
+    // siteClass: 2 = impulse (lumaImpulseRisk>0.3, wins over edge),
+    // 1 = edge (hLumaDelta >= 6 IRE, the cc edge-read soft knee),
+    // 0 = flat/texture. Cell order [maskBin*3 + siteClass].
+    double rgCellErr[9] = {0,0,0,0,0,0,0,0,0};
+    long rgCellN[9] = {0,0,0,0,0,0,0,0,0};
+    double rgCellBand[9] = {0,0,0,0,0,0,0,0,0};
+    long rgCellBandN[9] = {0,0,0,0,0,0,0,0,0};
+
+    // Election bypass: see the per-pixel site. Diagnostic A/B only.
+    static const bool electBypass = []{
+        const char *s = std::getenv("LDCD_ELECT_BYPASS");
+        return s && std::atoi(s) != 0;
+    }();
     static const int pyDiagL0 = []{ const char *s = std::getenv("LDCD_PY_L0"); return s ? std::atoi(s) : -1; }();
     static const int pyDiagL1 = []{ const char *s = std::getenv("LDCD_PY_L1"); return s ? std::atoi(s) : -1; }();
     static const int pyDiagC0 = []{ const char *s = std::getenv("LDCD_PY_C0"); return s ? std::atoi(s) : -1; }();
@@ -6798,6 +7257,42 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     const double comb = (double)rawLine[hh] -
                         (std::isfinite(c) ? c : 0.0);
                     const double m = std::clamp((double)ccMaskRow[xx], 0.0, 1.0);
+                    // Delta-value return (2026-08-02): the returned VALUE is
+                    // the measured contamination -- the elected carrier's
+                    // excess over the anchored carrier -- so lawful chroma
+                    // stays in chroma. raw - anchored == retracted luma by
+                    // construction, so a full commit hands the site the
+                    // anticipation-anchored luma. Lab conviction: the
+                    // committed verdict with the old full-residual value
+                    // recovered 20.8% of the stolen-luma gap but paid
+                    // 1.2-2.3 IRE at fired sites on colored content (legal
+                    // carrier dumped into Y). Where no anchored plane
+                    // exists the full-residual return stands -- there the
+                    // verdict itself came from the fallback witness.
+                    //
+                    // WITHDRAWN 2026-08-02 -- a segment hull [comb, raw] was
+                    // installed here and removed the same day. It was NOT a
+                    // hull on an impossible: both endpoints are defined by
+                    // comb, so its width IS the comb's carrier claim, and
+                    // passing raw only means the residual carrier changes
+                    // SIGN -- ordinary for a signed oscillation whenever
+                    // comb's sign or magnitude is wrong. It therefore
+                    // encoded "comb's carrier claim is correct" as if it
+                    // were a law, and handed the tie to comb (3.22 IRE at
+                    // return-delivering sites) over retracted (2.32 IRE).
+                    // Measured: it bound on 5.2% of pixels but on 0.00% of
+                    // COVERED def samples -- i.e. exclusively where no exact
+                    // channel exists to confirm it -- and moved the 2fSC
+                    // speckle class it was meant to fix by +0.0..+0.3%.
+                    // A restriction that acts only where it cannot be
+                    // verified, against the better estimator, needs a
+                    // tiebreaker; none exists. The genuine impossible (a
+                    // carrier larger than any legal carrier) is already
+                    // enforced by feasible() on the roster.
+                    if (anchored1DValid && retractedRow) {
+                        const double r = (double)retractedRow[xx];
+                        if (std::isfinite(r)) return comb + m * (r - comb);
+                    }
                     return comb + m * ((double)rawLine[hh] - comb);
                 }
                 const double c = carrierComp ? carrierComp[xx] : clpLine[hh];
@@ -7102,12 +7597,38 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     const double hd = dsHDeltaRow ? dsHDeltaRow[xi] : 0.0;
                     const int bin = hd >= 6.0 ? 1 : 0;
                     g_dsRefProbe.covered++;
-                    if (oneDRow && std::isfinite(oneDRow[xi]))
-                        g_dsRefProbe.e[bin][0].add((oneDRow[xi] - ex) * invIreScale);
+                    // Referee repair (2026-08-02): the certified head and
+                    // factFit stamp locked1DSource / carrierFit with the
+                    // exact fact at precisely the samples this referee
+                    // grades, so the raw planes read |e|=0 by construction.
+                    // Grade the PRE-fact estimator stashes instead.
+                    const float *preHead = probePreHead1D_flat.empty()
+                        ? nullptr
+                        : probePreHead1D_flat.data() +
+                              static_cast<size_t>(line) * demodWidth;
+                    const float *preFit = probePreFactFit_flat.empty()
+                        ? nullptr
+                        : probePreFactFit_flat.data() +
+                              static_cast<size_t>(line) * demodWidth;
+                    const double oneDEst =
+                        (preHead && std::isfinite(preHead[xi]))
+                            ? (double)preHead[xi]
+                            : (oneDRow ? oneDRow[xi]
+                                       : std::numeric_limits<
+                                             double>::quiet_NaN());
+                    if (std::isfinite(oneDEst))
+                        g_dsRefProbe.e[bin][0].add((oneDEst - ex) * invIreScale);
                     g_dsRefProbe.e[bin][1].add((rawH - combY - ex) * invIreScale);
                     const float *fitRowDs = carrierFit_line(line);
-                    if (fitRowDs && std::isfinite(fitRowDs[xi]))
-                        g_dsRefProbe.e[bin][2].add((fitRowDs[xi] - ex) * invIreScale);
+                    const double fitEst =
+                        (preFit && std::isfinite(preFit[xi]))
+                            ? (double)preFit[xi]
+                            : ((fitRowDs && std::isfinite(fitRowDs[xi]))
+                                   ? (double)fitRowDs[xi]
+                                   : std::numeric_limits<
+                                         double>::quiet_NaN());
+                    if (std::isfinite(fitEst))
+                        g_dsRefProbe.e[bin][2].add((fitEst - ex) * invIreScale);
                     if (retractedRow && std::isfinite(retractedRow[xi]))
                         g_dsRefProbe.e[bin][3].add(
                             (rawH - (double)retractedRow[xi] - ex) * invIreScale);
@@ -7125,13 +7646,11 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     static const int zC1 = zEnv("LDCD_DUMP_DSZONE_C1");
                     if (zL0 >= 0 && line >= zL0 && line <= zL1 &&
                         xi >= zC0 && xi <= zC1) {
-                        const double e1 =
-                            (oneDRow && std::isfinite(oneDRow[xi]))
-                                ? (oneDRow[xi] - ex) * invIreScale
+                        const double e1 = std::isfinite(oneDEst)
+                                ? (oneDEst - ex) * invIreScale
                                 : std::numeric_limits<double>::quiet_NaN();
-                        const double ef =
-                            (fitRowDs && std::isfinite(fitRowDs[xi]))
-                                ? (fitRowDs[xi] - ex) * invIreScale
+                        const double ef = std::isfinite(fitEst)
+                                ? (fitEst - ex) * invIreScale
                                 : std::numeric_limits<double>::quiet_NaN();
                         const double er =
                             (retractedRow && std::isfinite(retractedRow[xi]))
@@ -7171,17 +7690,30 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         ? std::clamp((double)ccImpurityRow[xi], 0.0, 1.0) : 0.0;
                     const double regionKeep = ccRegionRow
                         ? std::clamp((double)ccRegionRow[xi], 0.0, 1.0) : 0.0;
-                    // The detector's notch edge read, rebuilt from the TRUE
-                    // locked1DSource -- the same plane splitIQlocked uses, so
-                    // anchoring cannot flatter it.
+                    // Retired notch edge read, rebuilt for CONTRAST from the
+                    // PRE-head estimator stash (referee repair 2026-08-02:
+                    // locked1DSource IS the exact fact on covered samples, so
+                    // the old rebuild here was grading certified luma under a
+                    // detector label).
+                    const float *ccPreHead = probePreHead1D_flat.empty()
+                        ? nullptr
+                        : probePreHead1D_flat.data() +
+                              static_cast<size_t>(line) * demodWidth;
+                    auto oneDEstAt = [&](int rel) -> double {
+                        if (ccPreHead && std::isfinite(ccPreHead[rel]))
+                            return (double)ccPreHead[rel];
+                        return oneDRow ? oneDRow[rel]
+                                       : std::numeric_limits<
+                                             double>::quiet_NaN();
+                    };
                     double ccHDeltaIRE = 0.0;
-                    if (oneDRow) {
+                    if (oneDRow || ccPreHead) {
                         const int xm = std::max(0, xi - 2);
                         const int xp = std::min(width - 1, xi + 2);
                         const double nM =
-                            (double)rawLine[left + xm] - oneDRow[xm];
+                            (double)rawLine[left + xm] - oneDEstAt(xm);
                         const double nP =
-                            (double)rawLine[left + xp] - oneDRow[xp];
+                            (double)rawLine[left + xp] - oneDEstAt(xp);
                         ccHDeltaIRE = std::fabs(nP - nM) * invIreScale;
                     }
                     const double edgeRamp = std::clamp(
@@ -7212,8 +7744,21 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         (lurchIRE - kCcLurchSoftIRE) /
                             (kCcLurchHardIRE - kCcLurchSoftIRE), 0.0, 1.0);
 
+                    // Live committed-verdict read: devIRE / (2*cutoff), so
+                    // bin 0.5 = the shipping cutoff. -1/NaN (no anchored
+                    // plane) pins to 0 = the bail regime.
+                    double devRamp = 0.0;
+                    if (!probeCcDevIRE_flat.empty()) {
+                        const float dv = probeCcDevIRE_flat[
+                            static_cast<size_t>(line) * demodWidth + xi];
+                        if (std::isfinite(dv) && dv >= 0.0f)
+                            devRamp = std::clamp(
+                                (double)dv / (2.0 * kCcCommitCutoffIRE),
+                                0.0, 1.0);
+                    }
                     const double ccReads[CcRefProbe::NREADS] = {
-                        gA, edgeRamp, regionKeep, gPass, lurchRamp, mask };
+                        gA, edgeRamp, regionKeep, gPass, lurchRamp, mask,
+                        devRamp };
                     const double ccHd = dsHDeltaRow ? dsHDeltaRow[xi] : 0.0;
                     g_ccRefProbe.sample(ccHd >= 6.0 ? 1 : 0, carr, leak, mask,
                                         ccReads, line, xi);
@@ -7254,10 +7799,10 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                                     }
                                 }
                             starSkirtEx = sn_ > 0 ? se / sn_ : 0.0;
-                            const double e1D =
-                                (oneDRow && std::isfinite(oneDRow[xi]))
-                                    ? (oneDRow[xi] - (double)dsExactRow[h]) *
-                                          inv
+                            const double oneDEstStar = oneDEstAt(xi);
+                            const double e1D = std::isfinite(oneDEstStar)
+                                    ? (oneDEstStar -
+                                       (double)dsExactRow[h]) * inv
                                     : std::numeric_limits<
                                           double>::quiet_NaN();
                             g_ccRefProbe.starSample(starCls, carr, leak, mask,
@@ -7286,14 +7831,23 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     // Explanation ledger: class assignment (star > legal >
                     // detail > flat), per-estimator errors, gain windows.
                     {
+                        // Referee repair: pre-stamp fit / pre-head 1D, so
+                        // the explanation ledger grades estimators.
                         const float *fitRowCc = carrierFit_line(line);
+                        const float *preFitCc = probePreFactFit_flat.empty()
+                            ? nullptr
+                            : probePreFactFit_flat.data() +
+                                  static_cast<size_t>(line) * demodWidth;
                         const double fitIRE =
-                            (fitRowCc && std::isfinite(fitRowCc[xi]))
-                                ? (double)fitRowCc[xi] * invIreScale
-                                : std::numeric_limits<double>::quiet_NaN();
-                        const double oneDIRE =
-                            (oneDRow && std::isfinite(oneDRow[xi]))
-                                ? oneDRow[xi] * invIreScale
+                            (preFitCc && std::isfinite(preFitCc[xi]))
+                                ? (double)preFitCc[xi] * invIreScale
+                                : (fitRowCc && std::isfinite(fitRowCc[xi]))
+                                    ? (double)fitRowCc[xi] * invIreScale
+                                    : std::numeric_limits<
+                                          double>::quiet_NaN();
+                        const double oneDEstCls = oneDEstAt(xi);
+                        const double oneDIRE = std::isfinite(oneDEstCls)
+                                ? oneDEstCls * invIreScale
                                 : std::numeric_limits<double>::quiet_NaN();
                         const int cls =
                             starCls == 0 ? CcRefProbe::CStarClean
@@ -7560,6 +8114,15 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 const double bandVal =
                     (bandRow && std::isfinite((double)bandRow[xi]))
                         ? (double)bandRow[xi] : 0.0;
+                // NOTE (open, 2026-08-02): this admission formula and the
+                // value the election actually samples (planeY plane 4) are
+                // NOT the same expression -- admission tests
+                // comb + ccReturn*(raw - comb) + bandVal while the election
+                // samples the delta form comb + m*(retracted - comb). The
+                // roster therefore judges feasibility on a claim it will not
+                // evaluate. Left as found pending a measured decision; do
+                // not "fix" it by clamping, which was tried and withdrawn
+                // (see planeY plane 4).
                 const double returnedY = haveFactY
                     ? rawH - (double)dsExactRow[h]
                     : combY + ccReturn * (rawH - combY) + bandVal;
@@ -7607,6 +8170,22 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // base center, admits returned Y. A distance gate here removes
                 // exactly the strong HF that the return exists to recover.
                 const bool returnedAdmitted = returnedFeasible;
+                // ELECTION BYPASS (diagnostic A/B only, LDCD_ELECT_BYPASS=1;
+                // measurement instrument for the chroma-lean hunt, 2026-08-01).
+                // Forces the top band to the PURE COMB candidate, so emitted Y
+                // is the comb complement everywhere comb is feasible and the
+                // election's edge-population departure (measured 3.5 IRE RMS on
+                // ~20% of edge pixels) cannot express. If the locked-vs-bucket
+                // chroma lean (I -0.39 / Q -0.20 px) collapses toward the
+                // bucket referee under this, the election's complement
+                // departure is the source; if it survives, the election is
+                // exonerated and the bias is upstream of the roster.
+                // NOT a shipping mode: it discards every other candidate.
+                if (electBypass && combOK) {
+                    Y[h] = reconstructTop(0, candidateTopAt(0, h));
+                    continue;
+                }
+
                 if (nIn == 1 && !returnedAdmitted) {
                     Y[h] = reconstructTop(candPlane[inIdx[0]], candY[inIdx[0]]);
                     if (dumpHull) {
@@ -7899,6 +8478,64 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 const double blendTau = kBlendTauIRE * irescale;
                 double costs[4];
                 double wDiag[4] = {0.0, 0.0, 0.0, 0.0};
+                // Per-plane capture for the proximity-nulling measurement
+                // (user, 2026-08-02). proximity01 falls to 0 as a candidate
+                // departs from its neighbours -- which is the definition of
+                // return DELIVERING -- so the evidence term it multiplies
+                // may be switched off at exactly the sites it exists for.
+                double proxByPlane[5] = {-1, -1, -1, -1, -1};
+                double evByPlane[5]   = {0, 0, 0, 0, 0};
+                // ELECTION v2 (user-approved shape, 2026-08-02):
+                //  1. HF-surplus reward made CANDIDATE-NEUTRAL -- it no
+                //     longer needs illegalProof to vouch for the site.
+                //     Truth-validated as a general score, never a selector:
+                //     argmax|HF| is the truth-best candidate 46-48% vs 33%
+                //     chance across cube/title/bridge, yet a pure max-HF
+                //     pick LOSES to the election (0.50 vs 0.46). A score,
+                //     not a rule.
+                //  2. The named plane==1 (retracted) adjustment retires --
+                //     the neutral HF term is what it was approximating.
+                //  3. The return-evidence term stops being multiplied by
+                //     proximity01 (see above).
+                //  4. Blend moves from an absolute-difference exponential
+                //     to a ratio/log curve, so a candidate that is much
+                //     better pedestals regardless of the local cost scale.
+                // BITMASK so the four changes can be bisected:
+                //   1 = candidate-neutral HF-surplus reward
+                //   2 = retire the named plane==1 (retracted) term
+                //   4 = drop proximity01 scaling on return evidence
+                //   8 = ratio/log blend curve
+                //  15 = all four (the bundle first measured)
+                //
+                // DEFAULT 7 (= 1|2|4, everything except the ratio blend),
+                // promoted 2026-08-02 on a truth-graded bisection, held out
+                // (CERT_1D=0 + CHROMA_FACTS=0 + native retraction), cube and
+                // title, frame-wide elected error vs certified luma:
+                //     HF neutral   -0.74% / -0.22%
+                //     retire named +0.06% / -1.29%
+                //     un-gate ev   -1.88% / -0.64%   <- largest single win
+                //     ratio blend  +3.33% / +2.77%   <- the only loser
+                //     all four     +0.41% / +0.14%   (blend cancels the rest)
+                //     1|2|4        -2.56% / -2.14%   <- promoted
+                // At return-delivering sites 1|2|4 is -11.4% / -4.4%.
+                // The ratio/log blend is REJECTED BY MEASUREMENT: pedestaling
+                // harder only pays where the pedestaled candidate is right,
+                // and return is the best candidate at its delivering sites on
+                // the cube but NOT on the title (1.82 vs a 1.70 blend). A
+                // sharper curve cannot fix a score that cannot tell those two
+                // regimes apart. LDCD_ELECT_V2=8 keeps it available for A/B.
+                static const int electV2 = []{
+                    const char *e = std::getenv("LDCD_ELECT_V2");
+                    return e ? std::atoi(e) : 7;
+                }();
+                const bool ev2Hf    = (electV2 & 1) != 0;
+                const bool ev2Named = (electV2 & 2) != 0;
+                const bool ev2Prox  = (electV2 & 4) != 0;
+                const bool ev2Blend = (electV2 & 8) != 0;
+                static const double kHfBaseShare = []{
+                    const char *e = std::getenv("LDCD_HF_BASE");
+                    return e ? std::atof(e) : 0.40;
+                }();
                 {
                     double bestCost = 1e300;
                     for (int k = 0; k < nIn; ++k) {
@@ -7937,15 +8574,29 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         // cap is unchanged, so large-surplus behaviour is
                         // identical.
                         constexpr double kEarlyHandoffSlope = 2.0;
+                        // v2: a baseline share of the HF reward is paid
+                        // without the estimator's proof; the proof still
+                        // tops it up. Candidate-neutral by construction --
+                        // it names only |HF| against comb's |HF|.
+                        const double hfVouch = ev2Hf
+                            ? (kHfBaseShare + (1.0 - kHfBaseShare) *
+                                                  illegalProof)
+                            : illegalProof;
                         const double legality =
-                            illegalProof * std::min(kEarlyHandoffSlope * extra,
-                                                    imagePrefCap);
+                            hfVouch * std::min(kEarlyHandoffSlope * extra,
+                                               imagePrefCap);
                         cost -= legality;
-                        // Cross-colour return evidence helps only to the
-                        // degree the image supports the candidate, as before.
-                        cost -= proximity01 *
+                        // Cross-colour return evidence. v1 scaled it by
+                        // proximity01, which vanishes exactly where the
+                        // candidate departs -- i.e. where return delivers.
+                        if (plane >= 0 && plane <= 4) {
+                            proxByPlane[plane] = proximity01;
+                            evByPlane[plane] =
+                                std::max(0.0, inCrossColorReturnEvidence[k]);
+                        }
+                        cost -= (ev2Prox ? 1.0 : proximity01) *
                             std::max(0.0, inCrossColorReturnEvidence[k]);
-                        if (plane == 1)
+                        if (plane == 1 && !ev2Named)
                             cost += chromaT * kHighChromaDemoteIRE * irescale -
                                     impulseT * kImpulseRetractedBiasIRE *
                                         irescale;
@@ -7981,8 +8632,28 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                             (k < baseNIn) ? candPlane[inIdx[k]] : 4;
                         const double yk = reconstructTop(plane, inHF[k]);
                         if (!std::isfinite(yk)) continue;
-                        double w =
-                            std::exp(-(costs[k] - bestCost) / blendTau);
+                        // v1: exp(-dCost/tau), an ABSOLUTE difference
+                        // against a fixed 0.75 IRE scale -- where local
+                        // costs are compressed it cannot separate anyone.
+                        // v2: ratio/log curve w = (1 + dCost/floor)^-p, so
+                        // the pedestal follows the RATIO of the scores.
+                        static const double kElectFloorIRE = []{
+                            const char *e = std::getenv("LDCD_ELECT_FLOOR");
+                            return e ? std::atof(e) : 0.15;
+                        }();
+                        static const double kElectPow = []{
+                            const char *e = std::getenv("LDCD_ELECT_POW");
+                            return e ? std::atof(e) : 2.5;
+                        }();
+                        double w;
+                        if (ev2Blend) {
+                            const double d = std::max(0.0,
+                                costs[k] - bestCost) /
+                                (kElectFloorIRE * irescale);
+                            w = std::exp(-kElectPow * std::log1p(d));
+                        } else {
+                            w = std::exp(-(costs[k] - bestCost) / blendTau);
+                        }
                         if (k == darkestIdx && k < baseNIn && baseNIn > 1)
                             w *= 1.0 - darkestVetoGate;
                         if (std::isfinite(anchorCeilIRE)) {
@@ -8005,6 +8676,165 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 Y[h] = (blendDen > 1e-12)
                     ? blendNum / blendDen
                     : reconstructTop(winnerPlane, resultHF);
+
+                if (retImpactOn && antRefAge >= 1 &&
+                    !frameHasExactCoverage() &&
+                    antRefLuma_flat.size() ==
+                        (size_t)frameHeight * demodWidth) {
+                    const float ref = antRefLuma_flat[
+                        (size_t)line * demodWidth + xi];
+                    if (std::isfinite(ref)) {
+                        riErrSum += std::fabs(Y[h] - (double)ref) * invIreScale;
+                        riAbsYSum += std::fabs(rawH - Y[h]) * invIreScale;
+                        ++riN;
+                    }
+                }
+
+                if (yCandOn && dsExactRow &&
+                    std::isfinite(dsExactRow[h])) {
+                    const double lTrue = rawH - (double)dsExactRow[h];
+                    // truth's own local gradient, for the slope figures
+                    double gT = 0.0; bool haveG = false;
+                    if (h - 1 >= left && h + 1 < right &&
+                        std::isfinite(dsExactRow[h - 1]) &&
+                        std::isfinite(dsExactRow[h + 1])) {
+                        const double lm = (double)rawLine[h - 1] -
+                                          (double)dsExactRow[h - 1];
+                        const double lp = (double)rawLine[h + 1] -
+                                          (double)dsExactRow[h + 1];
+                        gT = std::fabs(lp - lm) * invIreScale;
+                        haveG = gT > 8.0;
+                    }
+                    if (retHullProbeOn && ccMaskRow && carrierComp) {
+                        const double cv = carrierComp[xi];
+                        const double combV =
+                            rawH - (std::isfinite(cv) ? cv : 0.0);
+                        const double mv = std::clamp(
+                            (double)ccMaskRow[xi], 0.0, 1.0);
+                        double pre = std::numeric_limits<double>::quiet_NaN();
+                        if (anchored1DValid && retractedRow &&
+                            std::isfinite(retractedRow[xi]))
+                            pre = combV + mv *
+                                ((double)retractedRow[xi] - combV);
+                        else
+                            pre = combV + mv * (rawH - combV);
+                        if (mv > 0.0 && std::isfinite(pre)) {
+                            const double post = std::clamp(pre,
+                                std::min(combV, rawH),
+                                std::max(combV, rawH));
+                            const double ePre =
+                                std::fabs(pre - lTrue) * invIreScale;
+                            const double ePost =
+                                std::fabs(post - lTrue) * invIreScale;
+                            ++rhN; rhPre += ePre; rhPost += ePost;
+                            if (std::fabs(post - pre) > 1e-9) {
+                                ++rhBindN;
+                                rhBindPre += ePre;
+                                rhBindPost += ePost;
+                                ++rhBindDef;
+                            }
+                        }
+                    }
+                    double bestE = 1e300;
+                    int bestK = -1;
+                    // HF-AS-QUALITY-PROXY TEST (user proposal, 2026-08-02:
+                    // "Rewarding HF content is a nice, candidate neutral
+                    // score that would give retracted a boost without
+                    // calling it by name"). Before wiring any such term
+                    // into the cost, ask truth whether it is a valid
+                    // proxy: does the candidate carrying the MOST HF
+                    // actually stand closest to certified luma? Reported
+                    // as (a) how often argmax|HF| == the truth-best
+                    // candidate, against the 1/n chance baseline, and
+                    // (b) what a pure "always pick max HF" selector would
+                    // have scored versus the shipping election and the
+                    // per-pixel oracle.
+                    int hfArgPlane = -1; double hfMaxAbs = -1.0;
+                    double hfPickErrHere = std::numeric_limits<
+                        double>::quiet_NaN();
+                    // RETURN-DELIVERY SPLIT (user, 2026-08-02: return must
+                    // "win on the merits where it's delivering", since comb
+                    // and retracted do not address bandpass luma at all).
+                    // Delivering = where the returned candidate actually
+                    // departs from comb, i.e. where it is claiming stolen
+                    // bandpass luma. Everywhere else it is comb by
+                    // construction and grading it says nothing.
+                    double ykByPlane[5];
+                    for (int q = 0; q < 5; ++q)
+                        ykByPlane[q] = std::numeric_limits<double>::quiet_NaN();
+                    for (int k = 0; k < nIn && k < 4; ++k) {
+                        const int plane =
+                            (k < baseNIn) ? candPlane[inIdx[k]] : 4;
+                        if (plane < 0 || plane > 4) continue;
+                        const double yk = reconstructTop(plane, inHF[k]);
+                        if (!std::isfinite(yk)) continue;
+                        const double e = std::fabs(yk - lTrue) * invIreScale;
+                        candErr[plane] += e; candN[plane]++;
+                        ykByPlane[plane] = yk;
+                        if (e < bestE) { bestE = e; bestK = plane; }
+                        const double hfAbs = std::fabs(inHF[k]);
+                        if (hfAbs > hfMaxAbs) {
+                            hfMaxAbs = hfAbs;
+                            hfArgPlane = plane;
+                            hfPickErrHere = e;
+                        }
+                        if (haveG) {
+                            // candidate gradient via its own plane values
+                            const double ym = planeY(plane, h - 1);
+                            const double yp = planeY(plane, h + 1);
+                            if (std::isfinite(ym) && std::isfinite(yp)) {
+                                candSlopeY[plane] +=
+                                    std::fabs(yp - ym) * invIreScale;
+                                candSlopeT[plane] += gT;
+                                candSlopeN[plane]++;
+                            }
+                        }
+                    }
+                    if (bestK >= 0) {
+                        electErr += std::fabs(Y[h] - lTrue) * invIreScale;
+                        oracleErr += bestE;
+                        electN++;
+                        oracleWin[bestK]++;
+                        if (hfArgPlane >= 0 && std::isfinite(hfPickErrHere)) {
+                            hfPickErr += hfPickErrHere;
+                            hfPickN++;
+                            hfChanceSum += 1.0 / (double)std::max(1, nIn);
+                            if (hfArgPlane == bestK) hfPickHit++;
+                        }
+                        const double yRet = ykByPlane[4];
+                        const double yComb = ykByPlane[0];
+                        if (std::isfinite(yRet) && std::isfinite(yComb) &&
+                            std::fabs(yRet - yComb) * invIreScale >=
+                                kRetDeliverIRE) {
+                            ++ractN;
+                            ractElect += std::fabs(Y[h] - lTrue) * invIreScale;
+                            ractRet   += std::fabs(yRet - lTrue) * invIreScale;
+                            ractComb  += std::fabs(yComb - lTrue) * invIreScale;
+                            const double yRetr = ykByPlane[1];
+                            if (std::isfinite(yRetr)) {
+                                ractRetr +=
+                                    std::fabs(yRetr - lTrue) * invIreScale;
+                                ++ractRetrN;
+                            }
+                            // Where does the elected Y actually sit between
+                            // the two? 0 = on comb, 1 = on return.
+                            const double span = yRet - yComb;
+                            if (std::fabs(span) > 1e-9) {
+                                ractPos += std::clamp(
+                                    (Y[h] - yComb) / span, -1.0, 2.0);
+                                ++ractPosN;
+                            }
+                            if (std::fabs(yRet - lTrue) <
+                                std::fabs(yComb - lTrue))
+                                ++ractRetBetter;
+                            if (proxByPlane[4] >= 0.0) {
+                                ractProxRet += proxByPlane[4];
+                                ractEvRet   += evByPlane[4];
+                                ++ractProxN;
+                            }
+                        }
+                    }
+                }
                 if (consDump) {
                     // Bucket writes Y and chroma from ONE scalar:
                     //   Y = raw - val, chroma = demod(val)  => Y + chroma == raw.
@@ -8200,34 +9030,88 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             }
         }
 
-        // ---- Star law: substitution pass ----
-        // Sits AFTER every Y branch so it holds under all configurations --
-        // election, plain comb, clpLine fallback alike (user mandate: the
-        // fix is invoked whatever the settings, even if it's just comb).
-        // The whole b-w-b run takes raw as one unit (one region, one
-        // render); the skirt is never substituted, so at a ringing site the
-        // pipeline keeps interpreting the skirt as chroma -- the refined
-        // bail. Seams land in black flanks.
-        if (starAnyLicense) {
-            for (int h = left + 5; h < right - 5; ++h) {
-                double flank = 0.0;
-                const double peakIRE =
-                    starSignatureAt(rawLine, h, &flank);
-                if (peakIRE <= 0.0) continue;
-                const size_t r =
-                    (size_t)(line / kStarRegLines) * starRegionsX +
-                    (h - left) / kStarRegCols;
-                if (!starLicense[r]) continue;
-                const double runThr = flank + 0.35 * peakIRE * irescale;
-                Y[h] = (double)rawLine[h];
-                starSubstituted++;
-                for (int k = -2; k <= 2; ++k) {
-                    if (k == 0) continue;
-                    if ((double)rawLine[h + k] > runThr) {
-                        Y[h + k] = (double)rawLine[h + k];
-                        starSubstituted++;
-                    }
+        // The split has already declared zero carrier on this footprint.
+        // Honour that complement after every Y branch: Y = raw - 0.  This is
+        // not a second decision and does not reshape the footprint.
+        if (starFootprintBuilt &&
+            starFootprint_flat.size() >=
+                static_cast<size_t>(frameHeight) * demodWidth) {
+            const std::uint8_t *star = starFootprint_flat.data() +
+                static_cast<size_t>(line) * demodWidth;
+            for (int xi = 0; xi < width; ++xi)
+                if (star[xi]) Y[left + xi] = (double)rawLine[left + xi];
+        }
+
+        // RETGRADE post-pass (per line, Y row now complete): grade emitted
+        // Y against certified truth, classed by mask x site, and split each
+        // error into its CARRIER-BAND vs out-of-band parts. The in-band
+        // share is the theft signature: luma stolen by the 1D bandpass
+        // lives near fSC, so residual error that is IN-band at a
+        // quiet-mask site is recoverable theft the detector missed, while
+        // broadband error there was never stolen luma at all and return
+        // cannot fix it.
+        if (retGradeOn) {
+            // Self-contained refetch (this scope is outside the demod
+            // block's row declarations).
+            const float *dsExactRow = exactCarrierRow(line);
+            const float *ccMaskRow = lockedCcMask_line(line);
+            const float *dsHDeltaRow = lockedLumaHDeltaIRE_line(line);
+            const AttributionEvidence *attribRow =
+                attributionEvidence_line(line);
+            const quint16 *rawLinePtr = rawbuffer.data() +
+                static_cast<size_t>(line) * videoParameters.fieldWidth;
+            const double *Y = componentFrame->y(line);
+            if (dsExactRow && Y) {
+            constexpr double bT0 = 0.676462;
+            constexpr double bT2 = -0.250000;
+            constexpr double bT4 = -0.088231;
+            static thread_local std::vector<double> errRow;
+            if ((int)errRow.size() < width)
+                errRow.resize(width);
+            for (int xi2 = 0; xi2 < width; ++xi2) {
+                const int hh = left + xi2;
+                errRow[xi2] = std::isfinite(dsExactRow[hh])
+                    ? Y[hh] - ((double)rawLinePtr[hh] -
+                               (double)dsExactRow[hh])
+                    : std::numeric_limits<double>::quiet_NaN();
+            }
+            for (int xi2 = 0; xi2 < width; ++xi2) {
+                const double e0 = errRow[xi2];
+                if (!std::isfinite(e0)) continue;
+                const double aerr = std::fabs(e0) * invIreScale;
+                rgErrSum += aerr;
+                rgErrSqSum += e0 * e0 * invIreScale * invIreScale;
+                rgSignedSum += e0 * invIreScale;
+                ++rgN;
+                const double m = ccMaskRow
+                    ? std::clamp((double)ccMaskRow[xi2], 0.0, 1.0) : 0.0;
+                const int mb = (m < 0.05) ? 0 : (m <= 0.5 ? 1 : 2);
+                const double impT = attribRow
+                    ? std::clamp(
+                          attribRow[xi2].facts.lumaImpulseRisk, 0.0, 1.0)
+                    : 0.0;
+                const double hd = dsHDeltaRow
+                    ? (double)dsHDeltaRow[xi2] : 0.0;
+                const int sc = (impT > 0.3) ? 2 : (hd >= 6.0 ? 1 : 0);
+                const int c = mb * 3 + sc;
+                rgCellErr[c] += aerr;
+                rgCellN[c]++;
+                // carrier-band part of the error at this sample
+                bool ok = true; double taps[5];
+                static const int off5[5] = { 0, -2, 2, -4, 4 };
+                for (int k = 0; k < 5 && ok; ++k) {
+                    const int j = std::clamp(xi2 + off5[k], 0, width - 1);
+                    taps[k] = errRow[j];
+                    if (!std::isfinite(taps[k])) ok = false;
                 }
+                if (ok) {
+                    const double bp = bT0 * taps[0] +
+                                      bT2 * (taps[1] + taps[2]) +
+                                      bT4 * (taps[3] + taps[4]);
+                    rgCellBand[c] += std::fabs(bp) * invIreScale;
+                    rgCellBandN[c]++;
+                }
+            }
             }
         }
 
@@ -8235,6 +9119,41 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             std::fill(w2d_frame_weight[line].begin(),
                       w2d_frame_weight[line].end(), 0.0f);
         }
+    }
+
+    if (retGradeOn && rgN > 0) {
+        std::fprintf(stderr,
+            "[RETGRADE] n=%ld meanAbsErr=%.4f IRE rms=%.4f IRE "
+            "meanSignedErr=%+.4f IRE\n",
+            rgN, rgErrSum / rgN,
+            std::sqrt(rgErrSqSum / rgN), rgSignedSum / rgN);
+        static const char *mbn[3] = {"quiet", "partial", "strong"};
+        static const char *scn[3] = {"flat", "edge", "impulse"};
+        for (int mb = 0; mb < 3; ++mb)
+            for (int sc = 0; sc < 3; ++sc) {
+                const int c = mb * 3 + sc;
+                if (!rgCellN[c]) continue;
+                std::fprintf(stderr,
+                    "[RETGRADE-CELL] mask=%s site=%s n=%ld "
+                    "meanAbsErr=%.4f errShare=%.1f%% pxShare=%.1f%% "
+                    "inBandShare=%.1f%%\n",
+                    mbn[mb], scn[sc], rgCellN[c],
+                    rgCellErr[c] / rgCellN[c],
+                    100.0 * rgCellErr[c] / rgErrSum,
+                    100.0 * rgCellN[c] / rgN,
+                    rgCellBandN[c]
+                        ? 100.0 * (rgCellBand[c] / rgCellBandN[c]) /
+                              (rgCellErr[c] / rgCellN[c])
+                        : 0.0);
+            }
+    }
+
+    if (retImpactOn && riN > 0) {
+        std::fprintf(stderr,
+            "[RETIMPACT] uncovered n=%ld  Y-vs-antRefLuma mean|err| %.3f IRE "
+            "(approx reference, NOT certified fact -- content scale "
+            "mean|Y-raw| %.2f IRE)\n",
+            riN, riErrSum / riN, riAbsYSum / riN);
     }
 
     if (consDump && consN > 0) {
@@ -8297,15 +9216,281 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
 
     if (starFixDump)
         std::fprintf(stderr,
-            "[STARFIX] covered=%d licensedRegions=%ld/%d substituted=%ld\n",
+            "[STARFIX] covered=%d licensedRegions=%ld/%d "
+            "signatures=%ld licensedCenters=%ld substitutedSamples=%ld "
+            "blackToBlack=%d extendedCenters=%ld addedSamples=%ld "
+            "addedExactN=%ld addedExactMean=%.3f addedExactMax=%.3f "
+            "carrierRunVetoes=%ld splitZeroSamples=%ld "
+            "anchoredReturnBlocked=%ld sceneStart=%d sceneSplit=%d "
+            "usedPrevEvidence=%d usedNextEvidence=%d\n",
             frameHasExactCoverage() ? 1 : 0, starLicensedRegions,
-            starRegionsX * starRegionsY, starSubstituted);
+            starRegionsX * starRegionsY, starSignatureCenters,
+            starLicensedCenters, starSubstitutedSamples,
+            1, starExtendedCenters,
+            starAddedSamples, starAddedExactN,
+            starAddedExactN > 0
+                ? starAddedExactSum / (double)starAddedExactN : 0.0,
+            starAddedExactMax, starCarrierRunVetoes, starSplitZeroSamples,
+            starAnchoredReturnBlocked, isSceneStart ? 1 : 0,
+            hasSceneSplit ? 1 : 0, starUsedPrevEvidence ? 1 : 0,
+            starUsedNextEvidence ? 1 : 0);
 
     if (DsRefProbe::on())
         g_dsRefProbe.flush();
 
     if (CcRefProbe::on())
         g_ccRefProbe.flush();
+
+    if (retHullProbeOn && rhN > 0) {
+        std::fprintf(stderr,
+            "[RETHULL] fired n=%ld  preHull %.4f  postHull %.4f IRE | "
+            "binding n=%ld (%.2f%%)  preHull %.4f  postHull %.4f IRE  "
+            "verdict=%s\n",
+            rhN, rhPre / rhN, rhPost / rhN,
+            rhBindN, 100.0 * (double)rhBindN / (double)rhN,
+            rhBindN ? rhBindPre / rhBindN : 0.0,
+            rhBindN ? rhBindPost / rhBindN : 0.0,
+            (rhBindN && rhBindPost > rhBindPre) ? "HULL HARMFUL"
+                : (rhBindN && rhBindPost < rhBindPre) ? "hull helps"
+                : "inert");
+    }
+    if (yCandOn && hfPickN > 0) {
+        std::fprintf(stderr,
+            "[HFPROXY] n=%ld  maxHF-is-truth-best %.1f%% (chance %.1f%%)  "
+            "maxHF-pick %.4f IRE  elected %.4f IRE  oracle %.4f IRE  "
+            "verdict=%s\n",
+            hfPickN, 100.0 * (double)hfPickHit / (double)hfPickN,
+            100.0 * hfChanceSum / (double)hfPickN,
+            hfPickErr / hfPickN,
+            electN ? electErr / electN : 0.0,
+            electN ? oracleErr / electN : 0.0,
+            (electN && hfPickErr / hfPickN < electErr / electN)
+                ? "HF beats the election" : "HF does not beat the election");
+    }
+    if (yCandOn && ractN > 0) {
+        std::fprintf(stderr,
+            "[YRET] delivering n=%ld (%.1f%% of graded)  elected %.4f  "
+            "return %.4f  comb %.4f  retracted %.4f IRE  "
+            "returnBetterThanComb %.1f%%  electedPos %.3f "
+            "(0=comb 1=return)\n",
+            ractN, 100.0 * (double)ractN / (double)std::max(1L, electN),
+            ractElect / ractN, ractRet / ractN, ractComb / ractN,
+            ractRetrN ? ractRetr / ractRetrN : 0.0,
+            100.0 * (double)ractRetBetter / (double)ractN,
+            ractPosN ? ractPos / ractPosN : 0.0);
+        std::fprintf(stderr,
+            "[YRETPROX] delivering n=%ld  proximity01(return) %.4f  "
+            "evidence %.4f  effective(v1 prox*ev) %.6f IRE\n",
+            ractProxN,
+            ractProxN ? ractProxRet / ractProxN : 0.0,
+            ractProxN ? (ractEvRet / ractProxN) * invIreScale : 0.0,
+            ractProxN ? (ractProxRet / ractProxN) *
+                        (ractEvRet / ractProxN) * invIreScale : 0.0);
+    }
+    if (yCandOn && electN > 0) {
+        static const char *pn[5] = {"comb","retracted","?2","oneD","returned"};
+        std::fprintf(stderr,
+            "[YCAND] n=%ld  elected %.3f IRE  ORACLE %.3f IRE  "
+            "headroom %.1f%%\n", electN, electErr / electN,
+            oracleErr / electN,
+            (electErr > 0.0)
+                ? 100.0 * (electErr - oracleErr) / electErr : 0.0);
+        for (int k = 0; k < 5; ++k) {
+            if (!candN[k]) continue;
+            std::fprintf(stderr,
+                "         %-9s fid %.3f IRE (n=%ld)  slope %.3f  "
+                "oracle-wins %.1f%%\n",
+                pn[k], candErr[k] / candN[k], candN[k],
+                (candSlopeT[k] > 0.0) ? candSlopeY[k] / candSlopeT[k] : 0.0,
+                100.0 * oracleWin[k] / electN);
+        }
+    }
+
+    // ---- LDCD_PROBE_YCERT: grade emitted Y against CERTIFIED LUMA ----
+    // User direction (2026-08-01): "use the certified/covered truth to compare
+    // excess sharpening. We want the sharpening, but not to the point of
+    // disruption of color."  On covered def lines the conservation fact
+    // Ltrue = raw - exact IS the luma, at full band, per sample.  So the
+    // witness's sharpening can be graded against truth instead of against
+    // another decoder's convention:
+    //   fidelity   mean |Y - Ltrue| over the line (IRE)
+    //   slope      mean |dY| / mean |dLtrue| at strong truth edges
+    //              (1.0 = matches truth; >1 = sharpened PAST the source)
+    //   overshoot  mean of (|Y-Ltrue| at edge-adjacent samples) in IRE, the
+    //              part that must leave through chroma (chroma = raw - Y)
+    //   band       fraction of |Y - Ltrue| energy above 1.3 MHz -- excess that
+    //              is not even expressible as a chroma correction
+    // Measurement only; -t 1 for a stable read.
+    {
+        static const bool yCertOn =
+            std::getenv("LDCD_PROBE_YCERT") != nullptr;
+        // NOTE: does NOT use certifiedDefLine() -- that helper is gated on
+        // the certified family, so with LDCD_CERT_1D=0 (the held-out
+        // configuration this probe needs) it reports no def lines at all.
+        // Read the exact plane directly: truth exists independently of
+        // whether the decoder is allowed to consume it.
+        if (yCertOn && exactCarrier_flat.size() ==
+                (size_t)frameHeight * videoParameters.fieldWidth) {
+            double fSum = 0.0; long fN = 0;
+            double dY = 0.0, dT = 0.0; long dN = 0;
+            double ovSum = 0.0; long ovN = 0;
+            double eLo = 0.0, eHi = 0.0;
+            for (int line = firstLine; line < lastLine; ++line) {
+                const float *ex = exactCarrierRow(line);
+                if (!ex) continue;
+                bool anyExact = false;
+                for (int xi = 0; xi < width && !anyExact; ++xi)
+                    anyExact = std::isfinite(ex[left + xi]);
+                if (!anyExact) continue;
+                const quint16 *raw = rawbuffer.data() +
+                    static_cast<size_t>(line) * videoParameters.fieldWidth;
+                const double *Yr = componentFrame->y(line);
+                std::vector<double> Lt(width,
+                    std::numeric_limits<double>::quiet_NaN());
+                for (int xi = 0; xi < width; ++xi) {
+                    const float e = ex[left + xi];
+                    if (std::isfinite(e))
+                        Lt[xi] = (double)raw[left + xi] - (double)e;
+                }
+                for (int xi = 1; xi < width - 1; ++xi) {
+                    if (!std::isfinite(Lt[xi])) continue;
+                    const double err = (Yr[left + xi] - Lt[xi]) * invIreScale;
+                    fSum += std::fabs(err); ++fN;
+                    if (!std::isfinite(Lt[xi - 1]) ||
+                        !std::isfinite(Lt[xi + 1])) continue;
+                    const double gT =
+                        std::fabs(Lt[xi + 1] - Lt[xi - 1]) * invIreScale;
+                    const double gY = std::fabs(Yr[left + xi + 1] -
+                                                Yr[left + xi - 1]) * invIreScale;
+                    if (gT > 8.0) {          // a real luma edge in TRUTH
+                        dY += gY; dT += gT; ++dN;
+                        ovSum += std::fabs(err); ++ovN;
+                    }
+                    // crude LF/HF split of the error at the carrier scale
+                    const double e0 = (Yr[left + xi] - Lt[xi]) * invIreScale;
+                    const double eM = 0.5 *
+                        (((std::isfinite(Lt[xi - 1]))
+                            ? (Yr[left + xi - 1] - Lt[xi - 1]) : 0.0) +
+                         ((std::isfinite(Lt[xi + 1]))
+                            ? (Yr[left + xi + 1] - Lt[xi + 1]) : 0.0)) *
+                        invIreScale;
+                    eLo += eM * eM;
+                    eHi += (e0 - eM) * (e0 - eM);
+                }
+            }
+            // ---- CHROMA quality against the CERTIFIED CARRIER ----
+            // User (2026-08-01): "Chroma side cost should look to the
+            // certified carrier. It's sparse, but nothing else is in the same
+            // league."  At a covered sample the TRUE carrier is exact, and the
+            // render's implied carrier is (raw - Y) -- the exact complement of
+            // emitted luma.  Both are composite-domain carriers, so their
+            // 4fSC quadrature envelopes are directly comparable:
+            //   env(x) = hypot(c[x], c[x+1])     (adjacent samples are 90 deg)
+            // Reported (all truth-referenced, no bucket anywhere):
+            //   amp     mean envRender / mean envTruth at strong truth chroma
+            //           -- SATURATION fidelity against fact (1.0 = correct)
+            //   width   10-90% transition width of each envelope at truth
+            //           chroma edges -- the width question, re-asked against
+            //           truth after the bucket-referenced version was
+            //           falsified by the user
+            //   err     mean |envRender - envTruth| in IRE
+            {
+                double aR = 0.0, aT = 0.0; long aN = 0;
+                double eSum = 0.0; long eN = 0;
+                std::vector<double> wR, wT;
+                for (int line = firstLine; line < lastLine; ++line) {
+                    const float *ex = exactCarrierRow(line);
+                    if (!ex) continue;
+                    const quint16 *raw = rawbuffer.data() +
+                        static_cast<size_t>(line) * videoParameters.fieldWidth;
+                    const double *Yr = componentFrame->y(line);
+                    std::vector<double> eT(width, std::nan("")),
+                                        eR(width, std::nan(""));
+                    for (int xi = 0; xi + 1 < width; ++xi) {
+                        const float e0 = ex[left + xi], e1 = ex[left + xi + 1];
+                        if (!std::isfinite(e0) || !std::isfinite(e1)) continue;
+                        eT[xi] = std::hypot((double)e0, (double)e1) *
+                                 invIreScale;
+                        const double r0 = (double)raw[left + xi] -
+                                          Yr[left + xi];
+                        const double r1 = (double)raw[left + xi + 1] -
+                                          Yr[left + xi + 1];
+                        eR[xi] = std::hypot(r0, r1) * invIreScale;
+                    }
+                    for (int xi = 0; xi < width; ++xi) {
+                        if (!std::isfinite(eT[xi]) || !std::isfinite(eR[xi]))
+                            continue;
+                        eSum += std::fabs(eR[xi] - eT[xi]); ++eN;
+                        if (eT[xi] > 10.0) {
+                            aR += eR[xi]; aT += eT[xi]; ++aN;
+                        }
+                    }
+                    // Transition widths at truth chroma edges.
+                    auto widthAt = [&](const std::vector<double> &v,
+                                       int xi) -> double {
+                        const int lo = xi - 12, hi = xi + 12;
+                        if (lo < 0 || hi >= width) return std::nan("");
+                        double a = 0, b = 0; int na = 0, nb = 0;
+                        for (int k = lo; k < lo + 4; ++k) {
+                            if (!std::isfinite(v[k])) return std::nan("");
+                            a += v[k]; ++na;
+                        }
+                        for (int k = hi - 3; k <= hi; ++k) {
+                            if (!std::isfinite(v[k])) return std::nan("");
+                            b += v[k]; ++nb;
+                        }
+                        a /= na; b /= nb;
+                        if (std::fabs(b - a) < 12.0) return std::nan("");
+                        const double t1 = std::min(a, b) +
+                            0.1 * std::fabs(b - a);
+                        const double t2 = std::min(a, b) +
+                            0.9 * std::fabs(b - a);
+                        int first = -1, last = -1;
+                        for (int k = lo; k <= hi; ++k) {
+                            if (!std::isfinite(v[k])) return std::nan("");
+                            if (v[k] >= t1 && v[k] <= t2) {
+                                if (first < 0) first = k;
+                                last = k;
+                            }
+                        }
+                        return (first >= 0 && last > first)
+                            ? (double)(last - first) : std::nan("");
+                    };
+                    for (int xi = 13; xi + 13 < width; ++xi) {
+                        if (!std::isfinite(eT[xi]) ||
+                            !std::isfinite(eT[xi + 1])) continue;
+                        if (std::fabs(eT[xi + 1] - eT[xi]) < 4.0) continue;
+                        const double wt = widthAt(eT, xi);
+                        const double wr = widthAt(eR, xi);
+                        if (std::isfinite(wt) && std::isfinite(wr)) {
+                            wT.push_back(wt); wR.push_back(wr);
+                        }
+                    }
+                }
+                auto mean = [](const std::vector<double> &v) {
+                    if (v.empty()) return 0.0;
+                    double s = 0.0; for (double x : v) s += x;
+                    return s / v.size();
+                };
+                std::fprintf(stderr,
+                    "[CCERT] n=%ld env-err %.2f IRE | strong n=%ld amp "
+                    "render/truth %.3f | edges n=%zu width truth %.2f "
+                    "render %.2f (x%.2f)\n",
+                    eN, eN ? eSum / eN : 0.0, aN,
+                    (aT > 0.0) ? aR / aT : 0.0, wT.size(),
+                    mean(wT), mean(wR),
+                    (mean(wT) > 0.0) ? mean(wR) / mean(wT) : 0.0);
+            }
+
+            std::fprintf(stderr,
+                "[YCERT] n=%ld fidelity |Y-Ltrue| %.2f IRE | edges n=%ld "
+                "slope Y/truth %.3f | edge-err %.2f IRE | HF share %.1f%%\n",
+                fN, fN ? fSum / fN : 0.0, dN,
+                (dT > 0.0) ? dY / dT : 0.0,
+                ovN ? ovSum / ovN : 0.0,
+                (eLo + eHi > 0.0) ? 100.0 * eHi / (eLo + eHi) : 0.0);
+        }
+    }
 }
 // Lurch preconditioner for the coarse luma prior.
 //
@@ -9157,6 +10342,13 @@ void Comb::FrameBuffer::probeEdgePairClassMap(int line)
 void Comb::FrameBuffer::probeOffGrid()
 {
     if (!OffGridProbe::on()) return;
+    // Referee repair (2026-08-02): on covered frames the certified head and
+    // factFit make the "fit" and "1D" sources here the exact carrier, so
+    // "off-grid leakage" and "fit-vs-comb dropout" would be truth-vs-comb
+    // measurements wearing estimator labels (the pre-repair "95.7% lock"
+    // calibration note is void for the same reason). The probe's question
+    // is about estimator behaviour; ask it only where estimators answer.
+    if (frameHasExactCoverage()) return;
 
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
@@ -9273,6 +10465,11 @@ void Comb::FrameBuffer::probeEdgeFate(int dimensions)
 
     std::vector<std::uint8_t> mask(width);
     for (int line = firstLine; line < lastLine; ++line) {
+        // Referee repair (2026-08-02): clpbuffer[0] is not "pure 1D" on
+        // certified or anticipated def lines (head / echo), so |2D-1D| and
+        // the pass-through counters would mix estimate/exact/anticipated
+        // baselines with no discriminator. Skip those lines.
+        if (certifiedDefLine(line) || anticipatedDefLine(line)) continue;
         const double *c0 = clpbuffer[0].pixel[line];
         const double *c1 = clpbuffer[1].pixel[line];
         const double *c2 = dims3 ? clpbuffer[2].pixel[line] : nullptr;
@@ -9300,6 +10497,366 @@ void Comb::FrameBuffer::probeEdgeFate(int dimensions)
         }
     }
     g_edgeFate.merge(ln, ld21, ld32, lex, lnear, dims3);
+}
+
+// ==== LDCD_PROBE_INVENT: carrier-invention ledger ====
+//
+// Reconciliation (user, 2026-08-02: "we want all the data we can get").
+// The premise behind the lawful-subspace push was that the anchored model
+// admits alias on the cube body -- but that reading was rendered |C|
+// (chroma magnitude after demod gain and transformIQ), which is NOT
+// carrier IRE and cannot be compared with the truth ledger, where the fit
+// grades 0.39-0.89 IRE against exact. One of those two readings misleads.
+//
+// This settles it in one unit: every carrier claimant vs the exact channel
+// in IRE, on covered def samples, full frame and inside a box.
+// Claimants: 1D (locked1DSource), comb (the elected composite carrier),
+// fit (carrierFit), retracted (raw - carrierRetracted).
+// Per claimant: mean |claim|, mean |claim - exact|, and two rates --
+//   invent  = P(|claim| > |exact| + 1 IRE)   claiming carrier truth lacks
+//   confisc = P(|exact| > |claim| + 1 IRE)   missing carrier truth has
+// against mean |exact|, the true carrier mass in that population.
+// Run with LDCD_CERT_1D=0: exact is read directly (truth survives) while
+// every claimant stays an estimator.
+void Comb::FrameBuffer::probeCarrierInvention()
+{
+    static const bool inventOn =
+        std::getenv("LDCD_PROBE_INVENT") != nullptr;
+    if (!inventOn) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int width     = videoParameters.activeVideoEnd - left;
+    if (width <= 0 || demodWidth <= 0 || lastLine <= firstLine) return;
+
+    static const auto iEnv = [](const char *n, int d) {
+        const char *s = std::getenv(n);
+        return s ? std::atoi(s) : d;
+    };
+    // Box in y4m/export coordinates: line = firstActiveFrameLine + row.
+    static const int bR0 = iEnv("LDCD_INVENT_L0", -1);
+    static const int bR1 = iEnv("LDCD_INVENT_L1", -1);
+    static const int bC0 = iEnv("LDCD_INVENT_C0", -1);
+    static const int bC1 = iEnv("LDCD_INVENT_C1", -1);
+    const bool haveBox = bR0 >= 0 && bC0 >= 0;
+
+    struct Acc {
+        long n = 0;
+        double ex = 0;
+        double mag[5] = {0, 0, 0, 0, 0};
+        double err[5] = {0, 0, 0, 0, 0};
+        long   inv[5] = {0, 0, 0, 0, 0};
+        long   con[5] = {0, 0, 0, 0, 0};
+        long   cn[5]  = {0, 0, 0, 0, 0};
+    };
+    Acc full, box;
+
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *ex = exactCarrierRow(line);
+        if (!ex) continue;
+        const quint16 *raw = rawbuffer.data()
+            + static_cast<size_t>(line) * videoParameters.fieldWidth;
+        const double *oneD = locked1DSource_line(line);
+        const double *comp = lockedCarrierComposite_line(line);
+        const float  *fit  = carrierFit_line(line);
+        const float  *retr = carrierRetracted_line(line);
+        const double *Yrow = componentFrame ? componentFrame->y(line)
+                                            : nullptr;
+        const int row = line - firstLine;
+
+        for (int xi = 0; xi < width; ++xi) {
+            const float exv = ex[left + xi];
+            if (!std::isfinite(exv)) continue;
+            const double exIRE = std::fabs((double)exv) * invIreScale;
+
+            double claim[5];
+            bool have[5];
+            claim[0] = oneD ? oneD[xi]
+                            : std::numeric_limits<double>::quiet_NaN();
+            claim[1] = comp ? comp[xi]
+                            : std::numeric_limits<double>::quiet_NaN();
+            claim[2] = fit ? (double)fit[xi]
+                           : std::numeric_limits<double>::quiet_NaN();
+            claim[3] = retr ? ((double)raw[left + xi] - (double)retr[xi])
+                            : std::numeric_limits<double>::quiet_NaN();
+            // The claimant the RENDERER actually consumes: rendered chroma
+            // is demod(raw - Y) of the ELECTED Y, not of any carrier plane.
+            // If the planes are clean and this is not, the invention lives
+            // in the election / Y assembly, not in the carrier model.
+            claim[4] = Yrow ? ((double)raw[left + xi] - Yrow[left + xi])
+                            : std::numeric_limits<double>::quiet_NaN();
+            for (int k = 0; k < 5; ++k) have[k] = std::isfinite(claim[k]);
+
+            auto feed = [&](Acc &A) {
+                ++A.n;
+                A.ex += exIRE;
+                for (int k = 0; k < 5; ++k) {
+                    if (!have[k]) continue;
+                    const double cIRE = std::fabs(claim[k]) * invIreScale;
+                    const double eIRE =
+                        std::fabs(claim[k] - (double)exv) * invIreScale;
+                    ++A.cn[k];
+                    A.mag[k] += cIRE;
+                    A.err[k] += eIRE;
+                    if (cIRE > exIRE + 1.0) ++A.inv[k];
+                    if (exIRE > cIRE + 1.0) ++A.con[k];
+                }
+            };
+            feed(full);
+            if (haveBox && row >= bR0 && row <= bR1 &&
+                xi >= bC0 && xi <= bC1)
+                feed(box);
+        }
+    }
+
+    static const char *cname[5] =
+        { "oneD", "comb", "fit ", "retr", "elecY" };
+    auto report = [&](const Acc &A, const char *tag) {
+        if (!A.n) return;
+        for (int k = 0; k < 5; ++k) {
+            if (!A.cn[k]) continue;
+            std::fprintf(stderr,
+                "[INVENT] seq=%d zone=%-4s claim=%s n=%-8ld "
+                "trueIRE=%.3f claimIRE=%.3f errIRE=%.3f "
+                "invent=%.3f confisc=%.3f\n",
+                (int)heldSeq1, tag, cname[k], A.cn[k],
+                A.ex / A.n, A.mag[k] / A.cn[k], A.err[k] / A.cn[k],
+                (double)A.inv[k] / A.cn[k], (double)A.con[k] / A.cn[k]);
+        }
+    };
+    report(full, "full");
+    report(box, "box");
+}
+
+// ==== LDCD_PROBE_TWEEN: two-sided certified-luma tween, held out ====
+//
+// User design call (2026-08-02): amplitude work in COMPOSITE is out -- an
+// envelope needs a window (a smoother on composite blurs, never cancels)
+// and the per-cycle alternative scores at carrier rate, which amplitude-
+// modulates the very thing it judges. The luma route is an identity
+// instead: carrier = raw - L, per sample, no window anywhere. Because
+// alias-conforming cross-colour IS luma, a true L excludes it from the
+// carrier model BY CONSTRUCTION rather than by bound -- the only form of
+// "lawful subspace" that can reject energy no spectral law can touch.
+//
+// The shipped anticipated rung is ONE-SIDED (causal copy from the previous
+// cover) = copying, not tweening, and it renders as the ghost the beach
+// exposed. The cadence makes the two-sided form available for free: every
+// uncovered frame sits at the midpoint between two covers.
+//
+// HELD OUT HONESTLY: target = the MIDDLE of three consecutive covers,
+// predicted from the outer two, graded per sample against its own exact
+// channel. That straddle spans 4 film frames with the target at the
+// midpoint -- exactly twice the real job's distance -- so every number is
+// a conservative bound on the real tween.
+//
+// Columns, all on one population:
+//   tween = 0.5*(L_prev2 + L_current)   the proposal
+//   copy  = L_prev2                     what ships today (one-sided)
+//   fit   = raw - fit                   the incumbent, from the PRE-STAMP
+//                                       fit stash so it grades an
+//                                       estimator, not the fact factFit
+//                                       writes over it
+// Split by DIRECT (both predictors land on their own def lines -- the
+// parity-union question) vs BRACKET, and by straddle disagreement
+// |L_prev2 - L_current| (the motion axis: where the two covers agree the
+// tween should be truth; where they disagree the disagreement IS the
+// out-of-band residual, NOT a witness -- see the revocation note in
+// refineRetractedTemporal).
+//
+// Run: LDCD_PROBE_TWEEN=1 LDCD_CERT_1D=0 -t 1. Exact is read directly
+// (certifiedDefLine short-circuits under CERT_1D=0), so truth survives the
+// hold-out while every estimator stays an estimator.
+void Comb::FrameBuffer::probeLumaTween()
+{
+    static const bool tweenOn =
+        std::getenv("LDCD_PROBE_TWEEN") != nullptr;
+    if (!tweenOn) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int width     = videoParameters.activeVideoEnd - left;
+    if (width <= 0 || demodWidth <= 0 || lastLine <= firstLine) return;
+    const size_t planeSz =
+        static_cast<size_t>(demodLines) * demodWidth;
+    if (planeSz == 0) return;
+    const float nanF = std::numeric_limits<float>::quiet_NaN();
+
+    // Coverage test independent of the certified-family gates, so the
+    // probe still sees covers under LDCD_CERT_1D=0.
+    bool isCover = false;
+    for (int line = firstLine; line < lastLine && !isCover; ++line) {
+        const float *ex = exactCarrierRow(line);
+        if (!ex) continue;
+        for (int xi = 0; xi < width; ++xi)
+            if (std::isfinite(ex[left + xi])) { isCover = true; break; }
+    }
+    if (!isCover) return;
+
+    // This cover's certified luma (raw - exact) and fit-implied luma.
+    std::vector<float> cert(planeSz, nanF), fitL(planeSz, nanF);
+    for (int line = firstLine; line < lastLine; ++line) {
+        const float *ex = exactCarrierRow(line);
+        if (!ex) continue;
+        const quint16 *raw = rawbuffer.data()
+            + static_cast<size_t>(line) * videoParameters.fieldWidth;
+        const float *preFit = (probePreFactFit_flat.size() == planeSz)
+            ? probePreFactFit_flat.data() +
+                  static_cast<size_t>(line) * demodWidth
+            : nullptr;
+        const float *fitRow = (carrierFit_flat.size() == planeSz)
+            ? carrierFit_flat.data() +
+                  static_cast<size_t>(line) * demodWidth
+            : nullptr;
+        float *cRow = cert.data() + static_cast<size_t>(line) * demodWidth;
+        float *fRow = fitL.data() + static_cast<size_t>(line) * demodWidth;
+        for (int xi = 0; xi < width; ++xi) {
+            const double rawV = (double)raw[left + xi];
+            if (std::isfinite(ex[left + xi]))
+                cRow[xi] = (float)(rawV - (double)ex[left + xi]);
+            double f = std::numeric_limits<double>::quiet_NaN();
+            if (preFit && std::isfinite(preFit[xi])) f = (double)preFit[xi];
+            else if (fitRow && std::isfinite(fitRow[xi]))
+                f = (double)fitRow[xi];
+            if (std::isfinite(f)) fRow[xi] = (float)(rawV - f);
+        }
+    }
+
+    // Rolling stash of the two previous covers. Function-local statics,
+    // the established diagnostic pattern in this file: -t 1 only.
+    static std::vector<float> certPrev, certPrev2, fitPrev;
+    static qint32 seqPrev = -1, seqPrev2 = -1;
+
+    if (certPrev.size() == planeSz && certPrev2.size() == planeSz &&
+        fitPrev.size() == planeSz) {
+        auto sampleAt = [&](const std::vector<float> &P, int line, int xi,
+                            bool &direct) -> double {
+            const float v = P[static_cast<size_t>(line) * demodWidth + xi];
+            if (std::isfinite(v)) { direct = true; return (double)v; }
+            direct = false;
+            if (line - 1 >= firstLine && line + 1 < lastLine) {
+                const float a =
+                    P[static_cast<size_t>(line - 1) * demodWidth + xi];
+                const float b =
+                    P[static_cast<size_t>(line + 1) * demodWidth + xi];
+                if (std::isfinite(a) && std::isfinite(b))
+                    return 0.5 * ((double)a + (double)b);
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        };
+
+        double sE[2][4][3] = {};
+        long sN[2][4] = {};
+        long sNf[2][4] = {};
+        long tgtN = 0, twAny = 0, twDirect = 0, cpAny = 0, cpDirect = 0;
+
+        for (int line = firstLine; line < lastLine; ++line) {
+            for (int xi = 0; xi < width; ++xi) {
+                const size_t idx =
+                    static_cast<size_t>(line) * demodWidth + xi;
+                const float tgtF = certPrev[idx];
+                if (!std::isfinite(tgtF)) continue;
+                const double tgt = (double)tgtF;
+                ++tgtN;
+                bool dA = false, dB = false;
+                const double a = sampleAt(certPrev2, line, xi, dA);
+                const double b = sampleAt(cert, line, xi, dB);
+                if (std::isfinite(a)) {
+                    ++cpAny;
+                    if (dA) ++cpDirect;
+                }
+                if (!std::isfinite(a) || !std::isfinite(b)) continue;
+                ++twAny;
+                if (dA && dB) ++twDirect;
+
+                const int cls = (dA && dB) ? 0 : 1;
+                const double dis = std::fabs(a - b) * invIreScale;
+                const int mb = dis < 0.5 ? 0 : dis < 2.0 ? 1
+                             : dis < 8.0 ? 2 : 3;
+                ++sN[cls][mb];
+                sE[cls][mb][0] +=
+                    std::fabs(0.5 * (a + b) - tgt) * invIreScale;
+                sE[cls][mb][1] += std::fabs(a - tgt) * invIreScale;
+                const float ft = fitPrev[idx];
+                if (std::isfinite(ft)) {
+                    sE[cls][mb][2] +=
+                        std::fabs((double)ft - tgt) * invIreScale;
+                    ++sNf[cls][mb];
+                }
+            }
+        }
+
+        // CONSECUTIVE-COVER UNION CENSUS. certPrev2 and certPrev are
+        // adjacent covers, i.e. exactly the pair that straddles ONE
+        // uncovered frame -- the real application geometry, as opposed to
+        // the ±2 straddle this probe must grade on (truth only exists at
+        // covers). The question the tween lives or dies on: does the
+        // yin-yang def-parity mirror make those two covers
+        // parity-complementary, so their union delivers DIRECT certified
+        // luma on every line of the frame between them (no vertical
+        // bracket -- no smoother)? Measured here over the whole active
+        // area, needing no truth.
+        long unionN = 0, unionDirect = 0, p2Only = 0, p1Only = 0, both = 0;
+        for (int line = firstLine; line < lastLine; ++line)
+            for (int xi = 0; xi < width; ++xi) {
+                const size_t idx =
+                    static_cast<size_t>(line) * demodWidth + xi;
+                const bool a = std::isfinite(certPrev2[idx]);
+                const bool b = std::isfinite(certPrev[idx]);
+                ++unionN;
+                if (a || b) ++unionDirect;
+                if (a && b) ++both;
+                else if (a) ++p2Only;
+                else if (b) ++p1Only;
+            }
+        auto defParOf = [&](const std::vector<float> &P) {
+            for (int line = firstLine; line < lastLine; ++line)
+                for (int xi = 0; xi < width; ++xi)
+                    if (std::isfinite(
+                            P[static_cast<size_t>(line) * demodWidth + xi]))
+                        return line & 1;
+            return -1;
+        };
+        std::fprintf(stderr,
+            "[TWEENUNION] coverA=%d coverB=%d parA=%d parB=%d "
+            "unionDirect=%.3f bothDirect=%.3f aOnly=%.3f bOnly=%.3f\n",
+            (int)seqPrev2, (int)seqPrev,
+            defParOf(certPrev2), defParOf(certPrev),
+            unionN ? (double)unionDirect / unionN : 0.0,
+            unionN ? (double)both / unionN : 0.0,
+            unionN ? (double)p2Only / unionN : 0.0,
+            unionN ? (double)p1Only / unionN : 0.0);
+
+        std::fprintf(stderr,
+            "[TWEENCOV] seqMid=%d seqPrev=%d seqNext=%d targetN=%ld "
+            "tweenAny=%.3f tweenDirect=%.3f copyAny=%.3f copyDirect=%.3f\n",
+            (int)seqPrev, (int)seqPrev2, (int)heldSeq1, tgtN,
+            tgtN ? (double)twAny / tgtN : 0.0,
+            tgtN ? (double)twDirect / tgtN : 0.0,
+            tgtN ? (double)cpAny / tgtN : 0.0,
+            tgtN ? (double)cpDirect / tgtN : 0.0);
+        static const char *cn[2] = { "direct", "bracket" };
+        static const char *mn[4] = { "<0.5", "0.5-2", "2-8", ">=8" };
+        for (int c = 0; c < 2; ++c)
+            for (int m = 0; m < 4; ++m) {
+                if (!sN[c][m]) continue;
+                std::fprintf(stderr,
+                    "[TWEEN] seqMid=%d cls=%-7s dis=%-5s n=%-8ld "
+                    "tween=%.4f copy=%.4f fit=%.4f\n",
+                    (int)seqPrev, cn[c], mn[m], sN[c][m],
+                    sE[c][m][0] / sN[c][m],
+                    sE[c][m][1] / sN[c][m],
+                    sNf[c][m] ? sE[c][m][2] / sNf[c][m] : 0.0);
+            }
+    }
+
+    certPrev2 = std::move(certPrev);
+    seqPrev2  = seqPrev;
+    certPrev  = cert;
+    fitPrev   = std::move(fitL);
+    seqPrev   = heldSeq1;
 }
 
 void Comb::FrameBuffer::lurchSharpenCoarsePrior(const double *means,
@@ -9464,18 +11021,24 @@ static void ldcdApplyPhaseSnap(const std::vector<double> &est,
                                bool clampRatio,
                                const double *gate)
 {
-    constexpr int kSnapHalf = 4;            // window [-3,+4], W=8
-    for (int xi = 3; xi < width - kSnapHalf; ++xi) {
+    // Centered 9-tap, half-weight ends (integer centroid; the old [-3,+4]
+    // W=8 window estimated phase/amplitude half a sample right of the
+    // sample it snapped). Endpoint classes coincide at 4fSC, so the class
+    // population and the 0.25 normalisation are unchanged.
+    constexpr int kSnapHalf = 4;
+    for (int xi = kSnapHalf; xi < width - kSnapHalf; ++xi) {
         double eI = 0.0, eQ = 0.0, rI = 0.0, rQ = 0.0;
         bool ok = true;
-        for (int k = xi - 3; k <= xi + kSnapHalf && ok; ++k) {
+        for (int k = xi - kSnapHalf; k <= xi + kSnapHalf && ok; ++k) {
             const double b = ref[k];
             if (!std::isfinite(b)) { ok = false; break; }
             static const int cB[4] = { 1, 0, -1, 0 };
             static const int sB[4] = { 0, 1, 0, -1 };
+            const double w =
+                (k == xi - kSnapHalf || k == xi + kSnapHalf) ? 0.5 : 1.0;
             const int ph = k & 3;
-            eI += est[k] * cB[ph]; eQ += est[k] * sB[ph];
-            rI += b * cB[ph];      rQ += b * sB[ph];
+            eI += w * est[k] * cB[ph]; eQ += w * est[k] * sB[ph];
+            rI += w * b * cB[ph];      rQ += w * b * sB[ph];
         }
         if (!ok) continue;
         // I/Q sums over W=8 carry ~4x the waveform amplitude; 0.25
@@ -9622,8 +11185,15 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
         return !(e && std::atoi(e) == 0);
     }();
 
+    static const bool tcwProbeOn =
+        std::getenv("LDCD_PROBE_TCW") != nullptr;
+    long tcwN[4] = {0, 0, 0, 0};
+    double tcwRes[4] = {0, 0, 0, 0};
+    double tcwWc[4] = {0, 0, 0, 0};
+
     std::vector<double> tAlign(width), est(width), out(width);
     std::vector<double> sideP(width), sideN(width), snapGate(width);
+
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine = rawbuffer.data()
             + static_cast<size_t>(line) * videoParameters.fieldWidth;
@@ -9646,20 +11216,23 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
         // ramped 0.5->0.9) or the snap abstains and the estimator keeps
         // its own phase. Window-smooth, never a per-sample cut.
         for (int xi = 0; xi < width; ++xi) snapGate[xi] = 0.0;
+        // Centered 9-tap, half-weight ends (see ldcdApplyPhaseSnap).
         constexpr int kSnapHalf = 4;
-        for (int xi = 3; xi < width - kSnapHalf; ++xi) {
+        for (int xi = kSnapHalf; xi < width - kSnapHalf; ++xi) {
             double pI = 0, pQ = 0, nI = 0, nQ = 0;
             bool ok = true;
-            for (int k = xi - 3; k <= xi + kSnapHalf && ok; ++k) {
+            for (int k = xi - kSnapHalf; k <= xi + kSnapHalf && ok; ++k) {
                 const double p = sideP[k], n = sideN[k];
                 if (!std::isfinite(p) || !std::isfinite(n)) {
                     ok = false; break;
                 }
                 static const int cB[4] = { 1, 0, -1, 0 };
                 static const int sB[4] = { 0, 1, 0, -1 };
+                const double w =
+                    (k == xi - kSnapHalf || k == xi + kSnapHalf) ? 0.5 : 1.0;
                 const int ph = k & 3;
-                pI += p * cB[ph]; pQ += p * sB[ph];
-                nI += n * cB[ph]; nQ += n * sB[ph];
+                pI += w * p * cB[ph]; pQ += w * p * sB[ph];
+                nI += w * n * cB[ph]; nQ += w * n * sB[ph];
             }
             if (!ok) continue;
             const double ap = std::hypot(pI, pQ) * 0.25;
@@ -9688,7 +11261,8 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
         //     R = raw_this - Lhat_nb = C_this + (L_this - L_nb)
         // -- the luma error is purely temporal (motion), no vertical
         // mixing enters at any point. The merge FIR takes the carrier and
-        // the out-of-band residual |R - BP(R)| is the motion witness,
+        // the out-of-band residual |R - BP(R)| is a CORRELATE ONLY (it is
+        // not a witness -- see the revocation note at the merge below),
         // feeding the same confidence alpha as the vertical comb (a
         // penalty to alpha, never a cutoff).
         if (temporalComb) {
@@ -9700,10 +11274,49 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
             // line's Lhat draws from BOTH neighbours symmetrically:
             // direct same-line from the parity that covers it, bracket
             // mean from the other; motion error goes common-mode.
+            //
+            // THE BRACKET IS NOT A COMPROMISE -- IT BUYS UNIFORM
+            // PROVENANCE, AND THAT IS THE WHOLE MECHANISM. Every line
+            // here carries the SAME mixture of prev/next and the SAME
+            // mixture of direct/bracket, so no term in Lhat depends on
+            // line parity and there is nothing for an error to alternate
+            // with.
+            //
+            // FALSIFIED 2026-08-02, do not attempt a third time: the
+            // "sharp direct + smooth delta" build. With D = L_prev -
+            // L_next it is algebraically exact to keep the SHARP direct
+            // value on every line and reach the true midpoint via
+            //     M = L_prev - D/2   (lines the prev cover owns)
+            //     M = L_next + D/2   (lines the next cover owns)
+            // smoothing only D, which is a motion difference field and
+            // therefore lawful to smooth. It measured +9.1%
+            // parity-locked luma (LHAT A/B on the cube, the same
+            // signature as v1's +9.4%) and chroma +2.5% AWAY from the
+            // certified truth level. The reason generalises:
+            //
+            //   ANY TERM WHOSE SIGN OR PROVENANCE DEPENDS ON LINE PARITY
+            //   CONVERTS ITS OWN ERROR INTO LINE ALTERNATION.
+            //
+            // D is applied as -D/2 on one parity and +D/2 on the other,
+            // so wherever the smoothed D departs from the true D -- i.e.
+            // wherever D itself carries vertical structure -- the residual
+            // enters with alternating sign and IS alternation. Exactness
+            // of the algebra does not help; only exactness of D would,
+            // and that is motion compensation, not smoothing. Sharpness
+            // at this site has to come from a better estimate of the
+            // OTHER parity's luma (uniform provenance preserved), never
+            // from a parity-signed correction.
             std::vector<double> R(width,
                 std::numeric_limits<double>::quiet_NaN());
             std::vector<double> lhatSum(width, 0.0);
             std::vector<int> lhatN(width, 0);
+            // Each cover's own value, kept apart: their DISAGREEMENT is the
+            // occlusion reading (see the guard below). Both are filled on
+            // every line by direct-or-bracket, so provenance stays uniform
+            // across parities and the guard cannot alternate.
+            std::vector<double> sideVal[2];
+            sideVal[0].assign(width, std::numeric_limits<double>::quiet_NaN());
+            sideVal[1].assign(width, std::numeric_limits<double>::quiet_NaN());
             for (int side = 0; side < 2; ++side) {
                 const FrameBuffer *fb = nb[side];
                 if (!fb) continue;
@@ -9724,9 +11337,10 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                 for (int xi = 0; xi < width; ++xi) {
                     const int h = left + xi;
                     if (pex0 && std::isfinite(pex0[h])) {
-                        lhatSum[xi] += static_cast<double>(rawNb[h]) -
-                                       static_cast<double>(pex0[h]);
-                        lhatN[xi] += 1;
+                        const double v = static_cast<double>(rawNb[h]) -
+                                         static_cast<double>(pex0[h]);
+                        lhatSum[xi] += v; lhatN[xi] += 1;
+                        sideVal[side][xi] = v;
                     } else if (pexU && pexD &&
                                std::isfinite(pexU[h]) &&
                                std::isfinite(pexD[h])) {
@@ -9734,21 +11348,79 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                                           static_cast<double>(pexU[h]);
                         const double ld = static_cast<double>(rawNbD[h]) -
                                           static_cast<double>(pexD[h]);
-                        lhatSum[xi] += 0.5 * (lu + ld);
-                        lhatN[xi] += 1;
+                        const double v = 0.5 * (lu + ld);
+                        lhatSum[xi] += v; lhatN[xi] += 1;
+                        sideVal[side][xi] = v;
                     }
                 }
             }
             // Both sides or nothing: a one-sided reference re-creates the
             // frame-source alternation the symmetric build exists to
             // prevent (stream edges lose the comb, keeping snap-only).
-            const int needSides = (nb[0] && nb[1]) ? 2 : 1;
+            // BUG FIXED 2026-08-02: this read `(nb[0] && nb[1]) ? 2 : 1`,
+            // i.e. where only ONE neighbour was covered it happily built the
+            // reference from that one side -- exactly the one-sided
+            // direct-reference shape the parity law falsified (+9.4%
+            // line-alternating luma), and precisely the opposite of what the
+            // comment above it promises. Measured consequence: the frames
+            // carrying the WORST temporal excursions (peaks 88-94 IRE) were
+            // the batch-boundary frames running one-sided, and the occlusion
+            // guard could not act on them either, because it needs two covers
+            // to form a disagreement. Both sides or nothing, as stated.
+            const int needSides = 2;
             for (int xi = 0; xi < width; ++xi) {
                 if (lhatN[xi] < needSides) continue;
                 R[xi] = static_cast<double>(rawLine[left + xi]) -
                         lhatSum[xi] / lhatN[xi];
             }
+
             constexpr double kOobTauIRE = 2.0;
+
+            // ---- OCCLUSION GUARD (2026-08-02) ----
+            // Replaces the out-of-band residual, whose term was revoked
+            // above: it reads only the out-of-band share of the temporal
+            // luma error while the ghost lives IN-band, and measured it
+            // INVERTED -- reading lower and trusting more at the largest
+            // merges. Visible cost: a light unmasking in the NEXT frame
+            // showing through a face.
+            //
+            // The two covers bracket this frame in time, so their
+            // disagreement is a DIRECT reading of temporal instability --
+            // largest exactly at an occlusion, no band assumption, and
+            // nothing for a smooth error to hide behind. Smoothed
+            // laterally (evidence may be smoothed; the VALUE it gates never
+            // is), then applied as a cutoff: commit fully below, bail
+            // entirely above, no floor.
+            static const bool tcGuard = []{
+                const char *e = std::getenv("LDCD_TC_GUARD");
+                return !(e && std::atoi(e) == 0);
+            }();
+            static const double kTcCutoffIRE = []{
+                const char *e = std::getenv("LDCD_TC_CUTOFF");
+                return e ? std::atof(e) : 3.0;
+            }();
+            const bool tcGuardLive = tcGuard && nb[0] && nb[1];
+            std::vector<double> occIRE(width, 0.0);
+            if (tcGuardLive) {
+                std::vector<double> draw(width,
+                    std::numeric_limits<double>::quiet_NaN());
+                for (int xi = 0; xi < width; ++xi)
+                    if (std::isfinite(sideVal[0][xi]) &&
+                        std::isfinite(sideVal[1][xi]))
+                        draw[xi] = std::fabs(sideVal[0][xi] -
+                                             sideVal[1][xi]) * invIreScale;
+                constexpr int kOccHalf = 4;
+                for (int xi = 0; xi < width; ++xi) {
+                    double acc = 0.0; int n = 0;
+                    for (int k = std::max(0, xi - kOccHalf);
+                         k <= std::min(width - 1, xi + kOccHalf); ++k) {
+                        if (!std::isfinite(draw[k])) continue;
+                        acc += draw[k]; ++n;
+                    }
+                    occIRE[xi] = n ? acc / n : 0.0;
+                }
+            }
+
             for (int xi = 0; xi < width; ++xi) {
                 bool ok = true;
                 double taps[5];
@@ -9762,9 +11434,66 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                 const double bp = 0.676462 * taps[0] +
                                   -0.250000 * (taps[1] + taps[2]) +
                                   -0.088231 * (taps[3] + taps[4]);
+                // ---- TERM REVOKED, 2026-08-02 (user instruction) ----
+                // This quantity was called a "motion witness" throughout
+                // this file. It is not a witness and never was: I coined the
+                // label, then reasoned from my own label. What it measures
+                // is the OUT-OF-BAND part of R = C_this + (L_this - L_nb).
+                // C_this is in-band by law, so `res` sees only the
+                // out-of-band share of the temporal luma error -- while the
+                // share that actually becomes a ghost is the IN-BAND part,
+                // which bp passes straight through and `res` cannot see.
+                // Lhat is also half bracket (a vertical mean), so `res`
+                // reads vertical luma detail even on a perfectly static
+                // frame: an HF-content reading with motion as one input.
+                //
+                // MEASURED (LDCD_PROBE_TCW, 40 frames), binned by how far
+                // the merge moves the estimate:
+                //     <1 IRE   93.07%  res  1.51  wc 0.885
+                //     1-5       6.47%  res  7.97  wc 0.655
+                //     5-20      0.45%  res 14.10  wc 0.589
+                //     >=20     0.002%  res  6.35  wc 0.716   <-- INVERTS
+                // At the largest, most damaging merges the reading FALLS and
+                // the trust RISES. It is blind exactly where it would have
+                // to see: a smooth occlusion -- a light unmasking behind a
+                // face -- is low-frequency, so it passes at near full
+                // weight. That is the cheek artifact.
+                //
+                // The 0.5 floor below compounds it: even a firing reading
+                // can only ever halve the damage.
+                //
+                // Nothing here has evidentiary standing until something
+                // grades it against truth.
                 const double res = std::fabs(R[xi] - bp);
-                const double wc = 0.5 + 0.5 * std::exp(
-                    -res / (kOobTauIRE * irescale));
+                double wc;
+                if (tcGuardLive) {
+                    const double t = std::clamp(
+                        (occIRE[xi] - kTcCutoffIRE) / (0.5 * kTcCutoffIRE),
+                        0.0, 1.0);
+                    wc = 1.0 - t * t * (3.0 - 2.0 * t);
+                } else {
+                    wc = 0.5 + 0.5 * std::exp(
+                        -res / (kOobTauIRE * irescale));
+                }
+                // LDCD_PROBE_TCW: is the out-of-band residual actually a
+                // witness for THIS failure? User challenge (2026-08-02):
+                // "How is the out of band residual a motion witness? Isn't
+                // it just comb's HF extension?" R = C_this + (L_this -
+                // L_nb); C_this is in-band by law, so res sees only the
+                // OUT-OF-BAND part of the temporal luma error -- while the
+                // part that becomes the ghost is the IN-BAND part bp passes
+                // straight through. Binned by how far the merge actually
+                // MOVES the estimate: if the big moves carry SMALL res and
+                // wc near 1, the witness is blind exactly where it matters.
+                if (tcwProbeOn) {
+                    const double moved =
+                        std::fabs(wc * (bp - est[xi])) * invIreScale;
+                    const int b = moved < 1.0 ? 0 : moved < 5.0 ? 1
+                                : moved < 20.0 ? 2 : 3;
+                    ++tcwN[b];
+                    tcwRes[b] += res * invIreScale;
+                    tcwWc[b]  += wc;
+                }
                 est[xi] = wc * bp + (1.0 - wc) * est[xi];
             }
         }
@@ -9775,6 +11504,15 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
         for (int xi = 0; xi < width; ++xi)
             retractedRow[xi] = static_cast<float>(
                 static_cast<double>(rawLine[left + xi]) - out[xi]);
+    }
+    if (tcwProbeOn) {
+        static const char *bn[4] = {"<1", "1-5", "5-20", ">=20"};
+        for (int b = 0; b < 4; ++b) {
+            if (!tcwN[b]) continue;
+            std::fprintf(stderr,
+                "[TCW] moveIRE=%-5s n=%-9ld meanOobRes=%.3f IRE  meanWc=%.3f\n",
+                bn[b], tcwN[b], tcwRes[b] / tcwN[b], tcwWc[b] / tcwN[b]);
+        }
     }
 }
 
@@ -9787,12 +11525,20 @@ void Comb::FrameBuffer::buildCarrierRetracted(const FrameBuffer *prevF)
 // first consumer inside buildCarrierRetractionStage.
 void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
 {
-    // Opt-in (LDCD_CERT_TONE=1): unvetted at render scale when the
-    // reversion verdict landed; rides the same promotion gate as the
-    // anchoring family.
+    // DEFAULT ON (promoted 2026-08-01 with the anchoring family, user
+    // directive): the research verdict is that the certified carrier has
+    // an exact repeating cycle, and the anticipated phase lands almost
+    // exactly on the measured phase at the next cover -- so the curve is
+    // usable CAUSALLY, from the previous covered frame alone.  This is
+    // the anticipation actuator: prev cover's certified regional phase,
+    // advanced by the tracked global rate, corrects the uncovered fit's
+    // trend at load time (before Pass 2 and before split2D consumes the
+    // ladder).  A tone corrects trend, never performs surgery (+-25 deg
+    // hull, confidence-scaled, bilinear-smooth).  Escape LDCD_CERT_TONE=0
+    // for A/B only.
     static const bool toneOn = []{
         const char *e = std::getenv("LDCD_CERT_TONE");
-        return e && std::atoi(e) != 0;
+        return !(e && std::atoi(e) == 0);
     }();
     if (!toneOn || certifiedOneDLevel() == 0) return;
     if (frameHasExactCoverage()) return;                // anchors stand
@@ -10758,13 +12504,20 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
 
                 if (std::fabs(det) > 1e-9) {
                     const double inv = 1.0 / det;
+                    // Centered 5-tap, half-weight ends (integer centroid;
+                    // the old [xi-1, xi+2] window solved for the envelope
+                    // half a sample right of the sample it published).  At
+                    // 4fSC the endpoint classes coincide, so each carrier
+                    // class keeps total weight 1 and the normal matrix is
+                    // unchanged.
                     for (int xi = 0; xi < width; ++xi) {
-                        const int s = std::clamp(xi - 1, 0, width - 4);
                         double sIY = 0.0, sQY = 0.0;
-                        for (int k = 0; k < 4; ++k) {
-                            const double v = carrierFit[s + k];
-                            sIY += basisI[s + k] * v;
-                            sQY += basisQ[s + k] * v;
+                        for (int k = -2; k <= 2; ++k) {
+                            const int j = std::clamp(xi + k, 0, width - 1);
+                            const double w = (k == -2 || k == 2) ? 0.5 : 1.0;
+                            const double v = w * carrierFit[j];
+                            sIY += basisI[j] * v;
+                            sQY += basisQ[j] * v;
                         }
                         envI[xi] = ( sQQ * sIY - sIQ * sQY) * inv;
                         envQ[xi] = (-sIQ * sIY + sII * sQY) * inv;
@@ -11051,6 +12804,93 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         return;
 
     // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // Pass 1.7: FACT ANCHOR (user-approved 2026-08-01; position reversed
+    // from the original facts-last placement on user direction: "put it
+    // early enough to benefit the line cancellation").  At certified
+    // samples the fit IS the exact carrier -- facts as facts, no gain,
+    // no blend, no hull.  Stamped BEFORE the cross-line passes, so the
+    // 1.75 bridge, Pass 1.9's +-2 evidence legs, and Pass 2's interline
+    // cancellation all comb against FACT legs: same contract as the comb
+    // candidates' cede/comb pair in a different shape -- def lines
+    // idempotent/const, comp lines improved by combing against truth.
+    // PERSISTENCE LAW: the passes downstream carry const-guards (the
+    // bridge never adopts into a certified line; 1.9 never repairs a
+    // certified sample; Pass 2 writes combedCarrier, not the fit; the
+    // tone no-ops on covered frames), so a stamped fact survives to
+    // publication structurally, not by re-stamping.
+    //
+    // REGIONAL FACT AUDIT (the return's architecture, tailored to the
+    // witness): before stamping, the fit's pre-stamp error |fit - exact|
+    // at certified samples is pooled per region (128x32, the tone's
+    // geometry).  This is the truth ledger as a live instrument: it
+    // grades the SOLVE where truth exists, and conditions trust in the
+    // fit where truth doesn't (the between-anchor alpha merges consume
+    // it bilinearly, seam-free).  Regions with no certified samples
+    // carry NaN = no verdict = conduct unchanged.
+    // Escape LDCD_FACT_FIT=0 (also inert at LDCD_CERT_1D=0 and under
+    // --dg-discard, where no facts exist).
+    // ---------------------------------------------------------------
+    fitFactAuditNx = 0;
+    fitFactAuditNy = 0;
+    {
+        static const bool factFitOn = []{
+            const char *e = std::getenv("LDCD_FACT_FIT");
+            return !(e && std::atoi(e) == 0);
+        }();
+        if (factFitOn && certifiedOneDLevel() >= 1 &&
+            frameHasExactCoverage()) {
+            const int nx = (width + 127) / 128;
+            const int ny = (lastLine + 31) / 32;
+            fitFactAuditNx = nx;
+            fitFactAuditNy = ny;
+            fitFactAuditIRE.assign((size_t)nx * ny,
+                std::numeric_limits<float>::quiet_NaN());
+            std::vector<double> aSum((size_t)nx * ny, 0.0);
+            std::vector<long> aN((size_t)nx * ny, 0);
+            // Referee repair (2026-08-02): keep the PRE-stamp fit so the
+            // truth referees' "fit" column grades the estimator, not the
+            // fact it was replaced by. Probe-only.
+            static const bool fitStashOn = []{
+                return std::getenv("LDCD_PROBE_DSREF") != nullptr ||
+                       std::getenv("LDCD_PROBE_CCREF") != nullptr ||
+                       std::getenv("LDCD_PROBE_ANTGRADE") != nullptr ||
+                       std::getenv("LDCD_PROBE_TWEEN") != nullptr;
+            }();
+            float *fitStash = nullptr;
+            if (fitStashOn) {
+                probePreFactFit_flat.assign(
+                    static_cast<size_t>(demodLines) * demodWidth,
+                    std::numeric_limits<float>::quiet_NaN());
+                fitStash = probePreFactFit_flat.data();
+            }
+            for (int line = firstLine; line < lastLine; ++line) {
+                if (!certifiedDefLine(line)) continue;
+                const float *exRow = exactCarrierRow(line);
+                if (!exRow) continue;
+                float *fitRow = carrierFit_flat.data()
+                    + static_cast<size_t>(line) * demodWidth;
+                const size_t rb = (size_t)(line / 32) * nx;
+                for (int xi = 0; xi < width; ++xi) {
+                    const float ex = exRow[left + xi];
+                    if (!std::isfinite(ex)) continue;
+                    const size_t r = rb + xi / 128;
+                    aSum[r] += std::fabs((double)fitRow[xi] - (double)ex) *
+                               invIreScale;
+                    aN[r]++;
+                    if (fitStash)
+                        fitStash[static_cast<size_t>(line) * demodWidth +
+                                 xi] = fitRow[xi];
+                    fitRow[xi] = ex;
+                }
+            }
+            for (size_t r = 0; r < aSum.size(); ++r)
+                if (aN[r] >= 16)
+                    fitFactAuditIRE[r] =
+                        static_cast<float>(aSum[r] / aN[r]);
+        }
+    }
+
     // Pass 1.75: vertical amplitude continuity for the fit (the beam fix).
     //
     // Measured (LDCD_PROBE_OFFGRID): on LEGAL carrier the fit holds lock on
@@ -11125,6 +12965,9 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         auto bridgeLine = [&](int line) {
             const CombCarrierGrammar *gL = carrierGrammarLine(line);
             if (!gL || !gL->grammarLocked) return;
+            // Fact persistence: a certified line is const -- the bridge
+            // never adopts into it (it serves as a fact PARTNER instead).
+            if (certifiedDefLine(line)) return;
             const double *bpL = locked1DRawBandpass_line(line);
             float *fitL = carrierFit_flat.data()
                           + static_cast<size_t>(line) * demodWidth;
@@ -11287,6 +13130,279 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     const lddecode::CombReachSourceFrame carrierFitSource =
         lddecode::makeCarrierFitScalarReachSource();
 
+    // Shared soft gate for the vertical passes below (Pass 1.9 evidence
+    // admission and Pass 2's reach/content-break guards read the same ramp).
+    auto softReachGate = [](double diffIRE, double softIRE, double hardIRE) {
+        if (diffIRE <= softIRE)
+            return 1.0;
+        if (diffIRE >= hardIRE)
+            return 0.0;
+        const double t = (diffIRE - softIRE) /
+                         std::max(1e-9, hardIRE - softIRE);
+        return 1.0 - (t * t * (3.0 - 2.0 * t));
+    };
+
+    // ---------------------------------------------------------------
+    // Pass 1.9: vertical schedule law on the fit — proven-standing
+    // exclusion (the title-bevel fix, 2026-08-01).
+    //
+    // The encoder bandwidth law (imposed once, at the Pass-1 model
+    // boundary) is a LATERAL law: legal carrier lives in fSC±1.3 MHz.
+    // The schedule adds a VERTICAL law the fit never honoured: legal
+    // carrier INVERTS against every grammar-certified Opposite partner.
+    // A component that MATCHES its Opposite partners is image-locked
+    // luma standing in the carrier band — the bandpass leak of a strong
+    // vertical image edge (same D²Y ripple on every line).  The fit
+    // follows raw and absorbs that leak; every full-subtraction product
+    // (native, the anchor ladder's fit rung) then confiscates it from Y,
+    // and the renderer's complement demodulates it as line-alternating
+    // false colour (the demod axis flips per line, so standing composite
+    // paints alternating green/magenta).  Measured on the Emissary title
+    // bevel: retracted Y sat a mean 5.6 IRE below comb Y at the leak
+    // columns; every election share given the fit-derived candidate
+    // rendered as the alternation.
+    //
+    // Shape of the law, and why it is imposed on the MODEL:
+    //   * The pedestal law forbids scaling the withdrawal (raw − w·fit
+    //     was the retired floating-pedestal product).  So the fit itself
+    //     is repaired: the PROVEN-standing component is removed from the
+    //     model, and what the encoder could not have modulated never
+    //     enters the carrier — Y keeps it by construction, upstream of
+    //     every election and every consumer.
+    //   * Proof, not detection: the signed schedule correlation of the
+    //     fit against FIELD-PURE legs only (±2 same-field Opposite; the
+    //     ±1 interfield leg is 20 ms away and motion scrambles its
+    //     relation — the beach garment lesson), integrated VERTICALLY
+    //     down the column, pointwise laterally.  The lateral envelope
+    //     aperture Pass 2's corroboration uses is WRONG for this law and
+    //     was measured failing on the bevel itself: a standing leak is a
+    //     1-6 px COLUMN (it is luma; only chroma is bound by the 1.3 MHz
+    //     envelope limit), and lateral smoothing diluted its pointwise
+    //     +0.9 match with the surrounding legal letter chroma down to
+    //     sc ~0.34, under the knee.  Vertically the aperture and the
+    //     evidence agree: the leak persists down the image edge (a
+    //     letter stem is 50+ lines), so the proof integrates where the
+    //     phenomenon lives.  A minimum evidence run (6 contributing leg
+    //     lines) keeps transient flukes out.  The license is the mirror
+    //     of scheduleAlternationLicense: it opens only where the fit
+    //     provably MATCHES where the schedule demands inversion
+    //     (sc ≥ +0.5, full at +0.9).  Everything short of proof leaves
+    //     the model untouched — no confidence hedging, the unproven fit
+    //     stays committed.
+    //   * The standing estimator is the waveform mid-sum s = ½(fit +
+    //     opp): exact for a chroma+standing mix (c+s with partner −c+s
+    //     gives s exactly), zero for pure legal chroma.  The license is
+    //     envelope-smooth by construction, so lic·s cannot manufacture
+    //     out-of-band sidebands (no fast-gain AM).
+    //   * HULL direction: the subtraction may only REMOVE carrier —
+    //     the repaired sample is clamped to the same sign and no larger
+    //     magnitude than the fit (a true per-sample projection; what it
+    //     removes returns to Y via raw − fit, which is lawful).
+    //   * flatFloor keeps the pre-law fit (same sparse-staleness caveat
+    //     Pass 1.75 carries; revisit if Pass 2's gates misbehave at
+    //     repaired columns).
+    // Known cost, accepted with eyes open: sustained diagonal chroma at
+    // slopes that rotate the carrier 180° per 2 lines reads as matching
+    // at ±2 and would be confiscated toward Y where the envelope
+    // correlation stays ≥ +0.5 over a full coherence length — the same
+    // verdict Pass 2's ownership license already renders on that
+    // content ("energy stays in Y").  Kill switch for A/B only:
+    // LDCD_STANDING_LAW=0.  Census under LDCD_PROBE_STANDING=1.
+    // ---------------------------------------------------------------
+    {
+        static const bool standingLawOn = []{
+            const char *s = std::getenv("LDCD_STANDING_LAW");
+            return !s || std::atoi(s) != 0;
+        }();
+        static const bool standingProbe =
+            std::getenv("LDCD_PROBE_STANDING") != nullptr;
+        // Windowed per-pixel dump (frame line / active column, same
+        // convention as LDCD_PY_*): sc, lic, s and the operands.
+        static const auto stEnvInt = [](const char *n, int f) {
+            const char *s = std::getenv(n); return s ? std::atoi(s) : f;
+        };
+        static const int stL0 = stEnvInt("LDCD_STANDING_L0", -1);
+        static const int stL1 = stEnvInt("LDCD_STANDING_L1", -1);
+        static const int stC0 = stEnvInt("LDCD_STANDING_C0", -1);
+        static const int stC1 = stEnvInt("LDCD_STANDING_C1", -1);
+        const bool stDump = stL0 >= 0 && stC0 >= 0;
+        if (standingLawOn) {
+            const double ampFloorS = 3.0 * irescale;    // 3 IRE
+            const double powFloorS = ampFloorS * ampFloorS;
+            constexpr int kVertHalf = 8;   // vertical window: ±8 lines
+            constexpr int kMinLegLines = 6; // minimum evidence run
+
+            // Sweep 1: per-line pointwise leg products against the
+            // ORIGINAL fit (nothing is modified until sweep 2, so plane
+            // reads are order-safe).  Five planes over the active span.
+            const int nLines = lastLine - firstLine;
+            const size_t planeN = static_cast<size_t>(nLines) * width;
+            std::vector<float> pP(planeN, 0.0f);   // Σ g·fit·leg
+            std::vector<float> pS(planeN, 0.0f);   // Σ g·fit²
+            std::vector<float> pL(planeN, 0.0f);   // Σ g·leg²
+            std::vector<float> pO(planeN, 0.0f);   // Σ g·leg
+            std::vector<float> pW(planeN, 0.0f);   // Σ g
+
+            for (int line = firstLine; line < lastLine; ++line) {
+                const CombCarrierGrammar *gL = carrierGrammarLine(line);
+                if (!gL || !gL->grammarLocked)
+                    continue;
+                const float *fitRow = carrierFit_flat.data()
+                                      + static_cast<size_t>(line) * demodWidth;
+                const float *floorRow = flatFloor_flat.data()
+                                        + static_cast<size_t>(line) * demodWidth;
+                float *rP = pP.data() +
+                    static_cast<size_t>(line - firstLine) * width;
+                float *rS = pS.data() +
+                    static_cast<size_t>(line - firstLine) * width;
+                float *rL = pL.data() +
+                    static_cast<size_t>(line - firstLine) * width;
+                float *rO = pO.data() +
+                    static_cast<size_t>(line - firstLine) * width;
+                float *rW = pW.data() +
+                    static_cast<size_t>(line - firstLine) * width;
+
+                for (int dir = -1; dir <= 1; dir += 2) {
+                    const int targetLine = line + 2 * dir;
+                    if (targetLine < firstLine || targetLine >= lastLine)
+                        continue;
+                    const CombCarrierGrammar *gT =
+                        carrierGrammarLine(targetLine);
+                    if (!gT || !gT->grammarLocked)
+                        continue;
+                    const lddecode::CombReachReply reach =
+                        combReachIndex.query(
+                            {line, targetLine, left, left,
+                             lddecode::CombReachUse::FieldScalarCancel,
+                             carrierFitSource});
+                    if (!(reach.allowScalarCancel && reach.mayBecomeVideo &&
+                          reach.carrierRelation ==
+                              lddecode::CarrierPhaseRelation::Opposite))
+                        continue;
+                    const float *legFit = carrierFit_flat.data()
+                        + static_cast<size_t>(targetLine) * demodWidth;
+                    const float *legFloor = flatFloor_flat.data()
+                        + static_cast<size_t>(targetLine) * demodWidth;
+                    for (int xi = 0; xi < width; ++xi) {
+                        const double legBreakIRE =
+                            std::fabs(static_cast<double>(floorRow[xi]) -
+                                      static_cast<double>(legFloor[xi])) *
+                            invIreScale;
+                        const double g = softReachGate(legBreakIRE, 3.0, 10.0);
+                        if (g <= 0.0)
+                            continue;
+                        const double c = static_cast<double>(fitRow[xi]);
+                        const double n = static_cast<double>(legFit[xi]);
+                        rP[xi] += static_cast<float>(g * c * n);
+                        rS[xi] += static_cast<float>(g * c * c);
+                        rL[xi] += static_cast<float>(g * n * n);
+                        rO[xi] += static_cast<float>(g * n);
+                        rW[xi] += static_cast<float>(g);
+                    }
+                }
+            }
+
+            // Sweep 2: sliding vertical sums per column, license, repair.
+            // In-place emit is safe: line L is only ever modified at step
+            // L, and every windowed read comes from the sweep-1 planes.
+            long provenPx = 0;
+            double confiscatedIRE = 0.0;
+
+            std::vector<double> vP(width), vS(width), vL(width), vN(width);
+            auto addLine = [&](int l, double sgn) {
+                if (l < firstLine || l >= lastLine) return;
+                const size_t r0 = static_cast<size_t>(l - firstLine) * width;
+                for (int xi = 0; xi < width; ++xi) {
+                    vP[xi] += sgn * pP[r0 + xi];
+                    vS[xi] += sgn * pS[r0 + xi];
+                    vL[xi] += sgn * pL[r0 + xi];
+                    if (pW[r0 + xi] > 0.0f)
+                        vN[xi] += sgn;
+                }
+            };
+            std::fill(vP.begin(), vP.end(), 0.0);
+            std::fill(vS.begin(), vS.end(), 0.0);
+            std::fill(vL.begin(), vL.end(), 0.0);
+            std::fill(vN.begin(), vN.end(), 0.0);
+            for (int l = firstLine; l <= firstLine + kVertHalf &&
+                                    l < lastLine; ++l)
+                addLine(l, +1.0);
+
+            for (int line = firstLine; line < lastLine; ++line) {
+                float *fitRow = carrierFit_flat.data()
+                                + static_cast<size_t>(line) * demodWidth;
+                const size_t r0 =
+                    static_cast<size_t>(line - firstLine) * width;
+                const CombCarrierGrammar *gL = carrierGrammarLine(line);
+                // Fact persistence: never repair a certified sample (the
+                // stamped fact is const; its legs still serve as evidence).
+                const float *exGuard = certifiedDefLine(line)
+                    ? exactCarrierRow(line) : nullptr;
+
+                if (gL && gL->grammarLocked) {
+                    for (int xi = 0; xi < width; ++xi) {
+                        if (exGuard &&
+                            std::isfinite(exGuard[left + xi]))
+                            continue;
+                        const double selfE = vS[xi];
+                        const double legE = vL[xi];
+                        const bool observable =
+                            vN[xi] >= kMinLegLines &&
+                            selfE > 0.0 && legE > 0.0 &&
+                            selfE / std::max(1.0, vN[xi]) >= powFloorS;
+                        const double sc = observable
+                            ? vP[xi] / std::sqrt(selfE * legE)
+                            : std::numeric_limits<double>::quiet_NaN();
+                        const double licHere = (observable && sc == sc)
+                            ? lddecode::scheduleAlternationLicense(-sc)
+                            : 0.0;
+                        const double wHere =
+                            static_cast<double>(pW[r0 + xi]);
+                        const double fit = static_cast<double>(fitRow[xi]);
+                        double s = std::numeric_limits<double>::quiet_NaN();
+                        double nf = fit;
+                        if (licHere > 0.0 && wHere > 0.0) {
+                            s = 0.5 * (fit +
+                                static_cast<double>(pO[r0 + xi]) / wHere);
+                            nf = fit - licHere * s;
+                            // Removal-only hull: same sign, no larger
+                            // magnitude — a true per-sample projection.
+                            if (fit >= 0.0)
+                                nf = std::clamp(nf, 0.0, fit);
+                            else
+                                nf = std::clamp(nf, fit, 0.0);
+                        }
+                        if (stDump && line >= stL0 && line <= stL1 &&
+                            xi >= stC0 && xi <= stC1) {
+                            std::fprintf(stderr,
+                                "STDUMP line=%d xi=%d fit=%.2f sc=%.3f "
+                                "lic=%.3f s=%.2f nRun=%.0f\n",
+                                line, xi, fit * invIreScale, sc,
+                                licHere, s * invIreScale, vN[xi]);
+                        }
+                        if (nf != fit) {
+                            fitRow[xi] = static_cast<float>(nf);
+                            if (standingProbe) {
+                                ++provenPx;
+                                confiscatedIRE +=
+                                    std::fabs(fit - nf) * invIreScale;
+                            }
+                        }
+                    }
+                }
+
+                // Slide the vertical window.
+                addLine(line - kVertHalf, -1.0);
+                addLine(line + kVertHalf + 1, +1.0);
+            }
+            if (standingProbe)
+                std::fprintf(stderr,
+                    "[STANDING] repaired px=%ld mean removed %.3f IRE\n",
+                    provenPx,
+                    provenPx > 0 ? confiscatedIRE / provenPx : 0.0);
+        }
+    }
+
     // ---------------------------------------------------------------
     // Pass 2: interline comb on carrierFit → combedCarrier.
     //
@@ -11311,16 +13427,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     // FieldScalarCancel for the same-field rung.  Only Opposite relations
     // cancel — a Same partner sees chroma and image-locked alien with the
     // same sign and cannot discriminate, so it contributes nothing here.
+    // (softReachGate is shared with Pass 1.9, defined above.)
     // ---------------------------------------------------------------
-    auto softReachGate = [](double diffIRE, double softIRE, double hardIRE) {
-        if (diffIRE <= softIRE)
-            return 1.0;
-        if (diffIRE >= hardIRE)
-            return 0.0;
-        const double t = (diffIRE - softIRE) /
-                         std::max(1e-9, hardIRE - softIRE);
-        return 1.0 - (t * t * (3.0 - 2.0 * t));
-    };
 
     // Diagnostic gate-chain dump (evidence-only, same family as LDCD_YVIEW).
     // LDCD_PASS2_DUMP=<prefix> writes every per-pixel term of the Pass-2
@@ -11689,11 +13797,15 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
             double ownedFallback;
             double p2corrCode = 4.0;       // dump-only: +4 = unobservable
             {
-                const int w0 = std::clamp(xi - 1, 0, width - 4);
+                // Centered 5-tap, half-weight ends (integer centroid);
+                // total weight stays 4 so the cycle-energy floor keeps
+                // its meaning.
                 double e0 = 0.0;
-                for (int k = 0; k < 4; ++k) {
-                    const double c = static_cast<double>(fitRow[w0 + k]);
-                    e0 += c * c;
+                for (int k = -2; k <= 2; ++k) {
+                    const int j = std::clamp(xi + k, 0, width - 1);
+                    const double w = (k == -2 || k == 2) ? 0.5 : 1.0;
+                    const double c = static_cast<double>(fitRow[j]);
+                    e0 += w * c * c;
                 }
                 const double ampFloor = 3.0 * irescale;      // 3 IRE envelope
                 // Energy of a carrier of envelope A over one full cycle is
@@ -11721,11 +13833,13 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                             continue;
                         const float *pf = legs[k].fit;
                         double dot = 0.0, eP = 0.0;
-                        for (int j = 0; j < 4; ++j) {
-                            const double c = static_cast<double>(fitRow[w0 + j]);
-                            const double n = static_cast<double>(pf[w0 + j]);
-                            dot += c * n;
-                            eP += n * n;
+                        for (int j = -2; j <= 2; ++j) {
+                            const int jj = std::clamp(xi + j, 0, width - 1);
+                            const double w = (j == -2 || j == 2) ? 0.5 : 1.0;
+                            const double c = static_cast<double>(fitRow[jj]);
+                            const double n = static_cast<double>(pf[jj]);
+                            dot += w * c * n;
+                            eP += w * n * n;
                         }
                         if (eP < eFloor)
                             continue;
@@ -11960,7 +14074,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     //       no-coverage letters riding the fit, the open cross-frame
     //       transfer work) -- the certified-carrier ladder below:
     //       covered sample -> (def-spare)/2 as itself; comp sample ->
-    //       certified-luma vertical comb where its out-of-band witness
+    //       certified-luma vertical comb where its out-of-band residual
     //       passes; fit only where no certified product exists. On
     //       material without dG coverage every sample falls through to
     //       the fit, i.e. exactly the old default.
@@ -11982,7 +14096,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     // is the carrier plus only the comp line's own vertical-detail
     // deviation. The merge's own carrier-band filter (unity at fSC and
     // +-1.3 MHz, zero at DC/2fSC) then takes the carrier, and the
-    // out-of-band residual |R - BP(R)| is the same honest witness the twin
+    // out-of-band residual |R - BP(R)| is the same correlate the twin
     // merge uses: where it is large the bracket assumption failed (real
     // vertical detail / chroma boundary) and the fit stands for that
     // sample. This narrows the covered/uncovered quality gap from the comp
@@ -11991,6 +14105,268 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     std::vector<double> certComp;
     if (retractedSource == 3)
         certComp.assign(width, std::numeric_limits<double>::quiet_NaN());
+
+    // Anticipated rung (uncovered frames, 2026-08-01, user-approved
+    // consumption level: ESTIMATOR with confidence alpha, NEVER
+    // certification -- no cede, no HQ-leg status; facts are facts,
+    // predictions are estimators).  The certified carrier's curve is
+    // causal (the anticipated phase lands almost exactly at the next
+    // cover), so the PREVIOUS cover's certified separation serves the
+    // uncovered frame at load time: its certified LUMA (raw - exact,
+    // direct where its parity covers the line, bracket mean otherwise)
+    // is the tween reference -- luma tweens where carrier cannot -- and
+    //     R = raw_this - Lhat_prev = C_this + (L_this - L_prev)
+    // keeps the carrier NATIVE to this frame (phase correct by
+    // construction; nothing is transferred as carrier).  The merge FIR
+    // takes the carrier; the out-of-band residual is the motion/
+    // staleness CORRELATE feeding alpha.  Unlike the covered comp rung
+    // there is NO parity floor on alpha: that floor is justified by a
+    // same-frame reference measured to beat the fit even where the
+    // residual fires; a reference one film frame away under motion is
+    // worse than the fit, so alpha must be able to reach zero and the
+    // rung fails toward the (tone-corrected) fit.  Escape: the rung
+    // rides LDCD_ANCHOR_1D / LDCD_CERT_1D family escapes -- with
+    // LDCD_CERT_1D=0 no exact data exists and the rung never forms.
+    // Chain maintenance: a covered frame publishes its own certified luma
+    // (raw - exact on def lines, NaN elsewhere); an uncovered frame
+    // inherits the previous frame's plane with age+1, capped at the same
+    // horizon the tone trusts (dtF <= 8), so every uncovered frame within
+    // the horizon of a cover holds the reference -- not only the
+    // immediate successor.
+    antRefAge = -1;
+    if (retractedSource == 3 && certifiedOneDLevel() >= 1) {
+        if (frameHasExactCoverage()) {
+            antRefLuma_flat.assign(
+                static_cast<size_t>(frameHeight) * demodWidth,
+                std::numeric_limits<float>::quiet_NaN());
+            for (int line = firstLine; line < lastLine; ++line) {
+                if (!certifiedDefLine(line)) continue;
+                const float *ex = exactCarrierRow(line);
+                if (!ex) continue;
+                const quint16 *raw = rawbuffer.data()
+                    + static_cast<size_t>(line) * videoParameters.fieldWidth;
+                float *dst = antRefLuma_flat.data()
+                    + static_cast<size_t>(line) * demodWidth;
+                for (int xi = 0; xi < width; ++xi) {
+                    const int h = left + xi;
+                    if (std::isfinite(ex[h]))
+                        dst[xi] = static_cast<float>(
+                            (double)raw[h] - (double)ex[h]);
+                }
+            }
+            antRefAge = 0;
+        } else if (prevF && prevF->antRefAge >= 0 &&
+                   prevF->antRefAge < 8 &&
+                   prevF->antRefLuma_flat.size() ==
+                       static_cast<size_t>(frameHeight) * demodWidth) {
+            antRefLuma_flat = prevF->antRefLuma_flat;
+            antRefAge = prevF->antRefAge + 1;
+        }
+    }
+
+    // Held-out grading (measurement only, LDCD_PROBE_ANTGRADE=1): on a
+    // COVERED frame, build the anticipated construction as if this frame
+    // were uncovered -- from the PREDECESSOR's chained reference plane --
+    // and grade per-sample against this frame's OWN exact channel.  The
+    // grade lattice is the frame's def lines (where exact exists), classed
+    // by what the reference plane offers THERE: DIRECT (tween luma known
+    // same-line) vs BRACKET (vertical mean of the plane's adjacent lines).
+    // Three estimators per class: FULL (raw - Lhat, full band, no FIR),
+    // FIR (the shipped rung's bp), and FIT (the baseline competitor).
+    // Reported: mean|err| / rms in IRE, and the signed correlation with
+    // exact (phase agreement -- the quantity the magnitude means were
+    // blind to).  Optional box via LDCD_ANTGRADE_L0/L1/C0/C1 (frame line /
+    // active column).
+    {
+        static const bool antGradeOn =
+            std::getenv("LDCD_PROBE_ANTGRADE") != nullptr;
+        if (antGradeOn && retractedSource == 3 && frameHasExactCoverage() &&
+            prevF && prevF->antRefAge >= 0 &&
+            prevF->antRefLuma_flat.size() ==
+                static_cast<size_t>(frameHeight) * demodWidth) {
+            static const auto agEnv = [](const char *n, int d) {
+                const char *s = std::getenv(n); return s ? std::atoi(s) : d;
+            };
+            static const int agL0 = agEnv("LDCD_ANTGRADE_L0", -1);
+            static const int agL1 = agEnv("LDCD_ANTGRADE_L1", -1);
+            static const int agC0 = agEnv("LDCD_ANTGRADE_C0", -1);
+            static const int agC1 = agEnv("LDCD_ANTGRADE_C1", -1);
+            const bool haveBox = agL0 >= 0 && agC0 >= 0;
+
+            struct AntAcc {
+                long n = 0;
+                double ae = 0, se = 0, dxe = 0, e2 = 0, x2 = 0;
+                void add(double est, double ex, double inv) {
+                    const double e = (est - ex) * inv;
+                    ++n; ae += std::fabs(e); se += e * e;
+                    dxe += est * ex; e2 += est * est; x2 += ex * ex;
+                }
+                void print(const char *tag) const {
+                    const double corr = (e2 > 0 && x2 > 0)
+                        ? dxe / std::sqrt(e2 * x2) : 0.0;
+                    std::fprintf(stderr,
+                        "  %-8s n=%-7ld mean|e|=%6.2f rms=%6.2f corr=%+.3f\n",
+                        tag, n, n ? ae / n : 0.0,
+                        n ? std::sqrt(se / n) : 0.0, corr);
+                }
+            };
+            AntAcc dFull, dFir, dFit, bFull, bFir, bFit;
+            AntAcc wFull, wFir, wFit;
+
+            std::vector<double> Rg(width,
+                std::numeric_limits<double>::quiet_NaN());
+            std::vector<std::uint8_t> clsRow(width);
+            const float *refBase = prevF->antRefLuma_flat.data();
+
+            for (int line = firstLine; line < lastLine; ++line) {
+                const float *ex = exactCarrierRow(line);
+                if (!ex) continue;
+                const quint16 *raw = rawbuffer.data()
+                    + static_cast<size_t>(line) * videoParameters.fieldWidth;
+                const float *fit = carrierFit_flat.data()
+                    + static_cast<size_t>(line) * demodWidth;
+                // Referee repair (2026-08-02): factFit stamped the fit with
+                // the exact fact at exactly the graded samples; the FIT
+                // baseline must read the pre-stamp estimator.
+                const float *preFitAg = probePreFactFit_flat.empty()
+                    ? nullptr
+                    : probePreFactFit_flat.data() +
+                          static_cast<size_t>(line) * demodWidth;
+                const float *r0 = refBase
+                    + static_cast<size_t>(line) * demodWidth;
+                const float *rU = (line - 1 >= firstLine)
+                    ? refBase + static_cast<size_t>(line - 1) * demodWidth
+                    : nullptr;
+                const float *rD = (line + 1 < lastLine)
+                    ? refBase + static_cast<size_t>(line + 1) * demodWidth
+                    : nullptr;
+
+                std::fill(Rg.begin(), Rg.end(),
+                          std::numeric_limits<double>::quiet_NaN());
+                for (int xi = 0; xi < width; ++xi) {
+                    clsRow[xi] = 0;
+                    double lhat =
+                        std::numeric_limits<double>::quiet_NaN();
+                    if (std::isfinite(r0[xi])) {
+                        lhat = (double)r0[xi];
+                        clsRow[xi] = 1;             // DIRECT
+                    } else if (rU && rD && std::isfinite(rU[xi]) &&
+                               std::isfinite(rD[xi])) {
+                        lhat = 0.5 * ((double)rU[xi] + (double)rD[xi]);
+                        clsRow[xi] = 2;             // BRACKET
+                    }
+                    if (std::isfinite(lhat))
+                        Rg[xi] = (double)raw[left + xi] - lhat;
+                }
+
+                for (int xi = 0; xi < width; ++xi) {
+                    const int h = left + xi;
+                    if (!std::isfinite(ex[h]) || clsRow[xi] == 0)
+                        continue;
+                    bool ok = true;
+                    double taps[5];
+                    static const int off[5] = { 0, -2, 2, -4, 4 };
+                    for (int k = 0; k < 5 && ok; ++k) {
+                        const int j = std::clamp(xi + off[k], 0, width - 1);
+                        taps[k] = Rg[j];
+                        if (!std::isfinite(taps[k])) ok = false;
+                    }
+                    const double bp = ok
+                        ? 0.676462 * taps[0] +
+                          -0.250000 * (taps[1] + taps[2]) +
+                          -0.088231 * (taps[3] + taps[4])
+                        : std::numeric_limits<double>::quiet_NaN();
+                    const double exd = (double)ex[h];
+                    const double fitd =
+                        (preFitAg && std::isfinite(preFitAg[xi]))
+                            ? (double)preFitAg[xi]
+                            : (double)fit[xi];
+                    const bool inBox = haveBox &&
+                        line >= agL0 && line <= agL1 &&
+                        xi >= agC0 && xi <= agC1;
+                    if (clsRow[xi] == 1) {
+                        dFull.add(Rg[xi], exd, invIreScale);
+                        if (std::isfinite(bp))
+                            dFir.add(bp, exd, invIreScale);
+                        dFit.add(fitd, exd, invIreScale);
+                    } else {
+                        bFull.add(Rg[xi], exd, invIreScale);
+                        if (std::isfinite(bp))
+                            bFir.add(bp, exd, invIreScale);
+                        bFit.add(fitd, exd, invIreScale);
+                    }
+                    if (inBox) {
+                        wFull.add(Rg[xi], exd, invIreScale);
+                        if (std::isfinite(bp))
+                            wFir.add(bp, exd, invIreScale);
+                        wFit.add(fitd, exd, invIreScale);
+                    }
+                }
+            }
+            // One ATOMIC line per frame (threaded runs interleave stderr
+            // between fprintf calls, never mid-line), tagged with the frame
+            // identity and this frame's own def parity so the two anchor
+            // legs (A->C vs C->A) and any longer cycle can be separated
+            // offline -- the recalibration axis (user, 2026-08-02): the
+            // original "lands almost exactly" verdict was one aggregate,
+            // never stratified by leg or cycle.
+            {
+                int ownDefPar = -1;
+                for (int l = firstLine; l < lastLine; ++l)
+                    if (certifiedDefLine(l)) { ownDefPar = l & 1; break; }
+                const auto m = [](const AntAcc &a) {
+                    return a.n ? a.ae / a.n : 0.0;
+                };
+                const auto c = [](const AntAcc &a) {
+                    return (a.e2 > 0 && a.x2 > 0)
+                        ? a.dxe / std::sqrt(a.e2 * a.x2) : 0.0;
+                };
+                std::fprintf(stderr,
+                    "[ANTGRADE1] seq=%d age=%d defPar=%d "
+                    "dN=%ld dFull=%.3f/%+.3f dFir=%.3f/%+.3f "
+                    "dFit=%.3f/%+.3f "
+                    "bN=%ld bFull=%.3f/%+.3f bFir=%.3f/%+.3f "
+                    "bFit=%.3f/%+.3f\n",
+                    (int)heldSeq1, prevF->antRefAge + 1, ownDefPar,
+                    dFull.n, m(dFull), c(dFull), m(dFir), c(dFir),
+                    m(dFit), c(dFit),
+                    bFull.n, m(bFull), c(bFull), m(bFir), c(bFir),
+                    m(bFit), c(bFit));
+            }
+            if (haveBox) {
+                std::fprintf(stderr, " BOX (L%d-%d C%d-%d):\n",
+                             agL0, agL1, agC0, agC1);
+                wFull.print("full"); wFir.print("fir"); wFit.print("fit");
+            }
+        }
+    }
+
+    // MOTION-WITNESSED CONSTRUCTION (default; the full-commit data run is
+    // kept as LDCD_ANT_COMMIT=1 for A/B).  The full-commit experiment
+    // rendered GHOSTS on motion (user verdict 2026-08-01, beach: "a
+    // reversion on the 'averaging is not tweening' front"): the chain is
+    // one-sided by load-time causality, so under motion Lhat carries the
+    // previous cover's edges at their displaced positions, the FIR passes
+    // that ghost geometry as carrier, and the cede makes it roster-
+    // unanimous -- the election cannot reject it.  The causal-anticipation
+    // license was for the PHASE CURVE (global, rides the cycle); per-pixel
+    // luma content moves, and a one-sided reference under motion is
+    // averaging, not tweening.  So the ceded center's VALUE is built with
+    // the out-of-band residual as its motion CORRELATE -- alpha =
+    // exp(-|R-bp|/tau) between tween carrier and fit, per sample, no
+    // floor -- the same shape as the shipped covered comp rung.  Weight is
+    // candidate confidence, never inter-candidate distance; unanimity
+    // stays uniform (no license flapping); static content keeps the
+    // anticipation, motion degrades to current-frame data.
+    static const bool antCommit = []{
+        const char *e = std::getenv("LDCD_ANT_COMMIT");
+        return e && std::atoi(e) == 1;
+    }();
+    std::vector<double> antComp;
+    const bool antRungOn = retractedSource == 3 &&
+        !frameHasExactCoverage() && antRefAge >= 1;
+    if (antRungOn)
+        antComp.assign(width, std::numeric_limits<double>::quiet_NaN());
 
     // Region-local ladder dump (LDCD_DUMP_RLAD=1, box via _R0/_R1/_C0/_C1
     // in output-row / active-column coords; run -t 1). One line per sample:
@@ -12114,6 +14490,42 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                 }
 
                 // Confidence-alpha merge of the two comp-line estimators.
+                // The fit partner's share is CONDITIONED by the regional
+                // fact audit (Pass 1.7): where the solve graded poorly
+                // against the exact truth in this neighbourhood, the fit
+                // is a proven-poor witness and its share fades toward the
+                // certified-bracket comb. Bilinear over region centers --
+                // a weight must never step at a region seam. No verdict
+                // (NaN / no audit) leaves conduct unchanged.
+                constexpr double kAuditTauIRE = 4.0;
+                auto factTrustAt = [&](int xi) -> double {
+                    if (fitFactAuditNx <= 0) return 1.0;
+                    const int nx = fitFactAuditNx, ny = fitFactAuditNy;
+                    const double rx = std::clamp(
+                        (xi - 64.0) / 128.0, 0.0, (double)(nx - 1));
+                    const double ry = std::clamp(
+                        (line - 16.0) / 32.0, 0.0, (double)(ny - 1));
+                    const int x0 = std::min((int)rx, nx - 1);
+                    const int y0 = std::min((int)ry, ny - 1);
+                    const int x1 = std::min(x0 + 1, nx - 1);
+                    const int y1 = std::min(y0 + 1, ny - 1);
+                    const double fx = rx - x0, fy = ry - y0;
+                    auto v = [&](int yy, int xx) -> double {
+                        const float a =
+                            fitFactAuditIRE[(size_t)yy * nx + xx];
+                        return std::isfinite(a) ? (double)a
+                            : std::numeric_limits<double>::quiet_NaN();
+                    };
+                    const double v00 = v(y0, x0), v01 = v(y0, x1);
+                    const double v10 = v(y1, x0), v11 = v(y1, x1);
+                    if (!(std::isfinite(v00) && std::isfinite(v01) &&
+                          std::isfinite(v10) && std::isfinite(v11)))
+                        return 1.0;   // no full verdict: unchanged
+                    const double a =
+                        (v00 * (1 - fx) + v01 * fx) * (1 - fy) +
+                        (v10 * (1 - fx) + v11 * fx) * fy;
+                    return std::exp(-a / kAuditTauIRE);
+                };
                 std::vector<double> est(width);
                 for (int xi = 0; xi < width; ++xi) {
                     const double fit = static_cast<double>(fitRowPub[xi]);
@@ -12124,6 +14536,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                                                   (kOobTauIRE * irescale));
                     else
                         wc = (resV[xi] <= kOobCutIRE * irescale) ? 1.0 : 0.0;
+                    wc = 1.0 - (1.0 - wc) * factTrustAt(xi);
                     est[xi] = wc * bpV[xi] + (1.0 - wc) * fit;
                 }
 
@@ -12160,6 +14573,92 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                         certComp[xi] = est[xi];
                 }
             }
+
+            // Anticipated rung: see the declaration comment above.  Built
+            // per line from the chained cover's certified luma; carrier
+            // stays native to this frame.
+            if (antRungOn) {
+                std::fill(antComp.begin(), antComp.end(),
+                          std::numeric_limits<double>::quiet_NaN());
+                const float *ref0 = antRefLuma_flat.data()
+                    + static_cast<size_t>(line) * demodWidth;
+                const float *refU = (line - 1 >= firstLine)
+                    ? antRefLuma_flat.data()
+                      + static_cast<size_t>(line - 1) * demodWidth
+                    : nullptr;
+                const float *refD = (line + 1 < lastLine)
+                    ? antRefLuma_flat.data()
+                      + static_cast<size_t>(line + 1) * demodWidth
+                    : nullptr;
+
+                std::vector<double> R(width,
+                    std::numeric_limits<double>::quiet_NaN());
+                for (int xi = 0; xi < width; ++xi) {
+                    double lhat = std::numeric_limits<double>::quiet_NaN();
+                    if (std::isfinite(ref0[xi])) {
+                        lhat = (double)ref0[xi];
+                    } else if (refU && refD &&
+                               std::isfinite(refU[xi]) &&
+                               std::isfinite(refD[xi])) {
+                        lhat = 0.5 * ((double)refU[xi] + (double)refD[xi]);
+                    }
+                    if (std::isfinite(lhat))
+                        R[xi] = (double)rawLine[left + xi] - lhat;
+                }
+
+                constexpr double kT0a = 0.676462;
+                constexpr double kT2a = -0.250000;
+                constexpr double kT4a = -0.088231;
+                constexpr double kAntTauIRE = 2.0;
+
+                // MOTION WITNESS: the out-of-band residual |R − bp|, the
+                // best-measured of three instruments (2026-08-01 battery,
+                // title-bevel / beach-Calt):
+                //   OOB residual            13.9/17.8 | 5.66  <- shipped
+                //   retracted-LF as GATE    20.1/21.9 | 5.58  (sharp LP;
+                //     boxcar was 22.5/26.5 -- bracket lines vertically
+                //     interpolate the reference across diagonals, a real
+                //     LF displacement the band-limited product never
+                //     carries, so gating on it taxes working sites)
+                //   retracted-LF as CORRECTOR (R' = R − LP(R − fit))
+                //                           19.5/24.2 | 5.95  (the LF of
+                //     R − fit includes the carrier-difference envelope,
+                //     and subtracting it polluted both scenes)
+                // NEGATIVE RESULT, do not re-propose the retracted-LF
+                // witness in either form without new evidence. Known
+                // remaining blind spot of the OOB residual: the in-band
+                // component of a displaced edge's leak passes the FIR at
+                // small residual and survives at partial alpha.
+                for (int xi = 0; xi < width; ++xi) {
+                    bool ok = true;
+                    double taps[5];
+                    static const int off[5] = { 0, -2, 2, -4, 4 };
+                    for (int k = 0; k < 5 && ok; ++k) {
+                        const int j = std::clamp(xi + off[k], 0, width - 1);
+                        taps[k] = R[j];
+                        if (!std::isfinite(taps[k])) ok = false;
+                    }
+                    if (!ok) continue;
+                    const double bp = kT0a * taps[0] +
+                                      kT2a * (taps[1] + taps[2]) +
+                                      kT4a * (taps[3] + taps[4]);
+                    if (antCommit) {
+                        // A/B escape: the full-commit data run (ghosts on
+                        // motion; kept for comparison renders only).
+                        antComp[xi] = bp;
+                        continue;
+                    }
+                    const double fit = static_cast<double>(fitRowPub[xi]);
+                    // Post-correction motion correlate: the surviving error
+                    // in R' is HF (the LF ghost body was corrected away by
+                    // construction), so the OOB residual is back to being
+                    // the right instrument for what remains.
+                    const double res = std::fabs(R[xi] - bp);
+                    const double wc =
+                        std::exp(-res * invIreScale / kAntTauIRE);
+                    antComp[xi] = wc * bp + (1.0 - wc) * fit;
+                }
+            }
         }
 
         for (int xi = 0; xi < width; ++xi) {
@@ -12185,6 +14684,17 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                 if (std::isfinite(ex)) {
                     carrier = static_cast<double>(ex);
                     rung = 'e';
+                } else if (antRungOn && std::isfinite(antComp[xi])) {
+                    // Anticipated rung: estimator with alpha, never
+                    // certification (see the antComp declaration).
+                    // Checked BEFORE certComp: on an uncovered frame the
+                    // exact rows exist as all-NaN planes, so the covered
+                    // comp construction above degenerates to a fit copy
+                    // in certComp -- rung order alone keeps the covered
+                    // frames' real cc rung senior (antRungOn is false
+                    // there).
+                    carrier = antComp[xi];
+                    rung = 'a';
                 } else if (std::isfinite(certComp[xi])) {
                     carrier = certComp[xi];
                     rung = 'c';
@@ -12242,16 +14752,25 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
 
     carrierRetractedValid = true;
 
-    // Publish the anchored 1D-out plane (covered frames, mode 3 only;
-    // uniform per frame -- validity is a frame property, never per line).
-    // A/B escape LDCD_ANCHOR_1D=0.
+    // Publish the anchored 1D-out plane (mode 3 only; uniform per frame --
+    // validity is a frame property, never per line).  Originally covered
+    // frames only; extended to uncovered frames 2026-08-01 with the tone
+    // promotion: the uncovered ladder's fit now carries the ANTICIPATED
+    // certified phase (applyToneToFit, causal from the previous cover), so
+    // the comb stages consume the anticipation-corrected carrier on every
+    // frame rather than falling back to the unanchored locked 1D on the
+    // uncovered ones.  A/B escape LDCD_ANCHOR_1D=0.
     static const bool anchor1D = []{
         const char *e = std::getenv("LDCD_ANCHOR_1D");
         return !(e && std::atoi(e) == 0);
     }();
     anchored1DValid = false;
+    // Gate: covered frames (original contract) or uncovered frames HOLDING
+    // THE CHAIN (the anticipation justifies the anchoring). Under
+    // --dg-discard neither exists and the plane never publishes -- the
+    // comb's 1D source stays the locked 1D, pre-campaign behaviour.
     if (anchor1D && !analysisOnly && retractedSource == 3 &&
-        frameHasExactCoverage()) {
+        (frameHasExactCoverage() || antRefAge >= 1)) {
         anchored1DSource_flat.assign(
             static_cast<size_t>(demodLines) * demodWidth, 0.0);
         for (int line = firstLine; line < lastLine; ++line) {
@@ -12266,6 +14785,88 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                           static_cast<double>(retr[xi]);
         }
         anchored1DValid = true;
+    }
+
+    // ---------------------------------------------------------------
+    // Anticipated head-echo (lattice-keyed cede on B and D, user-approved
+    // 2026-08-01). On anticipated lines the comb candidates must all see
+    // ONE story -- the anticipated center -- exactly as covered def lines
+    // see the certified story via the stage-1 head. But the anticipated
+    // value is an ESTIMATE, so it may NOT enter locked1DSource (the 1D
+    // safe retreat: produceY's 1D candidate and the CCR source stay on
+    // the untouched locked 1D). Instead the anticipated scalar is echoed
+    // into the products the comb path consumes: the published 1D chroma
+    // plane (clpbuffer[0], the tap system's base -- so bracket lines'
+    // legs comb against the anticipated values) and the stage-1 working
+    // IQ products (the Frame candidates' IQ prep). Same demod recipe as
+    // stage 1, per line from the grammar. The cede sites then extend
+    // their line predicate with anticipatedDefLine and read the scalar
+    // from the published plane.
+    // ---------------------------------------------------------------
+    if (anchored1DValid && !frameHasExactCoverage() && antRefAge >= 1) {
+        for (int line = firstLine; line < lastLine; ++line) {
+            if (!anticipatedDefLine(line)) continue;
+            const double *src = anchored1DSource_flat.data()
+                + static_cast<size_t>(line) * demodWidth;
+            CombCarrierGrammar *grammar = carrierGrammarLine(line);
+            const bool gl = grammar && grammar->grammarLocked;
+            const double bcos = gl ? grammar->burstCos : 1.0;
+            const double bsin = gl ? grammar->burstSin : 0.0;
+            double lutI[4], lutQ[4];
+            if (gl) {
+                for (int i = 0; i < 4; ++i) {
+                    lutI[i] = static_cast<double>(grammar->demodLUTTi[i]);
+                    lutQ[i] = static_cast<double>(grammar->demodLUTTq[i]);
+                }
+            } else {
+                fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked,
+                              lutI, lutQ);
+            }
+            double i4Scale[4], q4Scale[4], magScale[4];
+            for (int ph = 0; ph < 4; ++ph) {
+                lockedTo4fsc(lutI[ph], lutQ[ph], bcos, bsin,
+                             i4Scale[ph], q4Scale[ph]);
+                magScale[ph] = boundedMag(i4Scale[ph], q4Scale[ph]);
+            }
+            (void)magScale;
+
+            float *demodI  = demodTI_line(line);
+            float *demodQ  = demodTQ_line(line);
+            float *demodI4 = demodTI4fsc_line(line);
+            float *demodQ4 = demodTQ4fsc_line(line);
+            float *lockedI4 = locked1DTI4fsc_line(line);
+            float *lockedQ4 = locked1DTQ4fsc_line(line);
+            float *magnitude = demodIQMag4fsc_flat.data()
+                + static_cast<size_t>(line) * demodWidth;
+            double *published = clpbuffer[0].pixel[line];
+
+            std::vector<double> nI4(width), nQ4(width);
+            for (int rel = 0; rel < width; ++rel) {
+                const int h = left + rel;
+                const int phase = carrierSampleClass(line, h);
+                const double source = src[rel];
+                nI4[rel] = source * i4Scale[phase];
+                nQ4[rel] = source * q4Scale[phase];
+                if (demodI)  demodI[rel]  = static_cast<float>(
+                    source * lutI[phase]);
+                if (demodQ)  demodQ[rel]  = static_cast<float>(
+                    source * lutQ[phase]);
+                if (demodI4) demodI4[rel] = static_cast<float>(nI4[rel]);
+                if (demodQ4) demodQ4[rel] = static_cast<float>(nQ4[rel]);
+                published[h] = source;
+            }
+            for (int rel = 0; rel < width; ++rel) {
+                const int rm = std::max(0, rel - 1);
+                const int rp = std::min(width - 1, rel + 1);
+                const double i4 = centeredCarrierProduct3(
+                    nI4[rm], nI4[rel], nI4[rp]);
+                const double q4 = centeredCarrierProduct3(
+                    nQ4[rm], nQ4[rel], nQ4[rp]);
+                if (lockedI4) lockedI4[rel] = static_cast<float>(i4);
+                if (lockedQ4) lockedQ4[rel] = static_cast<float>(q4);
+                magnitude[rel] = static_cast<float>(boundedMag(i4, q4));
+            }
+        }
     }
 
     if (dumpDead) {

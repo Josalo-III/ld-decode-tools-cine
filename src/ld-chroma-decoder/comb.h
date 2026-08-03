@@ -223,7 +223,11 @@ public:
             double FVF_HEDGE_FRAME_B_BONUS   = 0.18; // Frame B bonus at horizontal luma edges (interframe is stable there)
 
             // Transition sharpness reward strength.
-            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.10;
+            // 0.16 (was 0.10, 2026-08-02): the transition-crossing award is
+            // the safe lever on uncovered-frame softness -- a scoring term,
+            // so it cannot manufacture edges, only prefer the candidate that
+            // already crossed faster. LDCD_FVF_SHARP_W overrides at runtime.
+            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.16;
 
             // Saturation regime biasing.
             double FVF_SAT_FIELD_A_PEN   = 0.06; // Field A penalty in high saturation
@@ -449,6 +453,22 @@ public:
 	// which no lawful carrier can carry).
 	void probeOffGrid();
 
+	// Two-sided certified-luma tween probe (LDCD_PROBE_TWEEN). MEASUREMENT
+	// ONLY, -t 1. Grades the MIDDLE of three consecutive covers, predicted
+	// from the outer two, against its own exact channel -- a 4-film-frame
+	// straddle, twice the real job's distance, so its numbers bound the
+	// real tween conservatively. Run with LDCD_CERT_1D=0 so every
+	// estimator stays an estimator while truth survives.
+	void probeLumaTween();
+
+	// Carrier-invention ledger (LDCD_PROBE_INVENT). MEASUREMENT ONLY.
+	// Grades every carrier claimant against the exact channel IN IRE on
+	// covered def samples -- full frame and inside a box
+	// (LDCD_INVENT_L0/L1/C0/C1, frame line / active column). Answers the
+	// acid-test question directly: does the model claim carrier where
+	// truth says there is none? Run with LDCD_CERT_1D=0.
+	void probeCarrierInvention();
+
 	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
 	// demodulated aperture views can bound the chroma at a luma step. Reads
 	// state only; writes nothing and changes no output. See comb.cpp.
@@ -534,7 +554,8 @@ public:
 	// a mode.
 	double starSignatureAt(const quint16 *rawLine, int h, double *flankOut,
 	                       double *flankLOut = nullptr,
-	                       double *flankROut = nullptr) const;
+	                       double *flankROut = nullptr,
+	                       bool *carrierRunVetoOut = nullptr) const;
 
 	// ---- Certified-field anchoring (user design, 2026-07-30) ----
 	// "I don't see a future where one signal wins it. 1D should be
@@ -561,15 +582,42 @@ public:
 	static int certifiedOneDLevel();      // env-resolved once
 	bool certifiedDefLine(int line) const; // any finite exact sample in active
 	mutable std::vector<qint8> certifiedLineCache; // -1 unknown / 0 / 1
-	void buildStarEvidence();   // idempotent per loadFields
+	// Anticipated lattice (uncovered frames only): true where the chained
+	// reference plane carries DIRECT tween luma for this line (the chain
+	// source's def parity). Drives the lattice-keyed cede on B and D.
+	// Structurally inert under --dg-discard: no merge -> no covers -> no
+	// chain -> always false.
+	bool anticipatedDefLine(int line) const;
+	mutable std::vector<qint8> anticipatedLineCache; // -1 unknown / 0 / 1
+	void buildStarEvidence() const;   // idempotent per loadFields
+	// The licensed black-to-black footprint is decided in splitIQlocked(); Y
+	// consumes its zero carrier, and the normal chroma filter renders raw - Y.
+	void buildStarFootprint(const FrameBuffer *prevF,
+	                        const FrameBuffer *nextF);
 	// Sync-tone increments shipped by the assembler (per field; see
 	// SourceField::dgSyncIncrement). Kept per source field; consumers
 	// compose with their own in-batch anchor measurement.
 	QVector<float> syncIncFirst, syncIncSecond;
-	std::vector<float>  starEvidenceSum;  // per region: sum |ex| IRE at sites
-	std::vector<qint32> starEvidenceCnt;
-	int starRegionsX = 0, starRegionsY = 0;
-	bool starEvidenceBuilt = false;
+	mutable std::vector<float>  starEvidenceSum; // per region: sum |ex| IRE
+	mutable std::vector<qint32> starEvidenceCnt;
+	mutable int starRegionsX = 0, starRegionsY = 0;
+	mutable bool starEvidenceBuilt = false;
+	std::vector<std::uint8_t> starFootprint_flat;
+	bool starFootprintBuilt = false;
+	long starLicensedRegions = 0;
+	long starSignatureCenters = 0;
+	long starLicensedCenters = 0;
+	long starSubstitutedSamples = 0;
+	long starExtendedCenters = 0;
+	long starAddedSamples = 0;
+	long starAddedExactN = 0;
+	long starCarrierRunVetoes = 0;
+	long starSplitZeroSamples = 0;
+	long starAnchoredReturnBlocked = 0;
+	bool starUsedPrevEvidence = false;
+	bool starUsedNextEvidence = false;
+	double starAddedExactSum = 0.0;
+	double starAddedExactMax = 0.0;
 	// Exact-carrier anchor extraction + transfer-error probe
 	// (LDCD_PROBE_ANCHOR=1, run -t 1). Measurement only.
 	void probeExactAnchors();
@@ -581,8 +629,11 @@ public:
 
 	const std::vector<std::vector<FvfModelMetrics>> &getFvfMetrics() const { return fvfMetrics; }
 
-	// Tracks if this frame is the start of a scene (edit boundary).
+	// Field-level edit provenance for temporal evidence consumers.  A boundary
+	// on the first field starts this frame's scene; one on the second field is
+	// a half-frame split and cannot license a whole-frame temporal operation.
 	bool isSceneStart = false;
+	bool hasSceneSplit = false;
 
 	// Identity of the frame this buffer currently holds, as the seqNos of the
 	// two fields it was loaded from.  The triple-buffer persists across
@@ -1188,6 +1239,40 @@ private:
 	// structurally, because those consumers never see this plane.
 	std::vector<double> anchored1DSource_flat;
 	bool anchored1DValid = false;
+
+	// Chained anticipated-reference luma (uncovered frames): the LAST
+	// cover's certified luma (raw - exact on its def lines, NaN
+	// elsewhere), copied forward frame-to-frame with an age counter so
+	// every uncovered frame after a cover holds the reference. age -1 =
+	// none; reset on frame reuse in loadFields.
+	std::vector<float> antRefLuma_flat;
+	int antRefAge = -1;
+
+	// Probe-only estimator stashes (referee repair, 2026-08-02 audit): the
+	// certified head overwrites locked1DSource with the exact fact on
+	// covered samples, and factFit stamps carrierFit likewise on certified
+	// def samples -- which made every referee "1D"/"fit" column
+	// self-referential there (DSREF/CCREF/ANTGRADE were reporting zeros as
+	// estimator success). These planes keep the PRE-fact estimator values,
+	// allocated only when a truth referee is engaged, and are never read by
+	// any render or decision path.
+	std::vector<float> probePreHead1D_flat;
+	std::vector<float> probePreFactFit_flat;
+	// Probe-only: the committed CCR verdict's measured disagreement
+	// (devIRE) per sample, so CCREF grades the LIVE detector read (the
+	// anchored delta) instead of only its retired predecessors. Written in
+	// splitIQlocked pass 1 when LDCD_PROBE_CCREF is set; NaN where no
+	// anchored plane.
+	std::vector<float> probeCcDevIRE_flat;
+
+	// Regional fact audit of the SOLVE (Pass 1.7): mean |fit - exact| in
+	// IRE at certified samples, pre-stamp, per 128x32 region; NaN = no
+	// verdict. Conditions the between-anchor alpha merges (the return's
+	// audit pattern tailored to the witness). Recomputed per frame in
+	// buildCarrierRetractionStage; Nx==0 means absent.
+	std::vector<float> fitFactAuditIRE;
+	int fitFactAuditNx = 0;
+	int fitFactAuditNy = 0;
 	inline const double *combSource1D_line(int line) const {
 		if (anchored1DValid && demodWidth > 0 && line >= 0 &&
 		    line < demodLines && !anchored1DSource_flat.empty())

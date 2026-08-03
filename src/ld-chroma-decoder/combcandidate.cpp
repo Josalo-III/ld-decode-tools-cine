@@ -970,7 +970,20 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
-        if (configuration.phaseCompensation)
+        // Fact injection for the tap base (2026-08-02 audit): the published
+        // 1D plane clpbuffer[0] carries the certified head AND the
+        // anticipated head-echo; locked1DSource carries only the head (the
+        // echo may not touch it -- 1D safe retreat). The taps comb against
+        // the full fact story, which is what the echo's design comment
+        // always claimed. On covered frames and plain 1D lines the two
+        // planes are identical, so this changes anticipated def-line legs
+        // only. Both paths now read the same published plane.
+        // LDCD_TAP_FACTS=0 restores the pre-injection base for A/B.
+        static const bool tapFactsOn = []{
+            const char *s = std::getenv("LDCD_TAP_FACTS");
+            return !(s && std::atoi(s) == 0);
+        }();
+        if (configuration.phaseCompensation && !tapFactsOn)
             return locked1DSource_line(ln);
         return bucketScalar1D_line(ln) + left;
     };
@@ -1700,6 +1713,16 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             return;
         }
     }
+    // Anticipated cede (lattice-keyed, B/D direct lines): same contract,
+    // center read from the published plane (the head-echo carries the
+    // anticipated story there; locked 1D stays the untouched safe retreat).
+    if (certifiedOneDLevel() >= 2 && anticipatedDefLine(tapLine.cacheLine)) {
+        const double *center =
+            clpbuffer[0].pixel[tapLine.cacheLine] +
+            videoParameters.activeVideoStart;
+        std::copy(center, center + width, outFieldLine);
+        return;
+    }
 
     const auto  &T   = configuration.tunables;
     const double invI = invIreScale;
@@ -2081,6 +2104,16 @@ void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
             return;
         }
     }
+    // Anticipated cede: see computeFieldALine.
+    if (certifiedOneDLevel() >= 2 && anticipatedDefLine(lineNumber)) {
+        const double *center = clpbuffer[0].pixel[lineNumber] +
+                               videoParameters.activeVideoStart;
+        std::copy(center, center + width, outFieldLine);
+        if (outReasonLine)
+            std::fill(outReasonLine, outReasonLine + width,
+                      (std::uint8_t)FieldBReasonCede);
+        return;
+    }
 
     const CombTapLine &tapLine = ensureCombTapLine(lineNumber);
     computeFieldBLine(tapLine, outFieldLine, outReasonLine);
@@ -2152,6 +2185,17 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                           (std::uint8_t)FieldBReasonCede);
             return;
         }
+    }
+    // Anticipated cede: see computeFieldALine.
+    if (certifiedOneDLevel() >= 2 && lineNumber >= first &&
+        lineNumber < last && anticipatedDefLine(lineNumber)) {
+        const double *center = clpbuffer[0].pixel[lineNumber] +
+                               videoParameters.activeVideoStart;
+        std::copy(center, center + width, outFieldLine);
+        if (outReasonLine)
+            std::fill(outReasonLine, outReasonLine + width,
+                      (std::uint8_t)FieldBReasonCede);
+        return;
     }
 
     if (lineNumber < first || lineNumber >= last ||
@@ -2831,8 +2875,12 @@ void Comb::FrameBuffer::computeFrameALine(
 
     auto scalarLine = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
+        // Fact injection (2026-08-02): read the published plane (head +
+        // anticipated echo) instead of locked1DSource (head only) so Frame
+        // A's legs see the anticipated story on uncovered frames. +left
+        // keeps this branch's rel-indexing convention.
         return configuration.phaseCompensation
-            ? locked1DSource_line(ln)
+            ? bucketScalar1D_line(ln) + left
             : bucketScalar1D_line(ln);
     };
 
@@ -2950,6 +2998,21 @@ void Comb::FrameBuffer::computeFrameBLine(
         const float *cQ4 = locked1DTQ4fsc_line(line);
         for (int rel = 0; rel < width; ++rel) {
             outFrameScalar[rel] = center ? center[rel] : 0.0;
+            outFrameIQ[rel] = std::complex<double>(
+                cI4 ? (double)cI4[rel] : 0.0,
+                cQ4 ? (double)cQ4[rel] : 0.0);
+        }
+        return;
+    }
+    // Anticipated cede (B/D direct lines): scalar from the published plane,
+    // IQ from the head-echoed locked products -- one story, same shape.
+    if (certifiedOneDLevel() >= 2 && anticipatedDefLine(line)) {
+        const double *center = clpbuffer[0].pixel[line] +
+                               videoParameters.activeVideoStart;
+        const float *cI4 = locked1DTI4fsc_line(line);
+        const float *cQ4 = locked1DTQ4fsc_line(line);
+        for (int rel = 0; rel < width; ++rel) {
+            outFrameScalar[rel] = center[rel];
             outFrameIQ[rel] = std::complex<double>(
                 cI4 ? (double)cI4[rel] : 0.0,
                 cQ4 ? (double)cQ4[rel] : 0.0);
@@ -4225,11 +4288,13 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
 
     const int hh = clampH(h);
 
-    // 1D sample: locked path reads the phase-corrected blind bandpass;
+    // 1D sample: locked path reads the anchored-aware source (the same
+    // plane split3D's base1d consumes -- fact injection 2026-08-02; falls
+    // back to the phase-corrected blind bandpass when no anchored plane);
     // bucket path reads clpbuffer[0] directly. relationSign folds the
     // carrier relation in so every consumer keeps Opposite-form math.
     const double *lockedRow = frameBuffer.configuration.phaseCompensation
-        ? frameBuffer.locked1DSource_line(lineNumber) : nullptr;
+        ? frameBuffer.combSource1D_line(lineNumber) : nullptr;
 
     if (lockedRow && (hh - left) >= 0 && (hh - left) < (right - left)) {
         result.sample = relationSign * lockedRow[hh - left];

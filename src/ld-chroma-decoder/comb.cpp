@@ -50,6 +50,92 @@ namespace {
         if (b > c) std::swap(b, c);
         return 0.5 * (b + c);
     }
+
+    // LDCD_PROBE_COMBFVF: grades the four raw ingredients that feed the
+    // Field-vs-Frame election -- A-side (Field A or Frame A, whichever regime
+    // is active), Field B, Frame B, and the FVF blend itself -- against
+    // certified luma, at every covered pixel, split by which A-side regime
+    // was in force. This is the "how much of comb's slope deficit is baked
+    // in by the inner election, per contestant" instrument: measurement
+    // only, no writes, no gate on the certified family (the exact channel is
+    // read directly here, independent of whether the decoder is allowed to
+    // CONSUME it elsewhere).
+    struct CombFvfCertProbe {
+        struct Acc {
+            double errSum = 0.0; long errN = 0;
+            double slopeY = 0.0, slopeT = 0.0; long slopeN = 0;
+        };
+        // [0]=field-regime, [1]=frame-regime
+        Acc aSide[2], fieldB[2], frameB[2], mixed[2];
+        double oracleErrSum[2] = {0.0, 0.0};
+        long oracleN[2] = {0, 0};
+        long oracleWinA[2] = {0, 0}, oracleWinFieldB[2] = {0, 0},
+             oracleWinFrameB[2] = {0, 0};
+
+        static bool on() {
+            static const bool v = std::getenv("LDCD_PROBE_COMBFVF") != nullptr;
+            return v;
+        }
+
+        void note(bool aIsFrame, double yA, double yFieldB, double yFrameB,
+                 double yMixed, double lTrue, double invIre)
+        {
+            const int r = aIsFrame ? 1 : 0;
+            auto add = [&](Acc &a, double y) {
+                if (!std::isfinite(y)) return;
+                a.errSum += std::fabs(y - lTrue) * invIre; ++a.errN;
+            };
+            add(aSide[r], yA);
+            add(fieldB[r], yFieldB);
+            add(frameB[r], yFrameB);
+            add(mixed[r], yMixed);
+
+            // Per-pixel oracle among the three RAW ingredients (never the
+            // mix): the produceY-level oracle taught us mean-of-contestants
+            // can look close while real per-pixel headroom hides behind
+            // anti-correlated errors. Ask the same question one level down.
+            if (std::isfinite(yA) && std::isfinite(yFieldB) &&
+                std::isfinite(yFrameB)) {
+                const double eA = std::fabs(yA - lTrue) * invIre;
+                const double eF = std::fabs(yFieldB - lTrue) * invIre;
+                const double eB = std::fabs(yFrameB - lTrue) * invIre;
+                double best = eA; int who = 0;
+                if (eF < best) { best = eF; who = 1; }
+                if (eB < best) { best = eB; who = 2; }
+                oracleErrSum[r] += best; ++oracleN[r];
+                if (who == 0) ++oracleWinA[r];
+                else if (who == 1) ++oracleWinFieldB[r];
+                else ++oracleWinFrameB[r];
+            }
+        }
+
+        void flushOnce() {
+            static const char *rn[2] = {"field-regime", "frame-regime"};
+            for (int r = 0; r < 2; ++r) {
+                if (!mixed[r].errN) continue;
+                std::fprintf(stderr,
+                    "[COMBFVF %s] n=%ld  A-side %.3f  FieldB %.3f  "
+                    "FrameB %.3f  MIXED %.3f  (IRE, mean |err| vs Ltrue)\n",
+                    rn[r], mixed[r].errN,
+                    aSide[r].errN ? aSide[r].errSum / aSide[r].errN : -1.0,
+                    fieldB[r].errN ? fieldB[r].errSum / fieldB[r].errN : -1.0,
+                    frameB[r].errN ? frameB[r].errSum / frameB[r].errN : -1.0,
+                    mixed[r].errSum / mixed[r].errN);
+                if (oracleN[r]) {
+                    const double oe = oracleErrSum[r] / oracleN[r];
+                    const double me = mixed[r].errSum / mixed[r].errN;
+                    std::fprintf(stderr,
+                        "           ORACLE(A/FieldB/FrameB) %.3f  headroom "
+                        "%.1f%%  wins A=%.1f%% FieldB=%.1f%% FrameB=%.1f%%\n",
+                        oe, me > 0.0 ? 100.0 * (me - oe) / me : 0.0,
+                        100.0 * oracleWinA[r] / oracleN[r],
+                        100.0 * oracleWinFieldB[r] / oracleN[r],
+                        100.0 * oracleWinFrameB[r] / oracleN[r]);
+                }
+            }
+        }
+    };
+    CombFvfCertProbe g_combFvfCertProbe;
 }
 
 // 3D candidate palette
@@ -191,10 +277,30 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
     }
 
-    const qint32 preStart = (configuration.dimensions == 3 &&
-                             !configuration.diagnosticOnly())
-        ? (startIndex - 4)
-        : (startIndex - 2);
+    // Chain pre-roll depth (2026-08-02). The anticipated chain, the tone
+    // anchor, and the anchored plane all walk prevF in display order, but
+    // the 2D witness path pre-rolled only ONE frame -- so every cross-frame
+    // chain silently restarted at every batch head (measured: one dead
+    // anticipated chain per 8-frame batch, rendered as a periodic CCR
+    // detector dropout). The pool has ALWAYS delivered two real
+    // look-behind frames (paddingHistory, sequential in frame order under
+    // the queue lock); reach back and load them both so the chain enters
+    // the batch alive. Cost: two extra analysed frames per batch, offset
+    // by the decoderBatchFrames raise (8 -> 12 keeps the (N+k)/N analysis
+    // overhead at its previous level). Determinism holds: batch
+    // composition depends only on queue order, never on thread count.
+    qint32 preRollFields = 2;
+    if (configuration.dimensions == 3 && !configuration.diagnosticOnly())
+        preRollFields = 4;
+    if (configuration.phaseCompensation && configuration.lumaWitness)
+        preRollFields = 6;
+    // A/B escape (bisect instrument): LDCD_PREROLL overrides in FIELDS.
+    static const int preRollEnv = []{
+        const char *s = std::getenv("LDCD_PREROLL");
+        return s ? std::atoi(s) : -1;
+    }();
+    if (preRollEnv >= 2) preRollFields = preRollEnv;
+    const qint32 preStart = startIndex - preRollFields;
 
     // True when the frame analyzed on the PREVIOUS loop iteration (now
     // sitting in `current` after rotation) was genuinely loaded this batch —
@@ -332,6 +438,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->produceY(
                 previous->holdsRealFrame() ? previous.get() : nullptr,
                 next->holdsRealFrame() ? next.get() : nullptr);
+            // Two-sided certified-luma tween measurement (inert unless
+            // LDCD_PROBE_TWEEN). Reads only load-time and ladder planes;
+            // placed here so every estimator it grades is final.
+            current->probeLumaTween();
+            current->probeCarrierInvention();
             current->filterIQLocked();
             current->doYNR();
             current->transformIQ(configuration.chromaGain,
@@ -676,10 +787,14 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
                                  std::numeric_limits<float>::quiet_NaN());
         exactCoverageCache = -1;   // recompute for the newly held frame
         anchored1DValid = false;   // stale plane must not survive reuse
+        antRefAge = -1;            // chained anticipated reference likewise
         starEvidenceBuilt = false; // star license evidence follows the frame
+        starFootprintBuilt = false;
+        starFootprint_flat.clear();
         syncIncFirst  = firstField.dgSyncIncrement;
         syncIncSecond = secondField.dgSyncIncrement;
         certifiedLineCache.clear(); // per-line certified verdicts likewise
+        anticipatedLineCache.clear(); // and the anticipated lattice
         auto copyPlane = [&](const QVector<float> &src, int frameParity) {
             if (src.isEmpty()) return;
             qint32 fl = 0;
@@ -702,6 +817,8 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     secondFieldPhaseID = secondField.field.fieldPhaseID;
     
     const bool editSplit = secondField.field.cinemap.isEditBoundary;
+    isSceneStart = firstField.field.cinemap.isEditBoundary;
+    hasSceneSplit = editSplit;
     const bool progressiveFrameRegimeAllowed =
         firstField.allowProgressiveFrameRegime &&
         secondField.allowProgressiveFrameRegime;
@@ -1801,7 +1918,30 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                         const double ratio = candStepIRE / std::max(1e-9, stepIRE);
                         const double sharp = std::clamp((ratio - 0.70) / 0.30, 0.0, 1.0);
                         const double stepStrength = std::clamp((stepIRE - EDGE_STEP_THRESH_IRE) / 6.0, 0.0, 1.0);
-                        const double W_EDGE_SHARP = 0.10;
+                        // User's transition-crossing award: reward a comb
+                        // that crosses a regional transition along the line
+                        // MORE QUICKLY. It buys edge clarity without the
+                        // usual sharpening costs (halos, instability)
+                        // precisely because it is a SCORING term -- it can
+                        // only change which existing candidate wins, never
+                        // manufacture an edge that no candidate produced.
+                        //
+                        // Boosted 2026-08-02 (user): uncovered frames carry a
+                        // lateral-motion-blur-like softness, and the
+                        // covered/uncovered quality gap is what strobes. This
+                        // is the safe lever on it.
+                        //
+                        // Also wires the DECLARED tunable, which was dead: a
+                        // hardcoded local shadowed
+                        // FVF_TRANSITION_SHARPNESS_WEIGHT so the knob in
+                        // comb.h did nothing. LDCD_FVF_SHARP_W overrides.
+                        static const double kSharpWEnv = []{
+                            const char *e = std::getenv("LDCD_FVF_SHARP_W");
+                            return e ? std::atof(e) : -1.0;
+                        }();
+                        const double W_EDGE_SHARP = (kSharpWEnv >= 0.0)
+                            ? kSharpWEnv
+                            : T.FVF_TRANSITION_SHARPNESS_WEIGHT;
                         score *= (1.0 - W_EDGE_SHARP * sharp * stepStrength);
                     };
 
@@ -2567,6 +2707,12 @@ void Comb::FrameBuffer::split2D()
 
     if (width <= 0 || firstLine >= lastLine) return;
 
+    // Reset the per-frame comb-vs-truth census (see the flush call at the end
+    // of this function). One FrameBuffer's split2D() call == one frame, so
+    // scoping the probe to this call avoids any cross-thread accumulation.
+    if (CombFvfCertProbe::on())
+        g_combFvfCertProbe = CombFvfCertProbe();
+
     // LDCD_DUMP_1DDIAG=1: dump raw / blind-bandpass / locked-1D scalars over
     // the LDCD_PROBE_CEDE window, one text block per line per frame, for the
     // demod-smear signature analysis (the white-then-black doublet the
@@ -2870,12 +3016,19 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameACompute &&
-            certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
+            certifiedOneDLevel() >= 2 &&
+            (certifiedDefLine(line) || anticipatedDefLine(line))) {
             // Certified cede (CONSTRUCTION, upstream of every election):
             // on a def line the Frame A candidate IS the center. The 4fsc
             // IQ pair comes from the stage-1 locked products of the same
             // certified scalar, so attribution consumers see one story.
-            const double *center = locked1DSource_line(line);
+            // Anticipated lines (B/D direct lattice) take the same shape:
+            // scalar from the published plane (head-echoed), IQ from the
+            // echoed locked products; locked 1D stays the safe retreat.
+            const double *center = certifiedDefLine(line)
+                ? locked1DSource_line(line)
+                : clpbuffer[0].pixel[line] +
+                  videoParameters.activeVideoStart;
             const float *cI4 = locked1DTI4fsc_line(line);
             const float *cQ4 = locked1DTQ4fsc_line(line);
             frameAIQ.assign(width, std::complex<double>(0.0, 0.0));
@@ -3004,6 +3157,50 @@ void Comb::FrameBuffer::split2D()
                         scratch_lateralLine.data(),
                         &frameIQ);
 
+                    // ---- LDCD_PROBE_COMBFVF: grade the FOUR raw comb
+                    // ingredients (A-side, Field B, Frame B, FVF blend)
+                    // against certified luma BEFORE they collapse into one
+                    // scalar. User (2026-08-01): "comb seems to be the real
+                    // low-hanging fruit... go ahead" -- one level deeper than
+                    // YCAND's produceY-level oracle: this asks whether the
+                    // slope deficit measured there is already baked in by
+                    // FVF's inner election, or introduced downstream.
+                    // Held-out is automatic here: nothing in this scope reads
+                    // the certified family, so no CERT_1D gate is needed.
+                    if (CombFvfCertProbe::on() && line >= firstLine &&
+                        line < lastLine) {
+                        const float *ex = exactCarrierRow(line);
+                        if (ex) {
+                            const quint16 *rawLine = rawbuffer.constData() +
+                                line * videoParameters.fieldWidth;
+                            const bool aIsFrame =
+                                wantFvf && fvfUseFrameModel;
+                            for (int rel = 1; rel < width - 1; ++rel) {
+                                const int h = left + rel;
+                                const float e = ex[h];
+                                if (!std::isfinite(e)) continue;
+                                const double lTrue =
+                                    (double)rawLine[h] - (double)e;
+                                const double rawH = (double)rawLine[h];
+                                const double yA = rawH -
+                                    (aIsFrame
+                                        ? scratch_frameAAdaptiveIQComposite[rel]
+                                        : scratch_lineWorkA[rel]);
+                                const double yFieldB =
+                                    rawH - scratch_lineWorkC[rel];
+                                const double yFrameB = rawH -
+                                    scratch_frameBDirectIQComposite[rel];
+                                double vMixed = scratch_outMixed[rel];
+                                if (!std::isfinite(vMixed))
+                                    vMixed = scratch_lineWorkC[rel];
+                                const double yMixed = rawH - vMixed;
+                                g_combFvfCertProbe.note(
+                                    aIsFrame, yA, yFieldB, yFrameB, yMixed,
+                                    lTrue, invIreScale);
+                            }
+                        }
+                    }
+
                     for (int rel = 0; rel < width; ++rel) {
                         double vMixed = scratch_outMixed[rel];
 
@@ -3031,6 +3228,9 @@ void Comb::FrameBuffer::split2D()
         CombContentReach::markVerticalChromaBoundaryBand(
             chromaBoundaryBand_flat, demodWidth, width, firstLine, lastLine, 1);
     }
+
+    if (CombFvfCertProbe::on())
+        g_combFvfCertProbe.flushOnce();
 }
 
 // 3D temporal adaptive
@@ -3085,7 +3285,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         for (int line = firstLine; line < lastLine; ++line) {
             // Certified cede (construction): no temporal members are even
             // evaluated on def lines; their share stays zero.
-            if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
+            if (certifiedOneDLevel() >= 3 &&
+                (certifiedDefLine(line) || anticipatedDefLine(line)))
                 continue;
             const double *lockedRow = configuration.phaseCompensation
                 ? combSource1D_line(line) : nullptr;
@@ -3190,7 +3391,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 out[x] = 0.25f * (su[x] + 2.0f * s0[x] + sd[x]);
         }
         for (int line = firstLine; line < lastLine; ++line) {
-            if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
+            if (certifiedOneDLevel() >= 3 &&
+                (certifiedDefLine(line) || anticipatedDefLine(line)))
                 continue;   // certified cede: the 2D seed (= center) stands
             const float *sv = shareV.data() + (size_t)line * width;
             const float *tm = tMean.data() + (size_t)line * width;
@@ -3212,7 +3414,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
     for (int line = firstLine; line < lastLine; ++line) {
         // Certified cede (construction): temporal machinery stands down on
         // def lines; the seeded 2D value (= center) stands.
-        if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
+        if (certifiedOneDLevel() >= 3 &&
+                (certifiedDefLine(line) || anticipatedDefLine(line)))
             continue;
 
         for (int h = left; h < right; ++h) {
