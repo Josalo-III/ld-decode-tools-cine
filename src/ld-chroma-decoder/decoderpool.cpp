@@ -517,18 +517,25 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
                                 0, 0,
                                 rawVec, dummyStart, dummyEnd);
                                 
-        // Trim batch to end on a cadence cycle boundary (cadenceId 9 = D2)
+        // Trim batch to end on a cadence cycle boundary (cadenceId 9 = D2).
+        // Skipped under --set-cadence: this boundary is read from CineMap's
+        // solve, which is the very thing an imposed cadence overrides, and the
+        // trim can cut at an odd field index — breaking the frame pairing the
+        // forced path counts on. The assembler's window carries any partial
+        // group across pushes, so no trim is needed there.
         const int rawSize = static_cast<int>(rawVec.size());
         int trimEnd = rawSize;
-        for (int i = rawSize - 1; i >= std::max(0, rawSize - 10); --i) {
-            const int cid = rawVec[i].field.cinemap.cadenceId;
-            if (cid == 9 || (cid >= 0 && cid % 10 == 9)) {
-                trimEnd = i + 1;
-                break;
-            }
-            if (rawVec[i].field.cinemap.isEditBoundary) {
-                trimEnd = i;
-                break;
+        if (cadenceConfig.setCadence == 0) {
+            for (int i = rawSize - 1; i >= std::max(0, rawSize - 10); --i) {
+                const int cid = rawVec[i].field.cinemap.cadenceId;
+                if (cid == 9 || (cid >= 0 && cid % 10 == 9)) {
+                    trimEnd = i + 1;
+                    break;
+                }
+                if (rawVec[i].field.cinemap.isEditBoundary) {
+                    trimEnd = i;
+                    break;
+                }
             }
         }
         

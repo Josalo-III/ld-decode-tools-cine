@@ -573,7 +573,28 @@ void CadenceAssembler::handOffCaptureFrameToBaseline(int pos)
 void CadenceAssembler::push(const QVector<SourceField>& newFields)
 {
     if (config.setCadence != 0 && !config.noPA) {
-        for (const auto& f : newFields) window.push_back(f);
+        if (config.reverseFieldOrder) {
+            // -r delivers each capture frame second-field-first, so the field
+            // stream arrives with every pair TRANSPOSED (seq 3,2,5,4,7,6...),
+            // not merely offset. Restore ascending order before counting: the
+            // imposed cycle is a statement about cadence slots, and a
+            // transposed stream cannot be modelled by any starting offset. Left
+            // transposed, the twin merge takes a B field as the spare and the
+            // real spare is assembled into a frankenframe with B — precisely
+            // the failure -r exists to correct. Pushes are frame-aligned (the
+            // batch trim is skipped in forced mode), so a pair here is one
+            // capture frame; an odd tail cannot arise, and if it ever did it
+            // passes through rather than desyncing every later pair.
+            const int n = newFields.size();
+            int i = 0;
+            for (; i + 1 < n; i += 2) {
+                window.push_back(newFields[i + 1]);
+                window.push_back(newFields[i]);
+            }
+            if (i < n) window.push_back(newFields[i]);
+        } else {
+            for (const auto& f : newFields) window.push_back(f);
+        }
         processWindowForced(false);
         return;
     }
@@ -808,25 +829,38 @@ bool CadenceAssembler::mergeDgPairWithSanityWrapper(SourceField& def, SourceFiel
     return ok;
 }
 
-// Forced cadence start offset helper
+// Forced cadence start offset helper.
+//
+// --set-cadence N is a FRAME count, 1..5, presented to the user 1-based over
+// exactly the axis ld-cinemap reports as phaseOffset (p0..p4 in its phase
+// tables): N-1 is the position, within the 5-frame pulldown cycle, of the
+// FIRST FRAME OF THIS RENDER. N=1 means the render opens on the complete A
+// frame. The count is relative to -s, so a scoped re-render of the same disc
+// names its own opening frame -- which is what makes a multicadence
+// composite workable: the autosolve keeps the dominant pattern, and each
+// other pattern gets its own scoped render at its own index.
+//
+// The five capture frames of the cycle occupy field slots (0,1) (2,3) (4,5)
+// (6,7) (8,9), so the first field's slot is simply 2*(N-1). Every value
+// therefore lands on a frame boundary, which is the whole point: A starts
+// clean on a frame and the user is only telling us which one.
+//
+// Nothing here validates the choice and no evidence may override it. Jamming
+// against the grain is the feature.
 int CadenceAssembler::forcedStartIndex() const
 {
-    int base = 0;
-    switch (config.setCadence) {
-        case 1: base = 0; break; // AA
-        case 2: base = 2; break; // AB
-        case 3: base = 4; break; // BC
-        case 4: base = 6; break; // CC
-        case 5: base = 8; break; // DD
-        default: base = 0; break;
-    }
+    const int n = std::clamp(config.setCadence, 1, 5);
+    int base = 2 * (n - 1);
 
-    // -r (reverseFieldOrder) shifts the starting slot by half a cycle (5 slots).
-    // In normal field order the upper (first-stored) field carries the A-definitional
-    // sample; reversing field order makes the lower field the first-stored, which
-    // flips which fields within each pulldown frame are the spares versus which are
-    // the B-frame fields — the core distinction in pulldown consolidation.
-    if (config.reverseFieldOrder) base = (base + 5) % CADENCE_NTSC_CYCLE;
+    // -r inverts upper-field-first to lower-field-first: the same inverted
+    // dominance ld-cinemap records as cadenceIds 10..19. That regime is a pure
+    // relabel of the same index layout — cinemap detects it by which side of the
+    // TBC frame grid the spare falls on, which is to say the pattern sits ONE
+    // FIELD over. So this +1 is the stream alignment, and the stamped cids move
+    // into the inverted space to carry the dominance downstream (see
+    // processWindowForced). An earlier form added 5 — half a cycle — which
+    // landed three of the five values on slots the loop had no handler for.
+    if (config.reverseFieldOrder) base = (base + 1) % CADENCE_NTSC_CYCLE;
     return base;
 }
 
@@ -874,15 +908,45 @@ int CadenceAssembler::findComplementPos(int i0) const {
 
 // Forced cadence (jam) mode: the user insists on a specific cadence pattern
 // regardless of what ld-cinemap detected. Fields are consumed in strict
-// A-B-C-D sequence driven by setCadence (which sets the starting slot) with
-// no cadenceId validation — every incoming field is assigned its position by
-// counting, not by metadata. This is useful when cadence metadata is absent
-// or when the user knows the disc has a simple, unbroken pulldown cadence.
+// A-B-C-D sequence driven by setCadence (which names the cycle position of
+// the render's first frame) with no cadenceId validation — every incoming
+// field is assigned its position by counting, not by metadata. This is the
+// path for jamming against the grain: multicadence composites where one
+// pattern won the autosolve and the others need their own scoped render.
+//
+// Two invariants make the counting safe to hand to a user:
+//
+//   1. No slot can stall. Every slot either starts a defined film frame or is
+//      an orphan head that releases ONE field to baseline and advances. An
+//      earlier form had handlers for six of the ten slots and simply broke out
+//      of the loop on the rest, so a start landing on slot 4 consumed nothing
+//      forever and flush discarded the whole render — --set-cadence 3 wrote a
+//      zero-byte file and reported success.
+//
+//   2. No field is dropped silently. Anything that cannot be placed goes to
+//      baseline so DecoderPool still emits it as plain video; the old flush
+//      path cleared the window outright, leaving holes in the output.
+//
+// A group is never consumed until it is complete: taking the A pair while its
+// spare was still in the next push cost one certified cover per batch.
 void CadenceAssembler::processWindowForced(bool flushMode)
 {
     if (config.noPA) return;
 
     const int start = forcedStartIndex();
+
+    // Dominance regime of the stamped identity. -r asserts lower-field-first,
+    // which is the inverted regime ld-cinemap records as cadenceIds 10..19; the
+    // index layout is identical, so cadenceIndex() normalises it for every role
+    // lookup downstream while cadenceIsInverted() keeps the dominance readable.
+    // Stamping the plain 0..9 space under -r would silently claim normal
+    // dominance for an inverted render.
+    const int regime = config.reverseFieldOrder ? CADENCE_NTSC_INVERTED_OFFSET : 0;
+
+    // Slot-by-slot trace of what the imposed count actually did. A jam is the
+    // user's assertion against the evidence, so the tool has to be able to
+    // show which real field landed in which asserted role.
+    static const bool forcedTrace = std::getenv("LDCD_PROBE_FORCED") != nullptr;
 
     auto cycleIndex = [&](qint64 consumed) -> int {
         int idx = int((start + (consumed % CADENCE_NTSC_CYCLE)) % CADENCE_NTSC_CYCLE);
@@ -893,8 +957,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
     auto emitTelecine2 = [&](char label, SourceField&& f1, int cid1,
                              SourceField&& f2, int cid2,
                              WorkItem::Expansion ex = WorkItem::Expansion::None) {
-        stampForcedCadence(f1, cid1);
-        stampForcedCadence(f2, cid2);
+        stampForcedCadence(f1, regime + cid1);
+        stampForcedCadence(f2, regime + cid2);
         bool swapped = orderPairForComb(f1, f2);
         WorkItem wi;
         wi.kind               = WorkItem::Kind::TelecineFrame;
@@ -912,6 +976,10 @@ void CadenceAssembler::processWindowForced(bool flushMode)
     auto pop1 = [&]() -> SourceField {
         SourceField f = std::move(window.front());
         window.pop_front();
+        if (forcedTrace)
+            std::fprintf(stderr, "FORCED slot=%d seq=%d firstField=%d\n",
+                         cycleIndex(forcedFieldIndex), f.field.seqNo,
+                         f.field.isFirstField ? 1 : 0);
         ++forcedFieldIndex;
         return f;
     };
@@ -922,183 +990,126 @@ void CadenceAssembler::processWindowForced(bool flushMode)
         return {std::move(a), std::move(b)};
     };
 
-    // Main loop: perform only the exact cadence-defined operation for the current slot.
-    while (true) {
-        if (window.empty()) break;
-        if (!flushMode && window.size() < 2) break;
+    // One loop for both push and flush. Each pass either consumes a complete
+    // group for the current slot, releases a single unplaceable field to
+    // baseline, or returns to wait for more input. Because every branch that
+    // does not return consumes at least one field, and every slot has a
+    // branch, the count always advances and no field is left unaccounted for.
+    while (!window.empty()) {
+        const int idx   = cycleIndex(forcedFieldIndex);
+        const int avail = static_cast<int>(window.size());
 
-        const int idx = cycleIndex(forcedFieldIndex);
+        // Not enough input for this slot's group. Mid-stream that means wait;
+        // at flush it means the group runs off the end of the range, so the
+        // head field is baseline material and the next slot gets its turn.
+        auto shortOfGroup = [&](int need) {
+            if (avail >= need) return false;
+            if (!flushMode) return true;
+            releaseToBaseline(pop1());
+            return true;
+        };
 
-        // A start: 0(def),1(comp), optional 2(spare)
-        if (idx == 0) {
-            if (window.size() < 2) break;
+        switch (idx) {
+        case 0: {
+            // A: def + comp, plus the trailing spare at slot 2. The spare is
+            // part of this group — hold the whole thing until it has arrived,
+            // or the merge loses a cover at every push boundary.
+            if (shortOfGroup(flushMode ? 2 : 3)) {
+                if (!flushMode) return;
+                continue;
+            }
             auto [def, comp] = pop2();
-            stampForcedCadence(def, 0);
-            stampForcedCadence(comp, 1);
+            stampForcedCadence(def, regime + 0);
+            stampForcedCadence(comp, regime + 1);
 
             WorkItem::Expansion ex = WorkItem::Expansion::None;
-
-            // If the next slot is 2, consume it as A-spare (if present).
             if (!window.empty() && cycleIndex(forcedFieldIndex) == 2) {
                 SourceField spare = pop1();
-                stampForcedCadence(spare, 2);
+                stampForcedCadence(spare, regime + 2);
                 if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
                     ex = WorkItem::Expansion::Trailing;
                 } else {
+                    // Twins disagreed (or the user asked for --dg-discard):
+                    // no certified plane for this frame, and the spare is
+                    // ordinary video. Exactly the dg-discard outcome, decided
+                    // per pair by the twins themselves.
                     releaseToBaseline(std::move(spare));
                 }
             }
-
             emitTelecine2('A', std::move(def), 0, std::move(comp), 1, ex);
             continue;
         }
 
-        // A spare slot (2): consume+discard when encountered standalone.
-        if (idx == 2) {
-            releaseToBaseline(pop1());
-            continue;
-        }
-
-        // B start: 3+4
-        if (idx == 3) {
-            if (window.size() < 2) break;
+        case 3: {
+            // B: two ordinary fields, no twin and so no certified carrier.
+            if (shortOfGroup(2)) {
+                if (!flushMode) return;
+                continue;
+            }
             auto [f3, f4] = pop2();
             emitTelecine2('B', std::move(f3), 3, std::move(f4), 4,
                           WorkItem::Expansion::None);
             continue;
         }
 
-        // C start (preferred): 5(spare)+6(comp)+7(def)
-        if (idx == 5) {
-            if (window.size() >= 3) {
-                SourceField spare = pop1(); // 5
-                SourceField comp  = pop1(); // 6
-                SourceField def   = pop1(); // 7
-                stampForcedCadence(spare, 5);
-                stampForcedCadence(comp, 6);
-                stampForcedCadence(def, 7);
-        
-                WorkItem::Expansion ex = WorkItem::Expansion::None;
-                if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
-                    ex = WorkItem::Expansion::Leading;
-                } else {
-                    releaseToBaseline(std::move(spare));
-                }
-                emitTelecine2('C', std::move(comp), 6, std::move(def), 7, ex);
+        case 5: {
+            // C: leading spare (slot 5) + comp + def.
+            if (shortOfGroup(3)) {
+                if (!flushMode) return;
                 continue;
             }
-        
-            if (flushMode) {
-                while (!window.empty()) releaseToBaseline(pop1());
+            SourceField spare = pop1(); // 5
+            SourceField comp  = pop1(); // 6
+            SourceField def   = pop1(); // 7
+            stampForcedCadence(spare, regime + 5);
+            stampForcedCadence(comp, regime + 6);
+            stampForcedCadence(def, regime + 7);
+
+            WorkItem::Expansion ex = WorkItem::Expansion::None;
+            if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+                ex = WorkItem::Expansion::Leading;
+            } else {
+                releaseToBaseline(std::move(spare));
             }
-            break;
+            emitTelecine2('C', std::move(comp), 6, std::move(def), 7, ex);
+            continue;
         }
-        
-        // C start (no spare): 6+7
-        if (idx == 6) {
-            if (window.size() < 2) break;
+
+        case 6: {
+            // C whose leading spare fell outside the range (a scoped render
+            // starting here). The film frame still stands, uncovered.
+            if (shortOfGroup(2)) {
+                if (!flushMode) return;
+                continue;
+            }
             auto [comp, def] = pop2();
             emitTelecine2('C', std::move(comp), 6, std::move(def), 7,
                           WorkItem::Expansion::None);
             continue;
         }
 
-        // D start: 8+9
-        if (idx == 8) {
-            if (window.size() < 2) break;
+        case 8: {
+            // D
+            if (shortOfGroup(2)) {
+                if (!flushMode) return;
+                continue;
+            }
             auto [f8, f9] = pop2();
             emitTelecine2('D', std::move(f8), 8, std::move(f9), 9,
                           WorkItem::Expansion::None);
             continue;
         }
 
-        // Any other slot: do nothing. No fallback, no invention.
-        // In non-flush, stop and wait (because you need more input to reach a defined slot).
-        // In flush, discard tail.
-        if (flushMode) {
-            window.clear();
+        default:
+            // Slots 1, 2, 4, 7, 9: an orphan half-frame whose partner lies
+            // before the start of this render (slot 4 is --set-cadence 3, and
+            // -r puts every value on an odd slot), or a spare whose
+            // definitional partner was already emitted. No invention of a
+            // missing partner: the field is real video, so it goes to
+            // baseline and the count moves on.
+            releaseToBaseline(pop1());
+            continue;
         }
-        break;
-    }
-
-    // Flush: drain remaining using only defined operations; discard any leftover tail.
-    if (flushMode) {
-        while (!window.empty()) {
-            const int idx = cycleIndex(forcedFieldIndex);
-
-            if (idx == 2) { releaseToBaseline(pop1()); continue; }
-
-            if (idx == 0) {
-                if (window.size() < 2) break;
-                auto [def, comp] = pop2();
-                stampForcedCadence(def, 0);
-                stampForcedCadence(comp, 1);
-
-                WorkItem::Expansion ex = WorkItem::Expansion::None;
-                if (!window.empty() && cycleIndex(forcedFieldIndex) == 2) {
-                    SourceField spare = pop1();
-                    stampForcedCadence(spare, 2);
-                    if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
-                        ex = WorkItem::Expansion::Trailing;
-                    } else {
-                        releaseToBaseline(std::move(spare));
-                    }
-                }
-                emitTelecine2('A', std::move(def), 0, std::move(comp), 1, ex);
-                continue;
-            }
-
-            if (idx == 3) {
-                if (window.size() < 2) break;
-                auto [f3, f4] = pop2();
-                emitTelecine2('B', std::move(f3), 3, std::move(f4), 4,
-                              WorkItem::Expansion::None);
-                continue;
-            }
-
-            if (idx == 5) {
-                if (window.size() >= 3) {
-                    SourceField spare = pop1();
-                    SourceField comp  = pop1();
-                    SourceField def   = pop1();
-                    stampForcedCadence(spare, 5);
-                    stampForcedCadence(comp, 6);
-                    stampForcedCadence(def, 7);
-            
-                    WorkItem::Expansion ex = WorkItem::Expansion::None;
-                    if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
-                        ex = WorkItem::Expansion::Leading;
-                    } else {
-                        releaseToBaseline(std::move(spare));
-                    }
-                    emitTelecine2('C', std::move(comp), 6, std::move(def), 7, ex);
-                    continue;
-                }
-                // Incomplete triple at flush — release whatever's left
-                while (!window.empty()) releaseToBaseline(pop1());
-                break;
-            }
-            if (idx == 6) {
-                if (window.size() < 2) break;
-                auto [comp, def] = pop2();
-                emitTelecine2('C', std::move(comp), 6, std::move(def), 7,
-                              WorkItem::Expansion::None);
-                continue;
-            }
-
-            if (idx == 8) {
-                if (window.size() < 2) break;
-                auto [f8, f9] = pop2();
-                emitTelecine2('D', std::move(f8), 8, std::move(f9), 9,
-                              WorkItem::Expansion::None);
-                continue;
-            }
-            while (!window.empty()) releaseToBaseline(pop1());
-            window.clear();
-            break;
-        }
-
-        window.clear();
     }
 }
 

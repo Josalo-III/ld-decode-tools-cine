@@ -166,6 +166,85 @@ void testCutTruncatedCSpareCompUsesFrameRegime()
           "cut tail should retain C-spare and C-comp identities");
 }
 
+// An imposed cadence is the user's assertion against the evidence, so the only
+// thing the assembler owes them is that it acts on every value and loses
+// nothing. Both invariants are checked for all five positions, in each field
+// order: every pushed field is either placed in a film frame or released to
+// baseline, and the run produces work.
+//
+// The regression this pins: forcedStartIndex mapped the five values onto field
+// slots {0,2,4,6,8} while the loop only had handlers for {0,2,3,5,6,8}. A start
+// on slot 4 (--set-cadence 3) consumed nothing forever, and flush discarded the
+// whole window without releasing it, so the render wrote a zero-byte file and
+// reported success.
+void testForcedCadenceActsOnEveryPositionAndLosesNoField()
+{
+    for (int reversed = 0; reversed <= 1; ++reversed) {
+        for (int setCadence = 1; setCadence <= 5; ++setCadence) {
+            LdDecodeMetaData::VideoParameters videoParameters;
+            CadenceAssembler::Configuration configuration;
+            configuration.setCadence        = setCadence;
+            configuration.reverseFieldOrder = (reversed != 0);
+
+            QVector<qint32> releasedToBaseline;
+            CadenceAssembler assembler(
+                videoParameters,
+                configuration,
+                [&](qint32 seqNo) { releasedToBaseline.push_back(seqNo); });
+
+            // Three full cycles, pushed in two batches so a group that
+            // straddles a push boundary is exercised too.
+            QVector<SourceField> first, second;
+            for (int i = 0; i < 12; ++i) first.push_back(makeField(i % 10));
+            for (int i = 12; i < 30; ++i) second.push_back(makeField(i % 10));
+            // makeField keys seqNo off cadenceId, which repeats every cycle;
+            // the accounting below needs distinct fields, so renumber.
+            for (int i = 0; i < first.size(); ++i) first[i].field.seqNo = i + 1;
+            for (int i = 0; i < second.size(); ++i)
+                second[i].field.seqNo = 12 + i + 1;
+
+            assembler.push(first);
+            assembler.push(second);
+            assembler.flush();
+            const QVector<CadenceAssembler::WorkItem> work = assembler.popWork();
+
+            char message[128];
+            std::snprintf(message, sizeof(message),
+                          "forced cadence %d (reversed=%d) produced no work",
+                          setCadence, reversed);
+            check(!work.isEmpty(), message);
+
+            QVector<qint32> accounted = releasedToBaseline;
+            for (const auto &item : work) {
+                accounted.push_back(item.f1.field.seqNo);
+                accounted.push_back(item.f2.field.seqNo);
+
+                // -r asserts lower-field-first, which is ld-cinemap's inverted
+                // regime (cadenceIds 10..19). Stamping the normal 0..9 space
+                // there would claim normal dominance for an inverted render.
+                for (const SourceField *f : { &item.f1, &item.f2 }) {
+                    const int cid = f->field.cinemap.cadenceId;
+                    std::snprintf(message, sizeof(message),
+                                  "forced cadence %d (reversed=%d) stamped cid "
+                                  "%d in the wrong dominance regime",
+                                  setCadence, reversed, cid);
+                    check(cadenceIsInverted(cid) == (reversed != 0), message);
+                }
+            }
+
+            // -r drops the stream's leading field when it regroups, so it can
+            // account for one field fewer than were pushed.
+            const int pushed   = static_cast<int>(first.size() + second.size());
+            const int expected = pushed - (reversed ? 1 : 0);
+            std::snprintf(message, sizeof(message),
+                          "forced cadence %d (reversed=%d) accounted for %d of "
+                          "%d fields", setCadence, reversed,
+                          static_cast<int>(accounted.size()), expected);
+            check(accounted.size() >= expected, message);
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -174,5 +253,6 @@ int main()
     testPassthroughPreservesIdentityButForbidsFrameComb();
     testCutTruncatedACompSpareUsesFrameRegime();
     testCutTruncatedCSpareCompUsesFrameRegime();
+    testForcedCadenceActsOnEveryPositionAndLosesNoField();
     return 0;
 }

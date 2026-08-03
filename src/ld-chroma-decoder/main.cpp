@@ -289,9 +289,14 @@ int main(int argc, char *argv[])
     QCommandLineOption setCadenceOption(
         QStringList() << "set-cadence",
         QCoreApplication::translate("main",
-            "Impose a global pulldown interpretation, selecting video start frames for the 5 -frame cycle, overriding cadenceId metadata from CineMap -"
-            "Values are: "
-            "1=AA, 2=AB, 3=BC, 4=CC, 5=DD"),
+            "Impose a pulldown interpretation, overriding cadenceId metadata from CineMap. "
+            "The value is the position of THIS RENDER'S FIRST FRAME within the 5-frame "
+            "pulldown cycle, counted from 1: 1 means the render opens on the complete A "
+            "frame (CineMap's phase p0), 2 means one frame further into the cycle, and so "
+            "on to 5. Counted from --start, so a scoped re-render names its own opening "
+            "frame - which is how a multicadence composite is built, one render per "
+            "pattern. Nothing validates the choice: twins that disagree simply leave that "
+            "frame uncovered, and --dg-discard turns the merge off wholesale."),
         QCoreApplication::translate("main", "number"));
     parser.addOption(setCadenceOption);
 
@@ -405,6 +410,28 @@ int main(int argc, char *argv[])
     }
     if (parser.isSet(noPAOption)) cadenceConfig.noPA = true;
     if (parser.isSet(dgDiscardOption)) cadenceConfig.dgDiscard = true;
+    // Parsed here, with the rest of the cadence options, because both the
+    // --no-pa conflict check below and the decoder construction that consumes
+    // combConfig happen before the end of option parsing. Sited further down, as
+    // it was, it reached neither: the check could never fire and the comb never
+    // learned the cadence was imposed.
+    if (parser.isSet(setCadenceOption)) {
+        const int val = parser.value(setCadenceOption).toInt();
+        if (val < 1 || val > 5) {
+            qCritical() << "--set-cadence must be in the range 1..5";
+            return -1;
+        }
+        cadenceConfig.setCadence  = val;
+        combConfig.imposedCadence = true;
+        // Notice on stderr so it cannot corrupt piped stdout (y4m/raw).
+        fprintf(stderr,
+                "Info: Imposing pulldown cadence: this render's first frame is "
+                "position %d of 5 in the cycle (1 = opens on the complete A "
+                "frame, ld-cinemap's phase p0). Counted from --start; not "
+                "validated.\n",
+                val);
+        std::fflush(stderr);
+    }
     if (parser.isSet(dgOutlierOption)) {
         cadenceConfig.dgOutlierThreshIre = parser.value(dgOutlierOption).toDouble();
     }
@@ -738,20 +765,6 @@ int main(int argc, char *argv[])
             outputConfig.paddingAmount = 8;
         }
     }
-    // After other cadenceConfig parsing in main.cpp
-    if (parser.isSet(setCadenceOption)) {
-        int val = parser.value(setCadenceOption).toInt();
-        if (val < 1 || val > 5) {
-            qCritical() << "--set-cadence must be in the range 1..5";
-            return -1;
-        }
-        cadenceConfig.setCadence = val;
-            // Send the notice to stderr so it doesnt corrupt piped stdout (y4m/raw)
-            fprintf(stderr,
-                    "Info: Forcing global cadence start at index %d (AA=1, AB=2, BC=3, CC=4, DD=5).\n",
-                    val);
-            std::fflush(stderr);
-        }
     // Perform the processing
     DecoderPool decoderPool(*decoder, inputFileName, metaData, outputConfig, cadenceConfig, outputFileName, startFrame, length, maxThreads);
     if (!decoderPool.process()) {

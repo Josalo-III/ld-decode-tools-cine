@@ -708,8 +708,21 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     
     const qint32 cidA = firstField.field.cinemap.cadenceId;
     const qint32 cidB = secondField.field.cinemap.cadenceId;
+    // Under autosolve editSplit is narrow and correct: the flag marks the first
+    // field of a new scene, so it is set here only when the cut falls BETWEEN
+    // this frame's two fields — the "A/A" case, where the leading A belongs to
+    // the outgoing shot and combing the pair would reach across the transition.
+    // A cut at the leading edge ("/AA") leaves it false and the frame is film,
+    // period.
+    //
+    // Under --set-cadence it does not apply at all. The user reaches for a jam
+    // precisely when the solve has failed, so its boundaries are not evidence to
+    // defer to; the asserted count is the whole authority. isSceneStart and
+    // hasSceneSplit above are untouched — they cannot contradict the count, and
+    // only ever stop evidence being borrowed across a marked transition.
+    const bool cadenceEditSplit = editSplit && !configuration.imposedCadence;
     cadenceId = lddecode::mergeCadenceIdForInterleavedFrame(
-        cidA, cidB, editSplit);
+        cidA, cidB, cadenceEditSplit);
     if (!progressiveFrameRegimeAllowed)
         cadenceId = lddecode::kCadenceVideo;
     // Clear working planes only in active region for safety

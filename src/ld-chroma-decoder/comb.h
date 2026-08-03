@@ -76,6 +76,15 @@ public:
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
         bool   debugInterfieldFlip = false; // Log per-leg benefit of carrier alignment on ±1 interfield pair
+        // --set-cadence is live. The /AA-is-film, A/A-is-not, A/B-drops-the-A
+        // rule for edit boundaries belongs to the AUTOSOLVE, which is reasoning
+        // from evidence it trusts. A jam is a different beast: the typical
+        // reason to reach for it is that the solve FAILED, and the user is
+        // forcing a cadence only they can see rather than going back to write
+        // metadata overrides. Protecting them from their own count — demoting a
+        // frame because the failed solve marked a cut inside it — takes the
+        // control away that is the entire point of the flag.
+        bool imposedCadence = false;
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
