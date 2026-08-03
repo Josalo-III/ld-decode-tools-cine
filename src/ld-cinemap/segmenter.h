@@ -10,7 +10,8 @@ namespace segmenter {
     // explicitly before this if a fresh run is needed.
     int segmentDisc(CineDisc& disc);
 
-    // Clears all isEditBoundary flags from disc metadata.
+    // Clears all isEditBoundary flags from disc metadata, leaving manual edit
+    // vetoes standing. This is the backing implementation for --clear-edits.
     // Never called implicitly by segmentDisc() or any other pass.
     void clearEditBoundaries(CineDisc& disc);
 
@@ -18,7 +19,9 @@ namespace segmenter {
     //   - isEditBoundary
     //   - cadenceId / cadenceIndexPresumed
     //   - pulldownRole
-    // This is the backing implementation for --clear-all-flags.
+    // and additionally discards every manual edit veto (isEditVetoed).
+    // This is the backing implementation for --clear-all-flags, and the only
+    // path in the tool that destroys a user veto.
     // Never called implicitly by any detection pass.
     void clearAllFlags(CineDisc& disc);
 

@@ -268,7 +268,6 @@ public:
             modifiedField.cinemap.cadenceId = cid;
             modifiedField.cinemap.cadenceIndexPresumed = false;
             modifiedField.cinemap.pulldownRole = pulldownRoleForCadenceId(cid);
-            modifiedField.cinemap.isManualOverride = true;
             m_md->updateField(modifiedField, idx);
             changed++;
         }
@@ -277,7 +276,9 @@ public:
     }
 
 private:
-    // Sets isEditBoundary and isManualOverride on all fields matching seqNoKeys.
+    // Applies a manual edit override to all fields matching seqNoKeys.
+    // value = true forces a boundary (whitelist) and lifts any standing veto;
+    // value = false vetoes the field (blacklist), which no detector can undo.
     int applyEditOverridesBySeqNoKeys(const std::vector<qint32>& seqNoKeys, bool value)
     {
         if (seqNoKeys.empty()) return 0;
@@ -296,8 +297,8 @@ private:
             if (field.pad) continue;
 
             auto modifiedField = field;
-            modifiedField.cinemap.isEditBoundary = value;
-            modifiedField.cinemap.isManualOverride = true;
+            if (value) modifiedField.cinemap.forceEditBoundary();
+            else       modifiedField.cinemap.vetoEditBoundary();
             m_md->updateField(modifiedField, idx);
             changed++;
         }

@@ -343,8 +343,9 @@ namespace visualEdits {
     
             auto field = md.getField(fieldIdx);
             if (field.cinemap.isEditBoundary) return;
-    
-            field.cinemap.isEditBoundary = true;
+            if (field.cinemap.isEditVetoed) return; // user shut this edit down
+
+            field.cinemap.assertEditBoundary();
             md.updateField(field, fieldIdx);
             editCount++;
             lastEditFrame = fieldIdx;

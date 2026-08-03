@@ -61,7 +61,7 @@ Ignored with `--skip-edits` and `--override-only`.
 - **`--strong <value>`** (default: 1.5) — Multiplier for strong discontinuities.
 - **`--peak <value>`** (default: 1.6) — Multiplier for peak luminance differences.
 - **`--edit-whitelist <keys>`** — Comma-separated field seqNo keys to force-mark as edit boundaries.
-- **`--edit-blacklist <keys>`** — Comma-separated field seqNo keys (ranges accepted) to force-exclude from edit boundaries.
+- **`--edit-blacklist <keys>`** — Comma-separated field seqNo keys (ranges accepted) to veto as edit boundaries. A veto is permanent and survives later runs: no detection or solver pass can re-assert a boundary on a vetoed field, and the veto travels with the metadata into any output file. Clear one with `--edit-whitelist` on the same field, or all of them with `--clear-all-flags`.
 
 ### Input/Output
 
@@ -70,7 +70,8 @@ Ignored with `--skip-edits` and `--override-only`.
 
 ### Metadata Management
 
-- **`--clear-all-flags`** — Clears all solver-owned flags (`isEditBoundary`, `cadenceId`, `cadenceIndexPresumed`, `pulldownRole`) before running. Applied before any other processing.
+- **`--clear-all-flags`** — Clears all solver-owned flags (`isEditBoundary`, `cadenceId`, `cadenceIndexPresumed`, `pulldownRole`) **and every manual edit veto** before running. This is the only command that discards a veto. Applied before any other processing.
+- **`--clear-edits`** — Clears edit boundaries only, keeping manual edit vetoes standing. Use this for a fresh detection pass that still honours the edits you have already shut down. Mutually exclusive with `--clear-all-flags`.
 - **`-r, --reverse`** — Swap first and second fields during processing.
 - **`-y, --yes`** — Assume yes for all prompts (used by `--clear-all-flags` confirmation).
 - **`-h, --help`** / **`-v, --version`**
@@ -108,6 +109,9 @@ Written to the SQLite `.tbc.db` at field level:
 
 **Edit detection** (full pipeline and `--detect-edits-only`):
 - `isEditBoundary` — true at phase discontinuities and visual cuts.
+- `isEditVetoed` — true where the user has vetoed a boundary via `--edit-blacklist`.
+
+These two are the tri-state `is_edit_boundary` column, not two columns: NULL means no determination, `1` means a boundary was asserted, `0` means a manual veto. A veto outranks every automatic determination — detection and solver passes reach the boundary flag only through an accessor that refuses to overwrite one — so false positives can be shut down once and stay down.
 
 **Cadence solving** (full pipeline and `--skip-edits`):
 - `cadenceId` — film frame identity within the cadence group; −1 if unsolved.
@@ -115,7 +119,8 @@ Written to the SQLite `.tbc.db` at field level:
 - `pulldownRole` — field's role in the 3:2 pattern (`"definitional"`, `"spare"`, or empty).
 
 **Manual overrides** (`--override-only`, or after detection/solve in other modes):
-- `--edit-whitelist` / `--edit-blacklist` — force or remove `isEditBoundary`.
+- `--edit-whitelist` — forces `isEditBoundary` and lifts any standing veto on that field.
+- `--edit-blacklist` — vetoes the field. Permanent until `--edit-whitelist` or `--clear-all-flags`.
 - `--cadence-override` — writes `cadenceId`, clears `cadenceIndexPresumed`, and refreshes `pulldownRole`.
 
 **Global**:

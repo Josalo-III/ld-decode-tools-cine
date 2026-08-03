@@ -681,8 +681,8 @@ void CineMap::detectCavCadenceBreaks(std::vector<Cav5Group>& groups,
 
         if (tFirst < 1 || tFirst > totalFields) return;
         auto fld = m_md->getField(tFirst);
-        if (!fld.cinemap.isEditBoundary) {
-            fld.cinemap.isEditBoundary = true;
+        if (!fld.cinemap.isEditBoundary && !fld.cinemap.isEditVetoed) {
+            fld.cinemap.assertEditBoundary();
             m_md->updateField(fld, tFirst);
             qInfo() << "CAV: inserted cadence break at field" << tFirst
                     << "(frame" << frameIdx << ")";
@@ -3702,8 +3702,8 @@ void CineMap::solveSegmentCine(SourceVideo& sv,
 
         if (tFirst < 1 || tFirst > m_md->getNumberOfFields()) return;
         auto fld = m_md->getField(tFirst);
-        if (!fld.cinemap.isEditBoundary) {
-            fld.cinemap.isEditBoundary = true;
+        if (!fld.cinemap.isEditBoundary && !fld.cinemap.isEditVetoed) {
+            fld.cinemap.assertEditBoundary();
             m_md->updateField(fld, tFirst);
         }
     };

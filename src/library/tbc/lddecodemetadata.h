@@ -179,25 +179,47 @@ public:
     // Stored in the cinemap side table; invisible to upstream consumers.
     //
     // inUse = false means cinemap has not run or did not touch this field.
-    // When inUse = true, isEditBoundary is meaningful: true means a boundary
-    // was asserted (auto-detection or manual whitelist); false means the field
-    // was explicitly vetoed via the blacklist. The NULL / 1 / 0 distinction in
-    // the database is preserved by write discipline: writeFieldCinemapAuto
-    // never writes 0; writeFieldCinemapManual is the only path that does.
+    //
+    // The database column is_edit_boundary is a tri-state, and both halves of
+    // it are carried here as separate facts so that a load is lossless:
+    //   NULL -> isEditBoundary = false, isEditVetoed = false  (no determination)
+    //   1    -> isEditBoundary = true,  isEditVetoed = false  (boundary asserted)
+    //   0    -> isEditBoundary = false, isEditVetoed = true   (manual user veto)
+    //
+    // A veto is a user fact, not a solver estimate, and it outranks every
+    // automatic determination. Detectors reach the boundary flag only through
+    // assertEditBoundary(), which cannot overwrite a veto; direct assignment of
+    // isEditBoundary = true does not appear anywhere in the tree.
     //
     // cadenceId = -1 and pulldownRole = QString() are the "not set" sentinels.
     struct Cinemap {
         bool inUse = false;
-        bool isManualOverride = false;
         bool isEditBoundary = false;
+        bool isEditVetoed = false;
         qint32 cadenceId = -1;
         bool cadenceIndexPresumed = false;
         QString pulldownRole;
 
+        // The only way a detector may assert a boundary. A vetoed field is left
+        // alone, so no detection pass can resurrect an edit the user shut down.
+        void assertEditBoundary() { if (!isEditVetoed) isEditBoundary = true; }
+
+        // Manual edit overrides. Reached only from the ld-cinemap
+        // blacklist/whitelist paths, never from detection.
+        void vetoEditBoundary()  { isEditVetoed = true;  isEditBoundary = false; }
+        void forceEditBoundary() { isEditVetoed = false; isEditBoundary = true; }
+
+        // Clears the boundary but leaves any veto standing (--clear-edits).
+        void clearEditBoundary() { isEditBoundary = false; }
+
+        // Clears both facts, returning the field to "no determination"
+        // (--clear-all-flags).
+        void clearEditState() { isEditBoundary = false; isEditVetoed = false; }
+
         // write() is split into two named paths matching the SqliteWriter API.
-        // writeAuto is called from Field::write via the inUse gate.
-        // writeManual is called directly from the whitelist/blacklist paths in
-        // ld-cinemap and must not be called from anywhere else.
+        // Field::write routes vetoed fields to writeManual, the only path
+        // permitted to write the literal 0; every other field goes to
+        // writeAuto, which writes 1 or NULL and never 0.
         void writeAuto(SqliteWriter &writer, int captureId, int fieldId) const;
         void writeManual(SqliteWriter &writer, int captureId, int fieldId) const;
     };

@@ -308,7 +308,11 @@ int main(int argc, char* argv[])
 
     QCommandLineOption clearAllFlagsOpt(
         QStringList() << "clear-all-flags",
-        "Clear all edit/cadence related flags in metadata before doing anything.");
+        "Clear all edit/cadence related flags in metadata before doing anything, including manual edit vetoes set by --edit-blacklist.");
+
+    QCommandLineOption clearEditsOpt(
+        QStringList() << "clear-edits",
+        "Clear all edit boundaries before doing anything, but keep manual edit vetoes set by --edit-blacklist.");
 
     QCommandLineOption yesOpt(
         QStringList() << "y" << "yes",
@@ -389,6 +393,7 @@ int main(int argc, char* argv[])
     parser.addOption(skipEditsOpt);
     parser.addOption(overrideOnlyOpt);
     parser.addOption(clearAllFlagsOpt);
+    parser.addOption(clearEditsOpt);
     parser.addOption(yesOpt);
     parser.addOption(cinemapTraceOpt);
     parser.addOption(editTraceOpt);
@@ -529,15 +534,21 @@ int main(int argc, char* argv[])
     }
 
     // -------------------------------------------------------------------------
-    // --clear-all-flags
+    // --clear-all-flags / --clear-edits
     // -------------------------------------------------------------------------
+    if (parser.isSet(clearAllFlagsOpt) && parser.isSet(clearEditsOpt)) {
+        qCritical("Error: --clear-all-flags and --clear-edits are mutually exclusive.");
+        return 1;
+    }
+
     if (parser.isSet(clearAllFlagsOpt)) {
         const bool modeFollows = parser.isSet(detectEditsOnlyOpt)
                               || parser.isSet(skipEditsOpt)
                               || parser.isSet(overrideOnlyOpt);
         const bool runPipeline = modeFollows
             || confirmPrompt(
-                   QString("Clearing all flags (edit boundaries/cadenceId). Continue?"),
+                   QString("Clearing all flags (edit boundaries/cadenceId) "
+                           "AND all manual edit vetoes. Continue?"),
                    autoConfirm);
 
         if (!runPipeline) {
@@ -546,6 +557,10 @@ int main(int argc, char* argv[])
         }
 
         segmenter::clearAllFlags(*disc);
+    }
+
+    if (parser.isSet(clearEditsOpt)) {
+        segmenter::clearEditBoundaries(*disc);
     }
 
     // -------------------------------------------------------------------------

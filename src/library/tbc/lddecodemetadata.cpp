@@ -252,14 +252,17 @@ void LdDecodeMetaData::Field::write(SqliteWriter &writer, int captureId) const
     dropOuts.write(writer, captureId, fieldId);
 
     if (cinemap.inUse) {
-        if (cinemap.isManualOverride)
+        // A vetoed field is the only thing that may write the literal 0, and it
+        // must do so on every write, into a fresh destination as readily as an
+        // in-place update. Everything else transcribes 1 or NULL.
+        if (cinemap.isEditVetoed)
             cinemap.writeManual(writer, captureId, fieldId);
         else
             cinemap.writeAuto(writer, captureId, fieldId);
     }
 }
-// Delegates to writeFieldCinemapAuto. Called from Field::write via the inUse gate.
-// Never writes is_edit_boundary = 0; preserves any existing manual veto.
+// Delegates to writeFieldCinemapAuto. Called from Field::write for any field
+// that is not vetoed. Writes 1 or NULL; never writes is_edit_boundary = 0.
 void LdDecodeMetaData::Cinemap::writeAuto(SqliteWriter &writer, int captureId, int fieldId) const
 {
     writer.writeFieldCinemapAuto(captureId, fieldId,
@@ -269,9 +272,9 @@ void LdDecodeMetaData::Cinemap::writeAuto(SqliteWriter &writer, int captureId, i
                                  pulldownRole);
 }
 
-// Delegates to writeFieldCinemapManual. Call only from the whitelist/blacklist
-// application paths in ld-cinemap. This is the only path that may write
-// is_edit_boundary = 0 (manual user veto).
+// Delegates to writeFieldCinemapManual. Selected by Field::write for vetoed
+// fields only. This is the only path that may write is_edit_boundary = 0
+// (manual user veto).
 void LdDecodeMetaData::Cinemap::writeManual(SqliteWriter &writer, int captureId, int fieldId) const
 {
     writer.writeFieldCinemapManual(captureId, fieldId,
@@ -571,12 +574,13 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
     }
 
     // A row present in the cinemap table means inUse = true.
-    // isEditBoundary reflects the column value directly: 1 = boundary asserted,
-    // 0 = manual veto. NULL in the database means the auto-pass ran but made
-    // no determination; SqliteValue::toBoolOrDefault returns false for NULL,
-    // which is the correct in-memory default.
+    // is_edit_boundary is a tri-state and both halves are carried into memory:
+    // 1 = boundary asserted, 0 = manual user veto, NULL = a pass ran but made no
+    // determination. toBoolOrDefault cannot be used here because it collapses
+    // NULL and 0 to the same false, which is what silently discarded the veto.
     struct CinemapRow {
         bool isEditBoundary;
+        bool isEditVetoed;
         int cadenceId;
         bool cadenceIndexPresumed;
         QString pulldownRole;
@@ -586,7 +590,9 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
     while (cinemapQuery.next()) {
         int fieldId = cinemapQuery.value("field_id").toInt();
         CinemapRow row;
-        row.isEditBoundary       = SqliteValue::toBoolOrDefault(cinemapQuery, "is_edit_boundary", false);
+        const QVariant editBoundaryValue = cinemapQuery.value("is_edit_boundary");
+        row.isEditBoundary       = !editBoundaryValue.isNull() && editBoundaryValue.toInt() == 1;
+        row.isEditVetoed         = !editBoundaryValue.isNull() && editBoundaryValue.toInt() == 0;
         row.cadenceId            = SqliteValue::toIntOrDefault(cinemapQuery,  "cadence_id", -1);
         row.cadenceIndexPresumed = SqliteValue::toBoolOrDefault(cinemapQuery, "cadence_index_presumed", false);
         const QVariant pr = cinemapQuery.value("pulldown_role");
@@ -662,6 +668,7 @@ void LdDecodeMetaData::readFields(SqliteReader &reader, int captureId)
         if (cinemapMap.contains(fieldId)) {
             const CinemapRow &row = cinemapMap[fieldId];
             field.cinemap.isEditBoundary       = row.isEditBoundary;
+            field.cinemap.isEditVetoed         = row.isEditVetoed;
             field.cinemap.cadenceId            = row.cadenceId;
             field.cinemap.cadenceIndexPresumed = row.cadenceIndexPresumed;
             field.cinemap.pulldownRole         = row.pulldownRole;

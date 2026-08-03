@@ -895,9 +895,16 @@ bool SqliteWriter::rollbackTransaction()
 
 // Auto-detection writer.
 //
-// Invariant: the value 0 in cinemap.is_edit_boundary is a manual user veto
-// and must never be overwritten by automated detection. This function refuses
-// to write 1 over an existing 0, and never emits 0 itself.
+// Invariant: the value 0 in cinemap.is_edit_boundary is a manual user veto, and
+// this path never emits it. Only writeFieldCinemapManual does, and Field::write
+// routes every vetoed field there, so a field reaching this function is by
+// construction not vetoed. The in-memory state is therefore transcribed
+// directly: 1 for an asserted boundary, NULL for no determination.
+//
+// This function deliberately does not consult the destination row. It used to,
+// as the sole means of carrying a veto across a write — which worked only when
+// the destination was also the source, so writing to a new output file silently
+// downgraded every veto to NULL. The veto now survives as a loaded fact instead.
 //
 // The other cinemap columns (cadence_id, cadence_index_presumed, pulldown_role)
 // are solver-owned and have no manual-override semantics, so they are updated
@@ -908,25 +915,7 @@ bool SqliteWriter::writeFieldCinemapAuto(int captureId, int fieldId,
                                          bool cadenceIndexPresumed,
                                          const QString &pulldownRole)
 {
-    // Read any existing is_edit_boundary value so we can preserve a manual veto.
-    QSqlQuery readQuery(db);
-    readQuery.prepare("SELECT is_edit_boundary FROM cinemap "
-                      "WHERE capture_id = ? AND field_id = ?");
-    readQuery.addBindValue(captureId);
-    readQuery.addBindValue(fieldId);
-
-    QVariant iebToWrite;  // NULL by default — "no information"
-    if (readQuery.exec() && readQuery.next()) {
-        const QVariant existing = readQuery.value("is_edit_boundary");
-        if (!existing.isNull() && existing.toInt() == 0) {
-            iebToWrite = 0;                   // preserve manual veto
-        } else if (isEditBoundary) {
-            iebToWrite = 1;
-        }
-        // else: not a boundary and no existing veto — leave NULL
-    } else if (isEditBoundary) {
-        iebToWrite = 1;
-    }
+    const QVariant iebToWrite = isEditBoundary ? QVariant(1) : QVariant();
 
     QSqlQuery query(db);
     query.prepare("INSERT OR REPLACE INTO cinemap "
