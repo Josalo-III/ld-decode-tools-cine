@@ -102,11 +102,77 @@ void testPassthroughPreservesIdentityButForbidsFrameComb()
           "passthrough cadence identity must not grant progressive FVF permission");
 }
 
+void testCutTruncatedACompSpareUsesFrameRegime()
+{
+    LdDecodeMetaData::VideoParameters videoParameters;
+    CadenceAssembler::Configuration configuration;
+    CadenceAssembler assembler(videoParameters, configuration);
+
+    // The edit discarded A-def (slot 0).  The scene begins with the valid
+    // A-comp/A-spare pair (slots 1,2), which straddles a capture-frame edge.
+    SourceField comp = makeField(1);
+    SourceField spare = makeField(2);
+    comp.field.seqNo = 101;
+    spare.field.seqNo = 102;
+    comp.capturePartnerSeqNo = 100;
+    spare.capturePartnerSeqNo = 103;
+    comp.field.cinemap.isEditBoundary = true;
+    comp.field.cinemap.cadenceIndexPresumed = true;
+
+    assembler.push(QVector<SourceField>({comp, spare}));
+    assembler.flush();
+    const QVector<CadenceAssembler::WorkItem> work = assembler.popWork();
+
+    check(work.size() == 1, "cut-truncated A should emit one frame work item");
+    check(work[0].kind == CadenceAssembler::WorkItem::Kind::TelecineFrame,
+          "cut-truncated A must use the frame regime, not passthrough");
+    check(work[0].filmLabel == 'A', "cut-truncated pair should retain A identity");
+    const int a0 = work[0].f1.field.cinemap.cadenceId;
+    const int a1 = work[0].f2.field.cinemap.cadenceId;
+    check((a0 == 1 && a1 == 2) || (a0 == 2 && a1 == 1),
+          "cut head should retain A-comp and A-spare identities");
+}
+
+void testCutTruncatedCSpareCompUsesFrameRegime()
+{
+    LdDecodeMetaData::VideoParameters videoParameters;
+    CadenceAssembler::Configuration configuration;
+    CadenceAssembler assembler(videoParameters, configuration);
+
+    // The cut removes C-def (slot 7), leaving C-spare/C-comp (5,6) at
+    // the tail of the outgoing scene.  They still form a complete C frame.
+    SourceField spare = makeField(5);
+    SourceField comp = makeField(6);
+    SourceField nextScene = makeField(-1);
+    spare.field.seqNo = 201;
+    comp.field.seqNo = 202;
+    nextScene.field.seqNo = 203;
+    spare.capturePartnerSeqNo = 200;
+    comp.capturePartnerSeqNo = 203;
+    nextScene.capturePartnerSeqNo = 204;
+    nextScene.field.cinemap.isEditBoundary = true;
+
+    assembler.push(QVector<SourceField>({spare, comp, nextScene}));
+    assembler.flush();
+    const QVector<CadenceAssembler::WorkItem> work = assembler.popWork();
+
+    check(!work.isEmpty(), "cut-truncated C should emit a frame work item");
+    check(work[0].kind == CadenceAssembler::WorkItem::Kind::TelecineFrame,
+          "cut-truncated C must use the frame regime, not passthrough");
+    check(work[0].filmLabel == 'C', "cut-truncated pair should retain C identity");
+    const int c0 = work[0].f1.field.cinemap.cadenceId;
+    const int c1 = work[0].f2.field.cinemap.cadenceId;
+    check((c0 == 5 && c1 == 6) || (c0 == 6 && c1 == 5),
+          "cut tail should retain C-spare and C-comp identities");
+}
+
 } // namespace
 
 int main()
 {
     testLockedCycleKeepsMixedFramePartnersAvailable();
     testPassthroughPreservesIdentityButForbidsFrameComb();
+    testCutTruncatedACompSpareUsesFrameRegime();
+    testCutTruncatedCSpareCompUsesFrameRegime();
     return 0;
 }

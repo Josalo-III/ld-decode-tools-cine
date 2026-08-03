@@ -236,6 +236,7 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
 
     // 6. Post-processing
     detectAndEncodeInvertedCadenceRuns();
+    const int cutTruncatedAHeads = recoverCutTruncatedAHeads();
     assignPulldownRoles();
 
     // ld-cinemap does not write back to DiscMap frame flags; that is DiscMap's domain.
@@ -243,7 +244,8 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold)
     // 7. Reconcile doplGang with final cadence geometry
     reconcileDoplGangWithCadence();
 
-    qInfo() << "Solver locked" << totalFieldsLocked << "fields.";
+    qInfo() << "Solver locked" << totalFieldsLocked << "fields; recovered"
+            << cutTruncatedAHeads << "cut-truncated A heads.";
     return totalFieldsLocked;
 }
 
@@ -4467,6 +4469,43 @@ int CineMap::enforceSteadyCadenceAcrossBoundaries(int maxSpanFields)
         m_disc->refreshFrameCache();
 
     return fixed;
+}
+
+int CineMap::recoverCutTruncatedAHeads()
+{
+    if (!m_md) return 0;
+
+    // A 3:2 edit can occur after A-def (slot 0).  The first two fields of
+    // the new scene are then A-comp (1) and A-spare (2): a complete A frame
+    // with its preferred twin absent.  Frame-granular phase painting can
+    // identify the spare while leaving the preceding comp unknown, because
+    // the pair straddles the physical capture-frame boundary.  Do not bridge
+    // any cadence across the cut; merely recover the one local complement
+    // implied by the verified A-spare on its right.
+    const int total = m_md->getNumberOfFields();
+    int repaired = 0;
+    for (int seq = 1; seq < total; ++seq) {
+        auto comp = m_md->getField(seq);
+        if (!comp.cinemap.isEditBoundary || cadenceKnown(comp.cinemap.cadenceId)) {
+            continue;
+        }
+
+        auto spare = m_md->getField(seq + 1);
+        if (spare.pad || !cadenceKnown(spare.cinemap.cadenceId) ||
+            cadenceIndex(spare.cinemap.cadenceId) != 2 ||
+            comp.isFirstField == spare.isFirstField) {
+            continue;
+        }
+
+        // `filmFrameComplement(2)` is A-comp (1), retaining the inverted
+        // dominance domain when the solved A-spare has it.
+        comp.cinemap.cadenceId = filmFrameComplement(spare.cinemap.cadenceId);
+        comp.cinemap.cadenceIndexPresumed = true;
+        m_cadenceConfidence[seq] = std::min(m_cadenceConfidence[seq + 1], 0.5);
+        m_md->updateField(comp, seq);
+        ++repaired;
+    }
+    return repaired;
 }
 
 int CineMap::frameIndexForField(int seq) const

@@ -1194,6 +1194,44 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
 
     const int role0 = roleOf(cid0);
 
+    // A cut can discard A-def while preserving the immediately following
+    // A-comp/A-spare pair.  CineMap records the comp as a provisional slot 1
+    // (rather than manufacturing the missing definition) and the spare is a
+    // solved slot 2.  Together they are a real complete A frame and must use
+    // the frame regime.  The spare has no B ownership; B1 remains available
+    // in its own capture pair for normal B reconstruction.
+    if (idx0 == 1 && head.field.cinemap.isEditBoundary) {
+        const int i1 = nextUnconsumedIndex(i0 + 1);
+        if (i1 >= 0) {
+            const SourceField &spareRef = history[i1].field;
+            const int spareCid = spareRef.field.cinemap.cadenceId;
+            if (cadenceKnown(spareCid) && cadenceIndex(spareCid) == 2 &&
+                cadenceFilmLetter(spareCid) == 'A' &&
+                !boundaryBetweenFields(head, spareRef)) {
+                markHistoryConsumed(i0);
+                markHistoryConsumed(i1);
+
+                SourceField comp = std::move(history[i0].field);
+                SourceField spare = std::move(history[i1].field);
+                const bool swapped = orderPairForComb(comp, spare);
+
+                WorkItem wi;
+                wi.kind = config.export24p ? WorkItem::Kind::FilmFrame
+                                            : WorkItem::Kind::TelecineFrame;
+                wi.expansion = WorkItem::Expansion::None;
+                wi.fieldsSwapped = swapped;
+                wi.invertedFieldOrder = false;
+                wi.filmLabel = 'A';
+                wi.f1 = std::move(comp);
+                wi.f2 = std::move(spare);
+                syncStamp(wi.f1);
+                syncStamp(wi.f2);
+                workQueue.push_back(std::move(wi));
+                return true;
+            }
+        }
+    }
+
     // --- HANDLE SPARES AT HEAD ---------------------------------
     if (role0 == 2) {
         // CASE 1: C-Spare (Index 5) - LEADING Spare
@@ -1210,6 +1248,40 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
                 return true;
             }
             int i2 = (i1 >= 0) ? nextUnconsumedIndex(i1 + 1) : -1;
+
+            // Mirror of the cut-truncated A head: C's spare is leading.
+            // When the cut falls between C-comp and C-def, C-spare plus
+            // C-comp remain a real complete C frame.  Retain the frame
+            // regime without manufacturing the missing C-def or carrying
+            // the cadence into the next scene.
+            const bool cutAfterCComp =
+                i1 >= 0 && i2 >= 0 &&
+                cadenceIndex(history[i1].field.field.cinemap.cadenceId) == 6 &&
+                cadenceFilmLetter(history[i1].field.field.cinemap.cadenceId) == 'C' &&
+                boundaryBetweenFields(history[i1].field, history[i2].field);
+            if (cutAfterCComp) {
+                markHistoryConsumed(i0);
+                markHistoryConsumed(i1);
+
+                SourceField spare = std::move(history[i0].field);
+                SourceField comp  = std::move(history[i1].field);
+                const bool swapped = orderPairForComb(spare, comp);
+
+                WorkItem wi;
+                wi.kind = config.export24p ? WorkItem::Kind::FilmFrame
+                                            : WorkItem::Kind::TelecineFrame;
+                wi.expansion = WorkItem::Expansion::None;
+                wi.fieldsSwapped = swapped;
+                wi.invertedFieldOrder = false;
+                wi.filmLabel = 'C';
+                wi.f1 = std::move(spare);
+                wi.f2 = std::move(comp);
+                syncStamp(wi.f1);
+                syncStamp(wi.f2);
+                workQueue.push_back(std::move(wi));
+                return true;
+            }
+
             bool hasCBody =
                 (i1 >= 0 && i2 >= 0 &&
                  cadenceIndex(history[i1].field.field.cinemap.cadenceId) == 6 &&

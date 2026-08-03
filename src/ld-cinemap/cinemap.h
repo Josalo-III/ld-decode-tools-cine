@@ -500,6 +500,10 @@ private:
     void detectCavCadenceBreaks(std::vector<Cav5Group>& groups, SourceVideo& sv);
     void solveCavFallback(SourceVideo& sv);
     int  enforceSteadyCadenceAcrossBoundaries(int maxSpanFields);
+    // A cut may remove A-def while leaving the immediately following
+    // A-comp/A-spare pair intact.  Preserve that partial-but-real A identity;
+    // it is not a licence to project cadence through the edit.
+    int  recoverCutTruncatedAHeads();
     // Attempts to commit a reciprocal doplGang link between fields a and b.
     // cacheOrNull: if provided, enforces strict A/C geometry before committing.
     bool tryCommitReciprocalGang(SourceVideo& sv,
