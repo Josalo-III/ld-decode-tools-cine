@@ -4964,9 +4964,9 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
         // regional audit above keep running: covered frames remain the
         // audit source that grades the uncovered frames' firings.
         // True coverage test, not the anchored-plane proxy: the plane now
-        // publishes on uncovered frames too (anticipated rung), and the
-        // retirement premise -- false colour excluded at construction --
-        // holds only where construction consumed FACTS.
+        // publishes on uncovered frames too after two-sided refinement, and
+        // the retirement premise -- false colour excluded at construction --
+        // holds only where construction consumed same-frame FACTS.
         const bool ccRetired =
             chromaFactsOn && frameHasExactCoverage();
 
@@ -6301,33 +6301,6 @@ bool Comb::FrameBuffer::certifiedDefLine(int line) const
         for (int h = left; h < right; ++h)
             if (std::isfinite(ex[h])) { c = 1; break; }
     }
-    return c != 0;
-}
-
-// Anticipated lattice: on an uncovered frame holding the chain, the lines
-// where the reference plane carries DIRECT tween luma (the chain source's
-// def parity). These are the strong lines of the B/D direct/bracket pair,
-// and the lattice-keyed cede keys on them. Under --dg-discard no chain
-// ever forms, so this is structurally false and every consumer reverts to
-// pre-campaign behaviour.
-bool Comb::FrameBuffer::anticipatedDefLine(int line) const
-{
-    if (certifiedOneDLevel() == 0) return false;
-    if (antRefAge < 1) return false;         // covered frames age 0; no chain -1
-    if (line < 0 || line >= frameHeight) return false;
-    if (antRefLuma_flat.size() !=
-        static_cast<size_t>(frameHeight) * demodWidth) return false;
-    if ((int)anticipatedLineCache.size() != frameHeight)
-        anticipatedLineCache.assign(frameHeight, -1);
-    qint8 &c = anticipatedLineCache[line];
-    if (c >= 0) return c != 0;
-    c = 0;
-    const float *row = antRefLuma_flat.data()
-        + static_cast<size_t>(line) * demodWidth;
-    const int width = videoParameters.activeVideoEnd -
-                      videoParameters.activeVideoStart;
-    for (int xi = 0; xi < width; ++xi)
-        if (std::isfinite(row[xi])) { c = 1; break; }
     return c != 0;
 }
 
@@ -10473,11 +10446,12 @@ void Comb::FrameBuffer::probeEdgeFate(int dimensions)
 
     std::vector<std::uint8_t> mask(width);
     for (int line = firstLine; line < lastLine; ++line) {
-        // Referee repair (2026-08-02): clpbuffer[0] is not "pure 1D" on
-        // certified or anticipated def lines (head / echo), so |2D-1D| and
-        // the pass-through counters would mix estimate/exact/anticipated
-        // baselines with no discriminator. Skip those lines.
-        if (certifiedDefLine(line) || anticipatedDefLine(line)) continue;
+        // clpbuffer[0] is not the untouched 1D baseline on certified or
+        // fact-corrected frames, so this particular diagnostic has no
+        // comparable reference there.
+        if (certifiedDefLine(line) ||
+            factCorrectedCarrierEstimate_line(line))
+            continue;
         const double *c0 = clpbuffer[0].pixel[line];
         const double *c1 = clpbuffer[1].pixel[line];
         const double *c2 = dims3 ? clpbuffer[2].pixel[line] : nullptr;
@@ -11160,25 +11134,31 @@ void Comb::FrameBuffer::buildTemporalCertReference(
 // local; only PHASE transfers, the coordinate that survives content
 // change best. Escapes: inert under LDCD_PHASE_SNAP=0 or
 // LDCD_PHASE_SNAP_T=0.
-void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
+bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                                                 const FrameBuffer *nextF)
 {
-    if (!carrierRetractedValid) return;
-    if (ldcdRetractedSourceMode() != 3) return;
-    if (!ldcdPhaseSnapOn() || !ldcdPhaseSnapTemporalOn()) return;
-    if (frameHasExactCoverage()) return;
+    if (!carrierRetractedValid) return false;
+    if (ldcdRetractedSourceMode() != 3) return false;
+    if (!ldcdPhaseSnapOn() || !ldcdPhaseSnapTemporalOn()) return false;
+    if (frameHasExactCoverage()) return false;
     const FrameBuffer *nb[2] = {
         (prevF && prevF->frameHasExactCoverage()) ? prevF : nullptr,
         (nextF && nextF->frameHasExactCoverage()) ? nextF : nullptr,
     };
-    if (!nb[0] && !nb[1]) return;
+    // Publication is all-or-nothing: an uncovered estimate may acquire
+    // fact-corrected authority only after two independent covered witnesses
+    // have participated.  At stream/batch edges the provisional retracted
+    // candidate remains available to the Y election, but the named estimate
+    // accessor stays null and no comb construction can mistake a one-sided
+    // hold for completed temporal refinement.
+    if (!nb[0] || !nb[1]) return false;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
-    if (width <= 0) return;
+    if (width <= 0) return false;
 
     // Temporal fade is stricter than vertical: the reference is a film
     // frame away, so demand more of its amplitude before trusting its
@@ -11522,11 +11502,54 @@ void Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                 bn[b], tcwN[b], tcwRes[b] / tcwN[b], tcwWc[b] / tcwN[b]);
         }
     }
+    publishAnchoredCarrierFromRetracted(
+        AnchoredCarrierProvenance::FactCorrectedEstimate);
+    return factCorrectedCarrierEstimate_line(firstLine) != nullptr;
 }
 
 void Comb::FrameBuffer::buildCarrierRetracted(const FrameBuffer *prevF)
 {
     buildCarrierRetractionStage(false, prevF);
+}
+
+
+// Publish a derived full-parity carrier only at the point where its stated
+// provenance is actually true. Covered frames arrive here from the load-time
+// same-frame construction. Uncovered frames arrive only after the two-sided
+// current-time refinement has completed; the causal placeholder is never
+// exposed through the fact-corrected accessor.
+void Comb::FrameBuffer::publishAnchoredCarrierFromRetracted(
+    AnchoredCarrierProvenance provenance)
+{
+    static const bool anchor1D = []{
+        const char *e = std::getenv("LDCD_ANCHOR_1D");
+        return !(e && std::atoi(e) == 0);
+    }();
+    if (!anchor1D || !carrierRetractedValid ||
+        ldcdRetractedSourceMode() != 3 ||
+        provenance == AnchoredCarrierProvenance::None)
+        return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int width     = videoParameters.activeVideoEnd - left;
+    if (width <= 0 || firstLine >= lastLine) return;
+
+    anchored1DSource_flat.assign(
+        static_cast<size_t>(demodLines) * demodWidth, 0.0);
+    for (int line = firstLine; line < lastLine; ++line) {
+        const quint16 *rawLine = rawbuffer.data()
+            + static_cast<size_t>(line) * videoParameters.fieldWidth;
+        const float *retr = carrierRetracted_flat.data()
+            + static_cast<size_t>(line) * demodWidth;
+        double *dst = anchored1DSource_flat.data()
+            + static_cast<size_t>(line) * demodWidth;
+        for (int xi = 0; xi < width; ++xi)
+            dst[xi] = static_cast<double>(rawLine[left + xi]) -
+                      static_cast<double>(retr[xi]);
+    }
+    anchoredCarrierProvenance = provenance;
 }
 
 // Sync-tone actuator. See comb.h. Runs between fit construction and its
@@ -14760,126 +14783,16 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
 
     carrierRetractedValid = true;
 
-    // Publish the anchored 1D-out plane (mode 3 only; uniform per frame --
-    // validity is a frame property, never per line).  Originally covered
-    // frames only; extended to uncovered frames 2026-08-01 with the tone
-    // promotion: the uncovered ladder's fit now carries the ANTICIPATED
-    // certified phase (applyToneToFit, causal from the previous cover), so
-    // the comb stages consume the anticipation-corrected carrier on every
-    // frame rather than falling back to the unanchored locked 1D on the
-    // uncovered ones.  A/B escape LDCD_ANCHOR_1D=0.
-    static const bool anchor1D = []{
-        const char *e = std::getenv("LDCD_ANCHOR_1D");
-        return !(e && std::atoi(e) == 0);
-    }();
+    // Load time may publish the covered construction because its same-frame
+    // provenance is complete.  The uncovered construction is still causal
+    // here, so keep it private in carrierRetracted_flat; current-time
+    // refineRetractedTemporal() will publish it only after both covered
+    // neighbours have participated.
     anchoredCarrierProvenance = AnchoredCarrierProvenance::None;
-    // Gate: covered frames (original contract) or uncovered frames HOLDING
-    // THE CHAIN (the anticipation justifies the anchoring). Under
-    // --dg-discard neither exists and the plane never publishes -- the
-    // comb's 1D source stays the locked 1D, pre-campaign behaviour.
-    const bool publishFactBackedCarrier = frameHasExactCoverage();
-    const bool publishFactCorrectedEstimate =
-        !publishFactBackedCarrier && antRefAge >= 1;
-    if (anchor1D && !analysisOnly && retractedSource == 3 &&
-        (publishFactBackedCarrier || publishFactCorrectedEstimate)) {
-        anchored1DSource_flat.assign(
-            static_cast<size_t>(demodLines) * demodWidth, 0.0);
-        for (int line = firstLine; line < lastLine; ++line) {
-            const quint16 *rawLine = rawbuffer.data()
-                + static_cast<size_t>(line) * videoParameters.fieldWidth;
-            const float *retr = carrierRetracted_flat.data()
-                + static_cast<size_t>(line) * demodWidth;
-            double *dst = anchored1DSource_flat.data()
-                + static_cast<size_t>(line) * demodWidth;
-            for (int xi = 0; xi < width; ++xi)
-                dst[xi] = static_cast<double>(rawLine[left + xi]) -
-                          static_cast<double>(retr[xi]);
-        }
-        anchoredCarrierProvenance = publishFactBackedCarrier
-            ? AnchoredCarrierProvenance::FactBacked
-            : AnchoredCarrierProvenance::FactCorrectedEstimate;
-    }
-
-    // ---------------------------------------------------------------
-    // Anticipated head-echo (lattice-keyed cede on B and D, user-approved
-    // 2026-08-01). On anticipated lines the comb candidates must all see
-    // ONE story -- the anticipated center -- exactly as covered def lines
-    // see the certified story via the stage-1 head. But the anticipated
-    // value is an ESTIMATE, so it may NOT enter locked1DSource (the 1D
-    // safe retreat: produceY's 1D candidate and the CCR source stay on
-    // the untouched locked 1D). Instead the anticipated scalar is echoed
-    // into the products the comb path consumes: the published 1D chroma
-    // plane (clpbuffer[0], the tap system's base -- so bracket lines'
-    // legs comb against the anticipated values) and the stage-1 working
-    // IQ products (the Frame candidates' IQ prep). Same demod recipe as
-    // stage 1, per line from the grammar. The cede sites then extend
-    // their line predicate with anticipatedDefLine and read the scalar
-    // from the published plane.
-    // ---------------------------------------------------------------
-    if (factCorrectedCarrierEstimate_line(firstLine)) {
-        for (int line = firstLine; line < lastLine; ++line) {
-            if (!anticipatedDefLine(line)) continue;
-            const double *src = factCorrectedCarrierEstimate_line(line);
-            CombCarrierGrammar *grammar = carrierGrammarLine(line);
-            const bool gl = grammar && grammar->grammarLocked;
-            const double bcos = gl ? grammar->burstCos : 1.0;
-            const double bsin = gl ? grammar->burstSin : 0.0;
-            double lutI[4], lutQ[4];
-            if (gl) {
-                for (int i = 0; i < 4; ++i) {
-                    lutI[i] = static_cast<double>(grammar->demodLUTTi[i]);
-                    lutQ[i] = static_cast<double>(grammar->demodLUTTq[i]);
-                }
-            } else {
-                fusedDemodLUT(bcos, bsin, spLUT_locked, cpLUT_locked,
-                              lutI, lutQ);
-            }
-            double i4Scale[4], q4Scale[4], magScale[4];
-            for (int ph = 0; ph < 4; ++ph) {
-                lockedTo4fsc(lutI[ph], lutQ[ph], bcos, bsin,
-                             i4Scale[ph], q4Scale[ph]);
-                magScale[ph] = boundedMag(i4Scale[ph], q4Scale[ph]);
-            }
-            (void)magScale;
-
-            float *demodI  = demodTI_line(line);
-            float *demodQ  = demodTQ_line(line);
-            float *demodI4 = demodTI4fsc_line(line);
-            float *demodQ4 = demodTQ4fsc_line(line);
-            float *lockedI4 = locked1DTI4fsc_line(line);
-            float *lockedQ4 = locked1DTQ4fsc_line(line);
-            float *magnitude = demodIQMag4fsc_flat.data()
-                + static_cast<size_t>(line) * demodWidth;
-            double *published = clpbuffer[0].pixel[line];
-
-            std::vector<double> nI4(width), nQ4(width);
-            for (int rel = 0; rel < width; ++rel) {
-                const int h = left + rel;
-                const int phase = carrierSampleClass(line, h);
-                const double source = src[rel];
-                nI4[rel] = source * i4Scale[phase];
-                nQ4[rel] = source * q4Scale[phase];
-                if (demodI)  demodI[rel]  = static_cast<float>(
-                    source * lutI[phase]);
-                if (demodQ)  demodQ[rel]  = static_cast<float>(
-                    source * lutQ[phase]);
-                if (demodI4) demodI4[rel] = static_cast<float>(nI4[rel]);
-                if (demodQ4) demodQ4[rel] = static_cast<float>(nQ4[rel]);
-                published[h] = source;
-            }
-            for (int rel = 0; rel < width; ++rel) {
-                const int rm = std::max(0, rel - 1);
-                const int rp = std::min(width - 1, rel + 1);
-                const double i4 = centeredCarrierProduct3(
-                    nI4[rm], nI4[rel], nI4[rp]);
-                const double q4 = centeredCarrierProduct3(
-                    nQ4[rm], nQ4[rel], nQ4[rp]);
-                if (lockedI4) lockedI4[rel] = static_cast<float>(i4);
-                if (lockedQ4) lockedQ4[rel] = static_cast<float>(q4);
-                magnitude[rel] = static_cast<float>(boundedMag(i4, q4));
-            }
-        }
-    }
+    anchored1DSource_flat.clear();
+    if (!analysisOnly && retractedSource == 3 && frameHasExactCoverage())
+        publishAnchoredCarrierFromRetracted(
+            AnchoredCarrierProvenance::FactBacked);
 
     if (dumpDead) {
         auto pct = [](long long a, long long b) {

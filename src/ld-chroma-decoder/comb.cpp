@@ -388,6 +388,26 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->holdsRealFrame() &&
             next->holdsRealFrame();
 
+        // Finish the uncovered estimate before any current-time consumer is
+        // allowed to see it.  load-time construction is deliberately only a
+        // provisional retracted candidate: the fact-corrected carrier plane
+        // is published by refineRetractedTemporal() after BOTH covered
+        // neighbours are available.  Rebuild 2D here so its comb candidates,
+        // and the 3D seed made from them below, consume that completed plane
+        // rather than the earlier causal placeholder.
+        bool publishedTwoSidedEstimate = false;
+        if (configuration.phaseCompensation && configuration.lumaWitness) {
+            const FrameBuffer *pf =
+                previous->holdsRealFrame() ? previous.get() : nullptr;
+            const FrameBuffer *nf =
+                next->holdsRealFrame() ? next.get() : nullptr;
+            publishedTwoSidedEstimate =
+                current->refineRetractedTemporal(pf, nf);
+            if (publishedTwoSidedEstimate &&
+                !configuration.diagnosticOnly())
+                current->split2D();
+        }
+
         if (configuration.dimensions == 3 &&
             !configuration.diagnosticOnly()) {
             current->copy2DTo3D();
@@ -400,16 +420,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         componentFrames[frameIndex].init(videoParameters,
                                          configuration.diagnosticOnly());
         current->setComponentFrame(componentFrames[frameIndex]);
-
-        // Two-sided temporal phase interpolation for UNCOVERED frames'
-        // retracted view: possible only here, once both temporal
-        // neighbours are loaded (the retracted consumers -- produceY and
-        // the diagnostic output -- all run at current-time, so refining
-        // now is safe by construction).
-        if (configuration.phaseCompensation && configuration.lumaWitness)
-            current->refineRetractedTemporal(
-                previous->holdsRealFrame() ? previous.get() : nullptr,
-                next->holdsRealFrame() ? next.get() : nullptr);
 
 
         // Diagnostic fast path: witness/carrier analysis is complete before
@@ -490,9 +500,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 };
                 std::fprintf(stderr,
                     "CADMAP out=%d cidT=%d cidB=%d letT=%c letB=%c "
-                    "editT=%d editB=%d seqT=%d seqB=%d\n",
+                    "editT=%d editB=%d seqT=%d seqB=%d covered=%d\n",
                     frameIndex, cidT, cidB, letter(cidT), letter(cidB),
-                    (int)edT, (int)edB, seqT, seqB);
+                    (int)edT, (int)edB, seqT, seqB,
+                    current->hasExactCoverage() ? 1 : 0);
             }
         }
 
@@ -795,7 +806,6 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         syncIncFirst  = firstField.dgSyncIncrement;
         syncIncSecond = secondField.dgSyncIncrement;
         certifiedLineCache.clear(); // per-line certified verdicts likewise
-        anticipatedLineCache.clear(); // and the anticipated lattice
         auto copyPlane = [&](const QVector<float> &src, int frameParity) {
             if (src.isEmpty()) return;
             qint32 fl = 0;
@@ -3017,19 +3027,12 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameACompute &&
-            certifiedOneDLevel() >= 2 &&
-            (certifiedDefLine(line) || anticipatedDefLine(line))) {
+            certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
             // Certified cede (CONSTRUCTION, upstream of every election):
             // on a def line the Frame A candidate IS the center. The 4fsc
             // IQ pair comes from the stage-1 locked products of the same
             // certified scalar, so attribution consumers see one story.
-            // Anticipated lines (B/D direct lattice) take the same shape:
-            // scalar from the published plane (head-echoed), IQ from the
-            // echoed locked products; locked 1D stays the safe retreat.
-            const double *center = certifiedDefLine(line)
-                ? locked1DSource_line(line)
-                : clpbuffer[0].pixel[line] +
-                  videoParameters.activeVideoStart;
+            const double *center = locked1DSource_line(line);
             const float *cI4 = locked1DTI4fsc_line(line);
             const float *cQ4 = locked1DTQ4fsc_line(line);
             frameAIQ.assign(width, std::complex<double>(0.0, 0.0));
@@ -3250,6 +3253,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         return !(e && std::atoi(e) == 0);
     }();
 
+
     // ---- Acceptance uniformity (user-directed, 2026-07-28) ----
     //
     // The parked failure of the temporal grammar was line-to-line striping,
@@ -3286,8 +3290,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         for (int line = firstLine; line < lastLine; ++line) {
             // Certified cede (construction): no temporal members are even
             // evaluated on def lines; their share stays zero.
-            if (certifiedOneDLevel() >= 3 &&
-                (certifiedDefLine(line) || anticipatedDefLine(line)))
+            if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
                 continue;
             const double *lockedRow = configuration.phaseCompensation
                 ? combSource1D_line(line) : nullptr;
@@ -3392,8 +3395,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 out[x] = 0.25f * (su[x] + 2.0f * s0[x] + sd[x]);
         }
         for (int line = firstLine; line < lastLine; ++line) {
-            if (certifiedOneDLevel() >= 3 &&
-                (certifiedDefLine(line) || anticipatedDefLine(line)))
+            if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
                 continue;   // certified cede: the 2D seed (= center) stands
             const float *sv = shareV.data() + (size_t)line * width;
             const float *tm = tMean.data() + (size_t)line * width;
@@ -3415,8 +3417,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
     for (int line = firstLine; line < lastLine; ++line) {
         // Certified cede (construction): temporal machinery stands down on
         // def lines; the seeded 2D value (= center) stands.
-        if (certifiedOneDLevel() >= 3 &&
-                (certifiedDefLine(line) || anticipatedDefLine(line)))
+        if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
             continue;
 
         for (int h = left; h < right; ++h) {

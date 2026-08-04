@@ -494,15 +494,17 @@ public:
 	// construction or not at all; refineRetractedTemporal is lawful
 	// because it refines a candidate the Y election then adjudicates.
 	// Shared two-sided certified temporal reference (sign-aligned,
-	// direct-or-bracket per side, mean across sides). One implementation:
-	// the retracted refinement and the elected-scalar refinement both call
-	// here.
+	// direct-or-bracket per side). The retracted refinement keeps the two
+	// endpoints separate for its agreement gate and uses their mean only as
+	// the gated interpolation target.
 	void buildTemporalCertReference(const FrameBuffer *prevF,
 	                                const FrameBuffer *nextF, int line,
 	                                std::vector<double> &tAlign,
 	                                std::vector<double> *sidePrev = nullptr,
 	                                std::vector<double> *sideNext = nullptr) const;
-	void refineRetractedTemporal(const FrameBuffer *prevF,
+	// Returns true only when a genuinely two-sided refinement completed and
+	// the uncovered frame's fact-corrected estimate was published from it.
+	bool refineRetractedTemporal(const FrameBuffer *prevF,
 	                             const FrameBuffer *nextF);
 	void outputDiagnosticFrame();
 
@@ -582,13 +584,6 @@ public:
 	static int certifiedOneDLevel();      // env-resolved once
 	bool certifiedDefLine(int line) const; // any finite exact sample in active
 	mutable std::vector<qint8> certifiedLineCache; // -1 unknown / 0 / 1
-	// Anticipated lattice (uncovered frames only): true where the chained
-	// reference plane carries DIRECT tween luma for this line (the chain
-	// source's def parity). Drives the lattice-keyed cede on B and D.
-	// Structurally inert under --dg-discard: no merge -> no covers -> no
-	// chain -> always false.
-	bool anticipatedDefLine(int line) const;
-	mutable std::vector<qint8> anticipatedLineCache; // -1 unknown / 0 / 1
 	void buildStarEvidence() const;   // idempotent per loadFields
 	// The licensed black-to-black footprint is decided in splitIQlocked(); Y
 	// consumes its zero carrier, and the normal chroma filter renders raw - Y.
@@ -650,6 +645,7 @@ public:
 	qint32 heldSeq2 = -1;
 
 	bool holdsRealFrame() const { return heldSeq1 >= 0 && heldSeq2 >= 0; }
+	bool hasExactCoverage() const { return frameHasExactCoverage(); }
 
 	bool holds(const SourceField &a, const SourceField &b) const {
 		return heldSeq1 == a.field.seqNo && heldSeq2 == b.field.seqNo;
@@ -1233,8 +1229,9 @@ private:
 	// 1D. This way the positives will propagate through comb just as the
 	// SNR benefits from the merge did"). The retraction ladder's carrier is
 	// published as the comb stages' preferred 1D-out plane on covered frames
-	// (exact on covered lines, certified comb elsewhere) and on uncovered
-	// frames that hold the anticipation chain (fact-corrected estimate).
+	// (exact on covered lines, certified comb elsewhere). On uncovered frames
+	// it remains unpublished until both covered neighbours have completed the
+	// temporal refinement; only then is it a fact-corrected estimate.
 	// The TRUE locked1DSource stays intact and keeps serving produceY's 1D
 	// election candidate and the CCR observation side: 1D REMAINS THE SAFE
 	// RETREAT structurally, because those consumers never see this plane.
@@ -1243,6 +1240,8 @@ private:
 		FactBacked,
 		FactCorrectedEstimate
 	};
+	void publishAnchoredCarrierFromRetracted(
+		AnchoredCarrierProvenance provenance);
 	std::vector<double> anchored1DSource_flat;
 	AnchoredCarrierProvenance anchoredCarrierProvenance =
 		AnchoredCarrierProvenance::None;
