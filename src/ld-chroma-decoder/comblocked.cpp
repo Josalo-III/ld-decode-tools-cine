@@ -11517,12 +11517,21 @@ void Comb::FrameBuffer::buildCarrierRetracted(const FrameBuffer *prevF)
 // Certified twin-bracket carrier hull. See feasibleband.h for the law, the
 // measurement record and the falsified alternatives.
 //
-// Placement: CURRENT time, because it needs BOTH neighbours; the fit and the
-// retraction ladder are built at load time from this frame alone, which is why
-// the uncovered letters currently ride an unbounded fit ("B soft ... the open
-// cross-frame transfer work", buildCarrierRetractionStage). Measured: denying
-// the merge wholesale (--dg-discard) leaves an uncovered frame's carrier
-// bit-identical, so no certified fact reaches this object by any other route.
+// Placement: CURRENT time, because it needs a covered NEIGHBOUR; the fit and
+// the retraction ladder are built at load time from this frame alone, which is
+// why the uncovered letters currently ride an unbounded fit ("B soft ... the
+// open cross-frame transfer work", buildCarrierRetractionStage). Measured:
+// denying the merge wholesale (--dg-discard) leaves an uncovered frame's
+// carrier bit-identical, so no certified fact reaches this object by any other
+// route.
+//
+// ONE bracket per line parity is the ordinary 3:2 geometry -- the two nearest
+// twins certify OPPOSITE parities, so each line of an uncovered frame has a
+// single certified side, and kMarginOneSided is what applies there. A single
+// neighbour is therefore sufficient and the guard below asks only for one.
+// An earlier draft demanded both, because the (since falsified) inter-bracket
+// motion precondition was measured BETWEEN them; that gate is gone and its
+// requirement went with it.
 //
 // It clamps the PUBLISHED carrier rather than the fit. The certified statement
 // is about carrier magnitude and does not care which stage produced the value,
