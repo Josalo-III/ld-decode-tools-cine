@@ -4516,19 +4516,17 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
         // suppression retirement (ccRetired, pass 2). Removed; do not
         // rebuild a product-side chroma path.
         //
-        // CCR evidence upgrade (2026-08-02): the anticipation-corrected
-        // carrier (anchored plane -- certified facts on covered frames,
-        // the causal chain on uncovered ones) is the detector's reference.
-        // Where it exists, disagreement between the elected carrier and
-        // the anchored carrier is MEASURED contamination in IRE, and the
-        // notch edge read, grammar proofs, and concert gate it replaced
-        // are deleted, not layered under.
-        const double *ccAnchRow = (anchored1DValid &&
-            anchored1DSource_flat.size() ==
-                static_cast<size_t>(demodLines) * demodWidth)
-            ? anchored1DSource_flat.data() +
-                  static_cast<size_t>(line) * demodWidth
-            : nullptr;
+        // CCR evidence upgrade (2026-08-02): the fact-backed carrier on
+        // covered frames and the fact-corrected estimate on uncovered ones
+        // are both accepted references, but their provenance remains
+        // distinct at the handoff. Where either exists, disagreement with
+        // locked 1D is MEASURED contamination in IRE; the notch edge read,
+        // grammar proofs, and concert gate it replaced are deleted, not
+        // layered under. Hard per-sample fact remains exactCarrierRow().
+        const double *ccFactRow = factBackedCarrier_line(line);
+        const double *ccEstimateRow =
+            factCorrectedCarrierEstimate_line(line);
+        const double *ccAnchRow = ccFactRow ? ccFactRow : ccEstimateRow;
         // Detector reference pair (2026-08-02, round 2): the OBSERVATION
         // side is the untouched locked 1D -- the safe retreat, which the
         // construction law guarantees no comb/echo signal ever enters --
@@ -4998,13 +4996,14 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                 (line + 2 < lastLine) ? carrierAnalysis_line(line + 2)
                                       : nullptr;
 
-            // Delta-value return: anchored carrier + this line's demod LUT
-            // (same recipe as pass 1) so a fired site's coherent products
-            // can be rebuilt from the lawful carrier below.
-            const double *anchProdRow = anchored1DValid
-                ? anchored1DSource_flat.data() +
-                      static_cast<size_t>(line) * demodWidth
-                : nullptr;
+            // Delta-value return: either the fact-backed carrier or the
+            // explicitly fact-corrected estimate, plus this line's demod LUT
+            // (same recipe as pass 1), rebuilds a fired site's products.
+            const double *factProdRow = factBackedCarrier_line(line);
+            const double *estimateProdRow =
+                factCorrectedCarrierEstimate_line(line);
+            const double *anchProdRow =
+                factProdRow ? factProdRow : estimateProdRow;
             double lutTi2[4] = {0, 0, 0, 0}, lutTq2[4] = {0, 0, 0, 0};
             const double giProduct2 = configuration.gi_product;
             const double gqProduct2 = configuration.gq_product;
@@ -5734,17 +5733,17 @@ void Comb::FrameBuffer::filterIQLocked()
         // boxcar). One policy, computed once; this renderer only applies it, so
         // the suppression cannot alias here.
         //
-        // Delta-value return (2026-08-02): where the anchored plane exists,
-        // a fired site's chroma renders from the ANCHORED (lawful) carrier
-        // instead of being amplitude-killed -- the mask returns the measured
-        // contamination to Y, and the lawful part keeps rendering as colour.
-        // Without an anchored plane the old suppression (kill by envelope)
-        // stands, matching the fallback verdict's semantics.
+        // Delta-value return (2026-08-02): a fired site may render from the
+        // fact-backed carrier or, on uncovered frames, the separately named
+        // fact-corrected estimate instead of being amplitude-killed. Without
+        // either source the old suppression stands. Do not collapse these
+        // accessors: exactCarrierRow() remains the hard-fact authority.
         const float *maskRow = lockedCcMask_line(line);
-        const double *anchRow = anchored1DValid
-            ? anchored1DSource_flat.data() +
-                  static_cast<size_t>(line) * demodWidth
-            : nullptr;
+        const double *factRenderRow = factBackedCarrier_line(line);
+        const double *estimateRenderRow =
+            factCorrectedCarrierEstimate_line(line);
+        const double *anchRow =
+            factRenderRow ? factRenderRow : estimateRenderRow;
         const double giProduct = configuration.gi_product;
         const double gqProduct = configuration.gq_product;
 
@@ -7008,6 +7007,15 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             carrierRetractedValid ? carrierRetracted_line(line) : nullptr;
         const float *ccMaskRow = lockedCcMask_line(line);
         const float *ccMaskRawRow = lockedCcMaskRaw_line(line);
+        // Plane 4 intentionally accepts either derived carrier family, but
+        // keeps the fact-backed construction distinct from the uncovered
+        // fact-corrected estimate. Hard fact itself is exactCarrierRow().
+        const double *returnedFactCarrierRow =
+            factBackedCarrier_line(line);
+        const double *returnedEstimateCarrierRow =
+            factCorrectedCarrierEstimate_line(line);
+        const bool returnedHasDerivedCarrier =
+            returnedFactCarrierRow || returnedEstimateCarrierRow;
 
         // Diagnostic view export (A/B only, same family as LD_RETRACTED_ADMIT).
         // LDCD_YVIEW publishes ONE election contestant AS Y so each candidate
@@ -7289,7 +7297,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     // tiebreaker; none exists. The genuine impossible (a
                     // carrier larger than any legal carrier) is already
                     // enforced by feasible() on the roster.
-                    if (anchored1DValid && retractedRow) {
+                    if (returnedHasDerivedCarrier && retractedRow) {
                         const double r = (double)retractedRow[xx];
                         if (std::isfinite(r)) return comb + m * (r - comb);
                     }
@@ -8712,7 +8720,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         const double mv = std::clamp(
                             (double)ccMaskRow[xi], 0.0, 1.0);
                         double pre = std::numeric_limits<double>::quiet_NaN();
-                        if (anchored1DValid && retractedRow &&
+                        if (returnedHasDerivedCarrier && retractedRow &&
                             std::isfinite(retractedRow[xi]))
                             pre = combV + mv *
                                 ((double)retractedRow[xi] - combV);
@@ -14764,13 +14772,16 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         const char *e = std::getenv("LDCD_ANCHOR_1D");
         return !(e && std::atoi(e) == 0);
     }();
-    anchored1DValid = false;
+    anchoredCarrierProvenance = AnchoredCarrierProvenance::None;
     // Gate: covered frames (original contract) or uncovered frames HOLDING
     // THE CHAIN (the anticipation justifies the anchoring). Under
     // --dg-discard neither exists and the plane never publishes -- the
     // comb's 1D source stays the locked 1D, pre-campaign behaviour.
+    const bool publishFactBackedCarrier = frameHasExactCoverage();
+    const bool publishFactCorrectedEstimate =
+        !publishFactBackedCarrier && antRefAge >= 1;
     if (anchor1D && !analysisOnly && retractedSource == 3 &&
-        (frameHasExactCoverage() || antRefAge >= 1)) {
+        (publishFactBackedCarrier || publishFactCorrectedEstimate)) {
         anchored1DSource_flat.assign(
             static_cast<size_t>(demodLines) * demodWidth, 0.0);
         for (int line = firstLine; line < lastLine; ++line) {
@@ -14784,7 +14795,9 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                 dst[xi] = static_cast<double>(rawLine[left + xi]) -
                           static_cast<double>(retr[xi]);
         }
-        anchored1DValid = true;
+        anchoredCarrierProvenance = publishFactBackedCarrier
+            ? AnchoredCarrierProvenance::FactBacked
+            : AnchoredCarrierProvenance::FactCorrectedEstimate;
     }
 
     // ---------------------------------------------------------------
@@ -14803,11 +14816,10 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     // their line predicate with anticipatedDefLine and read the scalar
     // from the published plane.
     // ---------------------------------------------------------------
-    if (anchored1DValid && !frameHasExactCoverage() && antRefAge >= 1) {
+    if (factCorrectedCarrierEstimate_line(firstLine)) {
         for (int line = firstLine; line < lastLine; ++line) {
             if (!anticipatedDefLine(line)) continue;
-            const double *src = anchored1DSource_flat.data()
-                + static_cast<size_t>(line) * demodWidth;
+            const double *src = factCorrectedCarrierEstimate_line(line);
             CombCarrierGrammar *grammar = carrierGrammarLine(line);
             const bool gl = grammar && grammar->grammarLocked;
             const double bcos = gl ? grammar->burstCos : 1.0;

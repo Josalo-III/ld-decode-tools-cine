@@ -1231,14 +1231,21 @@ private:
 
 	// ANCHORED 1D (user, 2026-07-29: "do the replacement coming out of
 	// 1D. This way the positives will propagate through comb just as the
-	// SNR benefits from the merge did"). The retraction ladder's carrier
-	// -- exact on covered lines, certified comb elsewhere -- published as
-	// the comb stages' preferred 1D-out plane on covered frames. The TRUE
-	// locked1DSource stays intact and keeps serving produceY's 1D
-	// election candidate and the CCR source: 1D REMAINS THE SAFE RETREAT
-	// structurally, because those consumers never see this plane.
+	// SNR benefits from the merge did"). The retraction ladder's carrier is
+	// published as the comb stages' preferred 1D-out plane on covered frames
+	// (exact on covered lines, certified comb elsewhere) and on uncovered
+	// frames that hold the anticipation chain (fact-corrected estimate).
+	// The TRUE locked1DSource stays intact and keeps serving produceY's 1D
+	// election candidate and the CCR observation side: 1D REMAINS THE SAFE
+	// RETREAT structurally, because those consumers never see this plane.
+	enum class AnchoredCarrierProvenance : std::uint8_t {
+		None,
+		FactBacked,
+		FactCorrectedEstimate
+	};
 	std::vector<double> anchored1DSource_flat;
-	bool anchored1DValid = false;
+	AnchoredCarrierProvenance anchoredCarrierProvenance =
+		AnchoredCarrierProvenance::None;
 
 	// Chained anticipated-reference luma (uncovered frames): the LAST
 	// cover's certified luma (raw - exact on its def lines, NaN
@@ -1273,24 +1280,37 @@ private:
 	std::vector<float> fitFactAuditIRE;
 	int fitFactAuditNx = 0;
 	int fitFactAuditNy = 0;
-	inline const double *combSource1D_line(int line) const {
-		if (anchored1DValid && demodWidth > 0 && line >= 0 &&
-		    line < demodLines && !anchored1DSource_flat.empty())
-			return anchored1DSource_flat.data() +
-			       static_cast<size_t>(line) * demodWidth;
-		return locked1DSource_line(line);
+	inline const double *anchoredCarrierStorage_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    anchored1DSource_flat.empty()) return nullptr;
+		return anchored1DSource_flat.data() +
+		       static_cast<size_t>(line) * demodWidth;
 	}
 
-	// Fact-family carrier for the RENDERED chroma demod on covered
-	// frames -- both parities of the same plane: exact (chat) on covered
-	// lines, the certified-comb rung on comp lines. Null on uncovered
-	// frames, so consumers fall back to the elected comb unchanged.
-	inline const double *anchoredCarrier_line(int line) const {
-		if (anchored1DValid && demodWidth > 0 && line >= 0 &&
-		    line < demodLines && !anchored1DSource_flat.empty())
-			return anchored1DSource_flat.data() +
-			       static_cast<size_t>(line) * demodWidth;
-		return nullptr;
+	// Covered-frame construction. exactCarrierRow() remains the sui-generis
+	// hard-fact accessor; this full-parity plane is exact on covered lines and
+	// the certified-comb construction on comp lines.
+	inline const double *factBackedCarrier_line(int line) const {
+		return anchoredCarrierProvenance ==
+			       AnchoredCarrierProvenance::FactBacked
+			? anchoredCarrierStorage_line(line) : nullptr;
+	}
+
+	// Uncovered-frame construction corrected by the chained facts. This is an
+	// estimate regardless of how strong its fact ancestry is.
+	inline const double *factCorrectedCarrierEstimate_line(int line) const {
+		return anchoredCarrierProvenance ==
+			       AnchoredCarrierProvenance::FactCorrectedEstimate
+			? anchoredCarrierStorage_line(line) : nullptr;
+	}
+
+	// Comb construction intentionally accepts either provenance. Consumers
+	// whose authority differs by provenance must use the distinct accessors.
+	inline const double *combSource1D_line(int line) const {
+		if (const double *fact = factBackedCarrier_line(line)) return fact;
+		if (const double *estimate =
+		        factCorrectedCarrierEstimate_line(line)) return estimate;
+		return locked1DSource_line(line);
 	}
 
 	inline const double *locked1DSource_line(int line) const {

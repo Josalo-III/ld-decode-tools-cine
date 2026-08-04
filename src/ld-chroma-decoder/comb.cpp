@@ -786,7 +786,8 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         exactCarrier_flat.assign((size_t)frameHeight * fw,
                                  std::numeric_limits<float>::quiet_NaN());
         exactCoverageCache = -1;   // recompute for the newly held frame
-        anchored1DValid = false;   // stale plane must not survive reuse
+        anchoredCarrierProvenance =
+            AnchoredCarrierProvenance::None; // stale plane must not survive reuse
         antRefAge = -1;            // chained anticipated reference likewise
         starEvidenceBuilt = false; // star license evidence follows the frame
         starFootprintBuilt = false;
