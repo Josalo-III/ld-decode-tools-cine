@@ -403,6 +403,10 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->holdsRealFrame() ? next.get() : nullptr;
             publishedTwoSidedEstimate =
                 current->refineRetractedTemporal(pf, nf);
+            // Magnitude law after the phase refinement, so the bound applies
+            // to the carrier the consumers will actually read.
+            if (current->applyCertifiedCarrierHull(pf, nf))
+                publishedTwoSidedEstimate = true;
             if (publishedTwoSidedEstimate &&
                 !configuration.diagnosticOnly())
                 current->split2D();

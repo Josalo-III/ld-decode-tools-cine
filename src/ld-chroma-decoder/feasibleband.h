@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 namespace lddecode {
@@ -201,6 +202,138 @@ inline CarrierFeasibleRange carrierFeasibleRange(double rawSample,
     if (!any)                             // no legal aperture: no restriction
         return { -1e300, 1e300 };
     return { rawSample - hi, rawSample - lo };   // { floor, ceiling }
+}
+
+// ---------------------------------------------------------------------------
+// CERTIFIED TWIN-BRACKET CARRIER BOUND — the temporal sibling of
+// lumaFeasibleFromPairSums above.
+//
+// That primitive uses the carrier's antisymmetry over +-2 SAMPLES to obtain a
+// carrier-free luma fact.  A 3:2 telecine hands us the same antisymmetry over
+// +-2 FIELDS: the definitional field and its spare are one film frame captured
+// twice, so with the carrier inverted between them
+//
+//     (def + spare)/2 = the image-locked band content   (carrier cancels)
+//     (def - spare)/2 = the carrier, exactly            (picture cancels)
+//
+// The second is a certified per-sample carrier for that film frame, in native
+// composite units.  Measured against the band-projected form it correlates at
+// r = +0.98, so nothing needs extracting to obtain it: the twin difference IS
+// the carrier.
+//
+// An uncovered frame has no twin of its own.  What it does have is a covered
+// frame on either side whose certified split says what FRACTION of the carrier
+// band at this location is genuinely carrier.  That fraction is a scene
+// property and it transfers; the sample values do not (measured: r = +0.08
+// pointwise, so this must never be used as a value -- see FALSIFIED below).
+// So the bracket yields a CEILING on carrier magnitude and nothing else, which
+// is exactly this file's contract: it forbids what cannot be true and says
+// nothing about which surviving value is preferred.
+//
+// Measured across 4 footage sources / 13 scenes / ~1.5M samples: the carrier
+// fit on a frame with no certified legs over-claims by 2.7-3.1x where the band
+// is luma-dominated and by 1.03-1.06x where it is genuinely chromatic, so the
+// bound is self-targeting -- it binds on the content class that produces
+// cross-colour and is inert on real chroma.
+//
+// FALSIFIED — none of these may enter a construction:
+//   * A fixed global ceiling.  49-62% of certified blocks exceed any constant
+//     in 0.3/0.5/0.7; carrier amplitude admits no single discriminator.
+//   * margin 1.0.  25.6% violation two-sided.  The margin is what makes this a
+//     feasibility bound rather than an estimator.
+//   * Scaling the bound by the INSTANTANEOUS band value.  It collapses at band
+//     zero-crossings, where the carrier need not be zero; 11.4% violation even
+//     at 3x headroom, and it does not converge.  The bound must be block-flat.
+//   * Estimating the fraction per sample.  15.0% violation at 1x1 against
+//     0.90% at 8x16.  The ratio is noisy at fine scale; estimate regionally,
+//     apply per sample.
+//   * Gating on the two brackets' agreement with each other.  Violations
+//     CONCENTRATE where they agree (2.2%) and vanish where they disagree
+//     (0.0%): disagreement inflates the max() and loosens the ceiling, so the
+//     statistic is anti-correlated with the failure, not independent of it.
+//   * Using the spare's carrier at the spare rotation as a value.  It is a
+//     deterministic negation of what the merge already holds.
+//   * An inter-bracket "motion" gate on rms(luma_prev - luma_next).  It looked
+//     decisive pooled (9.1% violation above 20 IRE against 0.1-0.4% below) and
+//     is an ARTEFACT: excluding one scene, that same bin runs at 0.24% while
+//     the excluded scene alone runs at 42.9%.  The statistic contains no
+//     displacement -- a bright object moving one sample outscores a dim one
+//     moving ten, and a lighting change with no movement outscores both -- so
+//     it was never a motion measurement, and pooling let one scene wear it as
+//     a law.  Any precondition here must be derived from an image
+//     transformation, not from a raw frame difference.
+//   * An amplitude floor under the bound.  It does not reach the failure
+//     regime below (8.6% at 5 IRE) and costs 9 points of engagement
+//     elsewhere.
+//
+// REQUIRED:
+//   * margin 3.0 where only ONE bracket certifies the line's parity, which is
+//     the ordinary 3:2 geometry for the uncovered letters (2.3% violation at
+//     margin 2.0 one-sided against 0.90% two-sided).
+//
+// OPEN — why this is not yet a default:
+//   On one of four sources the bound is unsafe at 9.8% and nothing tried so
+//   far separates it.  That material carries a carrier fraction of 0.003-0.008
+//   -- the band is ~99.5% image-locked -- and the violating blocks hold a
+//   genuine 0.07-0.11 against brackets at 0.002, with band energy identical
+//   across the bracket.  A MULTIPLICATIVE margin on a near-zero base forbids
+//   almost everything, so real chroma appearing in the middle film frame
+//   breaks it.  Every other scene measured runs at 0.00-0.09% with the bound
+//   active on 67-77% of blocks.  Until that regime is characterised this stays
+//   opt-in: a false forbid confiscates real colour, which outranks the gain.
+//
+// A mislabelled twin fails SAFE: if the pair is not one film frame, the
+// difference carries picture change as well as carrier, the fraction rises,
+// and the ceiling loosens toward inaction.  So this needs no validity test of
+// its own and never second-guesses the cadence autosolve.
+// ---------------------------------------------------------------------------
+
+// The carrier-antisymmetric projection at 4fSC: unity at fSC, null at DC and
+// at 2fSC.  Same +-2 antisymmetry lumaFeasibleFromPairSums sums over, taken
+// as a difference so it selects the carrier band instead of cancelling it.
+inline double carrierBandProjection(double sample_h, double sample_hMinus2)
+{
+    return 0.5 * (sample_h - sample_hMinus2);
+}
+
+// Block statistics feeding the bound.  Energies are mean-square over the same
+// block; the two bracket terms come from the certified frame, the local term
+// from the frame being bounded.
+struct CertifiedBracketBlock {
+    double bracketCarrierEnergy = 0.0;  // mean of ((def-spare)/2)^2
+    double bracketBandEnergy    = 0.0;  // mean of projection^2, bracket frame
+    double localBandEnergy      = 0.0;  // mean of projection^2, this frame
+    long   samples              = 0;
+};
+
+// Carrier-magnitude interval for every sample in the block.  An empty or
+// unusable bracket returns the unbounded interval: absence of evidence
+// forbids nothing.
+//
+// margin scales the certified fraction before it is believed (it is another
+// frame's fraction, not this one's); crest converts a block mean-square into a
+// per-sample amplitude that the carrier's own excursions may legitimately
+// reach.  A fraction that reaches unity forbids nothing at all -- the bracket
+// is reporting a fully chromatic band -- and the interval opens.
+inline FeasibleInterval carrierFeasibleFromCertifiedBracket(
+    const CertifiedBracketBlock &b, double margin, double crest)
+{
+    FeasibleInterval f;                       // unbounded
+    if (b.samples <= 0 || b.bracketBandEnergy <= 0.0 ||
+        b.localBandEnergy <= 0.0 || margin <= 0.0 || crest <= 0.0)
+        return f;
+
+    const double fraction = b.bracketCarrierEnergy / b.bracketBandEnergy;
+    if (!(fraction >= 0.0))                   // NaN-safe
+        return f;
+
+    const double ceiling = margin * fraction;
+    if (ceiling >= 1.0)                       // nothing is excluded
+        return f;
+
+    const double amplitude = crest * std::sqrt(ceiling * b.localBandEnergy);
+    f.clampTo(-amplitude, amplitude);
+    return f;
 }
 
 } // namespace lddecode

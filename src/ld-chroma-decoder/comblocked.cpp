@@ -11513,6 +11513,234 @@ void Comb::FrameBuffer::buildCarrierRetracted(const FrameBuffer *prevF)
 }
 
 
+// ---------------------------------------------------------------------------
+// Certified twin-bracket carrier hull. See feasibleband.h for the law, the
+// measurement record and the falsified alternatives.
+//
+// Placement: CURRENT time, because it needs BOTH neighbours; the fit and the
+// retraction ladder are built at load time from this frame alone, which is why
+// the uncovered letters currently ride an unbounded fit ("B soft ... the open
+// cross-frame transfer work", buildCarrierRetractionStage). Measured: denying
+// the merge wholesale (--dg-discard) leaves an uncovered frame's carrier
+// bit-identical, so no certified fact reaches this object by any other route.
+//
+// It clamps the PUBLISHED carrier rather than the fit. The certified statement
+// is about carrier magnitude and does not care which stage produced the value,
+// and clamping the publication keeps one story for every consumer instead of
+// bounding a base that later stages re-inflate.
+//
+// Structurally inert without the inputs: no cadence roles -> no spare -> no
+// exact channel -> no bracket -> unbounded interval everywhere. Under
+// --dg-discard nothing exists to read and this cannot fire.
+// ---------------------------------------------------------------------------
+bool Comb::FrameBuffer::applyCertifiedCarrierHull(const FrameBuffer *prevF,
+                                                  const FrameBuffer *nextF)
+{
+    // OPT-IN, not a default: one of four measured sources violates the bound
+    // at 9.8% and the regime is not yet characterised (see feasibleband.h).
+    // A false forbid confiscates real colour, so this does not ship on.
+    static const bool hullOn = []{
+        const char *e = std::getenv("LDCD_CARRIER_HULL");
+        return e && std::atoi(e) != 0;
+    }();
+    static const bool hullProbe = std::getenv("LDCD_PROBE_HULL") != nullptr;
+    static const auto hullEnvD = [](const char *n, double d) {
+        const char *e = std::getenv(n); return e ? std::atof(e) : d;
+    };
+    // One bracket per line parity is the ordinary 3:2 geometry for the
+    // uncovered letters (the two neighbouring twins certify OPPOSITE
+    // parities), and one-sided needs the wider margin: 2.3% violation at 2.0
+    // against 0.90% two-sided, 0.95% at 3.0.
+    static const double kMarginOneSided = hullEnvD("LDCD_HULL_MARGIN", 3.0);
+    static const double kMarginTwoSided = hullEnvD("LDCD_HULL_MARGIN2", 2.0);
+    // Block mean-square -> per-sample amplitude the carrier may legitimately
+    // reach. 0.58% per-sample violation at 2.0; 4.50% at 1.5.
+    static const double kCrest        = hullEnvD("LDCD_HULL_CREST", 2.0);
+    constexpr int kBlockLines   = 8;   // same-parity lines per block
+    constexpr int kBlockSamples = 16;
+
+    if (!hullOn) return false;
+    if (!carrierRetractedValid) return false;
+    if (ldcdRetractedSourceMode() != 3) return false;
+    // Covered frames carry their own twin; measured, their fit already tracks
+    // the certified carrier at r = +0.99 and has nothing to be bounded from.
+    if (frameHasExactCoverage()) return false;
+    // One bracket per line parity is the ordinary 3:2 geometry, so a single
+    // neighbour is enough; whichever certifies a line supplies that line.
+    if (!prevF && !nextF) return false;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int width     = videoParameters.activeVideoEnd - left;
+    if (width <= 0 || firstLine >= lastLine) return false;
+
+    const int fw = videoParameters.fieldWidth;
+    const double invIre = invIreScale;
+
+    // The carrier-antisymmetric projection of a composite line, active span.
+    // Shared definition; the bracket and this frame are measured identically.
+    auto projectBand = [&](const quint16 *rawLine, std::vector<double> &out) {
+        out.assign(width, 0.0);
+        for (int xi = 0; xi < width; ++xi) {
+            const int h = left + xi;
+            const double hm2 = (h - 2 >= 0) ? static_cast<double>(rawLine[h - 2])
+                                            : static_cast<double>(rawLine[h]);
+            out[xi] = lddecode::carrierBandProjection(
+                static_cast<double>(rawLine[h]), hm2);
+        }
+    };
+    const FrameBuffer *nb[2] = { prevF, nextF };
+    long clampedSamples = 0, evaluatedSamples = 0, bracketedBlocks = 0;
+    long fractionOpen = 0;
+    double removedIRE = 0.0;
+    bool changed = false;
+
+    // Per-block-row scratch, allocated once. Every projection below is taken
+    // exactly once per line and then read by every block column.
+    const size_t rowStride = static_cast<size_t>(width);
+    std::vector<double> selfBand(rowStride * kBlockLines);
+    std::vector<double> nbBand[2] = {
+        std::vector<double>(rowStride * kBlockLines),
+        std::vector<double>(rowStride * kBlockLines) };
+    std::vector<double> scratchA(width);
+    const float *nbExact[2][kBlockLines] = {};
+
+    for (int base = firstLine; base < lastLine; ++base) {
+        // Blocks run over SAME-PARITY lines: which neighbour certifies a line
+        // is a parity fact, so a block that mixed parities would mix brackets.
+        if (base + 2 * (kBlockLines - 1) >= lastLine) continue;
+        if ((base - firstLine) % (2 * kBlockLines) >= 2) continue;
+
+        for (int li = 0; li < kBlockLines; ++li) {
+            const int line = base + 2 * li;
+            double *sb = selfBand.data() + rowStride * li;
+            projectBand(rawbuffer.data() + static_cast<size_t>(line) * fw,
+                        scratchA);
+            std::copy(scratchA.begin(), scratchA.end(), sb);
+
+            for (int s = 0; s < 2; ++s) {
+                nbExact[s][li] = nullptr;
+                const FrameBuffer *n = nb[s];
+                if (!n || !n->frameHasExactCoverage()) continue;
+                const float *ex = n->exactCarrierRow(line);
+                if (!ex) continue;
+                nbExact[s][li] = ex;
+                projectBand(n->rawbuffer.data() + static_cast<size_t>(line) * fw,
+                            scratchA);
+                std::copy(scratchA.begin(), scratchA.end(),
+                          nbBand[s].data() + rowStride * li);
+            }
+        }
+
+        for (int x0 = 0; x0 + kBlockSamples <= width; x0 += kBlockSamples) {
+            lddecode::CertifiedBracketBlock stat[2];
+            double selfEnergy = 0.0;
+            long   selfN = 0;
+
+            for (int li = 0; li < kBlockLines; ++li) {
+                const double *sb = selfBand.data() + rowStride * li;
+                for (int xi = x0; xi < x0 + kBlockSamples; ++xi) {
+                    selfEnergy += sb[xi] * sb[xi];
+                    ++selfN;
+                }
+                for (int s = 0; s < 2; ++s) {
+                    const float *ex = nbExact[s][li];
+                    if (!ex) continue;
+                    const double *band = nbBand[s].data() + rowStride * li;
+                    for (int xi = x0; xi < x0 + kBlockSamples; ++xi) {
+                        const double c = static_cast<double>(ex[left + xi]);
+                        if (!std::isfinite(c)) continue;   // not certified here
+                        stat[s].bracketCarrierEnergy += c * c;
+                        stat[s].bracketBandEnergy += band[xi] * band[xi];
+                        ++stat[s].samples;
+                    }
+                }
+            }
+
+            if (selfN <= 0) continue;
+            const double localBand = selfEnergy / static_cast<double>(selfN);
+
+            // The loosest interval any bracket admits: a bracket that reports
+            // more carrier forbids less, and forbidding is the only thing this
+            // is allowed to do.
+            lddecode::FeasibleInterval iv;   // unbounded
+            int bracketsUsed = 0;
+            for (int s = 0; s < 2; ++s) {
+                if (stat[s].samples <= 0) continue;
+                ++bracketsUsed;
+            }
+            if (bracketsUsed == 0) continue;
+
+            const double margin = (bracketsUsed >= 2) ? kMarginTwoSided
+                                                      : kMarginOneSided;
+            bool bounded = false;
+            for (int s = 0; s < 2; ++s) {
+                if (stat[s].samples <= 0) continue;
+                lddecode::CertifiedBracketBlock b = stat[s];
+                b.bracketCarrierEnergy /= static_cast<double>(b.samples);
+                b.bracketBandEnergy    /= static_cast<double>(b.samples);
+                b.localBandEnergy       = localBand;
+                const lddecode::FeasibleInterval one =
+                    lddecode::carrierFeasibleFromCertifiedBracket(
+                        b, margin, kCrest);
+                if (one.hi > 1e299) continue;      // this bracket forbids nothing
+                if (!bounded) { iv = one; bounded = true; }
+                else {
+                    // Loosest of the available brackets, never the tightest:
+                    // each is an independent claim and only the weakest is
+                    // safe to impose.
+                    if (one.hi > iv.hi) { iv.hi = one.hi; iv.lo = one.lo; }
+                }
+            }
+            if (!bounded) { ++fractionOpen; continue; }
+            ++bracketedBlocks;
+
+            // carrierRetracted_flat holds raw - carrier (the retracted LUMA);
+            // the carrier is what raw minus it publishes. Bound the carrier
+            // and store the luma the bounded carrier implies, so whatever the
+            // hull refuses returns to Y rather than vanishing.
+            for (int li = 0; li < kBlockLines; ++li) {
+                const int line = base + 2 * li;
+                const quint16 *rawLine = rawbuffer.data()
+                    + static_cast<size_t>(line) * fw;
+                float *retractedRow = carrierRetracted_flat.data()
+                    + static_cast<size_t>(line) * demodWidth;
+                for (int xi = x0; xi < x0 + kBlockSamples; ++xi) {
+                    ++evaluatedSamples;
+                    const double lum = static_cast<double>(retractedRow[xi]);
+                    if (!std::isfinite(lum)) continue;
+                    const double raw = static_cast<double>(rawLine[left + xi]);
+                    const double carrier = raw - lum;
+                    const double bounded = iv.clamp(carrier);
+                    if (bounded == carrier) continue;
+                    retractedRow[xi] = static_cast<float>(raw - bounded);
+                    removedIRE += std::fabs(carrier - bounded) * invIre;
+                    ++clampedSamples;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if (hullProbe)
+        std::fprintf(stderr,
+            "[HULL] blocks bounded=%ld openFraction=%ld  "
+            "clamped %ld/%ld (%.1f%%)  mean removed %.2f IRE\n",
+            bracketedBlocks, fractionOpen,
+            clampedSamples, evaluatedSamples,
+            evaluatedSamples ? 100.0 * clampedSamples / evaluatedSamples : 0.0,
+            clampedSamples ? removedIRE / clampedSamples : 0.0);
+
+    if (!changed) return false;
+    // Republish through the ordinary path so the plane's stated provenance
+    // matches what the carrier now says. combSource1D_line() reads this plane
+    // directly, so republication is what reaches the comb.
+    publishAnchoredCarrierFromRetracted(
+        AnchoredCarrierProvenance::FactCorrectedEstimate);
+    return true;
+}
+
 // Publish a derived full-parity carrier only at the point where its stated
 // provenance is actually true. Covered frames arrive here from the load-time
 // same-frame construction. Uncovered frames arrive only after the two-sided

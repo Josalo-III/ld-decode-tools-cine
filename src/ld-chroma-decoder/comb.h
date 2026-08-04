@@ -506,6 +506,15 @@ public:
 	// the uncovered frame's fact-corrected estimate was published from it.
 	bool refineRetractedTemporal(const FrameBuffer *prevF,
 	                             const FrameBuffer *nextF);
+	// Certified twin-bracket carrier hull (uncovered frames only). The
+	// bracketing covered frames' twin cancellation states what fraction of
+	// the carrier band at a location is genuinely carrier; this frame's
+	// retracted carrier is clamped into the interval that fraction permits.
+	// A BOUND, never a value: see feasibleband.h for the measurement record
+	// and for the alternatives that were falsified. Returns true if the
+	// published carrier changed. Escape LDCD_CARRIER_HULL=0.
+	bool applyCertifiedCarrierHull(const FrameBuffer *prevF,
+	                               const FrameBuffer *nextF);
 	void outputDiagnosticFrame();
 
 	void lurchSharpenCoarsePrior(const double *means,
