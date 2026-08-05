@@ -11565,13 +11565,59 @@ bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
             if (!ok) continue;
             const double ap = std::hypot(pI, pQ) * 0.25;
             const double an = std::hypot(nI, nQ) * 0.25;
-            if (ap < kTSnapAmpMinIRE * irescale ||
-                an < kTSnapAmpMinIRE * irescale)
-                continue;
+            // AMPLITUDE RAMP, NOT A CUT -- the uncovered-letter checkerboard.
+            //
+            // The original form was
+            //     if (ap < kTSnapAmpMinIRE || an < kTSnapAmpMinIRE) continue;
+            // which holds the gate at exactly 0 on one side of a threshold and
+            // lets it reach 1 on the other: a BINARY PER-SAMPLE gate on a
+            // carrier-rate quantity. That is the shape ldcdSideCoherenceAlpha's
+            // own comment warns about a few lines above -- "binary per-sample
+            // gates interleave two differently-phased renders at pixel pitch
+            // along edges, which renders as checkerboard (the OOB-cut lesson,
+            // re-learned on the beach 2026-07-30)" -- and this stage is where
+            // the uncovered-letter checkerboard was bisected to (62bc3bf).
+            //
+            // MEASURED (per-line gate census, since removed; 5 uncovered
+            // frames, s1x11 2795). Attribution of every zero gate: per-side
+            // amplitude 91.4%, cosD twin-disagreement 0.7%, window bail 0.4%;
+            // the gate is on for 7.5% of samples. cosD RAMPS PROPERLY (mean
+            // step 0.019 across its 0.40-wide window, 0.5% of steps crossing it
+            // in one sample) -- the twin-agreement law is not implicated. The
+            // amplitude cut did not ramp at all, and since out = g*snapped +
+            // (1-g)*est, its boundary swapped the sample OUTRIGHT between the
+            // reference's phase and the estimator's own:
+            //     cut : mean gate step 0.545, 3763 steps >0.5, largest 1.000
+            //     ramp: mean gate step 0.074,  121 steps >0.5, largest 0.953
+            // -- 3763 full phase swaps per frame, on the rims of the high-
+            // carrier islands. Patches, which is how the user sees them.
+            //
+            // The ramp turns on the IDENTICAL SET of samples (27494 either
+            // way); it changes only how sharply they arrive. Confirmed by eye
+            // 2026-08-05 (cube_ampramp.mov, user: "Improved").
+            //
+            // WHY THIS WAS MISSED FOR A DAY: the frame-mean output difference
+            // is 0.009 IRE and the max is 28.6 IRE, a 3000:1 ratio. An earlier
+            // pass reported the mean and recorded the cut as EXONERATED. The
+            // effect lives on 3763 boundaries, not on 364720 samples; a mean
+            // over the frame cannot see a boundary error class.
+            //
+            // The weaker side ramps over kTSnapAmpTauIRE, the amplitude tau
+            // this stage already carries and passes to ldcdApplyPhaseSnap. The
+            // floor is unchanged: below kTSnapAmpMinIRE the gate is still zero,
+            // it is simply reached smoothly instead of by a step. No escape
+            // hatch -- a step in a blend weight is an error class, and the one
+            // remaining hard zero here is the window bail, which is a genuine
+            // absence (no reference exists) rather than a threshold.
+            const double aWeak = std::min(ap, an) * invIreScale;
+            const double ta = std::clamp(
+                (aWeak - kTSnapAmpMinIRE) / kTSnapAmpTauIRE, 0.0, 1.0);
+            const double ampAlpha = ta * ta * (3.0 - 2.0 * ta);
+            if (ampAlpha <= 0.0) continue;
             const double cosD = (pI * nI + pQ * nQ) /
                                 (16.0 * ap * an);
             const double t = std::clamp((cosD - 0.5) / 0.4, 0.0, 1.0);
-            snapGate[xi] = t * t * (3.0 - 2.0 * t);
+            snapGate[xi] = ampAlpha * t * t * (3.0 - 2.0 * t);
         }
 
         for (int xi = 0; xi < width; ++xi) {
