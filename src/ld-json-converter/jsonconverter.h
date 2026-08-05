@@ -1,40 +1,40 @@
-/******************************************************************************
- * jsonconverter.h
- * ld-json-converter - JSON converter tool for ld-decode
+/*
+ * File:        jsonconverter.h
+ * Module:      conversion
+ * Purpose:     Converts .tbc.json metadata into the SQLite .tbc.db format
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  * SPDX-FileCopyrightText: 2025 Simon Inns
- *
- * This file is part of ld-decode-tools.
- ******************************************************************************/
+ */
 
 #ifndef JSONCONVERTER_H
 #define JSONCONVERTER_H
 
-#include <QString>
 #include <QSqlDatabase>
-#include <QSqlQuery>
 #include <QSqlError>
+#include <QSqlQuery>
+#include <QString>
+
 #include "lddecodemetadata.h"
 
-class JsonConverter
-{
-public:
-    JsonConverter(const QString &inputJsonFilename, const QString &outputSqliteFilename);
-    ~JsonConverter();
+class JsonConverter {
+ public:
+  JsonConverter(const QString &inputJsonFilename,
+                const QString &outputSqliteFilename);
+  ~JsonConverter();
 
-    bool process();
+  bool process();
 
-private:
-    QString m_inputJsonFilename;
-    QString m_outputSqliteFilename;
-    QSqlDatabase m_database;
+ private:
+  QString m_inputJsonFilename;
+  QString m_outputSqliteFilename;
+  QSqlDatabase m_database;
 
-    void reportJsonContents(LdDecodeMetaData &metaData);
-    void countDropouts(const LdDecodeMetaData &metaData, qint32 &totalDropouts);
-    bool createDatabase();
-    bool createSchema();
-    bool insertData(LdDecodeMetaData &metaData);
+  void reportJsonContents(LdDecodeMetaData &metaData);
+  void countDropouts(const LdDecodeMetaData &metaData, qint32 &totalDropouts);
+  bool createDatabase();
+  bool createSchema();
+  bool insertData(LdDecodeMetaData &metaData);
 };
 
-#endif // JSONCONVERTER_H
+#endif  // JSONCONVERTER_H
