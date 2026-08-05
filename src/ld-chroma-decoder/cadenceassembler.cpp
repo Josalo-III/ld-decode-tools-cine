@@ -180,19 +180,13 @@ namespace {
         }
         if (total <= 0) return false;
         const double outlierFrac = double(outliers) / double(total);
-        static const bool dsDebug = std::getenv("LDCD_PROBE_DSREF") != nullptr;
         if (outlierFrac > maxOutlierFrac) {
-            if (dsDebug)
-                std::fprintf(stderr, "DSREF-MERGE reject seq=%d frac=%.3f\n",
-                             def.field.seqNo, outlierFrac);
             return false;
         }
-        if (dsDebug)
-            std::fprintf(stderr, "DSREF-MERGE accept seq=%d frac=%.3f\n",
-                         def.field.seqNo, outlierFrac);
 
-        // Twin-agreement audit (LDCD_DUMP_TWIN_L0/L1/C0/C1, field-line and
-        // FULL-raw-column coordinates; run -t 1). The (D-S)/2 channel is a
+        // Twin-agreement audit (the dump instrument, which printed
+        // field-line and FULL-raw-column values under -t 1, has since been
+        // removed). The (D-S)/2 channel is a
         // carrier measurement ONLY where the twins share content: the BP
         // makes the emitted value carrier-BAND by construction, so band
         // structure alone proves nothing. The out-of-band residual
@@ -200,29 +194,6 @@ namespace {
         // just twin noise, and where content differs (a video-rate element
         // composited over film-rate frames, say) it is large and the
         // "carrier" reading there is a content difference in disguise.
-        {
-            static const auto tEnv = [](const char *n) {
-                const char *s = std::getenv(n); return s ? std::atoi(s) : -1;
-            };
-            static const int tL0 = tEnv("LDCD_DUMP_TWIN_L0");
-            static const int tL1 = tEnv("LDCD_DUMP_TWIN_L1");
-            static const int tC0 = tEnv("LDCD_DUMP_TWIN_C0");
-            static const int tC1 = tEnv("LDCD_DUMP_TWIN_C1");
-            if (tL0 >= 0 && tC0 >= 0) {
-                for (int lf = std::max(y0, tL0); lf < std::min(y1, tL1 + 1); ++lf) {
-                    buildLine(lf);
-                    for (int h = std::max(activeLeft, tC0);
-                         h < std::min(activeRight, tC1 + 1); ++h) {
-                        std::fprintf(stderr,
-                            "TWIN seq=%d lf=%d h=%d lhat=%.1f chat=%.2f "
-                            "bp=%.2f oob=%.2f ire=%.4f\n",
-                            def.field.seqNo, lf, h, lhat[h],
-                            chat[h] / ireScale, bp[h] / ireScale,
-                            (chat[h] - bp[h]) / ireScale, ireScale);
-                    }
-                }
-            }
-        }
 
         // Pass 2: merged = Lhat + BP(chat); emit the exact-carrier channel.
         // Minor-disagreement error correction runs per line before emission.
@@ -238,9 +209,9 @@ namespace {
 
         std::vector<std::uint8_t> errMask(width), denyExact(width);
         std::vector<double> chatFix(width), lhatFix(width), bpFix(width);
-        long long nErrTotal = 0, nDefBad = 0, nSpareBad = 0;
 
-        // Twin phase capture (LDCD_DUMP_MERGEPH; tracker feed to follow).
+        // Twin phase capture (the dump instrument has since been removed;
+        // this feeds the sync tracker).
         // BURST-RELATIVE carrier phase per capture: burst and carrier are
         // both fsc, so (carrier phase - own burst phase) is a pure number
         // per capture, comparable across any stream positions with no
@@ -250,8 +221,6 @@ namespace {
         // anticipation curve's slope measured by conservation, not
         // estimated by tracking. (Anchor density alone would not have
         // warranted this; the exact derivative does.)
-        static const bool mergePhDump =
-            std::getenv("LDCD_DUMP_MERGEPH") != nullptr;
         double phCI = 0, phCQ = 0;             // pooled chat IQ (def coords)
         double phDBI = 0, phDBQ = 0, phSBI = 0, phSBQ = 0; // burst pools
         long phN = 0;
@@ -375,9 +344,6 @@ namespace {
                             ? (double)sl[x] + cf   // spare = L - c
                             : (double)dl[x] - cf;  // def   = L + c
                     }
-                    nErrTotal += rEnd - h + 1;
-                    if (badIsDef) nDefBad += rEnd - h + 1;
-                    else          nSpareBad += rEnd - h + 1;
                     h = rEnd + 1;
                 }
 
@@ -421,11 +387,6 @@ namespace {
             }
         }
 
-        if (dsDebug && nErrTotal > 0)
-            std::fprintf(stderr,
-                "DSREF-FIX seq=%d nerr=%lld defBad=%lld spareBad=%lld\n",
-                def.field.seqNo, nErrTotal, nDefBad, nSpareBad);
-
         // Sync tracker feed: regional pools derotated by the def capture's
         // own burst (burst-relative phase; slow burst wander must not alias
         // as carrier drift), plus the twin integrity differential.
@@ -441,6 +402,10 @@ namespace {
                 (*outRegQ)[r] = srQ[r] * buI - srI[r] * buQ;
             }
         }
+        // def carrier is chat; spare carrier is -chat sample-for-sample.
+        // Each referenced to its OWN burst; the difference of the two
+        // burst-relative phases (mod the fixed sequence offset) is the
+        // motion-free drift sample.
         if (outTwinDriftDeg && phN > 0) {
             const double aDef2 = std::atan2(phCQ, phCI);
             const double aSp2  = std::atan2(-phCQ, -phCI);
@@ -450,34 +415,6 @@ namespace {
             while (dd > 180.0) dd -= 360.0;
             while (dd < -180.0) dd += 360.0;
             *outTwinDriftDeg = dd;
-        }
-
-        if (mergePhDump && phN > 0) {
-            // def carrier is chat; spare carrier is -chat sample-for-sample.
-            // Each referenced to its OWN burst; the difference of the two
-            // burst-relative phases (mod the fixed sequence offset) is the
-            // motion-free drift sample.
-            const double degC = 180.0 / M_PI;
-            const double aDef = std::atan2(phCQ, phCI);
-            const double aSp  = std::atan2(-phCQ, -phCI);
-            const double bDef = std::atan2(phDBQ, phDBI);
-            const double bSp  = std::atan2(phSBQ, phSBI);
-            double relD = (aDef - bDef) * degC;
-            double relS = (aSp - bSp) * degC;
-            auto wrap = [](double d) {
-                while (d > 180.0) d -= 360.0;
-                while (d < -180.0) d += 360.0;
-                return d;
-            };
-            const double drift = wrap(relS - relD);
-            const double ampIRE =
-                std::hypot(phCI, phCQ) / std::max(1L, phN) / ireScale;
-            std::fprintf(stderr,
-                "MERGEPH defSeq=%d spSeq=%d dt=%d relDef=%.2f relSp=%.2f "
-                "drift=%.3f deg amp=%.2f IRE n=%ld\n",
-                def.field.seqNo, spare.field.seqNo,
-                spare.field.seqNo - def.field.seqNo,
-                wrap(relD), wrap(relS), drift, ampIRE, phN);
         }
 
         return true;
@@ -632,7 +569,6 @@ void CadenceAssembler::syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
                                          const std::vector<long>& regN,
                                          double ireScale)
 {
-    static const bool dbg = std::getenv("LDCD_DUMP_SYNCTRK") != nullptr;
     const int nReg = (int)regI.size();
     if (nReg <= 0) return;
     if ((int)syncTrk.size() != nReg) {
@@ -640,10 +576,6 @@ void CadenceAssembler::syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
         syncAnchorSeq = -1;
     }
     if (std::fabs(twinDriftDeg) > 1.0) {
-        if (dbg)
-            std::fprintf(stderr,
-                "[SYNCTRK seq=%d] twin integrity fail (%.2f deg) -- pair "
-                "distrusted\n", anchorSeq, twinDriftDeg);
         return;
     }
     constexpr double kAlpha = 0.5, kBeta = 0.12;
@@ -727,10 +659,6 @@ void CadenceAssembler::syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
         }
     }
     syncAnchorSeq = anchorSeq;
-    if (dbg)
-        std::fprintf(stderr,
-            "[SYNCTRK seq=%d] dt=%.0f usable=%zu cut=%d cuts=%ld\n",
-            anchorSeq, dt, misses.size(), (int)cut, syncCuts);
 }
 
 // Stamp a field with the tracker's predicted rotation since the previous
@@ -809,7 +737,6 @@ bool CadenceAssembler::orderPairForComb(SourceField& a, SourceField& b) const
 
 bool CadenceAssembler::mergeDgPairWithSanityWrapper(SourceField& def, SourceField& spare, SourceField& comp)
 {
-    static const bool dsDebug = std::getenv("LDCD_PROBE_DSREF") != nullptr;
     std::vector<double> regI, regQ;
     std::vector<long> regN;
     double twinDrift = 999.0;
@@ -822,10 +749,6 @@ bool CadenceAssembler::mergeDgPairWithSanityWrapper(SourceField& def, SourceFiel
         syncTrackerUpdate(def.field.seqNo, twinDrift, regI, regQ, regN,
                           ireScale);
     }
-    if (dsDebug)
-        std::fprintf(stderr, "DSREF-WRAP def=%d spare=%d ok=%d plane=%d\n",
-                     def.field.seqNo, spare.field.seqNo, (int)ok,
-                     (int)def.dgExactCarrier.size());
     return ok;
 }
 
@@ -943,10 +866,9 @@ void CadenceAssembler::processWindowForced(bool flushMode)
     // dominance for an inverted render.
     const int regime = config.reverseFieldOrder ? CADENCE_NTSC_INVERTED_OFFSET : 0;
 
-    // Slot-by-slot trace of what the imposed count actually did. A jam is the
-    // user's assertion against the evidence, so the tool has to be able to
-    // show which real field landed in which asserted role.
-    static const bool forcedTrace = std::getenv("LDCD_PROBE_FORCED") != nullptr;
+    // A jam is the user's assertion against the evidence, so the tool has to
+    // be able to show which real field landed in which asserted role. (The
+    // slot-by-slot trace instrument that did so has since been removed.)
 
     auto cycleIndex = [&](qint64 consumed) -> int {
         int idx = int((start + (consumed % CADENCE_NTSC_CYCLE)) % CADENCE_NTSC_CYCLE);
@@ -976,10 +898,6 @@ void CadenceAssembler::processWindowForced(bool flushMode)
     auto pop1 = [&]() -> SourceField {
         SourceField f = std::move(window.front());
         window.pop_front();
-        if (forcedTrace)
-            std::fprintf(stderr, "FORCED slot=%d seq=%d firstField=%d\n",
-                         cycleIndex(forcedFieldIndex), f.field.seqNo,
-                         f.field.isFirstField ? 1 : 0);
         ++forcedFieldIndex;
         return f;
     };

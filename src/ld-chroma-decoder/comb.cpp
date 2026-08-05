@@ -50,92 +50,6 @@ namespace {
         if (b > c) std::swap(b, c);
         return 0.5 * (b + c);
     }
-
-    // LDCD_PROBE_COMBFVF: grades the four raw ingredients that feed the
-    // Field-vs-Frame election -- A-side (Field A or Frame A, whichever regime
-    // is active), Field B, Frame B, and the FVF blend itself -- against
-    // certified luma, at every covered pixel, split by which A-side regime
-    // was in force. This is the "how much of comb's slope deficit is baked
-    // in by the inner election, per contestant" instrument: measurement
-    // only, no writes, no gate on the certified family (the exact channel is
-    // read directly here, independent of whether the decoder is allowed to
-    // CONSUME it elsewhere).
-    struct CombFvfCertProbe {
-        struct Acc {
-            double errSum = 0.0; long errN = 0;
-            double slopeY = 0.0, slopeT = 0.0; long slopeN = 0;
-        };
-        // [0]=field-regime, [1]=frame-regime
-        Acc aSide[2], fieldB[2], frameB[2], mixed[2];
-        double oracleErrSum[2] = {0.0, 0.0};
-        long oracleN[2] = {0, 0};
-        long oracleWinA[2] = {0, 0}, oracleWinFieldB[2] = {0, 0},
-             oracleWinFrameB[2] = {0, 0};
-
-        static bool on() {
-            static const bool v = std::getenv("LDCD_PROBE_COMBFVF") != nullptr;
-            return v;
-        }
-
-        void note(bool aIsFrame, double yA, double yFieldB, double yFrameB,
-                 double yMixed, double lTrue, double invIre)
-        {
-            const int r = aIsFrame ? 1 : 0;
-            auto add = [&](Acc &a, double y) {
-                if (!std::isfinite(y)) return;
-                a.errSum += std::fabs(y - lTrue) * invIre; ++a.errN;
-            };
-            add(aSide[r], yA);
-            add(fieldB[r], yFieldB);
-            add(frameB[r], yFrameB);
-            add(mixed[r], yMixed);
-
-            // Per-pixel oracle among the three RAW ingredients (never the
-            // mix): the produceY-level oracle taught us mean-of-contestants
-            // can look close while real per-pixel headroom hides behind
-            // anti-correlated errors. Ask the same question one level down.
-            if (std::isfinite(yA) && std::isfinite(yFieldB) &&
-                std::isfinite(yFrameB)) {
-                const double eA = std::fabs(yA - lTrue) * invIre;
-                const double eF = std::fabs(yFieldB - lTrue) * invIre;
-                const double eB = std::fabs(yFrameB - lTrue) * invIre;
-                double best = eA; int who = 0;
-                if (eF < best) { best = eF; who = 1; }
-                if (eB < best) { best = eB; who = 2; }
-                oracleErrSum[r] += best; ++oracleN[r];
-                if (who == 0) ++oracleWinA[r];
-                else if (who == 1) ++oracleWinFieldB[r];
-                else ++oracleWinFrameB[r];
-            }
-        }
-
-        void flushOnce() {
-            static const char *rn[2] = {"field-regime", "frame-regime"};
-            for (int r = 0; r < 2; ++r) {
-                if (!mixed[r].errN) continue;
-                std::fprintf(stderr,
-                    "[COMBFVF %s] n=%ld  A-side %.3f  FieldB %.3f  "
-                    "FrameB %.3f  MIXED %.3f  (IRE, mean |err| vs Ltrue)\n",
-                    rn[r], mixed[r].errN,
-                    aSide[r].errN ? aSide[r].errSum / aSide[r].errN : -1.0,
-                    fieldB[r].errN ? fieldB[r].errSum / fieldB[r].errN : -1.0,
-                    frameB[r].errN ? frameB[r].errSum / frameB[r].errN : -1.0,
-                    mixed[r].errSum / mixed[r].errN);
-                if (oracleN[r]) {
-                    const double oe = oracleErrSum[r] / oracleN[r];
-                    const double me = mixed[r].errSum / mixed[r].errN;
-                    std::fprintf(stderr,
-                        "           ORACLE(A/FieldB/FrameB) %.3f  headroom "
-                        "%.1f%%  wins A=%.1f%% FieldB=%.1f%% FrameB=%.1f%%\n",
-                        oe, me > 0.0 ? 100.0 * (me - oe) / me : 0.0,
-                        100.0 * oracleWinA[r] / oracleN[r],
-                        100.0 * oracleWinFieldB[r] / oracleN[r],
-                        100.0 * oracleWinFrameB[r] / oracleN[r]);
-                }
-            }
-        }
-    };
-    CombFvfCertProbe g_combFvfCertProbe;
 }
 
 // 3D candidate palette
@@ -434,10 +348,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             continue;
         }
 
-        // Edge-fate probe (measurement only; inert unless LDCD_PROBE_EDGEFATE):
-        // current's 1D/2D/3D scalar planes are all final at this point.
-        current->probeEdgeFate(configuration.dimensions);
-
         /*
          * Output path.
          *
@@ -452,11 +362,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->produceY(
                 previous->holdsRealFrame() ? previous.get() : nullptr,
                 next->holdsRealFrame() ? next.get() : nullptr);
-            // Two-sided certified-luma tween measurement (inert unless
-            // LDCD_PROBE_TWEEN). Reads only load-time and ladder planes;
-            // placed here so every estimator it grades is final.
-            current->probeLumaTween();
-            current->probeCarrierInvention();
             current->filterIQLocked();
             current->doYNR();
             current->transformIQ(configuration.chromaGain,
@@ -475,41 +380,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (configuration.dimensions == 3 ||
              configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldBSimple))
             current->overlayMap(*previous, *next);
-
-        // LDCD_DUMP_CADMAP=1: one machine-readable line per output frame --
-        // film-frame letters, cadence ids, edit flags, and source field
-        // sequence numbers -- so per-frame probe statistics and per-frame
-        // render metrics can be joined on the true cadence identity instead
-        // of modular guesswork. Interleaves with the probe blocks in decode
-        // order on stderr.
-        {
-            static const bool dumpCadMap = std::getenv("LDCD_DUMP_CADMAP") != nullptr;
-            if (dumpCadMap) {
-                int cidT = -1000, cidB = -1000, seqT = -1, seqB = -1;
-                bool edT = false, edB = false;
-                if (fieldIndex < inputFields.size()) {
-                    cidT = inputFields[fieldIndex].field.cinemap.cadenceId;
-                    edT  = inputFields[fieldIndex].field.cinemap.isEditBoundary;
-                    seqT = inputFields[fieldIndex].field.seqNo;
-                }
-                if (fieldIndex + 1 < inputFields.size()) {
-                    cidB = inputFields[fieldIndex + 1].field.cinemap.cadenceId;
-                    edB  = inputFields[fieldIndex + 1].field.cinemap.isEditBoundary;
-                    seqB = inputFields[fieldIndex + 1].field.seqNo;
-                }
-                auto letter = [](int cid) -> char {
-                    if (cid == lddecode::kCadenceVideo) return 'i';
-                    if (cid == lddecode::kCadenceProgressive) return 'p';
-                    return cadenceKnown(cid) ? cadenceFilmLetter(cid) : '?';
-                };
-                std::fprintf(stderr,
-                    "CADMAP out=%d cidT=%d cidB=%d letT=%c letB=%c "
-                    "editT=%d editB=%d seqT=%d seqB=%d covered=%d\n",
-                    frameIndex, cidT, cidB, letter(cidT), letter(cidB),
-                    (int)edT, (int)edB, seqT, seqB,
-                    current->hasExactCoverage() ? 1 : 0);
-            }
-        }
 
         // --- Visual Debug Overlays: Cadence / Film vs Video ------------------------
         if (configuration.debugCadence) {
@@ -890,8 +760,9 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 // of the samples two positions either side (a 2-tap comb at 2fsc), scaled by 0.5.
 // Result written to clpbuffer[0].
 // ---------------------------------------------------------------------------
-// APERTURE-CHROMA PHYSICS PROBE (LDCD_PROBE_APERTURE=1). Measurement only: it
-// reads state, writes nothing, and changes no output.
+// APERTURE-CHROMA PHYSICS (the instrument that measured this, LDCD_PROBE_APERTURE,
+// has since been removed; it was measurement only -- it read state, wrote
+// nothing, and changed no output). The reasoning below is the record.
 //
 // The question (writeup S7): do the four demodulated aperture views bound the
 // chroma usefully at a hard luma step?
@@ -934,183 +805,14 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 // trusted where it is provably exact, which isolates the step bias directly.
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// Hull width below which the covering means agree well enough that the carrier
-// is taken as exactly determined. Not a tuning knob on any output -- it only
-// selects which samples this probe reports as anchors.
-double probeAnchorIRE()
-{
-    static const double v = []{
-        const char *s = std::getenv("LDCD_PROBE_ANCHOR_IRE");
-        return s ? std::atof(s) : 1.0;
-    }();
-    return v;
-}
-
-struct ApertureProbeBin {
-    long   n       = 0;
-    long   nUnsup  = 0;    // no anchor within the envelope kernel's reach
-    double sum1D   = 0.0;
-    double sumMean = 0.0;
-    double sumExt  = 0.0;
-    double excess  = 0.0;  // sum of max(E_1d - E_ext, 0) over supported samples
-    long   nExceed = 0;    // E_1d exceeds E_ext by more than 2 IRE
-};
-
-struct ApertureProbeStats {
-    static constexpr int kBins = 5;
-    ApertureProbeBin bin[kBins];
-    long nSamples = 0;
-    long nAnchor  = 0;
-    long runHist[10] = {0};      // ambiguous run length; last bucket is >= 9
-    long nRuns = 0;
-
-    ~ApertureProbeStats() { report(); }
-
-    void report() const
-    {
-        if (nSamples <= 0) return;
-        static const char *kBinName[kBins] = {
-            "  <1 (anchor)", " 1-4         ", " 4-10        ",
-            "10-25        ", " >=25        "
-        };
-        std::fprintf(stderr,
-            "\n[APROBE] %ld samples, anchors %.1f%% (hull width < %.1f IRE)\n",
-            nSamples, 100.0 * double(nAnchor) / double(nSamples),
-            probeAnchorIRE());
-        std::fprintf(stderr,
-            "[APROBE] hullWidth      n      %%   E_1d   E_mean  E_ext   "
-            "excess  exceed%%  unsup%%\n");
-        for (int b = 0; b < kBins; ++b) {
-            const ApertureProbeBin &k = bin[b];
-            if (k.n == 0) continue;
-            const double inv = 1.0 / double(k.n);
-            std::fprintf(stderr,
-                "[APROBE] %s %8ld %5.1f %6.2f %7.2f %6.2f %7.2f %7.1f %7.1f\n",
-                kBinName[b], k.n, 100.0 * double(k.n) / double(nSamples),
-                k.sum1D * inv, k.sumMean * inv, k.sumExt * inv, k.excess * inv,
-                100.0 * double(k.nExceed) * inv,
-                100.0 * double(k.nUnsup) * inv);
-        }
-        std::fprintf(stderr, "[APROBE] ambiguous run lengths (%ld runs):", nRuns);
-        for (int i = 1; i < 10; ++i)
-            std::fprintf(stderr, " %d:%.1f%%", i,
-                         nRuns ? 100.0 * double(runHist[i]) / double(nRuns) : 0.0);
-        std::fprintf(stderr, "   (kernel reach +-4)\n");
-    }
-};
-
-ApertureProbeStats g_apertureProbe;
-
-int apertureProbeBin(double wIRE)
-{
-    if (wIRE <  1.0) return 0;
-    if (wIRE <  4.0) return 1;
-    if (wIRE < 10.0) return 2;
-    if (wIRE < 25.0) return 3;
-    return 4;
-}
-
-} // namespace
-
-void Comb::FrameBuffer::probeApertureChroma(int line, const double *carrierAtLeft)
-{
-    const double *apMean = lockedApertureMean_line(line);
-    if (!apMean || !carrierAtLeft) return;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int fullWidth = videoParameters.fieldWidth;
-    const int width     = right - left;
-    if (width < 16) return;
-    const quint16 *rawLine = rawbuffer.data() + size_t(line) * fullWidth;
-    const int lastStart = width - 4;
-
-    std::vector<double> mI(width), mQ(width), mIs(width), mQs(width);
-    std::vector<double> eI(width), eQ(width), eIs(width), eQs(width);
-    std::vector<double> aI(width), aQ(width);
-    std::vector<double> wIRE(width);
-    std::vector<std::uint8_t> anchor(width, 0);
-
-    for (int x = 0; x < width; ++x) {
-        const double raw = (double)rawLine[left + x];
-        // Feasible interval and the four-view mean, from the same covering set.
-        const auto rng = lddecode::carrierFeasibleRange(raw, apMean, x, width);
-        wIRE[x] = (rng.ceiling - rng.floor) * invIreScale;
-        double acc = 0.0; int nAcc = 0;
-        for (int d = 0; d < 4; ++d) {
-            const int v = x - (3 - d);
-            if (v < 0 || v > lastStart) continue;
-            acc += apMean[v]; ++nAcc;
-        }
-        const double m = nAcc ? (raw - acc / nAcc) : 0.0;
-        const int ph = carrierSampleClass(line, left + x);
-        const double s = sin4fsc(ph), c = cos4fsc(ph);
-        mI[x] = 2.0 * m * s;               mQ[x] = 2.0 * m * c;
-        eI[x] = 2.0 * carrierAtLeft[x] * s; eQ[x] = 2.0 * carrierAtLeft[x] * c;
-        anchor[x] = (nAcc == 4 && wIRE[x] < probeAnchorIRE()) ? 1 : 0;
-    }
-
-    // E_mean and E_1d: the lawful envelope of each stream, everywhere.
-    lddecode::projectExpressibleChromaEnvelope(mI.data(), nullptr, width, mIs.data());
-    lddecode::projectExpressibleChromaEnvelope(mQ.data(), nullptr, width, mQs.data());
-    lddecode::projectExpressibleChromaEnvelope(eI.data(), nullptr, width, eIs.data());
-    lddecode::projectExpressibleChromaEnvelope(eQ.data(), nullptr, width, eQs.data());
-
-    // E_ext: the same m, read ONLY where it is exact, and extended by the
-    // envelope kernel over anchors alone. Unlike the shared projection this
-    // WRITES the invalid positions -- that is the whole point here (extend the
-    // law into the gap), so it stays local to the probe rather than changing
-    // the sanctioned primitive, which must never smear a fit into an absence.
-    constexpr int half = lddecode::kChromaEnvelopeTaps / 2;
-    std::vector<std::uint8_t> supported(width, 0);
-    for (int x = 0; x < width; ++x) {
-        double accI = 0.0, accQ = 0.0, used = 0.0;
-        for (int t = 0; t < lddecode::kChromaEnvelopeTaps; ++t) {
-            const int j = x + t - half;
-            if (j < 0 || j >= width || !anchor[j]) continue;
-            const double w = lddecode::kChromaEnvelopeFilter[t];
-            accI += w * mI[j]; accQ += w * mQ[j]; used += w;
-        }
-        // Require real support, not one far tap carrying the whole estimate.
-        if (used > 0.10) {
-            aI[x] = accI / used; aQ[x] = accQ / used; supported[x] = 1;
-        } else {
-            aI[x] = 0.0; aQ[x] = 0.0;
-        }
-    }
-
-    for (int x = half; x < width - half; ++x) {
-        const int b = apertureProbeBin(wIRE[x]);
-        ApertureProbeBin &k = g_apertureProbe.bin[b];
-        const double e1d  = std::hypot(eIs[x], eQs[x]) * invIreScale;
-        const double emn  = std::hypot(mIs[x], mQs[x]) * invIreScale;
-        const double eext = std::hypot(aI[x],  aQ[x])  * invIreScale;
-        ++k.n;
-        k.sum1D += e1d; k.sumMean += emn;
-        ++g_apertureProbe.nSamples;
-        if (anchor[x]) ++g_apertureProbe.nAnchor;
-        if (!supported[x]) { ++k.nUnsup; continue; }
-        k.sumExt += eext;
-        k.excess += std::max(e1d - eext, 0.0);
-        if (e1d > eext + 2.0) ++k.nExceed;
-    }
-
-    // Ambiguous run lengths, against the kernel's +-4 reach.
-    int run = 0;
-    for (int x = 0; x <= width; ++x) {
-        const bool amb = (x < width) && !anchor[x];
-        if (amb) { ++run; continue; }
-        if (run > 0) {
-            ++g_apertureProbe.nRuns;
-            ++g_apertureProbe.runHist[std::min(run, 9)];
-            run = 0;
-        }
-    }
-}
-
 void Comb::FrameBuffer::split1D()
 {
+    // Sample-column windows come from the metadata header, never from
+    // hardcoded columns. MEASURED, on a colourburst study that hardcoded the
+    // burst as h 40..130: those columns caught sync-edge energy, so the study
+    // measured deterministic line structure where it meant to measure jitter.
+    // videoParameters carries colourBurstStart/End (and the active-video
+    // bounds read below) precisely so no consumer has to guess them.
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -1141,12 +843,6 @@ void Comb::FrameBuffer::split1D()
     }();
     const bool applyBucketHull = bucketHull && !configuration.phaseCompensation;
 
-    // Disposable measurement; off unless explicitly asked for.
-    static const bool probeAperture = []{
-        const char *s = std::getenv("LDCD_PROBE_APERTURE");
-        return s && std::atoi(s) != 0;
-    }();
-
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *src = rawbuffer.data() + line * fullWidth;
         double *dst        = clpbuffer[0].pixel[line];
@@ -1157,19 +853,8 @@ void Comb::FrameBuffer::split1D()
             dst[h] = ((double)src[h] - 0.5 * ((double)src[hm2] + (double)src[hp2])) * 0.5;
         }
 
-        // Probe the unmodified bandpass: it is the baseline the chroma-side
-        // constraint would act on, before any hull or doublet touches it.
-        if (probeAperture)
-            probeApertureChroma(line, dst + left);
-
         if (applyBucketHull)
             applyCarrierFeasibilityHull(line, dst + left);
-
-        // Pair class-map probe (measurement only; inert unless
-        // LDCD_PROBE_DISENT). The 1D output is never touched from other
-        // lines -- 1D is downstream's safe retreat.
-        if (!configuration.phaseCompensation)
-            probeEdgePairClassMap(line);
     }
 }
 
@@ -1383,65 +1068,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double invI = this->invIreScale;
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int probeLine0 = [] {
-        const char *s = std::getenv("LD_FVF_PROBE_LINE0");
-        return s ? std::atoi(s) : -1;
-    }();
-    const int probeLine1 = [probeLine0] {
-        const char *s = std::getenv("LD_FVF_PROBE_LINE1");
-        return s ? std::atoi(s) : probeLine0;
-    }();
-    const int probeC0 = [] {
-        const char *s = std::getenv("LD_FVF_PROBE_C0");
-        return s ? std::atoi(s) : -1;
-    }();
-    const int probeC1 = [probeC0] {
-        const char *s = std::getenv("LD_FVF_PROBE_C1");
-        return s ? std::atoi(s) : probeC0;
-    }();
-    const bool probeFvf =
-        probeLine0 >= 0 && probeLine1 >= probeLine0 &&
-        probeC0 >= 0 && probeC1 >= probeC0;
-
-    // LDCD_PROBE_FVF: aggregate election census. The question Frame B's work
-    // depends on is not "how often does the frame model win" but "how often
-    // does it win WHERE IT DIFFERS" -- a frame win at a pixel where both
-    // candidates agree delivers nothing. Windowed with the LDCD_PROBE_CEDE
-    // envs; reports at each frame wrap.
-    static const bool censusFvf = std::getenv("LDCD_PROBE_FVF") != nullptr;
-    static const auto cEnv = [](const char *n, int f) {
-        const char *s = std::getenv(n); return s ? std::atoi(s) : f;
-    };
-    static const int cL0 = cEnv("LDCD_PROBE_CEDE_L0", 0);
-    static const int cL1 = cEnv("LDCD_PROBE_CEDE_L1", 1 << 30);
-    static const int cC0 = cEnv("LDCD_PROBE_CEDE_C0", 0);
-    static const int cC1 = cEnv("LDCD_PROBE_CEDE_C1", 1 << 30);
-    static long cN, cFrame, cDiffN, cDiffFrame, cBigN, cBigFrame;
-    static double cSumDiffIRE, cSumDeliveredIRE;
-    static int cLastLine = -1;
-    static long cFrameIdx = 0;
-    const bool censusThisLine =
-        censusFvf && line >= cL0 && line <= cL1;
-    if (censusFvf) {
-        if (line < cLastLine && cN > 0) {
-            std::fprintf(stderr,
-                "[FVFCENSUS f=%ld ln=%d-%d col=%d-%d] px=%ld  frame wins %.1f%%\n"
-                "  where candidates differ >0.5 IRE: %.1f%% of px, frame wins %.1f%%\n"
-                "  where they differ >2.0 IRE:       %.1f%% of px, frame wins %.1f%%\n"
-                "  mean |frame-field| %.2f IRE, mean delivered by the choice %.2f IRE\n",
-                cFrameIdx, cL0, std::min(cL1, 9999), cC0, std::min(cC1, 9999),
-                cN, 100.0 * cFrame / cN,
-                100.0 * cDiffN / cN,
-                cDiffN > 0 ? 100.0 * cDiffFrame / cDiffN : 0.0,
-                100.0 * cBigN / cN,
-                cBigN > 0 ? 100.0 * cBigFrame / cBigN : 0.0,
-                cSumDiffIRE / cN, cSumDeliveredIRE / cN);
-            cFrameIdx++;
-            cN = cFrame = cDiffN = cDiffFrame = cBigN = cBigFrame = 0;
-            cSumDiffIRE = cSumDeliveredIRE = 0.0;
-        }
-        cLastLine = line;
-    }
 
     // Radius of the horizontal neighbor window used in cross-domain estimation.
     // Kept local: this is not a tunable in the current header.
@@ -2303,45 +1929,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         winner[rel]   = idx;
         outVal[rel]   = val;
         outShade[rel] = shade;
-        if (probeFvf && line >= probeLine0 && line <= probeLine1 &&
-            rel >= probeC0 && rel <= probeC1)
-        {
-            std::fprintf(stderr,
-                "[FVF] line=%d rel=%d idx=%d FA=%.2f FB=%.2f FR=%.2f "
-                "L1=%.2f scoreA=%.4f scoreB=%.4f scoreR=%.4f "
-                "hIRE=%.2f vIRE=%.2f chroma=%.2f diff=%.2f "
-                "lumFA=%.2f lumFB=%.2f lumFR=%.2f\n",
-                line,
-                rel,
-                idx,
-                FA * invI,
-                FB * invI,
-                FR * invI,
-                L1 * invI,
-                scoreA,
-                scoreB,
-                scoreR,
-                hIRE,
-                vIRE,
-                chromaMagIRE,
-                diff_fvf_ire,
-                lumFA * invI,
-                lumFB * invI,
-                lumFR * invI);
-        }
-        if (censusThisLine && rel >= cC0 && rel <= cC1) {
-            const double fieldBest = (scoreA <= scoreB) ? FA : FB;
-            const double dIRE = std::fabs(FR - fieldBest) * invI;
-            const bool frameWon = (idx == 2);
-            cN++;
-            if (frameWon) cFrame++;
-            cSumDiffIRE += dIRE;
-            // What the election actually delivered relative to always taking
-            // the field model: zero unless the frame model won.
-            if (frameWon) cSumDeliveredIRE += dIRE;
-            if (dIRE > 0.5) { cDiffN++; if (frameWon) cDiffFrame++; }
-            if (dIRE > 2.0) { cBigN++;  if (frameWon) cBigFrame++; }
-        }
         if      (idx == 2) frameCountTotal++;
         else if (idx == 0 || idx == 1) fieldCountTotal++;
         metrics.winner = idx;
@@ -2721,75 +2308,6 @@ void Comb::FrameBuffer::split2D()
 
     if (width <= 0 || firstLine >= lastLine) return;
 
-    // Reset the per-frame comb-vs-truth census (see the flush call at the end
-    // of this function). One FrameBuffer's split2D() call == one frame, so
-    // scoping the probe to this call avoids any cross-thread accumulation.
-    if (CombFvfCertProbe::on())
-        g_combFvfCertProbe = CombFvfCertProbe();
-
-    // LDCD_DUMP_1DDIAG=1: dump raw / blind-bandpass / locked-1D scalars over
-    // the LDCD_PROBE_CEDE window, one text block per line per frame, for the
-    // demod-smear signature analysis (the white-then-black doublet the
-    // locked path renders at chroma-envelope steps and the bucket path does
-    // not). Measurement only; parse offline.
-    {
-        static const bool dump1d = std::getenv("LDCD_DUMP_1DDIAG") != nullptr;
-        if (dump1d && configuration.phaseCompensation) {
-            static const auto dEnv = [](const char *n, int f) {
-                const char *s = std::getenv(n); return s ? std::atoi(s) : f;
-            };
-            static const int dL0 = dEnv("LDCD_PROBE_CEDE_L0", firstLine);
-            static const int dL1 = dEnv("LDCD_PROBE_CEDE_L1", lastLine - 1);
-            static const int dC0 = dEnv("LDCD_PROBE_CEDE_C0", 0);
-            static const int dC1 = dEnv("LDCD_PROBE_CEDE_C1", width - 1);
-            static long dumpFrame = 0;
-            const int c0 = std::max(0, dC0), c1 = std::min(width - 1, dC1);
-            for (int line = std::max(firstLine, dL0);
-                 line <= std::min(lastLine - 1, dL1); ++line) {
-                const quint16 *raw =
-                    rawbuffer.data() + line * videoParameters.fieldWidth;
-                const double *bp = clpbuffer[0].pixel[line];
-                const double *locked = locked1DSource_line(line);
-                if (!locked) continue;
-                const float *fit = carrierFit_line(line);
-                std::fprintf(stderr, "1DDIAG f=%ld ln=%d c0=%d irescale=%.4f\n",
-                             dumpFrame, line, c0, irescale);
-                // Colourburst columns from the METADATA window, not a guess:
-                // the first attempt hardcoded h 40..130, caught sync-edge
-                // energy, and measured deterministic line structure instead
-                // of jitter. The header carries the window bounds so the
-                // offline estimator knows exactly what it was given.
-                static const bool dumpBurst =
-                    std::getenv("LDCD_DUMP_1DDIAG_BURST") != nullptr;
-                if (dumpBurst &&
-                    videoParameters.colourBurstStart >= 0 &&
-                    videoParameters.colourBurstEnd >
-                        videoParameters.colourBurstStart) {
-                    const int b0 = std::max(0, videoParameters.colourBurstStart);
-                    const int b1 = std::min(left, videoParameters.colourBurstEnd);
-                    std::fprintf(stderr, "BST b0=%d b1=%d", b0, b1);
-                    for (int hh = b0; hh < b1; ++hh)
-                        std::fprintf(stderr, " %u", (unsigned)raw[hh]);
-                    std::fprintf(stderr, "\n");
-                }
-                for (int pass = 0; pass < 4; ++pass) {
-                    if (pass == 3 && !fit) break;
-                    std::fprintf(stderr, pass == 0 ? "RAW" : pass == 1 ? "BP"
-                                       : pass == 2 ? "LK" : "FIT");
-                    for (int rel = c0; rel <= c1; ++rel) {
-                        const double v = pass == 0 ? (double)raw[left + rel]
-                                       : pass == 1 ? bp[left + rel]
-                                       : pass == 2 ? locked[rel]
-                                       : (double)fit[rel];
-                        std::fprintf(stderr, " %.1f", v);
-                    }
-                    std::fprintf(stderr, "\n");
-                }
-            }
-            dumpFrame++;
-        }
-    }
-
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
         static const bool useLockedRawBandpassLine = [] {
             const char *s = std::getenv("LD_LINE_USE_LOCKED_RAW_BANDPASS");
@@ -2826,22 +2344,6 @@ void Comb::FrameBuffer::split2D()
         return s && std::atoi(s) != 0;
     }();
     if (oldSplit2D) {
-        // Branch statistics for the rebuild study, windowed with the same
-        // envs as the cede probe (LDCD_PROBE_CEDE + _L0/_L1/_C0/_C1).
-        static const bool oldStats = std::getenv("LDCD_PROBE_CEDE") != nullptr;
-        static const auto envInt = [](const char *name, int fallback) {
-            const char *s = std::getenv(name);
-            return s ? std::atoi(s) : fallback;
-        };
-        static const int pL0 = envInt("LDCD_PROBE_CEDE_L0", 0);
-        static const int pL1 = envInt("LDCD_PROBE_CEDE_L1", 1 << 30);
-        static const int pC0 = envInt("LDCD_PROBE_CEDE_C0", 0);
-        static const int pC1 = envInt("LDCD_PROBE_CEDE_C1", 1 << 30);
-        static long o2FrameIdx = 0;
-        long nPx = 0, nTwoLeg = 0, nOneLeg = 0, nFallback = 0, nNone = 0;
-        double sumKp = 0.0, sumKn = 0.0, sumSc = 0.0;
-        long nScHot = 0;  // sc > 1.5: weak coherence being amplified
-
         static constexpr double blackLine[MAX_WIDTH] = {0};
         for (int lineNumber = firstLine; lineNumber < lastLine; lineNumber++) {
             const double *previousLine = blackLine;
@@ -2867,7 +2369,6 @@ void Comb::FrameBuffer::split2D()
                 kn = qBound(0.0, 1 - (kn / kRange), 1.0);
 
                 double sc = 1.0;
-                int branch;  // diagnostic only: 1 two-leg, 2 one-leg, 3 fallback-similar, 4 none
 
                 if ((kn > 0) || (kp > 0)) {
                     if (kn > (3 * kp)) kp = 0;
@@ -2875,14 +2376,10 @@ void Comb::FrameBuffer::split2D()
 
                     sc = (2.0 / (kn + kp));
                     if (sc < 1.0) sc = 1.0;
-                    branch = (kp > 0 && kn > 0) ? 1 : 2;
                 } else {
                     if ((fabs(fabs(previousLine[h]) - fabs(nextLine[h])) -
                          fabs((nextLine[h] + previousLine[h]) * .2)) <= 0) {
                         kn = kp = 1;
-                        branch = 3;
-                    } else {
-                        branch = 4;
                     }
                 }
 
@@ -2892,37 +2389,11 @@ void Comb::FrameBuffer::split2D()
                 tc1 /= 4;
 
                 clpbuffer[1].pixel[lineNumber][h] = tc1;
-
-                if (oldStats &&
-                    lineNumber >= pL0 && lineNumber <= pL1 &&
-                    (h - left) >= pC0 && (h - left) <= pC1)
-                {
-                    nPx++;
-                    sumKp += kp; sumKn += kn; sumSc += sc;
-                    if (sc > 1.5) nScHot++;
-                    if (branch == 1) nTwoLeg++;
-                    else if (branch == 2) nOneLeg++;
-                    else if (branch == 3) nFallback++;
-                    else nNone++;
-                }
             }
             if (writeWeights && lineNumber < (int)w2d_frame_weight.size())
                 std::fill(w2d_frame_weight[lineNumber].begin(),
                           w2d_frame_weight[lineNumber].end(), 0.0f);
         }
-        if (oldStats && nPx > 0) {
-            std::fprintf(stderr,
-                "[OLD2D f=%ld ln=%d-%d col=%d-%d] px=%ld  "
-                "twoLeg %.1f%% oneLeg %.1f%% fallback %.1f%% none %.1f%%  "
-                "kp %.2f kn %.2f sc %.2f scHot(>1.5) %.1f%%\n",
-                o2FrameIdx, pL0, std::min(pL1, 9999), pC0, std::min(pC1, 9999),
-                nPx,
-                100.0 * nTwoLeg / nPx, 100.0 * nOneLeg / nPx,
-                100.0 * nFallback / nPx, 100.0 * nNone / nPx,
-                sumKp / nPx, sumKn / nPx, sumSc / nPx,
-                100.0 * nScHot / nPx);
-        }
-        o2FrameIdx++;
         return;
     }
 
@@ -3151,6 +2622,12 @@ void Comb::FrameBuffer::split2D()
                         }
                     }
                 } else {
+                    // MEASURED, on the produceY-level oracle: a
+                    // mean-of-contestants comparison can look close while
+                    // real per-pixel headroom hides behind anti-correlated
+                    // errors. So the quality of what this election collapses
+                    // into one scalar cannot be read off the mean error of
+                    // its ingredients -- it has to be asked per pixel.
                     scoreFieldVsFrame(
                         line,
                         tapLine,
@@ -3163,50 +2640,6 @@ void Comb::FrameBuffer::split2D()
                         writeWeights,
                         scratch_lateralLine.data(),
                         &frameIQ);
-
-                    // ---- LDCD_PROBE_COMBFVF: grade the FOUR raw comb
-                    // ingredients (A-side, Field B, Frame B, FVF blend)
-                    // against certified luma BEFORE they collapse into one
-                    // scalar. User (2026-08-01): "comb seems to be the real
-                    // low-hanging fruit... go ahead" -- one level deeper than
-                    // YCAND's produceY-level oracle: this asks whether the
-                    // slope deficit measured there is already baked in by
-                    // FVF's inner election, or introduced downstream.
-                    // Held-out is automatic here: nothing in this scope reads
-                    // the certified family, so no CERT_1D gate is needed.
-                    if (CombFvfCertProbe::on() && line >= firstLine &&
-                        line < lastLine) {
-                        const float *ex = exactCarrierRow(line);
-                        if (ex) {
-                            const quint16 *rawLine = rawbuffer.constData() +
-                                line * videoParameters.fieldWidth;
-                            const bool aIsFrame =
-                                wantFvf && fvfUseFrameModel;
-                            for (int rel = 1; rel < width - 1; ++rel) {
-                                const int h = left + rel;
-                                const float e = ex[h];
-                                if (!std::isfinite(e)) continue;
-                                const double lTrue =
-                                    (double)rawLine[h] - (double)e;
-                                const double rawH = (double)rawLine[h];
-                                const double yA = rawH -
-                                    (aIsFrame
-                                        ? scratch_frameAAdaptiveIQComposite[rel]
-                                        : scratch_lineWorkA[rel]);
-                                const double yFieldB =
-                                    rawH - scratch_lineWorkC[rel];
-                                const double yFrameB = rawH -
-                                    scratch_frameBDirectIQComposite[rel];
-                                double vMixed = scratch_outMixed[rel];
-                                if (!std::isfinite(vMixed))
-                                    vMixed = scratch_lineWorkC[rel];
-                                const double yMixed = rawH - vMixed;
-                                g_combFvfCertProbe.note(
-                                    aIsFrame, yA, yFieldB, yFrameB, yMixed,
-                                    lTrue, invIreScale);
-                            }
-                        }
-                    }
 
                     for (int rel = 0; rel < width; ++rel) {
                         double vMixed = scratch_outMixed[rel];
@@ -3235,9 +2668,6 @@ void Comb::FrameBuffer::split2D()
         CombContentReach::markVerticalChromaBoundaryBand(
             chromaBoundaryBand_flat, demodWidth, width, firstLine, lastLine, 1);
     }
-
-    if (CombFvfCertProbe::on())
-        g_combFvfCertProbe.flushOnce();
 }
 
 // 3D temporal adaptive
@@ -3347,41 +2777,6 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                     shareRaw[idx] = static_cast<float>(wT / (wT + w2d));
                 }
             }
-        }
-
-        // Share diagnostics (LDCD_PROBE_SHARE=1): does the acceptance
-        // strength actually alternate by parity, and how often are temporal
-        // members admitted at all?
-        static const bool probeShare = []{
-            const char *e = std::getenv("LDCD_PROBE_SHARE");
-            return e && std::atoi(e) != 0;
-        }();
-        if (probeShare) {
-            double sEven = 0, sOdd = 0; long nEven = 0, nOdd = 0, nNonZero = 0;
-            double altSum = 0; long altN = 0;
-            for (int line = firstLine; line < lastLine; ++line) {
-                const float *s0 = shareRaw.data() + (size_t)line * width;
-                for (int x = 0; x < width; ++x) {
-                    if (s0[x] > 0.0f) ++nNonZero;
-                    if (line & 1) { sOdd += s0[x]; ++nOdd; }
-                    else          { sEven += s0[x]; ++nEven; }
-                }
-                if (line + 1 < lastLine) {
-                    const float *s1 = shareRaw.data() + (size_t)(line + 1) * width;
-                    for (int x = 0; x < width; ++x) {
-                        altSum += std::fabs((double)s0[x] - (double)s1[x]);
-                        ++altN;
-                    }
-                }
-            }
-            std::fprintf(stderr,
-                "[SHARE] admitted %.1f%%  mean even %.3f odd %.3f (gap %.3f)  "
-                "line-to-line |dShare| %.3f\n",
-                100.0 * nNonZero / std::max<long>(1, nEven + nOdd),
-                nEven ? sEven / nEven : 0.0, nOdd ? sOdd / nOdd : 0.0,
-                std::fabs((nEven ? sEven / nEven : 0.0) -
-                          (nOdd ? sOdd / nOdd : 0.0)),
-                altN ? altSum / altN : 0.0);
         }
 
         // Pass 2: vertical [1,2,1] then lateral boxcar on the SHARE.
@@ -3819,31 +3214,6 @@ void Comb::FrameBuffer::splitIQ()
             Q[h] = sq;
         }
     }
-
-    // BUCKETDIAG: dump comb carrier, raw I/Q, Y at the problem location.
-    // Same env vars as CCDIAG: CC_DIAG_LINE, CC_DIAG_C0, CC_DIAG_C1.
-    {
-        static const int diagLine = qEnvironmentVariableIntValue("CC_DIAG_LINE");
-        static const int diagC0   = qEnvironmentVariableIntValue("CC_DIAG_C0");
-        static const int diagC1   = qEnvironmentVariableIntValue("CC_DIAG_C1");
-        if (diagLine > 0 && diagC0 > 0 && diagC1 > diagC0 &&
-            diagLine >= firstLine && diagLine < lastLine)
-        {
-            const int ln = diagLine;
-            const double *I = componentFrame->u(ln);
-            const double *Q = componentFrame->v(ln);
-            const double *Y = componentFrame->y(ln);
-            const int f = carrierLineFlip(ln);
-            fprintf(stderr, "BUCKETDIAG splitIQ line=%d flip=%d cols=%d..%d\n",
-                    ln, f, diagC0, diagC1);
-            for (int h = diagC0; h <= diagC1 && h < videoParameters.activeVideoEnd; ++h) {
-                double clp = clpbuffer[configuration.dimensions - 1].pixel[ln][h];
-                qint32 ph = carrierSampleClass(ln, h);
-                fprintf(stderr, "  h=%d ph=%d clp=%.3f I=%.3f Q=%.3f Y=%.1f\n",
-                        h, ph, clp, I[h], Q[h], Y[h]);
-            }
-        }
-    }
 }
 
 
@@ -3881,23 +3251,6 @@ void Comb::FrameBuffer::adjustY()
             Y[h] -= comp;
         }
     }
-
-    // BUCKETDIAG: Y after chroma subtraction
-    {
-        static const int diagLine = qEnvironmentVariableIntValue("CC_DIAG_LINE");
-        static const int diagC0   = qEnvironmentVariableIntValue("CC_DIAG_C0");
-        static const int diagC1   = qEnvironmentVariableIntValue("CC_DIAG_C1");
-        if (diagLine > 0 && diagC0 > 0 && diagC1 > diagC0 &&
-            diagLine >= firstLine && diagLine < lastLine)
-        {
-            const int ln = diagLine;
-            const double *Y = componentFrame->y(ln);
-            fprintf(stderr, "BUCKETDIAG adjustY line=%d cols=%d..%d\n", ln, diagC0, diagC1);
-            for (int h = diagC0; h <= diagC1 && h < right; ++h) {
-                fprintf(stderr, "  h=%d Y=%.3f\n", h, Y[h]);
-            }
-        }
-    }
 }
 
 // Bucket-path chroma low-pass filter: applies a symmetric FIR to the I and Q
@@ -3924,25 +3277,6 @@ void Comb::FrameBuffer::filterIQ()
         std::copy(temp, temp + width, I);
         iqFilter.apply(Q, temp, width);
         std::copy(temp, temp + width, Q);
-    }
-
-    // BUCKETDIAG: I/Q after low-pass filter
-    {
-        static const int diagLine = qEnvironmentVariableIntValue("CC_DIAG_LINE");
-        static const int diagC0   = qEnvironmentVariableIntValue("CC_DIAG_C0");
-        static const int diagC1   = qEnvironmentVariableIntValue("CC_DIAG_C1");
-        if (diagLine > 0 && diagC0 > 0 && diagC1 > diagC0 &&
-            diagLine >= firstLine && diagLine < lastLine)
-        {
-            const int ln = diagLine;
-            const double *I = componentFrame->u(ln) + startH;
-            const double *Q = componentFrame->v(ln) + startH;
-            fprintf(stderr, "BUCKETDIAG filterIQ line=%d cols=%d..%d\n", ln, diagC0, diagC1);
-            for (int h = diagC0; h <= diagC1 && h < startH + width; ++h) {
-                int rel = h - startH;
-                fprintf(stderr, "  h=%d I=%.3f Q=%.3f\n", h, I[rel], Q[rel]);
-            }
-        }
     }
 }
 
