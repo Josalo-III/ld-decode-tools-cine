@@ -48,6 +48,15 @@ protected:
     void run() override;
 
 private:
+    // A luma sample paired with the SNR weight of the source it came from. Value
+    // and weight travel as one object through the neighbour cache, dropout
+    // filtering and stacking, so a compacted sample list can never desynchronise
+    // from its weights the way two parallel vectors could.
+    struct WeightedSample {
+        quint16 value;
+        double  weight;
+    };
+
     QAtomicInt& abort;
     StackingPool& stackingPool;
     QVector<LdDecodeMetaData::VideoParameters> videoParameters;
@@ -67,27 +76,27 @@ private:
     void getProcessedSample(const qint32 x, const qint32 y,
                             const QVector<qint32>& availableSourcesForFrame,
                             const QVector<SourceVideo::Data>& inputFields,
-                            QHash<qint32, QVector<quint16>>& tmpField,
+                            const QVector<double>& sourceSnrWeights,
+                            QHash<qint32, QVector<WeightedSample>>& tmpField,
                             const QVector<QVector<QVector<QPair<qint32,qint32>>>>& srcDropMap,
                             const LdDecodeMetaData::VideoParameters& videoParameters,
                             const QVector<LdDecodeMetaData::Field>& fieldMetadata,
-                            QVector<quint16>& sample,
-                            QVector<quint16>& sampleN, QVector<quint16>& sampleS,
-                            QVector<quint16>& sampleE, QVector<quint16>& sampleW,
+                            QVector<WeightedSample>& sample,
+                            QVector<WeightedSample>& sampleN, QVector<WeightedSample>& sampleS,
+                            QVector<WeightedSample>& sampleE, QVector<WeightedSample>& sampleW,
                             QVector<bool>& isAllDropout,
                             const bool& noDiffDod, const bool& verbose);
 
-    inline quint16 median(QVector<quint16> v);
-    inline quint16 medoid(const QVector<quint16>& v);
-    inline qint32  mean(const QVector<quint16>& v);
+    inline quint16 median(QVector<WeightedSample> v);
+    inline quint16 medoid(const QVector<WeightedSample>& v);
+    inline qint32  mean(const QVector<WeightedSample>& v);
     inline quint16 closest(const QVector<quint16>& v, const qint32 target);
-    inline quint16 closestSnr(const QVector<quint16>& v, const QVector<double>& weights,
+    inline quint16 closestSnr(const QVector<WeightedSample>& v,
                                const qint32 target, const double maxPenalty);
 
-    quint16 stackMode(const QVector<quint16>& elements,
-                      const QVector<double>& elementSnrWeights,
-                      const QVector<quint16>& elementsN, const QVector<quint16>& elementsS,
-                      const QVector<quint16>& elementsE, const QVector<quint16>& elementsW,
+    quint16 stackMode(const QVector<WeightedSample>& elements,
+                      const QVector<WeightedSample>& elementsN, const QVector<WeightedSample>& elementsS,
+                      const QVector<WeightedSample>& elementsE, const QVector<WeightedSample>& elementsW,
                       const QVector<bool>& isAllDropout,
                       const qint32& mode, const qint32& smartThreshold,
                       const qint32& snrWeightThreshold);
@@ -95,7 +104,7 @@ private:
     inline bool isDropout(const DropOuts& dropOuts, const qint32 fieldX, const qint32 fieldY);
     inline bool haveAllDropout(const QVector<LdDecodeMetaData::Field>& fieldMetadata,
                                 const qint32 x, const qint32 y);
-    QVector<quint16> diffDod(const QVector<quint16>& inputValues,
+    QVector<WeightedSample> diffDod(const QVector<WeightedSample>& inputValues,
                              const LdDecodeMetaData::VideoParameters& videoParameters,
                              const bool& verbose);
 };

@@ -35,6 +35,7 @@
 #include "lddecodemetadata.h"
 #include "sourcevideo.h"
 #include "stackingpool.h"
+#include "stackingmodes.h"
 
 int main(int argc, char *argv[])
 {
@@ -105,13 +106,11 @@ int main(int argc, char *argv[])
                                         QCoreApplication::translate("main", "number"));
     parser.addOption(threadsOption);
 
-    // Option to select the stacking mode (-m)
+    // Option to select the stacking mode (-m). The summary of modes is derived
+    // from STACKING_MODES (stackingmodes.h) so it cannot drift from --help-mode.
     QCommandLineOption modeOption(QStringList() << "m" << "mode",
-                                        QCoreApplication::translate(
-                                         "main", "Specify the stacking mode to use (default is Auto) "
-                                         "-1 = auto / 0 = mean / 1 = median / 2 = smart mean / "
-                                         "3 = smart neighbor / 4 = neighbor / 5 = smart local neighbor / "
-                                         "6 = medoid with local neighbor / 7 = medoid"),
+                                        QStringLiteral("Specify the stacking mode to use (default is Auto) ")
+                                         + stackingModeSummary(),
                                          QCoreApplication::translate("main", "number"));
     parser.addOption(modeOption);
 
@@ -177,20 +176,8 @@ int main(int argc, char *argv[])
         qInfo() << "GPLv3 Open-Source - github: https://github.com/happycube/ld-decode";
         qInfo() << "For more info on stacking mode, use --help-mode\n";
         qInfo() << "Mode:\n";
-        qInfo() << "(-1) auto                : select mode depending on the number off frame available (2f: mean, 3~4f: smart mean, 5+f: smart-neighbor)\n";
-        qInfo() << " (0) mean                : average all samples not marked as dropouts using mean\n";
-        qInfo() << " (1) median              : find the median from samples not marked as dropout\n";
-        qInfo() << " (2) smart mean          : find the median from samples not marked as dropout then average all value within (median + smartThreshold) or (median - smart Threshold) using mean\n";
-        qInfo() << " (3) smart neighbor      : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
-        qInfo() << "                           then take the closest value to the median of the current sample from the different closest value found";
-        qInfo() << "                           then average all value within (selectedSample + smartThreshold) or (selectedSample - smart threshold) using mean";
-        qInfo() << "                           when only 2 sources are available, it take the closest sample to the neighbor\n";
-        qInfo() << "(4) neighbor             : find the median for every surroundings pixel not marked as dropout then find the closest sample to the surrounding median value for each neighbor";
-        qInfo() << "                           then take the closest value to the median of the current sample from the different closest value found then average the selected sample with the median";
-        qInfo() << "                           when only 2 sources are available, it take the closest sample to the neighbor";
-        qInfo() << "(5) local neighbor       : derive a medoid from the sample set, use it to identify and exclude outliers, then apply the neighbor process (as in mode 4) on the inlier set";
-        qInfo() << "(6) smart local neighbor : derive a medoid to exclude outliers, then apply the smart neighbor process (from mode 3) on the inlier set";
-        qInfo() << "(7) medoid               : return the sample with the shortest total distance to all other samples (falls back to median/mean for small sets)";
+        const QStringList modeLines = stackingModeHelp().split(QLatin1Char('\n'));
+        for (const QString& line : modeLines) qInfo().noquote() << line;
         return 0; // Exit after showing detailed help
     }
 
@@ -222,13 +209,13 @@ int main(int argc, char *argv[])
     }
 
     // Get the arguments from the parser
-    qint32 mode = -1;
+    qint32 mode = STACKING_MODE_AUTO;
     if (parser.isSet(modeOption)) {
         mode = parser.value(modeOption).toInt();
 
-        if (mode > 7 || mode < -1) {
+        if (mode > stackingModeMaxId() || mode < stackingModeMinId()) {
             qInfo() << "Specified mode (" << mode << ") is unknown, using auto mode instead";
-            mode = -1;
+            mode = STACKING_MODE_AUTO;
         }
     }
 

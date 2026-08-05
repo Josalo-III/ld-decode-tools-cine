@@ -618,9 +618,9 @@ void StackingPool::replaceFieldMetaData(qint32 frameNumber)
                 ldDecodeMetaData[sourceNo]->getNumberOfFrames() < currentSourceFrameNumber) continue;
             qint32 otherFieldNumber = 0;
             if constexpr (field == 1)
-                otherFieldNumber = ldDecodeMetaData[sourceNo]->getFirstFieldNumber(frameNumber);
+                otherFieldNumber = ldDecodeMetaData[sourceNo]->getFirstFieldNumber(currentSourceFrameNumber);
             else
-                otherFieldNumber = ldDecodeMetaData[sourceNo]->getSecondFieldNumber(frameNumber);
+                otherFieldNumber = ldDecodeMetaData[sourceNo]->getSecondFieldNumber(currentSourceFrameNumber);
             if (ldDecodeMetaData[sourceNo]->getField(otherFieldNumber).pad) continue;
             LdDecodeMetaData::Field potentialField = ldDecodeMetaData[sourceNo]->getField(otherFieldNumber);
             potentialField.seqNo        = currentField.seqNo;

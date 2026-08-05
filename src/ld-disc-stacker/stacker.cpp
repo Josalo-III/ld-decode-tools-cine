@@ -99,7 +99,7 @@ void Stacker::stackField(const qint32 frameNumber,
     // Sparse cache of pixel sample vectors for neighbour lookup in modes >= 3.
     // QHash avoids allocating ~150,000 empty QVector objects upfront; only
     // slots that are actually written incur any allocation.
-    QHash<qint32, QVector<quint16>> tmpField;
+    QHash<qint32, QVector<WeightedSample>> tmpField;
     tmpField.reserve(videoParameters.fieldWidth * 4);
 
     if (availableSourcesForFrame.size() > 0) {
@@ -136,47 +136,36 @@ void Stacker::stackField(const qint32 frameNumber,
         };
 
         // Hoist per-pixel working vectors outside the inner loop to avoid
-        // repeated heap allocation.
-        QVector<quint16> inputValues, valuesN, valuesS, valuesE, valuesW;
-        QVector<double>  inputSnrWeights;
+        // repeated heap allocation. Each sample carries its source's SNR weight
+        // inline, so a value and its weight can never be separated downstream.
+        QVector<WeightedSample> inputValues, valuesN, valuesS, valuesE, valuesW;
         inputValues.reserve(nSrc);
         valuesN.reserve(nSrc); valuesS.reserve(nSrc);
         valuesE.reserve(nSrc); valuesW.reserve(nSrc);
-        inputSnrWeights.reserve(nSrc);
 
         for (qint32 y = 0; y < videoParameters.fieldHeight; y++) {
             const qint32 rowOffset = videoParameters.fieldWidth * y;
             for (qint32 x = 0; x < videoParameters.fieldWidth; x++) {
-                inputValues.clear();     inputSnrWeights.clear();
+                inputValues.clear();
                 valuesN.clear();         valuesS.clear();
                 valuesE.clear();         valuesW.clear();
                 QVector<bool> isAllDropout = {true, true, true, true, true};
 
                 if (mode >= 3) {
-                    getProcessedSample(x, y, availableSourcesForFrame, inputFields, tmpField,
-                                       srcDropMap, videoParameters, fieldMetadata,
+                    getProcessedSample(x, y, availableSourcesForFrame, inputFields, sourceSnrWeights,
+                                       tmpField, srcDropMap, videoParameters, fieldMetadata,
                                        inputValues, valuesN, valuesS, valuesE, valuesW,
                                        isAllDropout, noDiffDod, verbose);
-
-                    // Assign SNR weights positionally from availableSourcesForFrame
-                    // to match the order in which inputValues were populated.
-                    inputSnrWeights.resize(inputValues.size());
-                    qint32 wi = 0;
-                    for (qint32 i = 0; i < availableSourcesForFrame.size() && wi < inputValues.size(); i++)
-                        inputSnrWeights[wi++] = (i < sourceSnrWeights.size()) ? sourceSnrWeights[i] : 0.0;
                 } else {
                     for (qint32 i = 0; i < availableSourcesForFrame.size(); i++) {
                         const quint16 pixelValue = inputFields[availableSourcesForFrame[i]][rowOffset + x];
                         const bool sampleIsDropout = fastIsDropout(i, x, y);
                         const double w = (i < sourceSnrWeights.size()) ? sourceSnrWeights[i] : 0.0;
 
-                        if (!sampleIsDropout) {
-                            inputValues.append(pixelValue);
-                            inputSnrWeights.append(w);
-                        } else if (pixelValue > 0 && !noDiffDod) {
-                            inputValues.append(pixelValue);
-                            inputSnrWeights.append(w);
-                        }
+                        if (!sampleIsDropout)
+                            inputValues.append({pixelValue, w});
+                        else if (pixelValue > 0 && !noDiffDod)
+                            inputValues.append({pixelValue, w});
 
                         if (!sampleIsDropout)
                             isAllDropout[0] = false;
@@ -188,24 +177,22 @@ void Stacker::stackField(const qint32 frameNumber,
                                 const double medianValue = static_cast<double>(median(inputValues));
                                 const double minValue = qMax(0.0,     medianValue - (medianValue / 100.0) * 10.0);
                                 const double maxValue = qMin(65535.0, medianValue + (medianValue / 100.0) * 10.0);
-                                QVector<quint16> filteredValues;
-                                QVector<double>  filteredWeights;
+                                QVector<WeightedSample> filteredValues;
                                 filteredValues.reserve(inputValues.size());
-                                filteredWeights.reserve(inputValues.size());
                                 for (qint32 pi = 0; pi < inputValues.size(); pi++) {
-                                    if (inputValues[pi] > minValue && inputValues[pi] < maxValue) {
+                                    if (inputValues[pi].value > minValue && inputValues[pi].value < maxValue)
                                         filteredValues.append(inputValues[pi]);
-                                        filteredWeights.append((pi < inputSnrWeights.size()) ? inputSnrWeights[pi] : 0.0);
-                                    }
                                 }
                                 inputValues.swap(filteredValues);
-                                inputSnrWeights.swap(filteredWeights);
                             }
 
                             if (verbose) {
-                                if (inputValues.size() > 0)
+                                if (inputValues.size() > 0) {
+                                    QVector<quint16> recovered; recovered.reserve(inputValues.size());
+                                    for (const auto& s : inputValues) recovered.append(s.value);
                                     qInfo().nospace() << "Frame #" << frameNumber << ": DiffDOD recovered " << inputValues.size()
-                                                      << " values: " << inputValues << " for field location (" << x << ", " << y << ")";
+                                                      << " values: " << recovered << " for field location (" << x << ", " << y << ")";
+                                }
                                 else if (x > videoParameters.colourBurstStart)
                                     qInfo().nospace() << "Frame #" << frameNumber << ": DiffDOD failed, no values recovered for field location (" << x << ", " << y << ")";
                                 else
@@ -230,16 +217,19 @@ void Stacker::stackField(const qint32 frameNumber,
                     outputField[rowOffset + x] = prevGoodValue;
                     if (x > videoParameters.colourBurstStart) dropOuts.append(x, x, y + 1);
                 } else if (inputValues.size() == 1) {
-                    outputField[rowOffset + x] = inputValues[0];
+                    outputField[rowOffset + x] = inputValues[0].value;
                     prevGoodValue = outputField[rowOffset + x];
                     if (forceDropout) dropOuts.append(x, x, y + 1);
                 } else {
-                    outputField[rowOffset + x] = stackMode(inputValues, inputSnrWeights,
+                    outputField[rowOffset + x] = stackMode(inputValues,
                                                             valuesN, valuesS, valuesE, valuesW,
                                                             isAllDropout, mode, smartThreshold,
                                                             snrWeightThreshold);
                     prevGoodValue = outputField[rowOffset + x];
-                    tmpField[rowOffset + x] = QVector<quint16>{prevGoodValue};
+                    // Cache the stacked result for neighbour lookups by later pixels/rows.
+                    // Only ever read back via neighbourEstimate (value only), so the
+                    // synthesised weight is immaterial.
+                    tmpField[rowOffset + x] = QVector<WeightedSample>{ {prevGoodValue, 0.0} };
                     if (forceDropout) dropOuts.append(x, x, y + 1);
                 }
             }
@@ -255,12 +245,11 @@ void Stacker::stackField(const qint32 frameNumber,
     }
 }
 
-quint16 Stacker::stackMode(const QVector<quint16>& elements,
-                           const QVector<double>& elementSnrWeights,
-                           const QVector<quint16>& elementsN,
-                           const QVector<quint16>& elementsS,
-                           const QVector<quint16>& elementsE,
-                           const QVector<quint16>& elementsW,
+quint16 Stacker::stackMode(const QVector<WeightedSample>& elements,
+                           const QVector<WeightedSample>& elementsN,
+                           const QVector<WeightedSample>& elementsS,
+                           const QVector<WeightedSample>& elementsE,
+                           const QVector<WeightedSample>& elementsW,
                            const QVector<bool>& isAllDropout,
                            const qint32& mode,
                            const qint32& smartThreshold,
@@ -271,7 +260,7 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
     quint32 result = 0;
     QVector<quint16> closestList;
 
-    const double maxSnrPenalty = (elementSnrWeights.size() == nbOfElements && nbOfElements > 1)
+    const double maxSnrPenalty = (nbOfElements > 1)
                                   ? static_cast<double>(snrWeightThreshold) * 0.5
                                   : 0.0;
 
@@ -279,11 +268,14 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
     quint32 resultNeighbor = 0;
     qint32 nbNeighbor = 0;
 
-    auto neighborEstimate = [&](const QVector<quint16>& v) -> qint32 {
+    auto neighborEstimate = [&](const QVector<WeightedSample>& v) -> qint32 {
         if (v.size() <= 0) return -1;
         return Stacker::median(v);
     };
 
+    // Dispatch on mode id. The user-facing name and description of each case are
+    // defined once in STACKING_MODES (stackingmodes.h); keep these cases in step
+    // with that table.
     switch (mode) {
         case 0: // mean
         {
@@ -301,10 +293,10 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
         {
             const qint32 med = Stacker::median(elements);
             for (int i = 0; i < nbOfElements; i++) {
-                const qint32 v = static_cast<qint32>(elements[i]);
+                const qint32 v = static_cast<qint32>(elements[i].value);
                 if (v < med + smartThreshold && v > med - smartThreshold) {
                     nbSelected++;
-                    result += static_cast<quint32>(elements[i]);
+                    result += static_cast<quint32>(elements[i].value);
                 }
             }
             result = (nbSelected == 0) ? static_cast<quint32>(med) : (result / static_cast<quint32>(nbSelected));
@@ -331,10 +323,10 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
 
             closestList.clear();
             if (nbNeighbor > 0) {
-                if (resultN > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultN, maxSnrPenalty));
-                if (resultS > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultS, maxSnrPenalty));
-                if (resultE > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultE, maxSnrPenalty));
-                if (resultW > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultW, maxSnrPenalty));
+                if (resultN > 0) closestList.append(Stacker::closestSnr(elements, resultN, maxSnrPenalty));
+                if (resultS > 0) closestList.append(Stacker::closestSnr(elements, resultS, maxSnrPenalty));
+                if (resultE > 0) closestList.append(Stacker::closestSnr(elements, resultE, maxSnrPenalty));
+                if (resultW > 0) closestList.append(Stacker::closestSnr(elements, resultW, maxSnrPenalty));
                 resultNeighbor = Stacker::closest(closestList, med);
             } else {
                 resultNeighbor = static_cast<quint32>(med);
@@ -343,11 +335,11 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
             if (nbOfElements > 2) {
                 result = 0; nbSelected = 0;
                 for (int i = 0; i < nbOfElements; i++) {
-                    const qint32 v = static_cast<qint32>(elements[i]);
+                    const qint32 v = static_cast<qint32>(elements[i].value);
                     if (v < static_cast<qint32>(resultNeighbor) + smartThreshold &&
                         v > static_cast<qint32>(resultNeighbor) - smartThreshold) {
                         nbSelected++;
-                        result += static_cast<quint32>(elements[i]);
+                        result += static_cast<quint32>(elements[i].value);
                     }
                 }
                 result = (nbSelected == 0) ? resultNeighbor : (result / static_cast<quint32>(nbSelected));
@@ -377,10 +369,10 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
 
             closestList.clear();
             if (nbNeighbor > 0) {
-                if (resultN > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultN, maxSnrPenalty));
-                if (resultS > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultS, maxSnrPenalty));
-                if (resultE > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultE, maxSnrPenalty));
-                if (resultW > 0) closestList.append(Stacker::closestSnr(elements, elementSnrWeights, resultW, maxSnrPenalty));
+                if (resultN > 0) closestList.append(Stacker::closestSnr(elements, resultN, maxSnrPenalty));
+                if (resultS > 0) closestList.append(Stacker::closestSnr(elements, resultS, maxSnrPenalty));
+                if (resultE > 0) closestList.append(Stacker::closestSnr(elements, resultE, maxSnrPenalty));
+                if (resultW > 0) closestList.append(Stacker::closestSnr(elements, resultW, maxSnrPenalty));
                 result = Stacker::closest(closestList, med);
                 if (nbOfElements > 2)
                     result = (static_cast<quint32>(med) + result) / 2;
@@ -393,16 +385,12 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
         case 5: // local neighbor: medoid inlier gate + mode 4 on inliers
         {
             const qint32 center = static_cast<qint32>(Stacker::medoid(elements));
-            QVector<quint16> inliers;
-            QVector<double>  inlierWeights;
+            QVector<WeightedSample> inliers;
             inliers.reserve(nbOfElements);
-            inlierWeights.reserve(nbOfElements);
             for (int i = 0; i < nbOfElements; i++) {
-                const qint32 v = static_cast<qint32>(elements[i]);
-                if (v < center + smartThreshold && v > center - smartThreshold) {
+                const qint32 v = static_cast<qint32>(elements[i].value);
+                if (v < center + smartThreshold && v > center - smartThreshold)
                     inliers.append(elements[i]);
-                    inlierWeights.append((i < elementSnrWeights.size()) ? elementSnrWeights[i] : 0.0);
-                }
             }
             if (inliers.isEmpty()) { result = static_cast<quint32>(center); break; }
 
@@ -422,10 +410,10 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
 
             closestList.clear();
             if (nbNeighbor > 0) {
-                if (resultN > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultN, maxSnrPenalty));
-                if (resultS > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultS, maxSnrPenalty));
-                if (resultE > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultE, maxSnrPenalty));
-                if (resultW > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultW, maxSnrPenalty));
+                if (resultN > 0) closestList.append(Stacker::closestSnr(inliers, resultN, maxSnrPenalty));
+                if (resultS > 0) closestList.append(Stacker::closestSnr(inliers, resultS, maxSnrPenalty));
+                if (resultE > 0) closestList.append(Stacker::closestSnr(inliers, resultE, maxSnrPenalty));
+                if (resultW > 0) closestList.append(Stacker::closestSnr(inliers, resultW, maxSnrPenalty));
                 result = Stacker::closest(closestList, inlierMedian);
                 if (inliers.size() > 2)
                     result = (static_cast<quint32>(inlierMedian) + result) / 2;
@@ -438,16 +426,12 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
         case 6: // smart local neighbor: medoid inlier gate + medoid on inliers + mode 3 neighbour anchor
         {
             const qint32 center = static_cast<qint32>(Stacker::medoid(elements));
-            QVector<quint16> inliers;
-            QVector<double>  inlierWeights;
+            QVector<WeightedSample> inliers;
             inliers.reserve(nbOfElements);
-            inlierWeights.reserve(nbOfElements);
             for (int i = 0; i < nbOfElements; i++) {
-                const qint32 v = static_cast<qint32>(elements[i]);
-                if (v < center + smartThreshold && v > center - smartThreshold) {
+                const qint32 v = static_cast<qint32>(elements[i].value);
+                if (v < center + smartThreshold && v > center - smartThreshold)
                     inliers.append(elements[i]);
-                    inlierWeights.append((i < elementSnrWeights.size()) ? elementSnrWeights[i] : 0.0);
-                }
             }
             if (inliers.isEmpty()) { result = static_cast<quint32>(center); break; }
 
@@ -468,19 +452,19 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
             quint32 neighborAnchor = smartLocalAnchor;
             closestList.clear();
             if (nbNeighbor > 0) {
-                if (resultN > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultN, maxSnrPenalty));
-                if (resultS > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultS, maxSnrPenalty));
-                if (resultE > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultE, maxSnrPenalty));
-                if (resultW > 0) closestList.append(Stacker::closestSnr(inliers, inlierWeights, resultW, maxSnrPenalty));
+                if (resultN > 0) closestList.append(Stacker::closestSnr(inliers, resultN, maxSnrPenalty));
+                if (resultS > 0) closestList.append(Stacker::closestSnr(inliers, resultS, maxSnrPenalty));
+                if (resultE > 0) closestList.append(Stacker::closestSnr(inliers, resultE, maxSnrPenalty));
+                if (resultW > 0) closestList.append(Stacker::closestSnr(inliers, resultW, maxSnrPenalty));
                 const quint32 neighborSelection = Stacker::closest(closestList, static_cast<qint32>(smartLocalAnchor));
                 if (inliers.size() > 2) {
                     quint32 neighborSum = 0; qint32 neighborCount = 0;
                     for (int i = 0; i < inliers.size(); i++) {
-                        const qint32 v = static_cast<qint32>(inliers[i]);
+                        const qint32 v = static_cast<qint32>(inliers[i].value);
                         if (v < static_cast<qint32>(neighborSelection) + smartThreshold &&
                             v > static_cast<qint32>(neighborSelection) - smartThreshold) {
                             neighborCount++;
-                            neighborSum += static_cast<quint32>(inliers[i]);
+                            neighborSum += static_cast<quint32>(inliers[i].value);
                         }
                     }
                     neighborAnchor = (neighborCount == 0) ? neighborSelection : (neighborSum / static_cast<quint32>(neighborCount));
@@ -512,11 +496,11 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
     {
         constexpr double BAD_CONSENSUS_MIN_WEIGHT_FRACTION = 0.35;
 
-        if (nbOfElements >= 3 && elementSnrWeights.size() == nbOfElements) {
+        if (nbOfElements >= 3) {
             double totalWeight = 0.0, weightedSum = 0.0;
             for (int i = 0; i < nbOfElements; i++) {
-                totalWeight += elementSnrWeights[i];
-                weightedSum += elementSnrWeights[i] * static_cast<double>(elements[i]);
+                totalWeight += elements[i].weight;
+                weightedSum += elements[i].weight * static_cast<double>(elements[i].value);
             }
 
             if (totalWeight > 0.0) {
@@ -528,11 +512,11 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
 
                     double agreeingWeight = 0.0, agreeingWeightedSum = 0.0;
                     for (int i = 0; i < nbOfElements; i++) {
-                        const double v = static_cast<double>(elements[i]);
+                        const double v = static_cast<double>(elements[i].value);
                         if (v >= snrWeightedMean - static_cast<double>(snrWeightThreshold) &&
                             v <= snrWeightedMean + static_cast<double>(snrWeightThreshold)) {
-                            agreeingWeight      += elementSnrWeights[i];
-                            agreeingWeightedSum += elementSnrWeights[i] * v;
+                            agreeingWeight      += elements[i].weight;
+                            agreeingWeightedSum += elements[i].weight * v;
                         }
                     }
 
@@ -546,16 +530,17 @@ quint16 Stacker::stackMode(const QVector<quint16>& elements,
     return static_cast<quint16>(result);
 }
 
-inline quint16 Stacker::median(QVector<quint16> elements)
+inline quint16 Stacker::median(QVector<WeightedSample> elements)
 {
     const qint32 noOfElements = elements.size();
+    const auto byValue = [](const WeightedSample& a, const WeightedSample& b) { return a.value < b.value; };
     if (noOfElements % 2 == 0) {
-        std::nth_element(elements.begin(), elements.begin() + noOfElements / 2, elements.end());
-        std::nth_element(elements.begin(), elements.begin() + (noOfElements - 1) / 2, elements.end());
-        return static_cast<quint16>((elements[(noOfElements - 1) / 2] + elements[noOfElements / 2]) / 2.0);
+        std::nth_element(elements.begin(), elements.begin() + noOfElements / 2, elements.end(), byValue);
+        std::nth_element(elements.begin(), elements.begin() + (noOfElements - 1) / 2, elements.end(), byValue);
+        return static_cast<quint16>((elements[(noOfElements - 1) / 2].value + elements[noOfElements / 2].value) / 2.0);
     } else {
-        std::nth_element(elements.begin(), elements.begin() + noOfElements / 2, elements.end());
-        return static_cast<quint16>(elements[noOfElements / 2]);
+        std::nth_element(elements.begin(), elements.begin() + noOfElements / 2, elements.end(), byValue);
+        return static_cast<quint16>(elements[noOfElements / 2].value);
     }
 }
 
@@ -563,38 +548,38 @@ inline quint16 Stacker::median(QVector<quint16> elements)
 // other samples — the most globally central real observation.
 // Fallback: N=0 → 0, N=1 → passthrough, N=2 → mean, N≥3 → O(N²) pairwise minimisation.
 // Ties broken by first-wins (stable and deterministic).
-inline quint16 Stacker::medoid(const QVector<quint16>& elements)
+inline quint16 Stacker::medoid(const QVector<WeightedSample>& elements)
 {
     const qint32 n = elements.size();
     if (n <= 0) return 0;
-    if (n == 1) return elements[0];
-    if (n == 2) return static_cast<quint16>((static_cast<quint32>(elements[0]) +
-                                             static_cast<quint32>(elements[1])) / 2);
+    if (n == 1) return elements[0].value;
+    if (n == 2) return static_cast<quint16>((static_cast<quint32>(elements[0].value) +
+                                             static_cast<quint32>(elements[1].value)) / 2);
 
     quint32 bestTotalDist = std::numeric_limits<quint32>::max();
-    quint16 bestValue     = elements[0];
+    quint16 bestValue     = elements[0].value;
     for (qint32 i = 0; i < n; i++) {
         quint32 totalDist = 0;
         for (qint32 j = 0; j < n; j++)
-            totalDist += static_cast<quint32>(std::abs(static_cast<qint32>(elements[i]) -
-                                                        static_cast<qint32>(elements[j])));
+            totalDist += static_cast<quint32>(std::abs(static_cast<qint32>(elements[i].value) -
+                                                        static_cast<qint32>(elements[j].value)));
         if (totalDist < bestTotalDist) {
             bestTotalDist = totalDist;
-            bestValue     = elements[i];
+            bestValue     = elements[i].value;
         }
     }
     return bestValue;
 }
 
-inline qint32 Stacker::mean(const QVector<quint16>& elements)
+inline qint32 Stacker::mean(const QVector<WeightedSample>& elements)
 {
     quint32 result = 0;
     const qint32 nbElements = elements.size();
     if (nbElements > 1) {
-        for (int i = 0; i < nbElements; i++) result += elements[i];
+        for (int i = 0; i < nbElements; i++) result += elements[i].value;
         return result / nbElements;
     } else if (nbElements == 1) {
-        return elements[0];
+        return elements[0].value;
     }
     return -1;
 }
@@ -615,30 +600,27 @@ inline quint16 Stacker::closest(const QVector<quint16>& elements, const qint32 t
 // Find the closest value to target, with a distance penalty for sources below
 // the median SNR weight. The penalty rises linearly from zero at the median weight
 // to maxPenalty at weight zero, capped so SNR never overrides a large distance gap.
-inline quint16 Stacker::closestSnr(const QVector<quint16>& elements,
-                                    const QVector<double>& weights,
+inline quint16 Stacker::closestSnr(const QVector<WeightedSample>& elements,
                                     const qint32 target, const double maxPenalty)
 {
     const qint32 n = elements.size();
     if (n == 0) return 0;
 
-    const bool hasWeights = (weights.size() == n);
-    double medianWeight = 0.0;
-    if (hasWeights) {
-        QVector<double> sorted(weights);
-        std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.end());
-        medianWeight = sorted[n / 2];
-    }
+    QVector<double> sorted;
+    sorted.reserve(n);
+    for (const auto& e : elements) sorted.append(e.weight);
+    std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.end());
+    const double medianWeight = sorted[n / 2];
 
-    qint32 bestValue = elements[0];
+    qint32 bestValue = elements[0].value;
     double bestCost  = std::numeric_limits<double>::max();
     for (int i = 0; i < n; i++) {
-        double dist = static_cast<double>(std::abs(target - static_cast<qint32>(elements[i])));
-        if (hasWeights && medianWeight > 0.0) {
-            const double deficit = qMax(0.0, medianWeight - weights[i]) / medianWeight;
+        double dist = static_cast<double>(std::abs(target - static_cast<qint32>(elements[i].value)));
+        if (medianWeight > 0.0) {
+            const double deficit = qMax(0.0, medianWeight - elements[i].weight) / medianWeight;
             dist += deficit * maxPenalty;
         }
-        if (dist < bestCost) { bestCost = dist; bestValue = elements[i]; }
+        if (dist < bestCost) { bestCost = dist; bestValue = elements[i].value; }
     }
     return static_cast<quint16>(bestValue);
 }
@@ -646,13 +628,14 @@ inline quint16 Stacker::closestSnr(const QVector<quint16>& elements,
 void Stacker::getProcessedSample(const qint32 x, const qint32 y,
                                   const QVector<qint32>& availableSourcesForFrame,
                                   const QVector<SourceVideo::Data>& inputFields,
-                                  QHash<qint32, QVector<quint16>>& tmpField,
+                                  const QVector<double>& sourceSnrWeights,
+                                  QHash<qint32, QVector<WeightedSample>>& tmpField,
                                   const QVector<QVector<QVector<QPair<qint32,qint32>>>>& srcDropMap,
                                   const LdDecodeMetaData::VideoParameters& videoParameters,
                                   const QVector<LdDecodeMetaData::Field>& fieldMetadata,
-                                  QVector<quint16>& sample,
-                                  QVector<quint16>& sampleN, QVector<quint16>& sampleS,
-                                  QVector<quint16>& sampleE, QVector<quint16>& sampleW,
+                                  QVector<WeightedSample>& sample,
+                                  QVector<WeightedSample>& sampleN, QVector<WeightedSample>& sampleS,
+                                  QVector<WeightedSample>& sampleE, QVector<WeightedSample>& sampleW,
                                   QVector<bool>& isAllDropout,
                                   const bool& noDiffDod, const bool& verbose)
 {
@@ -681,49 +664,52 @@ void Stacker::getProcessedSample(const qint32 x, const qint32 y,
 
     for (qint32 i = 0; i < availableSourcesForFrame.size(); i++) {
         source = availableSourcesForFrame[i];
+        // Weight of this source, bound to each value it contributes at the moment
+        // of the append so a skipped (dropout) source drops its weight with it.
+        const double w = (i < sourceSnrWeights.size()) ? sourceSnrWeights[i] : 0.0;
         if (y == 0) {
             if (x == 0) {
                 pixelValue = inputFields[source][rowOffset + x];
                 sampleIsDropout = fastIsDropout(i, x, y);
-                if (!sampleIsDropout) sample.append(pixelValue);
-                else if (pixelValue > 0 && !noDiffDod) sample.append(pixelValue);
+                if (!sampleIsDropout) sample.append({pixelValue, w});
+                else if (pixelValue > 0 && !noDiffDod) sample.append({pixelValue, w});
                 if (!sampleIsDropout) isAllDropout[0] = false;
 
                 pixelValue = inputFields[source][rowOffset + x + 1];
                 sampleIsDropout = fastIsDropout(i, x+1, y);
-                if (!sampleIsDropout) sampleE.append(pixelValue);
-                else if (pixelValue > 0 && !noDiffDod) sampleE.append(pixelValue);
+                if (!sampleIsDropout) sampleE.append({pixelValue, w});
+                else if (pixelValue > 0 && !noDiffDod) sampleE.append({pixelValue, w});
                 if (!sampleIsDropout) isAllDropout[3] = false;
 
                 pixelValue = inputFields[source][rowOffsetNext + x];
                 sampleIsDropout = fastIsDropout(i, x, y+1);
-                if (!sampleIsDropout) sampleS.append(pixelValue);
-                else if (pixelValue > 0 && !noDiffDod) sampleS.append(pixelValue);
+                if (!sampleIsDropout) sampleS.append({pixelValue, w});
+                else if (pixelValue > 0 && !noDiffDod) sampleS.append({pixelValue, w});
                 if (!sampleIsDropout) isAllDropout[2] = false;
             } else if (x == fieldWidth - 1) {
                 pixelValue = inputFields[source][rowOffsetNext + x];
                 sampleIsDropout = fastIsDropout(i, x, y+1);
-                if (!sampleIsDropout) sampleS.append(pixelValue);
-                else if (pixelValue > 0 && !noDiffDod) sampleS.append(pixelValue);
+                if (!sampleIsDropout) sampleS.append({pixelValue, w});
+                else if (pixelValue > 0 && !noDiffDod) sampleS.append({pixelValue, w});
                 if (!sampleIsDropout) isAllDropout[2] = false;
             } else {
                 pixelValue = inputFields[source][rowOffset + x + 1];
                 sampleIsDropout = fastIsDropout(i, x+1, y);
-                if (!sampleIsDropout) sampleE.append(pixelValue);
-                else if (pixelValue > 0 && !noDiffDod) sampleE.append(pixelValue);
+                if (!sampleIsDropout) sampleE.append({pixelValue, w});
+                else if (pixelValue > 0 && !noDiffDod) sampleE.append({pixelValue, w});
                 if (!sampleIsDropout) isAllDropout[3] = false;
 
                 pixelValue = inputFields[source][rowOffsetNext + x];
                 sampleIsDropout = fastIsDropout(i, x, y+1);
-                if (!sampleIsDropout) sampleS.append(pixelValue);
-                else if (pixelValue > 0 && !noDiffDod) sampleS.append(pixelValue);
+                if (!sampleIsDropout) sampleS.append({pixelValue, w});
+                else if (pixelValue > 0 && !noDiffDod) sampleS.append({pixelValue, w});
                 if (!sampleIsDropout) isAllDropout[2] = false;
             }
         } else if (y != fieldHeight - 1) {
             pixelValue = inputFields[source][rowOffsetNext + x];
             sampleIsDropout = fastIsDropout(i, x, y+1);
-            if (!sampleIsDropout) sampleS.append(pixelValue);
-            else if (pixelValue > 0 && !noDiffDod) sampleS.append(pixelValue);
+            if (!sampleIsDropout) sampleS.append({pixelValue, w});
+            else if (pixelValue > 0 && !noDiffDod) sampleS.append({pixelValue, w});
             if (!sampleIsDropout) isAllDropout[2] = false;
         }
     }
@@ -829,11 +815,11 @@ inline bool Stacker::haveAllDropout(const QVector<LdDecodeMetaData::Field>& fiel
     return true;
 }
 
-QVector<quint16> Stacker::diffDod(const QVector<quint16>& inputValues,
+QVector<Stacker::WeightedSample> Stacker::diffDod(const QVector<WeightedSample>& inputValues,
                                    const LdDecodeMetaData::VideoParameters& videoParameters,
                                    const bool& verbose)
 {
-    QVector<quint16> outputValues;
+    QVector<WeightedSample> outputValues;
     if (inputValues.size() < 3) return inputValues;
 
     const double medianValue = static_cast<double>(median(inputValues));
@@ -846,15 +832,20 @@ QVector<quint16> Stacker::diffDod(const QVector<quint16>& inputValues,
     const quint16 maxValue = static_cast<quint16>(maxValueD);
 
     for (qint32 i = 0; i < inputValues.size(); i++)
-        if (inputValues[i] > minValue && inputValues[i] < maxValue)
+        if (inputValues[i].value > minValue && inputValues[i].value < maxValue)
             outputValues.append(inputValues[i]);
 
     if (verbose) {
-        tbcDebugStream() << "diffDOD:  Input" << inputValues;
+        QVector<quint16> inVals; inVals.reserve(inputValues.size());
+        for (const auto& s : inputValues) inVals.append(s.value);
+        tbcDebugStream() << "diffDOD:  Input" << inVals;
         if (outputValues.size() == 0)
             tbcDebugStream().nospace() << "diffDOD: Empty output... Range was " << minValue << "-" << maxValue << " with a median of " << medianValue;
-        else
-            tbcDebugStream() << "diffDOD: Output" << outputValues;
+        else {
+            QVector<quint16> outVals; outVals.reserve(outputValues.size());
+            for (const auto& s : outputValues) outVals.append(s.value);
+            tbcDebugStream() << "diffDOD: Output" << outVals;
+        }
     }
 
     return outputValues;
