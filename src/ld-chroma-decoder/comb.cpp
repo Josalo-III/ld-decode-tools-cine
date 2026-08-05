@@ -542,22 +542,21 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             FrameCanvas::Colour fg = canvas.rgb(65535, 65535, 65535);
             FrameCanvas::Colour bg = canvas.rgb(0, 0, 0);
 
-            auto fieldLabel = [&](int cid, int fallbackCyclePos) -> char {
+            auto fieldLabel = [&](int cid) -> char {
                 if (cid == lddecode::kCadenceVideo)
-                    return 'i';
+                    return 'i';                    // -2: 59.94i interlaced video
 
                 if (cid == lddecode::kCadenceProgressive)
-                    return 'p';
+                    return 'P';                    // -3: 29.97p progressive
 
                 if (cadenceKnown(cid))
-                    return cadenceFilmLetter(cid);
+                    return cadenceFilmLetter(cid); // 0..19: film frame letter
 
-                return static_cast<char>('0' + ((fallbackCyclePos % 5) + 1));
+                return '?';                        // -1: unknown / unassigned
             };
 
-            const int cyclePos = frameIndex;
-            const char labelTop    = fieldLabel(cidTop, cyclePos);
-            const char labelBottom = fieldLabel(cidBottom, cyclePos);
+            const char labelTop    = fieldLabel(cidTop);
+            const char labelBottom = fieldLabel(cidBottom);
 
             const bool pureFrame =
                 (labelTop == labelBottom) &&
