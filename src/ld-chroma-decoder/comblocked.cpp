@@ -1200,6 +1200,34 @@ struct OffGridProbe {
 
 OffGridProbe g_offGrid;
 
+// Feasible-luma restraint census (LDCD_LURCH_FEASIBLE=1). Measurement only.
+struct LumaFeasProbe {
+    std::mutex mu;
+    long nBaseIn = 0, nBaseOut = 0;
+    double sumIn = 0.0, maxIn = 0.0;
+    static bool on() {
+        static const bool v = std::getenv("LDCD_LURCH_FEASIBLE") != nullptr;
+        return v;
+    }
+    void hit(double dIRE, bool baseIn) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (baseIn) {
+            ++nBaseIn; sumIn += dIRE;
+            if (dIRE > maxIn) maxIn = dIRE;
+        } else {
+            ++nBaseOut;
+        }
+    }
+    ~LumaFeasProbe() {
+        if (!on() || (nBaseIn + nBaseOut) == 0) return;
+        std::fprintf(stderr,
+            "[LUMAFEAS] lurch overshoot clamped: %ld samples, mean %.2f IRE, "
+            "max %.2f IRE | platform already infeasible (untouched): %ld\n",
+            nBaseIn, nBaseIn ? sumIn / nBaseIn : 0.0, maxIn, nBaseOut);
+    }
+};
+LumaFeasProbe g_lumaFeas;
+
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
@@ -1282,6 +1310,10 @@ void Comb::FrameBuffer::phaseLocked()
         // every sample) lurch-sharpened so a confirmed luma step lands at one
         // column instead of smearing across four. The gate is scaled by the
         // sweep level.
+        static const bool lumaFeasOn = []{
+            const char *e = std::getenv("LDCD_LURCH_FEASIBLE");
+            return e && std::atoi(e) != 0;
+        }();
         const double sharpLevel = coarseSharpLevel();
         const bool buildSharp =
             configuration.lumaWitness &&
@@ -1343,8 +1375,63 @@ void Comb::FrameBuffer::phaseLocked()
             // bright vertical contours; apply-only here.
             const std::vector<LurchStepRun> corrRuns =
                 corroborateLurchEdges(line);
+            std::vector<double> preSharp;
+            if (lumaFeasOn) preSharp.assign(sharp, sharp + width);
             applyLurchSteps(corrRuns, boxcar, width - 3,
                             width, sharpLevel, sharp, gateScratch.data());
+
+            // FEASIBLE-LUMA RESTRAINT (LDCD_LURCH_FEASIBLE=1, default OFF).
+            //
+            // Lurch earns its place because the four-sample coarse smears
+            // boundaries and lurch un-smears them. So the restriction cannot
+            // be "sharpen less"; it has to be "never sharpen to a value that
+            // cannot be true". feasibleband.h's pair-sum law supplies exactly
+            // that, and for LUMA rather than carrier: the carrier is
+            // antisymmetric over +-2 samples, so
+            //     composite[i] + composite[i+-2] = Y[i] + Y[i+-2]
+            // is carrier-free and EXACT. With luma bounded, each available
+            // neighbour pins Y[i] to an interval. A sharpened platform
+            // outside that interval asserts a luma the composite forbids.
+            //
+            // This is the primitive's first consumer. It forbids impossibles
+            // and says nothing about which surviving value is preferred --
+            // no threshold, nothing fitted, no per-scene constant.
+            //
+            // The probe separates two cases, because only the first is about
+            // lurch: BASE-IN means the unsharpened platform was feasible and
+            // the sharpening pushed it out (lurch overshoot); BASE-OUT means
+            // the platform was already infeasible before lurch touched it,
+            // which is a different defect and not this restraint's business.
+            if (lumaFeasOn) {
+                const double yLo = videoParameters.black16bIre - 10.0 * irescale;
+                const double yHi = videoParameters.white16bIre + 10.0 * irescale;
+                for (int xi = 0; xi < width; ++xi) {
+                    const int h = left + xi;
+                    double nb[2];
+                    int nn = 0;
+                    if (h - 2 >= 0)         nb[nn++] = (double)rawLine[h - 2];
+                    if (h + 2 < fullWidth)  nb[nn++] = (double)rawLine[h + 2];
+                    const lddecode::FeasibleInterval f =
+                        lddecode::lumaFeasibleFromPairSums(
+                            (double)rawLine[h], nb, nn, yLo, yHi);
+                    const double v = sharp[xi];
+                    const double c = f.clamp(v);
+                    static int dbg = 0;
+                    if (dbg < 12 && xi > 300 && xi < 320) {
+                        ++dbg;
+                        std::fprintf(stderr,
+                            "[FEASDBG] xi=%d sharp=%.0f pre=%.0f raw=%.0f "
+                            "lo=%.0f hi=%.0f nn=%d\n",
+                            xi, v, preSharp[xi], (double)rawLine[h],
+                            f.lo, f.hi, nn);
+                    }
+                    if (c == v) continue;
+                    const double base = preSharp[xi];
+                    const bool baseIn = (f.clamp(base) == base);
+                    g_lumaFeas.hit(std::fabs(v - c) * invIreScale, baseIn);
+                    if (baseIn) sharp[xi] = c;
+                }
+            }
         }
         lockedLumaCacheValid = true;
     }
@@ -9716,6 +9803,44 @@ void Comb::FrameBuffer::buildLurchStepRuns()
     if (width < 8 || firstLine >= lastLine || lockedApertureMean_flat.empty())
         return;
 
+    // FALSIFIED -- do not re-propose: SUB-PIXEL EDGE REFINEMENT FROM THE
+    // DISCARDED HALF-SAMPLE TERM.
+    //
+    // The moving coarse registers to integer xi by AVERAGING the two
+    // apertures whose centres straddle xi at +-0.5, so only their sum
+    // survives; their difference is a carrier-free luma gradient that is
+    // thrown away. The idea was to recover it as a sub-pixel correction to
+    // the detected edge.
+    //
+    // Measured against certified luma with LDCD_PROBE_LURCHVET, using only
+    // run-time-available quantities, over 9 scenes on 4 sources
+    // (n = 180,485 steps above 10 IRE):
+    //
+    //   scene       p50 placement err change     native slope
+    //   cube            -14.6%                      -2.14
+    //   s2x10            -1.2%                      -0.48
+    //   vol@520          +5.4%                      -0.18
+    //   ggv@18k          +7.7%                      +0.05
+    //   ggv@1.3k         +9.3%                      -0.08
+    //   beach           +13.8%                      +0.19
+    //   s1x11@45k       +17.5%                      -0.81
+    //   s1x11@60k       +17.6%                      -5.06
+    //   POOLED           +7.6%                      -0.23
+    //
+    // The relationship is not a physical constant: the slope CHANGES SIGN
+    // between sources, and on GGV -- 150k of those samples -- it is
+    // indistinguishable from zero. A coefficient fitted on the cube (-1.8)
+    // makes placement WORSE on eight of nine scenes. No fixed coefficient can
+    // exist, and a per-scene fit would be calibration, which this project
+    // does not do. The apparent effect was one shot's worth of frames
+    // mistaken for a mechanism.
+    //
+    // What DID survive is the census that killed it: the detector's
+    // reliability curve (blind below ~2.5 IRE, ~1 px at 5-10, 0.7-0.8 px
+    // above 10, 15-18% of runs with no certified counterpart), which is
+    // stable across all four sources and is the basis for restricting where
+    // these runs are allowed to act.
+
     for (int line = firstLine; line < lastLine; ++line) {
         const double *apMean = lockedApertureMean_line(line);
         if (!apMean) continue;
@@ -9752,6 +9877,30 @@ void Comb::FrameBuffer::buildLurchStepRuns()
         std::vector<std::vector<std::pair<double, int>>> pend(lastLine);
         std::vector<double> lhat(width);
         std::vector<LurchStepRun> certRuns;
+        // Detector vetting census (LDCD_PROBE_LURCHVET=1). READ-ONLY.
+        // A covered line carries BOTH the aperture means the detector sees
+        // and the certified luma saying what is actually there, so the
+        // detector can be scored against truth instead of against its own
+        // math -- which was impossible before the exact channel existed.
+        // Scores the detection as it stood BEFORE any certified
+        // repositioning. Alters nothing: not truth, not the runs, not
+        // conduct.
+        static const bool vetProbe =
+            std::getenv("LDCD_PROBE_LURCHVET") != nullptr;
+        // Stratified by certified step magnitude, because the two detectors
+        // are NOT equally sensitive: this one trips at 0.60 IRE per sample on
+        // noise-free truth, while the aperture detector works on 4-sample
+        // means with a ~1.2 IRE step floor. An unstratified "miss" count
+        // mostly measures that design gap, not detector error. Position error
+        // is measured to the NEAREST aperture run of the same sign at any
+        // distance, so the 1.5 px match window does not truncate it.
+        std::vector<char> vetLine(lastLine, 0);
+        std::vector<std::vector<LurchStepRun>> certAll(lastLine);
+        struct VetBin { long cert = 0, found = 0;
+            std::vector<double> err, res, grad; };
+        static constexpr double kVetEdges[5] = { 0.6, 1.2, 2.5, 5.0, 10.0 };
+        std::vector<VetBin> vetBin(6);
+        std::vector<double> vetDelta;
         for (int line = firstLine; line < lastLine; ++line) {
             const float *ex = exactCarrierRow(line);
             if (!ex) continue;
@@ -9771,8 +9920,61 @@ void Comb::FrameBuffer::buildLurchStepRuns()
             if (nFinite < 16) continue;
             detectCertifiedLurchSteps(lhat.data(), width, irescale,
                                       invIreScale, certRuns);
+            if (vetProbe) { vetLine[line] = 1; certAll[line] = certRuns; }
             for (const LurchStepRun &cr : certRuns) {
                 if (cr.suppressed) continue;
+                int vetB = 0;
+                if (vetProbe) {
+                    while (vetB < 5 && cr.stepAbsIRE >= kVetEdges[vetB])
+                        ++vetB;
+                    ++vetBin[vetB].cert;
+                    // Nearest same-sign aperture run at ANY distance.
+                    double best = -1.0, bestSigned = 0.0;
+                    for (const LurchStepRun &ar : lurchStepRuns[line]) {
+                        if (ar.suppressed) continue;
+                        if ((ar.stepSamples > 0.0) != (cr.stepSamples > 0.0))
+                            continue;
+                        const double d = std::fabs(ar.edge - cr.edge);
+                        if (best < 0.0 || d < best) {
+                            best = d;
+                            bestSigned = cr.edge - ar.edge;
+                        }
+                    }
+                    if (best >= 0.0) {
+                        ++vetBin[vetB].found;
+                        vetBin[vetB].err.push_back(best);
+                        // The term the moving coarse DISCARDS. sharp[xi]
+                        // averages the two apertures whose centres straddle
+                        // xi at +-0.5; only their sum survives. Their
+                        // DIFFERENCE is a carrier-free luma gradient at
+                        // half-sample offset. Does it predict where the
+                        // detector's placement is wrong?
+                        // OPERATIONAL quantities only: the gradient is
+                        // located from the APERTURE run's own edge and
+                        // normalised by its own step height, because that is
+                        // all a live correction can see. Locating from
+                        // cr.edge or scaling by cr.stepAbsIRE would fit a
+                        // coefficient on certified data the implementation
+                        // does not have.
+                        const double *ap = lockedApertureMean_line(line);
+                        const LurchStepRun *nr = nullptr;
+                        for (const LurchStepRun &ar : lurchStepRuns[line]) {
+                            if (ar.suppressed) continue;
+                            if ((ar.stepSamples > 0.0) != (cr.stepSamples > 0.0))
+                                continue;
+                            if (std::fabs(std::fabs(ar.edge - cr.edge) - best)
+                                < 1e-9) { nr = &ar; break; }
+                        }
+                        const int si = nr ? (int)std::lround(nr->edge) : -1;
+                        if (best <= 3.0 && ap && nr && si >= 0
+                            && si + 1 < width - 3 && nr->stepAbsIRE > 0.0) {
+                            const double g = (ap[si + 1] - ap[si]) *
+                                             invIreScale;
+                            vetBin[vetB].res.push_back(bestSigned);
+                            vetBin[vetB].grad.push_back(g / nr->stepAbsIRE);
+                        }
+                    }
+                }
                 bool matched = false;
                 for (LurchStepRun &ar : lurchStepRuns[line]) {
                     if (ar.suppressed) continue;
@@ -9793,6 +9995,7 @@ void Comb::FrameBuffer::buildLurchStepRuns()
                     // and the shared detector bias is what the delta
                     // cancels.
                     const double delta = cr.edge - ar.edge;
+                    if (vetProbe) vetDelta.push_back(std::fabs(delta));
                     ar.edge = cr.edge;          // the certified position
                     ar.gate = std::max(ar.gate, cr.gate);
                     ar.certified = true;
@@ -9820,6 +10023,143 @@ void Comb::FrameBuffer::buildLurchStepRuns()
                     certMissed[line].push_back(cr);
             }
         }
+        if (vetProbe) {
+            long vetAp = 0, vetFalse = 0;
+            // Stratified by the APERTURE run's own step height -- the
+            // quantity a restriction can key on at run time. Asks: of the
+            // runs the detector emits at this size, what fraction has NO
+            // certified step of the same sign within 1.5 px? On a covered
+            // line, truth says nothing is there.
+            long apCert[6] = {0}, apTot[6] = {0};
+            // Is a "false" run genuinely spurious, or is the CLAIM FLAG the
+            // artefact? ar.certified is set only on the first match and only
+            // within 1.5 px, so several runs on one wide feature leave all
+            // but one flagged false BY CONSTRUCTION. Measure distance to the
+            // nearest same-sign certified step regardless of the flag, and
+            // the run's own width, so the three readings separate.
+            std::vector<double> apNear[6];
+            std::vector<int> apWide[6];
+            std::vector<double> apCarOK[6], apCarBad[6];
+            for (int line = firstLine; line < lastLine; ++line) {
+                if (!vetLine[line]) continue;
+                for (const LurchStepRun &ar : lurchStepRuns[line]) {
+                    if (ar.suppressed) continue;
+                    ++vetAp;
+                    if (!ar.certified) ++vetFalse;
+                    int ab = 0;
+                    while (ab < 5 && ar.stepAbsIRE >= kVetEdges[ab]) ++ab;
+                    ++apTot[ab];
+                    if (ar.certified) ++apCert[ab];
+                    double nd = -1.0;
+                    for (const LurchStepRun &cr : certAll[line]) {
+                        if (cr.suppressed) continue;
+                        if ((cr.stepSamples > 0.0) != (ar.stepSamples > 0.0))
+                            continue;
+                        const double d = std::fabs(cr.edge - ar.edge);
+                        if (nd < 0.0 || d < nd) nd = d;
+                    }
+                    if (nd >= 0.0) apNear[ab].push_back(nd);
+                    apWide[ab].push_back(ar.b - ar.a);
+                    // Characterise the population truth does NOT corroborate.
+                    // If those runs sit where the CARRIER is strong, they are
+                    // leakage through imperfect four-sample cancellation and
+                    // the bandwidth law has a claim on them. If their carrier
+                    // looks like everyone else's, they are not a carrier
+                    // phenomenon and no bandwidth constraint will find them.
+                    const float *ex2 = exactCarrierRow(line);
+                    const int xe = (int)std::lround(ar.edge) + 2;
+                    if (ex2 && xe >= 0 && xe < width) {
+                        const float c = ex2[left + xe];
+                        if (std::isfinite(c)) {
+                            const double cIRE = std::fabs((double)c) *
+                                                invIreScale;
+                            if (nd >= 0.0 && nd <= 3.0) apCarOK[ab].push_back(cIRE);
+                            else                        apCarBad[ab].push_back(cIRE);
+                        }
+                    }
+                }
+            }
+            static const char *kBinName[6] = {
+                "  <0.6", "0.6-1.2", "1.2-2.5", "2.5-5.0", "5.0-10 ", " >10  " };
+            std::fprintf(stderr,
+                "[LURCHVET] lines=%ld  aperture runs=%ld  uncertified=%ld "
+                "(%.1f%%)\n",
+                (long)std::count(vetLine.begin(), vetLine.end(), 1),
+                vetAp, vetFalse, vetAp ? 100.0 * vetFalse / vetAp : 0.0);
+            for (int b = 0; b < 6; ++b) {
+                if (!apTot[b]) continue;
+                std::sort(apNear[b].begin(), apNear[b].end());
+                std::sort(apWide[b].begin(), apWide[b].end());
+                const double nmed = apNear[b].empty() ? -1.0
+                    : apNear[b][apNear[b].size() / 2];
+                const int wmed = apWide[b].empty() ? 0
+                    : apWide[b][apWide[b].size() / 2];
+                const double w15 = apNear[b].empty() ? 0.0 : 100.0 *
+                    std::count_if(apNear[b].begin(), apNear[b].end(),
+                        [](double d){ return d <= 1.5; }) / apNear[b].size();
+                const double w30 = apNear[b].empty() ? 0.0 : 100.0 *
+                    std::count_if(apNear[b].begin(), apNear[b].end(),
+                        [](double d){ return d <= 3.0; }) / apNear[b].size();
+                // Uncorroborated = no certified step of the same sign within
+                // 3 px. Distance-based, NOT the ar.certified claim flag: that
+                // flag is set on the first match only, so several runs on one
+                // feature leave all but one flagged by construction.
+                auto med = [](std::vector<double> &v) {
+                    if (v.empty()) return -1.0;
+                    std::sort(v.begin(), v.end());
+                    return v[v.size() / 2];
+                };
+                const double carOK = med(apCarOK[b]), carBad = med(apCarBad[b]);
+                std::fprintf(stderr,
+                    "[LURCHVET]   RUNS %s IRE emitted=%-6ld uncorrob=%.0f%% "
+                    "| nearest cert px med=%.2f <=1.5px=%.0f%% <=3px=%.0f%% "
+                    "| width med=%d | carrier IRE corrob=%.2f uncorrob=%.2f "
+                    "(n=%zu)\n",
+                    kBinName[b], apTot[b], 100.0 - w30,
+                    nmed, w15, w30, wmed, carOK, carBad, apCarBad[b].size());
+            }
+            for (int b = 0; b < 6; ++b) {
+                VetBin &v = vetBin[b];
+                if (!v.cert) continue;
+                std::sort(v.err.begin(), v.err.end());
+                double m = 0.0;
+                for (double d : v.err) m += d;
+                if (!v.err.empty()) m /= v.err.size();
+                const double p50 = v.err.empty() ? 0.0
+                    : v.err[v.err.size() / 2];
+                const double p90 = v.err.empty() ? 0.0
+                    : v.err[std::min(v.err.size() - 1,
+                        (size_t)(0.9 * v.err.size()))];
+                // Pearson r between the discarded half-sample gradient and
+                // the SIGNED placement residual, over near matches.
+                double rP = 0.0, slope = 0.0;
+                const size_t nc = v.res.size();
+                if (nc >= 32) {
+                    double mx = 0, my = 0;
+                    for (size_t i = 0; i < nc; ++i) { mx += v.grad[i]; my += v.res[i]; }
+                    mx /= nc; my /= nc;
+                    double sxy = 0, sxx = 0, syy = 0;
+                    for (size_t i = 0; i < nc; ++i) {
+                        const double dx = v.grad[i] - mx, dy = v.res[i] - my;
+                        sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+                    }
+                    if (sxx > 1e-12 && syy > 1e-12) {
+                        rP = sxy / std::sqrt(sxx * syy);
+                        slope = sxy / sxx;
+                    }
+                }
+                std::fprintf(stderr,
+                    "[LURCHVET]   step %s IRE  certified=%-6ld nearest-run "
+                    "err px mean=%.2f p50=%.2f p90=%.2f  within1.5px=%.1f%%"
+                    "  | subpx n=%-5zu r=%+.3f slope=%+.2f\n",
+                    kBinName[b], v.cert, m, p50, p90,
+                    v.err.empty() ? 0.0 : 100.0 *
+                        std::count_if(v.err.begin(), v.err.end(),
+                            [](double d){ return d <= 1.5; }) / v.err.size(),
+                    nc, rP, slope);
+            }
+        }
+
         // Apply the averaged common-mode corrections.
         for (int line = firstLine; line < lastLine; ++line) {
             auto &rowRuns = lurchStepRuns[line];
@@ -14631,7 +14971,19 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         return e && std::atoi(e) == 1;
     }();
     std::vector<double> antComp;
-    const bool antRungOn = retractedSource == 3 &&
+    // A/B escape (LDCD_ANT_RUNG=0, user-authorised 2026-08-04). Stands the
+    // anticipated rung down so the ladder falls through to certComp/fit.
+    // Default ON: inert unless set. Under test as the remaining source of the
+    // uncovered letters' checkerboard -- measured by the RLAD rung census,
+    // this rung stands on 100% of samples in the affected window and departs
+    // from the fit by 1.8-3.0 IRE, a departure that reads as STANDING (image-
+    // locked luma) rather than as carrier. Every other stage in this campaign
+    // carries an escape; this one did not, so it could not be tested.
+    static const bool antRungOff = []{
+        const char *e = std::getenv("LDCD_ANT_RUNG");
+        return e && std::atoi(e) == 0;
+    }();
+    const bool antRungOn = !antRungOff && retractedSource == 3 &&
         !frameHasExactCoverage() && antRefAge >= 1;
     if (antRungOn)
         antComp.assign(width, std::numeric_limits<double>::quiet_NaN());
