@@ -44,12 +44,13 @@ static inline bool cadenceKnown(int cid) { return cid >= 0; }
 static inline bool cadenceIsInverted(int cid) { return cid >= CADENCE_NTSC_INVERTED_OFFSET; }
 
 // Normalise cadenceId into 0..9 index space.
+// Every sentinel returns CADENCE_UNKNOWN: only a known id has a cadence
+// position. Wrapping a negative into 0..9 would hand VIDEO and PROGRESSIVE
+// the identities of DD and Cdef, defeating the protection above.
 static inline int cadenceIndex(int cid)
 {
-    if (cid == CADENCE_UNKNOWN) return CADENCE_UNKNOWN;
-    int v = cid % CADENCE_NTSC_CYCLE;
-    if (v < 0) v += CADENCE_NTSC_CYCLE;
-    return v;
+    if (!cadenceKnown(cid)) return CADENCE_UNKNOWN;
+    return cid % CADENCE_NTSC_CYCLE;
 }
 
 // -----------------------------------------------------------------------------
@@ -60,6 +61,7 @@ static inline int cadenceIndex(int cid)
 // These are the anchor fields verified in post-production.
 static inline bool isDefinitionalRole(int cid)
 {
+    if (!cadenceKnown(cid)) return false;
     int idx = cadenceIndex(cid);
     return (idx == 0 || idx == 7);
 }
@@ -68,6 +70,7 @@ static inline bool isDefinitionalRole(int cid)
 // These are the duplicate fields created by telecine.
 static inline bool isSpareRole(int cid)
 {
+    if (!cadenceKnown(cid)) return false;
     int idx = cadenceIndex(cid);
     return (idx == 2 || idx == 5);
 }
