@@ -25,7 +25,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <QtGlobal>
 
 namespace {
@@ -350,34 +349,6 @@ inline double coarseSharpLevel()
 // void for the same reason). The census asked about estimator behaviour, so
 // it skipped covered frames outright.
 
-// Feasible-luma restraint census (LDCD_LURCH_FEASIBLE=1). Measurement only.
-struct LumaFeasProbe {
-    std::mutex mu;
-    long nBaseIn = 0, nBaseOut = 0;
-    double sumIn = 0.0, maxIn = 0.0;
-    static bool on() {
-        static const bool v = std::getenv("LDCD_LURCH_FEASIBLE") != nullptr;
-        return v;
-    }
-    void hit(double dIRE, bool baseIn) {
-        std::lock_guard<std::mutex> lk(mu);
-        if (baseIn) {
-            ++nBaseIn; sumIn += dIRE;
-            if (dIRE > maxIn) maxIn = dIRE;
-        } else {
-            ++nBaseOut;
-        }
-    }
-    ~LumaFeasProbe() {
-        if (!on() || (nBaseIn + nBaseOut) == 0) return;
-        std::fprintf(stderr,
-            "[LUMAFEAS] lurch overshoot clamped: %ld samples, mean %.2f IRE, "
-            "max %.2f IRE | platform already infeasible (untouched): %ld\n",
-            nBaseIn, nBaseIn ? sumIn / nBaseIn : 0.0, maxIn, nBaseOut);
-    }
-};
-LumaFeasProbe g_lumaFeas;
-
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
@@ -460,10 +431,6 @@ void Comb::FrameBuffer::phaseLocked()
         // every sample) lurch-sharpened so a confirmed luma step lands at one
         // column instead of smearing across four. The gate is scaled by the
         // sweep level.
-        static const bool lumaFeasOn = []{
-            const char *e = std::getenv("LDCD_LURCH_FEASIBLE");
-            return e && std::atoi(e) != 0;
-        }();
         const double sharpLevel = coarseSharpLevel();
         const bool buildSharp =
             configuration.lumaWitness &&
@@ -525,12 +492,14 @@ void Comb::FrameBuffer::phaseLocked()
             // bright vertical contours; apply-only here.
             const std::vector<LurchStepRun> corrRuns =
                 corroborateLurchEdges(line);
-            std::vector<double> preSharp;
-            if (lumaFeasOn) preSharp.assign(sharp, sharp + width);
             applyLurchSteps(corrRuns, boxcar, width - 3,
                             width, sharpLevel, sharp, gateScratch.data());
 
-            // FEASIBLE-LUMA RESTRAINT (LDCD_LURCH_FEASIBLE=1, default OFF).
+            // Retained record from the removed LDCD_LURCH_FEASIBLE census
+            //
+            // FEASIBLE-LUMA RESTRAINT (was LDCD_LURCH_FEASIBLE=1, default
+            // OFF; never promoted, so the shipping sharpener has never been
+            // restrained by it).
             //
             // Lurch earns its place because the four-sample coarse smears
             // boundaries and lurch un-smears them. So the restriction cannot
@@ -547,41 +516,12 @@ void Comb::FrameBuffer::phaseLocked()
             // and says nothing about which surviving value is preferred --
             // no threshold, nothing fitted, no per-scene constant.
             //
-            // The probe separates two cases, because only the first is about
+            // The census separated two cases, because only the first is about
             // lurch: BASE-IN means the unsharpened platform was feasible and
             // the sharpening pushed it out (lurch overshoot); BASE-OUT means
             // the platform was already infeasible before lurch touched it,
             // which is a different defect and not this restraint's business.
-            if (lumaFeasOn) {
-                const double yLo = videoParameters.black16bIre - 10.0 * irescale;
-                const double yHi = videoParameters.white16bIre + 10.0 * irescale;
-                for (int xi = 0; xi < width; ++xi) {
-                    const int h = left + xi;
-                    double nb[2];
-                    int nn = 0;
-                    if (h - 2 >= 0)         nb[nn++] = (double)rawLine[h - 2];
-                    if (h + 2 < fullWidth)  nb[nn++] = (double)rawLine[h + 2];
-                    const lddecode::FeasibleInterval f =
-                        lddecode::lumaFeasibleFromPairSums(
-                            (double)rawLine[h], nb, nn, yLo, yHi);
-                    const double v = sharp[xi];
-                    const double c = f.clamp(v);
-                    static int dbg = 0;
-                    if (dbg < 12 && xi > 300 && xi < 320) {
-                        ++dbg;
-                        std::fprintf(stderr,
-                            "[FEASDBG] xi=%d sharp=%.0f pre=%.0f raw=%.0f "
-                            "lo=%.0f hi=%.0f nn=%d\n",
-                            xi, v, preSharp[xi], (double)rawLine[h],
-                            f.lo, f.hi, nn);
-                    }
-                    if (c == v) continue;
-                    const double base = preSharp[xi];
-                    const bool baseIn = (f.clamp(base) == base);
-                    g_lumaFeas.hit(std::fabs(v - c) * invIreScale, baseIn);
-                    if (baseIn) sharp[xi] = c;
-                }
-            }
+            // Only BASE-IN samples were ever clamped back to the interval.
         }
         lockedLumaCacheValid = true;
     }
@@ -610,18 +550,6 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
     const int width = right - left;
     const int fullWidth = videoParameters.fieldWidth;
 
-    static const int crDiagLine = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int crDiagC0 = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_C0");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int crDiagC1 = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_C1");
-        return s ? std::atoi(s) : -1;
-    }();
     static const double parallaxRepairTolIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_TOL_IRE");
         return s ? std::atof(s) : 0.5;
@@ -692,85 +620,6 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
                 analysis,
                 analysis + width,
                 lddecode::CarrierAnalysisRecord{});
-        }
-
-        if (crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0) {
-            const int c0 = std::clamp(crDiagC0, 0, width - 1);
-            const int c1 = std::clamp(
-                crDiagC1 < 0 ? crDiagC0 : crDiagC1,
-                c0,
-                width - 1);
-
-            std::fprintf(stderr,
-                "COARSERESOPT header line rel h phase raw oldBp viewCount "
-                "resLo resHi resSpreadIRE maxAbsMembershipIRE view s y4 residual "
-                "residualIRE membershipDeltaIRE membershipLocalX\n");
-
-            for (int rel = c0; rel <= c1; ++rel) {
-                const int sFirst = std::max(0, rel - 3);
-                const int sLast = width >= 4 ? std::min(rel, width - 4) : -1;
-                double residuals[4] = {0.0, 0.0, 0.0, 0.0};
-                double memberships[4] = {0.0, 0.0, 0.0, 0.0};
-                double localXs[4] = {0.0, 0.0, 0.0, 0.0};
-                double y4s[4] = {0.0, 0.0, 0.0, 0.0};
-                int starts[4] = {0, 0, 0, 0};
-                double lo = 1e300;
-                double hi = -1e300;
-                double maxMembership = 0.0;
-                int n = 0;
-
-                for (int s = sFirst; s <= sLast && n < 4; ++s, ++n) {
-                    const double y4 = 0.25 * (
-                        rawAtRel(s + 0) + rawAtRel(s + 1) +
-                        rawAtRel(s + 2) + rawAtRel(s + 3));
-                    const double residual = rawAtRel(rel) - y4;
-                    double membership = 0.0;
-                    double localX = 0.0;
-                    if (s + 4 < width) {
-                        membership = 0.25 *
-                            (rawAtRel(s + 4) - rawAtRel(s)) * invIreScale;
-                        localX = 0.5 * (static_cast<double>(s) +
-                                        static_cast<double>(s + 4)) - rel;
-                    }
-                    starts[n] = s;
-                    y4s[n] = y4;
-                    residuals[n] = residual;
-                    memberships[n] = membership;
-                    localXs[n] = localX;
-                    lo = std::min(lo, residual);
-                    hi = std::max(hi, residual);
-                    maxMembership = std::max(maxMembership, std::fabs(membership));
-                }
-
-                if (n == 0) {
-                    std::fprintf(stderr,
-                        "COARSERESOPT line=%d rel=%d h=%d phase=%d raw=%.6f "
-                        "oldBp=%.6f viewCount=0 resLo=0.000000 resHi=0.000000 "
-                        "resSpreadIRE=0.000000 maxAbsMembershipIRE=0.000000 "
-                        "view=-1 s=-1 y4=0.000000 residual=0.000000 "
-                        "residualIRE=0.000000 membershipDeltaIRE=0.000000 "
-                        "membershipLocalX=0.000000\n",
-                        line, rel, left + rel,
-                        carrierSampleClass(line, left + rel) & 3,
-                        rawAtRel(rel), baseline[rel]);
-                    continue;
-                }
-
-                const double spreadIRE = (hi - lo) * invIreScale;
-                for (int v = 0; v < n; ++v) {
-                    std::fprintf(stderr,
-                        "COARSERESOPT line=%d rel=%d h=%d phase=%d raw=%.6f "
-                        "oldBp=%.6f viewCount=%d resLo=%.6f resHi=%.6f "
-                        "resSpreadIRE=%.6f maxAbsMembershipIRE=%.6f "
-                        "view=%d s=%d y4=%.6f residual=%.6f residualIRE=%.6f "
-                        "membershipDeltaIRE=%.6f membershipLocalX=%.6f\n",
-                        line, rel, left + rel,
-                        carrierSampleClass(line, left + rel) & 3,
-                        rawAtRel(rel), baseline[rel], n, lo, hi, spreadIRE,
-                        maxMembership, v, starts[v], y4s[v], residuals[v],
-                        residuals[v] * invIreScale, memberships[v], localXs[v]);
-                }
-            }
         }
 
         if (!analysis)
@@ -1616,24 +1465,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     const int width = right - left;
     const int fullWidth = videoParameters.fieldWidth;
 
-    // Phase-1 cross-color diagnostic gate (parsed once).  See the measurement
-    // block in Pass 2.  A per-framebuffer heartbeat is emitted before the early
-    // return so a silent dump is self-explaining: it reports whether the locked
-    // path is even active and whether the requested line is in the active range.
-    static const int ccDiagLine = []{ const char *s = std::getenv("CC_DIAG_LINE"); return s ? std::atoi(s) : -1; }();
-    static const int ccDiagC0   = []{ const char *s = std::getenv("CC_DIAG_C0");   return s ? std::atoi(s) : -1; }();
-    static const int ccDiagC1   = []{ const char *s = std::getenv("CC_DIAG_C1");   return s ? std::atoi(s) : -1; }();
-    static const int crDiagLine = []{ const char *s = std::getenv("COARSE_RESID_DIAG_LINE"); return s ? std::atoi(s) : -1; }();
-    static const int crDiagC0   = []{ const char *s = std::getenv("COARSE_RESID_DIAG_C0");   return s ? std::atoi(s) : -1; }();
-    static const int crDiagC1   = []{ const char *s = std::getenv("COARSE_RESID_DIAG_C1");   return s ? std::atoi(s) : -1; }();
-    static const double crDiagFitTolIRE = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_FIT_TOL_IRE");
-        return s ? std::atof(s) : 1.5;
-    }();
-    static const double parallaxRepairTolIRE = []{
-        const char *s = std::getenv("LD_1D_PARALLAX_TOL_IRE");
-        return s ? std::atof(s) : 0.5;
-    }();
     static const double parallaxRepairMaxDeltaIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
         return s ? std::atof(s) : 0.35;
@@ -1650,18 +1481,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         const char *s = std::getenv("LD_1D_PARALLAX_REPAIR");
         return s && std::strcmp(s, "apply") == 0;
     }();
-    if (ccDiagLine >= 0) {
-        std::fprintf(stderr,
-            "CCDIAG-FB phaseComp=%d activeLines=[%d,%d) width=%d target=%d %s\n",
-            configuration.phaseCompensation ? 1 : 0, first, last, width, ccDiagLine,
-            (ccDiagLine >= first && ccDiagLine < last) ? "in-range" : "OUT-OF-RANGE");
-    }
-    if (crDiagLine >= 0) {
-        std::fprintf(stderr,
-            "COARSERES-FB phaseComp=%d activeLines=[%d,%d) width=%d target=%d %s\n",
-            configuration.phaseCompensation ? 1 : 0, first, last, width, crDiagLine,
-            (crDiagLine >= first && crDiagLine < last) ? "in-range" : "OUT-OF-RANGE");
-    }
 
     if (!configuration.phaseCompensation || width <= 0 || first >= last)
         return;
@@ -1837,16 +1656,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // in survivor selection.
         if (carrierAnalysis)
         {
-            const bool repairLogThisLine =
-                crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
-            const int repairLogFirst =
-                repairLogThisLine ? std::clamp(crDiagC0, 0, width - 1) : 0;
-            const int repairLogLast =
-                repairLogThisLine
-                    ? std::clamp(crDiagC1 < 0 ? crDiagC0 : crDiagC1,
-                                 repairLogFirst, width - 1)
-                    : -1;
-
             const double maxDeltaSamples =
                 std::max(0.0, parallaxRepairMaxDeltaIRE) * irescale;
             float *repairStrengthRow =
@@ -1858,59 +1667,41 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             if (repairDeltaRow)
                 std::fill(repairDeltaRow, repairDeltaRow + width, 0.0f);
 
-            if (repairLogThisLine) {
-                std::fprintf(stderr,
-                    "COARSERESREPAIR header line rel h phase mode reason "
-                    "sourceBp shortFit wideFit movingResidual optionCount "
-                    "survivorCount survivorLo survivorHi tolIRE maxDeltaIRE "
-                    "proposedDeltaIRE appliedDeltaIRE movingDistIRE "
-                    "maxAbsMembershipIRE sourceMinusShortIRE shortMinusWideIRE "
-                    "sourceMinusWideIRE\n");
-            }
-
             for (int rel = 0; rel < width; ++rel) {
-                const int p = carrierSampleClass(line, left + rel) & 3;
                 const auto &record = carrierAnalysis[rel];
                 const auto &residualDiag = record.residual;
                 const int optionCount = residualDiag.optionCount;
-                const double shortSample = record.fit.shortSample;
-                const double wideSample = record.fit.wideSample;
-                const double movingResidual = residualDiag.movingResidualSample;
                 const double sourceSample = bpLine[rel];
                 const int survivorCount = residualDiag.survivorCount();
                 const double survivorLo = residualDiag.survivorLo;
                 const double survivorHi = residualDiag.survivorHi;
-                const double maxAbsMembershipIRE =
-                    residualDiag.maxAbsMembershipIRE;
 
-                const char *reason = "no-options";
                 double proposedDelta = 0.0;
                 double appliedDelta = 0.0;
-                double movingDistIRE = 0.0;
 
+                // The branch taxonomy below is unchanged; the labels are the
+                // "reason" strings the removed COARSERESREPAIR log emitted.
                 if (carrierAnalysis[rel].scheduleConformance ==
                     lddecode::CarrierScheduleConformance::ScheduleIllegal) {
-                    // Registered as luma at analysis time: there is no
-                    // carrier here to repair, and the residual options are
-                    // luma interpretations that would only masquerade as
-                    // survivor conflict.
-                    reason = "schedule-illegal-luma";
+                    // schedule-illegal-luma. Registered as luma at analysis
+                    // time: there is no carrier here to repair, and the
+                    // residual options are luma interpretations that would
+                    // only masquerade as survivor conflict.
                 } else if (optionCount <= 0) {
-                    reason = "no-options";
+                    // no-options.
                 } else if (survivorCount <= 0) {
-                    reason = "conflict-no-survivors";
+                    // conflict-no-survivors.
                 } else if (survivorCount == optionCount) {
-                    reason = "no-discrimination-all-survive";
+                    // no-discrimination-all-survive.
                 } else if (sourceSample >= survivorLo &&
                            sourceSample <= survivorHi)
                 {
-                    reason = "source-inside";
+                    // source-inside.
                 } else {
-                    movingDistIRE = residualDiag.movingDistanceIRE;
                     const bool movingCompatible = residualDiag.movingCompatible;
 
                     if (!movingCompatible) {
-                        reason = "moving-conflict";
+                        // moving-conflict.
                     } else {
                         const double target =
                             std::clamp(sourceSample, survivorLo, survivorHi);
@@ -1921,13 +1712,13 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                             maxDeltaSamples);
 
                         if (!parallaxRepairApply) {
-                            // Analysis complete, but the repair is opt-in:
-                            // the ordinary bandpass remains source authority
-                            // and no repair hold is published downstream.
-                            reason = "report-only";
+                            // report-only. Analysis complete, but the repair
+                            // is opt-in: the ordinary bandpass remains source
+                            // authority and no repair hold is published
+                            // downstream.
                             appliedDelta = 0.0;
                         } else {
-                            reason = "apply";
+                            // apply.
                             bpLine[rel] = sourceSample + appliedDelta;
                             if (repairStrengthRow && maxDeltaSamples > 1e-9) {
                                 repairStrengthRow[rel] = static_cast<float>(
@@ -1943,32 +1734,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                                     static_cast<float>(appliedDelta);
                         }
                     }
-                }
-
-                if (repairLogThisLine &&
-                    rel >= repairLogFirst && rel <= repairLogLast)
-                {
-                    std::fprintf(stderr,
-                        "COARSERESREPAIR line=%d rel=%d h=%d phase=%d "
-                        "mode=%s reason=%s sourceBp=%.6f shortFit=%.6f "
-                        "wideFit=%.6f movingResidual=%.6f optionCount=%d "
-                        "survivorCount=%d survivorLo=%.6f survivorHi=%.6f "
-                        "tolIRE=%.6f maxDeltaIRE=%.6f proposedDeltaIRE=%.6f "
-                        "appliedDeltaIRE=%.6f movingDistIRE=%.6f "
-                        "maxAbsMembershipIRE=%.6f sourceMinusShortIRE=%.6f "
-                        "shortMinusWideIRE=%.6f sourceMinusWideIRE=%.6f\n",
-                        line, rel, left + rel, p, "default", reason, sourceSample,
-                        shortSample, wideSample, movingResidual, optionCount,
-                        survivorCount, survivorLo, survivorHi,
-                        std::max(0.0, parallaxRepairTolIRE),
-                        std::max(0.0, parallaxRepairMaxDeltaIRE),
-                        proposedDelta * invIreScale,
-                        appliedDelta * invIreScale,
-                        movingDistIRE,
-                        maxAbsMembershipIRE,
-                        (sourceSample - shortSample) * invIreScale,
-                        (shortSample - wideSample) * invIreScale,
-                        (sourceSample - wideSample) * invIreScale);
                 }
             }
         }
@@ -1998,16 +1763,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             preQ[rel + 1] = preQ[rel] + demQ[rel];
             preEnv[rel + 1] = preEnv[rel] + env[rel];
         }
-
-        // Wide coherent envelope: |sum(I,Q)| over the window, normalized so a
-        // coherent carrier of amplitude A returns ~A regardless of width.
-        auto wideEnvIRE = [&](int center) -> double {
-            const double meanI = centeredEvenWeightMean(
-                demI.data(), preI.data(), width, center, kWideWin);
-            const double meanQ = centeredEvenWeightMean(
-                demQ.data(), preQ.data(), width, center, kWideWin);
-            return 2.0 * boundedMag(meanI, meanQ) * invIreScale;
-        };
 
         // Narrow fit: rolling, current-centered mean of the 2-sample envelope.
         // The point envelope = A on coherent carrier but ripples at 2fsc under
@@ -2051,27 +1806,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // 1.3 MHz edges, is expressible by construction and passes at
         // w = 1; the weight never exceeds 1, so it can only return energy
         // to Y, never manufacture carrier.
-        const bool crDiagThisLine =
-            crDiagLine >= 0 && line == crDiagLine && crDiagC0 >= 0;
-        const int crDiagFirst =
-            crDiagThisLine ? std::clamp(crDiagC0, 0, width - 1) : 0;
-        const int crDiagLast =
-            crDiagThisLine
-                ? std::clamp(crDiagC1 < 0 ? crDiagC0 : crDiagC1,
-                             crDiagFirst, width - 1)
-                : -1;
-        if (crDiagThisLine) {
-            std::fprintf(stderr,
-                "COARSERESFIT header line rel h phase sourceBp shortFit wideFit "
-                "shortTolIRE shortLo shortHi optionCount survivorCount survivorLo "
-                "survivorHi nearestShortDistIRE sourceClampDeltaIRE "
-                "wideClampDeltaIRE sourceMinusShortIRE shortMinusWideIRE "
-                "sourceMinusWideIRE narrowMagIRE wideMagIRE impurity\n");
-            std::fprintf(stderr,
-                "COARSERESFITOPT header line rel view s residual residualIRE "
-                "distShortIRE distWideIRE inShortBand membershipDeltaIRE "
-                "membershipLocalX\n");
-        }
 
         // Aperture cross-color detector.  Publishes gA = aperture contamination
         // as carrierImpurity; gA is never a source gain.
@@ -2116,124 +1850,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 gA = clamp01(
                     (narrowMag - wideMag) /
                     std::max(kImpurityFloorIRE, narrowMag));
-            }
-
-            if (crDiagThisLine && rel >= crDiagFirst && rel <= crDiagLast) {
-                const int p = carrierSampleClass(line, left + rel) & 3;
-                const double wideSample =
-                    2.0 * (ZwI * cosRef[p] + ZwQ * sinRef[p]);
-
-                const double ZnI = centeredEvenWeightMean(
-                    demI.data(), preI.data(), width, rel, kNarrowWin);
-                const double ZnQ = centeredEvenWeightMean(
-                    demQ.data(), preQ.data(), width, rel, kNarrowWin);
-                const double shortSample =
-                    2.0 * (ZnI * cosRef[p] + ZnQ * sinRef[p]);
-
-                const double fitTolSamples =
-                    std::max(0.0, crDiagFitTolIRE) * irescale;
-                const double shortLo = shortSample - fitTolSamples;
-                const double shortHi = shortSample + fitTolSamples;
-
-                const int sFirst = std::max(0, rel - 3);
-                const int sLast = (width >= 4)
-                    ? std::min(rel, width - 4)
-                    : -1;
-
-                double survivorLo = 1e300;
-                double survivorHi = -1e300;
-                double nearestDistIRE = 1e300;
-                int optionCount = 0;
-                int survivorCount = 0;
-
-                for (int s = sFirst; s <= sLast && optionCount < 4; ++s) {
-                    const double y4 =
-                        0.25 * (rawAtRel(s + 0) +
-                                rawAtRel(s + 1) +
-                                rawAtRel(s + 2) +
-                                rawAtRel(s + 3));
-                    const double residual = rawAtRel(rel) - y4;
-                    const double distShortIRE =
-                        std::fabs(residual - shortSample) * invIreScale;
-                    const double distWideIRE =
-                        std::fabs(residual - wideSample) * invIreScale;
-                    const double distBandIRE =
-                        (residual < shortLo)
-                            ? (shortLo - residual) * invIreScale
-                            : ((residual > shortHi)
-                                ? (residual - shortHi) * invIreScale
-                                : 0.0);
-                    nearestDistIRE = std::min(nearestDistIRE, distBandIRE);
-
-                    const bool inBand =
-                        residual >= shortLo && residual <= shortHi;
-                    if (inBand) {
-                        ++survivorCount;
-                        survivorLo = std::min(survivorLo, residual);
-                        survivorHi = std::max(survivorHi, residual);
-                    }
-
-                    double membershipDeltaIRE = 0.0;
-                    double membershipLocalX = 0.0;
-                    if (s + 4 < width) {
-                        membershipDeltaIRE =
-                            0.25 * (rawAtRel(s + 4) - rawAtRel(s)) * invIreScale;
-                        membershipLocalX =
-                            0.5 * (static_cast<double>(s) +
-                                   static_cast<double>(s + 4)) -
-                            static_cast<double>(rel);
-                    }
-
-                    std::fprintf(stderr,
-                        "COARSERESFITOPT line=%d rel=%d view=%d s=%d "
-                        "residual=%.6f residualIRE=%.6f distShortIRE=%.6f "
-                        "distWideIRE=%.6f inShortBand=%d membershipDeltaIRE=%.6f "
-                        "membershipLocalX=%.6f\n",
-                        line, rel, optionCount, s, residual,
-                        residual * invIreScale, distShortIRE, distWideIRE,
-                        inBand ? 1 : 0, membershipDeltaIRE, membershipLocalX);
-                    ++optionCount;
-                }
-
-                if (survivorCount == 0) {
-                    survivorLo = 0.0;
-                    survivorHi = 0.0;
-                }
-                if (nearestDistIRE == 1e300)
-                    nearestDistIRE = 0.0;
-
-                auto clampDeltaIRE = [&](double sample) {
-                    if (survivorCount <= 0)
-                        return 0.0;
-                    const double clamped =
-                        std::clamp(sample, survivorLo, survivorHi);
-                    return (clamped - sample) * invIreScale;
-                };
-
-                const double sourceSample = bpLine[rel];
-                const double sourceMinusShortIRE =
-                    (sourceSample - shortSample) * invIreScale;
-                const double shortMinusWideIRE =
-                    (shortSample - wideSample) * invIreScale;
-                const double sourceMinusWideIRE =
-                    (sourceSample - wideSample) * invIreScale;
-                std::fprintf(stderr,
-                    "COARSERESFIT line=%d rel=%d h=%d phase=%d "
-                    "sourceBp=%.6f shortFit=%.6f wideFit=%.6f "
-                    "shortTolIRE=%.6f shortLo=%.6f shortHi=%.6f "
-                    "optionCount=%d survivorCount=%d survivorLo=%.6f "
-                    "survivorHi=%.6f nearestShortDistIRE=%.6f "
-                    "sourceClampDeltaIRE=%.6f wideClampDeltaIRE=%.6f "
-                    "sourceMinusShortIRE=%.6f shortMinusWideIRE=%.6f "
-                    "sourceMinusWideIRE=%.6f narrowMagIRE=%.6f wideMagIRE=%.6f "
-                    "impurity=%.6f\n",
-                    line, rel, left + rel, p, sourceSample, shortSample,
-                    wideSample, std::max(0.0, crDiagFitTolIRE), shortLo, shortHi,
-                    optionCount, survivorCount, survivorLo, survivorHi,
-                    nearestDistIRE, clampDeltaIRE(sourceSample),
-                    clampDeltaIRE(wideSample), sourceMinusShortIRE,
-                    shortMinusWideIRE, sourceMinusWideIRE, narrowMag, wideMag,
-                    gA);
             }
 
             // The emitted source is the full-resolution ordinary carrier plus
@@ -2324,89 +1940,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 record.carrierImpurity = std::max(
                     record.carrierImpurity,
                     apertureImpurity);
-            }
-        }
-
-        // ---- Phase-1 cross-color measurement diagnostic (gated, no output) ----
-        // Touches nothing in the signal path: not the source, not the impurity
-        // buffer, not alphaEff.  When CC_DIAG_LINE is set it dumps, at columns
-        // [CC_DIAG_C0,CC_DIAG_C1] (active-picture-relative), the purity facts
-        // plus residual-winding facts.  Purpose: see whether contamination reads
-        // rotating/scattered (high turn / low coherence, or low coherence with
-        // amplitude) while authentic chroma reads aligned (residual phase steady,
-        // stable centre nonzero) on the actual title frame, before any
-        // correction is enabled.  (Gate vars are parsed once at function top.)
-        if (ccDiagLine >= 0 && line == ccDiagLine && ccDiagC0 >= 0) {
-            constexpr double kPi = 3.14159265358979323846;
-            const int c0 = std::clamp(ccDiagC0, 0, width - 1);
-            const int c1 = std::clamp(ccDiagC1 < 0 ? ccDiagC0 : ccDiagC1, c0, width - 1);
-            for (int rel = c0; rel <= c1; ++rel) {
-                // Stable centre Zwide (8-cycle complex mean).
-                const double ZwI = centeredEvenWeightMean(
-                    demI.data(), preI.data(), width, rel, kWideWin);
-                const double ZwQ = centeredEvenWeightMean(
-                    demQ.data(), preQ.data(), width, rel, kWideWin);
-                const double stableAmpIRE = 2.0 * std::hypot(ZwI, ZwQ) * invIreScale;
-
-                const double narrowMag = narrowEnvIRE(rel);
-                const double wideMag   = wideEnvIRE(rel);
-                const double gA = (narrowMag > kImpurityFloorIRE && wideMag < narrowMag)
-                    ? clamp01((narrowMag - wideMag) / std::max(kImpurityFloorIRE, narrowMag))
-                    : 0.0;
-
-                // Residual winding over the narrow support: per-cycle complex
-                // envelope minus the stable centre, amplitude-weighted phase walk.
-                double sw = 0.0, scos = 0.0, ssin = 0.0, sturn = 0.0;
-                double sRmag = 0.0, sZmag = 0.0;
-                int nk = 0;
-                double prevTheta = 0.0;
-                bool havePrev = false;
-                const int ka = rel - kNarrowWin / 2;
-                const int kb = rel + kNarrowWin / 2;
-                for (int k = ka; k <= kb; ++k) {
-                    auto demAt = [&](const std::vector<double> &v, int x) {
-                        return v[std::clamp(x, 0, width - 1)];
-                    };
-                    const double ZcI = centeredCarrierCycle4Mean(
-                        demAt(demI, k - 2), demAt(demI, k - 1),
-                        demAt(demI, k), demAt(demI, k + 1),
-                        demAt(demI, k + 2));
-                    const double ZcQ = centeredCarrierCycle4Mean(
-                        demAt(demQ, k - 2), demAt(demQ, k - 1),
-                        demAt(demQ, k), demAt(demQ, k + 1),
-                        demAt(demQ, k + 2));
-                    const double Ri = ZcI - ZwI;
-                    const double Rq = ZcQ - ZwQ;
-                    const double Rmag = std::hypot(Ri, Rq);
-                    sRmag += Rmag;
-                    sZmag += std::hypot(ZcI, ZcQ);
-                    ++nk;
-                    const double theta = std::atan2(Rq, Ri);
-                    if (havePrev) {
-                        double d = theta - prevTheta;
-                        while (d >  kPi) d -= 2.0 * kPi;
-                        while (d < -kPi) d += 2.0 * kPi;
-                        const double w = Rmag;
-                        sw    += w;
-                        scos  += w * std::cos(d);
-                        ssin  += w * std::sin(d);
-                        sturn += w * d;
-                    }
-                    prevTheta = theta;
-                    havePrev = true;
-                }
-                const double incrementCoherence = sw > 0.0 ? std::hypot(scos, ssin) / sw : 0.0;
-                const double netTurn = sw > 0.0 ? std::fabs(sturn) / sw : 0.0;
-                const double meanRIRE = nk > 0 ? (sRmag / nk) * invIreScale : 0.0;
-                const double meanZIRE = nk > 0 ? (sZmag / nk) * invIreScale : 0.0;
-                const double residualStrength =
-                    meanRIRE / std::max(kImpurityFloorIRE, meanZIRE);
-
-                std::fprintf(stderr,
-                    "CCDIAG line=%d col=%d narrow=%.2f wide=%.2f stable=%.2f "
-                    "gA=%.3f coh=%.3f turn=%.3f rstr=%.3f\n",
-                    line, rel, narrowMag, wideMag, stableAmpIRE,
-                    gA, incrementCoherence, netTurn, residualStrength);
             }
         }
 
@@ -2688,16 +2221,6 @@ void Comb::FrameBuffer::measurePostCombImpurity()
 
     const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
 
-    static const int pcDiagLine = []{
-        const char *s = std::getenv("CC_DIAG_LINE"); return s ? std::atoi(s) : -1;
-    }();
-    static const int pcDiagC0 = []{
-        const char *s = std::getenv("CC_DIAG_C0"); return s ? std::atoi(s) : -1;
-    }();
-    static const int pcDiagC1 = []{
-        const char *s = std::getenv("CC_DIAG_C1"); return s ? std::atoi(s) : -1;
-    }();
-
     // Bandwidth-law cross-color contributor (opt-in, default off so the
     // authoritative impurity is byte-identical when disabled). Scores demod
     // envelope activity too fast to be legal carrier and MAXes it into gA; it
@@ -2825,13 +2348,6 @@ void Comb::FrameBuffer::measurePostCombImpurity()
             // stale pre-comb suspicion must not linger and suppress solved
             // pixels.
             impurityRow[rel] = static_cast<float>(gA);
-
-            if (pcDiagLine >= 0 && line == pcDiagLine &&
-                rel >= pcDiagC0 && rel <= pcDiagC1) {
-                std::fprintf(stderr,
-                    "CCPOST line=%d col=%d srcBuf=%d narrow=%.2f wide=%.2f gA=%.3f\n",
-                    line, rel, srcBuf, narrowMag, wideMag, gA);
-            }
         }
     }
 }
@@ -9436,16 +8952,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
             const char *s = std::getenv("LDCD_STANDING_LAW");
             return !s || std::atoi(s) != 0;
         }();
-        // Windowed per-pixel dump (frame line / active column, same
-        // convention as LDCD_PY_*): sc, lic, s and the operands.
-        static const auto stEnvInt = [](const char *n, int f) {
-            const char *s = std::getenv(n); return s ? std::atoi(s) : f;
-        };
-        static const int stL0 = stEnvInt("LDCD_STANDING_L0", -1);
-        static const int stL1 = stEnvInt("LDCD_STANDING_L1", -1);
-        static const int stC0 = stEnvInt("LDCD_STANDING_C0", -1);
-        static const int stC1 = stEnvInt("LDCD_STANDING_C1", -1);
-        const bool stDump = stL0 >= 0 && stC0 >= 0;
         if (standingLawOn) {
             const double ampFloorS = 3.0 * irescale;    // 3 IRE
             const double powFloorS = ampFloorS * ampFloorS;
@@ -9588,14 +9094,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                                 nf = std::clamp(nf, 0.0, fit);
                             else
                                 nf = std::clamp(nf, fit, 0.0);
-                        }
-                        if (stDump && line >= stL0 && line <= stL1 &&
-                            xi >= stC0 && xi <= stC1) {
-                            std::fprintf(stderr,
-                                "STDUMP line=%d xi=%d fit=%.2f sc=%.3f "
-                                "lic=%.3f s=%.2f nRun=%.0f\n",
-                                line, xi, fit * invIreScale, sc,
-                                licHere, s * invIreScale, vN[xi]);
                         }
                         if (nf != fit) {
                             fitRow[xi] = static_cast<float>(nf);

@@ -431,48 +431,6 @@ public:
 	                          std::vector<double> &vI, std::vector<double> &vQ,
 	                          std::vector<double> &sI, std::vector<double> &sQ,
 	                          double *ratioOut) const;
-	// Pair class-map probe at luma steps (LDCD_PROBE_DISENT). MEASUREMENT
-	// ONLY -- writes nothing. LAW: the 1D stage may contain no comb, blend,
-	// or cross-line signal; 1D is downstream's safe retreat. Adjacent lines
-	// may CONFIRM (phase, luma contrast); the P12 subtraction that briefly
-	// consumed this measurement was withdrawn for violating that law.
-	// Also profiles the error per run: peak|cm| vs step height (scale law),
-	// shape correlation r against the anticipated doublet, amplitude beta.
-	void probeEdgePairClassMap(int line);
-
-	// Downstream-fate probe (LDCD_PROBE_EDGEFATE). MEASUREMENT ONLY. After
-	// 2D/3D have run, measures how far the comb moved the carrier off its 1D
-	// source at lurch footprints vs everywhere else, and how often it
-	// effectively passed 1D through -- locating which consumer owns the edge
-	// pixels the evidence handoff must inform.
-	void probeEdgeFate(int dimensions);
-
-	// Off-grid leakage probe (LDCD_PROBE_OFFGRID). MEASUREMENT ONLY. Stage 1
-	// of the fit reset: fraction of each published carrier's energy outside
-	// the grammar-basis span per 4-sample window (off-span = DC + 2fSC,
-	// which no lawful carrier can carry).
-	void probeOffGrid();
-
-	// Two-sided certified-luma tween probe (LDCD_PROBE_TWEEN). MEASUREMENT
-	// ONLY, -t 1. Grades the MIDDLE of three consecutive covers, predicted
-	// from the outer two, against its own exact channel -- a 4-film-frame
-	// straddle, twice the real job's distance, so its numbers bound the
-	// real tween conservatively. Run with LDCD_CERT_1D=0 so every
-	// estimator stays an estimator while truth survives.
-	void probeLumaTween();
-
-	// Carrier-invention ledger (LDCD_PROBE_INVENT). MEASUREMENT ONLY.
-	// Grades every carrier claimant against the exact channel IN IRE on
-	// covered def samples -- full frame and inside a box
-	// (LDCD_INVENT_L0/L1/C0/C1, frame line / active column). Answers the
-	// acid-test question directly: does the model claim carrier where
-	// truth says there is none? Run with LDCD_CERT_1D=0.
-	void probeCarrierInvention();
-
-	// Disposable physics probe (LDCD_PROBE_APERTURE): measures whether the four
-	// demodulated aperture views can bound the chroma at a luma step. Reads
-	// state only; writes nothing and changes no output. See comb.cpp.
-	void probeApertureChroma(int line, const double *carrierAtLeft);
 
 	// Carrier-retraction front end, run after shared analysis and the locked
 	// local-carrier construction.
@@ -622,9 +580,6 @@ public:
 	bool starUsedNextEvidence = false;
 	double starAddedExactSum = 0.0;
 	double starAddedExactMax = 0.0;
-	// Exact-carrier anchor extraction + transfer-error probe
-	// (LDCD_PROBE_ANCHOR=1, run -t 1). Measurement only.
-	void probeExactAnchors();
 	void doCNR();
 	void doYNR();
 	void transformIQ(double chromaGain, double chromaPhase);
@@ -1262,23 +1217,6 @@ private:
 	// none; reset on frame reuse in loadFields.
 	std::vector<float> antRefLuma_flat;
 	int antRefAge = -1;
-
-	// Probe-only estimator stashes (referee repair, 2026-08-02 audit): the
-	// certified head overwrites locked1DSource with the exact fact on
-	// covered samples, and factFit stamps carrierFit likewise on certified
-	// def samples -- which made every referee "1D"/"fit" column
-	// self-referential there (DSREF/CCREF/ANTGRADE were reporting zeros as
-	// estimator success). These planes keep the PRE-fact estimator values,
-	// allocated only when a truth referee is engaged, and are never read by
-	// any render or decision path.
-	std::vector<float> probePreHead1D_flat;
-	std::vector<float> probePreFactFit_flat;
-	// Probe-only: the committed CCR verdict's measured disagreement
-	// (devIRE) per sample, so CCREF grades the LIVE detector read (the
-	// anchored delta) instead of only its retired predecessors. Written in
-	// splitIQlocked pass 1 when LDCD_PROBE_CCREF is set; NaN where no
-	// anchored plane.
-	std::vector<float> probeCcDevIRE_flat;
 
 	// Regional fact audit of the SOLVE (Pass 1.7): mean |fit - exact| in
 	// IRE at certified samples, pre-stamp, per 128x32 region; NaN = no
