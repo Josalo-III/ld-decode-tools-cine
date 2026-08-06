@@ -6786,6 +6786,82 @@ void Comb::FrameBuffer::buildTemporalCertReference(
 // local; only PHASE transfers, the coordinate that survives content
 // change best. Escapes: inert under LDCD_PHASE_SNAP=0 or
 // LDCD_PHASE_SNAP_T=0.
+namespace {
+// Offset search for the tween chase: demeaned NCC of the carrier-free
+// platform rows over a 48-sample window, lags +-12 (sized for motion
+// across a telecine cycle), parabolic refinement, gated on window energy
+// and peak correlation. Correspondence PRIOR only -- it narrows the anchor
+// search; it never supplies a rendered value.
+double ldcdP6WindowLag(const double *est, const double *ref,
+                       int w0, int W, double minRms)
+{
+    constexpr int kLag = 12;
+    double meanE = 0.0, meanR = 0.0;
+    for (int i = 0; i < W; ++i) { meanE += est[w0 + i]; meanR += ref[w0 + i]; }
+    meanE /= W; meanR /= W;
+    double eE = 0.0;
+    for (int i = kLag; i < W - kLag; ++i) {
+        const double de = est[w0 + i] - meanE;
+        eE += de * de;
+    }
+    const int inner = W - 2 * kLag;
+    if (eE / inner < minRms * minRms)
+        return std::numeric_limits<double>::quiet_NaN();
+    double corr[2 * kLag + 1];
+    int best = -1;
+    double bestC = 0.5;
+    for (int l = -kLag; l <= kLag; ++l) {
+        double dot = 0.0, er = 0.0;
+        for (int i = kLag; i < W - kLag; ++i) {
+            const double de = est[w0 + i] - meanE;
+            const double dr = ref[w0 + i + l] - meanR;
+            dot += de * dr;
+            er  += dr * dr;
+        }
+        const double c = dot / std::sqrt(std::max(1e-12, eE * er));
+        corr[l + kLag] = c;
+        if (c > bestC) { bestC = c; best = l + kLag; }
+    }
+    if (best <= 0 || best >= 2 * kLag)
+        return std::numeric_limits<double>::quiet_NaN();
+    const double A = corr[best - 1], B = corr[best], Cc = corr[best + 1];
+    const double den = A + Cc - 2.0 * B;
+    const double d = (std::fabs(den) < 1e-12)
+        ? 0.0 : std::clamp((A - Cc) / (2.0 * den), -0.5, 0.5);
+    return (double)(best - kLag) + d;
+}
+
+// TEMPORARY TELEMETRY (LDCD_ICEBERG_STATS=1): per-frame engagement of the
+// anchor tween, so selectivity is measured rather than inferred. Strip
+// with the campaign's instruments.
+struct LdcdIceStat {
+    long anchors = 0, matched = 0, licensed = 0, renderedSamples = 0;
+};
+thread_local LdcdIceStat gIceStat;
+
+// Catmull-Rom evaluation of a row at a fractional position; NaN outside
+// support or across a NaN sample. Shared by the tween delivery and the P6
+// referee (one implementation, per the no-duplicate-math law).
+template <typename T>
+double ldcdP6CrEval(const T *row, int W, double pos)
+{
+    const int base = (int)std::floor(pos);
+    if (base < 1 || base + 2 >= W)
+        return std::numeric_limits<double>::quiet_NaN();
+    const double y0 = row[base - 1], y1 = row[base],
+                 y2 = row[base + 1], y3 = row[base + 2];
+    if (!std::isfinite(y0) || !std::isfinite(y1) ||
+        !std::isfinite(y2) || !std::isfinite(y3))
+        return std::numeric_limits<double>::quiet_NaN();
+    const double t = pos - base;
+    const double t2 = t * t, t3 = t2 * t;
+    return 0.5 * ((2.0 * y1) + (-y0 + y2) * t +
+                  (2.0 * y0 - 5.0 * y1 + 4.0 * y2 - y3) * t2 +
+                  (-y0 + 3.0 * y1 - 3.0 * y2 + y3) * t3);
+}
+
+} // namespace
+
 bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
                                                 const FrameBuffer *nextF)
 {
@@ -7047,11 +7123,485 @@ bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
             // the batch-boundary frames running one-sided, and the occlusion
             // guard could not act on them either, because it needs two covers
             // to form a disagreement. Both sides or nothing, as stated.
+            // ICEBERG DELIVERY, REBUILT (2026-08-06; opt-in LDCD_ICEBERG=1
+            // pending the visual verdict). LAW: PARAMETERS INTERPOLATE; THE
+            // RENDER HAPPENS ONCE (After Effects model, author-directed).
+            // The first build violated law 4 by rendering both displaced
+            // covers and cross-dissolving them (0.5*(vP+vN)) -- a
+            // better-registered double exposure, whose sub-sample
+            // misregistration blunted every corner (the author's diagnosis:
+            // anchors' broken handles were being relaxed by the mix).
+            //
+            // Corrected construction, per line:
+            //   1. ANCHORS: sharpest contrasts in each cover's certified
+            //      luma (sub-sample position by parabola on |slope|).
+            //   2. CORRESPONDENCE: prev<->next anchor matching, with the
+            //      platform-chase lags as PRIOR only (evidence for the
+            //      match; never a render input). No match -> abstain.
+            //   3. TWEEN IN PARAMETER SPACE: position along the anchor's
+            //      own motion vector at the temporal fraction (adjacent
+            //      output frames at 24p: tau = 1/2); the anchor-centered
+            //      SHAPE as an aligned lerp of the two covers' local
+            //      profiles -- both re-sampled into anchor coordinates
+            //      BEFORE the lerp, so the corner interpolates as a corner.
+            //   4. THE PIN: this frame's own four-view membership evidence
+            //      corrects the tweened position (bounded, ramped) and
+            //      licenses the render (presence + position, both
+            //      smoothstepped). No corroboration -> abstain.
+            //   5. RENDER ONCE: the tweened shape placed at the tweened
+            //      position, feathered into the reference. Nothing is ever
+            //      superimposed; the bracket appears only as what the
+            //      pipeline already was, at ramped abstention boundaries.
+            // The outlawed mid-band displaced-average delivery is REMOVED
+            // (not grandfathered by its P6 number); mid geometry arrives
+            // only through the rendered anchors' side levels.
+            static const bool icebergTween = []{
+                const char *e = std::getenv("LDCD_ICEBERG");
+                return e && std::atoi(e) != 0;
+            }();
+            static const bool iceStats = []{
+                const char *e = std::getenv("LDCD_ICEBERG_STATS");
+                return e && std::atoi(e) != 0;
+            }();
+            std::vector<double> lhatAdj(width, 0.0);
+            if (icebergTween && nb[0] && nb[1] && lockedLumaCacheValid &&
+                nb[0]->lockedLumaCacheValid && nb[1]->lockedLumaCacheValid) {
+                const double *platC = lockedLumaSmooth_line(line);
+                const double *platP = nb[0]->lockedLumaSmooth_line(line);
+                const double *platN = nb[1]->lockedLumaSmooth_line(line);
+                const auto *evRow = coarseYEvidence_line(line);
+                constexpr int kTwWin = 48, kTwStride = 16;
+                const double minRms = 1.5 * irescale;
+
+                // Chase lags at window centers: correspondence prior.
+                const int nWin =
+                    std::max(0, (width - 28 - kTwWin) / kTwStride + 1);
+                std::vector<double> lagPA(nWin), lagNA(nWin);
+                std::vector<char> wOk(nWin, 0);
+                for (int i = 0; i < nWin; ++i) {
+                    const int w0 = 14 + i * kTwStride;
+                    lagPA[i] = ldcdP6WindowLag(platC, platP, w0, kTwWin,
+                                               minRms);
+                    lagNA[i] = ldcdP6WindowLag(platC, platN, w0, kTwWin,
+                                               minRms);
+                    wOk[i] = std::isfinite(lagPA[i]) &&
+                             std::isfinite(lagNA[i]);
+                }
+                auto lagsAt = [&](double x, double &lp, double &ln) {
+                    const int i = std::clamp(
+                        (int)std::lround((x - 14.0 - kTwWin / 2.0) /
+                                         kTwStride),
+                        0, std::max(0, nWin - 1));
+                    if (nWin <= 0 || !wOk[i]) return false;
+                    lp = lagPA[i]; ln = lagNA[i];
+                    return true;
+                };
+
+                // Anchor extraction from a certified cover row.
+                struct IceAnchor { double pos; double slope; };
+                auto extract = [&](const std::vector<double> &row,
+                                   std::vector<IceAnchor> &out) {
+                    out.clear();
+                    const double slopeFloor = 2.0 * irescale;
+                    int lastA = -3;
+                    for (int x = 6; x < width - 6; ++x) {
+                        if (x - lastA < 3) continue;
+                        if (!std::isfinite(row[x - 2]) ||
+                            !std::isfinite(row[x - 1]) ||
+                            !std::isfinite(row[x])     ||
+                            !std::isfinite(row[x + 1]) ||
+                            !std::isfinite(row[x + 2]))
+                            continue;
+                        const double sM = 0.5 * (row[x]     - row[x - 2]);
+                        const double s0 = 0.5 * (row[x + 1] - row[x - 1]);
+                        const double sP = 0.5 * (row[x + 2] - row[x]);
+                        const double a = std::fabs(s0);
+                        if (a < slopeFloor) continue;
+                        if (a < std::fabs(sM) || a <= std::fabs(sP))
+                            continue;
+                        const double den =
+                            std::fabs(sM) + std::fabs(sP) - 2.0 * a;
+                        const double d = (std::fabs(den) < 1e-12) ? 0.0 :
+                            std::clamp((std::fabs(sM) - std::fabs(sP)) /
+                                       (2.0 * den), -0.5, 0.5);
+                        lastA = x;
+                        out.push_back({ (double)x + d, s0 });
+                    }
+                };
+                std::vector<IceAnchor> ancP, ancN;
+                extract(sideVal[0], ancP);
+                extract(sideVal[1], ancN);
+
+                constexpr int kSnip = 5;   // shape support: pos +- 5
+                // SEGMENTS (2026-08-06): matched anchors are KNOTS of a
+                // per-line piecewise curve; spans render once each,
+                // assignment never accumulation (see the span pass below).
+                struct IceKnot {
+                    double q, pA, pB, w;
+                    double shape[2 * kSnip + 1];
+                };
+                std::vector<IceKnot> knots;
+
+                // Anchor-centered profiles, once per anchor.
+                auto snipOf = [&](const std::vector<double> &row, double pos,
+                                  double *out) -> bool {
+                    for (int k = -kSnip; k <= kSnip; ++k) {
+                        const double v = ldcdP6CrEval(
+                            row.data(), width, pos + k);
+                        if (!std::isfinite(v)) return false;
+                        out[k + kSnip] = v;
+                    }
+                    return true;
+                };
+                const int nP = (int)ancP.size(), nN = (int)ancN.size();
+                std::vector<std::array<double, 2 * kSnip + 1>> snipP(nP),
+                    snipN(nN);
+                std::vector<char> okP(nP, 0), okN(nN, 0);
+                for (int i = 0; i < nP; ++i)
+                    okP[i] = snipOf(sideVal[0], ancP[i].pos,
+                                    snipP[i].data());
+                for (int j = 0; j < nN; ++j)
+                    okN[j] = snipOf(sideVal[1], ancN[j].pos,
+                                    snipN[j].data());
+
+                // CORRESPONDENCE v2 (2026-08-06, after the segments
+                // verdict): the platform-chase prior fails exactly on
+                // platform-flat texture (the cube face: all detail is HF,
+                // which lockedLumaSmooth excludes), so the population the
+                // author pointed at never even attempted matching. The
+                // match test is now SHAPE ITSELF — aligned-snippet rms,
+                // stronger than any prior and available per candidate pair
+                // — with the prior narrowing the search where it exists and
+                // a bounded blind search where it does not. Two abstention
+                // disciplines guard the blind form: a near-tie at a
+                // distinct position (periodic texture's false-match mode)
+                // abstains, and every match must agree with its
+                // neighbours' displacement (the motion field is smooth;
+                // isolated matches without consensus fall back to
+                // requiring the prior, the old regime as floor).
+                struct IceMatch {
+                    int ai, bi;
+                    double disp, maxDiff;
+                    bool hadPrior;
+                };
+                std::vector<IceMatch> mats;
+                for (int i = 0; i < nP; ++i) {
+                    gIceStat.anchors++;
+                    if (!okP[i]) continue;
+                    const IceAnchor &A = ancP[i];
+                    double lp = 0.0, ln = 0.0;
+                    const bool havePrior = lagsAt(A.pos, lp, ln);
+                    const double cPred =
+                        havePrior ? (A.pos - lp + ln) : A.pos;
+                    const double radius = havePrior ? 3.0 : 12.0;
+                    int best = -1, second = -1;
+                    double bestS = 1e300, secondS = 1e300, bestMax = 0.0;
+                    for (int j = 0; j < nN; ++j) {
+                        if (!okN[j]) continue;
+                        const IceAnchor &B = ancN[j];
+                        if (std::fabs(B.pos - cPred) > radius) continue;
+                        if ((A.slope > 0) != (B.slope > 0)) continue;
+                        const double lo = std::min(std::fabs(A.slope),
+                                                   std::fabs(B.slope));
+                        const double hi = std::max(std::fabs(A.slope),
+                                                   std::fabs(B.slope));
+                        if (lo < 0.5 * hi) continue;
+                        double ss = 0.0, mx = 0.0;
+                        for (int k = 0; k < 2 * kSnip + 1; ++k) {
+                            const double d = snipP[i][k] - snipN[j][k];
+                            ss += d * d;
+                            mx = std::max(mx, std::fabs(d));
+                        }
+                        const double rms =
+                            std::sqrt(ss / (2 * kSnip + 1));
+                        if (rms < bestS) {
+                            secondS = bestS; second = best;
+                            bestS = rms; best = j; bestMax = mx;
+                        } else if (rms < secondS) {
+                            secondS = rms; second = j;
+                        }
+                    }
+                    if (best < 0) continue;
+                    if (bestS > 8.0 * irescale) continue;
+                    if (second >= 0 && secondS <= bestS * 1.25 &&
+                        std::fabs(ancN[second].pos - ancN[best].pos) > 1.5)
+                        continue;
+                    IceMatch m;
+                    m.ai = i; m.bi = best;
+                    m.disp = ancN[best].pos - A.pos;
+                    m.maxDiff = bestMax;
+                    m.hadPrior = havePrior;
+                    mats.push_back(m);
+                }
+
+                std::vector<char> keepM(mats.size(), 0);
+                for (size_t m = 0; m < mats.size(); ++m) {
+                    const double p0 = ancP[mats[m].ai].pos;
+                    double ds[33]; int nd = 0;
+                    for (size_t o = 0; o < mats.size() && nd < 33; ++o)
+                        if (std::fabs(ancP[mats[o].ai].pos - p0) <= 32.0)
+                            ds[nd++] = mats[o].disp;
+                    if (nd >= 3) {
+                        std::sort(ds, ds + nd);
+                        keepM[m] =
+                            std::fabs(mats[m].disp - ds[nd / 2]) <= 2.0;
+                    } else {
+                        keepM[m] = mats[m].hadPrior;
+                    }
+                }
+
+                // Pass 2: consensus-guided rematch. Periodic texture is
+                // structurally ambiguous to a blind search (the near-tie
+                // abstention above is correct there), but once the
+                // confident seeds have voted, the LOCAL CONSENSUS
+                // DISPLACEMENT disambiguates: a previously-ambiguous
+                // anchor re-matches inside a tight window around the
+                // consensus, where a quasi-periodic face offers at most
+                // one candidate. Each cover anchor may be claimed once.
+                {
+                    std::vector<char> matchedA(nP, 0), takenN(nN, 0);
+                    for (size_t m = 0; m < mats.size(); ++m)
+                        if (keepM[m]) {
+                            matchedA[mats[m].ai] = 1;
+                            takenN[mats[m].bi] = 1;
+                        }
+                    for (int i = 0; i < nP; ++i) {
+                        if (matchedA[i] || !okP[i]) continue;
+                        const IceAnchor &A = ancP[i];
+                        double ds[33]; int nd = 0;
+                        for (size_t o = 0; o < mats.size() && nd < 33; ++o)
+                            if (keepM[o] &&
+                                std::fabs(ancP[mats[o].ai].pos - A.pos)
+                                    <= 32.0)
+                                ds[nd++] = mats[o].disp;
+                        if (nd < 2) continue;
+                        std::sort(ds, ds + nd);
+                        const double med = ds[nd / 2];
+                        const double cPred = A.pos + med;
+                        int best = -1;
+                        double bestS = 1e300, bestMax = 0.0;
+                        for (int j = 0; j < nN; ++j) {
+                            if (!okN[j] || takenN[j]) continue;
+                            const IceAnchor &B = ancN[j];
+                            if (std::fabs(B.pos - cPred) > 2.5) continue;
+                            if ((A.slope > 0) != (B.slope > 0)) continue;
+                            const double lo = std::min(
+                                std::fabs(A.slope), std::fabs(B.slope));
+                            const double hi = std::max(
+                                std::fabs(A.slope), std::fabs(B.slope));
+                            if (lo < 0.5 * hi) continue;
+                            double ss = 0.0, mx = 0.0;
+                            for (int k = 0; k < 2 * kSnip + 1; ++k) {
+                                const double d =
+                                    snipP[i][k] - snipN[j][k];
+                                ss += d * d;
+                                mx = std::max(mx, std::fabs(d));
+                            }
+                            const double rms =
+                                std::sqrt(ss / (2 * kSnip + 1));
+                            if (rms < bestS) {
+                                bestS = rms; best = j; bestMax = mx;
+                            }
+                        }
+                        if (best < 0 || bestS > 8.0 * irescale)
+                            continue;
+                        IceMatch m2;
+                        m2.ai = i; m2.bi = best;
+                        m2.disp = ancN[best].pos - A.pos;
+                        m2.maxDiff = bestMax;
+                        m2.hadPrior = true;
+                        mats.push_back(m2);
+                        keepM.push_back(1);
+                        matchedA[i] = 1;
+                        takenN[best] = 1;
+                    }
+                }
+
+                for (size_t m = 0; m < mats.size(); ++m) {
+                    if (!keepM[m]) continue;
+                    const IceAnchor &A = ancP[mats[m].ai];
+                    const IceAnchor &Mn = ancN[mats[m].bi];
+                    gIceStat.matched++;
+
+                    constexpr double tau = 0.5;
+                    double q = A.pos + tau * (Mn.pos - A.pos);
+
+                    // The pin: presence + position from this frame's OWN
+                    // membership evidence at the tweened site. Bounded
+                    // position correction; ramped license; no evidence ->
+                    // abstain.
+                    if (!evRow) continue;
+                    const int qi = (int)std::lround(q);
+                    if (qi < 6 || qi >= width - 6) continue;
+                    const auto &ev = evRow[qi];
+                    double sw = 0.0, swx = 0.0;
+                    for (int v = 0; v < ev.viewCount; ++v) {
+                        const auto &vw = ev.views[v];
+                        const double w =
+                            std::fabs((double)vw.membershipDeltaIRE) *
+                            std::max(0.0f, vw.membershipSupport);
+                        swx += w * ((double)vw.apertureCenter + 0.5 -
+                                    (double)qi);
+                        sw  += w;
+                    }
+                    if (sw <= 1e-9) continue;
+                    const double pPar = (double)qi + swx / sw;
+                    double wAmp = std::clamp((sw - 0.3) / 0.7, 0.0, 1.0);
+                    wAmp = wAmp * wAmp * (3.0 - 2.0 * wAmp);
+                    double wPos = 1.0 - std::clamp(
+                        (std::fabs(pPar - q) - 0.75) / 1.25, 0.0, 1.0);
+                    wPos = wPos * wPos * (3.0 - 2.0 * wPos);
+                    const double lic = wAmp * wPos;
+                    if (lic <= 0.0) continue;
+                    gIceStat.licensed++;
+                    q += std::clamp(pPar - q, -0.75, 0.75) * lic;
+
+                    // Tweened shape from the cached aligned snippets; the
+                    // match's own post-alignment disagreement ramps the
+                    // render (content change, not motion).
+                    double shape[2 * kSnip + 1];
+                    for (int k = 0; k < 2 * kSnip + 1; ++k)
+                        shape[k] = (1.0 - tau) * snipP[mats[m].ai][k] +
+                                   tau * snipN[mats[m].bi][k];
+                    double wShape = 1.0 - std::clamp(
+                        (mats[m].maxDiff / irescale - 6.0) / 8.0,
+                        0.0, 1.0);
+                    wShape = wShape * wShape * (3.0 - 2.0 * wShape);
+                    const double wAll = lic * wShape;
+                    if (wAll <= 0.0) continue;
+
+                    IceKnot K;
+                    K.q = q; K.pA = A.pos; K.pB = Mn.pos; K.w = wAll;
+                    std::copy(shape, shape + 2 * kSnip + 1, K.shape);
+                    knots.push_back(K);
+                }
+
+                std::sort(knots.begin(), knots.end(),
+                          [](const IceKnot &a, const IceKnot &b) {
+                              return a.q < b.q;
+                          });
+
+                std::vector<double> vRow(width,
+                    std::numeric_limits<double>::quiet_NaN());
+                std::vector<double> wRow(width, 0.0);
+                constexpr double kMaxSpan = 24.0;
+                constexpr double tau = 0.5;
+
+                // Inter-knot spans: one render per sample, weight linear
+                // between the knot licenses (continuous across knots).
+                for (size_t i = 0; i + 1 < knots.size(); ++i) {
+                    const IceKnot &K1 = knots[i];
+                    const IceKnot &K2 = knots[i + 1];
+                    const double d = K2.q - K1.q;
+                    if (d <= 1.0 || d > kMaxSpan) continue;
+                    const double dpA = K2.pA - K1.pA;
+                    const double dpB = K2.pB - K1.pB;
+                    // Collapsed or crossing cover spans = occlusion or
+                    // mismatch: abstain.
+                    if (dpA <= 0.5 || dpB <= 0.5) continue;
+                    const int xs = (int)std::ceil(K1.q);
+                    const int xe = (int)std::ceil(K2.q) - 1;
+                    if (xs > xe) continue;
+                    double tmp[32];
+                    double spanDiff = 0.0;
+                    bool ok = true;
+                    for (int x = xs; x <= xe; ++x) {
+                        const double t = ((double)x - K1.q) / d;
+                        const double vP = ldcdP6CrEval(
+                            sideVal[0].data(), width, K1.pA + t * dpA);
+                        const double vN = ldcdP6CrEval(
+                            sideVal[1].data(), width, K1.pB + t * dpB);
+                        if (!std::isfinite(vP) || !std::isfinite(vN)) {
+                            ok = false; break;
+                        }
+                        tmp[x - xs] = (1.0 - tau) * vP + tau * vN;
+                        spanDiff = std::max(spanDiff, std::fabs(vP - vN));
+                    }
+                    if (!ok) continue;
+                    double rampS = 1.0 - std::clamp(
+                        (spanDiff / irescale - 6.0) / 8.0, 0.0, 1.0);
+                    rampS = rampS * rampS * (3.0 - 2.0 * rampS);
+                    if (rampS <= 0.0) continue;
+                    for (int x = xs; x <= xe; ++x) {
+                        const double t = ((double)x - K1.q) / d;
+                        const double w =
+                            (K1.w + t * (K2.w - K1.w)) * rampS;
+                        if (w > wRow[x]) {
+                            wRow[x] = w;
+                            vRow[x] = tmp[x - xs];
+                        }
+                    }
+                }
+
+                // Stamps only where the chain is open: isolated knots and
+                // chain ends. Assignment via the same winner rule, so a
+                // seam sample takes the stronger single render, never a
+                // mix.
+                for (size_t i = 0; i < knots.size(); ++i) {
+                    const IceKnot &K = knots[i];
+                    const double leftGap =
+                        (i > 0) ? K.q - knots[i - 1].q : 1e9;
+                    const double rightGap =
+                        (i + 1 < knots.size()) ? knots[i + 1].q - K.q : 1e9;
+                    auto stampSide = [&](int dx0, int dx1) {
+                        for (int dx = dx0; dx <= dx1; ++dx) {
+                            const int u = (int)std::floor(K.q) + dx;
+                            if (u < 0 || u >= width) continue;
+                            const double rel = (double)u - K.q;
+                            const double v = ldcdP6CrEval(
+                                K.shape, 2 * kSnip + 1, rel + kSnip);
+                            if (!std::isfinite(v)) continue;
+                            double f = 1.0 - std::clamp(
+                                (std::fabs(rel) - 2.5) / 2.5, 0.0, 1.0);
+                            f = f * f * (3.0 - 2.0 * f);
+                            const double w = K.w * f;
+                            if (w > wRow[u]) {
+                                wRow[u] = w;
+                                vRow[u] = v;
+                            }
+                        }
+                    };
+                    if (leftGap > kMaxSpan)  stampSide(-kSnip, 0);
+                    if (rightGap > kMaxSpan) stampSide(0, kSnip);
+                }
+
+                // Taper the WEIGHT field at every rendered-run edge so the
+                // correction never appears or vanishes in one sample
+                // (weight smoothing is lawful; the rendered VALUE is never
+                // smoothed).
+                {
+                    std::vector<double> dist(width, 0.0);
+                    double run = 0.0;
+                    for (int x = 0; x < width; ++x) {
+                        run = (wRow[x] > 0.0) ? run + 1.0 : 0.0;
+                        dist[x] = run;
+                    }
+                    run = 0.0;
+                    for (int x = width - 1; x >= 0; --x) {
+                        run = (wRow[x] > 0.0) ? run + 1.0 : 0.0;
+                        dist[x] = std::min(dist[x], run);
+                    }
+                    for (int x = 0; x < width; ++x) {
+                        double t = std::clamp(dist[x] / 3.0, 0.0, 1.0);
+                        wRow[x] *= t * t * (3.0 - 2.0 * t);
+                    }
+                }
+
+                for (int x = 0; x < width; ++x) {
+                    if (wRow[x] <= 0.0 || lhatN[x] < 2) continue;
+                    if (!std::isfinite(vRow[x])) continue;
+                    const double bracket = lhatSum[x] / lhatN[x];
+                    lhatAdj[x] = std::min(1.0, wRow[x]) *
+                                 (vRow[x] - bracket);
+                    gIceStat.renderedSamples++;
+                }
+            }
+
             const int needSides = 2;
             for (int xi = 0; xi < width; ++xi) {
                 if (lhatN[xi] < needSides) continue;
                 R[xi] = static_cast<double>(rawLine[left + xi]) -
-                        lhatSum[xi] / lhatN[xi];
+                        (lhatSum[xi] / lhatN[xi] + lhatAdj[xi]);
             }
 
             constexpr double kOobTauIRE = 2.0;
@@ -7177,6 +7727,21 @@ bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
             retractedRow[xi] = static_cast<float>(
                 static_cast<double>(rawLine[left + xi]) - out[xi]);
     }
+    {
+        static const bool iceStatsPrint = []{
+            const char *e = std::getenv("LDCD_ICEBERG_STATS");
+            return e && std::atoi(e) != 0;
+        }();
+        if (iceStatsPrint) {
+            std::fprintf(stderr,
+                "[ICE] frame %d: anchors %ld, matched %ld, licensed %ld, "
+                "rendered %ld samples\n",
+                (int)heldSeq1, gIceStat.anchors, gIceStat.matched,
+                gIceStat.licensed, gIceStat.renderedSamples);
+            gIceStat = LdcdIceStat();
+        }
+    }
+
     publishAnchoredCarrierFromRetracted(
         AnchoredCarrierProvenance::FactCorrectedEstimate);
     return factCorrectedCarrierEstimate_line(firstLine) != nullptr;
