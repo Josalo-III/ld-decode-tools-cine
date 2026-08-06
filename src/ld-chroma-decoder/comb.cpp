@@ -253,6 +253,44 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (fieldIndex + 2 >= 0) &&
             (fieldIndex + 3 < inputFields.size());
 
+        // PERF (2026-08-06): under the witness path at dimensions == 2, the
+        // load-time split2D on an uncovered frame consumes a causal
+        // placeholder that refineRetractedTemporal() replaces at decode time,
+        // after which split2D RERUNS -- the load-time run is computed and
+        // discarded. Deferring split2D to decode time runs it exactly once
+        // per frame with identical inputs at that moment:
+        //   * rerun frames: the deferred run IS today's rerun (same point in
+        //     the sequence, same completed planes);
+        //   * non-rerun frames: refineRetractedTemporal mutates nothing on
+        //     every early-out (verified: pure reads before each return), the
+        //     hull is opt-in, and the only cross-frame writer between load
+        //     and decode (buildCarrierAnalysis's prevFrame argument) only
+        //     reads -- so the deferred run sees bit-identical inputs.
+        // Byte-identity verified against the pre-change binary (md5 on 24
+        // frames of covered program material). The deferral is OFF for
+        // dimensions == 3 (split3D reads neighbours' load-time 2D), for
+        // showMap (overlayMap reads neighbour maps), and under
+        // LDCD_PROBE_2D_RERUN=0 (whose meaning is "keep the causal 2D").
+        static const bool rerun2D = []{
+            const char *e = std::getenv("LDCD_PROBE_2D_RERUN");
+            return !(e && std::atoi(e) == 0);
+        }();
+        // PROMOTED 2026-08-06 (visual verdict: "fine, compared to
+        // baseline"). The historical order ran split2D twice on rerun
+        // frames, and the divergence hunt proved split2D non-idempotent:
+        // collect/finalize ACCRETE onto the persistent per-pixel
+        // attribution records (max-then-scale on assessment.coherence, max
+        // on attributionConflict), so the old path shipped attribution that
+        // mixed the causal placeholder run's evidence with the refined
+        // run's on rerun frames (~0.5-1.4% of samples, local amplitudes to
+        // ~26%). The single decode-time run is the clean construction —
+        // evidence from the completed plane only — and ~13% faster. The
+        // three-hash discriminator record lives in the perf ledger.
+        const bool defer2D =
+            configuration.phaseCompensation && configuration.lumaWitness &&
+            configuration.dimensions == 2 && !configuration.showMap &&
+            rerun2D;
+
         if (canLoadNext) {
             next->loadFields(inputFields[fieldIndex + 2],
                              inputFields[fieldIndex + 3]);
@@ -278,7 +316,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                         current->holdsRealFrame() ? current.get() : nullptr);
             }
 
-            if (!configuration.diagnosticOnly())
+            if (!configuration.diagnosticOnly() && !defer2D)
                 next->split2D();
         } else {
             // Nothing to load into the recycled buffer, so whatever it still
@@ -321,8 +359,15 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             // to the carrier the consumers will actually read.
             if (current->applyCertifiedCarrierHull(pf, nf))
                 publishedTwoSidedEstimate = true;
-            if (publishedTwoSidedEstimate &&
-                !configuration.diagnosticOnly())
+            // INSTRUMENT (temporary): LDCD_PROBE_2D_RERUN=0 keeps the
+            // two-sided refinement but withholds it from the comb, so 2D
+            // stays on the causal tone-anticipated ladder built at load
+            // time.  Separates "what the forward field buys inside the
+            // comb" from "what it buys in the Y election".  Strip once the
+            // question closes.  (rerun2D hoisted to the loop head, where the
+            // split2D deferral consumes it too.)
+            if (!configuration.diagnosticOnly() &&
+                (defer2D || (publishedTwoSidedEstimate && rerun2D)))
                 current->split2D();
         }
 
