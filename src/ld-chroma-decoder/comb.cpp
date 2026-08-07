@@ -18,6 +18,48 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+
+// TEMPORARY INSTRUMENT (LDCD_PROBE_DIST=1) -- distribution of the temporal
+// similarity distance the agreement curve consumes, so its reward radius and
+// veto threshold are set from THIS distance rather than inherited from the
+// contaminated one they were tuned against. Counts only; cross-thread safe.
+// Strip when the threshold is settled.
+namespace {
+constexpr double kDistEdges[] = {0.5, 1, 2, 3, 4, 5, 6, 7.5, 10, 15, 20, 30, 50};
+constexpr int kDistBins = int(sizeof(kDistEdges) / sizeof(kDistEdges[0])) + 1;
+struct DistCensus {
+    bool on = std::getenv("LDCD_PROBE_DIST") != nullptr;
+    std::atomic<long> bin[kDistBins];
+    std::atomic<long> total{0};
+    DistCensus() { for (auto &b : bin) b.store(0); }
+    void add(double d) {
+        total.fetch_add(1, std::memory_order_relaxed);
+        int k = kDistBins - 1;
+        for (int i = 0; i < kDistBins - 1; ++i)
+            if (d <= kDistEdges[i]) { k = i; break; }
+        bin[k].fetch_add(1, std::memory_order_relaxed);
+    }
+    ~DistCensus() {
+        if (!on) return;
+        const double n = std::max(1L, total.load());
+        std::fprintf(stderr, "[DIST] temporal candidates %ld\n", total.load());
+        long cum = 0;
+        for (int i = 0; i < kDistBins; ++i) {
+            cum += bin[i].load();
+            if (i < kDistBins - 1)
+                std::fprintf(stderr, "   d <= %5.1f IRE : %5.1f%%  (cum %5.1f%%)\n",
+                             kDistEdges[i], 100.0 * bin[i].load() / n,
+                             100.0 * cum / n);
+            else
+                std::fprintf(stderr, "   d >  %5.1f IRE : %5.1f%%\n",
+                             kDistEdges[kDistBins - 2],
+                             100.0 * bin[i].load() / n);
+        }
+    }
+};
+DistCensus g_distCensus;
+} // namespace
+
 #include "combmath.h"
 #include "feasibleband.h"
 #include "framecanvas.h"
@@ -3161,6 +3203,7 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                 continue;
 
             const double dIRE = c[i].yPen;
+            if (g_distCensus.on) g_distCensus.add(dIRE);
             double delta = 0.0;
 
             if (dIRE <= T.AGREEMENT_REWARD_RADIUS_IRE) {

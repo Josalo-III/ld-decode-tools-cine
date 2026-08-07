@@ -3572,7 +3572,57 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         ? frameBuffer.clpbuffer[1].pixel[lineNumber + 1]
         : candClpC;
 
-    auto getLuma = [&](const quint16 *raw, const double *chroma, int idx) -> double {
+    // CARRIER-FREE LUMA FOR THE SIMILARITY DISTANCE.
+    //
+    // This distance used to be built from raw - clpbuffer[1] -- a per-frame 2D
+    // chroma ESTIMATE. Where that estimate carries a carrier-locked misread it
+    // inverts frame to frame, so a reference and a temporal candidate hold it
+    // with opposite sign and the distance reads about TWICE the misread. The
+    // artifact inflates the very measurement used to judge the candidate that
+    // would cancel it, which is why the old deviation veto self-defeated and
+    // was retired. The defect was in the INPUT, not in the penalty.
+    //
+    // The coarse platform cannot carry it: a legal four-sample mean cancels the
+    // carrier exactly, so the platform is carrier-free by construction. The
+    // lurch-sharpened form is preferred over the plain boxcar because lurch
+    // un-smears the four-sample placement limit, and the smoothness that
+    // remains is wanted here rather than tolerated -- this is a SIMILARITY
+    // metric, and a little smoothing is what stops it reacting to per-frame
+    // noise instead of to real content change.
+    //
+    // Falls back to the old reconstruction only where no coarse exists (bucket
+    // mode), which leaves those paths exactly as they were.
+    const int coarseLeft = videoParameters.activeVideoStart;
+    const int coarseW    = demodWidth;
+    auto coarseRow = [](const FrameBuffer &fb, int line) -> const double * {
+        if (!fb.lockedLumaCacheValid) return nullptr;
+        if (!fb.lockedLumaSharp_flat.empty())
+            return fb.lockedLumaSharp_line(line);
+        if (!fb.lockedLumaBaseY4_flat.empty())
+            return fb.lockedLumaBaseY4_line(line);
+        return nullptr;
+    };
+
+    const double *refCoarseC  = coarseRow(*this, refLineNumber);
+    const double *candCoarseC = coarseRow(frameBuffer, lineNumber);
+    const double *refCoarseU  = haveUp ? coarseRow(*this, refLineNumber - 1)
+                                       : refCoarseC;
+    const double *refCoarseD  = haveDn ? coarseRow(*this, refLineNumber + 1)
+                                       : refCoarseC;
+    const double *candCoarseU = haveUp ? coarseRow(frameBuffer, lineNumber - 1)
+                                       : candCoarseC;
+    const double *candCoarseD = haveDn ? coarseRow(frameBuffer, lineNumber + 1)
+                                       : candCoarseC;
+
+    auto getLuma = [&](const double *coarse, const quint16 *raw,
+                       const double *chroma, int idx) -> double {
+        if (coarse) {
+            const int rel = idx - coarseLeft;
+            if (rel >= 0 && rel < coarseW) {
+                const double v = coarse[rel];
+                if (std::isfinite(v)) return v;
+            }
+        }
         return static_cast<double>(raw[idx]) - chroma[idx];
     };
 
@@ -3584,17 +3634,17 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     const int c1 = hh;
     const int c2 = clampH(h + 1);
 
-    const double dC0 = std::fabs(getLuma(refRawC, refClpC, r0) -
-                                 getLuma(candRawC, candClpC, c0));
-    const double dC1 = std::fabs(getLuma(refRawC, refClpC, r1) -
-                                 getLuma(candRawC, candClpC, c1));
-    const double dC2 = std::fabs(getLuma(refRawC, refClpC, r2) -
-                                 getLuma(candRawC, candClpC, c2));
+    const double dC0 = std::fabs(getLuma(refCoarseC, refRawC, refClpC, r0) -
+                                 getLuma(candCoarseC, candRawC, candClpC, c0));
+    const double dC1 = std::fabs(getLuma(refCoarseC, refRawC, refClpC, r1) -
+                                 getLuma(candCoarseC, candRawC, candClpC, c1));
+    const double dC2 = std::fabs(getLuma(refCoarseC, refRawC, refClpC, r2) -
+                                 getLuma(candCoarseC, candRawC, candClpC, c2));
 
-    const double dU = std::fabs(getLuma(refRawU, refClpU, r1) -
-                                getLuma(candRawU, candClpU, c1));
-    const double dD = std::fabs(getLuma(refRawD, refClpD, r1) -
-                                getLuma(candRawD, candClpD, c1));
+    const double dU = std::fabs(getLuma(refCoarseU, refRawU, refClpU, r1) -
+                                getLuma(candCoarseU, candRawU, candClpU, c1));
+    const double dD = std::fabs(getLuma(refCoarseD, refRawD, refClpD, r1) -
+                                getLuma(candCoarseD, candRawD, candClpD, c1));
 
     const double yPen = ((dC0 + dC1 + dC2 + dU + dD) / 5.0) * invIreScale;
 

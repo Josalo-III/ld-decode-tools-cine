@@ -263,8 +263,29 @@ public:
             // the centered five-point spatial cross in getCandidate():
             //   d ≤ AGREEMENT_REWARD_RADIUS_IRE  → reward: −AGREEMENT_REWARD_MAX·(1−(d/r)²)
             //   d > AGREEMENT_REWARD_RADIUS_IRE  → neutral
-            // Output safety is enforced by the independent-estimate hull at
-            // the split3D write site, not by penalizing disagreement here.
+            //
+            // d is the CARRIER-FREE coarse distance (see getCandidate). Its
+            // old form, raw − clpbuffer[1], carried the per-frame chroma
+            // misread with opposite sign in reference and candidate, so it
+            // read about twice the misread and inflated the very measurement
+            // used to judge the candidate that would cancel it.
+            //
+            // The veto branch was retired 2026-07-13 for that reason,
+            // RESTORED 2026-08-06 once the input defect was gone, and removed
+            // again the same day: on the carrier-free distance it moved 2.7%
+            // of samples by up to ~68 codes without earning the change. The
+            // objection that motivated it still stands on paper — a
+            // reward-only curve cannot refuse, and beyond the lobe a partner
+            // disagreeing by 30 IRE merely loses its bonus — so if the duty is
+            // wanted back, place the region from the CARRIER-FREE
+            // distribution (LDCD_PROBE_DIST censuses it) rather than
+            // inheriting thresholds tuned against the contaminated one. The
+            // same caution applies to the reward lobe's own radius below.
+            //
+            // Output-side bounding does not carry this duty either: the
+            // split3D member hull was measured (see its census) and defaults
+            // off, because any distance-to-2D bound preferentially refuses the
+            // members cancelling the largest misread.
             double AGREEMENT_REWARD_RADIUS_IRE = 7.5; // half-width of the reward lobe (IRE)
             double AGREEMENT_REWARD_MAX        = 3.3; // peak reward at d=0 (penalty units, scaled by adaptThreshold)
             double AGREEMENT_VETO_BASE         = 7.0; // RETIRED / inert: retained for tuning compatibility
