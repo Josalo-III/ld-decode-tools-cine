@@ -411,6 +411,12 @@ public:
 	void applyLurchSteps(const std::vector<LurchStepRun> &runs,
 	                     const double *means, int meanCount, int width,
 	                     double gateGain, double *prior, double *gateOut) const;
+	// Whole-line banded solve for the coarse luma platform: the continuous
+	// successor to the plateau snap above. Consumes the WHOLE membership
+	// sequence as same-phase difference facts rather than pattern-matching
+	// one shape out of it. Writes the platform to yOut[0..width).
+	void solveLurchYCurve(int line, const double *apMean, int meanCount,
+	                      int width, double *yOut);
 	// Vertical snap corroboration: the lurch-snap was the last per-line hard
 	// quantizer -- run.edge jitters +-0.5-1 px line to line on texture noise
 	// and saw-tooths bright vertical contours. For each run with a matching
@@ -1018,8 +1024,10 @@ private:
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
 	std::vector<double> scratch_coe_frameIQMag; // pre-computed |frameIQ[r]| magnitudes (collectCombAttributionEvidence)
 		std::vector<double> scratch_lineWorkD; // Generic per-line filter scratch.
-	std::vector<double> scratch_lurchGate;     // Lurch pre-pass: combined support*delta gate per xi (anchor relaxation)
-	std::vector<double> scratch_lurchCurve;    // Lurch regression: whole-line banded-LS Y curve per xi
+	std::vector<double> scratch_lurchPlatform;   // Lurch solve: moving-coarse registration (the LF platform) per xi
+	std::vector<double> scratch_lurchCurve;    // Lurch solve: whole-line banded-LS Y curve per xi
+	std::vector<double> scratch_lurchWork;     // Lurch solve: Thomas workspace, 2 rows per phase chain
+	std::vector<double> scratch_lurchPin;      // Lurch solve: certified Y where pinned, NaN elsewhere
 	std::vector<lddecode::FourViewCarrierAttribution> scratch_carrierParallax; // line-local attribution working set
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;

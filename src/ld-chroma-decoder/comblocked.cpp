@@ -109,15 +109,100 @@ inline double maxCarrierAmpIREFromScale(double carrierScale)
                     carrierScale * kCarrierMaxPerBurstScale);
 }
 
-inline double coarseSharpLevel()
+// 4fSC sampling, in MHz. The lurch solve's phase chains step four samples, so
+// a chain's angular frequency is w = 8*pi*f/kSampleRateMHz.
+inline constexpr double kSubcarrierMHz = 3.579545;
+inline constexpr double kSampleRateMHz = 4.0 * kSubcarrierMHz;
+
+// The coarse platform's LF AUTHORITY: the frequency below which the platform,
+// rather than the same-phase difference facts, decides the platform.
+//
+// This replaces LD_COARSE_SHARP, which scaled the plateau substitution that
+// solveLurchYCurve() retired. A level made sense for a snap (apply more or
+// less of a substitution); it is meaningless against a solve, and blending a
+// solved curve back toward the blurry registration to honour one would be a
+// smoother in a new costume. The honest knob for the same duty is where the
+// platform's authority ends.
+//
+// Default is the encoder's own chroma bandlimit, and that is a derived value
+// rather than a starting guess, because of how the phase chains alias.
+//
+// A chain samples Y every four samples, so a component at frequency f advances
+// 8*pi*f/fs per chain step: f and fSC +- f land on the SAME chain frequency
+// (at f = fSC exactly, w = 2*pi = 0, which is why fSC content aliases to chain
+// DC and neither term here can see it -- the platform is silent about Y at the
+// subcarrier by construction, and must stay silent rather than invent).
+//
+// So "the platform owns chain frequencies below w_c" means it owns
+//
+//     [0, f_c]   AND   [fSC - f_c, fSC + f_c]
+//
+// Setting f_c to the encoder's chroma bandlimit therefore hands the platform
+// exactly the LEGAL CARRIER BAND -- where the platform, being a four-sample mean
+// and so carrier-free by construction, is precisely the right authority -- and
+// hands the difference facts the bands where legal carrier cannot live and a
+// same-phase raw difference is therefore pure luma. The two authorities land on
+// the two content classes with no overlap. Raising f_c hands the boxcar bands
+// it cannot see (blurrier); lowering it hands the facts the carrier band, where
+// their residual is legal envelope motion misread as luma.
+inline double lurchPlatformCutoffMHz()
 {
-    static const double level = []{
-        const char *s = std::getenv("LD_COARSE_SHARP");
-        if (!s || !*s) return 1.0;
+    static const double mhz = []{
+        const char *s = std::getenv("LDCD_LURCH_PLATFORM_MHZ");
+        if (!s || !*s) return 1.3;
         const double v = std::atof(s);
-        return std::isfinite(v) ? v : 0.0;
+        return (std::isfinite(v) && v > 0.0) ? v : 1.3;
     }();
-    return level;
+    return mhz;
+}
+
+// A/B escape: 0 restores the plateau snap at both platform call sites.
+inline bool lurchSolveEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_LURCH_SOLVE");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// Certified Dirichlet rows in the solve. DEFAULT OFF -- MEASURED UNLAWFUL.
+//
+// The idea is right and the shape is not. A covered frame certifies ONE PARITY,
+// so pinning per sample gives even lines exact Y and leaves odd lines solved,
+// inside one frame: per-line substitution of exact values into a shared
+// estimate path, which is the consumption shape the parity law already
+// falsified twice.
+//
+// Measured, s1x11 @2795, 9 output frames, vertical-Nyquist projection (a
+// second-difference roughness metric UNDERSTATED this at +2.7% -- it cannot
+// separate "sharper" from "alternating", so it was the wrong instrument):
+//
+//   covered frames   pin ON   2-line alternation  +8.90%   HF luma -1.45%
+//                    pin OFF                      -0.58%           +0.44%
+//   uncovered        (no facts; identical either way)  -2.6%       +1.05%
+//
+// The whole covered-frame regression is the pinning. Note this is NOT a
+// pin-versus-skip question: on a fully certified line the two are the same
+// operation, so skipping the solve there fails identically.
+//
+// The lawful shape is the one the doctrine already names -- certified luma is a
+// phase-free comb reference, so the UNCOVERED parity's lines should receive the
+// facts vertically from their two certified neighbours, which reaches both
+// parities together. Kept behind this escape for that work; it is not a tuning
+// option in the meantime.
+//
+// Also the truth-path switch for any referee grading this platform. A hold-out
+// here is NOT sufficient on its own: buildApertureMeans() already subtracts the
+// exact carrier when forming the pool, so the platform carries truth on covered
+// lines whatever this is set to.
+inline bool lurchPinEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_LURCH_PIN");
+        return (s && std::atoi(s) != 0);
+    }();
+    return on;
 }
 
 // Retained record from the removed LDCD_PROBE_KNEE census
@@ -431,13 +516,8 @@ void Comb::FrameBuffer::phaseLocked()
         // every sample) lurch-sharpened so a confirmed luma step lands at one
         // column instead of smearing across four. The gate is scaled by the
         // sweep level.
-        const double sharpLevel = coarseSharpLevel();
         const bool buildSharp =
-            configuration.lumaWitness &&
-            sharpLevel > 0.0 && !lockedLumaSharp_flat.empty();
-        std::vector<double> gateScratch;
-        if (buildSharp && width >= 4)
-            gateScratch.assign(width, 0.0);
+            configuration.lumaWitness && !lockedLumaSharp_flat.empty();
 
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
@@ -476,24 +556,31 @@ void Comb::FrameBuffer::phaseLocked()
             }
             // Derived FROM the pool above, not a private rebuild.
             const double *boxcar = apMean;
-            const int lastStart = width - 4;   // last legal aperture start
 
-            // Register the even four-sample means at integer xi by averaging
-            // the two half-sample apertures on either side.  Their combination
-            // is the phase-balanced five-sample support
-            // (0.5,1,1,1,0.5)/4 centred exactly at xi.
-            for (int xi = 0; xi < width; ++xi) {
-                const int s0 = std::clamp(xi - 2, 0, lastStart);
-                const int s1 = std::clamp(xi - 1, 0, lastStart);
-                sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
+            if (lurchSolveEnabled()) {
+                // The solve owns the registration too -- same construction,
+                // then the difference facts move it.
+                solveLurchYCurve(line, boxcar, width - 3, width, sharp);
+            } else {
+                const int lastStart = width - 4; // last legal aperture start
+
+                // Register the even four-sample means at integer xi by
+                // averaging the two half-sample apertures on either side.
+                // Their combination is the phase-balanced five-sample support
+                // (0.5,1,1,1,0.5)/4 centred exactly at xi.
+                for (int xi = 0; xi < width; ++xi) {
+                    const int s0 = std::clamp(xi - 2, 0, lastStart);
+                    const int s1 = std::clamp(xi - 1, 0, lastStart);
+                    sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
+                }
+                // Canonical runs (built once in split1D), edges vertically
+                // corroborated (median-of-three) so the snap stops sawing
+                // bright vertical contours; apply-only here.
+                const std::vector<LurchStepRun> corrRuns =
+                    corroborateLurchEdges(line);
+                applyLurchSteps(corrRuns, boxcar, width - 3,
+                                width, 1.0, sharp, nullptr);
             }
-            // Canonical runs (built once in split1D), edges vertically
-            // corroborated (median-of-three) so the snap stops sawing
-            // bright vertical contours; apply-only here.
-            const std::vector<LurchStepRun> corrRuns =
-                corroborateLurchEdges(line);
-            applyLurchSteps(corrRuns, boxcar, width - 3,
-                            width, sharpLevel, sharp, gateScratch.data());
 
             // Retained record from the removed LDCD_LURCH_FEASIBLE census
             //
@@ -4529,8 +4616,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             // authority and defines the top-band coordinate. No second coarse
             // is mixed into reconstruction.
             const bool useSharpCoarse =
-                configuration.lumaWitness && coarseSharpLevel() > 0.0 &&
-                !lockedLumaSharp_flat.empty();
+                configuration.lumaWitness && !lockedLumaSharp_flat.empty();
             auto coarseFloor_line = [&](int l) -> const double * {
                 return useSharpCoarse ? lockedLumaSharp_line(l)
                                       : lockedLumaBaseY4_line(l);
@@ -6585,6 +6671,206 @@ void Comb::FrameBuffer::applyLurchSteps(const std::vector<LurchStepRun> &runs,
     }
 }
 
+// ---------------------------------------------------------------------------
+// The coarse luma platform, SOLVED rather than snapped.
+//
+// applyLurchSteps() above pattern-matches one shape out of the membership
+// sequence -- a confirmed step -- and substitutes an idealisation of it. What
+// it does not match, it discards: movement under 0.30 IRE per window, any run
+// whose sign is not monotone, every run longer than six windows ("a long run
+// is a ramp, not a step"), and every step under 1.25 IRE. The survivors
+// collapse to six scalars and are applied as a piecewise-constant plateau. So
+// the platform learns "a step of about this size sits near this column" and
+// nothing else, and it learns it as a cliff.
+//
+// THE FACTS ARE CONTINUOUS AND THEY ARE EVERYWHERE. Two samples four apart
+// share carrier phase, so with no detection of any kind:
+//
+//     raw[x+4] - raw[x] = (Y[x+4] - Y[x]) + (C[x+4] - C[x])
+//
+// and the residual C[x+4] - C[x] is exactly the carrier ENVELOPE's drift over
+// four samples. The encoder low-passes that envelope to ~1.3 MHz before
+// modulation (feasibleband.h's bandwidth law), so ABOVE that frequency the
+// difference facts are exact by law, and BELOW it the envelope may legitimately
+// move and their residual is that legal motion. The band split is therefore not
+// a taste parameter: the difference facts own HF, the coarse platform owns LF, and
+// the crossover is the encoder's chroma bandwidth. lurchPlatformCutoffMHz() is
+// that crossover, and it is the platform's whole LF-authority control.
+//
+// THE SOLVE. Per line, minimise
+//
+//     wA * sum_x ( Y[x+4] - Y[x] - d[x] )^2  +  wB * sum_x ( Y[x] - A[x] )^2
+//
+// A being the integer-centred moving coarse. Y[x] couples only to Y[x+-4], so
+// the system separates into four independent tridiagonal chains by carrier
+// phase class and Thomas solves each exactly in O(width). The 2026 predecessor
+// (ad5dd4a, deleted by the witness rollback in fc3cd4b) ran 14 alternating
+// Gauss-Seidel sweeps over this same system; the iteration was never needed.
+//
+// It also tied Y itself to the already-snapped prior, and had to note that
+// "anchoring to the blurry boxcar would make the anchor fight the difference
+// facts at every edge" (its word for the platform) -- true, and an artifact
+// of tying the wrong
+// quantity. The platform's only real duty is the slow part, and that part is
+// slow BY LAW. Tied at LF it is never consulted at an edge, so the snap is
+// not needed as a precondition and the second pass disappears.
+//
+// THE FACTS DO NOT ENTER HERE YET. Pinning certified samples as Dirichlet rows
+// was built and measured, and it violates the parity law -- see
+// lurchPinEnabled() for the numbers and for why skipping certified lines
+// instead would fail in exactly the same way. It is off by default.
+//
+// The solve is nonetheless not fact-blind: buildApertureMeans() forms the pool
+// from raw - exact wherever the twin channel certifies a sample, so the
+// platform is already certified-derived on covered lines -- at window-mean
+// resolution,
+// spread over four samples, which is why that consumption does not alternate
+// and a per-sample substitution does.
+// ---------------------------------------------------------------------------
+void Comb::FrameBuffer::solveLurchYCurve(int line, const double *apMean,
+                                         int meanCount, int width,
+                                         double *yOut)
+{
+    if (!apMean || !yOut || width <= 0 || meanCount <= 0)
+        return;
+
+    const int lastStart = meanCount - 1;
+
+    // Registration: the integer-centred moving coarse. Averaging the two
+    // half-sample apertures straddling xi gives the phase-balanced five-sample
+    // support (0.5,1,1,1,0.5)/4 centred exactly at xi -- the same platform both
+    // consumers built privately before this existed. It is also the fallback:
+    // every early return below leaves the platform exactly as it was.
+    if ((int)scratch_lurchPlatform.size() < width)
+        scratch_lurchPlatform.resize(width);
+    double *platform = scratch_lurchPlatform.data();
+    for (int xi = 0; xi < width; ++xi) {
+        const int s0 = std::clamp(xi - 2, 0, lastStart);
+        const int s1 = std::clamp(xi - 1, 0, lastStart);
+        platform[xi] = 0.5 * (apMean[s0] + apMean[s1]);
+        yOut[xi]   = platform[xi];
+    }
+
+    const int left      = videoParameters.activeVideoStart;
+    const int fullWidth = videoParameters.fieldWidth;
+    if (line < 0 || fullWidth <= 0 || left < 0 ||
+        (size_t)(line + 1) * fullWidth > rawbuffer.size())
+        return;
+    const quint16 *rawLine = rawbuffer.data() + (size_t)line * fullWidth;
+    const auto raw = [&](int xi) -> double {
+        return (double)rawLine[left + xi];
+    };
+
+    if ((int)scratch_lurchPin.size() < width)
+        scratch_lurchPin.resize(width);
+    double *pin = scratch_lurchPin.data();
+    const float *exRow = lurchPinEnabled() ? exactCarrierRow(line) : nullptr;
+    int pinCount = 0;
+    for (int xi = 0; xi < width; ++xi) {
+        pin[xi] = std::numeric_limits<double>::quiet_NaN();
+        if (!exRow)
+            continue;
+        const float e = exRow[left + xi];
+        if (!std::isfinite(e))
+            continue;
+        pin[xi]  = raw(xi) - (double)e;
+        yOut[xi] = pin[xi];
+        ++pinCount;
+    }
+    if (pinCount >= width)
+        return;                     // fully certified: conservation answered
+
+    // Along a phase chain the solution is
+    //     Y(w) = [wA*|1-e^-iw|^2 * facts + wB * A(w)] / [wA*|1-e^-iw|^2 + wB]
+    // so the platform dominates below w_c where 2*(1-cos w_c) = wB/wA. The chain
+    // steps four samples, which puts w_c = 8*pi*f_c/fs.
+    constexpr double wA = 1.0;
+    const double wc = std::clamp(
+        8.0 * M_PI * lurchPlatformCutoffMHz() / kSampleRateMHz, 1e-4, M_PI);
+    const double wB = 2.0 * (1.0 - std::cos(wc));
+
+    const int maxChain = (width + 3) / 4 + 1;
+    if ((int)scratch_lurchWork.size() < 2 * maxChain)
+        scratch_lurchWork.resize(2 * maxChain);
+    double *cp = scratch_lurchWork.data();
+    double *dp = cp + maxChain;
+
+    const auto solveChains = [&]() {
+        for (int k = 0; k < 4; ++k) {
+            const int N = (width - k + 3) / 4;
+            if (N < 2)
+                continue;
+            for (int n = 0; n < N; ++n) {
+                const int x = k + 4 * n;
+                double diag, lower, upper, rhs;
+                if (std::isfinite(pin[x])) {
+                    diag = 1.0; lower = 0.0; upper = 0.0; rhs = pin[x];
+                } else {
+                    const bool hasNext = (n <= N - 2);
+                    const bool hasPrev = (n >= 1);
+                    diag  = wB + wA * ((hasNext ? 1.0 : 0.0) +
+                                       (hasPrev ? 1.0 : 0.0));
+                    lower = hasPrev ? -wA : 0.0;
+                    upper = hasNext ? -wA : 0.0;
+                    rhs   = wB * platform[x];
+                    if (hasNext) rhs -= wA * (raw(x + 4) - raw(x));
+                    if (hasPrev) rhs += wA * (raw(x) - raw(x - 4));
+                }
+                // Strictly diagonally dominant (diag = wB + sum|off|, wB > 0),
+                // so Thomas is stable with no pivoting.
+                const double denom = diag - lower * (n ? cp[n - 1] : 0.0);
+                const double inv =
+                    (std::fabs(denom) > 1e-12) ? (1.0 / denom) : 0.0;
+                cp[n] = upper * inv;
+                dp[n] = (rhs - lower * (n ? dp[n - 1] : 0.0)) * inv;
+            }
+            yOut[k + 4 * (N - 1)] = dp[N - 1];
+            for (int n = N - 2; n >= 0; --n)
+                yOut[k + 4 * n] = dp[n] - cp[n] * yOut[k + 4 * (n + 1)];
+        }
+    };
+
+    solveChains();
+
+    // FEASIBILITY, as a hard box. composite[i] + composite[i+-2] = Y[i] +
+    // Y[i+-2] is carrier-free and exact, so with luma globally bounded each
+    // available neighbour pins Y[i] to an interval. The global bounds are
+    // deliberately generous: a FeasibleInterval forbids what cannot be true and
+    // says nothing about which surviving value is preferred, and the failure
+    // this formulation is actually exposed to is a chain of cumulative
+    // differences DRIFTING, which a wide box still catches.
+    //
+    // Violators are pinned and the chain re-solved, so a clamp propagates along
+    // the phase chain rather than truncating one sample in isolation.
+    const double yLo = (double)videoParameters.black16bIre -  25.0 * irescale;
+    const double yHi = (double)videoParameters.black16bIre + 125.0 * irescale;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        int clamped = 0;
+        for (int xi = 0; xi < width; ++xi) {
+            if (std::isfinite(pin[xi]))
+                continue;
+            double nb[2];
+            int nbCount = 0;
+            if (xi - 2 >= 0)    nb[nbCount++] = raw(xi - 2);
+            if (xi + 2 < width) nb[nbCount++] = raw(xi + 2);
+            const lddecode::FeasibleInterval f =
+                lddecode::lumaFeasibleFromPairSums(raw(xi), nb, nbCount,
+                                                   yLo, yHi);
+            if (!f.valid())
+                continue;
+            const double c = f.clamp(yOut[xi]);
+            if (c != yOut[xi]) {
+                pin[xi] = c;
+                ++clamped;
+            }
+        }
+        if (clamped == 0)
+            break;
+        solveChains();
+    }
+}
+
 // Build the carrier-retracted view from the shared carrier model.
 //
 // The locked orchestration is intentionally single-pass here:
@@ -8430,21 +8716,28 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
             // boxcar statistic with half the smear baked in; the prior is
             // the rolling legal mean, and the lurch preconditioner restores
             // the step placement the boxcar blurs.
-            for (int xi = 0; xi < width; ++xi) {
-                const int s0 = std::clamp(xi - 2, 0, meanCount - 1);
-                const int s1 = std::clamp(xi - 1, 0, meanCount - 1);
-                refinedY[xi] = 0.5 * (winFloor[s0] + winFloor[s1]);
+            // Lurch preconditioner: resolve the prior's step placement before
+            // the carrier fit consumes it, so step energy stays out of
+            // raw - refinedY and never enters the carrier band. winFloor IS
+            // the shared aperture pool (copied above), so this is the same
+            // quantity the witness platform solves -- one construction, two
+            // readers.
+            if (lurchSolveEnabled()) {
+                solveLurchYCurve(line, winFloor.data(), meanCount, width,
+                                 refinedY);
+            } else {
+                for (int xi = 0; xi < width; ++xi) {
+                    const int s0 = std::clamp(xi - 2, 0, meanCount - 1);
+                    const int s1 = std::clamp(xi - 1, 0, meanCount - 1);
+                    refinedY[xi] = 0.5 * (winFloor[s0] + winFloor[s1]);
+                }
+                // Canonical runs (built once in split1D on the same pool),
+                // edges vertically corroborated; apply-only here.
+                const std::vector<LurchStepRun> corrRuns =
+                    corroborateLurchEdges(line);
+                applyLurchSteps(corrRuns, winFloor.data(),
+                                meanCount, width, 1.0, refinedY, nullptr);
             }
-
-            // Lurch preconditioner: sharpen the prior before the carrier fit
-            // consumes it, so step energy stays out of raw - refinedY and
-            // never enters the carrier band. Canonical runs (built once in
-            // split1D on the same pool), edges vertically corroborated;
-            // apply-only here.
-            const std::vector<LurchStepRun> corrRuns =
-                corroborateLurchEdges(line);
-            applyLurchSteps(corrRuns, winFloor.data(),
-                            meanCount, width, 1.0, refinedY, nullptr);
 
             for (int s = 0; s < meanCount; ++s) {
                 double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
