@@ -2835,17 +2835,91 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
                 double outs[4], pens[4];
                 int nT = 0;
-                auto admit = [&](const TemporalCandidateSamples::Sample &sm) {
+                // OUTPUT HULL, per member (3d-output-hull-fallback-plan.md §2).
+                //
+                // Averages and sane cancellations are interior operations, so
+                // an output beyond the range its INDEPENDENT estimates
+                // establish is manufactured energy by definition. The hull is
+                // therefore built from the seeded 2D result and the opposite
+                // temporal direction's output, and the member's own value is
+                // EXCLUDED -- a self-inclusive hull is vacuous, exactly as
+                // pairwise bounds like |out| <= max(|a|,|b|) are always true
+                // for the difference form.
+                //
+                // This is what lets the cancellation case through. On a
+                // static per-frame misread the two directions corroborate
+                // each other (out_prev ~ out_next = the clean chroma) while
+                // both sit far from the contaminated ref2d, so the member
+                // passes at full strength on its partner's evidence. The
+                // plain distance-to-2D test this replaces could not grant
+                // that: it refused a member for departing from the very
+                // reference the member exists to correct, which is the
+                // "artifact repels its own cure" defect that retired the
+                // deviation veto in the first place. The blend stage was
+                // built after the hull and inherited the member test without
+                // the law.
+                //
+                // With no valid partner the hull degenerates to {ref2d} +-
+                // slack: a conservative distance-to-2D at OUTPUT scale, so a
+                // lone candidate stays checkerboard-safe.
+                //
+                // MEASURED AND DEFAULTED OFF (LDCD_3D_BLEND_HULL=1 to enable).
+                // Census of the gate's own decisions, 25M members per scene:
+                //
+                //                        knit (static)   concert (motion)
+                //   partner valid            68.6%            64.7%
+                //   admit, hull              96.7%            88.1%
+                //   admit, flat cap          99.9%            98.4%
+                //   hull refuses, flat admits 3.2%            10.6%
+                //   flat refuses, hull admits 0.0%             0.3%
+                //
+                // Two readings, and together they retire this as the lever.
+                // The flat cap admits 98-100% -- the blend has never had an
+                // effective member guard at all. And the hull's traffic is
+                // almost entirely EXTRA REFUSAL; the widening that grants the
+                // cancellation certificate fires in 0.0-0.3% of members, so
+                // the mechanism the plan built it for does not occur at a
+                // usable rate. On the knit 63% of its extra refusals had no
+                // partner, i.e. the degenerate ref2d +- slack case doing the
+                // work rather than corroboration.
+                //
+                // Refusing 3.2% of members cost two thirds of 3D's lag-1
+                // cancellation gain (sleeve +0.176 -> +0.064), because a
+                // bound on distance-from-2D preferentially removes the
+                // members that depart from 2D the most -- which are exactly
+                // the ones cancelling the largest misread. That is the same
+                // "artifact repels its own cure" geometry that retired the
+                // deviation veto, and it applies to ANY distance-to-2D bound,
+                // this hull included. The partner term was supposed to be the
+                // escape from it and empirically is not.
+                static const bool blendHull = []{
+                    const char *e = std::getenv("LDCD_3D_BLEND_HULL");
+                    return e && std::atoi(e) != 0;
+                }();
+                auto admit = [&](const TemporalCandidateSamples::Sample &sm,
+                                 const TemporalCandidateSamples::Sample &pt) {
                     if (nT >= 4 || !sm.valid) return;
                     const double out = (base1d - sm.value) * 0.5;
                     if (!std::isfinite(out)) return;
-                    if (std::fabs(out - ref2d) > memberBound) return;
+
+                    double hullMin = ref2d, hullMax = ref2d;
+                    if (pt.valid) {
+                        const double outPartner = (base1d - pt.value) * 0.5;
+                        if (std::isfinite(outPartner)) {
+                            hullMin = std::min(hullMin, outPartner);
+                            hullMax = std::max(hullMax, outPartner);
+                        }
+                    }
+                    const bool okHull =
+                        (out >= hullMin - slack && out <= hullMax + slack);
+                    const bool okFlat = (std::fabs(out - ref2d) <= memberBound);
+                    if (!(blendHull ? okHull : okFlat)) return;
                     outs[nT] = out; pens[nT] = sm.penalty; ++nT;
                 };
-                admit(ts.previousField);
-                admit(ts.nextField);
-                admit(ts.previousFrame);
-                admit(ts.nextFrame);
+                admit(ts.previousField, ts.nextField);
+                admit(ts.nextField,     ts.previousField);
+                admit(ts.previousFrame, ts.nextFrame);
+                admit(ts.nextFrame,     ts.previousFrame);
                 if (nT == 0) continue;
 
                 double pMin = ts.best2DPenalty;
