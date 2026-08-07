@@ -1164,8 +1164,74 @@ static constexpr int    kCornerOuterRounds    = 2;
 static constexpr double kCornerParallaxSoft   = 0.15;
 static constexpr double kCornerParallaxHard   = 0.45;
 
+// TEMPORARY INSTRUMENT (LDCD_PROBE_VC=1): grades the Van Cittert D2Y estimate
+// against certified luma on covered def lines. Strip once the question closes.
+namespace {
+// AMPLITUDE-CONDITIONED (iceberg plan Section 6, "Referee noise floor"):
+// any agreement measure between two noisy quantities converges to a fixed
+// positive value with no signal present, and three instruments in this tree
+// have already been caught that way. Binned by the stranded peak's own
+// bandpass amplitude |C| in IRE, so a usable regime can be SEEN rather than
+// diluted into a single pooled number.
+constexpr int kVcBins = 5;
+const double kVcEdge[kVcBins] = { 2.0, 5.0, 10.0, 20.0, 1e9 };
+const char  *kVcName[kVcBins] = { "|C|<2", "2-5", "5-10", "10-20", ">20" };
+
+struct LdcdVcGrade {
+    long   n[kVcBins]      = {0};
+    double sTrue[kVcBins]  = {0}, sKap[kVcBins] = {0}, sRes[kVcBins] = {0};
+    double sTrueF[kVcBins] = {0}, sKapF[kVcBins] = {0}, sResF[kVcBins] = {0};
+    double sXc[kVcBins]    = {0};
+};
+thread_local LdcdVcGrade gVc;
+
+void ldcdVcGrade(double t, double k, double r,
+                 double tF, double kF, double rF, double inv, double ampIRE)
+{
+    LdcdVcGrade &g = gVc;
+    int b = 0;
+    while (b < kVcBins - 1 && ampIRE >= kVcEdge[b]) ++b;
+    t *= inv; k *= inv; r *= inv; tF *= inv; kF *= inv; rF *= inv;
+    g.n[b]++;
+    g.sTrue[b] += t * t; g.sKap[b] += k * k; g.sRes[b] += r * r;
+    g.sXc[b] += t * k;
+    g.sTrueF[b] += tF; g.sKapF[b] += kF; g.sResF[b] += rF;
+}
+
+void ldcdVcGradeReport(int tag)
+{
+    LdcdVcGrade &g = gVc;
+    long tot = 0;
+    for (int b = 0; b < kVcBins; ++b) tot += g.n[b];
+    if (tot < 1000) return;
+    std::fprintf(stderr, "[VC] frame %d  (kappa vs certified D2{Lhat}, "
+                         "binned by stranded-peak |C|)\n", tag);
+    std::fprintf(stderr, "      %-8s %9s %8s %8s %9s %7s %9s %9s\n",
+                 "bin", "n", "truth", "kappa", "resid/tru", "corr",
+                 "kapF/truF", "resF/truF");
+    for (int b = 0; b < kVcBins; ++b) {
+        if (g.n[b] < 200) continue;
+        const double n = (double)g.n[b];
+        const double rt = std::sqrt(g.sTrue[b] / n),
+                     rk = std::sqrt(g.sKap[b] / n),
+                     rr = std::sqrt(g.sRes[b] / n);
+        std::fprintf(stderr,
+            "      %-8s %9ld %8.3f %8.3f %8.0f%% %7.3f %8.0f%% %8.0f%%\n",
+            kVcName[b], g.n[b], rt, rk, 100.0 * rr / std::max(1e-9, rt),
+            g.sXc[b] / n / std::max(1e-12, rt * rk),
+            100.0 * g.sKapF[b] / std::max(1e-9, g.sTrueF[b]),
+            100.0 * g.sResF[b] / std::max(1e-9, g.sTrueF[b]));
+    }
+    g = LdcdVcGrade();
+}
+} // namespace
+
 void Comb::FrameBuffer::buildCornerLeak()
 {
+    static const bool probeVanCittert = []{
+        const char *s = std::getenv("LDCD_PROBE_VC");
+        return s && std::atoi(s) != 0;
+    }();
     // No consumer yet, so the default path must not pay for it: ~11% of a
     // locked decode (the 60 Van Cittert sweeps dominate). Enable explicitly
     // with LDCD_CORNER_LEAK=1 while developing. Remove this gate when the
@@ -1278,20 +1344,93 @@ void Comb::FrameBuffer::buildCornerLeak()
         // same fail-closed rule the schedule licenses use: one axis that
         // decisively votes legal carrier revokes the luma claim outright,
         // whereas an absent/abstaining axis merely fails to support it.
+        // LDCD_CORNER_ABSTAIN=1 frees the abstaining case below. MEASURED AND
+        // DEFAULTED OFF 2026-08-05 -- the reasoning is sound and the result
+        // does not earn its place; see the census and the trade recorded at
+        // the gate.
+        static const bool abstainIsNeutral = []{
+            const char *s = std::getenv("LDCD_CORNER_ABSTAIN");
+            return s && std::atoi(s) != 0;
+        }();
         for (int x = 0; x < width; ++x) {
-            double g = ramp(ratio[x], kCornerParallaxSoft, kCornerParallaxHard);
+            const double par = ramp(ratio[x], kCornerParallaxSoft,
+                                    kCornerParallaxHard);
+            double g = par;
+            double contra = 0.0, proof = 1.0;
             if (analysisRow) {
-                const double contra = std::clamp(
+                contra = std::clamp(
                     (double)analysisRow[x].conformanceContradictionFraction,
                     0.0, 1.0);
                 if (contra > 0.0)
                     g = 0.0;                 // observed legal-carrier vote: protect
-                else
-                    g *= lddecode::carrierIllegalProof(
+                else {
+                    proof = lddecode::carrierIllegalProof(
                         (double)analysisRow[x].carrierConformance,
                         (double)analysisRow[x].conformanceSupportFraction);
+                    // AN ABSTENTION IS NOT A VOTE AGAINST (user, 2026-08-05).
+                    // The schedule has three states and only two are opinions:
+                    //   contra > 0  an axis decisively votes LEGAL CARRIER
+                    //               -> outright veto, unchanged;
+                    //   proof  > 0  the schedule positively proves illegality
+                    //               -> it scales the correction, unchanged;
+                    //   proof == 0  with no contradiction, the schedule has NO
+                    //               OPINION -- and multiplying by it turned
+                    //               silence into a veto.
+                    // carrierIllegalProof is zero through the whole ambiguous
+                    // middle BY DESIGN ("real chroma is never claimed as
+                    // luma"), a precision guarantee written for a channel with
+                    // no independent corroboration. Parallax IS independent
+                    // corroboration: measured at diagonal luma edges on the
+                    // cube it reads 0.70 against 0.47 elsewhere, versus the
+                    // established populations (colour p50 0.05-0.12, pure luma
+                    // p50 0.89). Census over the shot: the licence refused ~85%
+                    // of the correction there, and 57-65% of the refusals were
+                    // this abstention -- against only 4-13% genuine contra.
+                    //
+                    // This is NOT the reverted "parallax alone" form (+28.5%
+                    // luma alternation at thin straps against +10.5%). That
+                    // experiment removed the whole schedule block, contra veto
+                    // included. Here a decisive legal-carrier vote still
+                    // revokes outright and positive proof still scales; only
+                    // silence stops vetoing, and there parallax decides alone.
+                    // The per-sample step this leaves at proof == 0 is carried
+                    // into gateSmooth by the encoder's chroma-envelope kernel
+                    // below, which is why the gate is smoothed before it acts.
+                    //
+                    // MEASURED, AND IT DOES NOT EARN ITS PLACE (2026-08-05).
+                    // Freeing the abstention raises the diagonal gate 0.111 ->
+                    // 0.639 as intended, but it also raises the gate EVERYWHERE
+                    // (non-diagonal 0.033 -> 0.533, 16x), and the cost lands in
+                    // luma:
+                    //               abstain OFF            abstain ON
+                    //  cube strut   alt -1.2%              fc -2.3%, alt +4.9%
+                    //  faces/unifm  alt -3.0%              colour 0, alt +2.4%
+                    //  beach strap  alt -1.1%, sat +0.1%   sat -0.4%, alt +2.7%
+                    // As licensed today the corrector is a mild WIN on luma
+                    // alternation everywhere; freeing the abstention flips it to
+                    // a loss in the same class and sign as the +28.5% at thin
+                    // straps that restored this gate originally (smaller only
+                    // because contra still vetoes). An error class outranks the
+                    // colour gain.
+                    //
+                    // THE STATED RATIONALE IS WRONG EVEN THOUGH THE BEHAVIOUR IS
+                    // RIGHT. The abstention veto is justified as chroma
+                    // precision, but freeing it costs 0.3-0.4% saturation on the
+                    // most saturated program material on the disc -- it was
+                    // never protecting real chroma. What it actually does is act
+                    // as an ACCURACY FILTER on the Van Cittert leak estimate,
+                    // confining the correction to samples where that estimate is
+                    // well-founded; without it the estimate's own carrier-rate
+                    // error reaches Y. The open question is the estimate's
+                    // accuracy at ~0.64 authority, not its permission. Re-test
+                    // this licence AFTER the estimate improves; do not re-run it
+                    // as a tuning exercise before then.
+                    if (proof > 0.0 || !abstainIsNeutral)
+                        g *= proof;
+                }
             }
             gate[x] = g;
+
         }
         for (int x = 0; x < width; ++x) {
             double acc = 0.0, wsum = 0.0;
@@ -1387,6 +1526,67 @@ void Comb::FrameBuffer::buildCornerLeak()
                     kappa[x] += (mObs[x] - sKappa[x]);
             }
         }
+        // TEMPORARY INSTRUMENT (LDCD_PROBE_VC=1): grade the Van Cittert
+        // estimator against CERTIFIED TRUTH, before any gate.
+        //
+        //   dG conservation:  merged = Lhat + BP(chat),  exactCarrier = BP(chat)
+        //   so on a covered def line   Lhat[x] = raw[x] - exactCarrier[x]
+        //
+        // is carrier-free luma at FULL bandwidth, fSC included. kappa claims to
+        // estimate D2_stride2{Y}; here D2_stride2{Lhat} is that quantity as a
+        // conservation fact. The referee is legitimate because
+        // locked1DRawBandpass is the pure 0.50c - 0.25(m2+p2) formula off raw,
+        // written once in buildCarrierAnalysis and never fact-injected -- kappa
+        // has not seen the exact channel.
+        //
+        // The question: is the residual (truth - kappa) concentrated at fSC?
+        // Van Cittert's error profile is sin^2, frozen at the subcarrier, so it
+        // should recover the non-fSC part and miss the rest -- and that missed
+        // part, returned as its complement in Y, is the alternation.
+        if (probeVanCittert) {
+            const float *ex = exactCarrierRow(line);
+            if (ex) {
+                static const int c4[4] = { 1, 0, -1, 0 };
+                static const int s4[4] = { 0, 1, 0, -1 };
+                auto fscMag = [&](const double *v, int x) {
+                    double i = 0.0, q = 0.0;
+                    for (int k = -4; k < 4; ++k) {
+                        const int ph = (x + k) & 3;
+                        i += v[x + k] * c4[ph];
+                        q += v[x + k] * s4[ph];
+                    }
+                    return std::hypot(i, q) * 0.25;
+                };
+                std::vector<double> yTrue(width, 0.0), d2True(width, 0.0),
+                                    resid(width, 0.0);
+                std::vector<char> ok(width, 0);
+                for (int x = 0; x < width; ++x) {
+                    const double e = (double)ex[left + x];
+                    if (!std::isfinite(e)) continue;
+                    yTrue[x] = (double)rawLine[left + x] - e;
+                    ok[x] = 1;
+                }
+                for (int x = 2; x < width - 2; ++x) {
+                    if (!ok[x - 2] || !ok[x] || !ok[x + 2]) continue;
+                    d2True[x] = yTrue[x - 2] - 2.0 * yTrue[x] + yTrue[x + 2];
+                    resid[x]  = d2True[x] - kappa[x];
+                }
+                for (int x = 6; x < width - 6; ++x) {
+                    if (!ok[x - 2] || !ok[x] || !ok[x + 2]) continue;
+                    // Condition on the stranded peak's OWN amplitude: the
+                    // bandpass envelope |C| over +-2 samples, in IRE.
+                    double amp = 0.0;
+                    for (int k = -2; k <= 2; ++k)
+                        amp = std::max(amp, std::fabs(bpLine[x + k]));
+                    ldcdVcGrade(d2True[x], kappa[x], resid[x],
+                                fscMag(d2True.data(), x),
+                                fscMag(kappa.data(), x),
+                                fscMag(resid.data(), x), 1.0 / irescale,
+                                amp / irescale);
+                }
+            }
+        }
+
         for (int x = 0; x < width; ++x)
             kappa[x] *= gateSmooth[x];
 
@@ -1399,6 +1599,30 @@ void Comb::FrameBuffer::buildCornerLeak()
         // the fSC neighbourhood (its response is exactly 0.5 at fSC), redundant
         // with the Van Cittert recovery profile that already owns that band;
         // it silently halved every fSC-rate leak the solve had recovered.
+        // TWO SEPARATIONS TRIED AND BOTH FALSIFIED (2026-08-05), while hunting
+        // why this stage's luma alternation grows with its own correction.
+        //
+        // (a) "envExcess is the fSC injector." It is a remodulation onto the
+        //     carrier basis, so it is at fSC by construction and carries no
+        //     licence, while kappa is licensed and cannot produce fSC -- so it
+        //     looked like the whole alternation channel. Withholding it from
+        //     the leak made alternation WORSE, not better (cube -1.2% -> -0.3%,
+        //     faces -3.0% -> -0.1%): it is mildly helping.
+        // (b) "the gate's spatial variation AM-modulates kappa into fSC."
+        //     Removing the gate entirely -- the largest correction and the only
+        //     one with zero AM -- made alternation worse again (+6.6% cube,
+        //     +13.8% faces, +13.6% straps).
+        //
+        // Both refuted the same way: alternation is strictly MONOTONIC in
+        // correction magnitude, through gate 0.11 -> 0.64 -> 1.0. The cause is
+        // kappa itself, and the referee below (LDCD_PROBE_VC) named it: graded
+        // against certified D2{Lhat}, kappa's residual is 67% (cube) / 91%
+        // (beach) fSC, and kappa does NOT abstain at the subcarrier -- it emits
+        // 55%/95% of truth's fSC magnitude in the WRONG PHASE, so the error
+        // adds instead of cancelling. Every unit applied pushes wrong-phase fSC
+        // into Y. That is not fixable by licensing or by term separation: the
+        // fSC null is a single-line law, and no single-line test can separate
+        // fSC luma from fSC chroma. See the iceberg pre-implementation plan.
         for (int x = 0; x < width; ++x)
             leakRow[x] = -0.25 * kappa[x] + envExcess[x];
 
@@ -1432,6 +1656,8 @@ void Comb::FrameBuffer::buildCornerLeak()
                 leakRow[x] = bpLine[x] - notchAdj[x];   // excess -> leak -> luma
         }
     }
+
+    if (probeVanCittert) ldcdVcGradeReport((int)heldSeq1);
 
     // Retained record from the removed LDCD_DUMP_CORNER dump
     //
