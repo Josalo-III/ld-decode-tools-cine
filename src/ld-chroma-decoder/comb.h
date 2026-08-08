@@ -1281,10 +1281,29 @@ private:
 
 	// Comb construction intentionally accepts either provenance. Consumers
 	// whose authority differs by provenance must use the distinct accessors.
+	// THE RATCHET (author, 2026-08-07): "the flow of influence should be
+	// like a valve, or a ratchet — one direction only." Certified facts
+	// spread to their weaker counterparts; estimates never flow back. For
+	// the COMB LADDER that means the fact-corrected ESTIMATE tier is
+	// retired from this accessor: the uncovered retracted claim is, by its
+	// own charter, a nuisance-removal product that deliberately under-
+	// states carrier at contested texture ("we will never use the carrier
+	// fit for direct use as [chroma]") — categorically unfit as a comb leg
+	// or base. A covered frame serves its fact-backed plane (certified
+	// legs spread to uncovered neighbours' combing); an uncovered frame
+	// serves the pure OBSERVATION — locked 1D, the safe retreat — so no
+	// estimate ever combs into a fact-bearing frame. The estimate plane
+	// remains published for its Y-side consumers via its own accessor.
+	// LDCD_COMB_ESTIMATE_LEG=1 restores the estimate tier for A/B.
 	inline const double *combSource1D_line(int line) const {
+		static const bool estimateLeg = []{
+			const char *e = std::getenv("LDCD_COMB_ESTIMATE_LEG");
+			return e && std::atoi(e) == 1;
+		}();
 		if (const double *fact = factBackedCarrier_line(line)) return fact;
-		if (const double *estimate =
-		        factCorrectedCarrierEstimate_line(line)) return estimate;
+		if (estimateLeg)
+			if (const double *estimate =
+			        factCorrectedCarrierEstimate_line(line)) return estimate;
 		return locked1DSource_line(line);
 	}
 
