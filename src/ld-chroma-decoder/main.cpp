@@ -322,7 +322,7 @@ int main(int argc, char *argv[])
     parser.addOption(debugInterfieldFlipOption);
 
     QCommandLineOption crossColorReturnOption(QStringList() << "cross-color-return",
-                                    QCoreApplication::translate("main", "NTSC locked mode: Transfers detected false chroma back to Y, restoring high-frequency luma detail. (default 0.0; 1.0 returns the full measured fraction, 2.0 effective max)"),
+                                    QCoreApplication::translate("main", "NTSC locked mode: Transfers detected false chroma back to Y, restoring high-frequency luma detail. (omitted 0.0; bare flag 1.0 = the full measured fraction; 2.0 effective max)"),
                                     QCoreApplication::translate("main", "number"));
     parser.addOption(crossColorReturnOption);
 
@@ -364,8 +364,26 @@ int main(int argc, char *argv[])
     parser.addPositionalArgument("input", QCoreApplication::translate("main", "Specify input TBC file (- for piped input)"));
     parser.addPositionalArgument("output", QCoreApplication::translate("main", "Specify output file (omit or - for piped output)"));
 
+    // --cross-color-return engages at 1.0 when the flag is given without a
+    // value (user, 2026-08-07). Qt declares it as taking a value, so a bare
+    // flag would otherwise abort process() with "Missing value"; supply the
+    // default here rather than making the value optional, which would make
+    // `--cross-color-return 0.5` swallow 0.5 as a positional argument.
+    // An explicit value, `--cross-color-return=V`, and the flag's absence
+    // (still 0.0) are all unaffected.
+    QStringList ccArgs = a.arguments();
+    for (int i = 0; i < ccArgs.size(); ++i) {
+        if (ccArgs.at(i) != QStringLiteral("--cross-color-return"))
+            continue;
+        bool numeric = false;
+        if (i + 1 < ccArgs.size())
+            ccArgs.at(i + 1).toDouble(&numeric);
+        if (!numeric)
+            ccArgs.insert(i + 1, QStringLiteral("1.0"));
+    }
+
     // Process the command line options and arguments
-    parser.process(a);
+    parser.process(ccArgs);
 
     // Standard logging options
     processStandardDebugOptions(parser);
