@@ -7141,11 +7141,48 @@ static bool ldcdPhaseSnapOn()
     return on;
 }
 
+// DEFAULT OFF (2026-08-07, author). The synchronization inventory, in the
+// colour-management frame the project reasons in:
+//
+//   grammar / sign frames  PROFILES -- deterministic metadata, exact,
+//                          content-free conversions into the 4fSC working
+//                          space. Sound.
+//   the certified tone     CALIBRATION DRIFT -- the schedule's actual phase
+//                          wanders against nominal; the tone tracks it from
+//                          certified anchors and corrects TREND inside a
+//                          hull. Raster-anchored, content-free, survives
+//                          motion. Sound, and the temporal phase authority.
+//   the VERTICAL snap      licensed by the film-frame law: all lines of a
+//                          film frame are one photographed instant, so a
+//                          same-frame certified bracket describes the same
+//                          moment of the same scene. Sound.
+//   the TEMPORAL snap      NOT a synchronization. Carrier phase decomposes
+//                          into SCHEDULE (raster-anchored, global, the
+//                          tone's property) and MODULATION (hue -- content,
+//                          painted on objects, travelling with them). This
+//                          snapped each window to the covers' TOTAL phase,
+//                          schedule PLUS their hue geometry at this raster
+//                          position. Under stillness the two are
+//                          indistinguishable; under motion it stamps
+//                          foreign paint's phase into this frame -- the
+//                          dissolve's crime in phase space. The twin gate
+//                          cannot license it even in principle: endpoint
+//                          agreement is the covers consenting with EACH
+//                          OTHER, never consent from the frame being
+//                          rendered.
+//
+// Convicted by eye (author, 2026-08-07): checkerboards came off with the
+// snap disabled; the election hid most of the residue but not all. Its
+// original justification -- the sharp/soft pulse -- was priced against the
+// old soft uncovered plane, a floor that no longer exists (the plane is now
+// policed, hulled and tone-disciplined). Whatever this contributes beyond
+// the tone is, by the decomposition, content import.
+// LDCD_PHASE_SNAP_T=1 restores it for A/B.
 static bool ldcdPhaseSnapTemporalOn()
 {
     static const bool on = []{
         const char *e = std::getenv("LDCD_PHASE_SNAP_T");
-        return !(e && std::atoi(e) == 0);
+        return e && std::atoi(e) != 0;
     }();
     return on;
 }
@@ -7379,7 +7416,13 @@ bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
 {
     if (!carrierRetractedValid) return false;
     if (ldcdRetractedSourceMode() != 3) return false;
-    if (!ldcdPhaseSnapOn() || !ldcdPhaseSnapTemporalOn()) return false;
+    if (!ldcdPhaseSnapOn()) return false;
+    // NOTE: the temporal snap's own gate is NOT an early return. This
+    // routine also publishes the fact-corrected estimate plane, which has
+    // four Y-side consumers; standing the snap down must not withdraw that
+    // publication. With the snap off (default) and the temporal comb off
+    // (default), the per-line work below is an identity on the retracted
+    // plane and only the publication survives.
     if (frameHasExactCoverage()) return false;
     const FrameBuffer *nb[2] = {
         (prevF && prevF->frameHasExactCoverage()) ? prevF : nullptr,
@@ -7407,10 +7450,22 @@ bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
     constexpr double kTSnapAmpMinIRE = 2.0;
     constexpr double kTSnapAmpTauIRE = 4.0;
 
-    // A/B escape only (LDCD_TEMPORAL_COMB=0); default ON.
+    // DEFAULT OFF (2026-08-07, author): the temporal certified-luma comb is
+    // a REGRESSION -- its reference is the mean of the two covers' certified
+    // luma, i.e. the uncovered top band becomes a cross-dissolve of the two
+    // neighbouring keyframes. Convicted by eye on the Wolf 359 scene:
+    // cross-colour manufactured on the moving Melbourne (the dissolve holds
+    // the ship twice at half strength; the in-band share of the displaced-
+    // edge mismatch passes the merge FIR into the carrier estimate as
+    // paint), plus softness. With it off, uncovered frames keep the frame's
+    // own load-time estimate plus the twin-gated phase snap.
+    // LDCD_TEMPORAL_COMB=1 restores the dissolve for A/B.
+    // NOTE: the iceberg tween (LDCD_ICEBERG) currently lives INSIDE this
+    // gate and is dormant while it is off; re-plumbing the tween over the
+    // native floor is the open Phase E task in the iceberg plan.
     static const bool temporalComb = []{
         const char *e = std::getenv("LDCD_TEMPORAL_COMB");
-        return !(e && std::atoi(e) == 0);
+        return e && std::atoi(e) != 0;
     }();
 
     std::vector<double> tAlign(width), est(width), out(width);
@@ -8232,9 +8287,16 @@ bool Comb::FrameBuffer::refineRetractedTemporal(const FrameBuffer *prevF,
             }
         }
 
-        ldcdApplyPhaseSnap(est, tAlign, out, width, irescale,
-                           kTSnapAmpMinIRE, kTSnapAmpTauIRE, true,
-                           snapGate.data());
+        // The temporal snap (default OFF -- see ldcdPhaseSnapTemporalOn's
+        // decomposition note). Off, the estimate stands as this frame's own
+        // and the loop below is an identity on the retracted plane.
+        if (ldcdPhaseSnapTemporalOn()) {
+            ldcdApplyPhaseSnap(est, tAlign, out, width, irescale,
+                               kTSnapAmpMinIRE, kTSnapAmpTauIRE, true,
+                               snapGate.data());
+        } else {
+            for (int xi = 0; xi < width; ++xi) out[xi] = est[xi];
+        }
         for (int xi = 0; xi < width; ++xi)
             retractedRow[xi] = static_cast<float>(
                 static_cast<double>(rawLine[left + xi]) - out[xi]);
@@ -11004,18 +11066,24 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         return e && std::atoi(e) == 1;
     }();
     std::vector<double> antComp;
-    // A/B escape (LDCD_ANT_RUNG=0, user-authorised 2026-08-04). Stands the
-    // anticipated rung down so the ladder falls through to certComp/fit.
-    // Default ON: inert unless set. Under test as the remaining source of the
-    // uncovered letters' checkerboard -- measured by the since-removed RLAD
-    // rung census, this rung stands on 100% of samples in the affected window
-    // and departs from the fit by 1.8-3.0 IRE, a departure that reads as
-    // STANDING (image-locked luma) rather than as carrier. Every other stage
-    // in this campaign carries an escape; this one did not, so it could not
-    // be tested.
+    // DEFAULT OFF (2026-08-07, author: "We weren't supposed to comb against
+    // the anticipated rung -- that was supposed to be a sync tone for
+    // keeping phase aligned."). The anticipation license was for the PHASE
+    // CURVE -- carrier phase is raster-anchored and rides the cycle, so it
+    // survives motion; the WAVEFORM is content and does not. That licensed
+    // duty is applyToneToFit(), which remains on. This rung combed the
+    // previous cover's certified luma for carrier VALUES -- under motion
+    // that reference holds objects at their old positions, the displaced-
+    // edge mismatch's in-band share passes the FIR as carrier, and its
+    // out-of-band alpha is the guard class measured blind to exactly that
+    // (the TCW inversion). Bisected 2026-08-07 on the Wolf 359 ship: the
+    // rung's paint is 23-47 chroma codes at object edges, uncovered frames
+    // only; standing it down removes it. Earlier RLAD census agrees: the
+    // rung's departure from the fit read as STANDING (image-locked luma),
+    // not carrier. LDCD_ANT_RUNG=1 restores the comb for A/B.
     static const bool antRungOff = []{
         const char *e = std::getenv("LDCD_ANT_RUNG");
-        return e && std::atoi(e) == 0;
+        return !(e && std::atoi(e) == 1);
     }();
     const bool antRungOn = !antRungOff && retractedSource == 3 &&
         !frameHasExactCoverage() && antRefAge >= 1;
