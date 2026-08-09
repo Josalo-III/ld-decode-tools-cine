@@ -4107,6 +4107,10 @@ void Comb::FrameBuffer::buildAnchorCeiling()
 {
     anchorCeiling_flat.clear();
     anchorCoveredLine.clear();
+    // Built-for-this-frame marker, set before the early returns: on an
+    // uncovered frame "no plane" IS the built result, and every consumer
+    // asking later must not trigger a rebuild.
+    anchorCeilingValid = true;
     if (exactCarrier_flat.empty()) return;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -4597,8 +4601,10 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // decoder's own burst-locking adds on top.
 
     // Anchor ceiling: pooled regional amplitude bound from the exact
-    // channel. Cheap no-op on frames without coverage.
-    buildAnchorCeiling();
+    // channel. Cheap no-op on frames without coverage. The retraction
+    // stage's certified-anchor fit hull usually built it already this
+    // frame; build here only when that stage did not run.
+    if (!anchorCeilingValid) buildAnchorCeiling();
 
     // Retained record from the removed LDCD_PROBE_YCAND census
     // Per-CANDIDATE grading against certified luma. User question
@@ -4703,6 +4709,87 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
         return s && std::atoi(s) != 0;
     }();
 
+    // Fixed-kernel notch candidate (plane 5). OFF by default.
+    //
+    // The exact relation to comb, which governs everything below:
+    //
+    //   notchY - combY = carrierComp - sin^2(D)*raw
+    //
+    // where sin^2(D) = [-1,0,2,0,-1]/4 is the notch's complement. Split raw
+    // into pedestal + carrier + luma: sin^2(D) takes the whole carrier plus
+    // the near-fSC part of the luma, so wherever comb's carrier estimate is
+    // sound the two candidates differ by EXACTLY -sin^2(D)*L -- the near-fSC
+    // luma, and nothing else. Where the picture has none, both publish the
+    // same pedestal and the roster's identity dedup correctly refuses to
+    // count one hypothesis twice.
+    //
+    // PARTICIPATION, program material (2026-08-09, Emissarymovie-s1x11, an
+    // 11-disc stack, cube at -s 2600, ntsc3d + fvf + witness + ccr 1.0):
+    //   offered on every election pixel, 40-50% ADMITTED, 50-60% duplicate,
+    //   0% infeasible; at seated pixels mean blindness 1.50 IRE with only
+    //   1.4% above the 10 IRE chromaT calls high chroma, so the gate leaves
+    //   the candidate 74% of its weight (mean factor 0.7385).
+    // Effect on emitted Y vs notch-off: 96% of pixels on alternating output
+    // frames, mean 0.14 IRE, p95 0.44, max 17.9 -- and 0.3% on the frames
+    // between. That odd/even split is UNEXPLAINED; do not assume the
+    // pulldown letters without measuring it. (Census predates the covered-
+    // frame cede below, 2026-08-09 -- covered frames no longer seat the
+    // notch at all, so re-measure before reasoning from these numbers.)
+    //
+    // RETRACTED, and worth the space because it nearly buried the plane: the
+    // first census ran on ve-snw-cut and reported 99.18% duplicate, 0.82%
+    // admitted, mean blindness 10.93 IRE, 48% of seated pixels above 10 IRE
+    // -- from which this comment concluded the notch was structurally
+    // incapable of contributing, since distinctness and blindness appeared
+    // to COINCIDE. They do not. The pattern is not a stack and carries no
+    // near-fSC luma for the notch to disagree with comb about, so every
+    // disagreement it did have was carrier by construction. The identity
+    // above is material-independent; the inference drawn from it was not.
+    //
+    // The gate is nonetheless load-bearing, measured on the pattern where it
+    // could be isolated: sweeping tau left participation pinned while
+    // max|dY| ran 0.30 IRE (tau=1) -> 1.39 (tau=4) -> 44.9 (tau=1000).
+    // Ungated, this plane publishes tens of IRE of "no summit here" at the
+    // summits. Tau is the first thing to sweep on real material too.
+    //
+    // STILL UNMEASURED: whether any of this is BETTER. Participation and
+    // departure are not fidelity. Grade against certified luma before
+    // promoting or removing.
+    static const bool notchCandidate = []{
+        const char *s = std::getenv("LDCD_Y_NOTCH");
+        return s && std::atoi(s) != 0;
+    }();
+    // CERTIFIED CEDE for the notch (user, 2026-08-09: "pulling notch out
+    // of covered frames altogether, given its ungovernability"): the same
+    // rule every comb candidate carries, in the only shape a raw-only
+    // kernel can carry it. On a covered frame the def lines are fact
+    // (the early-out below) and the comp lines' candidates all descend
+    // from the certified ladder, so they dedup into ONE roster entry —
+    // which made the notch the lone dissenter with its largest blend
+    // share exactly where the material is already separated, and its
+    // touch, confined to every other line, rendered as interline
+    // alternation on the certified fields. A plane that cannot inherit
+    // certification has no franchise on a covered frame. Per-frame, never
+    // per-line: uniform provenance.
+    const bool notchLive = notchCandidate && !frameHasExactCoverage();
+    // Blindness scale for the notch's alpha withdrawal, IRE. Tight by
+    // design: chromaT treats 10 IRE as high chroma, and the notch's own
+    // failure mode (publishing a near-zero top just above the carrier, where
+    // cos^2 is only 0.07 at 4.2 MHz) has to be caught before it softens the
+    // blend. The first thing to sweep.
+    static const double notchBlindTauIRE = []{
+        const char *s = std::getenv("LDCD_Y_NOTCH_TAU");
+        return s ? std::atof(s) : 4.0;
+    }();
+
+    // Line-scope copy of the LDCD_CC_FACTS switch for the certified
+    // early-out below (the pixel loop resolves its own; same env, same
+    // once-only value).
+    static const bool certChromaFactsY = []{
+        const char *e = std::getenv("LDCD_CC_FACTS");
+        return !(e && std::atoi(e) == 0);
+    }();
+
     // PERF (2026-08-06): per-line plane-luma caches for the election's
     // samplers. planeY is pure per (plane, sample) given the line's row
     // pointers, but the per-pixel scoring reads it through overlapping
@@ -4713,12 +4800,13 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // verified against the pre-change binary, md5 dc131e1c on 24 frames of
     // covered program material).
     std::vector<double> pyRow0(width), pyRow1(width), pyRow3(width),
-                        pyRow4(width);
+                        pyRow4(width), pyRow5(width);
     // Companion caches, same contract: candidate residuals (planeY - coarse,
     // the samplers' own subtraction, done once) and the carrier-basis LUT
     // values per sample class (the per-tap grammar lookup, done once).
     std::vector<double> resRow0(width), resRow1(width), resRow3(width),
-                        resRow4(width), spRowV(width), cpRowV(width);
+                        resRow4(width), resRow5(width),
+                        spRowV(width), cpRowV(width);
 
 
     // produceY is a pure consumer. splitIQlocked() exports the selected comb
@@ -4777,6 +4865,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
         //             raw - w·carrierFit; LDCD_RETRACTED_SOURCE overrides)
         //   oned      plane 3, raw - locked1DSource
         //   returned  plane 4, combY + ccMask*(raw - combY)
+        //   notch     plane 5, [1,0,2,0,1]/4 on raw (no LDCD_Y_NOTCH needed:
+        //             the view samples the plane directly)
         //   (unset)   the elected output
         //
         // The plane views route through planeY() below so they are EXACTLY
@@ -4795,6 +4885,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             if (std::strcmp(s, "retracted") == 0) return 1;
             if (std::strcmp(s, "oned") == 0)      return 3;
             if (std::strcmp(s, "returned") == 0)  return 4;
+            if (std::strcmp(s, "notch") == 0)     return 5;
             return -1;
         }();
         if (yViewMode == 100) {
@@ -4810,7 +4901,44 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             continue;
         }
 
-        if (retractedRow || ccMaskRow) {
+        // ---- Certified early-out (user direction, 2026-08-09) ----
+        //
+        // On a certified sample the conservation fact Ltrue = raw - exact IS
+        // the luma, at full band. There is nothing for an election to decide:
+        // every candidate is obliged to carry that value unadulterated (the
+        // ratchet law), so adjudicating between them can only dilute a fact
+        // with estimates. Emit it and run no scoring at all -- no candidate
+        // planes, no cleanliness projections, no neighbour probes. A quantity
+        // that cannot change the answer must not be computed.
+        //
+        // This is also the structural cure for a defect the notch candidate
+        // exposed: a plane derived purely from raw cannot inherit
+        // certification, so it entered the blend at certified positions as an
+        // estimate and pulled Y off truth -- and worse at certified samples
+        // than uncertified ones, because the fact-carrying candidates dedup
+        // into a single entry there and the lone dissenter's share of the
+        // blend rises. Ceding the plane to fact would have fixed the notch;
+        // this fixes the CLASS, for every present and future candidate,
+        // by removing the decision rather than policing the candidates.
+        const float *certExactRow = exactCarrierRow(line);
+        const bool certLineActive =
+            certChromaFactsY && certExactRow && certifiedDefLine(line);
+        bool certLineComplete = false;
+        if (certLineActive) {
+            certLineComplete = true;
+            for (int h = left; h < right; ++h)
+                if (!std::isfinite(certExactRow[h])) {
+                    certLineComplete = false;
+                    break;
+                }
+        }
+        if (certLineComplete) {
+            // Whole line is fact: skip the election block entirely, including
+            // its per-line plane caches. Falls through to the star footprint
+            // pass below, which is a separate declaration and still applies.
+            for (int h = left; h < right; ++h)
+                Y[h] = (double)rawLine[h] - (double)certExactRow[h];
+        } else if (retractedRow || ccMaskRow) {
             // ================= HF luma election =================
             //
             // One selected coarse owns LF. Comb owns the middle band and is
@@ -4961,6 +5089,49 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         if (std::isfinite(r)) return comb + m * (r - comb);
                     }
                     return comb + m * ((double)rawLine[hh] - comb);
+                } else if (plane == 5) {
+                    // Fixed-kernel notch: cos^2(w) = [1,0,2,0,1]/4 on raw.
+                    //
+                    // The one contestant with NO lineage. No fit, no mask, no
+                    // phase solve, nothing estimated -- it reads raw and a
+                    // constant, so it carries no per-pixel claim that can be
+                    // wrong, and its behaviour is known in closed form at
+                    // every frequency. That independence is the whole case
+                    // for it: comb, retracted and returned all descend from
+                    // one IQ lineage and can therefore agree for a common
+                    // reason rather than a corroborating one.
+                    //
+                    // WHY THE SQUARE. The bare [1,0,1]/2 notch is |cos w| in
+                    // MAGNITUDE but cos w in SIGN, and cos w is NEGATIVE from
+                    // fSC to Nyquist -- exactly the span the top-band
+                    // extractor (1 - fourMean) holds at unity. It would
+                    // publish the raster's finest luma polarity-reversed: a
+                    // one-pixel highlight rendered as a one-pixel hole. In
+                    // luma there is no phase convention to absorb that the
+                    // way the carrier grammar absorbs a chroma flip -- the
+                    // number IS the brightness. Squaring keeps the null at
+                    // fSC and unity at DC and 2fSC while never going
+                    // negative; the price is a wider skirt (0.50 at half-fSC
+                    // where |cos| held 0.707).
+                    //
+                    // At +-2 reach this kernel is FORCED, not preferred:
+                    // symmetric [a,0,b,0,a] with unity DC (b + 2a = 1) and a
+                    // null at fSC (b - 2a = 0) has the single solution
+                    // a = 1/4, b = 1/2. Odd taps cannot buy anything -- they
+                    // contribute exactly nothing at fSC (cos(pi/2) = 0) while
+                    // breaking the DC/Nyquist balance a luma candidate needs.
+                    // A narrower notch requires +-4 and negative outer taps,
+                    // which ring; these taps are non-negative and sum to 1,
+                    // so this kernel is a weighted average and cannot
+                    // overshoot its own support. Its reach also stays inside
+                    // the +-2 apertures that judge it (fourMean,
+                    // carrierCleanlinessOf, completeTopAt), so no referee
+                    // here is scoring content it cannot see.
+                    const int hm = std::clamp(hh - 2, left, right - 1);
+                    const int hp = std::clamp(hh + 2, left, right - 1);
+                    return 0.25 * ((double)rawLine[hm] +
+                                   2.0 * (double)rawLine[hh] +
+                                   (double)rawLine[hp]);
                 }
                 const double c = carrierComp ? carrierComp[xx] : clpLine[hh];
                 return (double)rawLine[hh] - (std::isfinite(c) ? c : 0.0);
@@ -4983,17 +5154,20 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 if (retractedRow) pyRow1[xx] = planeY(1, hh);
                 if (oneDRow)      pyRow3[xx] = planeY(3, hh);
                 if (ccMaskRow)    pyRow4[xx] = planeY(4, hh);
+                if (notchLive) pyRow5[xx] = planeY(5, hh);
             }
             const double *pyR0 = pyRow0.data();
             const double *pyR1 = retractedRow ? pyRow1.data() : pyRow0.data();
             const double *pyR3 = oneDRow      ? pyRow3.data() : pyRow0.data();
             const double *pyR4 = ccMaskRow    ? pyRow4.data() : pyRow0.data();
+            const double *pyR5 = notchLive ? pyRow5.data() : pyRow0.data();
             auto planeYc = [&](int plane, int hh) -> double {
                 const int xx = hh - left;
                 switch (plane) {
                     case 1:  return pyR1[xx];
                     case 3:  return pyR3[xx];
                     case 4:  return pyR4[xx];
+                    case 5:  return pyR5[xx];
                     default: return pyR0[xx];
                 }
             };
@@ -5009,12 +5183,15 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             const double *resR1 = retractedRow ? resRow1.data() : resRow0.data();
             const double *resR3 = oneDRow      ? resRow3.data() : resRow0.data();
             const double *resR4 = ccMaskRow    ? resRow4.data() : resRow0.data();
+            const double *resR5 =
+                notchLive ? resRow5.data() : resRow0.data();
             if (coarseRow) {
                 for (int xx = 0; xx < width; ++xx) {
                     resRow0[xx] = pyR0[xx] - coarseRow[xx];
                     if (retractedRow) resRow1[xx] = pyR1[xx] - coarseRow[xx];
                     if (oneDRow)      resRow3[xx] = pyR3[xx] - coarseRow[xx];
                     if (ccMaskRow)    resRow4[xx] = pyR4[xx] - coarseRow[xx];
+                    if (notchLive) resRow5[xx] = pyR5[xx] - coarseRow[xx];
                 }
             }
             auto resAt = [&](int plane, int xx) -> double {
@@ -5022,6 +5199,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     case 1:  return resR1[xx];
                     case 3:  return resR3[xx];
                     case 4:  return resR4[xx];
+                    case 5:  return resR5[xx];
                     default: return resR0[xx];
                 }
             };
@@ -5290,6 +5468,15 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 const int xi = h - left;
                 const double rawH = (double)rawLine[h];
 
+                // Per-sample arm of the certified early-out. Reached only on
+                // PARTIALLY certified lines -- fully certified ones never
+                // enter this block. Placed before any candidate work so a
+                // certified sample costs one compare and one subtraction.
+                if (certLineActive && std::isfinite(certExactRow[h])) {
+                    Y[h] = rawH - (double)certExactRow[h];
+                    continue;
+                }
+
                 // combY -- senior comb candidate.
                 double combY;
                 if (carrierComp) {
@@ -5406,8 +5593,12 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // Roster with structural feasibility DQ. Coherent comb is the
                 // senior hypothesis; 1D replaces it only if comb is infeasible.
                 // Retracted Y may join as the one independent base challenger.
-                double candY[3]; // top-band values; name retained locally
-                int    candPlane[3];
+                // Top-band values; name retained locally. Three base planes
+                // can be live at once (comb-or-1D, retracted, notch) and
+                // addBaseCandidate is unbounded by design, so keep the margin
+                // the roster had before the notch joined.
+                double candY[4];
+                int    candPlane[4];
                 int    nCand = 0;
                 const double identityTol = 1e-6 * irescale;
                 auto addBaseCandidate = [&](double completeY, int plane) {
@@ -5434,7 +5625,18 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     addBaseCandidate(combY, 0);
                 }
 
-                if (retractedRow) {
+                // ABSTENTION IS AN ANSWER, and it is checked at the door.
+                // A non-finite retracted sample is the witness declaring it
+                // has no product here (see the publication's abstention
+                // rung). The old conduct substituted combY and ran the whole
+                // admission on it, seating a SECOND copy of comb under the
+                // witness's plane number -- identity dedup usually collapsed
+                // it, so the damage was quiet, but a candidate must never
+                // answer with another candidate's value. Now the seat simply
+                // goes unfilled; the election is downstream of the comb, so
+                // the roster is the fallback and no candidate needs an
+                // internal retreat.
+                if (retractedRow && std::isfinite((double)retractedRow[xi])) {
                     // Evidence admission for retractedY (raw - combedCarrier),
                     // the leg that keeps near-carrier HF luma the comb strips.
                     //
@@ -5455,8 +5657,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     // admitted outright; a conflicted fit is admitted only when
                     // its HF is corroborated by a neighbour. Feasibility
                     // remains the only true DQ.
-                    const double r = retractedRow ? (double)retractedRow[xi] : combY;
-                    const double ry = std::isfinite(r) ? r : combY;
+                    const double r = (double)retractedRow[xi];
+                    const double ry = r;
                     bool retractedAdmitted =
                         retractedAdmitAll ||
                         !analysisRow ||
@@ -5523,6 +5725,22 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         addBaseCandidate(y1, 3);
                     }
                 }
+
+                // Fixed-kernel notch. No admission test exists here, and none
+                // is needed: there is no estimate to vet, so feasibility --
+                // the only true DQ -- is the entire gate. That law already
+                // does real work on this plane. The notch's implied carrier
+                // is raw - notchY = sin^2(w)*raw, i.e. the WHOLE local fSC
+                // band, so wherever that exceeds the structural amplitude
+                // ceiling the candidate is claiming a carrier no legal
+                // carrier could be, and feasible() removes it with no special
+                // case. It joins as a BASE candidate: unlike returned it is
+                // not derived from comb, so it is entitled to move the
+                // population statistics the base set defines. notchLive,
+                // not notchCandidate: covered frames are ceded whole (see
+                // the declaration).
+                if (notchLive)
+                    addBaseCandidate(planeYc(5, h), 5);
 
                 // Returned Y is derived from combY, so it is a selectable
                 // challenger but not another independent observation when the
@@ -5598,7 +5816,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // medoid isn't that great, we shouldn't allow it to govern").
                 // Removed: every base candidate now always reaches the cost
                 // loop and the confidence-alpha blend below, agreeing or not.
-                int inIdx[3];
+                int inIdx[4];
                 int nIn = 0;
                 for (int k = 0; k < nCand; ++k)
                     inIdx[nIn++] = k;
@@ -5629,8 +5847,10 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
 
                 // Inlier HF set + per-inlier carrier-basis cleanliness. This is
                 // a cautionary term, not the positive reason to select HF.
-                double inHF[3], inCarrierCleanliness[3];
-                double inCrossColorReturnEvidence[3] = {0.0, 0.0, 0.0};
+                // Sized for the full roster: three BASE candidates
+                // (comb-or-1D, retracted, notch) plus the derived return.
+                double inHF[4], inCarrierCleanliness[4];
+                double inCrossColorReturnEvidence[4] = {0.0, 0.0, 0.0, 0.0};
                 for (int k = 0; k < nIn; ++k) {
                     inHF[k] = candY[inIdx[k]];
                     inCarrierCleanliness[k] =
@@ -5681,6 +5901,19 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     for (int k = 0; k < nIn; ++k) {
                         const int plane = (k < baseNIn)
                             ? candPlane[inIdx[k]] : 4;
+                        // The notch is excluded by construction, not by
+                        // policy. This term pays for carrier reduction
+                        // measured RELATIVE TO COMB, and the notch's null
+                        // removes the entire fSC band at every pixel in the
+                        // frame -- so it would collect the maximum award
+                        // everywhere for an arithmetic identity rather than
+                        // for anything it discovered. A candidate must not
+                        // earn evidence its samples did not earn, and a
+                        // constant is not evidence.
+                        if (plane == 5) {
+                            inCrossColorReturnEvidence[k] = 0.0;
+                            continue;
+                        }
                         const double deliveredReduction = std::max(
                             0.0,
                             combCarrierMagnitude -
@@ -5784,12 +6017,29 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 constexpr double kHighChromaDemoteIRE    = 1.5;
 
                 // Capped-caution reference: median cleanliness of the base set.
-                double sw[3];
-                const int refN = std::clamp(baseNIn, 1, nIn);
-                for (int i = 0; i < refN; ++i)
-                    sw[i] = inCarrierCleanliness[i];
-                std::sort(sw, sw + refN);
-                const double medianW = sw[refN / 2];
+                //
+                // The notch is excluded from the REFERENCE POPULATION, not
+                // from the penalty. Its residual has zero carrier-basis
+                // energy by construction, so its cleanliness is pinned at 1.0
+                // as a structural constant rather than a measurement of this
+                // pixel. Leaving it in drags the median up and charges every
+                // OTHER candidate for the notch's arithmetic. Its own penalty
+                // then falling to zero is honest -- it genuinely carries no
+                // carrier residue -- and that honesty is precisely why it
+                // cannot serve as the bar. With no measured reference left,
+                // medianW = 0 makes the caution inert rather than inventing a
+                // threshold out of a constant.
+                double sw[4];
+                int refN = 0;
+                for (int i = 0; i < baseNIn && i < nIn; ++i) {
+                    if (candPlane[inIdx[i]] == 5) continue;
+                    sw[refN++] = inCarrierCleanliness[i];
+                }
+                double medianW = 0.0;
+                if (refN > 0) {
+                    std::sort(sw, sw + refN);
+                    medianW = sw[refN / 2];
+                }
 
                 const double combTopHere = combTop0;
                 const double illegalProof = analysisRow
@@ -6052,6 +6302,41 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         }
                         if (k == darkestIdx && k < baseNIn && baseNIn > 1)
                             w *= 1.0 - darkestVetoGate;
+                        // Notch blindness -- the term that makes a fixed
+                        // kernel safe to seat.
+                        //
+                        // For every ESTIMATING candidate, "carrier I removed"
+                        // and "content I could not see" are different
+                        // quantities: they subtract a claim. For a fixed
+                        // kernel they are THE SAME QUANTITY by construction,
+                        // so the instrument already in this election measures
+                        // the notch's local blindness with nothing new built
+                        // -- raw - notchY IS exactly what the null swallowed.
+                        //
+                        // Where the pixel's energy sits in that null the
+                        // notch's near-zero top band is an ABSTENTION, not a
+                        // measurement of "no detail here". Winner-take-all
+                        // had no way to say that: a candidate was seated or
+                        // discarded, and a seated abstention is a confident
+                        // wrong answer. A blend can simply withdraw the
+                        // weight, which is what this does.
+                        //
+                        // RAW magnitude, deliberately NOT the illegalProof-
+                        // excluded form chromaT uses above. chromaT asks
+                        // "is this legal chroma?"; this asks "how much of
+                        // this pixel is in my null?", and the kernel is
+                        // equally blind to legal carrier and to confiscated
+                        // luma. Opposite treatment, and the difference is the
+                        // point: it is what keeps the notch silent at the
+                        // iceberg summits, where its answer would be zero and
+                        // zero would be wrong.
+                        if (plane == 5) {
+                            const double blindIRE =
+                                remainingCarrierMagnitudeOf(5, h) *
+                                invIreScale;
+                            if (blindIRE > 0.0 && notchBlindTauIRE > 0.0)
+                                w *= std::exp(-blindIRE / notchBlindTauIRE);
+                        }
                         if (std::isfinite(anchorCeilIRE)) {
                             const double complete = (k < baseNIn)
                                 ? planeY(candPlane[inIdx[k]], h)
@@ -6103,6 +6388,9 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                       w2d_frame_weight[line].end(), 0.0f);
         }
     }
+
+
+
 
     // Retained record from the removed LDCD_PROBE_YCERT census
     //
@@ -7149,6 +7437,18 @@ static bool ldcdPhaseSnapOn()
 {
     static const bool on = []{
         const char *e = std::getenv("LDCD_PHASE_SNAP");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+// Fact anchor switch (LDCD_FACT_FIT, default on): shared between the Pass
+// 1.7 stamp and the Pass 2 valve, which must agree on whether the def-line
+// fit rows are facts. One resolution, per the single-producer rule.
+static bool ldcdFactFitOn()
+{
+    static const bool on = []{
+        const char *e = std::getenv("LDCD_FACT_FIT");
         return !(e && std::atoi(e) == 0);
     }();
     return on;
@@ -8679,6 +8979,10 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     const size_t need = static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
     if (carrierFit_flat.size() < need)
         carrierFit_flat.assign(need, 0.0f);
+    // Zeroed EVERY frame, not merely sized: a line that takes a no-model
+    // path writes no marker, so a stale 1 from the previous frame would
+    // certify a model that was never solved.
+    carrierFitLineValid.assign(static_cast<size_t>(lastLine), 0);
     if (configuration.lumaWitness) {
         if (carrierRetracted_flat.size() < need)
             carrierRetracted_flat.assign(need, 0.0f);
@@ -9703,6 +10007,12 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                     }
                 }
             }
+            // A carrier model was solved for this line, so a candidate may
+            // stand on it. Both no-model paths -- the unlocked-grammar
+            // `continue` above and the degenerate-width else below -- leave
+            // this at 0, and the witness abstains there rather than
+            // publishing raw.
+            carrierFitLineValid[line] = 1;
         } else {
             for (int xi = 0; xi < width; ++xi) {
                 const double cf = 0.0;
@@ -10075,9 +10385,12 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     // idempotent/const, comp lines improved by combing against truth.
     // PERSISTENCE LAW: the passes downstream carry const-guards (the
     // bridge never adopts into a certified line; 1.9 never repairs a
-    // certified sample; Pass 2 writes combedCarrier, not the fit; the
-    // tone no-ops on covered frames), so a stamped fact survives to
-    // publication structurally, not by re-stamping.
+    // certified sample; Pass 2's valve passes a def line through un-combed
+    // — "writes combedCarrier, not the fit" protected the buffer but let
+    // the published product comb the fact with comp estimates, the valve
+    // violation closed 2026-08-09; the tone no-ops on covered frames), so
+    // a stamped fact survives to publication structurally, not by
+    // re-stamping.
     //
     // FACT STAMP: at certified samples the fit is replaced by the exact
     // fact, so no consumer of the fit can read an estimate where truth is
@@ -10095,11 +10408,7 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     // the wiring that had no remaining end.
     // ---------------------------------------------------------------
     {
-        static const bool factFitOn = []{
-            const char *e = std::getenv("LDCD_FACT_FIT");
-            return !(e && std::atoi(e) == 0);
-        }();
-        if (factFitOn && certifiedOneDLevel() >= 1 &&
+        if (ldcdFactFitOn() && certifiedOneDLevel() >= 1 &&
             frameHasExactCoverage()) {
             for (int line = firstLine; line < lastLine; ++line) {
                 if (!certifiedDefLine(line)) continue;
@@ -10592,6 +10901,83 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     }
 
     // ---------------------------------------------------------------
+    // Pass 1.95: CERTIFIED-ANCHOR ENVELOPE HULL on the fit (user,
+    // 2026-08-09: the fit "ought to also be bandwidth constrained along
+    // feasibleband lines between certified anchors").
+    //
+    // Between the certified anchor lines the fit is an estimate, but the
+    // anchors certify what carrier amplitude this neighbourhood actually
+    // holds: the anchor ceiling is pooled from the exact channel's own
+    // envelope, laterally max-dilated and margin-padded, so it encodes
+    // an impossible, never a preference. The fit's envelope may not
+    // assert more than the facts bracketing it license.
+    //
+    // Form is the sanctioned one (the envelope-legality precedent, the
+    // same shape as the parallax policing in Pass 1): a w <= 1 hull
+    // gathered AND applied at envelope scale through the encoder's own
+    // 9-tap chroma kernel (feasibleband.h), so it can only return energy
+    // to Y and cannot manufacture out-of-band sidebands. Both sides of
+    // the comparison live at envelope scale — the fit side is the
+    // smoothed quadrature envelope, the ceiling is regional and slower
+    // still — per the falsified-ceiling record (a point envelope held to
+    // an envelope-scale bound rectifies noise into real attenuation of
+    // legal colour; measured -25% on saturated bars).
+    //
+    // Def lines are skipped whole: their fit is the fact (Pass 1.7), and
+    // a fact is not scaled. Uncovered frames publish no ceiling and the
+    // pass is inert. Where the ceiling carries no authority (+inf), w
+    // stays 1 — absence of fact bounds nothing.
+    // ---------------------------------------------------------------
+    {
+        if (!anchorCeilingValid) buildAnchorCeiling();
+        if (frameHasExactCoverage() && !anchorCeiling_flat.empty()) {
+            std::vector<double> envRaw(width), envSm(width),
+                                wRaw(width), wSm(width);
+            for (int line = firstLine; line < lastLine; ++line) {
+                if (certifiedDefLine(line)) continue;
+                const float *ceilRow = anchorCeilingRow(line);
+                if (!ceilRow) continue;
+                float *fitRow = carrierFit_flat.data()
+                                + static_cast<size_t>(line) * demodWidth;
+
+                // Quadrature envelope of the fit (adjacent 4fSC samples
+                // are 90 degrees apart), then the encoder kernel brings
+                // it to envelope scale before any comparison.
+                for (int xi = 0; xi < width; ++xi) {
+                    const double a = static_cast<double>(fitRow[xi]);
+                    const double b = static_cast<double>(
+                        fitRow[std::min(xi + 1, width - 1)]);
+                    envRaw[xi] = std::sqrt(a * a + b * b) * invIreScale;
+                }
+                lddecode::projectExpressibleChromaEnvelope(
+                    envRaw.data(), nullptr, width, envSm.data());
+
+                bool any = false;
+                for (int xi = 0; xi < width; ++xi) {
+                    const double c = static_cast<double>(ceilRow[left + xi]);
+                    double w = 1.0;
+                    if (std::isfinite(c) && envSm[xi] > 1e-6)
+                        w = std::min(1.0, c / envSm[xi]);
+                    wRaw[xi] = w;
+                    if (w < 1.0) any = true;
+                }
+                if (!any) continue;
+
+                // The gain itself is smoothed by the same kernel before
+                // application (the AM law: gathered and applied at
+                // envelope scale), then clamped as a hull.
+                lddecode::projectExpressibleChromaEnvelope(
+                    wRaw.data(), nullptr, width, wSm.data());
+                for (int xi = 0; xi < width; ++xi) {
+                    const double w = std::clamp(wSm[xi], 0.0, 1.0);
+                    if (w < 1.0)
+                        fitRow[xi] = static_cast<float>(fitRow[xi] * w);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Pass 2: interline comb on carrierFit → combedCarrier.
     //
     // Leg roster, not a fixed pairing.  The previous form admitted only
@@ -10655,6 +11041,30 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
             // No grammar, no corroboration: the published product withdraws
             // nothing here (fail closed, same term as the license).
             std::fill(wRow, wRow + width, 0.0f);
+            continue;
+        }
+
+        // THE VALVE (user, 2026-08-09): the covered interfield comb flows
+        // one way. Certified spreads its value — the comp lines' ±1 legs
+        // are the fact-stamped def fits (Pass 1.7), and those lines comb
+        // vigorously against them below — but the reverse is prohibited: a
+        // def line is already separated, and blending it with comp-line
+        // estimates adulterates a fact with a model. The Pass 1.7
+        // persistence law protected the FIT from every downstream pass but
+        // let this pass comb the fact into its published product anyway
+        // ("Pass 2 writes combedCarrier, not the fit" satisfied the letter
+        // and lost the law). So the def line passes through un-combed,
+        // whole: combedCarrier IS the fit, and the corroboration is 1.0 —
+        // a conservation identity is its own proof, and the withdrawal it
+        // licenses is exactly raw - exact = certified luma. Uniform per
+        // line: the sparse repair-denied samples on a def line carry the
+        // law-bounded estimate fit and inherit the line's authority rather
+        // than manufacturing a per-sample provenance seam.
+        if (ldcdFactFitOn() && certifiedDefLine(line)) {
+            for (int xi = 0; xi < width; ++xi) {
+                combRow[xi] = fitRow[xi];
+                wRow[xi] = 1.0f;
+            }
             continue;
         }
 
@@ -11602,6 +12012,29 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                 anchoredRow[xi] = certifiedCarrier;
 
             if (retractedRow) {
+                // ABSTENTION, NOT A FALLBACK (user, 2026-08-09: "the cede
+                // should be to some kind of 'I'm null, don't include me'").
+                // Where this line has no solved carrier model the fit row
+                // holds a written ZERO, and raw - 0 is the whole composite,
+                // carrier included -- a checkerboard seated as a base
+                // candidate with full rights over the centre and the
+                // population statistics. The election is DOWNSTREAM of the
+                // comb, so every candidate has the rest of the roster to
+                // fall back on and none of them needs an internal retreat.
+                // NaN is the honest publication: the admission below reads
+                // it as absent and the seat simply goes unfilled.
+                //
+                // Facts are exempt -- they do not come from the fit. A
+                // covered sample keeps its exact channel and a comp sample
+                // its certified construction even on a line the solver
+                // never reached.
+                const bool haveFact =
+                    std::isfinite(ex) || std::isfinite(certComp[xi]);
+                if (!carrierFitLineSolved(line) && !haveFact) {
+                    retractedRow[xi] =
+                        std::numeric_limits<float>::quiet_NaN();
+                    continue;
+                }
                 double witnessCarrier;
                 switch (retractedSource) {
                 case 1:
@@ -11611,7 +12044,48 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                     witnessCarrier = static_cast<double>(combRowPub[xi]);
                     break;
                 case 3:
-                    witnessCarrier = certifiedCarrier;
+                    // THE WITNESS AND THE LADDER PART COMPANY AT THE LAST
+                    // RUNG (2026-08-09). Both take fact where fact exists:
+                    // the exact channel, then the fact-only comp
+                    // construction. Where neither exists they must NOT
+                    // agree, because they answer to opposite laws.
+                    //
+                    // The ladder's last rung is the locked 1D OBSERVATION,
+                    // and that is correct for it: its plane is published as
+                    // FactBacked and read as a comb source, so every rung
+                    // must be fact or observation, never an estimate.
+                    //
+                    // The witness is the opposite creature. It is an
+                    // estimate-grade luma hypothesis BY DESIGN, and the Y
+                    // election exists to adjudicate it. Its last rung is
+                    // therefore the frame's own photograph: the policed,
+                    // bandwidth-lawful, tone-corrected fit -- values
+                    // borrowed from no other frame.
+                    //
+                    // Riding the ladder's rung here was a real defect, not
+                    // a nicety. On an uncovered frame it made
+                    // retractedY == raw - locked1DSource, which is plane 3
+                    // exactly -- and plane 3 is seated only when comb is
+                    // INFEASIBLE, a retreat of last resort, while plane 1
+                    // is seated on admission. So --luma-witness installed
+                    // 1D as a permanent base candidate with full rights
+                    // over the centre, the subset and the population
+                    // statistics, on every uncovered frame. Measured by the
+                    // author's eye on the Borg cube: the lattice columns
+                    // rendered with "1D style errors instead of good
+                    // detail", and the same range without --luma-witness
+                    // was sharper. It also meant the entire ~2,450-line fit
+                    // solve ran on uncovered frames and was discarded at
+                    // this line.
+                    //
+                    // "1D is the safe retreat" is a law about a RETREAT.
+                    // Seating it as a contender inverts the law it is named
+                    // for.
+                    witnessCarrier = std::isfinite(ex)
+                        ? static_cast<double>(ex)
+                        : (std::isfinite(certComp[xi])
+                            ? certComp[xi]
+                            : static_cast<double>(fitRowPub[xi]));
                     break;
                 default:
                     witnessCarrier = static_cast<double>(wRowPub[xi]) *

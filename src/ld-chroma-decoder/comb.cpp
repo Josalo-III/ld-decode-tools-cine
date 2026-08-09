@@ -791,6 +791,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     combReachIndex.bind(&carrierGrammar, first, last);
 
     lockedLumaCacheValid = false;
+    anchorCeilingValid = false;
 }
 
 

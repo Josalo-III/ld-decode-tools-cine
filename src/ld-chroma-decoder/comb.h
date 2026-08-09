@@ -920,6 +920,18 @@ private:
 	// CarrierFitScalar / BurstLockedSigned / PhasePreservedCarrier.  Any
 	// cross-line video use must go through CombReachIndex.
 	std::vector<float> carrierFit_flat;
+	// 1 = a carrier model was actually SOLVED for this line. 0 on the
+	// no-model paths (grammar unlocked, model invalid), where carrierFit
+	// carries a written zero rather than an estimate. The zero is fine for
+	// the internal math -- flattened = raw - 0 -- but a consumer that turns
+	// it into a picture publishes the whole composite, carrier included. A
+	// candidate with no model must ABSTAIN, so the witness reads this and
+	// publishes NaN. Sized lastLine; empty until the stage runs.
+	std::vector<std::uint8_t> carrierFitLineValid;
+	inline bool carrierFitLineSolved(int line) const {
+		return line >= 0 && line < (int)carrierFitLineValid.size() &&
+		       carrierFitLineValid[line] != 0;
+	}
 	std::vector<float> carrierRetracted_flat;    // raw - promoted carrier model (retracted view, not final Y)
 	// Iceberg recovery is a luma-domain cross-colour-return product.  It is
 	// deliberately stored apart from every carrier plane: recoveredY is a
@@ -1005,6 +1017,12 @@ private:
     std::vector<std::complex<double>> scratch_fbPadDn;
     std::vector<std::complex<double>> scratch_fbDiff0;
     std::vector<std::complex<double>> scratch_fbDevRows;
+    // Notch-locator rows for Frame B's own registration: [1,0,1]/2 on raw at
+    // lines +-1, edge-replicated with the search's overhang. Luma-domain
+    // material for a luma-geometry question; see the search in
+    // computeFrameBLine.
+    std::vector<double> scratch_fbNotchUp;
+    std::vector<double> scratch_fbNotchDn;
 		// Shared line scratch planes used by split2D and witness retraction.
 		std::vector<double> scratch_lineWorkA; // Field A scalar / carrier-fit row.
 		std::vector<double> scratch_lineWorkB; // Field gate / witness basis-I row.
@@ -1386,6 +1404,10 @@ private:
 		       anchorCoveredLine[line] != 0;
 	}
 	void buildAnchorCeiling();
+	// Per-frame build marker so the ceiling is computed once per held
+	// frame regardless of which consumer asks first (the retraction
+	// stage's fit hull runs long before produceY). Reset in loadFields().
+	bool anchorCeilingValid = false;
 
 	// True when this frame holds any dG twin-certified carrier. Cheap
 	// sampled probe, cached per held frame (reset in loadFields()).
