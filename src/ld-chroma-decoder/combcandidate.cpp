@@ -485,11 +485,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
-        // Fact-family injection for the tap base: clpbuffer[0] carries the
-        // certified head on covered frames and the completed two-sided,
-        // fact-corrected estimate on uncovered frames. locked1DSource remains
-        // the untouched observation/safe-retreat plane. Both comb paths read
-        // the same published construction here.
+        // Fact-family injection is covered-only. On uncovered frames this is
+        // the ordinary 1D observation; no two-sided estimate may become a tap
+        // base.
         // LDCD_TAP_FACTS=0 restores the pre-injection base for A/B.
         static const bool tapFactsOn = []{
             const char *s = std::getenv("LDCD_TAP_FACTS");
@@ -2286,9 +2284,9 @@ void Comb::FrameBuffer::computeFrameALine(
 
     auto scalarLine = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
-        // Read the published construction rather than the untouched
-        // locked1DSource so Frame A sees the completed two-sided estimate on
-        // uncovered frames. +left keeps this branch's rel-indexing convention.
+        // Covered frames may carry their certified construction here;
+        // uncovered frames retain the ordinary 1D observation. +left keeps
+        // this branch's rel-indexing convention.
         return configuration.phaseCompensation
             ? bucketScalar1D_line(ln) + left
             : bucketScalar1D_line(ln);
@@ -2820,13 +2818,38 @@ void Comb::FrameBuffer::computeFrameBLine(
                 devMag[si] = cmag(devAcc) / kWinSum;
             }
 
-            int bestSi = 2;
-            double bestDev = devMag[2] / kRegMargin;
-            for (int si = 0; si < 5; ++si) {
-                if (si == 2) continue;
-                if (devMag[si] < bestDev) {
-                    bestDev = devMag[si];
-                    bestSi = si;
+            // CERTIFIED REGISTRATION FIRST (2026-08-08). Where the frame
+            // carries a fact-grade aim for this column -- measured on the
+            // two bracketing lines' certified, carrier-free luma, published
+            // by buildCarrierRetractionStage -- take it instead of searching
+            // here. Same quantity, same sign convention (see comb.h); the
+            // difference is the material it was measured on. This search
+            // reads precleaned IQ, and by its own account above is "steered
+            // by chroma texture", which is precisely the wander certified
+            // luma cannot have. The fact exists only on the comp lines of a
+            // covered frame, so the IQ search below still serves every other
+            // line and the un-covered case is unchanged.
+            //
+            // bestSi is set FROM the adopted d rather than left where the
+            // search put it: dSame = devMag[bestSi] feeds the ratio and ride
+            // gates below, and a gate read at a different shift from the
+            // correction it licenses is the incoherence this whole change is
+            // about.
+            const qint8 *certRegRow = certRegistration_line(line);
+            const qint8 certReg = certRegRow ? certRegRow[x] : kCertRegNone;
+            int bestSi;
+            if (certReg != kCertRegNone) {
+                const int sStarCert = sameIsUp ? -(int)certReg : (int)certReg;
+                bestSi = std::clamp(sStarCert + 2, 0, 4);
+            } else {
+                bestSi = 2;
+                double bestDev = devMag[2] / kRegMargin;
+                for (int si = 0; si < 5; ++si) {
+                    if (si == 2) continue;
+                    if (devMag[si] < bestDev) {
+                        bestDev = devMag[si];
+                        bestSi = si;
+                    }
                 }
             }
 

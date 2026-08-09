@@ -471,26 +471,11 @@ public:
 	// Delta is region-pooled, confidence-scaled, bilinearly smoothed —
 	// no per-sample decisions. Escape LDCD_CERT_TONE=0.
 	void applyToneToFit(const FrameBuffer *prevF);
-	// REMOVED (user, 2026-07-30: "you are not dismantling score field vs
-	// frame"): a stage that phase-snapped the ELECTED scalar post-election
-	// -- an output-side rewrite of the election's verdict, the same
-	// unlawful shape as the earlier election-output cede, and rejected for
-	// the same reason. Temporal corrections enter as CANDIDATE or head
-	// construction or not at all; refineRetractedTemporal is lawful
-	// because it refines a candidate the Y election then adjudicates.
-	// Shared two-sided certified temporal reference (sign-aligned,
-	// direct-or-bracket per side). The retracted refinement keeps the two
-	// endpoints separate for its agreement gate and uses their mean only as
-	// the gated interpolation target.
-	void buildTemporalCertReference(const FrameBuffer *prevF,
-	                                const FrameBuffer *nextF, int line,
-	                                std::vector<double> &tAlign,
-	                                std::vector<double> *sidePrev = nullptr,
-	                                std::vector<double> *sideNext = nullptr) const;
-	// Returns true only when a genuinely two-sided refinement completed and
-	// the uncovered frame's fact-corrected estimate was published from it.
-	bool refineRetractedTemporal(const FrameBuffer *prevF,
-	                             const FrameBuffer *nextF);
+	// Two-sided certified neighbours may recover an uncovered frame's luma
+	// structure for cross-colour return. Returns true when at least one
+	// licensed recovered-luma sample was published.
+	bool buildIcebergReturn(const FrameBuffer *prevF,
+	                       const FrameBuffer *nextF);
 	// Certified twin-bracket carrier hull (uncovered frames only). The
 	// bracketing covered frames' twin cancellation states what fraction of
 	// the carrier band at a location is genuinely carrier; this frame's
@@ -936,6 +921,12 @@ private:
 	// cross-line video use must go through CombReachIndex.
 	std::vector<float> carrierFit_flat;
 	std::vector<float> carrierRetracted_flat;    // raw - promoted carrier model (retracted view, not final Y)
+	// Iceberg recovery is a luma-domain cross-colour-return product.  It is
+	// deliberately stored apart from every carrier plane: recoveredY is a
+	// complete luma value and returnWeight is its current-frame licence.
+	// Neither may be exposed through a carrier accessor or used as a comb leg.
+	std::vector<float> icebergRecoveredY_flat;
+	std::vector<float> icebergReturnWeight_flat;
 	std::vector<float> flatFloor_flat;           // 4-sample carrier-free luma floor
 	std::vector<float> combedCarrier_flat;       // grammar-reached interline carrier fit
 	// Envelope-scale schedule corroboration in [0,1]: how much of the
@@ -1124,6 +1115,29 @@ private:
 	// client (Frame B reach exemption, hLumaDeltaIRE, cross-color, FVF
 	// vertical regime) without recomputation.
 	std::vector<float> lockedLumaHDeltaIRE_flat;
+	// CERTIFIED REGISTRATION: the local diagonal advance in samples per
+	// line, measured fact against fact and published once for every client.
+	//
+	// Sign convention, shared with Frame B's own search (computeFrameBLine):
+	// a feature at column x on this line sits at x-s on the line above and
+	// x+s on the line below, so the aligned pair is (up[x-s], dn[x+s]).
+	// Frame B's registered `d` IS this s -- the two were derived
+	// independently and agree, which is why one number can serve both.
+	//
+	// Measured on CERTIFIED LUMA (raw - exact on the two bracketing lines),
+	// so it exists only where both brackets are certified: the comp lines of
+	// a covered frame. kCertRegNone elsewhere. That sparsity is honest --
+	// this is a fact, not an estimate, and it declines to exist where the
+	// facts do not. Frame B keeps its own IQ search for the lines this
+	// cannot reach.
+	//
+	// Why fact-grade beats what Frame B computes for itself: Frame B
+	// registers on precleaned IQ, and its own comment records that
+	// maximizing the difference magnitude "is steered by chroma texture...
+	// the search would wander on textured content". Certified luma is
+	// carrier-free by conservation -- there is no chroma in it to wander on.
+	static constexpr qint8 kCertRegNone = 127;
+	std::vector<qint8> certRegistration_flat;
 	// COLLECTED POOL (unfiltered): the sliding four-sample aperture means.
 	//
 	//   lockedApertureMean[v] = mean( raw[left+v .. left+v+3] )
@@ -1212,26 +1226,32 @@ private:
 		return lockedLumaHDeltaIRE_flat.data() + size_t(line) * demodWidth;
 	}
 
+	inline qint8 *certRegistration_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    certRegistration_flat.empty()) return nullptr;
+		return certRegistration_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const qint8 *certRegistration_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    certRegistration_flat.empty()) return nullptr;
+		return certRegistration_flat.data() + size_t(line) * demodWidth;
+	}
+
 	inline double *locked1DSource_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    locked1DSource_flat.empty()) return nullptr;
 		return locked1DSource_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
-	// ANCHORED 1D (user, 2026-07-29: "do the replacement coming out of
-	// 1D. This way the positives will propagate through comb just as the
-	// SNR benefits from the merge did"). The retraction ladder's carrier is
-	// published as the comb stages' preferred 1D-out plane on covered frames
-	// (exact on covered lines, certified comb elsewhere). On uncovered frames
-	// it remains unpublished until both covered neighbours have completed the
-	// temporal refinement; only then is it a fact-corrected estimate.
-	// The TRUE locked1DSource stays intact and keeps serving produceY's 1D
-	// election candidate and the CCR observation side: 1D REMAINS THE SAFE
-	// RETREAT structurally, because those consumers never see this plane.
+	// ANCHORED 1D. Only covered frames may publish this plane: exact carrier on
+	// twin-covered lines and the certified-bracket comb on their comp lines.
+	// Uncovered frames always serve locked1DSource -- the observed 1D band is
+	// the mandatory start because no carrier estimate can resolve composite's
+	// luma/carrier ambiguity.
 	enum class AnchoredCarrierProvenance : std::uint8_t {
 		None,
-		FactBacked,
-		FactCorrectedEstimate
+		FactBacked
 	};
 	void publishAnchoredCarrierFromRetracted(
 		AnchoredCarrierProvenance provenance);
@@ -1247,14 +1267,6 @@ private:
 	std::vector<float> antRefLuma_flat;
 	int antRefAge = -1;
 
-	// Regional fact audit of the SOLVE (Pass 1.7): mean |fit - exact| in
-	// IRE at certified samples, pre-stamp, per 128x32 region; NaN = no
-	// verdict. Conditions the between-anchor alpha merges (the return's
-	// audit pattern tailored to the witness). Recomputed per frame in
-	// buildCarrierRetractionStage; Nx==0 means absent.
-	std::vector<float> fitFactAuditIRE;
-	int fitFactAuditNx = 0;
-	int fitFactAuditNy = 0;
 	inline const double *anchoredCarrierStorage_line(int line) const {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    anchored1DSource_flat.empty()) return nullptr;
@@ -1271,39 +1283,11 @@ private:
 			? anchoredCarrierStorage_line(line) : nullptr;
 	}
 
-	// Uncovered-frame construction corrected by the chained facts. This is an
-	// estimate regardless of how strong its fact ancestry is.
-	inline const double *factCorrectedCarrierEstimate_line(int line) const {
-		return anchoredCarrierProvenance ==
-			       AnchoredCarrierProvenance::FactCorrectedEstimate
-			? anchoredCarrierStorage_line(line) : nullptr;
-	}
-
-	// Comb construction intentionally accepts either provenance. Consumers
-	// whose authority differs by provenance must use the distinct accessors.
-	// THE RATCHET (author, 2026-08-07): "the flow of influence should be
-	// like a valve, or a ratchet — one direction only." Certified facts
-	// spread to their weaker counterparts; estimates never flow back. For
-	// the COMB LADDER that means the fact-corrected ESTIMATE tier is
-	// retired from this accessor: the uncovered retracted claim is, by its
-	// own charter, a nuisance-removal product that deliberately under-
-	// states carrier at contested texture ("we will never use the carrier
-	// fit for direct use as [chroma]") — categorically unfit as a comb leg
-	// or base. A covered frame serves its fact-backed plane (certified
-	// legs spread to uncovered neighbours' combing); an uncovered frame
-	// serves the pure OBSERVATION — locked 1D, the safe retreat — so no
-	// estimate ever combs into a fact-bearing frame. The estimate plane
-	// remains published for its Y-side consumers via its own accessor.
-	// LDCD_COMB_ESTIMATE_LEG=1 restores the estimate tier for A/B.
+	// Certified facts may replace the covered source.  Everywhere else the
+	// comb starts with the observation; there is intentionally no estimate
+	// escape hatch.
 	inline const double *combSource1D_line(int line) const {
-		static const bool estimateLeg = []{
-			const char *e = std::getenv("LDCD_COMB_ESTIMATE_LEG");
-			return e && std::atoi(e) == 1;
-		}();
 		if (const double *fact = factBackedCarrier_line(line)) return fact;
-		if (estimateLeg)
-			if (const double *estimate =
-			        factCorrectedCarrierEstimate_line(line)) return estimate;
 		return locked1DSource_line(line);
 	}
 
@@ -1644,9 +1628,37 @@ private:
 		return (width > 0) ? getNotchLumaEven2(vec.data(), rel, width) : 0.0;
 	}
 		
+	// TEMPORAL STANDING, RESOLVED ONCE PER LINE (author, 2026-08-08: "hoist
+	// it and build the data for quick lookups. Less potential for unique
+	// results").
+	//
+	// Every term is a per-LINE or per-FRAME property -- which line of which
+	// frame is twin-certified, and whether a neighbour frame is covered at
+	// all -- so all of it is constant across the h loop. Resolving it per
+	// column cost a scan per candidate per sample AND let the grant flip
+	// column to column inside one line, which is a per-column decision in
+	// an election that has to render a line uniformly. One verdict per
+	// line, applied to every column of that line identically.
+	//
+	// The members carry the FINISHED bonus, not an increment, so the
+	// baseline grant cannot be lost by a caller forgetting to add it back:
+	// getBestCandidate never names the constants at all.
+	struct TemporalEvidenceStanding {
+		double prevFieldUp = 0.0;   // previousFrame @ lineNumber - 1
+		double selfFieldUp = 0.0;   // *this         @ lineNumber - 1
+		double nextFieldDn = 0.0;   // nextFrame     @ lineNumber + 1
+		double selfFieldDn = 0.0;   // *this         @ lineNumber + 1
+		double prevFrameB  = 0.0;   // previousFrame, whole frame
+		double nextFrameB  = 0.0;   // nextFrame, whole frame
+	};
+	TemporalEvidenceStanding temporalEvidenceStanding(
+		qint32 lineNumber, const FrameBuffer &previousFrame,
+		const FrameBuffer &nextFrame) const;
+
 	void getBestCandidate(qint32 lineNumber, qint32 h,
 						  const FrameBuffer &previousFrame,
 						  const FrameBuffer &nextFrame,
+						  const TemporalEvidenceStanding &standing,
 						  qint32 &bestIndex, double &bestSample,
 						  TemporalCandidateSamples *temporalSamples = nullptr) const;
 
@@ -1806,6 +1818,18 @@ private:
 		if (!carrierRetractedValid || demodWidth <= 0 ||
 		    line < 0 || line >= demodLines) return nullptr;
 		return carrierRetracted_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* icebergRecoveredY_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    icebergRecoveredY_flat.empty()) return nullptr;
+		return icebergRecoveredY_flat.data() +
+		       static_cast<size_t>(line) * demodWidth;
+	}
+	inline const float* icebergReturnWeight_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    icebergReturnWeight_flat.empty()) return nullptr;
+		return icebergReturnWeight_flat.data() +
+		       static_cast<size_t>(line) * demodWidth;
 	}
 	// The NATIVE per-line fit, before any vertical promotion.  raw minus this
 	// is the independent inverse-encoder view; raw minus combedCarrier is the

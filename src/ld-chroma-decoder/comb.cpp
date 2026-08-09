@@ -248,7 +248,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     qint32 preRollFields = 2;
     if (configuration.dimensions == 3 && !configuration.diagnosticOnly())
         preRollFields = 4;
-    if (configuration.phaseCompensation && configuration.lumaWitness)
+    // Follows the retraction gate below: the certified chain needs the
+    // look-behind, and starving it is the batch-head chain loss. This now
+    // costs two extra analysed frames per batch on any certified run, not
+    // only witness runs.
+    if (configuration.phaseCompensation &&
+        FrameBuffer::certifiedOneDLevel() >= 1)
         preRollFields = 6;
     // A/B escape (bisect instrument): LDCD_PREROLL overrides in FIELDS.
     static const int preRollEnv = []{
@@ -295,44 +300,6 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             (fieldIndex + 2 >= 0) &&
             (fieldIndex + 3 < inputFields.size());
 
-        // PERF (2026-08-06): under the witness path at dimensions == 2, the
-        // load-time split2D on an uncovered frame consumes a causal
-        // placeholder that refineRetractedTemporal() replaces at decode time,
-        // after which split2D RERUNS -- the load-time run is computed and
-        // discarded. Deferring split2D to decode time runs it exactly once
-        // per frame with identical inputs at that moment:
-        //   * rerun frames: the deferred run IS today's rerun (same point in
-        //     the sequence, same completed planes);
-        //   * non-rerun frames: refineRetractedTemporal mutates nothing on
-        //     every early-out (verified: pure reads before each return), the
-        //     hull is opt-in, and the only cross-frame writer between load
-        //     and decode (buildCarrierAnalysis's prevFrame argument) only
-        //     reads -- so the deferred run sees bit-identical inputs.
-        // Byte-identity verified against the pre-change binary (md5 on 24
-        // frames of covered program material). The deferral is OFF for
-        // dimensions == 3 (split3D reads neighbours' load-time 2D), for
-        // showMap (overlayMap reads neighbour maps), and under
-        // LDCD_PROBE_2D_RERUN=0 (whose meaning is "keep the causal 2D").
-        static const bool rerun2D = []{
-            const char *e = std::getenv("LDCD_PROBE_2D_RERUN");
-            return !(e && std::atoi(e) == 0);
-        }();
-        // PROMOTED 2026-08-06 (visual verdict: "fine, compared to
-        // baseline"). The historical order ran split2D twice on rerun
-        // frames, and the divergence hunt proved split2D non-idempotent:
-        // collect/finalize ACCRETE onto the persistent per-pixel
-        // attribution records (max-then-scale on assessment.coherence, max
-        // on attributionConflict), so the old path shipped attribution that
-        // mixed the causal placeholder run's evidence with the refined
-        // run's on rerun frames (~0.5-1.4% of samples, local amplitudes to
-        // ~26%). The single decode-time run is the clean construction —
-        // evidence from the completed plane only — and ~13% faster. The
-        // three-hash discriminator record lives in the perf ledger.
-        const bool defer2D =
-            configuration.phaseCompensation && configuration.lumaWitness &&
-            configuration.dimensions == 2 && !configuration.showMap &&
-            rerun2D;
-
         if (canLoadNext) {
             next->loadFields(inputFields[fieldIndex + 2],
                              inputFields[fieldIndex + 3]);
@@ -353,12 +320,14 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 // only -- publishes lockedCornerLeak_flat, changes no output.
                 next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
-                if (configuration.lumaWitness)
+                // Presence of certified, not the witness fork -- see the
+                // gate at the top of buildCarrierRetractionStage.
+                if (FrameBuffer::certifiedOneDLevel() >= 1)
                     next->buildCarrierRetracted(
                         current->holdsRealFrame() ? current.get() : nullptr);
             }
 
-            if (!configuration.diagnosticOnly() && !defer2D)
+            if (!configuration.diagnosticOnly())
                 next->split2D();
         } else {
             // Nothing to load into the recycled buffer, so whatever it still
@@ -382,35 +351,16 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->holdsRealFrame() &&
             next->holdsRealFrame();
 
-        // Finish the uncovered estimate before any current-time consumer is
-        // allowed to see it.  load-time construction is deliberately only a
-        // provisional retracted candidate: the fact-corrected carrier plane
-        // is published by refineRetractedTemporal() after BOTH covered
-        // neighbours are available.  Rebuild 2D here so its comb candidates,
-        // and the 3D seed made from them below, consume that completed plane
-        // rather than the earlier causal placeholder.
-        bool publishedTwoSidedEstimate = false;
-        if (configuration.phaseCompensation && configuration.lumaWitness) {
+        // Build the uncovered frame's iceberg return only after both covered
+        // neighbours are available. This is downstream luma-side evidence;
+        // split2D has already completed from the immutable 1D comb source.
+        if (configuration.phaseCompensation &&
+            FrameBuffer::certifiedOneDLevel() >= 1) {
             const FrameBuffer *pf =
                 previous->holdsRealFrame() ? previous.get() : nullptr;
             const FrameBuffer *nf =
                 next->holdsRealFrame() ? next.get() : nullptr;
-            publishedTwoSidedEstimate =
-                current->refineRetractedTemporal(pf, nf);
-            // Magnitude law after the phase refinement, so the bound applies
-            // to the carrier the consumers will actually read.
-            if (current->applyCertifiedCarrierHull(pf, nf))
-                publishedTwoSidedEstimate = true;
-            // INSTRUMENT (temporary): LDCD_PROBE_2D_RERUN=0 keeps the
-            // two-sided refinement but withholds it from the comb, so 2D
-            // stays on the causal tone-anticipated ladder built at load
-            // time.  Separates "what the forward field buys inside the
-            // comb" from "what it buys in the Y election".  Strip once the
-            // question closes.  (rerun2D hoisted to the loop head, where the
-            // split2D deferral consumes it too.)
-            if (!configuration.diagnosticOnly() &&
-                (defer2D || (publishedTwoSidedEstimate && rerun2D)))
-                current->split2D();
+            current->buildIcebergReturn(pf, nf);
         }
 
         if (configuration.dimensions == 3 &&
@@ -759,6 +709,8 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
         exactCoverageCache = -1;   // recompute for the newly held frame
         anchoredCarrierProvenance =
             AnchoredCarrierProvenance::None; // stale plane must not survive reuse
+		icebergRecoveredY_flat.clear();
+		icebergReturnWeight_flat.clear();
         antRefAge = -1;            // chained anticipated reference likewise
         starEvidenceBuilt = false; // star license evidence follows the frame
         starFootprintBuilt = false;
@@ -2814,6 +2766,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 continue;
             const double *lockedRow = configuration.phaseCompensation
                 ? combSource1D_line(line) : nullptr;
+            const TemporalEvidenceStanding standing =
+                temporalEvidenceStanding(line, previousFrame, nextFrame);
             for (int h = left; h < right; ++h) {
                 const size_t idx =
                     static_cast<size_t>(line) * width + (h - left);
@@ -2824,7 +2778,7 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
                 qint32 bestIndex; double bestSample;
                 TemporalCandidateSamples ts;
-                getBestCandidate(line, h, previousFrame, nextFrame,
+                getBestCandidate(line, h, previousFrame, nextFrame, standing,
                                  bestIndex, bestSample, &ts);
 
                 const int h0 = clampH(h);
@@ -2979,16 +2933,19 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
         if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
             continue;
 
+        const TemporalEvidenceStanding standing =
+            temporalEvidenceStanding(line, previousFrame, nextFrame);
+
         for (int h = left; h < right; ++h) {
             const int rel = h - left;
-        
-        
+
+
             qint32 bestIndex;
             double bestSample;
             TemporalCandidateSamples temporalSamples;
-            
+
             // Pass *this as well so getBestCandidate knows context
-            getBestCandidate(line, h, previousFrame, nextFrame,
+            getBestCandidate(line, h, previousFrame, nextFrame, standing,
                              bestIndex, bestSample, &temporalSamples);
         
             const int h0 = clampH(h);
@@ -3077,18 +3034,79 @@ bool Comb::FrameBuffer::frameHasExactCoverage() const
 }
 
 // 3D Election
+// THE BASELINE IS UNCONDITIONAL (author, 2026-08-08: "Baseline should act as
+// before"; "My mandate for 3D was exclusively about the change in penalties
+// when certified").
+//
+// FIELD_BONUS and FRAME_BONUS are the comb election's own structural
+// preference for a temporal candidate over a line candidate, and they long
+// predate certification. They are granted here with no test of any kind, so
+// material that carries no certification at all -- non-cadence, no-info,
+// LDCD_CERT_1D=0 -- elects exactly as it always did. An earlier form made the
+// grant itself conditional on coverage, which withdrew the preference from
+// every uncovered stream: exactCarrier_flat is allocated all-NaN on every
+// frame, so the isfinite test failed everywhere and both bonuses read zero on
+// material where certification never enters the question. That was outside
+// the mandate.
+//
+// Certification adds an INCREMENT on top, because a certified source is
+// trusted further. It is deliberately small: the 2D similarity curve
+// (AGREEMENT_REWARD_*) already jacks these up where the candidates agree
+// beyond this, and the two must not stack excessively -- which is why the
+// frame bonus was reduced in the first place. Certified totals are -5.0 and
+// -6.0 against the -4.0 / -5.0 baseline.
+static constexpr double LINE_BONUS  = -2.0;
+static constexpr double FIELD_BONUS = -4.0;
+static constexpr double FRAME_BONUS = -5.0;
+static constexpr double CERT_FIELD_EXTRA = -1.0;
+static constexpr double CERT_FRAME_EXTRA = -1.0;
+
+Comb::FrameBuffer::TemporalEvidenceStanding
+Comb::FrameBuffer::temporalEvidenceStanding(
+    qint32 lineNumber, const FrameBuffer &previousFrame,
+    const FrameBuffer &nextFrame) const
+{
+    TemporalEvidenceStanding s;
+
+    // Coverage earns the increment only at the temporal source which actually
+    // carries it: a +/-1 field candidate when that source LINE is twin-
+    // certified, a same-line temporal frame when that FRAME is covered.
+    // certifiedDefLine and frameHasExactCoverage are both memoised per frame
+    // (certifiedLineCache / exactCoverageCache), so this is a table read once
+    // the first line of a frame has touched them.
+    //
+    // Intentionally not expressed as a penalty on the current frame: its
+    // completed 2D estimate already contains the FVF election (including
+    // Frame B), and coverage must not reach backwards to prejudice that
+    // contest.
+    auto fieldStanding = [](const FrameBuffer &fb, int candidateLine) {
+        return FIELD_BONUS +
+               (fb.certifiedDefLine(candidateLine) ? CERT_FIELD_EXTRA : 0.0);
+    };
+    auto frameStanding = [](const FrameBuffer &fb) {
+        return FRAME_BONUS +
+               (certifiedOneDLevel() > 0 && fb.frameHasExactCoverage()
+                    ? CERT_FRAME_EXTRA : 0.0);
+    };
+
+    s.prevFieldUp = fieldStanding(previousFrame, lineNumber - 1);
+    s.selfFieldUp = fieldStanding(*this,         lineNumber - 1);
+    s.nextFieldDn = fieldStanding(nextFrame,     lineNumber + 1);
+    s.selfFieldDn = fieldStanding(*this,         lineNumber + 1);
+    s.prevFrameB  = frameStanding(previousFrame);
+    s.nextFrameB  = frameStanding(nextFrame);
+    return s;
+}
+
 void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                                          const FrameBuffer &previousFrame,
                                          const FrameBuffer &nextFrame,
+                                         const TemporalEvidenceStanding &standing,
                                          qint32 &bestIndex, double &bestSample,
                                          TemporalCandidateSamples *temporalSamples) const
 {
     Candidate c[NUM_CANDIDATES];
     const FrameBuffer* src[NUM_CANDIDATES] = { nullptr };
-
-    static constexpr double LINE_BONUS  = -2.0;
-    static constexpr double FIELD_BONUS = -4.0;
-    static constexpr double FRAME_BONUS = -5.0;
 
     auto invalidateCandidate = [&](int idx) {
         c[idx].penalty = 1000.0;
@@ -3139,23 +3157,23 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
             // with the correct sign; self-frame is the fallback.
             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
                                               previousFrame, lineNumber - 1, h,
-                                              FIELD_BONUS);
+                                              standing.prevFieldUp);
             src[CAND_PREV_FIELD] = &previousFrame;
             if (c[CAND_PREV_FIELD].penalty >= 1000.0) {
                 c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
                                                   *this, lineNumber - 1, h,
-                                                  FIELD_BONUS);
+                                                  standing.selfFieldUp);
                 src[CAND_PREV_FIELD] = this;
             }
         } else if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber - 1)) {
             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
                                               previousFrame, lineNumber - 1, h,
-                                              FIELD_BONUS);
+                                              standing.prevFieldUp);
             src[CAND_PREV_FIELD] = &previousFrame;
         } else {
             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
                                               *this, lineNumber - 1, h,
-                                              FIELD_BONUS);
+                                              standing.selfFieldUp);
             src[CAND_PREV_FIELD] = this;
         }
     }
@@ -3165,23 +3183,23 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         if (temporalGrammar3D) {
             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
                                               nextFrame, lineNumber + 1, h,
-                                              FIELD_BONUS);
+                                              standing.nextFieldDn);
             src[CAND_NEXT_FIELD] = &nextFrame;
             if (c[CAND_NEXT_FIELD].penalty >= 1000.0) {
                 c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
                                                   *this, lineNumber + 1, h,
-                                                  FIELD_BONUS);
+                                                  standing.selfFieldDn);
                 src[CAND_NEXT_FIELD] = this;
             }
         } else if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber + 1)) {
             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
                                               nextFrame, lineNumber + 1, h,
-                                              FIELD_BONUS);
+                                              standing.nextFieldDn);
             src[CAND_NEXT_FIELD] = &nextFrame;
         } else {
             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
                                               *this, lineNumber + 1, h,
-                                              FIELD_BONUS);
+                                              standing.selfFieldDn);
             src[CAND_NEXT_FIELD] = this;
         }
     }
@@ -3200,7 +3218,7 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         // as the baseline.
         c[CAND_PREV_FRAME] = getCandidate(lineNumber, h,
                                           previousFrame, lineNumber, h,
-                                          FRAME_BONUS);
+                                          standing.prevFrameB);
         src[CAND_PREV_FRAME] = &previousFrame;
     } else {
         invalidateCandidate(CAND_PREV_FRAME);
@@ -3211,35 +3229,10 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
         carrierLineFlip(lineNumber) == nextFrame.carrierLineFlip(lineNumber)) {
         c[CAND_NEXT_FRAME] = getCandidate(lineNumber, h,
                                           nextFrame, lineNumber, h,
-                                          FRAME_BONUS);
+                                          standing.nextFrameB);
         src[CAND_NEXT_FRAME] = &nextFrame;
     } else {
         invalidateCandidate(CAND_NEXT_FRAME);
-    }
-
-    // --- Uncovered-frame deference (user, 2026-07-28: "perhaps B could
-    // have a small penalty in getBestCandidate for current candidates") ---
-    //
-    // A frame with no dG twin coverage (B and D letters, and all
-    // non-cadence material) carries an estimated carrier everywhere, while
-    // its A/C neighbours carry the conservation-exact one. Where such a
-    // frame sits beside a covered neighbour, its own spatial candidates
-    // are the weaker testimony, so they pay a small penalty and the
-    // temporal candidates drawn from certified neighbours become cheaper.
-    //
-    // This is DIFFERENTIAL, which is why it can act where the earlier
-    // per-sample "certified source bonus" could not: that bonus applied
-    // uniformly to every same-frame candidate and cancelled in the argmin.
-    // Inert by construction when neither neighbour is covered, when this
-    // frame is itself covered, and on material with no coverage at all.
-    if (!frameHasExactCoverage() &&
-        (previousFrame.frameHasExactCoverage() ||
-         nextFrame.frameHasExactCoverage())) {
-        static constexpr double UNCOVERED_SELF_PENALTY = 1.0;
-        for (int i = 0; i < NUM_CANDIDATES; ++i) {
-            if (src[i] != this || c[i].penalty >= 1000.0) continue;
-            c[i].penalty += UNCOVERED_SELF_PENALTY;
-        }
     }
 
     // --- Agreement Reward Shaping ---
@@ -3661,10 +3654,13 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
     for (int line = firstLine; line < lastLine; ++line) {
         double *U = componentFrame->u(line);
         double *V = componentFrame->v(line);
+        const TemporalEvidenceStanding standing =
+            temporalEvidenceStanding(line, previousFrame, nextFrame);
         for (int h = left; h < right; ++h) {
             qint32 bestIndex;
             double bestSample;
-            getBestCandidate(line, h, previousFrame, nextFrame, bestIndex, bestSample);
+            getBestCandidate(line, h, previousFrame, nextFrame, standing,
+                             bestIndex, bestSample);
             U[h] = shades[bestIndex].u;
             V[h] = shades[bestIndex].v;
         }
