@@ -4650,7 +4650,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // impact." Reference: the antRefLuma chain (Pass 1.7's tween, validated
     // TRUTH-GRADE on static content -- ANTGRADE box: 0.78 IRE mean|err|,
     // corr +0.997 vs certified truth at the title bevel), read DIRECTLY
-    // since produceY and buildCarrierRetractionStage share the same
+    // since produceY and buildCertifiedCarrierStage share the same
     // FrameBuffer. Direct-tier samples only (antRefLuma_flat[line] itself
     // finite, not the vertical-bracket fallback) -- the higher-confidence
     // tier. This is an APPROXIMATE reference, not fact: it must be reported
@@ -4736,14 +4736,22 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
         const double *clpLine = clpbuffer[srcBuf].pixel[line];
         const double *carrierComp = lockedCarrierComposite_line(line);
 
-        // A retracted value is an eligible Y hypothesis only on a covered
-        // frame, where its carrier subtraction is fact-backed.  Uncovered
-        // fits remain diagnostic and cannot enter the Y election by being
-        // used as carrier.
+        // --luma-witness IS the access to this candidate, and the only gate
+        // it needs (author, 2026-08-08). carrierRetractedValid now tracks the
+        // option exactly, and the accessor tests it, so asking for the row is
+        // asking for the feature.
+        //
+        // A COVERAGE gate stood here and was wrong: it demanded the witness be
+        // fact-backed before it could be heard, which is not what the witness
+        // ever claimed to be -- it is an estimate-grade luma hypothesis by
+        // design, and the Y election is what adjudicates it. Worse, it
+        // withdrew the candidate from the material that has no facts at all:
+        // interlaced footage carries no 3:2 cadence, so frameHasExactCoverage()
+        // is false on every frame and the feature could never appear on the
+        // very footage a user enables it for.
         const bool coveredFrame = frameHasExactCoverage();
-        const float *retractedRow =
-            (coveredFrame && carrierRetractedValid)
-                ? carrierRetracted_line(line) : nullptr;
+        const float *retractedRow = carrierRetractedValid
+            ? carrierRetracted_line(line) : nullptr;
         const float *ccMaskRow = lockedCcMask_line(line);
         const float *icebergYRow = icebergRecoveredY_line(line);
         const float *icebergWRow = icebergReturnWeight_line(line);
@@ -4870,7 +4878,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
 
             // Structural carrier-amplitude ceiling (samples): I/Q are bounded
             // sinusoids, so apparent carrier beyond this must be luma. Used as
-            // the feasibility DQ. Same bound buildCarrierRetracted clamps with.
+            // the feasibility DQ. The optional witness hull uses the same bound.
             // Measured limits (bars/beach) -- see maxCarrierAmpIREFromScale.
             const CombCarrierGrammar *grammarLine =
                 carrierGrammarLine(line);
@@ -5164,7 +5172,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 n.raw = rawbuffer.data() + l * fullWidth;
                 n.cc = lockedCarrierComposite_line(l);
                 n.clp = clpbuffer[srcBuf].pixel[l];
-                n.ret = coveredFrame ? carrierRetracted_line(l) : nullptr;
+                n.ret = carrierRetracted_line(l);
                 n.coarse = coarseFloor_line(l);
                 n.analysis = carrierAnalysis_line(l);
                 n.grammar = carrierGrammarLine(l);
@@ -7105,21 +7113,19 @@ void Comb::FrameBuffer::solveLurchYCurve(int line, const double *apMean,
     }
 }
 
-// Build the carrier-retracted view from the shared carrier model.
+// Build the certified carrier ladder from the shared carrier record.
 //
 // The locked orchestration is intentionally single-pass here:
 //   1. buildCarrierAnalysis() harvests canonical bandpass and schedule
 //      conformance data.
 //   2. buildPhaseCorrected1D() builds the corrected 1D baseline.
-//   3. buildCarrierRetracted() calls buildCarrierRetractionStage(false)
+//   3. buildCertifiedCarrierLadder() calls buildCertifiedCarrierStage()
 //      once, after the corrected 1D baseline exists.
 //
-// buildCarrierRetractionStage() then performs four-view carrier/Y attribution,
-// line-to-line cancellation on carrierFit, and raw - combedCarrier to produce
-// the flattened carrier-retracted view.
-// Retracted-view mode resolution and the covered-frame working-space phase
-// snap. Uncovered iceberg recovery is luma-only and does not consume these
-// carrier-model controls.
+// The certified plane is the primary product. If --luma-witness is enabled,
+// the same pass also performs its four-view attribution and creates its
+// private retracted-luma view. Uncovered iceberg recovery is luma-only and
+// does not consume these carrier-model controls.
 static int ldcdRetractedSourceMode()
 {
     static const int mode = []{
@@ -8248,9 +8254,9 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
     return anyIcebergReturn;
 }
 
-void Comb::FrameBuffer::buildCarrierRetracted(const FrameBuffer *prevF)
+void Comb::FrameBuffer::buildCertifiedCarrierLadder(const FrameBuffer *prevF)
 {
-    buildCarrierRetractionStage(false, prevF);
+    buildCertifiedCarrierStage(prevF);
 }
 
 
@@ -8261,7 +8267,7 @@ void Comb::FrameBuffer::buildCarrierRetracted(const FrameBuffer *prevF)
 // Placement: CURRENT time, because it needs a covered NEIGHBOUR; the fit and
 // the retraction ladder are built at load time from this frame alone, which is
 // why the uncovered letters currently ride an unbounded fit ("B soft ... the
-// open cross-frame transfer work", buildCarrierRetractionStage). Measured:
+// open cross-frame transfer work", buildCertifiedCarrierStage). Measured:
 // denying the merge wholesale (--dg-discard) leaves an uncovered frame's
 // carrier bit-identical, so no certified fact reaches this object by any other
 // route.
@@ -8470,47 +8476,8 @@ bool Comb::FrameBuffer::applyCertifiedCarrierHull(const FrameBuffer *prevF,
     return true;
 }
 
-// Publish a derived full-parity carrier only when same-frame certification
-// makes its provenance true.  Uncovered estimates never enter this channel.
-void Comb::FrameBuffer::publishAnchoredCarrierFromRetracted(
-    AnchoredCarrierProvenance provenance)
-{
-    static const bool anchor1D = []{
-        const char *e = std::getenv("LDCD_ANCHOR_1D");
-        return !(e && std::atoi(e) == 0);
-    }();
-    if (!anchor1D || !carrierRetractedValid ||
-        ldcdRetractedSourceMode() != 3 ||
-        provenance == AnchoredCarrierProvenance::None)
-        return;
-    if (provenance != AnchoredCarrierProvenance::FactBacked ||
-        !frameHasExactCoverage())
-        return;
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int width     = videoParameters.activeVideoEnd - left;
-    if (width <= 0 || firstLine >= lastLine) return;
-
-    anchored1DSource_flat.assign(
-        static_cast<size_t>(demodLines) * demodWidth, 0.0);
-    for (int line = firstLine; line < lastLine; ++line) {
-        const quint16 *rawLine = rawbuffer.data()
-            + static_cast<size_t>(line) * videoParameters.fieldWidth;
-        const float *retr = carrierRetracted_flat.data()
-            + static_cast<size_t>(line) * demodWidth;
-        double *dst = anchored1DSource_flat.data()
-            + static_cast<size_t>(line) * demodWidth;
-        for (int xi = 0; xi < width; ++xi)
-            dst[xi] = static_cast<double>(rawLine[left + xi]) -
-                      static_cast<double>(retr[xi]);
-    }
-    anchoredCarrierProvenance = provenance;
-}
-
 // Sync-tone actuator. See comb.h. Runs between fit construction and its
-// first consumer inside buildCarrierRetractionStage.
+// first consumer inside buildCertifiedCarrierStage.
 void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
 {
     // DEFAULT ON (promoted 2026-08-01 with the anchoring family, user
@@ -8669,10 +8636,11 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
 //               fact-only comp rung, 0.0% fallback. Uncovered frame: 100%
 //               locked 1D observation. No fit anywhere on either.
 
-void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
-                                                    const FrameBuffer *prevF)
+void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
 {
     carrierRetractedValid = false;
+    anchoredCarrierProvenance = AnchoredCarrierProvenance::None;
+    anchored1DSource_flat.clear();
 
     // GATED ON THE PRESENCE OF CERTIFIED (author, 2026-08-08: "the proper
     // home, the only gating should be on the presence of certified").
@@ -8686,13 +8654,10 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     // business being a child of a produceY election escape.
     //
     // Per-frame coverage is deliberately NOT tested here. A frame without
-    // coverage still builds the ladder, and with the fit off the ladder
-    // every one of its samples takes the locked 1D observation -- so its
-    // retracted view IS the 1D product. What it does not get is a published
-    // anchored source: publishAnchoredCarrierFromRetracted is conditioned on
-    // frameHasExactCoverage() at the tail, so a two-field A or C at head or
-    // tail serves locked 1D through combSource1D_line and is combed by
-    // whatever comb the user selected.
+    // coverage still reaches the ladder, but publishes no anchored plane: it
+    // serves locked 1D through combSource1D_line and is combed by whatever
+    // comb the user selected. No retracted-luma storage participates in that
+    // decision.
     if (!configuration.phaseCompensation ||
         certifiedOneDLevel() < 1)
         return;
@@ -8714,8 +8679,12 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     const size_t need = static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
     if (carrierFit_flat.size() < need)
         carrierFit_flat.assign(need, 0.0f);
-    if (carrierRetracted_flat.size() < need)
-        carrierRetracted_flat.assign(need, 0.0f);
+    if (configuration.lumaWitness) {
+        if (carrierRetracted_flat.size() < need)
+            carrierRetracted_flat.assign(need, 0.0f);
+    } else {
+        carrierRetracted_flat.clear();
+    }
     if (flatFloor_flat.size() < need)
         flatFloor_flat.assign(need, 0.0f);
     if (combedCarrier_flat.size() < need)
@@ -8735,9 +8704,16 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         coarseYEvidence_flat.assign(need, lddecode::FourViewPixelEvidence{});
     if (carrierImpurity_flat.size() < need)
         carrierImpurity_flat.assign(need, 0.0f);
-    if (carrierAnalysis_flat.size() < need)
+    if (configuration.lumaWitness && carrierAnalysis_flat.size() < need)
         return; // shared analysis must already have been produced
 
+    // The carrier-retracted model and its promotion passes are the expensive
+    // --luma-witness product.  Certified carrier construction was moved out
+    // from under that option, but the witness model accidentally came with it
+    // and made every locked decode pay the witness cost.  Keep the fact-only
+    // certified ladder below unconditional; build this estimate/view only
+    // when the user explicitly asks for the witness.
+    if (configuration.lumaWitness) {
     if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
     if ((int)scratch_lineWorkA.size()   < width) scratch_lineWorkA.resize(width, 0.0);
@@ -10083,8 +10059,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         carrierRetractionModelValid = true;
     }
 
-    if (analysisOnly)
-        return;
     if (!carrierRetractionModelValid)
         return;
 
@@ -11159,6 +11133,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
             }
         }
     }
+    } // --luma-witness carrier-retracted model
 
     // NOTE: the encoder bandwidth law is imposed ONCE, on the native
     // carrierFit at the Pass-1 model boundary.  It is deliberately NOT
@@ -11225,6 +11200,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     //       selected comb, which is what it was always entitled to.
     //   native (LDCD_RETRACTED_SOURCE=native) -- raw - carrierFit
     //       everywhere: the pre-anchor default, kept as the A/B escape.
+    // This selector belongs solely to the optional witness view. It has no
+    // authority over the certified carrier plane.
     const int retractedSource = ldcdRetractedSourceMode();
 
     // Certified-luma vertical comb for the COMP lines in anchor mode (user,
@@ -11256,141 +11233,32 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     // column -- see the registration below. Both bracket rows are certified
     // carrier-free luma, so the aim is measured fact against fact, which is
     // what entitles it to run inside a fact-only rung.
-    std::vector<double> certComp;
-    if (retractedSource == 3)
-        certComp.assign(width, std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> certComp(
+        width, std::numeric_limits<double>::quiet_NaN());
 
-    // Anticipated rung (uncovered frames, 2026-08-01, user-approved
-    // consumption level: ESTIMATOR with confidence alpha, NEVER
-    // certification -- no cede, no HQ-leg status; facts are facts,
-    // predictions are estimators).  The certified carrier's curve is
-    // causal (the anticipated phase lands almost exactly at the next
-    // cover), so the PREVIOUS cover's certified separation serves the
-    // uncovered frame at load time: its certified LUMA (raw - exact,
-    // direct where its parity covers the line, bracket mean otherwise)
-    // is the tween reference -- luma tweens where carrier cannot -- and
-    //     R = raw_this - Lhat_prev = C_this + (L_this - L_prev)
-    // keeps the carrier NATIVE to this frame (phase correct by
-    // construction; nothing is transferred as carrier).  The merge FIR
-    // takes the carrier; the out-of-band residual is the motion/
-    // staleness CORRELATE feeding alpha.  Unlike the covered comp rung
-    // there is NO parity floor on alpha: that floor is justified by a
-    // same-frame reference measured to beat the fit even where the
-    // residual fires; a reference one film frame away under motion is
-    // worse than the fit, so alpha must be able to reach zero and the
-    // rung fails toward the (tone-corrected) fit.  Escape: the rung
-    // rides LDCD_ANCHOR_1D / LDCD_CERT_1D family escapes -- with
-    // LDCD_CERT_1D=0 no exact data exists and the rung never forms.
-    // Chain maintenance: a covered frame publishes its own certified luma
-    // (raw - exact on def lines, NaN elsewhere); an uncovered frame
-    // inherits the previous frame's plane with age+1, capped at the same
-    // horizon the tone trusts (dtF <= 8), so every uncovered frame within
-    // the horizon of a cover holds the reference -- not only the
-    // immediate successor.
-    antRefAge = -1;
-    if (retractedSource == 3 && certifiedOneDLevel() >= 1) {
-        if (frameHasExactCoverage()) {
-            antRefLuma_flat.assign(
-                static_cast<size_t>(frameHeight) * demodWidth,
-                std::numeric_limits<float>::quiet_NaN());
-            for (int line = firstLine; line < lastLine; ++line) {
-                if (!certifiedDefLine(line)) continue;
-                const float *ex = exactCarrierRow(line);
-                if (!ex) continue;
-                const quint16 *raw = rawbuffer.data()
-                    + static_cast<size_t>(line) * videoParameters.fieldWidth;
-                float *dst = antRefLuma_flat.data()
-                    + static_cast<size_t>(line) * demodWidth;
-                for (int xi = 0; xi < width; ++xi) {
-                    const int h = left + xi;
-                    if (std::isfinite(ex[h]))
-                        dst[xi] = static_cast<float>(
-                            (double)raw[h] - (double)ex[h]);
-                }
-            }
-            antRefAge = 0;
-        } else if (prevF && prevF->antRefAge >= 0 &&
-                   prevF->antRefAge < 8 &&
-                   prevF->antRefLuma_flat.size() ==
-                       static_cast<size_t>(frameHeight) * demodWidth) {
-            antRefLuma_flat = prevF->antRefLuma_flat;
-            antRefAge = prevF->antRefAge + 1;
-        }
-    }
-
-    // Retained record from the removed LDCD_PROBE_ANTGRADE census
+    // ANTICIPATED RUNG -- REMOVED 2026-08-08 (author: "I was only ever
+    // interested in the sync tone"). It stood the previous cover's certified
+    // luma up as a carrier reference on uncovered frames, chained forward to
+    // a horizon of 8 frames, and merged it with the fit under an out-of-band
+    // alpha.
     //
-    // Held-out grading (measurement only, LDCD_PROBE_ANTGRADE=1): on a
-    // COVERED frame, build the anticipated construction as if this frame
-    // were uncovered -- from the PREDECESSOR's chained reference plane --
-    // and grade per-sample against this frame's OWN exact channel.  The
-    // grade lattice is the frame's def lines (where exact exists), classed
-    // by what the reference plane offers THERE: DIRECT (tween luma known
-    // same-line) vs BRACKET (vertical mean of the plane's adjacent lines).
-    // Three estimators per class: FULL (raw - Lhat, full band, no FIR),
-    // FIR (the shipped rung's bp), and FIT (the baseline competitor).
-    // Reported: mean|err| / rms in IRE, and the signed correlation with
-    // exact (phase agreement -- the quantity the magnitude means were
-    // blind to).  Optional box via LDCD_ANTGRADE_L0/L1/C0/C1 (frame line /
-    // active column).
+    // The licensed duty was always the PHASE CURVE: carrier phase is
+    // raster-anchored and rides the cycle, so it survives motion. That duty
+    // is applyToneToFit(), which remains on and is untouched by this removal.
+    // The WAVEFORM is content and does not survive motion -- the chained
+    // reference holds objects at their old positions, the displaced-edge
+    // mismatch's in-band share passes the FIR as carrier, and the rung's
+    // out-of-band alpha is measured blind to exactly that class.
     //
-    // Referee repair (2026-08-02): factFit stamped the fit with
-    // the exact fact at exactly the graded samples; the FIT
-    // baseline must read the pre-stamp estimator.
-    //
-    // One ATOMIC line per frame (threaded runs interleave stderr
-    // between fprintf calls, never mid-line), tagged with the frame
-    // identity and this frame's own def parity so the two anchor
-    // legs (A->C vs C->A) and any longer cycle can be separated
-    // offline -- the recalibration axis (user, 2026-08-02): the
-    // original "lands almost exactly" verdict was one aggregate,
-    // never stratified by leg or cycle.
-
-    // MOTION-WITNESSED CONSTRUCTION (default; the full-commit data run is
-    // kept as LDCD_ANT_COMMIT=1 for A/B).  The full-commit experiment
-    // rendered GHOSTS on motion (user verdict 2026-08-01, beach: "a
-    // reversion on the 'averaging is not tweening' front"): the chain is
-    // one-sided by load-time causality, so under motion Lhat carries the
-    // previous cover's edges at their displaced positions, the FIR passes
-    // that ghost geometry as carrier, and the cede makes it roster-
-    // unanimous -- the election cannot reject it.  The causal-anticipation
-    // license was for the PHASE CURVE (global, rides the cycle); per-pixel
-    // luma content moves, and a one-sided reference under motion is
-    // averaging, not tweening.  So the ceded center's VALUE is built with
-    // the out-of-band residual as its motion CORRELATE -- alpha =
-    // exp(-|R-bp|/tau) between tween carrier and fit, per sample, no
-    // floor -- the same shape as the shipped covered comp rung.  Weight is
-    // candidate confidence, never inter-candidate distance; unanimity
-    // stays uniform (no license flapping); static content keeps the
-    // anticipation, motion degrades to current-frame data.
-    static const bool antCommit = []{
-        const char *e = std::getenv("LDCD_ANT_COMMIT");
-        return e && std::atoi(e) == 1;
-    }();
-    std::vector<double> antComp;
-    // DEFAULT OFF (2026-08-07, author: "We weren't supposed to comb against
-    // the anticipated rung -- that was supposed to be a sync tone for
-    // keeping phase aligned."). The anticipation license was for the PHASE
-    // CURVE -- carrier phase is raster-anchored and rides the cycle, so it
-    // survives motion; the WAVEFORM is content and does not. That licensed
-    // duty is applyToneToFit(), which remains on. This rung combed the
-    // previous cover's certified luma for carrier VALUES -- under motion
-    // that reference holds objects at their old positions, the displaced-
-    // edge mismatch's in-band share passes the FIR as carrier, and its
-    // out-of-band alpha is the guard class measured blind to exactly that
-    // (the TCW inversion). Bisected 2026-08-07 on the Wolf 359 ship: the
-    // rung's paint is 23-47 chroma codes at object edges, uncovered frames
-    // only; standing it down removes it. Earlier RLAD census agrees: the
+    // Measured before it was defaulted off (Wolf 359 ship, 2026-08-07):
+    // 23-47 chroma codes of paint at object edges, uncovered frames only,
+    // removed by standing the rung down. The RLAD census agreed -- the
     // rung's departure from the fit read as STANDING (image-locked luma),
-    // not carrier. LDCD_ANT_RUNG=1 restores the comb for A/B.
-    static const bool antRungOff = []{
-        const char *e = std::getenv("LDCD_ANT_RUNG");
-        return !(e && std::atoi(e) == 1);
-    }();
-    const bool antRungOn = !antRungOff && retractedSource == 3 &&
-        !frameHasExactCoverage() && antRefAge >= 1;
-    if (antRungOn)
-        antComp.assign(width, std::numeric_limits<double>::quiet_NaN());
+    // not carrier.
+    //
+    // Its antRefLuma chain went with it. That chain snapshotted and copied a
+    // frame-sized float plane on EVERY certified frame, outside the witness
+    // block, to feed only this default-off consumer.
 
     // Retained record from the removed LDCD_DUMP_RLAD dump
     //
@@ -11410,6 +11278,16 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
     constexpr double kSnapAmpTauIRE = 3.0;
     constexpr double kSnapAmpMinIRE = 1.0;
 
+    static const bool anchor1D = []{
+        const char *e = std::getenv("LDCD_ANCHOR_1D");
+        return !(e && std::atoi(e) == 0);
+    }();
+    const bool publishCertified = anchor1D && frameHasExactCoverage();
+    if (publishCertified) {
+        anchored1DSource_flat.assign(
+            static_cast<size_t>(demodLines) * demodWidth, 0.0);
+    }
+
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine =
             rawbuffer.data() + static_cast<size_t>(line) * videoParameters.fieldWidth;
@@ -11419,8 +11297,14 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                                   + static_cast<size_t>(line) * demodWidth;
         const float *wRowPub = carrierCorroboration_flat.data()
                                + static_cast<size_t>(line) * demodWidth;
-        float *retractedRow = carrierRetracted_flat.data()
-                              + static_cast<size_t>(line) * demodWidth;
+        float *retractedRow = configuration.lumaWitness
+            ? carrierRetracted_flat.data()
+                  + static_cast<size_t>(line) * demodWidth
+            : nullptr;
+        double *anchoredRow = publishCertified
+            ? anchored1DSource_flat.data()
+                  + static_cast<size_t>(line) * demodWidth
+            : nullptr;
 
         const float *exRowPub = exactCarrierRow(line);
         const float *exU = (line - 1 >= firstLine)
@@ -11428,10 +11312,28 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         const float *exD = (line + 1 < lastLine)
             ? exactCarrierRow(line + 1) : nullptr;
 
-        if (retractedSource == 3) {
+        {
             std::fill(certComp.begin(), certComp.end(),
                       std::numeric_limits<double>::quiet_NaN());
-            if (exU && exD) {
+            // PRECONDITION, ASKED CHEAPLY (2026-08-08). exactCarrierRow
+            // returns a valid ALL-NaN row rather than nullptr wherever the
+            // twin merge left no facts, so `exU && exD` is true on every line
+            // of an uncovered frame AND on every def line of a covered one --
+            // the two populations whose brackets carry nothing. The rung then
+            // ran at full cost to publish nothing: the registration search
+            // sampled seven shifts of a seven-tap SAD per column against NaN,
+            // R stayed NaN, the FIR declined every sample, and the snap
+            // refused every window, leaving certComp at the NaN filled above.
+            //
+            // certifiedDefLine is the memoised per-line verdict for "does
+            // this row carry any certified sample", so this asks the block's
+            // own stated precondition -- it exists only where both brackets
+            // are certified, i.e. the comp lines of a covered frame -- for
+            // the price of two cached reads. Behaviour-identical: every write
+            // the skipped path could make is to a local, or to certComp and
+            // certRegistration, both already sitting at their absent values.
+            if (exU && exD &&
+                certifiedDefLine(line - 1) && certifiedDefLine(line + 1)) {
                 const quint16 *rawU = rawbuffer.data()
                     + static_cast<size_t>(line - 1) * videoParameters.fieldWidth;
                 const quint16 *rawD = rawbuffer.data()
@@ -11591,9 +11493,8 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
                 // were wrong with it, neither of them a tuning question:
                 //
                 //   * It laundered an estimate into the FACT CHANNEL. This
-                //     product is published by
-                //     publishAnchoredCarrierFromRetracted as FactBacked and
-                //     read by Frame B and every 2D candidate through
+                //     product is published directly as FactBacked and read
+                //     by Frame B and every 2D candidate through
                 //     combSource1D_line -- the plane comb.h describes as
                 //     "exact on covered lines and the certified-comb
                 //     construction on comp lines". A fit share inside it is
@@ -11671,88 +11572,6 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
             // Anticipated rung: see the declaration comment above.  Built
             // per line from the chained cover's certified luma; carrier
             // stays native to this frame.
-            if (antRungOn) {
-                std::fill(antComp.begin(), antComp.end(),
-                          std::numeric_limits<double>::quiet_NaN());
-                const float *ref0 = antRefLuma_flat.data()
-                    + static_cast<size_t>(line) * demodWidth;
-                const float *refU = (line - 1 >= firstLine)
-                    ? antRefLuma_flat.data()
-                      + static_cast<size_t>(line - 1) * demodWidth
-                    : nullptr;
-                const float *refD = (line + 1 < lastLine)
-                    ? antRefLuma_flat.data()
-                      + static_cast<size_t>(line + 1) * demodWidth
-                    : nullptr;
-
-                std::vector<double> R(width,
-                    std::numeric_limits<double>::quiet_NaN());
-                for (int xi = 0; xi < width; ++xi) {
-                    double lhat = std::numeric_limits<double>::quiet_NaN();
-                    if (std::isfinite(ref0[xi])) {
-                        lhat = (double)ref0[xi];
-                    } else if (refU && refD &&
-                               std::isfinite(refU[xi]) &&
-                               std::isfinite(refD[xi])) {
-                        lhat = 0.5 * ((double)refU[xi] + (double)refD[xi]);
-                    }
-                    if (std::isfinite(lhat))
-                        R[xi] = (double)rawLine[left + xi] - lhat;
-                }
-
-                constexpr double kT0a = 0.676462;
-                constexpr double kT2a = -0.250000;
-                constexpr double kT4a = -0.088231;
-                constexpr double kAntTauIRE = 2.0;
-
-                // MOTION WITNESS: the out-of-band residual |R − bp|, the
-                // best-measured of three instruments (2026-08-01 battery,
-                // title-bevel / beach-Calt):
-                //   OOB residual            13.9/17.8 | 5.66  <- shipped
-                //   retracted-LF as GATE    20.1/21.9 | 5.58  (sharp LP;
-                //     boxcar was 22.5/26.5 -- bracket lines vertically
-                //     interpolate the reference across diagonals, a real
-                //     LF displacement the band-limited product never
-                //     carries, so gating on it taxes working sites)
-                //   retracted-LF as CORRECTOR (R' = R − LP(R − fit))
-                //                           19.5/24.2 | 5.95  (the LF of
-                //     R − fit includes the carrier-difference envelope,
-                //     and subtracting it polluted both scenes)
-                // NEGATIVE RESULT, do not re-propose the retracted-LF
-                // witness in either form without new evidence. Known
-                // remaining blind spot of the OOB residual: the in-band
-                // component of a displaced edge's leak passes the FIR at
-                // small residual and survives at partial alpha.
-                for (int xi = 0; xi < width; ++xi) {
-                    bool ok = true;
-                    double taps[5];
-                    static const int off[5] = { 0, -2, 2, -4, 4 };
-                    for (int k = 0; k < 5 && ok; ++k) {
-                        const int j = std::clamp(xi + off[k], 0, width - 1);
-                        taps[k] = R[j];
-                        if (!std::isfinite(taps[k])) ok = false;
-                    }
-                    if (!ok) continue;
-                    const double bp = kT0a * taps[0] +
-                                      kT2a * (taps[1] + taps[2]) +
-                                      kT4a * (taps[3] + taps[4]);
-                    if (antCommit) {
-                        // A/B escape: the full-commit data run (ghosts on
-                        // motion; kept for comparison renders only).
-                        antComp[xi] = bp;
-                        continue;
-                    }
-                    const double fit = static_cast<double>(fitRowPub[xi]);
-                    // Post-correction motion correlate: the surviving error
-                    // in R' is HF (the LF ghost body was corrected away by
-                    // construction), so the OOB residual is back to being
-                    // the right instrument for what remains.
-                    const double res = std::fabs(R[xi] - bp);
-                    const double wc =
-                        std::exp(-res * invIreScale / kAntTauIRE);
-                    antComp[xi] = wc * bp + (1.0 - wc) * fit;
-                }
-            }
         }
 
         // THE SAFE RETREAT for the certified ladder (author, 2026-08-08: the
@@ -11768,52 +11587,40 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         const double *obs1D = locked1DSource_line(line);
 
         for (int xi = 0; xi < width; ++xi) {
-            double carrier;
-            switch (retractedSource) {
-            case 1:
-                carrier = static_cast<double>(fitRowPub[xi]);
-                break;
-            case 2:
-                carrier = static_cast<double>(combRowPub[xi]);
-                break;
-            case 3: {
-                // CERTIFIED CARRIER, used as itself (user: "we already have
-                // a carrier... the merged fields can cancel to luma or
-                // carrier with a sign flip"). Covered sample: (def-spare)/2
-                // IS the carrier, a conservation fact. Comp sample: the
-                // certified-luma vertical comb above, fact-only and with no
-                // fallback of its own. Neither available: the observation.
-                const float ex = exRowPub ? exRowPub[left + xi]
-                                          : std::numeric_limits<float>::quiet_NaN();
-                if (std::isfinite(ex)) {
-                    carrier = static_cast<double>(ex);
-                } else if (antRungOn && std::isfinite(antComp[xi])) {
-                    // Anticipated rung: estimator with alpha, never
-                    // certification (see the antComp declaration). Kept
-                    // senior to certComp on its own terms; the old reason
-                    // for the ordering (certComp degenerating to a fit copy
-                    // on uncovered frames) died with the merge -- certComp
-                    // is now NaN there, because R is.
-                    carrier = antComp[xi];
-                } else if (std::isfinite(certComp[xi])) {
-                    carrier = certComp[xi];
-                } else if (obs1D) {
-                    carrier = obs1D[xi];
-                } else {
-                    // Unreachable in the shipped order: buildPhaseCorrected1D
-                    // runs before this stage. Kept so a reordering degrades
-                    // to the previous conduct rather than to silence.
-                    carrier = static_cast<double>(fitRowPub[xi]);
+            // The certified plane has exactly three rungs: measured twin
+            // carrier, fact-only comp construction, observed locked 1D. It
+            // is computed independently of every witness/fit selector.
+            const float ex = exRowPub ? exRowPub[left + xi]
+                                      : std::numeric_limits<float>::quiet_NaN();
+            const double certifiedCarrier = std::isfinite(ex)
+                ? static_cast<double>(ex)
+                : (std::isfinite(certComp[xi])
+                    ? certComp[xi]
+                    : (obs1D ? obs1D[xi] : 0.0));
+
+            if (anchoredRow)
+                anchoredRow[xi] = certifiedCarrier;
+
+            if (retractedRow) {
+                double witnessCarrier;
+                switch (retractedSource) {
+                case 1:
+                    witnessCarrier = static_cast<double>(fitRowPub[xi]);
+                    break;
+                case 2:
+                    witnessCarrier = static_cast<double>(combRowPub[xi]);
+                    break;
+                case 3:
+                    witnessCarrier = certifiedCarrier;
+                    break;
+                default:
+                    witnessCarrier = static_cast<double>(wRowPub[xi]) *
+                                     static_cast<double>(fitRowPub[xi]);
+                    break;
                 }
-                break;
+                retractedRow[xi] = static_cast<float>(
+                    static_cast<double>(rawLine[left + xi]) - witnessCarrier);
             }
-            default:
-                carrier = static_cast<double>(wRowPub[xi]) *
-                          static_cast<double>(fitRowPub[xi]);
-                break;
-            }
-            retractedRow[xi] = static_cast<float>(
-                static_cast<double>(rawLine[left + xi]) - carrier);
         }
     }
 
@@ -12012,13 +11819,7 @@ void Comb::FrameBuffer::buildCarrierRetractionStage(bool analysisOnly,
         }
     }
 
-    carrierRetractedValid = true;
-
-    // Only a covered construction has carrier authority. The uncovered
-    // retracted model remains private diagnostic state and is never published.
-    anchoredCarrierProvenance = AnchoredCarrierProvenance::None;
-    anchored1DSource_flat.clear();
-    if (!analysisOnly && retractedSource == 3 && frameHasExactCoverage())
-        publishAnchoredCarrierFromRetracted(
-            AnchoredCarrierProvenance::FactBacked);
+    carrierRetractedValid = configuration.lumaWitness;
+    if (publishCertified)
+        anchoredCarrierProvenance = AnchoredCarrierProvenance::FactBacked;
 }

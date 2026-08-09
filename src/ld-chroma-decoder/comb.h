@@ -400,8 +400,7 @@ public:
 	// grammar + harvested bandpass supply the frame-axis conformance test).
 	// This is the comb's own 3D structure. Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
-	void buildCarrierRetractionStage(bool analysisOnly,
-	                                 const FrameBuffer *prevF = nullptr);
+	void buildCertifiedCarrierStage(const FrameBuffer *prevF = nullptr);
 
 	// Corner-leak corrector. The locked bandpass reads luma CURVATURE as false
 	// carrier: leak[x] = -0.25 * (Y[x-2] - 2Y[x] + Y[x+2]), exactly. A
@@ -459,9 +458,10 @@ public:
 	                          std::vector<double> &sI, std::vector<double> &sQ,
 	                          double *ratioOut) const;
 
-	// Carrier-retraction front end, run after shared analysis and the locked
-	// local-carrier construction.
-	void buildCarrierRetracted(const FrameBuffer *prevF = nullptr);
+	// Publish the certified carrier ladder after shared analysis and the locked
+	// local-carrier construction.  --luma-witness may build its private
+	// retracted-luma view during this pass, but that view is not ladder storage.
+	void buildCertifiedCarrierLadder(const FrameBuffer *prevF = nullptr);
 	// Sync-tone actuator: on UNCOVERED frames, rotate the FIT's carrier
 	// phase toward the tracker reference (in-batch covered anchor advanced
 	// by the shipped rate). The fit is a MODEL product — rotating it is
@@ -912,7 +912,7 @@ private:
 	// which keeps this energy as luma, without geometric corroboration).
 	std::vector<float> regionAlienPartner_flat;
 
-	// --- Carrier-retraction buffers. Populated by buildCarrierRetracted();
+	// --- Carrier-retraction buffers. Populated only for --luma-witness;
 	// same geometry as the demod flats (demodLines x demodWidth).
 	// carrierImpurity_flat above is shared with the current aperture detector
 	// and reused here. ---
@@ -1253,19 +1253,14 @@ private:
 		None,
 		FactBacked
 	};
-	void publishAnchoredCarrierFromRetracted(
-		AnchoredCarrierProvenance provenance);
 	std::vector<double> anchored1DSource_flat;
 	AnchoredCarrierProvenance anchoredCarrierProvenance =
 		AnchoredCarrierProvenance::None;
 
-	// Chained anticipated-reference luma (uncovered frames): the LAST
-	// cover's certified luma (raw - exact on its def lines, NaN
-	// elsewhere), copied forward frame-to-frame with an age counter so
-	// every uncovered frame after a cover holds the reference. age -1 =
-	// none; reset on frame reuse in loadFields.
-	std::vector<float> antRefLuma_flat;
-	int antRefAge = -1;
+	// The chained anticipated-reference luma plane that stood here is REMOVED
+	// (2026-08-08) with its only consumer, the anticipated rung; see the
+	// record in buildCertifiedCarrierStage. The sync tone (applyToneToFit) was
+	// the part of that work worth keeping and does not read this.
 
 	inline const double *anchoredCarrierStorage_line(int line) const {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||

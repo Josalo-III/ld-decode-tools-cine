@@ -2821,7 +2821,7 @@ void Comb::FrameBuffer::computeFrameBLine(
             // CERTIFIED REGISTRATION FIRST (2026-08-08). Where the frame
             // carries a fact-grade aim for this column -- measured on the
             // two bracketing lines' certified, carrier-free luma, published
-            // by buildCarrierRetractionStage -- take it instead of searching
+            // by buildCertifiedCarrierStage -- take it instead of searching
             // here. Same quantity, same sign convention (see comb.h); the
             // difference is the material it was measured on. This search
             // reads precleaned IQ, and by its own account above is "steered

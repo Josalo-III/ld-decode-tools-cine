@@ -320,10 +320,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 // only -- publishes lockedCornerLeak_flat, changes no output.
                 next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
-                // Presence of certified, not the witness fork -- see the
-                // gate at the top of buildCarrierRetractionStage.
+                // Presence of certified, not the witness fork.  The ladder
+                // publishes its carrier plane directly; luma-witness may
+                // additionally ask the same stage for its private view.
                 if (FrameBuffer::certifiedOneDLevel() >= 1)
-                    next->buildCarrierRetracted(
+                    next->buildCertifiedCarrierLadder(
                         current->holdsRealFrame() ? current.get() : nullptr);
             }
 
@@ -711,7 +712,6 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
             AnchoredCarrierProvenance::None; // stale plane must not survive reuse
 		icebergRecoveredY_flat.clear();
 		icebergReturnWeight_flat.clear();
-        antRefAge = -1;            // chained anticipated reference likewise
         starEvidenceBuilt = false; // star license evidence follows the frame
         starFootprintBuilt = false;
         starFootprint_flat.clear();
