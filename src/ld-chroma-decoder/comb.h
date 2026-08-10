@@ -572,6 +572,12 @@ public:
 	// SourceField::dgSyncIncrement). Kept per source field; consumers
 	// compose with their own in-batch anchor measurement.
 	QVector<float> syncIncFirst, syncIncSecond;
+	// Cadence position of each source field, kept alongside its payload.
+	// The sync anchor is always a def, so the anchor's position is
+	// (thisIndex - dtFields) mod the cycle -- which is what keys the
+	// anchor-to-target polarity. Derived from the same cinemap the merged
+	// cadenceId comes from; the merge is lossy for this purpose.
+	qint32 cadenceIdFirst = -1, cadenceIdSecond = -1;
 	mutable std::vector<float>  starEvidenceSum; // per region: sum |ex| IRE
 	mutable std::vector<qint32> starEvidenceCnt;
 	mutable int starRegionsX = 0, starRegionsY = 0;

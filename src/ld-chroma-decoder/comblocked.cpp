@@ -14,6 +14,7 @@
  * A subset of comb functions used when --ntsc-phase-comp is active
  ******************************************************************************/
 
+#include "cadencedefs.h"
 #include "comb.h"
 #include "combmath.h"
 #include "feasibleband.h"
@@ -8780,6 +8781,36 @@ bool Comb::FrameBuffer::applyCertifiedCarrierHull(const FrameBuffer *prevF,
 // first consumer inside buildCertifiedCarrierStage.
 void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
 {
+    // Retained record from the removed LDCD_PROBE_TONELEGACY census
+    //
+    // Question (user, 2026-08-09): "while the certified carrier is correct,
+    // we do a lot of rotating in our comb, so uncovered frames have their
+    // own distinct legacy to grapple with." The actuator below differences a
+    // FACT (prevF's exact channel, raw domain, untouched by the comb)
+    // against a MODEL (this frame's fit, after the basis projection and
+    // every per-sample surgery between its basis exit and publication). If
+    // those carry a systematic phase offset, d0 is the sync delta PLUS that
+    // offset. A covered frame holds both for the same lines, and dt is zero
+    // there, so what remains is the legacy alone.
+    //
+    // MEASURED, facts deprived (LDCD_FACT_FIT=0 LDCD_LURCH_CERT=0), pooled on
+    // the tone's own 128x32 grid with the tone's signing, split by parity:
+    //
+    //   signed mean +0.034 deg | |L| p90 0.918 deg | max 13.60 deg
+    //   0 regions past the hull | no parity split (even +0.060 / odd +0.007)
+    //   17,098 regions over 726 frames
+    //
+    // THERE IS NO ROTATION LEGACY. The fit's phase is truth-grade even with
+    // the facts switched off, so it needs no conversion term -- and that is
+    // what makes d0 readable as the anticipation error directly, which is
+    // how the polarity defect below was isolated.
+    //
+    // REFEREE DISCIPLINE, the hard way: Pass 1.7 stamps the certified fact
+    // INTO the fit on def lines and runs BEFORE this call site. Without
+    // LDCD_FACT_FIT=0 the two operands are the same array and L is
+    // identically zero -- a wiring diagram, not a measurement. A first run
+    // read exactly 0.00 across all 674 frames and had to be thrown out.
+
     // DEFAULT ON (promoted 2026-08-01 with the anchoring family, user
     // directive): the research verdict is that the certified carrier has
     // an exact repeating cycle, and the anticipated phase lands almost
@@ -8805,6 +8836,73 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
     const double gConf  = pay[1];
     const double dtF    = pay[2];
     if (gConf < 0.2 || dtF <= 0.0 || dtF > 8.0) return;
+
+    // ---------------------------------------------------------------
+    // ANCHOR-TO-TARGET POLARITY (2026-08-09). The anchor is a certified
+    // field from an EARLIER cadence position; its carrier polarity is not
+    // this field's. Nothing converted it, so on the odd field gaps the
+    // anchor arrived 180 deg out and the +-25 deg hull -- meant as a
+    // safety -- applied the MAXIMUM rotation to every region instead of
+    // refusing. 2A*sin(12.5deg) = 43% of the local carrier into Y: the
+    // uncovered-frame checkerboard, seen on D at extreme saturation
+    // (purple first, since the residue scales with carrier amplitude).
+    //
+    // A LOOKUP, NOT A CALCULATION (user directive). The rows are READ OFF
+    // the measured census, not derived: raw NTSC advances 270 deg/field,
+    // but this pooling lives in the decoder's signed 4fSC convention and
+    // the residual is not that number. Deriving it from per-field
+    // increments is how this was mis-attributed twice.
+    //
+    // The anchor is always a def (syncTrackerUpdate takes def.field.seqNo)
+    // so only rows 0 (Adef) and 7 (Cdef) exist, and the target is the
+    // uncovered letter's leading field. Under INVERTED dominance the
+    // leading field swaps -- B leads with B1 and D with D2 -- so the roles
+    // change but the phase stays knowable, and those pairs are listed
+    // rather than left to abstain (user, 2026-08-09). cadenceIndex()
+    // normalises both dominances into 0..9, so one table serves.
+    //
+    //   anchor -> target   gap   polarity   measured d0 before conversion
+    //   0 Adef -> 4 B2      4      0        3.7 deg    (217 frames)
+    //   0 Adef -> 3 B1      3      pi       170.2 deg  (inverted dominance)
+    //   7 Cdef -> 8 D1      1      pi       178.2 deg  (235 frames)
+    //   7 Cdef -> 9 D2      2      0        -          (inverted dominance)
+    //
+    // An unlisted pair is UNKNOWN polarity, and the response is to stand
+    // the stage down for the WHOLE FRAME. That is a knowledge test, not a
+    // magnitude test: which space the anchor is in is a property of the
+    // cadence, known before any region is measured. An earlier build
+    // gated per region on |d0| > hull, which let a region reading under
+    // the hull act while its neighbours refused -- and delta is bilinearly
+    // interpolated, so that smears a rotation gradient across a
+    // neighbourhood that declined one. One frame, one decision.
+    // ---------------------------------------------------------------
+    const qint32 targetCid = !syncIncFirst.isEmpty() ? cadenceIdFirst
+                                                     : cadenceIdSecond;
+    const int targetIdx = cadenceIndex(targetCid);
+    if (targetIdx < 0) return;                  // sentinel: no position
+    const int anchorIdx =
+        ((targetIdx - (int)dtF) % CADENCE_NTSC_CYCLE +
+         CADENCE_NTSC_CYCLE) % CADENCE_NTSC_CYCLE;
+
+    double polarity = 0.0;
+    {
+        struct PolarityRow { int anchor, target; double rot; };
+        static const PolarityRow kPolarity[] = {
+            { 0, 4, 0.0   },   // Adef -> B2   (normal dominance)
+            { 0, 3, M_PI  },   // Adef -> B1   (inverted dominance)
+            { 7, 8, M_PI  },   // Cdef -> D1   (normal dominance)
+            { 7, 9, 0.0   },   // Cdef -> D2   (inverted dominance)
+        };
+        bool listed = false;
+        for (const PolarityRow &row : kPolarity) {
+            if (row.anchor == anchorIdx && row.target == targetIdx) {
+                polarity = row.rot;
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) return;                    // unknown space: stand down
+    }
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
@@ -8869,6 +8967,33 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
     const double floorRaw = 2.0 * irescale;
     constexpr double kMaxDelta = 25.0 * M_PI / 180.0;
     std::vector<double> delta((size_t)nx * ny, 0.0);
+
+    // Retained record from the removed LDCD_PROBE_TONEACT census
+    //
+    // The actuator's own rotation, graded in situ on the uncovered frames.
+    // Legitimate because the legacy census above proved the fit truth-grade:
+    // with an accurate fit, d0 IS the anticipation error, so the cycle
+    // premise can be graded here with no covered-frame pairing.
+    //
+    // MEASURED (Emissarymovie-s1x11, cube), split by the field gap:
+    //
+    //   dtF  frames  regions  clamped  clamp%   d0 p50   letter
+    //     1     235     3593     3122     87%   178.2    D  (odd  gap)
+    //     4     217     3456        6      0%     3.7    B  (even gap)
+    //     3       1        1        1    100%   170.2    B, inverted
+    //     7       1       12        2     17%   158.5
+    //
+    // The omega*dt advance is only 0.03-1.6 deg, so it cannot carry the
+    // 180 deg. The CYCLE PREMISE IS CONFIRMED on the even half (3.7 deg,
+    // nothing clamped) -- the defect was never the anticipation, it was that
+    // nothing converted the anchor into the target field's space.
+    //
+    // Frame-scope backstop population: |d0| AFTER conversion. With the
+    // right polarity row this is the few-degree drift the cycle premise
+    // predicts; a converted anchor that still rails means the TABLE is
+    // wrong, and that must be loud rather than absorbed by the hull.
+    std::vector<double> backstopAbs;
+
     for (int r = 0; r < nx * ny; ++r) {
         if (aN[r] < 64 || fN[r] < 64) continue;
         if (std::hypot(aI[r], aQ[r]) / aN[r] < floorRaw) continue;
@@ -8877,11 +9002,38 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
         if (r < nRegPay) conf *= std::clamp((double)pay[4 + r * 2 + 1],
                                             0.0, 1.0);
         if (conf <= 0.05) continue;
-        const double aPh = std::atan2(aQ[r], aI[r]) + gOmega * dtF;
+        // The anchor is brought into THIS field's space before it is
+        // differenced -- the conversion, applied once, from the table.
+        const double aPh =
+            std::atan2(aQ[r], aI[r]) + gOmega * dtF + polarity;
         const double d0 = std::atan2(
             std::sin(aPh) * fI[r] - std::cos(aPh) * fQ[r],
             std::cos(aPh) * fI[r] + std::sin(aPh) * fQ[r]);
+        backstopAbs.push_back(std::fabs(d0));
         delta[r] = std::clamp(conf * d0, -kMaxDelta, kMaxDelta);
+    }
+
+    // FRAME-SCOPE BACKSTOP. With the right polarity row, |d0| is the
+    // few-degree drift the cycle predicts. If the MEDIAN still exceeds the
+    // hull the table is wrong for this pair, and the stage must stand down
+    // for the whole frame rather than let the hull rail region by region.
+    // Frame-scope by construction, so it cannot patchwork; loud once per
+    // process, because a wrong table is a defect to fix, not a condition to
+    // absorb.
+    if (!backstopAbs.empty()) {
+        std::vector<double> bs = backstopAbs;
+        std::sort(bs.begin(), bs.end());
+        const double med = bs[bs.size() / 2];
+        if (med > kMaxDelta) {
+            std::fill(delta.begin(), delta.end(), 0.0);
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                std::fprintf(stderr,
+                    "[TONE] anchor %d -> target %d (dt %.0f fields):"
+                    " median |d0| %.1f deg after conversion -- polarity"
+                    " table is wrong for this pair; stage stood down.\n",
+                    anchorIdx, targetIdx, dtF, med * 180.0 / M_PI);
+        }
     }
 
     // Bilinear delta field over region centers, then the quadrature

@@ -748,6 +748,8 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     
     const qint32 cidA = firstField.field.cinemap.cadenceId;
     const qint32 cidB = secondField.field.cinemap.cadenceId;
+    cadenceIdFirst  = cidA;
+    cadenceIdSecond = cidB;
     // Under autosolve editSplit is narrow and correct: the flag marks the first
     // field of a new scene, so it is set here only when the cut falls BETWEEN
     // this frame's two fields — the "A/A" case, where the leading A belongs to
