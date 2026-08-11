@@ -4107,6 +4107,7 @@ void Comb::FrameBuffer::filterIQLocked()
 void Comb::FrameBuffer::buildAnchorCeiling()
 {
     anchorCeiling_flat.clear();
+    anchorFloor_flat.clear();
     anchorCoveredLine.clear();
     // Built-for-this-frame marker, set before the early returns: on an
     // uncovered frame "no plane" IS the built result, and every consumer
@@ -4130,10 +4131,17 @@ void Comb::FrameBuffer::buildAnchorCeiling()
     constexpr double kMarginRel     = 0.10; // relative pad
     constexpr double kMarginAbsIRE  = 1.5;  // absolute pad
     constexpr double kFloorIRE      = 2.5;  // authority floor (noise env)
+    // Floor-plane constants. Erosion radius = the measured intra-frame
+    // edge-transfer p90 (4 px): a floor survives anchor drift by
+    // SHRINKING its claim area, the mirror of the ceiling's dilation.
+    // Authority threshold matches the ceiling's noise envelope: below it
+    // the certified carrier cannot vouch for presence.
+    constexpr int    kFloorErode    = 4;
+    constexpr double kFloorAuthIRE  = 2.5;
 
     const double inf = std::numeric_limits<double>::infinity();
     // Pooled per-line envelope rows, +inf where no authority.
-    std::vector<std::vector<double>> pooled(lastLine);
+    std::vector<std::vector<double>> pooled(lastLine), pooledLo(lastLine);
     std::vector<double> env(fullWidth, std::numeric_limits<double>::quiet_NaN());
     bool anyCovered = false;
 
@@ -4168,6 +4176,23 @@ void Comb::FrameBuffer::buildAnchorCeiling()
             if (nv >= (b - a + 1) / 2)
                 row[h] = std::max(kFloorIRE,
                                   m * (1.0 + kMarginRel) + kMarginAbsIRE);
+        }
+        // Floor row: sliding MIN over the erosion radius, margins
+        // SUBTRACTED, and a denied sample poisons the window -- a floor
+        // asserts presence, and absence cannot vouch for presence.
+        auto &lo = pooledLo[line];
+        lo.assign(fullWidth, 0.0);
+        for (int h = left; h < right; ++h) {
+            double m = inf; bool ok = true;
+            const int a = std::max(left, h - kFloorErode);
+            const int b = std::min(right - 1, h + kFloorErode);
+            for (int j = a; j <= b; ++j) {
+                if (!std::isfinite(env[j])) { ok = false; break; }
+                m = std::min(m, env[j]);
+            }
+            if (!ok) continue;
+            const double f = m * (1.0 - kMarginRel) - kMarginAbsIRE;
+            lo[h] = (f >= kFloorAuthIRE) ? f : 0.0;
         }
     }
 
@@ -4207,6 +4232,42 @@ void Comb::FrameBuffer::buildAnchorCeiling()
                 else c = std::max(c1, c2);
             }
             out[h] = (float)c;
+        }
+    }
+
+    // Floor plane assembly: same bracket structure as the ceiling, every
+    // operation inverted. Own covered row stands as itself; an uncovered
+    // line takes the MIN of its bracketing covered rows, and only where
+    // BOTH grant authority -- one witness cannot vouch a floor across a
+    // line it never saw.
+    anchorFloor_flat.assign((size_t)lastLine * fullWidth, 0.0f);
+    for (int line = firstLine; line < lastLine; ++line) {
+        float *out = anchorFloor_flat.data() + (size_t)line * fullWidth;
+        const std::vector<double> *src[3] = {nullptr, nullptr, nullptr};
+        if (!pooledLo[line].empty()) src[0] = &pooledLo[line];
+        else {
+            if (line - 1 >= firstLine && !pooledLo[line - 1].empty())
+                src[1] = &pooledLo[line - 1];
+            if (line + 1 < lastLine && !pooledLo[line + 1].empty())
+                src[2] = &pooledLo[line + 1];
+            if (!src[1] && line - 2 >= firstLine &&
+                !pooledLo[line - 2].empty())
+                src[1] = &pooledLo[line - 2];
+            if (!src[2] && line + 2 < lastLine &&
+                !pooledLo[line + 2].empty())
+                src[2] = &pooledLo[line + 2];
+        }
+        if (!src[0] && !src[1] && !src[2]) continue;
+        for (int h = left; h < right; ++h) {
+            double f = 0.0;
+            if (src[0]) {
+                f = (*src[0])[h];
+            } else if (src[1] && src[2]) {
+                const double f1 = (*src[1])[h];
+                const double f2 = (*src[2])[h];
+                f = (f1 > 0.0 && f2 > 0.0) ? std::min(f1, f2) : 0.0;
+            }
+            out[h] = (float)f;
         }
     }
 }
@@ -4553,6 +4614,120 @@ void Comb::FrameBuffer::buildStarFootprint(const FrameBuffer *prevF,
     }
 }
 
+// One implementation of the notch-HF witness curves (see comb.h). English
+// spec, per the design discussion of 2026-08-10:
+//   bp    -- the recording's own wiggle: the fixed bandpass kernel on raw.
+//            Its crests are read from the recording, never asserted, so no
+//            phase error is possible.
+//   wLaw  -- the loudness law: colour loudness cannot change faster than
+//            the encoder's chroma kernel could emit, so removal never
+//            exceeds the lawful amount; a summit's excess stays in Y.
+//   keep  -- the grammar-schedule testimony: lawful carrier anti-phases
+//            against its +-2 partners; a wiggle that MATCHES them is
+//            image-locked luma standing in the carrier band. Two-tier
+//            verdict, measured 2026-08-10: pooled testimony wins the noise
+//            regime (median), a DECISIVE single-witness anti-phase acquits
+//            outright at boundaries where one partner sits across the edge
+//            and testifies falsely (the Field B one-leg lesson). Exclusion
+//            only -- testimony can only return energy to Y. Partners
+//            TESTIFY, they never contribute signal.
+// The carrier object is bp*wLaw*keep -- an explicit, renderable wave,
+// SUBTRACTED from raw, never cancelled into it.
+void Comb::FrameBuffer::buildNotchHfCurves(
+    int line, std::vector<double> &bp,
+    std::vector<double> &wLaw, std::vector<double> &keep) const
+{
+    // Confirmation ramp: removal begins at rho = -confirmLo and is full
+    // at rho = -(confirmLo + confirmW). Sweepable for the referee.
+    static const double confirmLo = []{
+        const char *e = std::getenv("LDCD_NOTCHHF_CONFIRM_LO");
+        return e ? std::atof(e) : 0.15;
+    }();
+    static const double confirmW = []{
+        const char *e = std::getenv("LDCD_NOTCHHF_CONFIRM_W");
+        return e ? std::atof(e) : 0.45;
+    }();
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int w     = right - left;
+    const int fullW = videoParameters.fieldWidth;
+    bp.assign(w, 0.0);
+    wLaw.assign(w, 1.0);
+    // PRESUMPTION OF LUMA (author, 2026-08-10, after the phaser-beam
+    // dashes): keep starts at ZERO -- nothing is removed until the
+    // schedule positively confirms carrier. The old default presumed
+    // carrier where testimony was weak, and along a thin luma feature
+    // (partners sit across it, so testimony can only flicker) the flapping
+    // removal rendered the beam as dashes and dots. Under this stance a
+    // feature that cannot be confirmed is never subtracted, structurally.
+    keep.assign(w, 0.0);
+    if (w <= 8) return;
+
+    const quint16 *rawC = rawbuffer.data() + size_t(line) * fullW;
+    const quint16 *rawU = (line >= 2)
+        ? rawbuffer.data() + size_t(line - 2) * fullW : nullptr;
+    const quint16 *rawD = (line + 2 < frameHeight)
+        ? rawbuffer.data() + size_t(line + 2) * fullW : nullptr;
+    auto bpOf = [](const quint16 *row, int h) {
+        return 0.5 * (double)row[h] -
+               0.25 * ((double)row[h - 2] + (double)row[h + 2]);
+    };
+
+    std::vector<double> bpU(w, 0.0), bpD(w, 0.0), envObs(w), envLaw(w);
+    for (int xi = 0; xi < w; ++xi) {
+        const int h = left + xi;
+        bp[xi] = bpOf(rawC, h);
+        if (rawU) bpU[xi] = bpOf(rawU, h);
+        if (rawD) bpD[xi] = bpOf(rawD, h);
+    }
+    for (int xi = 0; xi < w; ++xi)
+        envObs[xi] = std::hypot(bp[xi], bp[std::min(xi + 1, w - 1)]);
+    lddecode::projectExpressibleChromaEnvelope(
+        envObs.data(), nullptr, w, envLaw.data());
+    for (int xi = 0; xi < w; ++xi)
+        if (envObs[xi] > 1e-9)
+            wLaw[xi] = std::min(1.0, envLaw[xi] / envObs[xi]);
+
+    const double noiseFloor = 1.0 * irescale;
+    if (!rawU && !rawD) return;
+    for (int xi = 3; xi < w - 3; ++xi) {
+        double sCC = 0, sCU = 0, sUU = 0, sCD = 0, sDD = 0;
+        for (int k = -3; k <= 3; ++k) {
+            const double c = bp[xi + k];
+            const double u = bpU[xi + k];
+            const double d = bpD[xi + k];
+            sCC += c * c;
+            sCU += c * u; sUU += u * u;
+            sCD += c * d; sDD += d * d;
+        }
+        if (sCC < noiseFloor * noiseFloor * 7) continue;
+        double rhoU = 0.0, rhoD = 0.0;
+        bool haveU = false, haveD = false;
+        if (rawU && sUU >= noiseFloor * noiseFloor * 7) {
+            rhoU = sCU / std::sqrt(sCC * sUU);
+            haveU = true;
+        }
+        if (rawD && sDD >= noiseFloor * noiseFloor * 7) {
+            rhoD = sCD / std::sqrt(sCC * sDD);
+            haveD = true;
+        }
+        if (!haveU && !haveD) continue;   // no testimony: luma stands
+        // keep = degree of POSITIVE confirmation. Pooled anti-phase ramps
+        // removal in; anything short of clear anti-phase leaves the luma
+        // alone. A decisive single-witness anti-phase still acquits
+        // outright (the one honest partner at a vertical boundary).
+        const double sPP2 = sUU + sDD;
+        const double sCP2 = sCU + sCD;
+        const double rhoP = (sPP2 > 1e-12)
+            ? sCP2 / std::sqrt(sCC * sPP2) : 0.0;
+        double kp = std::clamp((-rhoP - confirmLo) / confirmW, 0.0, 1.0);
+        constexpr double kDecisive = -0.5;
+        if ((haveU && rhoU <= kDecisive) || (haveD && rhoD <= kDecisive))
+            kp = 1.0;
+        keep[xi] = kp;
+    }
+}
+
 void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                                  const FrameBuffer *nextF)
 {
@@ -4732,10 +4907,24 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     //   the candidate 74% of its weight (mean factor 0.7385).
     // Effect on emitted Y vs notch-off: 96% of pixels on alternating output
     // frames, mean 0.14 IRE, p95 0.44, max 17.9 -- and 0.3% on the frames
-    // between. That odd/even split is UNEXPLAINED; do not assume the
-    // pulldown letters without measuring it. (Census predates the covered-
-    // frame cede below, 2026-08-09 -- covered frames no longer seat the
-    // notch at all, so re-measure before reasoning from these numbers.)
+    // between.
+    //
+    // The odd/even split is the TELECINE CADENCE (author; measured
+    // 2026-08-10). It is covered vs uncovered, and it is what this plane is
+    // FOR. On a covered frame every other candidate descends from the
+    // certified ladder and they dedup to one roster entry, so the notch has
+    // nothing left to disagree with -- hence 0.3%. On an uncovered frame
+    // comb's carrier is an ESTIMATE, the identity above leaves the two
+    // candidates differing by exactly the near-fSC luma, and the notch is
+    // the only contestant whose Nyquist behaviour no phase error can spoil.
+    // Independently measured on the emitted picture: uncovered frames carry
+    // a ~10% Nyquist-corner excess over covered ones (RMS of the [[1,-1],
+    // [-1,1]] basis normalised by broadband HF; alternation index 0.20 per
+    // 40-frame segment, Melbourne shot).
+    //
+    // (Census predates the covered-frame cede below, 2026-08-09 -- covered
+    // frames no longer seat the notch at all, so re-measure the
+    // participation figures before reasoning from those.)
     //
     // RETRACTED, and worth the space because it nearly buried the plane: the
     // first census ran on ve-snw-cut and reported 99.18% duplicate, 0.82%
@@ -5719,13 +5908,19 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     if (retractedAdmitted)
                         addBaseCandidate(ry, 1);
                 }
-                if (!combOK && oneDRow) {
-                    const double o = oneDRow[xi];
-                    if (std::isfinite(o)) {
-                        const double y1 = rawH - o;
-                        addBaseCandidate(y1, 3);
-                    }
-                }
+                // 1D SEAT REMOVED (author directive, reiterated 2026-08-10:
+                // "I previously insisted on removing 1D"). It entered only
+                // where comb failed feasibility -- ALONE, so no election
+                // ever adjudicated it: a lone candidate's weight cancels in
+                // num/den, which is why every steering form measured
+                // bit-identical there. And the YVIEW forensics convicted
+                // the seat: +0.385 odd/even checker gap on the action
+                // segment (weapons fire = 1D cross-colour), 6x any other
+                // voice. The locked 1D OBSERVATION keeps every construction
+                // role it has (the certified ladder's last rung, the safe
+                // retreat); only the election franchise is withdrawn.
+                // planeForTop defaults to comb, so the empty-ballot
+                // fallback is the senior hypothesis, never 1D.
 
                 // Fixed-kernel notch. No admission test exists here, and none
                 // is needed: there is no estimate to vet, so feasibility --
@@ -6303,6 +6498,31 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         }
                         if (k == darkestIdx && k < baseNIn && baseNIn > 1)
                             w *= 1.0 - darkestVetoGate;
+                        // Retained record from the removed carrier-in-Y
+                        // steering (2026-08-10, FALSIFIED five ways).
+                        // Author's directive was to weight the blend by
+                        // testing candidates against comb as the phase
+                        // measure. Odd/even checker gap, baseline +0.0925:
+                        // template projection +0.0997 (the weight itself
+                        // rippled at carrier rate -- a per-sample weight
+                        // interleaves differently-weighted blends at pixel
+                        // pitch and MANUFACTURES the checker it polices);
+                        // basis envelope +0.1020 (the template carries
+                        // comb's own AMPLITUDE errors, so witnesses were
+                        // demoted for disagreeing with comb's mistakes);
+                        // quadrature phase-only +0.0933. Then two wirings
+                        // aimed at plane 3 returned BIT-IDENTICAL output:
+                        // 1D seats only where comb is infeasible, i.e.
+                        // ALONE, and a lone candidate's weight cancels in
+                        // num/den. Decomposition closed it: absolute
+                        // uncovered checker comb 1314 / retracted 1278 /
+                        // elected 1270 -- the blend already beats every
+                        // voice, and the excess is COMMON-MODE across all
+                        // estimators (spread <= 3.5%). No reweighting can
+                        // remove what every candidate shares; it is the
+                        // price of estimating the carrier instead of
+                        // knowing it, and it yields only upstream.
+                        //
                         // Notch blindness -- the term that makes a fixed
                         // kernel safe to seat.
                         //
@@ -7429,6 +7649,8 @@ static int ldcdRetractedSourceMode()
             return 1;
         if (s[0] == 'p')
             return 2;
+        if (std::strcmp(s, "notchhf") == 0)
+            return 4;
         return 3;
     }();
     return mode;
@@ -8828,14 +9050,35 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
     }();
     if (!toneOn || certifiedOneDLevel() == 0) return;
     if (frameHasExactCoverage()) return;                // anchors stand
-    if (!prevF || !prevF->frameHasExactCoverage()) return;
+
+    // Probe switch hoisted so every standdown below can name itself. A
+    // stage that returns silently is indistinguishable from one that was
+    // never reached, and that ambiguity has cost two runs in this hunt.
+    static const bool actOn = []{
+        const char *e = std::getenv("LDCD_PROBE_TONEACT");
+        return e && std::atoi(e) != 0;
+    }();
+    auto standDown = [&](const char *why) {
+        if (actOn)
+            std::fprintf(stderr,
+                "[TONEACT] frame %d  uncovered  STAND DOWN: %s\n",
+                (int)heldSeq1, why);
+    };
+
+    if (!prevF || !prevF->frameHasExactCoverage()) {
+        standDown("previous frame is not covered");
+        return;
+    }
     const QVector<float> &pay =
         !syncIncFirst.isEmpty() ? syncIncFirst : syncIncSecond;
-    if (pay.size() < 4) return;
+    if (pay.size() < 4) { standDown("no dgSyncIncrement payload"); return; }
     const double gOmega = pay[0];
     const double gConf  = pay[1];
     const double dtF    = pay[2];
-    if (gConf < 0.2 || dtF <= 0.0 || dtF > 8.0) return;
+    if (gConf < 0.2 || dtF <= 0.0 || dtF > 8.0) {
+        standDown("payload out of range (gConf/dtF)");
+        return;
+    }
 
     // ---------------------------------------------------------------
     // ANCHOR-TO-TARGET POLARITY (2026-08-09). The anchor is a certified
@@ -8879,7 +9122,10 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
     const qint32 targetCid = !syncIncFirst.isEmpty() ? cadenceIdFirst
                                                      : cadenceIdSecond;
     const int targetIdx = cadenceIndex(targetCid);
-    if (targetIdx < 0) return;                  // sentinel: no position
+    if (targetIdx < 0) {
+        standDown("sentinel cadenceId: no cadence position");
+        return;
+    }
     const int anchorIdx =
         ((targetIdx - (int)dtF) % CADENCE_NTSC_CYCLE +
          CADENCE_NTSC_CYCLE) % CADENCE_NTSC_CYCLE;
@@ -8901,14 +9147,21 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
                 break;
             }
         }
-        if (!listed) return;                    // unknown space: stand down
+        if (!listed) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                          "unlisted polarity pair (anchor %d -> target %d)",
+                          anchorIdx, targetIdx);
+            standDown(buf);
+            return;
+        }
     }
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
     const int left      = videoParameters.activeVideoStart;
     const int width     = videoParameters.activeVideoEnd - left;
-    if (width <= 0) return;
+    if (width <= 0) { standDown("zero active width"); return; }
     const int nx = (width + 127) / 128;
     const int ny = (lastLine + 31) / 32;
     const int nRegPay = (pay.size() - 4) / 2;
@@ -8937,7 +9190,7 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
             aN[r]++;
         }
     }
-    if (defPar < 0) return;
+    if (defPar < 0) { standDown("no def lines in the anchor frame"); return; }
 
     // Local fit phase, pooled over the SAME parity lines with the SAME
     // signing so the delta lives in one convention and any lattice
@@ -8961,12 +9214,36 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
         }
     }
 
-    // Per-region delta: (anchor advanced by the global rate) minus fit,
-    // confidence-scaled, hulled at +-25 deg (a tone corrects trend, never
-    // performs surgery).
+    // ONE ROTATION PER FRAME, robustly estimated (author, 2026-08-10:
+    // "I'm unclear why a predictable phase cycle was broken into regions in
+    // the first place; the cycle isn't smaller than the field; it's
+    // larger").
+    //
+    // The sync phase relationship is a property of the FIELD and its cycle
+    // is longer than one field, so there is no spatial structure inside a
+    // field for a regional grid to resolve. Region-to-region variation in
+    // d0 is CONTENT HUE, not sync. The assembler reached the same verdict
+    // from the other end and said so at its own pooling site: "the
+    // coordinate with measurable signal (regional increments are zero-mean
+    // noise ...; the +-6 deg segment curve is global)".
+    //
+    // The grid survives only as a ROBUSTNESS SUBSTRATE -- one vote per
+    // region, so the loudest object in frame cannot set the answer the way
+    // a single amplitude-weighted global pool would. The estimate emitted
+    // is a single number.
+    //
+    // What this retires, measured: the old per-region field pinned every
+    // ungraded region to ZERO, and only 22-35 of the 96 regions grade on a
+    // typical uncovered frame -- so three quarters of the field was a hole
+    // dragging the trend to nothing, and the applied rotation was a set of
+    // bumps rather than a trend. A single outlier region could also rail:
+    // on the Melbourne shot one region reached a 95 deg residual after
+    // conversion and clamped to the 25 deg rail, raising that frame's
+    // checkerboard energy 5.4% RMS frame-wide (11% in energy) concentrated
+    // in ~2% of the area. A constant field cannot vary spatially, cannot
+    // hole, and gives an outlier one vote in a median instead of a patch.
     const double floorRaw = 2.0 * irescale;
     constexpr double kMaxDelta = 25.0 * M_PI / 180.0;
-    std::vector<double> delta((size_t)nx * ny, 0.0);
 
     // Retained record from the removed LDCD_PROBE_TONEACT census
     //
@@ -8994,6 +9271,23 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
     // wrong, and that must be loud rather than absorbed by the hull.
     std::vector<double> backstopAbs;
 
+    // TEMPORARY INSTRUMENT (LDCD_PROBE_TONEACT=1), reinstated 2026-08-10:
+    // the author reports checkerboard still present on a D frame with the
+    // conversion in. Two hypotheses, and only the POST-CONVERSION residual
+    // distribution separates them:
+    //   (a) the tone still rails in the TAIL. The frame-scope backstop
+    //       tests the MEDIAN, so a wide residual passes it quietly while
+    //       individual regions clamp at 25 deg = 43% of the local carrier.
+    //       Measured d0 p50 was 178.2 / 170.2 / 158.5 -- not exactly pi --
+    //       and the lower half of |d0| was never characterised.
+    //   (b) this checkerboard is not the tone at all, in which case
+    //       railed==0 here and the search moves elsewhere.
+    // Strip again when that is settled.
+    std::vector<double> actD0;
+    // Signed per-region readings; only their median leaves this stage.
+    std::vector<double> regionD0;
+    double confSum = 0.0;
+
     for (int r = 0; r < nx * ny; ++r) {
         if (aN[r] < 64 || fN[r] < 64) continue;
         if (std::hypot(aI[r], aQ[r]) / aN[r] < floorRaw) continue;
@@ -9010,7 +9304,9 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
             std::sin(aPh) * fI[r] - std::cos(aPh) * fQ[r],
             std::cos(aPh) * fI[r] + std::sin(aPh) * fQ[r]);
         backstopAbs.push_back(std::fabs(d0));
-        delta[r] = std::clamp(conf * d0, -kMaxDelta, kMaxDelta);
+        regionD0.push_back(d0);
+        confSum += conf;
+        if (actOn) actD0.push_back(std::fabs(d0) * (180.0 / M_PI));
     }
 
     // FRAME-SCOPE BACKSTOP. With the right polarity row, |d0| is the
@@ -9020,12 +9316,17 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
     // Frame-scope by construction, so it cannot patchwork; loud once per
     // process, because a wrong table is a defect to fix, not a condition to
     // absorb.
-    if (!backstopAbs.empty()) {
+    double deltaGlobal = 0.0;
+    double madDeg = -1.0;
+    if (!regionD0.empty()) {
         std::vector<double> bs = backstopAbs;
         std::sort(bs.begin(), bs.end());
         const double med = bs[bs.size() / 2];
         if (med > kMaxDelta) {
-            std::fill(delta.begin(), delta.end(), 0.0);
+            // The table is wrong for this pair: stand down, loudly. Kept
+            // on |d0| rather than the signed median, because a 180 deg
+            // error with mixed signs has a signed median near zero and
+            // would slip through unremarked.
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true))
                 std::fprintf(stderr,
@@ -9033,38 +9334,59 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
                     " median |d0| %.1f deg after conversion -- polarity"
                     " table is wrong for this pair; stage stood down.\n",
                     anchorIdx, targetIdx, dtF, med * 180.0 / M_PI);
+        } else {
+            std::vector<double> sv = regionD0;
+            std::sort(sv.begin(), sv.end());
+            const double medSigned = sv[sv.size() / 2];
+            // Robust spread: median absolute deviation about the median.
+            // The tone is ONE number for the whole field, so if it exists
+            // every voting region agrees on it; MAD is the test of whether
+            // it exists at all.
+            std::vector<double> dev(sv.size());
+            for (size_t i = 0; i < sv.size(); ++i)
+                dev[i] = std::fabs(sv[i] - medSigned);
+            std::sort(dev.begin(), dev.end());
+            madDeg = dev[dev.size() / 2] * 180.0 / M_PI;
+            const double confMean = confSum / (double)regionD0.size();
+            deltaGlobal = std::clamp(confMean * medSigned,
+                                     -kMaxDelta, kMaxDelta);
         }
     }
 
-    // Bilinear delta field over region centers, then the quadrature
-    // rotation per line. Smooth by construction: no seams, no per-sample
-    // policy.
-    std::vector<double> rot(width), src(width);
+    if (actOn) {
+        std::fprintf(stderr,
+            "[TONEACT] frame %d  anchor %d -> target %d  polarity %.0f"
+            "  dtF %.0f  voting regions %zu\n",
+            (int)heldSeq1, anchorIdx, targetIdx, polarity * 180.0 / M_PI,
+            dtF, actD0.size());
+        if (!actD0.empty()) {
+            std::sort(actD0.begin(), actD0.end());
+            const size_t n = actD0.size();
+            std::fprintf(stderr,
+                "      |d0| post-conv p50 %7.2f  p90 %7.2f  max %7.2f"
+                "   MAD %7.2f   applied %7.2f\n",
+                actD0[n / 2],
+                actD0[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1],
+                actD0[n - 1], madDeg, deltaGlobal * 180.0 / M_PI);
+        }
+    }
+
+    // ONE rotation, applied to the whole frame. The bilinear delta field
+    // that stood here is retired with the regional estimate it carried: a
+    // constant field has nothing to interpolate, and interpolating between
+    // graded regions and zeroed holes was the bump-manufacturing step.
+    if (deltaGlobal == 0.0) return;          // nothing to apply
+    const double cosRot = std::cos(deltaGlobal);
+    const double sinRot = std::sin(deltaGlobal);
+    std::vector<double> src(width);
     for (int line = firstLine; line < lastLine; ++line) {
         float *fit = carrierFit_flat.data() + (size_t)line * demodWidth;
-        const double ry = std::clamp(
-            (line - 16.0) / 32.0, 0.0, (double)(ny - 1) - 1e-6);
-        const int r0 = (int)ry;
-        const double wy = ry - r0;
-        for (int xi = 0; xi < width; ++xi) {
-            const double rx = std::clamp(
-                (xi - 64.0) / 128.0, 0.0, (double)(nx - 1) - 1e-6);
-            const int c0 = (int)rx;
-            const double wx = rx - c0;
-            const double d =
-                (1 - wy) * ((1 - wx) * delta[(size_t)r0 * nx + c0] +
-                            wx * delta[(size_t)r0 * nx + c0 + 1 < (size_t)nx * ny ? (size_t)r0 * nx + std::min(c0 + 1, nx - 1) : (size_t)r0 * nx + c0]) +
-                wy * ((1 - wx) * delta[(size_t)std::min(r0 + 1, ny - 1) * nx + c0] +
-                      wx * delta[(size_t)std::min(r0 + 1, ny - 1) * nx + std::min(c0 + 1, nx - 1)]);
-            src[xi] = fit[xi];
-            rot[xi] = d;
-        }
+        for (int xi = 0; xi < width; ++xi) src[xi] = fit[xi];
         for (int xi = 0; xi < width; ++xi) {
             const double sm = xi > 0 ? src[xi - 1] : src[xi];
             const double sp = xi + 1 < width ? src[xi + 1] : src[xi];
             const double q = 0.5 * (sm - sp);
-            fit[xi] = (float)(std::cos(rot[xi]) * src[xi] +
-                              std::sin(rot[xi]) * q);
+            fit[xi] = (float)(cosRot * src[xi] + sinRot * q);
         }
     }
 }
@@ -10600,6 +10922,18 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     // consensus range and amplitude ceiling. No qualifying partner => the
     // dropout stands -- an honest hole, never a synthetic patch.
     //
+    // SCOPE, measured 2026-08-11: this stage repairs WHOLE-WINDOW lost
+    // lock. It cannot see the per-sample crash class -- compact colour
+    // features where the fit's claim collapses at the feature EDGE (6-7%
+    // of compact-run samples below 0.15 of certified, crash rate 7-14% at
+    // the run edge against 0-3% in its interior). A single crashed sample
+    // among four leaves the window RMS near 0.87 of normal, far above the
+    // 0.4 gate. An along-line bridge arm was built for that class and
+    // adopted ZERO times for exactly this reason; it was removed. The
+    // class needs a per-sample detector and, before that, a bisect of
+    // WHERE in the fit pipeline the zeros are born -- repairing at the end
+    // while an earlier stage manufactures them is the wrong end.
+    //
     // flatFloor at bridged windows still reflects the pre-bridge fit
     // (sparse; revisit if Pass 2's gates misbehave at bridged columns).
     // Kill switch for A/B only: LDCD_FIT_BRIDGE=0.
@@ -10611,6 +10945,7 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
         static const double kBridgeRawStrongIRE = 8.0;
         static const double kBridgeCollapse     = 0.4;
         static const double kBridgePartnerHold  = 0.6;
+
 
         std::vector<std::uint8_t> bridged(width);
         auto lineBasis = [&](const CombCarrierGrammar *g, double *bI, double *bQ) {
@@ -10775,6 +11110,7 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                 bridgeLine(line);
             for (int line = lastLine - 1; line >= firstLine; --line)
                 bridgeLine(line);
+
         }
     }
 
@@ -11079,6 +11415,13 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     // a fact is not scaled. Uncovered frames publish no ceiling and the
     // pass is inert. Where the ceiling carries no authority (+inf), w
     // stays 1 — absence of fact bounds nothing.
+    //
+    // TWO-SIDED since 2026-08-10: the anchor FLOOR is the lower jaw of the
+    // same law (see buildAnchorCeiling and the application below). Where
+    // the certified envelope vouches carrier presence, the fit may not
+    // claim materially less than the anchors license — the underclaim's
+    // residue is carrier left in Y (cross-luma, the checkerboard crime)
+    // and desaturated compact colour (the Saratoga's engines).
     // ---------------------------------------------------------------
     {
         if (!anchorCeilingValid) buildAnchorCeiling();
@@ -11104,14 +11447,40 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                 lddecode::projectExpressibleChromaEnvelope(
                     envRaw.data(), nullptr, width, envSm.data());
 
+                // TWO-SIDED (the floor added 2026-08-10, author: the law
+                // "is supposed to resist delta excess, and sanding off
+                // these features is a big delta. Wedding it to underclaim
+                // seems an odd asymmetry, since as bad as cross color is,
+                // cross-luma is a checkerboard"). Census that priced it:
+                // at anchor-vouched runs <=8 samples wide the fit's claim
+                // sits at p10 0.14-0.26 of the certified loudness (the
+                // Saratoga's impulse engines), while broad runs track at
+                // 0.95-1.01 -- the compact scale is lawless BOTH ways
+                // (p90 1.5), so the bracket closes from both sides.
+                //
+                // The lift is MULTIPLICATIVE and capped: it can only
+                // amplify the fit's own observed waveform -- same shape,
+                // same phase, in-band by construction -- never substitute
+                // one. A claim collapsed to nothing stays nothing (that
+                // class belongs to Pass 1.75's bridge). Floor < ceiling
+                // is guaranteed by construction (min-pool minus margins
+                // vs max-pool plus margins), so the jaws cannot argue.
+                const float *floorRow = anchorFloorRow(line);
+                constexpr double kLiftCap = 4.0;
                 bool any = false;
                 for (int xi = 0; xi < width; ++xi) {
                     const double c = static_cast<double>(ceilRow[left + xi]);
                     double w = 1.0;
                     if (std::isfinite(c) && envSm[xi] > 1e-6)
                         w = std::min(1.0, c / envSm[xi]);
+                    if (w >= 1.0 && floorRow && envSm[xi] > 1e-6) {
+                        const double f =
+                            static_cast<double>(floorRow[left + xi]);
+                        if (f > 0.0 && envSm[xi] < f)
+                            w = std::min(f / envSm[xi], kLiftCap);
+                    }
                     wRaw[xi] = w;
-                    if (w < 1.0) any = true;
+                    if (w != 1.0) any = true;
                 }
                 if (!any) continue;
 
@@ -11121,8 +11490,8 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                 lddecode::projectExpressibleChromaEnvelope(
                     wRaw.data(), nullptr, width, wSm.data());
                 for (int xi = 0; xi < width; ++xi) {
-                    const double w = std::clamp(wSm[xi], 0.0, 1.0);
-                    if (w < 1.0)
+                    const double w = std::clamp(wSm[xi], 0.0, kLiftCap);
+                    if (w != 1.0)
                         fitRow[xi] = static_cast<float>(fitRow[xi] * w);
                 }
             }
@@ -11762,6 +12131,15 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     //       selected comb, which is what it was always entitled to.
     //   native (LDCD_RETRACTED_SOURCE=native) -- raw - carrierFit
     //       everywhere: the pre-anchor default, kept as the A/B escape.
+    //   notchhf (LDCD_RETRACTED_SOURCE=notchhf) -- the anchor ladder with
+    //       the FIT RUNG REPLACED by the notch group's HF-preserving
+    //       member (raw's own wiggle x encoder loudness law x grammar
+    //       testimony under the presumption of luma; see
+    //       buildNotchHfCurves). Facts stay facts, certified comps stay
+    //       certified; only where the ladder fell to the fit does the
+    //       construction stand instead. Phase-free and comb-free by
+    //       construction. A/B rig for the author's judgement; not a
+    //       default.
     // This selector belongs solely to the optional witness view. It has no
     // authority over the certified carrier plane.
     const int retractedSource = ldcdRetractedSourceMode();
@@ -12148,6 +12526,12 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
         // than removing it.
         const double *obs1D = locked1DSource_line(line);
 
+        // Notch-HF rung curves, built once per line (raw-only; independent
+        // of the fit solve, so the fit's NaN abstention does not apply).
+        std::vector<double> lawBp, lawW, lawKeep;
+        if (retractedSource == 4)
+            buildNotchHfCurves(line, lawBp, lawW, lawKeep);
+
         for (int xi = 0; xi < width; ++xi) {
             // The certified plane has exactly three rungs: measured twin
             // carrier, fact-only comp construction, observed locked 1D. It
@@ -12182,7 +12566,11 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                 // never reached.
                 const bool haveFact =
                     std::isfinite(ex) || std::isfinite(certComp[xi]);
-                if (!carrierFitLineSolved(line) && !haveFact) {
+                // The lawful rung (mode 4) is built from raw alone and
+                // exists on every line; the no-solved-fit abstention is a
+                // statement about the FIT and does not apply to it.
+                if (retractedSource != 4 &&
+                    !carrierFitLineSolved(line) && !haveFact) {
                     retractedRow[xi] =
                         std::numeric_limits<float>::quiet_NaN();
                     continue;
@@ -12194,6 +12582,19 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                     break;
                 case 2:
                     witnessCarrier = static_cast<double>(combRowPub[xi]);
+                    break;
+                case 4:
+                    // Notch-HF rung: same fact-first conduct as the anchor
+                    // ladder -- exact channel, then certified comp -- and
+                    // the constructed lawful carrier stands exactly where
+                    // the fit rung stood. The A/B against mode 3 therefore
+                    // differs ONLY where the fit was the source: the
+                    // uncovered letters.
+                    witnessCarrier = std::isfinite(ex)
+                        ? static_cast<double>(ex)
+                        : (std::isfinite(certComp[xi])
+                            ? certComp[xi]
+                            : lawBp[xi] * lawW[xi] * lawKeep[xi]);
                     break;
                 case 3:
                     // THE WITNESS AND THE LADDER PART COMPANY AT THE LAST
@@ -12250,6 +12651,39 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
         }
     }
 
+    // Retained record from the removed LDCD_PROBE_COMPACT census
+    //
+    // Compact colour (Saratoga impulse engines, cube explosion) went
+    // desaturated when a525701 made the uncovered witness rung the fit
+    // instead of the locked 1D observation. Author's mechanism: aperture
+    // walk -- "1D has a 2 pixel reach ... fits are worse, having a 4 pixel
+    // minimum. As the feature is walked, composite realities take over,
+    // and the errors alternate."
+    //
+    // MEASURED on covered def lines against certified truth (facts
+    // deprived), per strong-carrier run, binned by run width:
+    //
+    //   width    claim/certified p10 / p50 / p90     ripple excess H / V
+    //   <=8       0.14-0.26 / 0.75-0.94 / 1.49-1.59      1.91x / 1.86x
+    //   9-16      0.43-0.83 / 0.86-0.99 / 1.08-1.58      1.19x / 1.52x
+    //   17-32     0.79-0.90 / 0.92-1.00 / 0.98-1.36      1.25x / 1.54x
+    //   33-64     0.76-0.95 / 0.98-0.99 / 1.01-1.07      1.07x / 1.56x
+    //
+    // Two DISTINCT defects, which a 2-D checkerboard metric sums into one
+    // number and cannot separate. The HORIZONTAL excess is width-dependent
+    // (1.91x compact -> 1.07x broad): that is the aperture walk, and it is
+    // the compact-colour breathing. The VERTICAL excess is width-
+    // INDEPENDENT (~1.5x at every width): the fit solves each line
+    // separately and its envelope wanders line to line. The vertical one
+    // is unclaimed work.
+    //
+    // SHAPE (per sample, compact runs): 6-7% below 0.15 of certified -- a
+    // CRASH population, not a ripple, which a smooth oscillation about 1
+    // cannot produce. It clusters at the run EDGE (crash 7-14% at d0
+    // against 0-3% at d3): the 4-sample window straddling feature and
+    // background, two composite realities in one solve. See the scope note
+    // on Pass 1.75 above -- that stage's whole-window detector cannot see
+    // this class.
     // TEMPORARY INSTRUMENT (LDCD_PROBE_FITTHEFT=1): held-out fit-theft
     // grading on covered def lines. Question (2026-08-06, user): "It may be
     // that some of the detail along the line is being 'retracted' as

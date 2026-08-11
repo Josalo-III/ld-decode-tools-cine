@@ -1404,12 +1404,41 @@ private:
 	}
 	// 1 = this frame line is a merged-twin (exact-covered) line: PINNED.
 	// Empty on frames without coverage.
+	// Anchor FLOOR: the lower jaw of the envelope law (author, 2026-08-10:
+	// the constraint "is supposed to resist delta excess, and sanding off
+	// these features is a big delta" -- an envelope the encoder could not
+	// have swelled that fast, it also could not have collapsed that fast).
+	// Same geometry as the ceiling; 0 = no authority. Built from the same
+	// certified envelope, ERODED (min-pooled) where the ceiling dilated,
+	// min-of-brackets where the ceiling took max: a floor must survive
+	// anchor drift by shrinking, and both bracketing covers must vouch.
+	std::vector<float> anchorFloor_flat;
+	inline const float *anchorFloorRow(int line) const {
+		if (line < 0 || anchorFloor_flat.empty()) return nullptr;
+		const int w = videoParameters.fieldWidth;
+		if (w <= 0 || (size_t)(line + 1) * w > anchorFloor_flat.size())
+			return nullptr;
+		return anchorFloor_flat.data() + (size_t)line * w;
+	}
 	std::vector<std::uint8_t> anchorCoveredLine;
 	inline bool anchorLinePinned(int line) const {
 		return line >= 0 && line < (int)anchorCoveredLine.size() &&
 		       anchorCoveredLine[line] != 0;
 	}
 	void buildAnchorCeiling();
+	// Notch-HF witness curves for one line (the notch group's HF-preserving
+	// member; its sibling notch-fsc is the fixed cos^2 kernel that nulls the
+	// fSC band wholesale). bp = the recording's own wiggle (fixed bandpass
+	// on raw, no solved phase); wLaw = the encoder-law loudness bound;
+	// keep = the grammar-schedule testimony under the PRESUMPTION OF LUMA:
+	// nothing is subtracted unless partners positively confirm carrier, so a
+	// thin feature the schedule cannot vouch against is never touched (the
+	// phaser-beam dash class, made impossible rather than tuned away). One
+	// implementation serves the witness rung
+	// (LDCD_RETRACTED_SOURCE=notchhf). Carrier object = bp*wLaw*keep.
+	void buildNotchHfCurves(int line, std::vector<double> &bp,
+	                        std::vector<double> &wLaw,
+	                        std::vector<double> &keep) const;
 	// Per-frame build marker so the ceiling is computed once per held
 	// frame regardless of which consumer asks first (the retraction
 	// stage's fit hull runs long before produceY). Reset in loadFields().
