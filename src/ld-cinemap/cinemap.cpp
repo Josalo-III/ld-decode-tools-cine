@@ -2747,6 +2747,72 @@ std::vector<CineMap::TwinACInfo> CineMap::harvestACTwinsForSegment_strict(
     }
   }
 
+  // The spacing tripwire. In 3:2 the A and C triples are structurally
+  // disjoint — three consecutive fields each, separated by the B fields — so
+  // two claimed trios sharing ANY field assert a geometry the pulldown cannot
+  // produce. Both claims are suspect the moment they touch, and suspicion
+  // triggers vetting, not a tally: a contradicted claim keeps its vote only
+  // if it meets the certified standard — the cancellation test already run by
+  // certifyTriplesForSegment — which conservation grants to at most one side
+  // of any contradiction. Uncontradicted claims are NOT vetted; they carry
+  // the sparse solver's ordinary commitment, which is the autosolve's job.
+  //
+  // Measured before this on the Emissary crawl: 656 harvest trios, rich in
+  // mutual contradictions (A and C claimed on shared fields two apart),
+  // outvoting 21 conservation facts at 0.950.
+  if (out.size() >= 2) {
+    auto lo = [](const TwinACInfo& t) {
+      return std::min({t.defSeq, t.compSeq, t.spareSeq});
+    };
+    auto hi = [](const TwinACInfo& t) {
+      return std::max({t.defSeq, t.compSeq, t.spareSeq});
+    };
+
+    std::vector<bool> contradicted(out.size(), false);
+    for (size_t i = 0; i + 1 < out.size(); ++i) {
+      for (size_t j = i + 1; j < out.size(); ++j) {
+        if (hi(out[i]) >= lo(out[j]) && lo(out[i]) <= hi(out[j])) {
+          contradicted[i] = true;
+          contradicted[j] = true;
+        }
+      }
+    }
+
+    auto certified = [&](const TwinACInfo& t) {
+      for (const auto& c : m_certifiedTriples) {
+        if (c.defSeq == t.defSeq && c.spareSeq == t.spareSeq) return true;
+      }
+      return false;
+    };
+
+    int flagged = 0;
+    for (size_t i = 0; i < out.size(); ++i) {
+      if (contradicted[i]) flagged++;
+    }
+
+    size_t kept = 0;
+    int vetoed = 0;
+    for (size_t i = 0; i < out.size(); ++i) {
+      if (contradicted[i] && !certified(out[i])) {
+        vetoed++;
+        continue;
+      }
+      out[kept++] = out[i];
+    }
+    out.resize(kept);
+
+    if (vetoed > 0 && m_decisionTraceEnabled) {
+      qInfo().noquote() << QString(
+                               "CineMap decision: TWIN_SPACING_VET fields "
+                               "[%1..%2] contradicted=%3 vetoed=%4 kept=%5")
+                               .arg(segStartField)
+                               .arg(segEndField)
+                               .arg(flagged)
+                               .arg(vetoed)
+                               .arg(kept);
+    }
+  }
+
   return out;
 }
 
@@ -3024,20 +3090,36 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv, int segStartField,
   if (!m_md || !m_disc) return false;
   if (rejectReason) rejectReason->clear();
 
-  // One standard of evidence. This election's roster is the certified
-  // triples — pairs that cancelled on both conservation channels at the
-  // disc's own floor — and nothing else votes. The harvest's threshold and
-  // ratio paths keep their clue duties (doplGang hole-fill, the metadata
-  // links the decoder's merge consumes) but they no longer elect: on the
-  // Emissary opening crawl the absolute-threshold path manufactured 656
-  // "twins" from mostly-black frames — overlapping A and C claims on shared
-  // fields, geometry 3:2 cannot produce — and locked the segment at 0.950
-  // over the scan's correct refusal. A certified roster makes that class of
-  // contradiction structurally impossible rather than merely detectable:
-  // certification enforces the spacing law before any claim reaches a tally.
-  std::vector<TwinACInfo> acTwins;
+  // The roster: the harvest's trios, vetted by the spacing tripwire, with
+  // the certified triples added on top.
+  //
+  // An earlier build made this election certified-only, and it dumped what
+  // the autosolve exists to deliver: 3,918 fields that the harvest had been
+  // committing as film — dark shots, static cards, looks that break
+  // cancellation — fell to the residual, every one of them manual work the
+  // user used to get for free. We are a sparse solver on purpose. A
+  // weak-evidence commitment that is right saves a manual pass; one that is
+  // wrong was headed for manual repair anyway; an uncommitted segment is
+  // pure loss either way. So the harvest votes — the tripwire inside
+  // harvestACTwinsForSegment_strict has already removed the claims 3:2
+  // cannot produce (the Emissary crawl's 656 trios were rich in overlapping
+  // A/C contradictions, which is how junk outvoted 21 facts at 0.950), and
+  // what survives carries the ordinary commitment. Certified triples join
+  // the same tally as the strongest members of the roster, deduplicated by
+  // their def field.
+  std::vector<TwinACInfo> acTwins =
+      harvestACTwinsForSegment_strict(segStartField, segEndField, cache);
+
   for (const auto& t : m_certifiedTriples) {
     if (t.loSeq < segStartField || t.loSeq + 2 > segEndField) continue;
+    bool present = false;
+    for (const auto& a : acTwins) {
+      if (a.defSeq == t.defSeq) {
+        present = true;
+        break;
+      }
+    }
+    if (present) continue;
     TwinACInfo info;
     info.defSeq = t.defSeq;
     info.spareSeq = t.spareSeq;
@@ -3046,19 +3128,13 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv, int segStartField,
     acTwins.push_back(info);
   }
 
-  // The same corroboration floor certifiedPhaseForRange holds: a lone
-  // certification can be false — noise-marginal cancellations on a static
-  // card produced three of them on the Emissary title card, enough to elect
-  // at 0.950 under an any-roster rule — and two agreeing facts cannot easily
-  // be, since a false one lands on an arbitrary phase. Below the floor the
-  // facts stay out of this election entirely.
-  if (static_cast<int>(acTwins.size()) < MIN_CERTIFIED_VOTES) {
-    if (rejectReason) *rejectReason = "below-certified-quorum";
+  if (acTwins.empty()) {
+    if (rejectReason) *rejectReason = "no-twins";
     if (m_decisionTraceEnabled) {
       qInfo().noquote()
           << QString(
                  "CineMap decision: DG_GEOMETRY_LOCK fields [%1..%2] "
-                 "result=false reason=below-certified-quorum twins=%3")
+                 "result=false reason=no-twins twins=%3")
                  .arg(segStartField)
                  .arg(segEndField)
                  .arg(acTwins.size());
