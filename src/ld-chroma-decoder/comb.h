@@ -476,15 +476,6 @@ public:
 	// licensed recovered-luma sample was published.
 	bool buildIcebergReturn(const FrameBuffer *prevF,
 	                       const FrameBuffer *nextF);
-	// Certified twin-bracket carrier hull (uncovered frames only). The
-	// bracketing covered frames' twin cancellation states what fraction of
-	// the carrier band at a location is genuinely carrier; this frame's
-	// retracted carrier is clamped into the interval that fraction permits.
-	// A BOUND, never a value: see feasibleband.h for the measurement record
-	// and for the alternatives that were falsified. Returns true if the
-	// published carrier changed. Escape LDCD_CARRIER_HULL=0.
-	bool applyCertifiedCarrierHull(const FrameBuffer *prevF,
-	                               const FrameBuffer *nextF);
 	void outputDiagnosticFrame();
 
 	void lurchSharpenCoarsePrior(const double *means,
@@ -1426,6 +1417,23 @@ private:
 		       anchorCoveredLine[line] != 0;
 	}
 	void buildAnchorCeiling();
+	// TEMPORARY INSTRUMENT (LDCD_PROBE_CARRIERBW=1). Read-only census of the
+	// certified carrier's own transition law. Writes nothing, renders
+	// nothing; strip when the question closes.
+	void probeCarrierBandwidth() const;
+	// TEMPORARY INSTRUMENT (LDCD_PROBE_NOTCHTRUTH=1). Grades the notch-fsc
+	// plane against certified luma OUTSIDE the election, calibrates the
+	// carrier-strength estimators against truth, reports the uncovered
+	// distribution, and runs the compact-site sign test. Read-only.
+	void probeNotchTruth() const;
+	// TEMPORARY INSTRUMENT (LDCD_PROBE_STARVERT=1). Vertical run-length
+	// census of the star footprint: does the law fire on structures that
+	// are not isolated in the vertical axis? Read-only.
+	void probeStarVertical() const;
+	// TEMPORARY INSTRUMENT (LDCD_PROBE_COVTRUTH=1). Covered-frame truth
+	// decomposition: certified carrier vs certified luma at the sites the
+	// uncovered machinery fails on. Read-only.
+	void probeCoveredTruth() const;
 	// Notch-HF witness curves for one line (the notch group's HF-preserving
 	// member; its sibling notch-fsc is the fixed cos^2 kernel that nulls the
 	// fSC band wholesale). bp = the recording's own wiggle (fixed bandpass
@@ -1436,9 +1444,31 @@ private:
 	// phaser-beam dash class, made impossible rather than tuned away). One
 	// implementation serves the witness rung
 	// (LDCD_RETRACTED_SOURCE=notchhf). Carrier object = bp*wLaw*keep.
+	// `heard` (optional) marks the samples where testimony was actually
+	// consulted. keep == 0 has TWO meanings -- "the partners convicted this
+	// as luma" and "no partner could be reached" -- and a consumer that
+	// seats the construction as a candidate must tell them apart: the first
+	// is a verdict, the second publishes raw with its carrier intact.
 	void buildNotchHfCurves(int line, std::vector<double> &bp,
 	                        std::vector<double> &wLaw,
-	                        std::vector<double> &keep) const;
+	                        std::vector<double> &keep,
+	                        std::vector<quint8> *heard = nullptr) const;
+	// Compact-colour ESCAPE (author, 2026-08-11: "for the compact color
+	// case, we need detection and escape"). The fit has no native capacity
+	// below its 4-sample aperture, so at a schedule-CONFIRMED compact
+	// carrier run it stands aside rather than being repaired: the claim is
+	// rebuilt from the narrowest apertures available -- 1D's +-2 taps where
+	// they agree, the notch's +-1 complement where they do not. Detection
+	// and arbitration both read the frame's OWN bandpass, so it needs no
+	// covers and works on every frame. Escape LDCD_COMPACT_ESCAPE=0.
+	// Per LINE, called from inside the fit's construction loop so the
+	// carrier-cancelled luma floor is built from the REPAIRED fit. Run as
+	// a later whole-plane pass it left flatFloor describing the
+	// pre-repair state, and Pass 2's content-break and reach gates then
+	// judged repaired samples on stale evidence.
+	void applyCompactColorEscapeLine(int line, double *carrierFit,
+	                                 double *flattened,
+	                                 const double *rawWhole, float *fitRow);
 	// Per-frame build marker so the ceiling is computed once per held
 	// frame regardless of which consumer asks first (the retraction
 	// stage's fit hull runs long before produceY). Reset in loadFields().

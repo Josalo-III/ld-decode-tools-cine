@@ -389,7 +389,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         /*
          * Output path.
          *
-         * splitIQlocked() is the post-election demod of the selected comb.
+        * splitIQlocked() is the post-election demod of the selected comb.
          */
         if (configuration.phaseCompensation) {
             current->measurePostCombImpurity();

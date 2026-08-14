@@ -29,6 +29,134 @@ static constexpr double sin4fsc_data_global[] = { 1.0, 0.0, -1.0, 0.0 };
 inline double sin4fsc(int i) { return sin4fsc_data_global[i & 3]; }
 inline double cos4fsc(int i) { return sin4fsc((i + 1) & 3); }
 
+// ---------------------------------------------------------------------------
+// CARRIER LANES — the two coordinate streams a 4fSC carrier plane really is.
+//
+// A carrier-band filter on a 4fSC grid has taps at EVEN offsets only, so it
+// never mixes the two sample lattices. A plane it produced is therefore not
+// one waveform: it is TWO INDEPENDENT COLOUR-COORDINATE STREAMS AT 2fSC,
+// interleaved. Consecutive samples of one lane are 2 samples of 4fSC apart,
+// hence 180 degrees, so de-alternating by (-1)^(h>>1) -- the same expression
+// for both parities -- recovers each stream directly.
+//
+// Writing c[x] = I*cos(a+33deg) + Q*sin(a+33deg) with a advancing 90deg per
+// sample and theta = a(0) + 33deg, the de-alternated lanes are
+//
+//     laneA =  I*cos(theta) + Q*sin(theta)
+//     laneB = -I*sin(theta) + Q*cos(theta)
+//
+// i.e. THE LANES ARE THE COLOUR COORDINATES ROTATED BY theta, and nothing
+// else. No information is created or destroyed and no sample moves, so the
+// decomposition is exactly invertible.
+//
+// WHY THIS PRIMITIVE EXISTS. The 4fSC demod already in this decoder computes
+// envI[x] = 2*c[x]*sin4fsc(ph) and envQ[x] = 2*c[x]*cos4fsc(ph). Because
+// sin4fsc is {1,0,-1,0}, envI is NON-ZERO ONLY ON EVEN ph and equals twice
+// the de-alternated even lane; envQ likewise carries the odd lane. They are
+// the lanes with zeros punched into the other parity, and the low-pass that
+// follows is doing two jobs at once: enforcing the bandwidth law AND
+// interpolating across those zeros. Entangling them is why the law's kernel
+// shape could not be changed independently -- sharpen the law and you alter
+// the interpolation, relax the interpolation and you alter the law.
+//
+// Working in lanes separates the two, and the separation is visible in the
+// coefficients rather than being a matter of interpretation. Split the 9-tap
+// envelope kernel by tap parity:
+//
+//   even offsets  0.0021  0.0903  0.3153  0.0903  0.0021   sum 0.5001
+//   odd offsets       0.0191  0.2308  0.2308  0.0191       sum 0.4998
+//
+// The EVEN taps land on real lane samples: that is the law. The ODD taps land
+// on the punched zeros: that is the interpolation. (The near-exact 0.5/0.5
+// split is also where the demod's factor of 2 comes from.) Renormalised, the
+// law a lane actually receives is the 5-tap
+//
+//   [0.004199, 0.180564, 0.630474, 0.180564, 0.004199]
+//
+// which reproduces the full-grid response through the passband to within
+// 0.08 dB (-2.21 vs -2.26 at 1.30 MHz, -2.93 vs -3.01 at 1.50).
+//
+// So a full-grid kernel whose taps are even-only IS a lane kernel with every
+// other tap taken, and a lane kernel needs about half the taps for that
+// mechanical reason -- not because a sample rate changed underneath. (A lane
+// does carry one sample per two of 4fSC, but nothing here rests on saying so,
+// and 2fSC is numerically the 4fSC grid's own Nyquist, which invites exactly
+// the rate/Nyquist confusion this note is written to avoid.)
+//
+// THE DECOMPOSITION BOTTOMS OUT AT TWO, and not by convention: there are two
+// lanes because the carrier is a two-component object. Four samples carry
+// both coordinates twice, once positive and once negative; de-alternation
+// undoes the sign and parity separates the coordinates, which exhausts the
+// structure. Splitting a lane again is ordinary decimation with nothing
+// behind it -- two streams with no distinction, half the samples of one
+// coordinate discarded. The licence is spent after one use.
+//
+// hypot(c[x], c[x+1]) is the same conflation in the other direction: a sound
+// magnitude, but it discards the lane split, which is real evidence -- on the
+// certified carrier both lanes are separately FACT.
+//
+// NOTE ON AXES: these are LANES, not I and Q. Recovering the colour axes
+// needs the rotation by theta above, and theta is a property of the line's
+// burst. This primitive deliberately stops short of naming the axes; a
+// caller that needs I/Q must supply the angle, because handing a lane to a
+// per-axis law under an axis name is the one error neither can detect.
+// ---------------------------------------------------------------------------
+
+// De-alternation sign for absolute sample index h. Self-inverse.
+inline double carrierLaneSign(int h) { return ((h >> 1) & 1) ? -1.0 : 1.0; }
+
+// Split `carrier` (width samples starting at absolute index h0) into its two
+// lanes. laneA collects even absolute indices, laneB odd. Non-finite samples
+// are carried through, never patched: an absent sample is not a zero.
+inline void decomposeCarrierLanes(const double *carrier, int h0, int width,
+                                  std::vector<double> &laneA,
+                                  std::vector<double> &laneB)
+{
+    laneA.clear();
+    laneB.clear();
+    if (!carrier || width <= 0) return;
+    laneA.reserve((width + 1) / 2);
+    laneB.reserve((width + 1) / 2);
+    for (int i = 0; i < width; ++i) {
+        const int h = h0 + i;
+        const double d = carrier[i] * carrierLaneSign(h);
+        ((h & 1) == 0 ? laneA : laneB).push_back(d);
+    }
+}
+
+// Exact inverse of decomposeCarrierLanes for the same (h0, width).
+inline void recomposeCarrierLanes(const std::vector<double> &laneA,
+                                  const std::vector<double> &laneB,
+                                  int h0, int width, double *carrier)
+{
+    if (!carrier || width <= 0) return;
+    size_t ia = 0, ib = 0;
+    for (int i = 0; i < width; ++i) {
+        const int h = h0 + i;
+        const bool even = ((h & 1) == 0);
+        const std::vector<double> &lane = even ? laneA : laneB;
+        size_t &idx = even ? ia : ib;
+        if (idx >= lane.size()) return;      // caller mismatched the geometry
+        carrier[i] = lane[idx++] * carrierLaneSign(h);
+    }
+}
+
+// Rotate a lane pair into a colour-axis pair, and back. theta is the angle
+// the lanes are rotated by (see the derivation above); pass the line's own
+// value. These are the only places an axis convention enters.
+inline void laneToAxis(double a, double b, double cosT, double sinT,
+                       double &axWide, double &axNarrow)
+{
+    axWide   = a * cosT - b * sinT;
+    axNarrow = a * sinT + b * cosT;
+}
+inline void axisToLane(double axWide, double axNarrow,
+                       double cosT, double sinT, double &a, double &b)
+{
+    a =  axWide * cosT + axNarrow * sinT;
+    b = -axWide * sinT + axNarrow * cosT;
+}
+
 // Magnitude of a bounded 2-vector: direct sqrt, not std::hypot.  Comb
 // magnitudes are video-domain quantities (sample/IRE scale) whose squares
 // cannot over- or underflow a double, so hypot's IEEE range guarding is

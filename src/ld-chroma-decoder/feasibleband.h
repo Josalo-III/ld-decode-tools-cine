@@ -77,9 +77,17 @@ inline FeasibleInterval lumaFeasibleFromPairSums(
 //
 // This is a feasibility fact of the same family as the pair-sum interval
 // above: it forbids what the encoder could not have produced, and says
-// nothing about which surviving value is preferred.  It differs only in
-// living on a SEQUENCE rather than a scalar, so it is expressed as a
-// projection onto the expressible sub-space instead of as an interval.
+// nothing about which surviving value is preferred.  It differs in living on
+// a SEQUENCE rather than a scalar, so it cannot be an interval.
+//
+// IT IS NOT A PROJECTION, despite what this header said until 2026-08-11.
+// A forward FIR is idempotent only if its response is 0 or 1 everywhere, and
+// this one's is neither: applying it twice costs a further 3.01 dB at 1.5 MHz
+// (measured; the same defect a third-party review caught in 2026-07 when it
+// was being applied at three layers, H(f)^3).  Callers must therefore know
+// how many times it has run, which is a fragile contract for something
+// calling itself a law.  See the kernel note below for why the shape is
+// wrong for this job in the first place.
 //
 // From the NTSC encoder (ld-chroma-encoder/encoder/ntscencoder.cpp):
 //
@@ -87,6 +95,16 @@ inline FeasibleInterval lumaFeasibleFromPairSums(
 //         uvFilter.apply(C1);  uvFilter.apply(C2);      // 9 taps, 1.3 MHz
 //     and only then modulated
 //         chroma = C2*sin(a + 33deg) + C1*cos(a + 33deg);
+//
+//     A SECOND ENCODER MODE EXISTS, and it is easy to over-read. Under
+//     NARROWBAND_Q (ntscencoder.cpp:300) C2 is rotated 33 degrees out of U/V
+//     and filtered by a 23-tap 0.46 MHz kernel instead, so the two
+//     coordinates are bandlimited very differently. But NARROWBAND_Q is an
+//     ENCODER symbol for synthesising test material -- it is NOT evidence
+//     about how any disc was mastered, and it must not be cited as such.
+//     What the DECODER already believes about the axes is in filterIQLocked,
+//     which renders I at 1.5 MHz and Q at 0.67 MHz -- a mechanism chosen for
+//     spec-mindful noise removal, not a law (see the locked-Q record).
 //   * luma receives NO filter of any kind: Y[x] goes straight to the output,
 //     gated only at the active-region edges.  Full band to Nyquist.
 //
@@ -106,14 +124,49 @@ inline FeasibleInterval lumaFeasibleFromPairSums(
 // Caveats this primitive does NOT resolve:
 //   * The law is an EXCLUSION.  Carrier cannot live outside the band, but luma
 //     certainly lives inside it, so this constrains without fully separating.
-//   * Real mastering chains are not this encoder.  A ~1.3 MHz chroma bandlimit
-//     is standard NTSC practice rather than an implementation quirk, but
-//     multi-generation or dubbed sources may present a somewhat wider
-//     effective band; treat the projection as the conservative floor it is.
+//   * Real mastering chains are not this encoder.  This caveat used to warn
+//     that multi-generation or dubbed sources might present a WIDER effective
+//     band, making the law unsafe as a bound.  Measured on disc 2026-08-11
+//     against certified twins, and it points the other way: nothing measured
+//     anywhere exceeded its design filter, so the law is confirmed as a
+//     ceiling.  The result is PER AXIS and pooling the axes gives a confident
+//     wrong number -- the narrow axis is at spec everywhere (0.46-0.55 MHz),
+//     while the wide axis reaches spec only on electronically-generated
+//     content (1.05-1.17 MHz on a title, 0.62-0.65 on anything photographed).
+//     That last figure is a property of CONTENT through a lens, never a
+//     legality bound: a law must forbid only what the encoder could not emit,
+//     so the wide axis stays at its 1.50 MHz design and must not be tightened
+//     toward what one scene happened to contain.
 // ---------------------------------------------------------------------------
 
-// The encoder's own chroma bandlimit (ntscencoder.cpp uvFilterCoeffs):
-// 0 dB at DC, >= -2 dB at 1.3 MHz, < -20 dB at 3.6 MHz, at 4fSC.
+// The encoder's own chroma bandlimit (ntscencoder.cpp uvFilterCoeffs).
+//
+// MEASURED RESPONSE at 4fSC (2026-08-11). The two figures this comment used
+// to carry -- ">= -2 dB at 1.3 MHz, < -20 dB at 3.6 MHz" -- were BOTH wrong,
+// and wrong in the reassuring direction:
+//
+//        DC   0.46   1.00   1.30   1.50   2.00   2.50   3.58 MHz
+//      0.00  -0.28  -1.34  -2.26  -3.01  -5.35  -8.37 -17.15 dB
+//
+// So it takes 2.26 dB at 1.3 MHz (not "at most 2") and reaches only
+// -17.15 dB at Nyquist (not "below -20").
+//
+// THIS IS THE ENCODER'S CREATION FILTER, NOT A LEGALITY TEST, and the two
+// jobs want opposite shapes. Legal chroma reaching us has ALREADY been
+// through this response once at the encoder; applying it again in the name
+// of legality attenuates what is by definition legal -- a third of the
+// amplitude at the encoder's own passband edge -- while admitting
+// out-of-band energy at only -17 dB. A law wants a flat passband and a steep
+// stop; this has a drooping passband and a lazy stop. It fails in both
+// directions at once.
+//
+// Verified replacements exist (Kaiser designs, flat to 0.01 dB in band,
+// -59/-88 dB in stop, idempotent to 0.009 dB so the run-count contract
+// disappears) but are NOT wired: they must be applied on the true I/Q axes,
+// and the demodulated channels in this decoder are on the raw sample-class
+// lattice (combmath.h sin4fsc/cos4fsc), which is the LANE frame, not I/Q.
+// Handing a narrow Q kernel to a channel merely NAMED Q would clip legal I
+// by 26 dB at 1.3 MHz.
 inline constexpr int kChromaEnvelopeTaps = 9;
 inline constexpr double kChromaEnvelopeFilter[kChromaEnvelopeTaps] = {
     0.0021, 0.0191, 0.0903, 0.2308, 0.3153,
@@ -165,6 +218,149 @@ inline void projectExpressibleChromaEnvelope(const double *in,
 
         out[i] = (used > 1e-12) ? (acc / used) : in[i];
     }
+}
+
+// ---------------------------------------------------------------------------
+// REPLACEMENT LAW KERNELS (designed and verified 2026-08-11, NOT YET WIRED).
+//
+// The kernel above is the encoder's CREATION filter. These two are LEGALITY
+// TESTS, which is a different job and wants the opposite shape: flat wherever
+// the encoder could legally have put energy, steep immediately above it.
+//
+//                    in band      at the stop      idempotency
+//   encoder kernel   -3.01 dB @1.5   -17 dB @Nyq   -3.01 dB per extra pass
+//   wide law         -0.01 dB @1.5   -59 dB @2.2   -0.009 dB
+//   narrow law       -0.01 dB @0.8   -88 dB @1.5   -0.008 dB
+//
+// Being idempotent to 0.01 dB, these retire the "must be applied exactly
+// once" contract that made the old kernel fragile: a second pass costs
+// nothing measurable, so no caller has to know the run count.
+//
+// TWO AXES. Read the landscape before wiring either, because most of this
+// ground is already surveyed and the survey is better than a fresh guess:
+//
+//   * filterIQLocked ALREADY filters per axis (1.5 / 0.67 MHz). Per-axis
+//     treatment is not a new capability to introduce here.
+//   * Swapping the encoder 9-tap onto both render axes was already measured
+//     (LDCD_RENDER_FEASIBLE): cross-colour 3% BETTER, width and saturation
+//     unchanged -- free, and it does not move the chroma smear.
+//   * Naively widening Q to 1.3 MHz costs +14.2% cross-colour on GGV
+//     monochrome bars. Any Q change must be measured on BOTH axes at once:
+//     cross-colour admitted AND transition width.
+//
+//   WIDE -- passband 1.50 MHz, the encoder's uvFilter design point, which is
+//   what a law must bound. Do NOT retune it toward the 0.62-0.65 MHz measured
+//   on photographed material: that is a lens and a film chain, not a legality
+//   limit, and a title on the same disc legally reached 1.05-1.17 MHz.
+//
+//   NARROW -- passband 0.80 MHz. THIS NUMBER IS NOT YET JUSTIFIED. It was
+//   derived from the encoder's narrowband-Q design point plus margin, i.e.
+//   from a test-synthesis mode misread as a mastering fact. It also sits
+//   LOOSER than the 0.67 MHz the renderer already applies, so as written it
+//   would never bind. Settle what the narrow axis's legal bound actually is
+//   before wiring this; the number here is a placeholder, not a finding.
+// ---------------------------------------------------------------------------
+
+enum class ChromaLawAxis { Wide, Narrow };
+
+inline constexpr int kChromaLawWideTaps = 75;
+inline constexpr double kChromaLawWide[kChromaLawWideTaps] = {
+    -0.000172157, -0.000216309, -0.000052499, +0.000319393, +0.000673212,
+    +0.000650387, +0.000037160, -0.000954748, -0.001665972, -0.001360526,
+    +0.000173559, +0.002222995, +0.003366078, +0.002355885, -0.000817816,
+    -0.004485000, -0.006027750, -0.003587675, +0.002276636, +0.008269144,
+    +0.010004789, +0.004946670, -0.005193938, -0.014504787, -0.015983451,
+    -0.006276025, +0.010902650, +0.025400201, +0.025895632, +0.007397957,
+    -0.023421518, -0.048952329, -0.048233909, -0.008148624, +0.067696001,
+    +0.157745539, +0.230515396, +0.258411496, +0.230515396, +0.157745539,
+    +0.067696001, -0.008148624, -0.048233909, -0.048952329, -0.023421518,
+    +0.007397957, +0.025895632, +0.025400201, +0.010902650, -0.006276025,
+    -0.015983451, -0.014504787, -0.005193938, +0.004946670, +0.010004789,
+    +0.008269144, +0.002276636, -0.003587675, -0.006027750, -0.004485000,
+    -0.000817816, +0.002355885, +0.003366078, +0.002222995, +0.000173559,
+    -0.001360526, -0.001665972, -0.000954748, +0.000037160, +0.000650387,
+    +0.000673212, +0.000319393, -0.000052499, -0.000216309, -0.000172157
+};
+
+inline constexpr int kChromaLawNarrowTaps = 87;
+inline constexpr double kChromaLawNarrow[kChromaLawNarrowTaps] = {
+    +0.000142502, +0.000214411, +0.000239181, +0.000172641, -0.000011973,
+    -0.000305192, -0.000649802, -0.000943503, -0.001059383, -0.000882418,
+    -0.000353991, +0.000488651, +0.001492946, +0.002403798, +0.002913359,
+    +0.002741818, +0.001731759, -0.000069799, -0.002369908, -0.004651116,
+    -0.006264315, -0.006582279, -0.005183165, -0.002018322, +0.002486059,
+    +0.007435369, +0.011601380, +0.013674906, +0.012592748, +0.007868721,
+    -0.000153808, -0.010203333, -0.020183911, -0.027486889, -0.029467403,
+    -0.023998482, -0.009988168, +0.012257890, +0.040921596, +0.072850966,
+    +0.104016519, +0.130168745, +0.147572959, +0.153676469, +0.147572959,
+    +0.130168745, +0.104016519, +0.072850966, +0.040921596, +0.012257890,
+    -0.009988168, -0.023998482, -0.029467403, -0.027486889, -0.020183911,
+    -0.010203333, -0.000153808, +0.007868721, +0.012592748, +0.013674906,
+    +0.011601380, +0.007435369, +0.002486059, -0.002018322, -0.005183165,
+    -0.006582279, -0.006264315, -0.004651116, -0.002369908, -0.000069799,
+    +0.001731759, +0.002741818, +0.002913359, +0.002403798, +0.001492946,
+    +0.000488651, -0.000353991, -0.000882418, -0.001059383, -0.000943503,
+    -0.000649802, -0.000305192, -0.000011973, +0.000172641, +0.000239181,
+    +0.000214411, +0.000142502
+};
+
+// Shared FIR body: symmetric kernel, taps dropped at line ends and beside
+// invalid positions with the remaining weight renormalised so passband gain
+// stays 1.0 (the cutoff is correspondingly approximate there). `in` and `out`
+// may not alias.
+inline void applyRenormalisedSymmetricFir(const double *in,
+                                          const std::uint8_t *valid,
+                                          int n,
+                                          double *out,
+                                          const double *k,
+                                          int ktaps)
+{
+    if (!in || !out || !k || n <= 0 || ktaps <= 0)
+        return;
+
+    const int half = ktaps / 2;
+
+    for (int i = 0; i < n; ++i) {
+        if (valid && !valid[i]) {
+            out[i] = in[i];
+            continue;
+        }
+
+        double acc = 0.0;
+        double used = 0.0;
+        for (int t = 0; t < ktaps; ++t) {
+            const int j = i + t - half;
+            if (j < 0 || j >= n)
+                continue;
+            if (valid && !valid[j])
+                continue;
+            const double w = k[t];
+            acc += w * in[j];
+            used += w;
+        }
+
+        out[i] = (used > 1e-12) ? (acc / used) : in[i];
+    }
+}
+
+// Bound one COLOUR COORDINATE to what the encoder could have modulated on
+// that axis. The caller must supply a genuine I or Q sequence: the axis is
+// the whole point, and the demodulated channels in this decoder are on the
+// raw sample-class lattice (the lane frame), which is 33 degrees away.
+// Handing a lane to this function under an axis name is the one mistake it
+// cannot detect.
+inline void projectLawfulChromaCoordinate(const double *in,
+                                          const std::uint8_t *valid,
+                                          int n,
+                                          double *out,
+                                          ChromaLawAxis axis)
+{
+    if (axis == ChromaLawAxis::Narrow)
+        applyRenormalisedSymmetricFir(in, valid, n, out,
+                                      kChromaLawNarrow, kChromaLawNarrowTaps);
+    else
+        applyRenormalisedSymmetricFir(in, valid, n, out,
+                                      kChromaLawWide, kChromaLawWideTaps);
 }
 
 // Coarse-residual feasibility bounds on the COMPOSITE carrier at one sample.
