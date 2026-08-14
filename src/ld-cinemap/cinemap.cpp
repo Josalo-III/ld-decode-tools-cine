@@ -4909,6 +4909,32 @@ int CineMap::certifiedPhaseForRange(int fieldStart, int fieldEnd,
   if (outDissent) *outDissent = total - bestN;
 
   if (bestN < MIN_CERTIFIED_VOTES) return -1;
+
+  // Triples override a solve only when they form a LATTICE — one schedule,
+  // agreed. Real film is unanimous (the battle votes 19-of-19 on one
+  // offset); flukes on near-static video certify at density but SCATTER at
+  // chance (measured 4-of-12 and 3-of-6 across the five offsets), because a
+  // fluke is a noise event and noise has no schedule.
+  //
+  // The majority floor is FLAT, not proportional to segment size: a film
+  // segment's triples concentrate wherever its motion permits certification
+  // — the battle's twenty live in one quiet hundred-field stretch of a
+  // thousand-frame segment — so scaling the demand by span punishes exactly
+  // the segments whose facts are localised (measured: it blocked the battle
+  // by one vote). Five agreeing clears every measured fluke population
+  // (which top out at four) with real film an order beyond; the bare
+  // two-vote quorum survives for microshots, which is what it was for: a
+  // shot too short to build a pattern rides its only facts, and nothing
+  // else can carry it.
+  constexpr int MICROSHOT_MAX_FRAMES = 50;
+  constexpr int LATTICE_VOTES_NONMICRO = 5;
+  const int frames = std::max(1, (fieldEnd - fieldStart + 1) / 2);
+  const int densityNeed = (frames <= MICROSHOT_MAX_FRAMES)
+                              ? MIN_CERTIFIED_VOTES
+                              : LATTICE_VOTES_NONMICRO;
+  if (bestN < densityNeed) return -1;
+  if (static_cast<double>(bestN) < 0.8 * static_cast<double>(total)) return -1;
+
   return best;
 }
 
