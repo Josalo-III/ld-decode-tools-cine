@@ -3644,21 +3644,43 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // signature; it was being read as "ambiguous" and handed to the harvest.
   //
   // Three gates, so the verdict is imposed and not retreated to. All five
-  // phases negative — the signature itself. Power at the busy-no-phase
-  // precedent (avgW >= 0.35) — enough active frames to mean it. And a
-  // MOTION floor on the median raw score: a static video card reads
-  // all-negative with high avgW too, because the stretch amplifies its
-  // noise, but it combs at noise level — measured on Emissary, the title
-  // card sits at p50 0.18 against 3.16 for the disc-head video (which holds
-  // the 407-421 transition) and 9.77 for the crawl. Weak-comb material
-  // falls through to the progressive residue instead, by the standing cost
-  // ruling: comb too faint to certify -2 is comb too faint for the
-  // interfield stage to mangle, and the Frame regime is superior absent
-  // errors. Segments holding certified facts can never land here — the
-  // facts override in solveSegment converts any non-film verdict back to
-  // film, which is what keeps the crawl's segment (its battle triples) on
-  // the plate.
-  constexpr double INTERLACE_P50_MIN = 1.0;
+  // phases negative — the signature itself. Enough frames to constitute a
+  // regime rather than a glitch. And a MOTION gate on the TOP of the raw
+  // distribution, not its middle: low-motion interlace combs in a minority
+  // of frames — a talking head on Vol reads p50 0.033 with its active
+  // frames at 1.5 — while a static video card's whole distribution tops
+  // out at noise (title card p90 0.198). A median floor missed the first
+  // and an avgW floor blocked two genuine Vol shots at 0.195/0.257 while
+  // never guarding anything (the title card it might have caught sits at
+  // avgW 0.76). Measured p90 populations: title card 0.198 / low-motion
+  // interlace 1.51 / heavy interlace 7-12.6 — the gate at 0.5 has 2.5x
+  // margin below and 3x above. Weak-comb material falls through to the
+  // progressive residue, by the standing cost ruling: comb too faint to
+  // certify -2 is comb too faint for the interfield stage to mangle, and
+  // the Frame regime is superior absent errors. Segments holding certified
+  // facts can never land here — the facts override in solveSegment converts
+  // any non-film verdict back to film, which is what keeps the crawl's
+  // segment (its battle triples) on the plate.
+  // A per-disc calibrated motion floor was built and measured here, and it
+  // failed in both directions at once: block minima land in a disc's black
+  // scenes (Emissary read 0.004, letting a static card through), while a
+  // disc without static ground reads its floor ABOVE its own faintest
+  // genuine interlace (Vol read 0.064 against a vouched 0.060 talking-head
+  // shot). The fixed gate stays, and the faintest shots stay manual — the
+  // priced residue of a threshold that must also keep faint FILM (a
+  // talking-head segment measures p90 0.384) out of -2.
+  // The completing grammar, the author's law: comb 2-in-5 is film, comb
+  // everywhere is -2, comb nowhere is -3. The 2-in-5 readings run first
+  // (scan lock, bump); what reaches here is the not-2-in-5 class, and this
+  // gate is the everywhere/nowhere line at the meaningful-comb scale.
+  // Measured across two discs: everything vouched -2 carries p90 >= 1.51;
+  // everything vouched away from -2 tops out at 0.94 (a grain-dead composite
+  // shot whose faint video-rate comb the author priced as -3, and faint film
+  // talking heads at 0.07-0.38). 1.2 sits between with 1.27x margin each
+  // way. Below it, comb-nowhere material falls through to the election and
+  // the progressive residue.
+  constexpr double INTERLACE_P90_MIN = 1.2;
+  constexpr int INTERLACE_MIN_FRAMES = 15;
 
   auto interlaceThirdReading = [&](PhaseRun r) -> PhaseRun {
     if (r.type != PhaseRun::Type::Unknown) return r;
@@ -3668,7 +3690,8 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
       if (phaseScores[p] >= 0.0) allNegative = false;
     }
 
-    if (allNegative && avgW >= 0.35 && p50 >= INTERLACE_P50_MIN) {
+    if (allNegative && numFrames >= INTERLACE_MIN_FRAMES &&
+        p90 >= INTERLACE_P90_MIN) {
       r.type = PhaseRun::Type::Interlaced;
       r.confidence = 0.75;
       r.reason = "no-phase-leaves-pures-clean";
@@ -3677,12 +3700,12 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
         qInfo().noquote()
             << QString(
                    "CineMap decision: MIXEDNESS_INTERLACE fields [%1..%2] "
-                   "frames=%3 avgW=%4 p50=%5 scores={%6} result=interlaced")
+                   "frames=%3 avgW=%4 p90=%5 scores={%6} result=interlaced")
                    .arg(startField)
                    .arg(endField)
                    .arg(numFrames)
                    .arg(avgW, 0, 'f', 4)
-                   .arg(p50, 0, 'f', 4)
+                   .arg(p90, 0, 'f', 4)
                    .arg(phaseArrayString(phaseScores, -1));
       }
     }
