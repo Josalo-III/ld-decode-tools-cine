@@ -39,7 +39,7 @@ class CineMap {
   int probeDgRange(const QString& tbcFilePath, int startField, int endField);
 
   // Instrument: calibrate the disc's twin/noise floor and report it. If ranges
-  // is non-empty ("a-b,c-d,..."), also report each range's duty at both
+  // is non-empty ("a-b,c-d,..."), also report each range's twin share at both
   // operating points. Read-only — no solve, no metadata write.
   int probeDgFloor(const QString& tbcFilePath, const QString& ranges);
 
@@ -288,14 +288,14 @@ class CineMap {
   //
   // Two different questions read the same measurement at different generosity.
   // The recall question — "are there any twins here, or may we stop looking" —
-  // is deliberately liberal: progressive material stays at exactly zero duty
+  // is deliberately liberal: progressive material stays at exactly zero twin share
   // out to 3x the floor, so admitting more costs nothing, while a missed twin
   // means incorrect operations downstream in chroma decoder. Non-terminal
   // negatives may be wrong; they only trigger a harder look.
   //
   // The geometry question — "which phase" — uses the tight point, because
   // surplus hits blur the spacing-5 / alternating-parity structure that carries
-  // the phase (at 1.75x a low-motion telecine shot inflates to 46% duty against
+  // the phase (at 1.75x a low-motion telecine shot inflates to a 46% twin share against
   // the ~20% that 3:2 predicts).
   static constexpr double FLOOR_MULT_RECALL = 2.00;
   static constexpr double FLOOR_MULT_GEOMETRY = 1.35;
@@ -399,7 +399,7 @@ class CineMap {
   // telecined segment lands near 1/5; progressive material lands at 0; content
   // with no motion at all lands near 1, which is the absence of information
   // rather than evidence of twins.
-  double twinDuty(SourceVideo& sv, int startField, int endField,
+  double twinShare(SourceVideo& sv, int startField, int endField,
                   double floorIre, int* outHits = nullptr,
                   int* outPairs = nullptr, double* outQuietestIre = nullptr,
                   std::vector<int>* outHitFields = nullptr);

@@ -1870,8 +1870,8 @@ bool CineMap::filmRuledOut(SourceVideo& sv, int segStart, int segEnd) {
   // Geometry operating point: the tight floor. The generous one deliberately
   // over-admits so a twin is never missed, but those extra hits are not twins
   // and scatter across offsets, diluting the very concentration being measured.
-  const double dutyG =
-      twinDuty(sv, segStart, segEnd, nf.ire * FLOOR_MULT_GEOMETRY, &hits,
+  const double shareG =
+      twinShare(sv, segStart, segEnd, nf.ire * FLOOR_MULT_GEOMETRY, &hits,
                &pairs, &quiet, &hitFields);
 
   const int possible = std::max(0, segEnd - segStart - 1);
@@ -1882,7 +1882,7 @@ bool CineMap::filmRuledOut(SourceVideo& sv, int segStart, int segEnd) {
   // Everything at the floor is the absence of information, not evidence of
   // video: a static passage's field difference is pure noise whether it is film
   // or not.
-  if (dutyG >= 0.80) return false;
+  if (shareG >= 0.80) return false;
 
   const double conc = cycleConcentration(hitFields);
   const bool ruledOut = (conc < CYCLE_CONCENTRATION_MIN);
@@ -1890,14 +1890,14 @@ bool CineMap::filmRuledOut(SourceVideo& sv, int segStart, int segEnd) {
   if (m_decisionTraceEnabled) {
     qInfo().noquote() << QString(
                              "CineMap decision: FILM_CENSUS fields [%1..%2] "
-                             "floor=%3 pairs=%4 coverage=%5 dutyGeo=%6 hits=%7 "
+                             "floor=%3 pairs=%4 coverage=%5 shareGeo=%6 hits=%7 "
                              "conc=%8 filmRuledOut=%9")
                              .arg(segStart)
                              .arg(segEnd)
                              .arg(nf.ire, 0, 'f', 4)
                              .arg(pairs)
                              .arg(coverage, 0, 'f', 3)
-                             .arg(dutyG, 0, 'f', 3)
+                             .arg(shareG, 0, 'f', 3)
                              .arg(hits)
                              .arg(conc, 0, 'f', 3)
                              .arg(ruledOut ? "yes" : "no");
@@ -1944,7 +1944,7 @@ double CineMap::cycleConcentration(const std::vector<int>& hitFields) const {
   return best;
 }
 
-double CineMap::twinDuty(SourceVideo& sv, int startField, int endField,
+double CineMap::twinShare(SourceVideo& sv, int startField, int endField,
                          double floorIre, int* outHits, int* outPairs,
                          double* outQuietestIre,
                          std::vector<int>* outHitFields) {
@@ -2023,7 +2023,7 @@ int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges) {
   }
 
   printf("\n%-16s %6s %6s %6s %8s %8s %8s %8s %5s  %s\n", "range", "pairs",
-         "cover", "quiet", "q/floor", "dutyGeo", "dutyRec", "hitsRec", "conc",
+         "cover", "quiet", "q/floor", "shareGeo", "shareRec", "hitsRec", "conc",
          "read");
 
   int reported = 0;
@@ -2038,9 +2038,9 @@ int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges) {
     int hitsG = 0, hitsR = 0, pairs = 0;
     double quiet = 0.0;
     std::vector<int> hitFieldsG, hitFieldsR;
-    const double dutyG = twinDuty(sv, lo, hi, nf.ire * FLOOR_MULT_GEOMETRY,
+    const double shareG = twinShare(sv, lo, hi, nf.ire * FLOOR_MULT_GEOMETRY,
                                   &hitsG, &pairs, &quiet, &hitFieldsG);
-    const double dutyR = twinDuty(sv, lo, hi, nf.ire * FLOOR_MULT_RECALL,
+    const double shareR = twinShare(sv, lo, hi, nf.ire * FLOOR_MULT_RECALL,
                                   &hitsR, &pairs, &quiet, &hitFieldsR);
 
     // Each question reads its own operating point. "All floor, so no
@@ -2080,7 +2080,7 @@ int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges) {
     // otherwise slip through and read as twins on the strength of an incidental
     // cycle. Low-motion telecine reaches only ~57% at the generous point, so an
     // 80% line still separates it from near-static's 83-98%.
-    const bool allFloor = (dutyG >= 0.80) || (dutyR >= 0.80);
+    const bool allFloor = (shareG >= 0.80) || (shareR >= 0.80);
 
     // Solve for the preponderance: the output regime is whichever covers the
     // BIGGEST PICTURE AREA. A composite carries more than one regime at once
@@ -2103,7 +2103,7 @@ int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges) {
 
     printf("%-16s %6d %5.0f%% %6.2f %8.2f %7.1f%% %7.1f%% %8d %6.2f  %s\n",
            qPrintable(spec), pairs, coverage * 100.0, quiet, margin,
-           dutyG * 100.0, dutyR * 100.0, hitsR, conc, read);
+           shareG * 100.0, shareR * 100.0, hitsR, conc, read);
     reported++;
   }
 

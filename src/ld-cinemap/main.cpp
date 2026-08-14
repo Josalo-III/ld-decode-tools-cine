@@ -350,7 +350,7 @@ int main(int argc, char* argv[]) {
       QStringList() << "dg-floor",
       "Instrument: measure the disc's own twin/noise floor and report it. "
       "Value is an optional comma-separated list of field ranges (a-b,c-d) "
-      "whose duty is then reported at both operating points; pass 'none' for "
+      "whose twin share is then reported at both operating points; pass 'none' for "
       "calibration only. Read-only: no solve, no metadata write.",
       "ranges");
 
