@@ -3505,58 +3505,6 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   const double activeSpread =
       (activeFrames > 0) ? (spread / activeFrames) : 0.0;
 
-  if (activeFrames == 0 && avgW < 0.05) {
-    run.type = PhaseRun::Type::Unknown;
-    run.reason = "silence";
-
-    if (m_decisionTraceEnabled) {
-      qInfo().noquote()
-          << QString(
-                 "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
-                 "result=unknown reason=silence p10=%4 p50=%5 p90=%6 avgW=%7 "
-                 "activeFrames=%8 scores={%9}")
-                 .arg(startField)
-                 .arg(endField)
-                 .arg(numFrames)
-                 .arg(p10, 0, 'f', 6)
-                 .arg(p50, 0, 'f', 6)
-                 .arg(p90, 0, 'f', 6)
-                 .arg(avgW, 0, 'f', 4)
-                 .arg(activeFrames)
-                 .arg(phaseArrayString(phaseScores, bestP));
-    }
-
-    return run;
-  }
-
-  if (avgW > 0.35 && activeSpread < (avgW * 0.15)) {
-    run.type = PhaseRun::Type::Unknown;
-    run.confidence = 0.0;
-    run.reason = "busy-no-phase";
-
-    if (m_decisionTraceEnabled) {
-      qInfo().noquote()
-          << QString(
-                 "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
-                 "result=unknown reason=busy-no-phase p10=%4 p50=%5 p90=%6 "
-                 "avgW=%7 activeFrames=%8 activeSpread=%9 threshold=%10 "
-                 "scores={%11}")
-                 .arg(startField)
-                 .arg(endField)
-                 .arg(numFrames)
-                 .arg(p10, 0, 'f', 6)
-                 .arg(p50, 0, 'f', 6)
-                 .arg(p90, 0, 'f', 6)
-                 .arg(avgW, 0, 'f', 4)
-                 .arg(activeFrames)
-                 .arg(activeSpread, 0, 'f', 4)
-                 .arg(avgW * 0.15, 0, 'f', 4)
-                 .arg(phaseArrayString(phaseScores, bestP));
-    }
-
-    return run;
-  }
-
   // -------------------------------------------------------------------------
   // Second reading: the two-frame bump against the segment norm.
   //
@@ -3685,6 +3633,115 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
     return r;
   };
 
+  // -------------------------------------------------------------------------
+  // Third reading: interlace, from the scan's own signature.
+  //
+  // 3:2 guarantees at least three of any five consecutive frames are pure,
+  // and a pure frame's fields are the same film frame — zero comb by
+  // conservation, whatever the motion. A score vector negative at EVERY
+  // phase therefore says no hypothesis leaves the clean positions clean:
+  // comb where film cannot put it. That was always this scanner's interlace
+  // signature; it was being read as "ambiguous" and handed to the harvest.
+  //
+  // Three gates, so the verdict is imposed and not retreated to. All five
+  // phases negative — the signature itself. Power at the busy-no-phase
+  // precedent (avgW >= 0.35) — enough active frames to mean it. And a
+  // MOTION floor on the median raw score: a static video card reads
+  // all-negative with high avgW too, because the stretch amplifies its
+  // noise, but it combs at noise level — measured on Emissary, the title
+  // card sits at p50 0.18 against 3.16 for the disc-head video (which holds
+  // the 407-421 transition) and 9.77 for the crawl. Weak-comb material
+  // falls through to the progressive residue instead, by the standing cost
+  // ruling: comb too faint to certify -2 is comb too faint for the
+  // interfield stage to mangle, and the Frame regime is superior absent
+  // errors. Segments holding certified facts can never land here — the
+  // facts override in solveSegment converts any non-film verdict back to
+  // film, which is what keeps the crawl's segment (its battle triples) on
+  // the plate.
+  constexpr double INTERLACE_P50_MIN = 1.0;
+
+  auto interlaceThirdReading = [&](PhaseRun r) -> PhaseRun {
+    if (r.type != PhaseRun::Type::Unknown) return r;
+
+    bool allNegative = true;
+    for (int p = 0; p < 5; ++p) {
+      if (phaseScores[p] >= 0.0) allNegative = false;
+    }
+
+    if (allNegative && avgW >= 0.35 && p50 >= INTERLACE_P50_MIN) {
+      r.type = PhaseRun::Type::Interlaced;
+      r.confidence = 0.75;
+      r.reason = "no-phase-leaves-pures-clean";
+
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: MIXEDNESS_INTERLACE fields [%1..%2] "
+                   "frames=%3 avgW=%4 p50=%5 scores={%6} result=interlaced")
+                   .arg(startField)
+                   .arg(endField)
+                   .arg(numFrames)
+                   .arg(avgW, 0, 'f', 4)
+                   .arg(p50, 0, 'f', 4)
+                   .arg(phaseArrayString(phaseScores, -1));
+      }
+    }
+
+    return r;
+  };
+
+  if (activeFrames == 0 && avgW < 0.05) {
+    run.type = PhaseRun::Type::Unknown;
+    run.reason = "silence";
+
+    if (m_decisionTraceEnabled) {
+      qInfo().noquote()
+          << QString(
+                 "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
+                 "result=unknown reason=silence p10=%4 p50=%5 p90=%6 avgW=%7 "
+                 "activeFrames=%8 scores={%9}")
+                 .arg(startField)
+                 .arg(endField)
+                 .arg(numFrames)
+                 .arg(p10, 0, 'f', 6)
+                 .arg(p50, 0, 'f', 6)
+                 .arg(p90, 0, 'f', 6)
+                 .arg(avgW, 0, 'f', 4)
+                 .arg(activeFrames)
+                 .arg(phaseArrayString(phaseScores, bestP));
+    }
+
+    return run;
+  }
+
+  if (avgW > 0.35 && activeSpread < (avgW * 0.15)) {
+    run.type = PhaseRun::Type::Unknown;
+    run.confidence = 0.0;
+    run.reason = "busy-no-phase";
+
+    if (m_decisionTraceEnabled) {
+      qInfo().noquote()
+          << QString(
+                 "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
+                 "result=unknown reason=busy-no-phase p10=%4 p50=%5 p90=%6 "
+                 "avgW=%7 activeFrames=%8 activeSpread=%9 threshold=%10 "
+                 "scores={%11}")
+                 .arg(startField)
+                 .arg(endField)
+                 .arg(numFrames)
+                 .arg(p10, 0, 'f', 6)
+                 .arg(p50, 0, 'f', 6)
+                 .arg(p90, 0, 'f', 6)
+                 .arg(avgW, 0, 'f', 4)
+                 .arg(activeFrames)
+                 .arg(activeSpread, 0, 'f', 4)
+                 .arg(avgW * 0.15, 0, 'f', 4)
+                 .arg(phaseArrayString(phaseScores, bestP));
+    }
+
+    return interlaceThirdReading(bumpSecondReading(run));
+  }
+
   // Tie / ambiguity detection. Under anti-pattern, 3-mixed-in-a-row content
   // produces an INHERENT tie between two phases (both "off by one" placements
   // score the same — the math is symmetric in the three-consecutive case).
@@ -3731,7 +3788,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
                  .arg(phaseArrayString(phaseScores, bestP));
     }
 
-    return bumpSecondReading(run);
+    return interlaceThirdReading(bumpSecondReading(run));
   }
 
   if (bestP != -1 && calculatedConf > 0.45) {
@@ -3784,7 +3841,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
                              .arg(phaseArrayString(phaseScores, bestP));
   }
 
-  return bumpSecondReading(run);
+  return interlaceThirdReading(bumpSecondReading(run));
 }
 
 CineMap::PhaseRun CineMap::solveSegment(
@@ -3833,213 +3890,236 @@ CineMap::PhaseRun CineMap::solveSegment(
   const int mixedPhase = mixednessLocked ? run.phaseOffset : -1;
   const double mixedConf = mixednessLocked ? run.confidence : 0.0;
 
-  // 2. Pattern harvest — the cheap fast-out. It checks only the ~2 sites per
-  //    5-frame cycle that a candidate phase predicts, instead of every d=2 pair
-  //    in the segment, and writes what it confirms to doplGang.
-  //
-  //    It runs on any phase mixedness can NAME, not only one it could lock.
-  //    Checking a proposed phase cheaply is exactly how an unsure proposal
-  //    should be adjudicated, and that is the case where a fast-out is worth
-  //    the most. Previously this was gated on a lock, so the fast path could
-  //    never fire when it was needed and brute force ran regardless.
-  int patternCandidatePhase = mixedPhase;
-  if (patternCandidatePhase < 0 && mixInformative) {
-    int bestMix = -1;
-    double bestMixScore = 0.0;
-    for (int p = 0; p < 5; ++p) {
-      if (mixVec[p] > bestMixScore) {
-        bestMixScore = mixVec[p];
-        bestMix = p;
-      }
+  // A positive interlace verdict from the scan is not "mixedness failed to
+  // lock" — it is a verdict, and the harvest's commitment is for unknown
+  // ground, never for overruling one. So the election below is skipped
+  // entirely: no pattern bonus, no dg tally, nothing that could convert the
+  // verdict back to film on clue-grade evidence. Certified facts still
+  // outrank it — the override past the election converts any non-film
+  // verdict where two facts agree, which is what keeps a segment whose
+  // triples span the cut (the crawl sharing its segment with the battle) on
+  // the plate.
+  if (run.type == PhaseRun::Type::Interlaced) {
+    if (m_decisionTraceEnabled) {
+      qInfo().noquote() << QString(
+                               "CineMap summary: SEGMENT fields [%1..%2] "
+                               "mixedness=%3 final=interlaced conf=%4 "
+                               "source=scan-verdict")
+                               .arg(segStartField)
+                               .arg(segEndField)
+                               .arg(mixednessSummary)
+                               .arg(run.confidence, 0, 'f', 3);
     }
-    patternCandidatePhase = bestMix;  // stays -1 if nothing scored positive
-  }
-
-  int patternPairs = 0;
-  if (patternCandidatePhase >= 0) {
-    patternPairs = harvestTwinsByPattern(sv, segStartField, segEndField,
-                                         patternCandidatePhase, cache);
-  }
-
-  // 3. Brute force is the FALLBACK, not the default. It is the wholesale
-  //    operation — every d=2 pair in the segment — so it runs only when pattern
-  //    came up short of the ~1-twin-per-5-frames that 3:2 predicts. A pattern
-  //    that found its twins has already established the cadence, and paying for
-  //    the wholesale pass on top of it buys nothing.
-  //
-  //    Restricted to d=2: classifyTwinAC_strict requires hi==lo+2, so d=4/6
-  //    cannot form geometry.
-  const int segFramesForPattern =
-      std::max(1, (segEndField - segStartField + 1) / 2);
-  const int expectedPatternPairs = std::max(1, segFramesForPattern / 5);
-  const bool patternSufficed =
-      (patternPairs >= std::max(1, (expectedPatternPairs + 1) / 2));
-
-  int harvestedEdges = 0;
-  if (!patternSufficed) {
-    harvestedEdges = static_cast<int>(
-        harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2).size());
-  }
-
-  DgLock lock;
-  QString geomRejectReason;
-  (void)tryLockByDgGeometry(sv, segStartField, segEndField, cache, lock,
-                            &geomRejectReason);
-  const auto dgVec = lock.phaseScores;
-  const bool dgInformative = lock.phaseScoresInformative;
-
-  // 4. Evidence-additive election.
-  //    We have two per-phase evidence vectors with different scales:
-  //      - mixVec: raw mixedness count (unbounded above)
-  //      - dgVec:  normalized A/C agreement (~[-0.25, 0.5])
-  //    Max-normalize each (clamping negatives to 0 so phases with net
-  //    disagreement contribute nothing), then sum. Highest score wins
-  //    the segment. We never veto: a phase with both signals voting for
-  //    it beats a phase one signal disfavors, but a strong single-signal
-  //    candidate can still win if the other signal is silent.
-  auto maxNormalize = [](const std::array<double, 5>& v) {
-    double mx = 0.0;
-    for (double x : v)
-      if (x > mx) mx = x;
-    std::array<double, 5> n = {0.0, 0.0, 0.0, 0.0, 0.0};
-    if (mx > 0.0) {
-      for (int i = 0; i < 5; ++i) n[i] = std::max(0.0, v[i]) / mx;
-    }
-    return n;
-  };
-
-  const auto mixN =
-      mixInformative ? maxNormalize(mixVec) : std::array<double, 5>{};
-  const auto dgN =
-      dgInformative ? maxNormalize(dgVec) : std::array<double, 5>{};
-
-  std::array<double, 5> combined = {0.0, 0.0, 0.0, 0.0, 0.0};
-  int signalSources = 0;
-  if (mixInformative) {
-    for (int i = 0; i < 5; ++i) combined[i] += mixN[i];
-    signalSources++;
-  }
-  if (dgInformative) {
-    for (int i = 0; i < 5; ++i) combined[i] += dgN[i];
-    signalSources++;
-  }
-
-  // Pattern bonus at the phase pattern actually tested: confirmatory evidence
-  // at predicted sites adds weight to that phase, calibrated against the
-  // ~1-per-5-frames expected twin rate. Capped at 1.0 (same scale as one
-  // normalized signal contribution).
-  //
-  // Keyed to patternCandidatePhase rather than to a locked mixedness phase,
-  // since pattern now also runs on named-but-unlocked candidates. The bonus
-  // remains one-sided — only the tested phase can earn it — which is why
-  // pattern is a fast-out and not a vote: the election proper is mixVec +
-  // dgVec.
-  if (patternCandidatePhase >= 0 && patternPairs > 0) {
-    const double patternBonus =
-        std::min(1.0, double(patternPairs) / double(expectedPatternPairs));
-    combined[patternCandidatePhase] += patternBonus;
-  }
-
-  int bestP = -1;
-  double bestC = -1e9;
-  for (int p = 0; p < 5; ++p) {
-    if (combined[p] > bestC) {
-      bestC = combined[p];
-      bestP = p;
-    }
-  }
-  double secondC = -1e9;
-  for (int p = 0; p < 5; ++p) {
-    if (p == bestP) continue;
-    if (combined[p] > secondC) secondC = combined[p];
-  }
-  const double margin =
-      (bestP != -1 && secondC > -1e8) ? (bestC - secondC) : bestC;
-
-  // Margin floor: 0.15 per contributing signal source (same shape as the
-  // per-detector margin gate). Two signals → 0.30, one → 0.15.
-  constexpr double MARGIN_PER_SOURCE = 0.15;
-  const double marginFloor = MARGIN_PER_SOURCE * std::max(1, signalSources);
-  const bool hasWinner =
-      (bestP != -1) && (bestC > 0.0) && (margin >= marginFloor);
-
-  if (hasWinner) {
-    run.type = PhaseRun::Type::Pulldown32;
-    run.phaseOffset = bestP;
-    run.endField = segEndField;
-    run.reason.clear();
-    // Confidence: 0.80 base + scaled by how much the margin exceeds the
-    // floor (caps at 0.95). Both signals agreeing produces a strong margin.
-    double conf = 0.80;
-    if (marginFloor > 0.0) {
-      conf += 0.15 * std::min(1.0, (margin - marginFloor) / marginFloor);
-    }
-    run.confidence = std::clamp(conf, 0.80, 0.95);
   } else {
-    run.type = PhaseRun::Type::Unknown;
-    run.confidence = 0.0;
-    run.reason = (signalSources == 0) ? QString("no-signals")
-                                      : QString("no-clear-combined-winner");
-  }
-
-  if (m_decisionTraceEnabled) {
-    auto vecStr = [](const std::array<double, 5>& v, int bestIdx) {
-      QString out;
+    // 2. Pattern harvest — the cheap fast-out. It checks only the ~2 sites per
+    //    5-frame cycle that a candidate phase predicts, instead of every d=2 pair
+    //    in the segment, and writes what it confirms to doplGang.
+    //
+    //    It runs on any phase mixedness can NAME, not only one it could lock.
+    //    Checking a proposed phase cheaply is exactly how an unsure proposal
+    //    should be adjudicated, and that is the case where a fast-out is worth
+    //    the most. Previously this was gated on a lock, so the fast path could
+    //    never fire when it was needed and brute force ran regardless.
+    int patternCandidatePhase = mixedPhase;
+    if (patternCandidatePhase < 0 && mixInformative) {
+      int bestMix = -1;
+      double bestMixScore = 0.0;
       for (int p = 0; p < 5; ++p) {
-        if (p > 0) out += " ";
-        out += QString("p%1=%2%3")
-                   .arg(p)
-                   .arg(v[p], 0, 'f', 3)
-                   .arg(p == bestIdx ? "*" : "");
+        if (mixVec[p] > bestMixScore) {
+          bestMixScore = mixVec[p];
+          bestMix = p;
+        }
       }
-      return out;
+      patternCandidatePhase = bestMix;  // stays -1 if nothing scored positive
+    }
+
+    int patternPairs = 0;
+    if (patternCandidatePhase >= 0) {
+      patternPairs = harvestTwinsByPattern(sv, segStartField, segEndField,
+                                           patternCandidatePhase, cache);
+    }
+
+    // 3. Brute force is the FALLBACK, not the default. It is the wholesale
+    //    operation — every d=2 pair in the segment — so it runs only when pattern
+    //    came up short of the ~1-twin-per-5-frames that 3:2 predicts. A pattern
+    //    that found its twins has already established the cadence, and paying for
+    //    the wholesale pass on top of it buys nothing.
+    //
+    //    Restricted to d=2: classifyTwinAC_strict requires hi==lo+2, so d=4/6
+    //    cannot form geometry.
+    const int segFramesForPattern =
+        std::max(1, (segEndField - segStartField + 1) / 2);
+    const int expectedPatternPairs = std::max(1, segFramesForPattern / 5);
+    const bool patternSufficed =
+        (patternPairs >= std::max(1, (expectedPatternPairs + 1) / 2));
+
+    int harvestedEdges = 0;
+    if (!patternSufficed) {
+      harvestedEdges = static_cast<int>(
+          harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2).size());
+    }
+
+    DgLock lock;
+    QString geomRejectReason;
+    (void)tryLockByDgGeometry(sv, segStartField, segEndField, cache, lock,
+                              &geomRejectReason);
+    const auto dgVec = lock.phaseScores;
+    const bool dgInformative = lock.phaseScoresInformative;
+
+    // 4. Evidence-additive election.
+    //    We have two per-phase evidence vectors with different scales:
+    //      - mixVec: raw mixedness count (unbounded above)
+    //      - dgVec:  normalized A/C agreement (~[-0.25, 0.5])
+    //    Max-normalize each (clamping negatives to 0 so phases with net
+    //    disagreement contribute nothing), then sum. Highest score wins
+    //    the segment. We never veto: a phase with both signals voting for
+    //    it beats a phase one signal disfavors, but a strong single-signal
+    //    candidate can still win if the other signal is silent.
+    auto maxNormalize = [](const std::array<double, 5>& v) {
+      double mx = 0.0;
+      for (double x : v)
+        if (x > mx) mx = x;
+      std::array<double, 5> n = {0.0, 0.0, 0.0, 0.0, 0.0};
+      if (mx > 0.0) {
+        for (int i = 0; i < 5; ++i) n[i] = std::max(0.0, v[i]) / mx;
+      }
+      return n;
     };
-    QString sources;
-    if (mixInformative) sources += "mix";
-    if (dgInformative) sources += sources.isEmpty() ? "dg" : "+dg";
-    if (patternCandidatePhase >= 0 && patternPairs > 0)
-      sources += sources.isEmpty() ? "pattern" : "+pattern";
-    if (sources.isEmpty()) sources = "none";
 
-    qInfo().noquote()
-        << QString(
-               "CineMap decision: SEGMENT_ELECT fields [%1..%2] sources=%3 "
-               "patternPhase=%4 mixedConf=%5 patternPairs=%6/%17 "
-               "patternSufficed=%18 bruteEdges=%7 mixN={%8} dgN={%9} "
-               "combined={%10} bestPhase=%11 bestScore=%12 secondBest=%13 "
-               "margin=%14 floor=%15 result=%16")
-               .arg(segStartField)
-               .arg(segEndField)
-               .arg(sources)
-               .arg(patternCandidatePhase)
-               .arg(mixedConf, 0, 'f', 3)
-               .arg(patternPairs)
-               .arg(harvestedEdges)
-               .arg(vecStr(mixN, bestP))
-               .arg(vecStr(dgN, bestP))
-               .arg(vecStr(combined, bestP))
-               .arg(bestP)
-               .arg(bestC, 0, 'f', 4)
-               .arg(secondC > -1e8 ? secondC : 0.0, 0, 'f', 4)
-               .arg(margin, 0, 'f', 4)
-               .arg(marginFloor, 0, 'f', 4)
-               .arg(hasWinner
-                        ? "lock"
-                        : (signalSources == 0 ? "no-signals"
-                                              : "no-clear-combined-winner"))
-               .arg(expectedPatternPairs)
-               .arg(patternSufficed ? "yes(brute skipped)" : "no(brute ran)");
+    const auto mixN =
+        mixInformative ? maxNormalize(mixVec) : std::array<double, 5>{};
+    const auto dgN =
+        dgInformative ? maxNormalize(dgVec) : std::array<double, 5>{};
 
-    qInfo().noquote()
-        << QString(
-               "CineMap summary: SEGMENT fields [%1..%2] mixedness=%3 final=%4 "
-               "conf=%5 source=evidence-additive(%6)")
-               .arg(segStartField)
-               .arg(segEndField)
-               .arg(mixednessSummary)
-               .arg(phaseRunSummary(run))
-               .arg(run.confidence, 0, 'f', 3)
-               .arg(sources);
+    std::array<double, 5> combined = {0.0, 0.0, 0.0, 0.0, 0.0};
+    int signalSources = 0;
+    if (mixInformative) {
+      for (int i = 0; i < 5; ++i) combined[i] += mixN[i];
+      signalSources++;
+    }
+    if (dgInformative) {
+      for (int i = 0; i < 5; ++i) combined[i] += dgN[i];
+      signalSources++;
+    }
+
+    // Pattern bonus at the phase pattern actually tested: confirmatory evidence
+    // at predicted sites adds weight to that phase, calibrated against the
+    // ~1-per-5-frames expected twin rate. Capped at 1.0 (same scale as one
+    // normalized signal contribution).
+    //
+    // Keyed to patternCandidatePhase rather than to a locked mixedness phase,
+    // since pattern now also runs on named-but-unlocked candidates. The bonus
+    // remains one-sided — only the tested phase can earn it — which is why
+    // pattern is a fast-out and not a vote: the election proper is mixVec +
+    // dgVec.
+    if (patternCandidatePhase >= 0 && patternPairs > 0) {
+      const double patternBonus =
+          std::min(1.0, double(patternPairs) / double(expectedPatternPairs));
+      combined[patternCandidatePhase] += patternBonus;
+    }
+
+    int bestP = -1;
+    double bestC = -1e9;
+    for (int p = 0; p < 5; ++p) {
+      if (combined[p] > bestC) {
+        bestC = combined[p];
+        bestP = p;
+      }
+    }
+    double secondC = -1e9;
+    for (int p = 0; p < 5; ++p) {
+      if (p == bestP) continue;
+      if (combined[p] > secondC) secondC = combined[p];
+    }
+    const double margin =
+        (bestP != -1 && secondC > -1e8) ? (bestC - secondC) : bestC;
+
+    // Margin floor: 0.15 per contributing signal source (same shape as the
+    // per-detector margin gate). Two signals → 0.30, one → 0.15.
+    constexpr double MARGIN_PER_SOURCE = 0.15;
+    const double marginFloor = MARGIN_PER_SOURCE * std::max(1, signalSources);
+    const bool hasWinner =
+        (bestP != -1) && (bestC > 0.0) && (margin >= marginFloor);
+
+    if (hasWinner) {
+      run.type = PhaseRun::Type::Pulldown32;
+      run.phaseOffset = bestP;
+      run.endField = segEndField;
+      run.reason.clear();
+      // Confidence: 0.80 base + scaled by how much the margin exceeds the
+      // floor (caps at 0.95). Both signals agreeing produces a strong margin.
+      double conf = 0.80;
+      if (marginFloor > 0.0) {
+        conf += 0.15 * std::min(1.0, (margin - marginFloor) / marginFloor);
+      }
+      run.confidence = std::clamp(conf, 0.80, 0.95);
+    } else {
+      run.type = PhaseRun::Type::Unknown;
+      run.confidence = 0.0;
+      run.reason = (signalSources == 0) ? QString("no-signals")
+                                        : QString("no-clear-combined-winner");
+    }
+
+    if (m_decisionTraceEnabled) {
+      auto vecStr = [](const std::array<double, 5>& v, int bestIdx) {
+        QString out;
+        for (int p = 0; p < 5; ++p) {
+          if (p > 0) out += " ";
+          out += QString("p%1=%2%3")
+                     .arg(p)
+                     .arg(v[p], 0, 'f', 3)
+                     .arg(p == bestIdx ? "*" : "");
+        }
+        return out;
+      };
+      QString sources;
+      if (mixInformative) sources += "mix";
+      if (dgInformative) sources += sources.isEmpty() ? "dg" : "+dg";
+      if (patternCandidatePhase >= 0 && patternPairs > 0)
+        sources += sources.isEmpty() ? "pattern" : "+pattern";
+      if (sources.isEmpty()) sources = "none";
+
+      qInfo().noquote()
+          << QString(
+                 "CineMap decision: SEGMENT_ELECT fields [%1..%2] sources=%3 "
+                 "patternPhase=%4 mixedConf=%5 patternPairs=%6/%17 "
+                 "patternSufficed=%18 bruteEdges=%7 mixN={%8} dgN={%9} "
+                 "combined={%10} bestPhase=%11 bestScore=%12 secondBest=%13 "
+                 "margin=%14 floor=%15 result=%16")
+                 .arg(segStartField)
+                 .arg(segEndField)
+                 .arg(sources)
+                 .arg(patternCandidatePhase)
+                 .arg(mixedConf, 0, 'f', 3)
+                 .arg(patternPairs)
+                 .arg(harvestedEdges)
+                 .arg(vecStr(mixN, bestP))
+                 .arg(vecStr(dgN, bestP))
+                 .arg(vecStr(combined, bestP))
+                 .arg(bestP)
+                 .arg(bestC, 0, 'f', 4)
+                 .arg(secondC > -1e8 ? secondC : 0.0, 0, 'f', 4)
+                 .arg(margin, 0, 'f', 4)
+                 .arg(marginFloor, 0, 'f', 4)
+                 .arg(hasWinner
+                          ? "lock"
+                          : (signalSources == 0 ? "no-signals"
+                                                : "no-clear-combined-winner"))
+                 .arg(expectedPatternPairs)
+                 .arg(patternSufficed ? "yes(brute skipped)" : "no(brute ran)");
+
+      qInfo().noquote()
+          << QString(
+                 "CineMap summary: SEGMENT fields [%1..%2] mixedness=%3 final=%4 "
+                 "conf=%5 source=evidence-additive(%6)")
+                 .arg(segStartField)
+                 .arg(segEndField)
+                 .arg(mixednessSummary)
+                 .arg(phaseRunSummary(run))
+                 .arg(run.confidence, 0, 'f', 3)
+                 .arg(sources);
+    }
+
   }
 
   // Facts outrank the election. Where the segment holds corroborated
