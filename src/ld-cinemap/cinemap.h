@@ -95,6 +95,14 @@ class CineMap {
   struct FrameMixedness {
     int frameIndex = -1;  // 0-based frame index within capture
     double score = 0.0;  // lips mixedness: does this frame comb (detail masked)
+
+    // The same read over the ACTIVE raster. The pattern machinery keeps the
+    // centre ROI it was calibrated on; the VERDICT amplitude gates read this
+    // one, because a hand gesturing at the frame edge is comb the centre
+    // window never sees, and the active bounds exclude the blanking junk
+    // that made a raw-field window unusable. A superset sum: wideScore is
+    // never below score, so no centre-window verdict can be lost to it.
+    double wideScore = 0.0;
   };
 
   // A candidate twin pair with its diff and confidence score.
@@ -358,7 +366,7 @@ class CineMap {
                              int height) const;
 
   double calculateLipsScore(SourceVideo& sv, int f1, int f2, int width,
-                            int height) const;
+                            int height, bool fullRaster = false) const;
 
   std::vector<FrameMixedness> computeFrameMixedness(SourceVideo& sv,
                                                     int segStart, int segEnd);
@@ -388,8 +396,15 @@ class CineMap {
   const TwinDemod& demodTwinCached(SourceVideo& sv, int seq1, int seq2,
                                    int width, int height);
 
+  // fullRaster widens the window to 95% of the frame both axes. The centre
+  // window is right for the calibrated twin machinery; a STILLNESS claim
+  // must look everywhere — a gesturing hand at the frame edge is temporal
+  // motion the centre never sees, and the temporal axis is immune to the
+  // static matte edges that poison any widened spatial metric. Wide calls
+  // bypass the cache: they are a different quantity.
   TwinDemod calculateDemodulatedFieldDiff(SourceVideo& sv, int f1, int f2,
-                                          int width, int height);
+                                          int width, int height,
+                                          bool fullRaster = false);
 
   // Measures the disc's twin/noise floor once and caches it. See NoiseFloor.
   const NoiseFloor& calibrateTwinFloor(SourceVideo& sv);
@@ -531,6 +546,10 @@ class CineMap {
   double verifyPhaseByTwins(SourceVideo& sv, int segStart, int segEnd,
                             int phaseOffset, const SegmentCaptureCache& cache);
 
+  // P is a demanding verdict; this is its bar, shared by the scan's crash
+  // candidate and the full-raster verification that grants it.
+  static constexpr double PROGRESSIVE_CRASH_P90 = 0.15;
+
   // Majority of predicted sites must actually be twins. Perfect telecine
   // gives 1.0; this leaves room for dropouts and pad fields without admitting a
   // phase whose predicted sites are mostly empty.
@@ -554,6 +573,14 @@ class CineMap {
     int anchorFrame = -1;  // frame the phase is measured from
     int phase = 0;         // 5-frame position of anchorFrame
     bool aType = false;    // trailing spare (A) vs leading spare (C)
+
+    // True when the triple's non-twin neighbours carry film grain — pair
+    // energy well above the twin floor. A grain-frozen twin standing out
+    // from grainy neighbours can only be film: video has no film grain to
+    // freeze. A triple certified from noise dips on near-static video has
+    // neighbours AT the floor and is not backed. Measured: film-clip
+    // neighbours run 4-17x the floor, video flukes 1.5-2.8x.
+    bool grainBacked = false;
   };
 
   // Finds every twin that cancels in [segStart, segEnd] and returns the

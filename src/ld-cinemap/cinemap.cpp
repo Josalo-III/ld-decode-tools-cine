@@ -243,6 +243,83 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
     }
   }
 
+  // Tiebreak: an interlace lock is evidence, and a weak film guess beside
+  // one is no longer sparse ground. The sparse solve commits where nothing
+  // is known — that is the autosolve's job — but a segment whose own scan
+  // read all-negative (more than 2-in-5 mixed, below the sureness line) and
+  // whose film came from the harvest alone, sitting against a neighbour the
+  // scan positively locked as interlace, is a contradiction, and the tie
+  // breaks toward the evidence. Interlaced can lock a shot just like film.
+  //
+  // Measured case: Vol 9495-9696, all-negative busy-no-phase, elected film
+  // at 0.950 by harvest junk, sandwiched between two -2 verdicts of its own
+  // shot. Real film locks (mixedness, pattern, facts) are never weak and are
+  // never touched; segments whose scan had nothing informative to say are
+  // guarded out, which keeps tiny and silent segments with the commitment.
+  {
+    int tiebroken = 0;
+    for (size_t i = 0; i < solvedSegments.size(); ++i) {
+      auto& seg = solvedSegments[i];
+      if (seg.run.type != PhaseRun::Type::Pulldown32) continue;
+      if (!seg.run.reason.contains(QStringLiteral("weak-elect"))) continue;
+      if (!seg.run.phaseScoresInformative) continue;
+
+      bool allNeg = true;
+      for (int p = 0; p < 5; ++p) {
+        if (seg.run.phaseScores[p] > 0.0) allNeg = false;
+      }
+      if (!allNeg) continue;
+
+      // Grain-backed triples prove film; a segment holding them is not
+      // unknown ground and the tie may not break away from its own facts.
+      int backed = 0;
+      for (const auto& t : m_certifiedTriples) {
+        if (t.loSeq < seg.startField || t.loSeq + 2 > seg.endField) continue;
+        if (t.grainBacked) backed++;
+      }
+      if (backed >= 3) continue;
+
+      const bool leftInterlaced =
+          (i > 0) &&
+          (solvedSegments[i - 1].run.type == PhaseRun::Type::Interlaced);
+      const bool rightInterlaced =
+          (i + 1 < solvedSegments.size()) &&
+          (solvedSegments[i + 1].run.type == PhaseRun::Type::Interlaced);
+      if (!leftInterlaced && !rightInterlaced) continue;
+
+      seg.run.type = PhaseRun::Type::Interlaced;
+      seg.run.confidence = 0.75;
+      seg.run.reason = QStringLiteral("tiebreak-adjacent-interlace");
+
+      for (int f = seg.startField; f <= seg.endField; ++f) {
+        auto fld = m_md->getField(f);
+        if (fld.pad) continue;
+        fld.cinemap.cadenceId = -2;
+        fld.cinemap.cadenceIndexPresumed = false;
+        fld.cinemap.pulldownRole.clear();
+        m_cadenceConfidence[f] = 0.75;
+        m_md->updateField(fld, f);
+      }
+      tiebroken++;
+
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote() << QString(
+                                 "CineMap decision: INTERLACE_TIEBREAK fields "
+                                 "[%1..%2] weak film guess beside %3 "
+                                 "interlace lock — tie breaks to -2")
+                                 .arg(seg.startField)
+                                 .arg(seg.endField)
+                                 .arg(leftInterlaced && rightInterlaced
+                                          ? "flanking"
+                                          : "an adjacent");
+      }
+    }
+    if (tiebroken > 0) {
+      qInfo() << "Interlace tiebreak converted" << tiebroken
+              << "weak film guess(es) beside interlace locks.";
+    }
+  }
+
   // 4. Continuity & intra-segment healing pass
   qInfo() << "Running Continuity Healer...";
   int healedCount = healContinuity(sv, solvedSegments, cache);
@@ -1181,7 +1258,7 @@ double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width,
 // half where a speaking person's lips might be, and do a more expensive
 // alternate method of comparing fields
 double CineMap::calculateLipsScore(SourceVideo& sv, int f1, int f2, int width,
-                                   int height) const {
+                                   int height, bool fullRaster) const {
   if (f1 < 1 || f2 < 1 || width <= 0 || height <= 0) return 0.0;
 
   auto d1 = sv.getVideoField(f1);
@@ -1197,11 +1274,32 @@ double CineMap::calculateLipsScore(SourceVideo& sv, int f1, int f2, int width,
   const double scaleToIre =
       (white > black) ? (100.0 / (white - black)) : (100.0 / 65535.0);
 
-  // Lips ROI (Center-Lower)
-  const int startX = static_cast<int>(width * 0.20);
-  const int endX = static_cast<int>(width * 0.80);
-  const int startY = static_cast<int>(height * 0.40);
-  const int endY = static_cast<int>(height * 0.80);
+  // Lips ROI (Center-Lower), or the ACTIVE raster (760x480-class) inset 5%
+  // for whole-frame reads. The active bounds come from the decoder's own
+  // metadata: a percentage of the raw field swallows vertical blanking, and
+  // line-21 captions flicker per field — an unmatted static title card read
+  // a wide-lips floor of 23 from that junk alone.
+  int startX, endX, startY, endY;
+  if (fullRaster) {
+    const auto& vpa = m_md->getVideoParameters();
+    const int ax0 = (vpa.activeVideoStart > 0) ? vpa.activeVideoStart : 0;
+    const int ax1 = (vpa.activeVideoEnd > ax0) ? vpa.activeVideoEnd : width;
+    const int ay0 =
+        (vpa.firstActiveFieldLine > 0) ? vpa.firstActiveFieldLine : 0;
+    const int ay1 =
+        (vpa.lastActiveFieldLine > ay0) ? vpa.lastActiveFieldLine : height;
+    const int mx = (ax1 - ax0) / 40;  // 2.5% inset each side
+    const int my = (ay1 - ay0) / 40;
+    startX = ax0 + mx;
+    endX = ax1 - mx;
+    startY = ay0 + my;
+    endY = ay1 - my;
+  } else {
+    startX = static_cast<int>(width * 0.20);
+    endX = static_cast<int>(width * 0.80);
+    startY = static_cast<int>(height * 0.40);
+    endY = static_cast<int>(height * 0.80);
+  }
 
   double totalLipsEnergy = 0.0;
 
@@ -1281,6 +1379,22 @@ std::vector<CineMap::FrameMixedness> CineMap::computeFrameMixedness(
   // cause of the large reading. Measured, lips is also the CHEAPER operator
   // (0.69-0.84x notch over three discs), so the tiering cost accuracy and
   // bought nothing.
+  // Lips does not run on frames that are still in TIME. Its spatial mask is
+  // blind to vertically symmetric fine detail — a thin edge sitting on one
+  // field's scanline has up equal to down, so the mask reads flat while the
+  // centre line differs from their mean, and the metric fires on pure image
+  // structure. Razor-sharp scanned stills are the worst case: rock solid to
+  // the eye, yet they scored 1.6-2.4 and read as interlace. Stillness is
+  // decided on the axis structure cannot fool: the same-parity difference
+  // across time. On the stills it sits at 1.3x the twin floor — nothing
+  // moves — while every genuinely combing segment measured on two discs
+  // reads 1.9x or more. A frame whose flanking same-parity pairs both rest
+  // at the floor cannot comb from motion, and whatever lips would report
+  // there is structure, not divergence.
+  const NoiseFloor& nf = calibrateTwinFloor(sv);
+  const double stillIre = nf.valid ? nf.ire * 1.5 : 0.0;
+  const int totalFields = m_md->getNumberOfFields();
+
   for (int fi = startFrame; fi <= endFrame; ++fi) {
     if (m_disc->isPadded(fi)) continue;
 
@@ -1288,8 +1402,28 @@ std::vector<CineMap::FrameMixedness> CineMap::computeFrameMixedness(
     int f2 = m_disc->getSecondFieldNumber(fi + 1);
     if (f1 < 1 || f2 < 1) continue;
 
-    results.push_back(
-        {fi, calculateLipsScore(sv, f1, f2, vp.fieldWidth, vp.fieldHeight)});
+    if (stillIre > 0.0 && f1 + 2 <= totalFields && f2 + 2 <= totalFields) {
+      // Wide raster, uncached: a stillness claim must look everywhere. The
+      // centre window declared a shot still while hands gestured at the
+      // frame edge, the scan went silent, and the election was bailed into
+      // a P the picture contradicts.
+      const TwinDemod a = calculateDemodulatedFieldDiff(
+          sv, f1, f1 + 2, vp.fieldWidth, vp.fieldHeight, /*fullRaster=*/true);
+      const TwinDemod b = calculateDemodulatedFieldDiff(
+          sv, f2, f2 + 2, vp.fieldWidth, vp.fieldHeight, /*fullRaster=*/true);
+      if (a.valid && b.valid && a.grainIre < stillIre &&
+          b.grainIre < stillIre) {
+        results.push_back({fi, 0.0, 0.0});
+        continue;
+      }
+    }
+
+    FrameMixedness m;
+    m.frameIndex = fi;
+    m.score = calculateLipsScore(sv, f1, f2, vp.fieldWidth, vp.fieldHeight);
+    m.wideScore = calculateLipsScore(sv, f1, f2, vp.fieldWidth,
+                                     vp.fieldHeight, /*fullRaster=*/true);
+    results.push_back(m);
   }
 
   return results;
@@ -1792,7 +1926,7 @@ int CineMap::probeCombAxes(const QString& tbcFilePath, int startField,
   // whenever notch >= 0.10 on the assumption that a large notch is self-evident
   // — the case this column tests.
   printf(
-      "frame,f1,f2,cad,notchWithin,notchAcross,ratio,lipsWithin,lipsAcross\n");
+      "frame,f1,f2,cad,notchWithin,notchAcross,ratio,lipsWithin,lipsAcross,lipsWide\n");
 
   int rows = 0;
   for (int fi = startFrame; fi < endFrame; ++fi) {
@@ -1811,10 +1945,13 @@ int CineMap::probeCombAxes(const QString& tbcFilePath, int startField,
         calculateLipsScore(sv, f1, f2, vp.fieldWidth, vp.fieldHeight);
     const double lipsA =
         calculateLipsScore(sv, n1, f2, vp.fieldWidth, vp.fieldHeight);
+    const double lipsWide = calculateLipsScore(sv, f1, f2, vp.fieldWidth,
+                                               vp.fieldHeight,
+                                               /*fullRaster=*/true);
 
-    printf("%d,%d,%d,%d,%.5f,%.5f,%.4f,%.5f,%.5f\n", fi, f1, f2,
+    printf("%d,%d,%d,%d,%.5f,%.5f,%.4f,%.5f,%.5f,%.5f\n", fi, f1, f2,
            m_md->getField(f1).cinemap.cadenceId, within, across,
-           (across > 1e-9) ? (within / across) : 0.0, lipsW, lipsA);
+           (across > 1e-9) ? (within / across) : 0.0, lipsW, lipsA, lipsWide);
     rows++;
   }
 
@@ -2185,7 +2322,8 @@ int CineMap::probeDgRange(const QString& tbcFilePath, int startField,
 CineMap::TwinDemod CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv,
                                                           int f1, int f2,
                                                           int width,
-                                                          int height) {
+                                                          int height,
+                                                          bool fullRaster) {
   TwinDemod out;
   if (!m_md || f1 < 1 || f2 < 1 || width <= 0 || height <= 0) return out;
   const auto vp = m_md->getVideoParameters();
@@ -2197,10 +2335,24 @@ CineMap::TwinDemod CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv,
   const uint16_t* p1 = reinterpret_cast<const uint16_t*>(d1.constData());
   const uint16_t* p2 = reinterpret_cast<const uint16_t*>(d2.constData());
 
-  const int startX = width / 4;
-  const int endX = (width * 3) / 4;
-  const int yStart = height / 4;
-  const int yEnd = (height * 3) / 4;
+  int startX, endX, yStart, yEnd;
+  if (fullRaster) {
+    // Active raster inset 2.5% each side: percentages of the raw field
+    // swallow vertical blanking, whose per-field junk is temporal change.
+    const int ax0 = (vp.activeVideoStart > 0) ? vp.activeVideoStart : 0;
+    const int ax1 = (vp.activeVideoEnd > ax0) ? vp.activeVideoEnd : width;
+    const int ay0 = (vp.firstActiveFieldLine > 0) ? vp.firstActiveFieldLine : 0;
+    const int ay1 = (vp.lastActiveFieldLine > ay0) ? vp.lastActiveFieldLine : height;
+    startX = ax0 + (ax1 - ax0) / 40;
+    endX = ax1 - (ax1 - ax0) / 40;
+    yStart = ay0 + (ay1 - ay0) / 40;
+    yEnd = ay1 - (ay1 - ay0) / 40;
+  } else {
+    startX = width / 4;
+    endX = (width * 3) / 4;
+    yStart = height / 4;
+    yEnd = (height * 3) / 4;
+  }
   const int yStep = 4;  // subsample lines for speed; x stays stride 1
 
   // dG twin metric. A telecine twin is the same film frame scanned twice, so
@@ -3383,6 +3535,25 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   const double p90 = percentile(0.90);
   const double denom = std::max(1e-9, (p90 - p10));
 
+  // The verdict amplitude, on the active raster: comb anywhere in the
+  // picture counts, blanking junk does not. Measured against the same gates:
+  // a gesturing-hand interview reads 1.73 wide against 0.32 in the centre
+  // window and finally crosses the -2 line; the crash class stays under
+  // 0.15 (0.108); film that must not fire tops out at 0.70.
+  double wideP90 = 0.0;
+  {
+    std::vector<double> wv;
+    wv.reserve(mixed.size());
+    for (const auto& m : mixed) wv.push_back(m.wideScore);
+    if (!wv.empty()) {
+      const size_t k =
+          static_cast<size_t>(0.9 * static_cast<double>(wv.size() - 1));
+      std::nth_element(wv.begin(), wv.begin() + static_cast<std::ptrdiff_t>(k),
+                       wv.end());
+      wideP90 = wv[k];
+    }
+  }
+
   // ABSOLUTE silence gate, and it must come BEFORE the percentile stretch.
   //
   // The stretch below rescales whatever spread exists into [0,1], so it cannot
@@ -3690,8 +3861,69 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
       if (phaseScores[p] >= 0.0) allNegative = false;
     }
 
+    // The film veto. A grain-backed triple — a frozen twin standing out
+    // from grainy neighbours — can only come from film, whatever schedule it
+    // fails to form: a poor telecine's noise combs past every amplitude gate
+    // (Naked City reads p90 53 on lips), but video cannot fake film grain.
+    // Three backed triples and the -2 verdict declines; the segment falls to
+    // the sparse film solve and the healing chain, which is where film with
+    // an unrecoverable cadence belongs.
+    int grainBackedCount = 0;
+    for (const auto& t : m_certifiedTriples) {
+      if (t.loSeq < startField || t.loSeq + 2 > endField) continue;
+      if (t.grainBacked) grainBackedCount++;
+    }
+
+    if (allNegative && grainBackedCount >= 3) {
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: MIXEDNESS_INTERLACE fields [%1..%2] "
+                   "VETOED — %3 grain-backed triples prove film")
+                   .arg(startField)
+                   .arg(endField)
+                   .arg(grainBackedCount);
+      }
+      return r;
+    }
+
+    // The progressive crash. P is a demanding verdict: the sparse film
+    // solve stays ahead of it because the human eye still beats the
+    // software and sees combing the metrics missed — film keeps the
+    // material correctable, progressive forecloses it. So mere low scores
+    // go to film, and P fires only on a true crash to "no difference":
+    // measured, the crash class reads p90 0.060-0.074 (an interview whose
+    // only motion is below every instrument, a faint film talking head)
+    // while the low-score class starts at 0.319. The bar at 0.15 carries
+    // 2x margin to both. Skips the election like the -2 verdict does, so
+    // harvest junk cannot commit a phase on ground the scan measured and
+    // found empty.
     if (allNegative && numFrames >= INTERLACE_MIN_FRAMES &&
-        p90 >= INTERLACE_P90_MIN) {
+        wideP90 < PROGRESSIVE_CRASH_P90) {
+      // A widened LIPS check was tried here and was poisoned by letterbox
+      // matte edges (a static matte reads 37 IRE-units of "comb" through the
+      // mask's blind spot), so the whole-frame duty lives in the stillness
+      // gate instead, on the temporal axis mattes cannot touch. By the time
+      // a segment reaches this branch its frames survived that wide gate.
+      r.type = PhaseRun::Type::Progressive;
+      r.confidence = 0.70;
+      r.reason = "crash-to-no-difference";
+
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: MIXEDNESS_PROGRESSIVE fields [%1..%2] "
+                   "frames=%3 wideP90=%4 result=progressive")
+                   .arg(startField)
+                   .arg(endField)
+                   .arg(numFrames)
+                   .arg(wideP90, 0, 'f', 4);
+      }
+      return r;
+    }
+
+    if (allNegative && numFrames >= INTERLACE_MIN_FRAMES &&
+        wideP90 >= INTERLACE_P90_MIN) {
       r.type = PhaseRun::Type::Interlaced;
       r.confidence = 0.75;
       r.reason = "no-phase-leaves-pures-clean";
@@ -3700,12 +3932,12 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
         qInfo().noquote()
             << QString(
                    "CineMap decision: MIXEDNESS_INTERLACE fields [%1..%2] "
-                   "frames=%3 avgW=%4 p90=%5 scores={%6} result=interlaced")
+                   "frames=%3 avgW=%4 wideP90=%5 scores={%6} result=interlaced")
                    .arg(startField)
                    .arg(endField)
                    .arg(numFrames)
                    .arg(avgW, 0, 'f', 4)
-                   .arg(p90, 0, 'f', 4)
+                   .arg(wideP90, 0, 'f', 4)
                    .arg(phaseArrayString(phaseScores, -1));
       }
     }
@@ -3922,16 +4154,20 @@ CineMap::PhaseRun CineMap::solveSegment(
   // verdict where two facts agree, which is what keeps a segment whose
   // triples span the cut (the crawl sharing its segment with the battle) on
   // the plate.
-  if (run.type == PhaseRun::Type::Interlaced) {
+  if (run.type == PhaseRun::Type::Interlaced ||
+      run.type == PhaseRun::Type::Progressive) {
     if (m_decisionTraceEnabled) {
       qInfo().noquote() << QString(
                                "CineMap summary: SEGMENT fields [%1..%2] "
-                               "mixedness=%3 final=interlaced conf=%4 "
+                               "mixedness=%3 final=%5 conf=%4 "
                                "source=scan-verdict")
                                .arg(segStartField)
                                .arg(segEndField)
                                .arg(mixednessSummary)
-                               .arg(run.confidence, 0, 'f', 3);
+                               .arg(run.confidence, 0, 'f', 3)
+                               .arg(run.type == PhaseRun::Type::Interlaced
+                                        ? "interlaced"
+                                        : "progressive");
     }
   } else {
     // 2. Pattern harvest — the cheap fast-out. It checks only the ~2 sites per
@@ -4068,7 +4304,17 @@ CineMap::PhaseRun CineMap::solveSegment(
       run.type = PhaseRun::Type::Pulldown32;
       run.phaseOffset = bestP;
       run.endField = segEndField;
-      run.reason.clear();
+      // A win carried by the harvest alone — no mixedness lock, no pattern
+      // sufficiency — is the sparse solve's commitment, and it is tagged as
+      // such: commitment on unknown ground is the autosolve's job, but
+      // against positive evidence next door it is no longer sparse ground,
+      // it is a tiebreaker need, and the tiebreak pass needs to know which
+      // wins were guesses. Facts corroborating below strip the tag.
+      if (!mixednessLocked && !patternSufficed) {
+        run.reason = QStringLiteral("weak-elect");
+      } else {
+        run.reason.clear();
+      }
       // Confidence: 0.80 base + scaled by how much the margin exceeds the
       // floor (caps at 0.95). Both signals agreeing produces a strong margin.
       double conf = 0.80;
@@ -4165,6 +4411,8 @@ CineMap::PhaseRun CineMap::solveSegment(
 
     if (factPhase >= 0) {
       if (run.type == PhaseRun::Type::Pulldown32) {
+        // Corroborated by facts either way: not a guess.
+        run.reason.remove(QStringLiteral("weak-elect"));
         if (run.phaseOffset != factPhase) {
           if (m_decisionTraceEnabled) {
             qInfo().noquote() << QString(
@@ -4810,6 +5058,20 @@ std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
     return m.grainIre < floorIre;
   };
 
+  // Neighbour grain, for the backing test. Returns -1 where unmeasurable.
+  auto neighbourGrain = [&](int a, int b) -> double {
+    if (a < 1 || b < 1 || a > totalFields || b > totalFields) return -1.0;
+    const TwinDemod m =
+        demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+    return m.valid ? m.grainIre : -1.0;
+  };
+
+  // Film grain animates between film frames, so a real twin's non-twin
+  // neighbours are LOUD; a fluke certified from a noise dip on near-static
+  // video has neighbours resting at the floor. Three times the raw floor
+  // splits the measured populations with room on both sides.
+  const double grainBackIre = nf.ire * 3.0;
+
   for (int s = segStart; s + 2 <= segEnd; ++s) {
     // Geometry first: it costs nothing and rejects most positions outright.
     const TwinACInfo ac = classifyTwinAC_strict(s, s + 2, cache);
@@ -4835,6 +5097,14 @@ std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
     t.spareSeq = ac.spareSeq;
     t.aType = (ac.role == TwinACRole::AType);
     t.anchorFrame = cache.cap[s].frameIndex;
+
+    {
+      const double gl = neighbourGrain(s - 2, s);
+      const double gr = neighbourGrain(s + 2, s + 4);
+      const double gmin =
+          (gl >= 0.0 && gr >= 0.0) ? std::min(gl, gr) : std::max(gl, gr);
+      t.grainBacked = (gmin >= grainBackIre);
+    }
 
     // A's def frame is group position 0 and its spare trails, so the triple
     // opens on position 0. C's spare leads from the BC frame, so its triple
