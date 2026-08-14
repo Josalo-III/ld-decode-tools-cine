@@ -550,6 +550,80 @@ class CineMap {
   // phase whose predicted sites are mostly empty.
   static constexpr double PHASE_VERIFY_MIN = 0.50;
 
+  // A twin that cancels names its own film frame outright.
+  //
+  // The pair is (def, spare) and the field between them is the comp, so one
+  // measurement fixes three fields — but both A and C present the same twin
+  // relation, so the pair alone cannot say which. Geometry answers it, and the
+  // answer is structural rather than statistical: the comp shares its input
+  // frame with the def, so the spare is the twin that sits OUTSIDE that frame,
+  // and 3:2 puts A's spare after it (trailing) and C's before it (leading).
+  // A's def frame is then group position 0 and C's is position 3, which is an
+  // absolute anchor — from one cancelling pair the whole cycle follows.
+  struct CertifiedTriple {
+    int loSeq = -1;  // first of the three consecutive fields
+    int defSeq = -1;
+    int compSeq = -1;
+    int spareSeq = -1;
+    int anchorFrame = -1;  // frame the phase is measured from
+    int phase = 0;         // 5-frame position of anchorFrame
+    bool aType = false;    // trailing spare (A) vs leading spare (C)
+  };
+
+  // Finds every twin that cancels in [segStart, segEnd] and returns the
+  // triples in field order. Writes no cadence: a fact belongs in the segment's
+  // phase, and painting a few certified values while an election paints the
+  // rest leaves correct islands in a wrong field.
+  std::vector<CertifiedTriple> certifyTriplesForSegment(
+      SourceVideo& sv, int segStart, int segEnd,
+      const SegmentCaptureCache& cache);
+
+  // The phase the certified triples in a field range FORCE, expressed as the
+  // offset applyCadenceToSegment measures from startFrameIdx. Returns -1 where
+  // the range carries no facts.
+  //
+  // Majority wins, which is the preponderance rule this material needs: a
+  // composite element telecined out of line with the plate dissents from the
+  // plate's schedule, and the plate is what a background solve is for.
+  // outDissent counts those disagreements — they are not noise to discard but
+  // the map of where a foreground pass in 24p space is owed.
+  int certifiedPhaseForRange(int fieldStart, int fieldEnd, int startFrameIdx,
+                             int* outVotes = nullptr,
+                             int* outDissent = nullptr) const;
+
+  // One triple can be a false certification; two that agree cannot easily be,
+  // since a false one lands on an arbitrary phase. Below this the facts stay
+  // out of the election entirely.
+  static constexpr int MIN_CERTIFIED_VOTES = 2;
+
+  // A cadence schedule as the break test needs to read it: which frame carries
+  // AA, the phase offset from that anchor, and the dominance domain. Two of
+  // these — the one running out and the one coming in — are all that is needed
+  // to predict every twin site either side of a break.
+  struct BreakSchedule {
+    int anchorFrame = -1;  // 0-based frame index the phase is measured from
+    int phase = 0;         // 5-frame position of anchorFrame
+    bool inverted = false;
+  };
+
+  // Frames either side of the coarse candidate whose twin sites are measured.
+  // Twins recur once per parity per 5-frame cycle, so this span must exceed
+  // that cycle or a schedule has no site to be judged on.
+  static constexpr int BREAK_WINDOW_FRAMES = 4;
+
+  // Fallback leash, used only where no certified triple brackets the break.
+  // Where the facts exist they bound the search instead, and a bound taken
+  // from evidence is not a constant anyone has to justify.
+  static constexpr int BREAK_SEARCH_RADIUS_FIELDS = 5;
+
+  // Places a cadence break on the field where the outgoing schedule's twins
+  // stop cancelling and the incoming schedule's start, which may be either
+  // field of a frame. Returns the chosen 1-based field, or -1 if no break can
+  // be formed at coarseFrameIdx at all.
+  int chooseBreakField(SourceVideo& sv, int coarseFrameIdx,
+                       const BreakSchedule& outgoing,
+                       const BreakSchedule& incoming);
+
   int healContinuity(SourceVideo& sv, std::vector<SegmentResult>& segments,
                      const SegmentCaptureCache& cache);
 
@@ -613,4 +687,6 @@ class CineMap {
   std::unordered_map<TwinDemodCacheKey, TwinDemod, TwinDemodCacheKeyHash>
       m_twinDemodCache;
   NoiseFloor m_noiseFloor;  // measured once per run by calibrateTwinFloor()
+  // Conservation facts, in field order. Anchors for everything downstream.
+  std::vector<CertifiedTriple> m_certifiedTriples;
 };

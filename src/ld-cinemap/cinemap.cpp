@@ -125,6 +125,7 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
   }
   m_doplGang.assign(totalFields + 1, std::nullopt);
   m_cadenceConfidence.assign(totalFields + 1, 0.0);
+  m_certifiedTriples.clear();
 
   // CAV fast-path
   if (m_disc->isDiscCav()) {
@@ -172,6 +173,16 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
                                .arg(segEnd);
     }
 
+    // Conservation facts first. Every twin that cancels here has already named
+    // its own three fields before any election is asked for an opinion, and
+    // the painter's confidence guard keeps them: what follows fills in around
+    // the facts rather than voting on them.
+    {
+      auto certified = certifyTriplesForSegment(sv, segStart, segEnd, cache);
+      m_certifiedTriples.insert(m_certifiedTriples.end(), certified.begin(),
+                                certified.end());
+    }
+
     auto mixedness = computeFrameMixedness(sv, segStart, segEnd);
 
     if (m_policy == Policy::Cine) {
@@ -182,6 +193,22 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
       dummyRun.phaseOffset = 0;
       dummyRun.endField = segEnd;
       dummyRun.confidence = 0.8;
+
+      // This run's phase can reach the metadata through the healer and the
+      // final paint, so it must carry the facts' phase where facts exist —
+      // otherwise a downstream repaint could undo what the facts just set.
+      {
+        int segAnchor = -1;
+        for (int s = segStart; s <= segEnd; ++s) {
+          if (cache.validSeq(s)) {
+            segAnchor = cache.cap[s].frameIndex;
+            break;
+          }
+        }
+        const int factPhase =
+            certifiedPhaseForRange(segStart, segEnd, segAnchor);
+        if (factPhase >= 0) dummyRun.phaseOffset = factPhase;
+      }
 
       solvedSegments.push_back({segStart, segEnd, dummyRun, mixedness});
     } else {
@@ -656,24 +683,18 @@ void CineMap::detectCavCadenceBreaks(std::vector<Cav5Group>& groups,
   const int totalFields = m_md->getNumberOfFields();
   const int nFrames = m_disc->getNumberOfFrames();
 
-  auto markBoundaryAtFrame = [&](int frameIdx) {
-    if (frameIdx < 0 || frameIdx >= nFrames) return;
-    if (m_disc->isPadded(frameIdx)) return;
+  // A break is written to a FIELD. The frame is only where the evidence
+  // pointed; which of its fields owns the cut is chooseBreakField's answer.
+  auto markBoundaryAtField = [&](int seq, int frameIdx) {
+    if (seq < 1 || seq > totalFields) return;
 
-    const int frameNumber = frameIdx + 1;
-    int f1 = m_disc->getFirstFieldNumber(frameNumber);
-    int f2 = m_disc->getSecondFieldNumber(frameNumber);
-    if (f1 < 1 || f2 < 1) return;
+    auto fld = m_md->getField(seq);
+    if (fld.pad) return;
 
-    auto [tFirst, tSecond] = fo.temporalOrder(f1, f2);
-    (void)tSecond;
-
-    if (tFirst < 1 || tFirst > totalFields) return;
-    auto fld = m_md->getField(tFirst);
     if (!fld.cinemap.isEditBoundary && !fld.cinemap.isEditVetoed) {
       fld.cinemap.assertEditBoundary();
-      m_md->updateField(fld, tFirst);
-      qInfo() << "CAV: inserted cadence break at field" << tFirst << "(frame"
+      m_md->updateField(fld, seq);
+      qInfo() << "CAV: inserted cadence break at field" << seq << "(frame"
               << frameIdx << ")";
     }
   };
@@ -731,7 +752,14 @@ void CineMap::detectCavCadenceBreaks(std::vector<Cav5Group>& groups,
       }
     }
 
-    markBoundaryAtFrame(candidateFrame);
+    // Both schedules are already in hand: a group's f0 is its AA frame, and the
+    // signature carries the dominance domain that side is running in.
+    const BreakSchedule outgoing{gPrev.f0, 0, sp.invertedDomain};
+    const BreakSchedule incoming{gCurr.f0, 0, sc.invertedDomain};
+
+    const int breakField =
+        chooseBreakField(sv, candidateFrame, outgoing, incoming);
+    if (breakField > 0) markBoundaryAtField(breakField, candidateFrame);
   }
 
   m_disc
@@ -3807,6 +3835,64 @@ CineMap::PhaseRun CineMap::solveSegment(
                .arg(sources);
   }
 
+  // Facts outrank the election. Where the segment holds corroborated
+  // certified triples, the phase they force IS the segment's phase; the
+  // election above stands only where no facts reach. And where the election
+  // abstained but facts exist, the facts alone are a lock — a twin that
+  // cancels is film, however short the shot.
+  {
+    int segAnchor = -1;
+    for (int s = segStartField; s <= segEndField; ++s) {
+      if (cache.validSeq(s)) {
+        segAnchor = cache.cap[s].frameIndex;
+        break;
+      }
+    }
+
+    int factVotes = 0, factDissent = 0;
+    const int factPhase = certifiedPhaseForRange(
+        segStartField, segEndField, segAnchor, &factVotes, &factDissent);
+
+    if (factPhase >= 0) {
+      if (run.type == PhaseRun::Type::Pulldown32) {
+        if (run.phaseOffset != factPhase) {
+          if (m_decisionTraceEnabled) {
+            qInfo().noquote() << QString(
+                                     "CineMap decision: CERTIFIED_PHASE "
+                                     "fields [%1..%2] elected=%3 certified=%4 "
+                                     "votes=%5 dissent=%6 — facts overrule")
+                                     .arg(segStartField)
+                                     .arg(segEndField)
+                                     .arg(run.phaseOffset)
+                                     .arg(factPhase)
+                                     .arg(factVotes)
+                                     .arg(factDissent);
+          }
+          run.phaseOffset = factPhase;
+          run.reason += "+certified-facts";
+        }
+      } else {
+        if (m_decisionTraceEnabled) {
+          qInfo().noquote() << QString(
+                                   "CineMap decision: CERTIFIED_PHASE fields "
+                                   "[%1..%2] election=%3 certified=%4 votes=%5 "
+                                   "dissent=%6 — facts lock where the "
+                                   "election abstained")
+                                   .arg(segStartField)
+                                   .arg(segEndField)
+                                   .arg(phaseRunTypeName(run.type))
+                                   .arg(factPhase)
+                                   .arg(factVotes)
+                                   .arg(factDissent);
+        }
+        run.type = PhaseRun::Type::Pulldown32;
+        run.phaseOffset = factPhase;
+        run.confidence = std::max(run.confidence, 0.8);
+        run.reason = "certified-facts";
+      }
+    }
+  }
+
   return run;
 }
 
@@ -3814,7 +3900,6 @@ void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
                                int segEndField,
                                const SegmentCaptureCache& cache,
                                const std::vector<FrameMixedness>& mixedness) {
-  Q_UNUSED(sv);
   if (!m_md || !m_disc || segStartField >= segEndField) return;
   if (mixedness.empty()) return;
 
@@ -3963,25 +4048,35 @@ void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
   // -----------------------------------------------------------------
   // 3. Insert cadence boundaries at run transitions and paint cadence.
   // -----------------------------------------------------------------
-  auto setCadenceBoundaryAtFrame = [&](int frameIdx) {
-    if (frameIdx < 0 || frameIdx >= m_disc->getNumberOfFrames()) return;
-    if (m_disc->isPadded(frameIdx)) return;
+  auto markBoundaryAtField = [&](int seq) {
+    if (seq < 1 || seq > m_md->getNumberOfFields()) return;
 
-    const int frameNumber = frameIdx + 1;
-    int f1 = m_disc->getFirstFieldNumber(frameNumber);
-    int f2 = m_disc->getSecondFieldNumber(frameNumber);
-    if (f1 < 1 || f2 < 1) return;
+    auto fld = m_md->getField(seq);
+    if (fld.pad) return;
 
-    auto [tFirst, tSecond] = fo.temporalOrder(f1, f2);
-    (void)tSecond;
-
-    if (tFirst < 1 || tFirst > m_md->getNumberOfFields()) return;
-    auto fld = m_md->getField(tFirst);
     if (!fld.cinemap.isEditBoundary && !fld.cinemap.isEditVetoed) {
       fld.cinemap.assertEditBoundary();
-      m_md->updateField(fld, tFirst);
+      m_md->updateField(fld, seq);
     }
   };
+
+  // Breaks first, then paint. A run's paint has to stop where its break stands,
+  // and a break that lands mid-frame splits the straddling frame between the
+  // outgoing and incoming schedules — one field each.
+  std::vector<int> breakField(runs.size(), -1);
+
+  for (size_t ri = 1; ri < runs.size(); ++ri) {
+    const BreakSchedule outgoing{runs[ri - 1].frameStart, runs[ri - 1].phase,
+                                 false};
+    const BreakSchedule incoming{runs[ri].frameStart, runs[ri].phase, false};
+
+    const int seq =
+        chooseBreakField(sv, runs[ri].frameStart, outgoing, incoming);
+    if (seq > 0) {
+      breakField[ri] = seq;
+      markBoundaryAtField(seq);
+    }
+  }
 
   for (size_t ri = 0; ri < runs.size(); ++ri) {
     const Run& r = runs[ri];
@@ -3989,15 +4084,57 @@ void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
     int fs = 0, fe = 0;
     if (!frameRangeToFieldRange(r.frameStart, r.frameEnd, fs, fe)) continue;
 
+    // Own exactly the fields on this side of the breaks at either end.
+    if (breakField[ri] > 0) fs = breakField[ri];
+    if (ri + 1 < runs.size() && breakField[ri + 1] > 0)
+      fe = breakField[ri + 1] - 1;
+
     fs = std::max(fs, segStartField);
     fe = std::min(fe, segEndField);
     if (fs >= fe) continue;
 
-    if (ri > 0) setCadenceBoundaryAtFrame(r.frameStart);
+    // applyCadenceToSegment measures its phase from the first frame it paints,
+    // and a break may have moved that off the run's own first frame. Carry the
+    // schedule across the difference rather than let the anchor move under it.
+    int paintFirstFrame = -1;
+    for (int s = fs; s <= fe; ++s) {
+      if (cache.validSeq(s)) {
+        paintFirstFrame = cache.cap[s].frameIndex;
+        break;
+      }
+    }
+    if (paintFirstFrame < 0) continue;
+
+    int phase = normalizePhase(
+        static_cast<long long>(r.phase) + paintFirstFrame - r.frameStart, 5);
+
+    // Facts outrank the election. Where the run holds corroborated certified
+    // triples, the phase they force IS the run's phase, and mixedness stands
+    // only where no facts reach. Painting the whole run with the facts' phase
+    // is what keeps fact and election from ever writing a mixed field.
+    int factVotes = 0, factDissent = 0;
+    const int factPhase =
+        certifiedPhaseForRange(fs, fe, paintFirstFrame, &factVotes,
+                               &factDissent);
+    if (factPhase >= 0) {
+      if (factPhase != phase && m_decisionTraceEnabled) {
+        qInfo().noquote() << QString(
+                                 "CineMap decision: CERTIFIED_PHASE fields "
+                                 "[%1..%2] elected=%3 certified=%4 votes=%5 "
+                                 "dissent=%6 — facts overrule")
+                                 .arg(fs)
+                                 .arg(fe)
+                                 .arg(phase)
+                                 .arg(factPhase)
+                                 .arg(factVotes)
+                                 .arg(factDissent);
+      }
+      phase = factPhase;
+    }
 
     constexpr double CINE_RUN_CONF = 0.80;
     applyCadenceToSegment(fs, fe,
-                          /*isLock=*/true, r.phase,
+                          /*isLock=*/true, phase,
                           /*fillCid=*/CADENCE_UNKNOWN, CINE_RUN_CONF, cache);
   }
 }
@@ -4320,6 +4457,402 @@ double CineMap::verifyPhaseByTwins(SourceVideo& sv, int segStart, int segEnd,
 
   if (sites < 2) return -1.0;  // no power: darkness, not a rejection
   return static_cast<double>(hits) / sites;
+}
+
+// -----------------------------------------------------------------------------
+// Conservation facts: the certified triple
+// -----------------------------------------------------------------------------
+//
+// A twin is two captures of one film field on opposite subcarrier phase, so it
+// cancels by conservation — luma in the difference, carrier in the sum. That
+// makes it a value rather than a clue, and a value needs no run length to be
+// true: the pair names its def and spare, the field between them is the comp,
+// and geometry names the letter. Three fields, from one measurement.
+//
+// The one thing cancellation cannot say by itself is whether the content simply
+// never moved. A frozen shot cancels at every d=2 position, and a pair that
+// cancels no better than its own neighbours carries no information about which
+// film frame it is. So the twin must be the quiet one among its same-parity
+// neighbours — the local form of the one-twin-per-parity-per-cycle law — and
+// where that fails nothing is certified and the elections keep the field.
+std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
+    SourceVideo& sv, int segStart, int segEnd,
+    const SegmentCaptureCache& cache) {
+  std::vector<CertifiedTriple> out;
+  if (!m_md || !m_disc) return out;
+
+  const NoiseFloor& nf = calibrateTwinFloor(sv);
+  if (!nf.valid) return out;
+
+  // The geometry operating point: this asks which position a pair occupies,
+  // and surplus hits blur the very structure being read.
+  const double floorIre = nf.ire * FLOOR_MULT_GEOMETRY;
+  if (!(floorIre > 0.0)) return out;
+
+  const auto& vp = m_md->getVideoParameters();
+  const int totalFields = m_md->getNumberOfFields();
+
+  auto cancels = [&](int a, int b) -> bool {
+    if (a < 1 || b < 1 || a > totalFields || b > totalFields) return false;
+    const TwinDemod m =
+        demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+    if (!m.valid) return false;
+    return m.grainIre < floorIre;
+  };
+
+  for (int s = segStart; s + 2 <= segEnd; ++s) {
+    // Geometry first: it costs nothing and rejects most positions outright.
+    const TwinACInfo ac = classifyTwinAC_strict(s, s + 2, cache);
+    if (ac.role == TwinACRole::Unknown) continue;
+
+    if (!cancels(s, s + 2)) continue;
+
+    // Frozen content cancels everywhere; a twin stands out from its own
+    // parity's neighbours.
+    if (cancels(s - 2, s)) continue;
+    if (cancels(s + 2, s + 4)) continue;
+
+    // Never overlap one fact with another: two overlapping triples are a
+    // contradiction, and the first one keeps the ground.
+    if (!out.empty() && s <= out.back().loSeq + 2) continue;
+
+    if (!cache.validSeq(s)) continue;
+
+    CertifiedTriple t;
+    t.loSeq = s;
+    t.defSeq = ac.defSeq;
+    t.compSeq = ac.compSeq;
+    t.spareSeq = ac.spareSeq;
+    t.aType = (ac.role == TwinACRole::AType);
+    t.anchorFrame = cache.cap[s].frameIndex;
+
+    // A's def frame is group position 0 and its spare trails, so the triple
+    // opens on position 0. C's spare leads from the BC frame, so its triple
+    // opens on position 2. Either way the phase is the position of the first
+    // frame the triple covers, which is what the painter measures from.
+    t.phase = t.aType ? 0 : 2;
+
+    // Deliberately writes NOTHING. A triple that paints its own three fields
+    // while an elected phase paints the rest produces correct islands inside a
+    // wrong field wherever the two disagree, and the confidence that protects
+    // the island makes the disagreement permanent instead of loud. Measured on
+    // Emissary side 1: 0.00% of cadence steps broken before, 18.76% after.
+    //
+    // A fact must set the segment's PHASE, not a few of its values. Until it
+    // does, the triples serve as anchors for break placement only.
+    out.push_back(t);
+
+    if (m_decisionTraceEnabled) {
+      qInfo().noquote() << QString(
+                               "CineMap decision: CERTIFIED_TRIPLE %1 def=%2 "
+                               "comp=%3 spare=%4 frame=%5 phase=%6")
+                               .arg(t.aType ? "A" : "C")
+                               .arg(t.defSeq)
+                               .arg(t.compSeq)
+                               .arg(t.spareSeq)
+                               .arg(t.anchorFrame)
+                               .arg(t.phase);
+    }
+  }
+
+  return out;
+}
+
+// Which paint offset do the facts in [fieldStart, fieldEnd] force?
+//
+// Each triple states its own frame's group position outright, so relative to
+// any paint anchor it names exactly one legal offset. Counting those names
+// across the range is the preponderance rule this material needs: a composite
+// element telecined out of line with the plate dissents from the plate's
+// schedule, and the plate is what a background solve is for. The dissent count
+// is returned rather than discarded — it is the map of where a foreground pass
+// in 24p space is owed.
+int CineMap::certifiedPhaseForRange(int fieldStart, int fieldEnd,
+                                    int startFrameIdx, int* outVotes,
+                                    int* outDissent) const {
+  if (outVotes) *outVotes = 0;
+  if (outDissent) *outDissent = 0;
+  if (startFrameIdx < 0) return -1;
+
+  int votes[5] = {0, 0, 0, 0, 0};
+
+  for (const auto& t : m_certifiedTriples) {
+    if (t.loSeq < fieldStart || t.loSeq + 2 > fieldEnd) continue;
+
+    // The offset that puts t.anchorFrame at position t.phase when positions
+    // are measured from startFrameIdx.
+    const int off = normalizePhase(
+        static_cast<long long>(t.phase) - t.anchorFrame + startFrameIdx, 5);
+    votes[off]++;
+  }
+
+  int best = -1, bestN = 0, total = 0;
+  for (int p = 0; p < 5; ++p) {
+    total += votes[p];
+    if (votes[p] > bestN) {
+      bestN = votes[p];
+      best = p;
+    }
+  }
+
+  if (outVotes) *outVotes = bestN;
+  if (outDissent) *outDissent = total - bestN;
+
+  if (bestN < MIN_CERTIFIED_VOTES) return -1;
+  return best;
+}
+
+// -----------------------------------------------------------------------------
+// Where a cadence break lands
+// -----------------------------------------------------------------------------
+//
+// A cadence break is a field event. The evidence that finds one is quantised to
+// frames — a CAV group signature that flips, a mixedness phase run that ends —
+// but the break itself is not, and a cut landing between a frame's two fields
+// is as ordinary as one landing on its head.
+//
+// Both sides name their own twins, and a twin is a conservation fact rather
+// than a resemblance. 3:2 pulldown captures the same film field twice, and
+// NTSC's four-field sequence guarantees the repeat carries the subcarrier at
+// opposite phase:
+//
+//     def = L + C, spare = L - C
+//     def + spare  ->  the carrier cancels, luma survives
+//     def - spare  ->  luma cancels, the carrier survives
+//
+// So every same-parity d=2 pair in the window is asked, on both channels at
+// once, whether it is two captures of one film field — and no pair needs
+// special handling. A pair spanning the cut is two different film fields, so
+// neither channel cancels and it scores against whichever schedule claimed it.
+//
+// A candidate break field is therefore only an assignment: the outgoing
+// schedule owns the fields to its left, the incoming schedule the fields to its
+// right. That assignment predicts by itself which pairs must be twins, and the
+// break lands where prediction and measurement agree best.
+int CineMap::chooseBreakField(SourceVideo& sv, int coarseFrameIdx,
+                              const BreakSchedule& outgoing,
+                              const BreakSchedule& incoming) {
+  if (!m_md || !m_disc) return -1;
+
+  const int nFrames = m_disc->getNumberOfFrames();
+  if (coarseFrameIdx < 0 || coarseFrameIdx >= nFrames) return -1;
+  if (m_disc->isPadded(coarseFrameIdx)) return -1;
+
+  FieldOrderPolicy fo;
+  fo.reverse = m_disc->getReverseFieldOrder();
+
+  const int totalFields = m_md->getNumberOfFields();
+
+  // The frame head is the fallback throughout: wherever the twins cannot
+  // separate the candidates we keep the break the coarse evidence found rather
+  // than abstain.
+  int headField = -1;
+  {
+    const int f1 = m_disc->getFirstFieldNumber(coarseFrameIdx + 1);
+    const int f2 = m_disc->getSecondFieldNumber(coarseFrameIdx + 1);
+    if (f1 < 1 || f2 < 1) return -1;
+    auto [tFirst, tSecond] = fo.temporalOrder(f1, f2);
+    (void)tSecond;
+    if (tFirst < 1 || tFirst > totalFields) return -1;
+    headField = tFirst;
+  }
+
+  const NoiseFloor& nf = calibrateTwinFloor(sv);
+  if (!nf.valid) return headField;
+
+  // The geometry operating point: this is a "which position" question, and
+  // surplus hits blur the very structure being read.
+  const double floorIre = nf.ire * FLOOR_MULT_GEOMETRY;
+  if (!(floorIre > 0.0)) return headField;
+
+  // The facts bracket the break, and each side's nearest certified triple is a
+  // better anchor for that side than any frame estimate: the triple states its
+  // own position outright, where a run start has to be waited for.
+  const CertifiedTriple* outFact = nullptr;
+  const CertifiedTriple* inFact = nullptr;
+  for (const auto& t : m_certifiedTriples) {
+    if (t.loSeq + 2 < headField) outFact = &t;
+    if (t.loSeq > headField && inFact == nullptr) inFact = &t;
+  }
+
+  BreakSchedule outSched = outgoing;
+  BreakSchedule inSched = incoming;
+
+  // Without facts either side, the caller's schedules stand and the fallback
+  // leash bounds the search.
+  int bracketLo = headField - BREAK_SEARCH_RADIUS_FIELDS;
+  int bracketHi = headField + BREAK_SEARCH_RADIUS_FIELDS;
+  bool bracketed = false;
+
+  if (outFact != nullptr && inFact != nullptr) {
+    outSched = {outFact->anchorFrame, outFact->phase, outgoing.inverted};
+    inSched = {inFact->anchorFrame, inFact->phase, incoming.inverted};
+
+    // The cut cannot fall inside a triple that cancelled: those three fields
+    // are one film frame. So it lies after the outgoing triple's last field
+    // and no later than the incoming triple's first.
+    bracketLo = outFact->loSeq + 3;
+    bracketHi = inFact->loSeq;
+    bracketed = true;
+  }
+
+  // Every field of the window in temporal order, carrying the cadence id each
+  // schedule would give it.
+  struct WindowField {
+    int seq = -1;
+    int frameIdx = -1;
+    int cidOut = CADENCE_UNKNOWN;
+    int cidIn = CADENCE_UNKNOWN;
+  };
+  std::vector<WindowField> wf;
+
+  auto cidsForFrame = [&](int frameIdx,
+                          const BreakSchedule& s) -> std::pair<int, int> {
+    if (s.anchorFrame < 0) return {CADENCE_UNKNOWN, CADENCE_UNKNOWN};
+    const int pos = normalizePhase(
+        static_cast<long long>(frameIdx) - s.anchorFrame + s.phase, 5);
+    auto [c1, c2] = fo.cavCadenceIdsForFrameInGroup(pos);
+    const int base = s.inverted ? CADENCE_NTSC_INVERTED_OFFSET : 0;
+    return {base + c1, base + c2};
+  };
+
+  const int frameLo = std::max(0, coarseFrameIdx - BREAK_WINDOW_FRAMES);
+  const int frameHi =
+      std::min(nFrames - 1, coarseFrameIdx + BREAK_WINDOW_FRAMES);
+
+  for (int fi = frameLo; fi <= frameHi; ++fi) {
+    if (m_disc->isPadded(fi)) continue;
+
+    const int f1 = m_disc->getFirstFieldNumber(fi + 1);
+    const int f2 = m_disc->getSecondFieldNumber(fi + 1);
+    if (f1 < 1 || f2 < 1) continue;
+
+    auto [tFirst, tSecond] = fo.temporalOrder(f1, f2);
+    auto [outFirst, outSecond] = cidsForFrame(fi, outSched);
+    auto [inFirst, inSecond] = cidsForFrame(fi, inSched);
+
+    wf.push_back({tFirst, fi, outFirst, inFirst});
+    wf.push_back({tSecond, fi, outSecond, inSecond});
+  }
+  if (wf.size() < 4) return headField;
+
+  const auto& vp = m_md->getVideoParameters();
+
+  // One measurement per candidate pair, both channels, cached.
+  struct Site {
+    int i = -1;  // index in wf of the earlier field
+    int j = -1;  // index in wf of its d=2 same-parity partner
+    double defect = 0.0;
+  };
+  std::vector<Site> sites;
+
+  for (size_t i = 0; i + 2 < wf.size(); ++i) {
+    const auto& a = wf[i];
+    const auto& b = wf[i + 2];
+
+    // Two apart in temporal order is same parity and adjacent frames, which is
+    // the twin geometry — but only while the window is frame-contiguous.
+    if (b.frameIdx != a.frameIdx + 1) continue;
+    if (a.seq < 1 || b.seq < 1) continue;
+    if (a.seq > totalFields || b.seq > totalFields) continue;
+
+    const TwinDemod m =
+        demodTwinCached(sv, a.seq, b.seq, vp.fieldWidth, vp.fieldHeight);
+    if (!m.valid) continue;
+
+    // Each channel in its own natural unit: the luma difference against the
+    // disc's own measured floor, and the carrier cancellation defect, which is
+    // dimensionless and so carries its own scale. The carrier half is consulted
+    // only where there was chroma to cancel — dCoh is the power meter, and no
+    // chroma present is a different state from chroma that failed to cancel.
+    double defect = m.grainIre / floorIre;
+    if (m.dCohIre > 0.0) defect += m.qCoh();
+
+    sites.push_back(
+        {static_cast<int>(i), static_cast<int>(i + 2), defect});
+  }
+  if (sites.size() < 2) return headField;
+
+  // Cost of cutting immediately before wf[cutIdx]: predicted twins should
+  // cancel, everything else should not. Both populations must be present or the
+  // window has nothing to say about this cut.
+  auto costForCut = [&](size_t cutIdx) -> double {
+    double twinSum = 0.0, otherSum = 0.0;
+    int twinN = 0, otherN = 0;
+
+    for (const auto& s : sites) {
+      const int cidA =
+          (static_cast<size_t>(s.i) < cutIdx) ? wf[s.i].cidOut : wf[s.i].cidIn;
+      const int cidB =
+          (static_cast<size_t>(s.j) < cutIdx) ? wf[s.j].cidOut : wf[s.j].cidIn;
+
+      const bool predictedTwin = cadenceKnown(cidA) && cadenceKnown(cidB) &&
+                                 getTwinMateCadenceId(cidA) == cidB;
+
+      if (predictedTwin) {
+        twinSum += s.defect;
+        twinN++;
+      } else {
+        otherSum += s.defect;
+        otherN++;
+      }
+    }
+
+    if (twinN == 0 || otherN == 0)
+      return std::numeric_limits<double>::max();
+    return (twinSum / twinN) - (otherSum / otherN);
+  };
+
+  size_t headIdx = wf.size();
+  for (size_t k = 0; k < wf.size(); ++k) {
+    if (wf[k].seq == headField) {
+      headIdx = k;
+      break;
+    }
+  }
+  if (headIdx == wf.size()) return headField;
+
+  const double headCost = costForCut(headIdx);
+
+  size_t bestIdx = headIdx;
+  double bestCost = headCost;
+
+  // Candidates are the measured window clipped by the bracket: we look only
+  // where we have measurements, and the facts narrow it from there.
+  for (size_t k = 0; k < wf.size(); ++k) {
+    if (k == headIdx) continue;
+    if (wf[k].seq < bracketLo || wf[k].seq > bracketHi) continue;
+
+    const double c = costForCut(k);
+    if (c < bestCost) {
+      bestCost = c;
+      bestIdx = k;
+    }
+  }
+
+  if (m_decisionTraceEnabled) {
+    qInfo().noquote() << QString(
+                             "CineMap decision: BREAK_FIELD frame=%1 head=%2 "
+                             "chosen=%3 sites=%4 headCost=%5 bestCost=%6 "
+                             "bracket=[%7..%8]%9 %10")
+                             .arg(coarseFrameIdx)
+                             .arg(headField)
+                             .arg(wf[bestIdx].seq)
+                             .arg(sites.size())
+                             .arg(headCost, 0, 'f', 4)
+                             .arg(bestCost, 0, 'f', 4)
+                             .arg(bracketLo)
+                             .arg(bracketHi)
+                             .arg(bracketed ? "certified" : "leash")
+                             .arg(wf[bestIdx].frameIdx == coarseFrameIdx &&
+                                          wf[bestIdx].seq != headField
+                                      ? "midframe"
+                                      : (wf[bestIdx].seq == headField
+                                             ? "head"
+                                             : "moved"));
+  }
+
+  return wf[bestIdx].seq;
 }
 
 int CineMap::healContinuity(SourceVideo& sv,
