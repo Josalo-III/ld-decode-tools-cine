@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -3478,6 +3479,134 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
     return run;
   }
 
+  // -------------------------------------------------------------------------
+  // Second reading: the two-frame bump against the segment norm.
+  //
+  // The per-frame path above needs each frame to carry its own verdict, and
+  // on material where a video-rate look rides the whole frame it cannot: the
+  // pattern is a small excess at the two expected-mixed positions, under
+  // heavy-tailed per-frame noise. Piling the evidence across the segment and
+  // asking WHERE the bump sits is the original mixedness design, and rank
+  // does the piling robustly: within one 5-frame cycle, drift is nothing and
+  // an outlier frame moves one rank, not the mean. Per cycle, does the top
+  // score land on the two positions the phase calls mixed? Chance is 0.4;
+  // count the hits and ask for significance.
+  //
+  // Two independent gates, both inherited scales. The amplitude gate reuses
+  // LIPS_SILENCE — a bump smaller than the meaningful-lips floor is rank
+  // noise on a silent card, whatever its count (measured: title card z=1.8
+  // at bump 0.002; crawl z=0.5 at 0.006). The significance gate is plain 3
+  // sigma, with the runner-up required to stay below it so an aliased
+  // two-phase tie names rather than locks. Measured on Emissary: the bridge
+  // establishing shot — film under a 29.97 look, per-frame path blind —
+  // locks at z=3.84, bump 0.094, on the phase the solve confirms.
+  auto bumpSecondReading = [&](PhaseRun r) -> PhaseRun {
+    constexpr int BUMP_MIN_CYCLES = 8;
+    constexpr double BUMP_Z_LOCK = 3.0;
+    constexpr double BUMP_Z_NAME = 2.0;
+
+    const int nFrames = static_cast<int>(mixed.size());
+    if (nFrames < BUMP_MIN_CYCLES * 5) return r;
+
+    // Complete cycles only: a cycle missing a position cannot rank.
+    std::map<int, std::array<double, 5>> cycles;
+    std::map<int, int> cycleFill;
+    for (int i = 0; i < nFrames; ++i) {
+      const int rel = mixed[i].frameIndex - startFrameIdx;
+      if (rel < 0) continue;
+      auto& c = cycles[rel / 5];
+      c[rel % 5] = mixed[i].score;
+      cycleFill[rel / 5] |= (1 << (rel % 5));
+    }
+
+    int nCyc = 0;
+    std::array<int, 5> hits = {0, 0, 0, 0, 0};
+    std::array<std::vector<double>, 5> bumps;
+
+    for (const auto& [ci, c] : cycles) {
+      if (cycleFill[ci] != 0x1F) continue;
+      nCyc++;
+
+      int topPos = 0;
+      for (int q = 1; q < 5; ++q)
+        if (c[q] > c[topPos]) topPos = q;
+
+      for (int p = 0; p < 5; ++p) {
+        // Phase p calls absolute positions (1-p)%5 and (2-p)%5 mixed.
+        const int mA = ((1 - p) % 5 + 5) % 5;
+        const int mB = ((2 - p) % 5 + 5) % 5;
+        if (topPos == mA || topPos == mB) hits[p]++;
+        const double m2 = (c[mA] + c[mB]) / 2.0;
+        double m3 = 0.0;
+        for (int q = 0; q < 5; ++q)
+          if (q != mA && q != mB) m3 += c[q];
+        bumps[p].push_back(m2 - m3 / 3.0);
+      }
+    }
+    if (nCyc < BUMP_MIN_CYCLES) return r;
+
+    int bestP = -1, secondP = -1;
+    double bestZ = -1e9, secondZ = -1e9;
+    std::array<double, 5> medBump = {0, 0, 0, 0, 0};
+
+    const double se = std::sqrt(nCyc * 0.4 * 0.6);
+    for (int p = 0; p < 5; ++p) {
+      const double z = (hits[p] - nCyc * 0.4) / se;
+      std::sort(bumps[p].begin(), bumps[p].end());
+      medBump[p] = bumps[p][bumps[p].size() / 2];
+      if (z > bestZ) {
+        secondZ = bestZ;
+        secondP = bestP;
+        bestZ = z;
+        bestP = p;
+      } else if (z > secondZ) {
+        secondZ = z;
+        secondP = p;
+      }
+    }
+    (void)secondP;
+
+    const bool meaningful = (bestP >= 0) && (medBump[bestP] > LIPS_SILENCE);
+    const bool significant = meaningful && (bestZ >= BUMP_Z_LOCK);
+    const bool unambiguous = (secondZ < BUMP_Z_LOCK);
+
+    if (significant && unambiguous) {
+      r.type = PhaseRun::Type::Pulldown32;
+      r.phaseOffset = bestP;
+      // Rank evidence is robust but coarser than a clean per-frame lock;
+      // its confidence tops out below one.
+      r.confidence = std::min(0.85, 0.55 + 0.05 * bestZ);
+      r.reason.clear();
+    }
+
+    if (meaningful && bestZ >= BUMP_Z_NAME) {
+      // Name the phase for the election even without a lock: the bump vector
+      // is positive where the ± accumulation was not, so the pattern harvest
+      // gets a candidate to confirm at its predicted twin sites and mixedness
+      // stops being silent in the additive election.
+      for (int p = 0; p < 5; ++p) r.phaseScores[p] = std::max(0.0, medBump[p]);
+      r.phaseScoresInformative = true;
+    }
+
+    if (m_decisionTraceEnabled && meaningful && bestZ >= BUMP_Z_NAME) {
+      qInfo().noquote()
+          << QString(
+                 "CineMap decision: MIXEDNESS_BUMP fields [%1..%2] cycles=%3 "
+                 "bestPhase=%4 hits=%5 z=%6 secondZ=%7 medBump=%8 result=%9")
+                 .arg(startField)
+                 .arg(endField)
+                 .arg(nCyc)
+                 .arg(bestP)
+                 .arg(hits[bestP])
+                 .arg(bestZ, 0, 'f', 2)
+                 .arg(secondZ, 0, 'f', 2)
+                 .arg(medBump[bestP], 0, 'f', 4)
+                 .arg(significant && unambiguous ? "lock" : "named");
+    }
+
+    return r;
+  };
+
   // Tie / ambiguity detection. Under anti-pattern, 3-mixed-in-a-row content
   // produces an INHERENT tie between two phases (both "off by one" placements
   // score the same — the math is symmetric in the three-consecutive case).
@@ -3524,7 +3653,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
                  .arg(phaseArrayString(phaseScores, bestP));
     }
 
-    return run;
+    return bumpSecondReading(run);
   }
 
   if (bestP != -1 && calculatedConf > 0.45) {
@@ -3577,7 +3706,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
                              .arg(phaseArrayString(phaseScores, bestP));
   }
 
-  return run;
+  return bumpSecondReading(run);
 }
 
 CineMap::PhaseRun CineMap::solveSegment(
