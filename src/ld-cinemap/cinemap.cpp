@@ -4043,9 +4043,10 @@ void CineMap::classifyAsInterlaced(
     auto f = m_md->getField(s);
     if (f.pad) continue;
 
-    // Only paint where we don't already have a known cadence (film or
-    // otherwise).
-    if (cadenceKnown(f.cinemap.cadenceId)) continue;
+    // Only paint free ground. An asserted sentinel is not free ground, and
+    // cadenceKnown() deliberately excludes it from pulldown arithmetic — so
+    // the test here must be against UNKNOWN, not against "known".
+    if (f.cinemap.cadenceId != CADENCE_UNKNOWN) continue;
 
     f.cinemap.cadenceId = -2;  // 59.94i
     // Confidence: not absolute, but stronger than "unsolved"
@@ -4115,7 +4116,9 @@ void CineMap::classifyAsProgressive(
     auto f = m_md->getField(s);
     if (f.pad) continue;
 
-    if (cadenceKnown(f.cinemap.cadenceId)) continue;
+    // Free ground only — an asserted interlace sentinel must not be flipped
+    // to progressive by a broader classification.
+    if (f.cinemap.cadenceId != CADENCE_UNKNOWN) continue;
 
     f.cinemap.cadenceId = -3;  // 29.97p progressive
     if (m_cadenceConfidence[s] < 0.7) m_cadenceConfidence[s] = 0.7;
@@ -4848,8 +4851,12 @@ void CineMap::applyCadenceToSegment(int segStart, int segEnd, bool isLock,
     auto fld = m_md->getField(i);
     if (fld.pad) continue;
 
-    // Don't overwrite a higher-confidence lock already on this field.
-    if (cadenceKnown(fld.cinemap.cadenceId) &&
+    // Don't overwrite a higher-confidence assertion already on this field.
+    // ANY asserted id is protected by its recorded confidence — including the
+    // VIDEO and PROGRESSIVE sentinels, which cadenceKnown() deliberately
+    // excludes from pulldown arithmetic but which are no less a verdict. Only
+    // CADENCE_UNKNOWN is free ground.
+    if (fld.cinemap.cadenceId != CADENCE_UNKNOWN &&
         m_cadenceConfidence[i] > finalConf)
       continue;
 
