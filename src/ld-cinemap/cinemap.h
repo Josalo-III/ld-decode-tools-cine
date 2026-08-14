@@ -433,21 +433,7 @@ class CineMap {
   // weakest measured telecine with headroom.
   static constexpr double CYCLE_CONCENTRATION_MIN = 0.40;
 
-  // A video sentinel may only be asserted over a well-sampled span. Below this
-  // coverage the span is dark, not video, and darkness must bridge rather than
-  // tag.
-  static constexpr double MIN_TAG_COVERAGE = 0.75;
 
-  // True when the twin census has positively ruled film out over
-  // [segStart,segEnd]: no concentrated cadence, and enough usable pairs to mean
-  // it. Only then may the 59.94i / progressive fork be asked.
-  //
-  // The asymmetry is the whole point. Tagging a film-dominant shot as video
-  // makes 24p export drop frames at effectively random positions, which
-  // destroys the shot for the restorer's later composite; the reverse error is
-  // recoverable by a second pass with --set-cadence. So film must be positively
-  // excluded, never merely unproven, before any video sentinel is written.
-  bool filmRuledOut(SourceVideo& sv, int segStart, int segEnd);
 
   double calculateBoostedDemodDiff(SourceVideo& sv, int f1, int f2, int width,
                                    int height);
@@ -626,6 +612,12 @@ class CineMap {
 
   int healContinuity(SourceVideo& sv, std::vector<SegmentResult>& segments,
                      const SegmentCaptureCache& cache);
+
+  // Paints CADENCE_PROGRESSIVE over every field still UNKNOWN after pattern,
+  // facts, anchored healing, and cut recovery have declined — the unanchored
+  // residue. Low confidence by design: this is the weakest claim in the
+  // system, and any later pass with actual evidence outranks it.
+  int paintProgressiveResidual(int hardMaxField);
 
   void demoteCadenceRange(int startSeq, int endSeq, double newMaxConf);
   void promoteCadenceRange(int startSeq, int endSeq, double newConf);

@@ -215,15 +215,21 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
     } else {
       PhaseRun run = solveSegment(sv, segStart, segEnd, cache, mixedness);
 
-      if (run.type != PhaseRun::Type::Pulldown32) {
-        // Failing to lock a phase is not evidence of video. Ask the twin
-        // census to positively rule film out before writing either video
-        // sentinel; where it cannot, leave the span unknown for the healer
-        // to bridge, which is what "solve in the dark" is for.
-        if (filmRuledOut(sv, segStart, segEnd)) {
-          classifyAsInterlaced(segStart, segEnd, mixedness);
-          classifyAsProgressive(segStart, segEnd, mixedness);
-        }
+      // A video sentinel is a POSITIVE decision, and no negative inference
+      // may make it. The twin census used to gate the classifiers here by
+      // "ruling film out" — but absent twins prove nothing: a look applied
+      // at 29.97, a dissolve, and per-field compositing all destroy twins
+      // while leaving film standing, and measured on Emissary the census
+      // read two confirmed film scenes and two video scrolls identically as
+      // "video". Certified fields confirm; they never disprove. A sentinel
+      // is written only when a verdict names it — the classifiers now paint
+      // solely on the scan's own Interlaced/Progressive verdicts — and what
+      // no verdict claims falls to the anchored healer and then to the
+      // progressive residual.
+      if (run.type == PhaseRun::Type::Interlaced) {
+        classifyAsInterlaced(segStart, segEnd, mixedness);
+      } else if (run.type == PhaseRun::Type::Progressive) {
+        classifyAsProgressive(segStart, segEnd, mixedness);
       }
 
       solvedSegments.push_back({segStart, segEnd, run, mixedness});
@@ -261,6 +267,22 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
   detectAndEncodeInvertedCadenceRuns();
   const int cutTruncatedAHeads = recoverCutTruncatedAHeads();
   assignPulldownRoles();
+
+  // What remains unknown after pattern, facts, anchored healing, and cut
+  // recovery have all declined is the unanchored residue, and it reads
+  // PROGRESSIVE. The old posture left it unknown to avoid committing on weak
+  // evidence — but downstream, unknown is itself a commitment, and interlace
+  // is never a safe retreat: if the residue is secretly interlaced, the comb
+  // we could not find is the same comb the interfield stage cannot find, so
+  // the error is bounded by the evidence that failed to exist — while the
+  // progressive ID engages the decoder's Frame regime, which is superior
+  // absent errors. Written at low confidence so any later pass with actual
+  // evidence overrules it.
+  const int residualFields = paintProgressiveResidual(hardMaxField);
+  if (residualFields > 0) {
+    qInfo() << "Progressive residual painted" << residualFields
+            << "unanchored field(s).";
+  }
 
   // ld-cinemap does not write back to DiscMap frame flags; that is DiscMap's
   // domain.
@@ -1888,52 +1910,6 @@ const CineMap::NoiseFloor& CineMap::calibrateTwinFloor(SourceVideo& sv) {
   return m_noiseFloor;
 }
 
-bool CineMap::filmRuledOut(SourceVideo& sv, int segStart, int segEnd) {
-  const NoiseFloor& nf = calibrateTwinFloor(sv);
-  if (!nf.valid) return false;  // no floor measured: cannot rule anything out
-
-  int hits = 0, pairs = 0;
-  double quiet = 0.0;
-  std::vector<int> hitFields;
-
-  // Geometry operating point: the tight floor. The generous one deliberately
-  // over-admits so a twin is never missed, but those extra hits are not twins
-  // and scatter across offsets, diluting the very concentration being measured.
-  const double shareG =
-      twinShare(sv, segStart, segEnd, nf.ire * FLOOR_MULT_GEOMETRY, &hits,
-               &pairs, &quiet, &hitFields);
-
-  const int possible = std::max(0, segEnd - segStart - 1);
-  const double coverage =
-      (possible > 0) ? (static_cast<double>(pairs) / possible) : 0.0;
-  if (coverage < MIN_TAG_COVERAGE) return false;  // dark, not video
-
-  // Everything at the floor is the absence of information, not evidence of
-  // video: a static passage's field difference is pure noise whether it is film
-  // or not.
-  if (shareG >= 0.80) return false;
-
-  const double conc = cycleConcentration(hitFields);
-  const bool ruledOut = (conc < CYCLE_CONCENTRATION_MIN);
-
-  if (m_decisionTraceEnabled) {
-    qInfo().noquote() << QString(
-                             "CineMap decision: FILM_CENSUS fields [%1..%2] "
-                             "floor=%3 pairs=%4 coverage=%5 shareGeo=%6 hits=%7 "
-                             "conc=%8 filmRuledOut=%9")
-                             .arg(segStart)
-                             .arg(segEnd)
-                             .arg(nf.ire, 0, 'f', 4)
-                             .arg(pairs)
-                             .arg(coverage, 0, 'f', 3)
-                             .arg(shareG, 0, 'f', 3)
-                             .arg(hits)
-                             .arg(conc, 0, 'f', 3)
-                             .arg(ruledOut ? "yes" : "no");
-  }
-
-  return ruledOut;
-}
 
 double CineMap::cycleConcentration(const std::vector<int>& hitFields) const {
   if (!m_md || hitFields.size() < 4) return 0.0;
@@ -3048,18 +3024,44 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv, int segStartField,
   if (!m_md || !m_disc) return false;
   if (rejectReason) rejectReason->clear();
 
-  auto acTwins =
-      harvestACTwinsForSegment_strict(segStartField, segEndField, cache);
+  // One standard of evidence. This election's roster is the certified
+  // triples — pairs that cancelled on both conservation channels at the
+  // disc's own floor — and nothing else votes. The harvest's threshold and
+  // ratio paths keep their clue duties (doplGang hole-fill, the metadata
+  // links the decoder's merge consumes) but they no longer elect: on the
+  // Emissary opening crawl the absolute-threshold path manufactured 656
+  // "twins" from mostly-black frames — overlapping A and C claims on shared
+  // fields, geometry 3:2 cannot produce — and locked the segment at 0.950
+  // over the scan's correct refusal. A certified roster makes that class of
+  // contradiction structurally impossible rather than merely detectable:
+  // certification enforces the spacing law before any claim reaches a tally.
+  std::vector<TwinACInfo> acTwins;
+  for (const auto& t : m_certifiedTriples) {
+    if (t.loSeq < segStartField || t.loSeq + 2 > segEndField) continue;
+    TwinACInfo info;
+    info.defSeq = t.defSeq;
+    info.spareSeq = t.spareSeq;
+    info.compSeq = t.compSeq;
+    info.role = t.aType ? TwinACRole::AType : TwinACRole::CType;
+    acTwins.push_back(info);
+  }
 
-  if (acTwins.empty()) {
-    if (rejectReason) *rejectReason = "no-strict-ac-twins";
+  // The same corroboration floor certifiedPhaseForRange holds: a lone
+  // certification can be false — noise-marginal cancellations on a static
+  // card produced three of them on the Emissary title card, enough to elect
+  // at 0.950 under an any-roster rule — and two agreeing facts cannot easily
+  // be, since a false one lands on an arbitrary phase. Below the floor the
+  // facts stay out of this election entirely.
+  if (static_cast<int>(acTwins.size()) < MIN_CERTIFIED_VOTES) {
+    if (rejectReason) *rejectReason = "below-certified-quorum";
     if (m_decisionTraceEnabled) {
       qInfo().noquote()
           << QString(
                  "CineMap decision: DG_GEOMETRY_LOCK fields [%1..%2] "
-                 "result=false reason=no-strict-ac-twins")
+                 "result=false reason=below-certified-quorum twins=%3")
                  .arg(segStartField)
-                 .arg(segEndField);
+                 .arg(segEndField)
+                 .arg(acTwins.size());
     }
     return false;
   }
@@ -5455,6 +5457,28 @@ int CineMap::fieldForFrame(int frameIdx) const {
   if (!m_disc || frameIdx < 0 || frameIdx >= m_disc->getNumberOfFrames())
     return -1;
   return m_disc->getFirstFieldNumber(frameIdx + 1);
+}
+
+int CineMap::paintProgressiveResidual(int hardMaxField) {
+  if (!m_md) return 0;
+
+  const int total = std::min(hardMaxField, m_md->getNumberOfFields());
+  int painted = 0;
+
+  for (int i = 1; i <= total; ++i) {
+    auto f = m_md->getField(i);
+    if (f.pad) continue;
+    if (f.cinemap.cadenceId != CADENCE_UNKNOWN) continue;
+
+    f.cinemap.cadenceId = CADENCE_PROGRESSIVE;
+    f.cinemap.cadenceIndexPresumed = false;
+    f.cinemap.pulldownRole.clear();
+    m_cadenceConfidence[i] = 0.5;
+    m_md->updateField(f, i);
+    painted++;
+  }
+
+  return painted;
 }
 
 void CineMap::demoteCadenceRange(int startSeq, int endSeq, double newMaxConf) {
