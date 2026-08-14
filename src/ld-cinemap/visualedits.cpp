@@ -26,6 +26,16 @@ struct FieldDescriptor {
   bool valid = false;
   double cells[9] = {0.0};         // Luma (DC)
   double chromaEnergy[9] = {0.0};  // Chroma Magnitude (approx)
+
+  // Brightest point in the title-safe area, on subcarrier-cancelled luma.
+  //
+  // The cell means above cannot answer "is there a picture here". A cell
+  // averages some seventeen thousand samples, so a starfield — black
+  // everywhere except point sources and one small bright object — reports the
+  // same DC as an empty frame. That is the same error that drove mixedness
+  // from notch to lips: an average is not the question. Blackness is a
+  // statement that NOTHING peaks above black, and only a peak can say it.
+  double peakIre = 0.0;
 };
 
 struct DeltaStats {
@@ -123,6 +133,26 @@ FieldDescriptor computeFieldDescriptor(
     }
   }
 
+  // Peak pass. At 4fsc, samples x and x+2 are 180 degrees apart in subcarrier
+  // phase, so their mean cancels it — the peak is then a luma peak rather than
+  // a chroma excursion, and a lone hot sample is halved rather than believed.
+  {
+    double peak = 0.0;
+
+    for (int y = y0; y < y1; ++y) {
+      const uint16_t* rowPtr = fieldData + y * width;
+      for (int x = x0; x < x1 && x + 2 < width; ++x) {
+        const double luma = (static_cast<double>(rowPtr[x]) +
+                             static_cast<double>(rowPtr[x + 2])) *
+                            0.5;
+        if (luma > peak) peak = luma;
+      }
+    }
+
+    desc.peakIre = sampleToIre(static_cast<uint16_t>(
+        std::min(peak, static_cast<double>(UINT16_MAX))));
+  }
+
   return desc;
 }
 
@@ -178,6 +208,15 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
   // Black-span segmentation (IRE; endpoints must be black themselves)
   const double BLACK_ENTER_IRE = 2.4;  // "definitely black"
   const double BLACK_EXIT_IRE = 2.8;   // "definitely not black" (hysteresis)
+
+  // No area may peak above this for the field to count as empty.
+  //
+  // The DC thresholds above are delicate — 0.4 IRE apart, and set low enough
+  // to keep a washed-out black from reading as picture. A peak needs no such
+  // care: washed-out black sits a few IRE up, while a star or a lit hull is
+  // tens of IRE, so anything in this region separates them and the exact value
+  // does not do the work. That is the whole advantage of asking for a peak.
+  const double BLACK_PEAK_IRE = 15.0;
   const int BLACK_CONFIRM = 12;  // consecutive black/not-black confirmations
 
   bool inBlackRun = false;
@@ -215,11 +254,14 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     return v[7];
   };
 
-  auto isBlackField = [&](double p90Ire) -> bool {
-    return p90Ire <= BLACK_ENTER_IRE;
+  // A field is empty only if its DC is black AND nothing in it peaks above
+  // black. Either condition failing is enough to call it picture: one bright
+  // area is a picture no matter what the average says.
+  auto isBlackField = [&](double p90Ire, double peakIre) -> bool {
+    return p90Ire <= BLACK_ENTER_IRE && peakIre <= BLACK_PEAK_IRE;
   };
-  auto isNotBlackField = [&](double p90Ire) -> bool {
-    return p90Ire >= BLACK_EXIT_IRE;
+  auto isNotBlackField = [&](double p90Ire, double peakIre) -> bool {
+    return p90Ire >= BLACK_EXIT_IRE || peakIre > BLACK_PEAK_IRE;
   };
 
   // Correlation (Pearson on 3x3 mean luma)
@@ -433,8 +475,8 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     const double p90Ire = getP90Luma(d_curr);
 
     // --- Black-span state machine (endpoints are BLACK fields) ---
-    const bool blackNow = isBlackField(p90Ire);
-    const bool notBlackNow = isNotBlackField(p90Ire);
+    const bool blackNow = isBlackField(p90Ire, d_curr.peakIre);
+    const bool notBlackNow = isNotBlackField(p90Ire, d_curr.peakIre);
 
     if (blackNow) {
       consecBlack++;
@@ -453,6 +495,11 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
       firstBlackField = std::max(1, i - (BLACK_CONFIRM - 1));
       lastBlackField = i;
       // Do NOT commit yet — wait for end of run to determine duration/logic.
+
+      if (LOG_COMMITS) {
+        qInfo().nospace() << "EditDetector: BLACK_RUN entered at field " << i
+                          << " p90=" << p90Ire << " peak=" << d_curr.peakIre;
+      }
     }
 
     if (inBlackRun) {
@@ -467,6 +514,9 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
         constexpr int BLACK_STANDOFF = 50;
 
         if (runLengthFields < (BLACK_STANDOFF * 2)) {
+          // Nothing in an empty picture can say where inside it the cut falls,
+          // so the midpoint is the honest answer. What matters is that the run
+          // reaching here really is empty.
           const int midpoint = firstBlackField + runLengthFields / 2;
           commitBoundary(midpoint, "blackRunMid_short", 0.0, "black",
                          "shortRunNadir", 0.0, false, 0.0, 0.0, z, 0.0, 0.0, 0,
