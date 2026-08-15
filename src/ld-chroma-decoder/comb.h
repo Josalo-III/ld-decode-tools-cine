@@ -1421,15 +1421,10 @@ private:
 	// certified carrier's own transition law. Writes nothing, renders
 	// nothing; strip when the question closes.
 	void probeCarrierBandwidth() const;
-	// TEMPORARY INSTRUMENT (LDCD_PROBE_NOTCHTRUTH=1). Grades the notch-fsc
-	// plane against certified luma OUTSIDE the election, calibrates the
-	// carrier-strength estimators against truth, reports the uncovered
-	// distribution, and runs the compact-site sign test. Read-only.
-	void probeNotchTruth() const;
-	// TEMPORARY INSTRUMENT (LDCD_PROBE_STARVERT=1). Vertical run-length
-	// census of the star footprint: does the law fire on structures that
-	// are not isolated in the vertical axis? Read-only.
-	void probeStarVertical() const;
+	// TEMPORARY INSTRUMENT (LDCD_PROBE_COMPACT=1). The compact-colour sign
+	// test: do the carrier fit and the notch complement err in opposite
+	// directions at compact features, or reinforce? Read-only.
+	void probeCompactSites() const;
 	// TEMPORARY INSTRUMENT (LDCD_PROBE_COVTRUTH=1). Covered-frame truth
 	// decomposition: certified carrier vs certified luma at the sites the
 	// uncovered machinery fails on. Read-only.
