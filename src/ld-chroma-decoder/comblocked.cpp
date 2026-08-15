@@ -5635,11 +5635,16 @@ double Comb::FrameBuffer::starSignatureAt(const quint16 *rawLine, int h,
     // Out-of-frame is fail-OPEN, matching the existing edge conduct: a star
     // near the picture edge cannot present its flanks and is not convicted
     // for the frame's geometry.
+    // A triplet at k covers samples k..k+2, so "black out to +-N" is triplets
+    // k = 3 .. N-2. The DEFAULT (N = 5) is exactly the single k = 3 triplet
+    // the law always read -- byte-identical, md5-verified -- and larger N is
+    // the swept instrument. (The first form of this loop ran k = 3..N and so
+    // read out to +-7 at default: an unlabelled tightening, caught by md5.)
     {
         const int runTo = kStarBlackRun;
-        if (h - (runTo + 2) >= left && h + (runTo + 2) < right) {
+        if (runTo > 5 && h - runTo >= left && h + runTo < right) {
             const double blk = (double)videoParameters.black16bIre;
-            for (int k = 3; k <= runTo; ++k) {
+            for (int k = 4; k <= runTo - 2; ++k) {
                 const double mL = (rw(-k) + rw(-k - 1) + rw(-k - 2)) / 3.0;
                 const double mR = (rw( k) + rw( k + 1) + rw( k + 2)) / 3.0;
                 if ((mL - blk) * inv > kStarBlackCeilIRE) return 0.0;
