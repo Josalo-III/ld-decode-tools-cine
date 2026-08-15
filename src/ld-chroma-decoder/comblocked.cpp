@@ -943,6 +943,11 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
     //   conf  = carrierConformance  (interline: -1 inverts like carrier,
     //                                +1 matches where schedule demands inversion
     //                                = image-locked luma leak)
+
+    // Band facts ride the same head position: every canonical band row now
+    // exists, so the one consolidated scan publishes wLaw, both testimony
+    // reaches, and the parallax consensus for all downstream consumers.
+    buildBandFacts();
 }
 
 // ---------------------------------------------------------------------------
@@ -4656,6 +4661,301 @@ void Comb::FrameBuffer::probeCoveredTruth() const
     }
 }
 
+// TEMPORARY INSTRUMENT (LDCD_PROBE_SPAN=1; >=2 adds the per-span dump):
+// the compact-span locator, author's design (2026-08-14): notch as the
+// region identifier (1D disqualified -- it manufactures short colour bursts
+// from luma), spans under 4 samples = the scale the fit and every 4-sample
+// coarse mean are structurally blind to. Viewed as signed IQ ("so we
+// understand both phase and saturation"), ALONG THE LINE ONLY -- the
+// vertical axes are shelved until the single-line channel's power is known.
+//
+// Per certified span the dump emits every along-line feature the IQ view
+// offers, plus truth, so the data picks the discriminator offline:
+//   te teMax L cohSpan flipDeg flankPhDeg flankRatio satIRE
+void Comb::FrameBuffer::probeCompactSpans() const
+{
+    static const int level = []{
+        const char *e = std::getenv("LDCD_PROBE_SPAN");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (level < 1) return;
+
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int width     = right - left;
+    if (width <= 16) return;
+
+    constexpr double kStrongIRE = 6.0;
+    constexpr int    kSpanMax   = 3;    // "below 4 pixels in length"
+
+    long spans = 0, spansCert = 0;
+
+    // Level 3: per-space solidity census over TRUTH runs. Seven spaces:
+    // fit; notch(+/-2) and notch(+/-1) as the SHIPPING product form
+    // (bp x wLaw x keep per sample); raw band; band x wLaw (the shape
+    // law alone, no testimony); parallax-unwound band; and the
+    // agreement of the independent witnesses (min of parallax and the
+    // notch+/-1 product -- lawfulness, vertical testimony, and
+    // along-line aperture math share no machinery). Buckets by truth
+    // run length; per space, covered fraction at the locator threshold,
+    // fragment count, and mean claim/truth ratio.
+    // Run with LDCD_FACT_FIT=0 or the fit reads truth back to itself.
+    constexpr int kNB = 4;
+    auto bucketOf = [](int L) {
+        return L <= 3 ? 0 : L <= 7 ? 1 : L <= 15 ? 2 : 3;
+    };
+    long   covRuns[kNB] = {0}, covPx[kNB] = {0};
+    long   covHit[7][kNB] = {{0}}, covFrag[7][kNB] = {{0}};
+    double covRatio[7][kNB] = {{0}};
+
+    std::vector<double> env(width), parSpread, envPar;
+    std::vector<std::complex<double>> Zc, Zt;
+    for (int line = firstLine; line < lastLine; ++line) {
+        // Everything this probe grades is head-published fact: the
+        // canonical band row, the encoder-law weight, both testimony
+        // reaches, and the parallax consensus all come from
+        // buildBandFacts. Only the aperture-mean SPREAD (a dump feature,
+        // measured inverted at <4 px) is derived locally.
+        const double *bpn   = locked1DRawBandpass_line(line);
+        const double *wLaw2 = bandWLaw_line(line);
+        const double *keep2 = bandKeep_line(line, 2);
+        const double *keep1 = bandKeep_line(line, 1);
+        const float  *parI  = parallaxI_line(line);
+        const float  *parQ  = parallaxQ_line(line);
+        if (!bpn || !wLaw2 || !keep2 || !keep1 || !parI || !parQ)
+            continue;
+        // Signed-IQ demod of the band content, this line's own grammar.
+        auto cur = lddecode::carrierGrammarSignedSampleCursor(
+            configuration.phaseCompensation ? carrierGrammarLine(line)
+                                            : nullptr, left);
+        Zc.assign(width, {0.0, 0.0});
+        for (int xi = 0; xi < width; ++xi)
+            Zc[xi] = lddecode::carrierGrammarDemodSignedCompositeTo4fsc(
+                cur, bpn[xi]);
+        for (int xi = 0; xi < width; ++xi)
+            env[xi] = std::hypot(bpn[xi],
+                                 bpn[std::min(xi + 1, width - 1)]) *
+                      invIreScale;
+
+        const double *ap = lockedApertureMean_line(line);
+        parSpread.assign(width, -1.0);
+        envPar.assign(width, 0.0);
+        for (int x = 0; x < width; ++x) {
+            envPar[x] = std::hypot((double)parI[x], (double)parQ[x]) *
+                        invIreScale;
+            if (ap && demodWidth == width) {
+                double lo = 1e18, hi = -1e18; int nv = 0;
+                for (int v = std::max(0, x - 3);
+                     v <= std::min(x, width - 4); ++v) {
+                    lo = std::min(lo, ap[v]);
+                    hi = std::max(hi, ap[v]); ++nv;
+                }
+                if (nv >= 2) parSpread[x] = (hi - lo) * invIreScale;
+            }
+        }
+
+        const bool cert = certifiedDefLine(line);
+        const float *ex = cert ? exactCarrierRow(line) : nullptr;
+
+        if (ex) {
+            // Truth in the same domain as the observation: the exact
+            // carrier through the SAME bandpass kernel, then the same
+            // signed demod, so offline templates and fits compare like
+            // with like.
+            auto bpTAt = [&](int h) -> double {
+                const int hm = std::max(left, h - 2);
+                const int hp = std::min(right - 1, h + 2);
+                const double a = ex[h], m = ex[hm], p = ex[hp];
+                if (!std::isfinite(a) || !std::isfinite(m) ||
+                    !std::isfinite(p))
+                    return (double)NAN;
+                return 0.5 * a - 0.25 * (m + p);
+            };
+            auto curT = lddecode::carrierGrammarSignedSampleCursor(
+                configuration.phaseCompensation ? carrierGrammarLine(line)
+                                                : nullptr, left);
+            Zt.assign(width, {(double)NAN, (double)NAN});
+            for (int xi = 0; xi < width; ++xi) {
+                const double v = bpTAt(left + xi);
+                const auto z =
+                    lddecode::carrierGrammarDemodSignedCompositeTo4fsc(
+                        curT, std::isfinite(v) ? v : 0.0);
+                if (std::isfinite(v)) Zt[xi] = z;
+            }
+        }
+
+        if (level >= 3 && ex) {
+            const float *fit = carrierFit_line(line);
+            // Shipping product form: hypot of the adjacent per-sample
+            // claims, bp x wLaw x keep. wLaw derives from bp alone, so
+            // it is reach-independent and serves both notch spaces.
+            auto notch1At = [&](int xi, int x1) {
+                return std::hypot(bpn[xi] * wLaw2[xi] * keep1[xi],
+                                  bpn[x1] * wLaw2[x1] * keep1[x1]) *
+                       invIreScale;
+            };
+            auto claimAt = [&](int s, int xi) -> double {
+                const int x1 = std::min(xi + 1, width - 1);
+                switch (s) {
+                case 0:   // fit
+                    if (!fit) return 0.0;
+                    return std::hypot((double)fit[xi], (double)fit[x1]) *
+                           invIreScale;
+                case 1:   // notch +/-2, shipping product
+                    return std::hypot(bpn[xi] * wLaw2[xi] * keep2[xi],
+                                      bpn[x1] * wLaw2[x1] * keep2[x1]) *
+                           invIreScale;
+                case 3:   // notch +/-1, shipping product
+                    return notch1At(xi, x1);
+                case 4:   // parallax-unwound band estimate
+                    return envPar[xi];
+                case 5:   // agreement of the independent witnesses
+                    return std::min(envPar[xi], notch1At(xi, x1));
+                case 6:   // shape law alone: band x wLaw, no testimony
+                    return std::hypot(bpn[xi] * wLaw2[xi],
+                                      bpn[x1] * wLaw2[x1]) * invIreScale;
+                default:  // raw band envelope (the 1D/locator space)
+                    return env[xi];
+                }
+            };
+            int ts = -1;
+            for (int xi = 0; xi <= width; ++xi) {
+                double envT = 0.0;
+                if (xi < width) {
+                    const float ea = ex[left + xi];
+                    const float eb = ex[left + std::min(xi + 1, width - 1)];
+                    if (std::isfinite(ea) && std::isfinite(eb))
+                        envT = std::hypot((double)ea, (double)eb) *
+                               invIreScale;
+                }
+                const bool in = (xi < width) && envT >= kStrongIRE;
+                if (in) { if (ts < 0) ts = xi; continue; }
+                if (ts < 0) continue;
+                const int trs = ts, tre = xi;
+                ts = -1;
+                const int Lt = tre - trs;
+                if (Lt < 2 || Lt > 31) continue;
+                const int b = bucketOf(Lt);
+                ++covRuns[b]; covPx[b] += Lt;
+                for (int s = 0; s < 7; ++s) {
+                    bool prevIn = false;
+                    for (int k = trs; k < tre; ++k) {
+                        const double c = claimAt(s, k);
+                        const float ea = ex[left + k];
+                        const float eb =
+                            ex[left + std::min(k + 1, width - 1)];
+                        const double t =
+                            std::hypot((double)ea, (double)eb) *
+                            invIreScale;
+                        if (t > 1e-9) covRatio[s][b] += c / t;
+                        const bool on = c >= kStrongIRE;
+                        if (on) {
+                            ++covHit[s][b];
+                            if (!prevIn) ++covFrag[s][b];
+                        }
+                        prevIn = on;
+                    }
+                }
+            }
+        }
+
+        int runStart = -1;
+        for (int xi = 0; xi <= width; ++xi) {
+            const bool in = (xi < width) && env[xi] >= kStrongIRE;
+            if (in) { if (runStart < 0) runStart = xi; continue; }
+            if (runStart < 0) continue;
+            const int rs = runStart, re = xi;
+            runStart = -1;
+            const int L = re - rs;
+            if (L > kSpanMax) continue;
+            ++spans;
+            if (!ex) continue;
+
+            // Per-span scalar features cannot separate here: the naked
+            // two-coordinate fit is unfalsifiable at L=2 (two unknowns,
+            // two equations) and one check at L=3, and single-sample
+            // demod projections land on alternating quadrature axes by
+            // construction. What remains along the line is SHAPE -- the
+            // encoder's chroma lowpass spreads a real compact colour into
+            // a known skirt over the flanks. Emit the raw window (span
+            // +/-3, observed and truth through the same demod) and do the
+            // template work offline.
+            if (rs < 3 || re + 3 > width) continue;
+
+            // Truth: mean AND max over the span (the mean blurs a
+            // half-hole span; the max says whether carrier is here at all).
+            double te = 0.0, teMax = 0.0; int n = 0; bool finite = true;
+            for (int k = rs; k < re; ++k) {
+                const int h = left + k;
+                const float ea = ex[h];
+                const float eb = ex[std::min(h + 1, right - 1)];
+                if (!std::isfinite(ea) || !std::isfinite(eb)) {
+                    finite = false; break;
+                }
+                const double t =
+                    std::hypot((double)ea, (double)eb) * invIreScale;
+                te += t; teMax = std::max(teMax, t); ++n;
+            }
+            if (!finite || n == 0) continue;
+            ++spansCert;
+
+            // Coarse-residual parallax over the span (spread of covering
+            // aperture means / band envelope). MEASURED 2026-08-14: at
+            // <4 px this reads INVERTED -- compact carrier does not fill
+            // a 4-window, fails to null, and telegraphs as divergence --
+            // so it is dumped as data, never used as a verdict here.
+            double parRatio = -1.0;
+            {
+                double s = 0.0; int m = 0;
+                for (int k = rs; k < re; ++k)
+                    if (parSpread[k] >= 0.0 && env[k] > 1e-9) {
+                        s += parSpread[k] / env[k]; ++m;
+                    }
+                if (m) parRatio = s / m;
+            }
+
+            if (level >= 2) {
+                char row[512];
+                int p = std::snprintf(row, sizeof row,
+                    "SPANW %.3f %.3f %d %.3f", te / n, teMax, L, parRatio);
+                for (int k = rs - 3;
+                     k < re + 3 && p < (int)sizeof row - 48; ++k)
+                    p += std::snprintf(row + p, sizeof row - p,
+                        " %.2f %.2f %.2f %.2f",
+                        Zc[k].real() * invIreScale,
+                        Zc[k].imag() * invIreScale,
+                        Zt[k].real() * invIreScale,
+                        Zt[k].imag() * invIreScale);
+                std::fprintf(stderr, "%s\n", row);
+            }
+        }
+    }
+    if (spansCert)
+        qInfo().noquote() << QString::asprintf(
+            "SPANCENSUS seq %d  spans<4 %ld  certified-graded %ld",
+            (int)heldSeq1, spans, spansCert);
+    if (level >= 3) {
+        for (int b = 0; b < kNB; ++b) {
+            if (!covRuns[b]) continue;
+            std::fprintf(stderr,
+                "SPANCOV %d %d %ld %ld  %ld %ld %ld %ld %ld %ld %ld"
+                "  %ld %ld %ld %ld %ld %ld %ld"
+                "  %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                (int)heldSeq1, b, covRuns[b], covPx[b],
+                covHit[0][b], covHit[1][b], covHit[2][b], covHit[3][b],
+                covHit[4][b], covHit[5][b], covHit[6][b],
+                covFrag[0][b], covFrag[1][b], covFrag[2][b], covFrag[3][b],
+                covFrag[4][b], covFrag[5][b], covFrag[6][b],
+                covRatio[0][b] / covPx[b], covRatio[1][b] / covPx[b],
+                covRatio[2][b] / covPx[b], covRatio[3][b] / covPx[b],
+                covRatio[4][b] / covPx[b], covRatio[5][b] / covPx[b],
+                covRatio[6][b] / covPx[b]);
+        }
+    }
+}
+
 // TEMPORARY INSTRUMENT (LDCD_PROBE_COMPACT=1): the compact-colour sign test.
 //
 // Survivor of the notch-truth probe, kept because its question is OPEN and
@@ -5382,292 +5682,10 @@ void Comb::FrameBuffer::buildStarFootprint(const FrameBuffer *prevF,
 //            TESTIFY, they never contribute signal.
 // The carrier object is bp*wLaw*keep -- an explicit, renderable wave,
 // SUBTRACTED from raw, never cancelled into it.
-// Compact-colour escape. See comb.h.
-//
-// WHY AN ESCAPE AND NOT A REPAIR. Measured: at strong certified runs <= 8
-// samples the fit's claim reaches p10 0.14-0.26 of truth, with 6-7% of
-// samples below 0.15 -- a crash, clustered at the run EDGE (7-14% at d0
-// against 0-3% at d3). Bisecting the pipeline found no culprit stage
-// because there is none: a 4-sample minimum aperture cannot resolve a
-// feature narrower than itself, and at the edge the window spans two
-// composite realities. Author: "the fit has never had a native capacity
-// for this case." So the fit declares the case out of reach and steps
-// aside.
-//
-// THE FALLBACK IS A PAIR, not a substitute (author): "we might need to
-// combine the notch complement with 1D ... simply because the 1D +-2
-// cause a low-grade version of the alternation, and the notch +-1 reach
-// could fill this in via its complement." 1D's 2-sample reach is better
-// than the fit's 4 but not immune -- its taps still straddle a compact
-// edge. The notch's +-1 complement is the only support narrower than the
-// features in question. So: 1D where its own taps AGREE, the notch
-// complement where they do not, crossfaded on the disagreement itself.
-// The arbiter is evidence read from the frame's own bandpass, not a
-// tuning constant, and it is smooth because tap disagreement is smooth.
-//
-// THE GATE IS CONFIRMATION, NOT COMPACTNESS. A compact strong run in the
-// carrier band is either compact colour or an iceberg summit -- identical
-// local signature, opposite owners. The notch complement hands the WHOLE
-// band to chroma, which is right at confirmed colour and catastrophic at
-// a summit. So the escape fires only where the schedule testimony
-// positively confirms carrier (buildNotchHfCurves' keep, under the
-// presumption of luma); an unvouched compact run keeps the fit's answer,
-// however poor. Construction stage, upstream of every election.
-void Comb::FrameBuffer::applyCompactColorEscapeLine(
-    int line, double *carrierFitRow, double *flattened,
-    const double *rawWhole, float *fitRow)
-{
-    // OPT-IN pending the author's eye (2026-08-11). The escape aims
-    // correctly -- it fires only where the schedule vouches carrier, the
-    // observation is strong and the fit has lost the feature, and it
-    // carries those samples from 0.877 to 1.045 of certified with the
-    // crash population 0.4% -> 0.2%. But it RAISES the checker gap on the
-    // action segment (+0.0881 -> +0.0931), and per-feature application
-    // did not change that, so the cause is not interleaving: the fit is a
-    // smooth MODEL and the fallback is an OBSERVATION, and Y = raw - claim
-    // inherits the claim's noise. Accuracy bought with variance, in the
-    // currency the error-class ordering forbids. Not a default until the
-    // saturation gain is judged worth it by eye.
-    static const bool escapeOn = []{
-        const char *e = std::getenv("LDCD_COMPACT_ESCAPE");
-        return e && std::atoi(e) != 0;
-    }();
-    if (!escapeOn || carrierFit_flat.empty()) return;
-
-    // DETECT THE FAILURE, NOT THE FEATURE. A first build gated on
-    // compactness alone and fired on 129-567 samples/frame where the fit
-    // was ALREADY SOUND (crash 0.0% before), moving the ratio to certified
-    // from 0.95 to 1.05-1.16 -- replacing good claims with over-large ones,
-    // because the notch complement hands the whole observed band to chroma
-    // and at a healthy site that band carries in-band luma too.
-    //
-    // The fit's failure is detectable in-frame without truth: where the
-    // schedule CONFIRMS carrier and the observation is strong but the fit
-    // claims almost none, the solve has lost the feature. Confirmation is
-    // what makes the inference safe -- an unvouched shortfall is the
-    // iceberg case, where the fit is RIGHT to claim less than the band.
-    constexpr int    kCompactMax   = 8;
-    constexpr int    kCompactMin   = 2;
-    constexpr double kStrongIRE    = 6.0;
-    constexpr double kConfirmMin   = 0.35;  // schedule must vouch
-    constexpr double kFailFrac     = 0.50;  // fit below half the observed
-    // 1D tap disagreement, in IRE, over which the notch takes the sample.
-    constexpr double kTapAgreeIRE  = 1.0;
-    constexpr double kTapStraddle  = 4.0;
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int width     = right - left;
-    if (width <= 16) return;
-
-    // HELD-OUT GRADING (LDCD_PROBE_ESCAPE=1, measurement only). The escape
-    // skips certified def lines -- which is the only population carrying
-    // truth -- so with the facts deprived (LDCD_FACT_FIT=0) it is allowed
-    // onto them and graded there: the ratio to certified at the escaped
-    // samples, before and after. Same trap the bisect fell into, avoided
-    // deliberately this time.
-    static const bool probeOn = []{
-        const char *e = std::getenv("LDCD_PROBE_ESCAPE");
-        return e && std::atoi(e) != 0;
-    }();
-    long nEsc = 0, nCrashBefore = 0, nCrashAfter = 0;
-    double sBefore = 0.0, sAfter = 0.0;
-    long nPh = 0, nPhH = 0;
-    double sPhC = 0.0, sPhF = 0.0, sPhCH = 0.0, sPhFH = 0.0;
-
-    std::vector<double> bp, wLaw, keep, env;
-    {
-        const bool defLine = certifiedDefLine(line);
-        // Facts are never overwritten: a certified def line already holds
-        // the exact carrier and has nothing to escape from.
-        if (defLine && !probeOn) return;
-        const float *exRow = defLine ? exactCarrierRow(line) : nullptr;
-        const double *bpRow = locked1DRawBandpass_line(line);
-        if (!bpRow) return;
-        buildNotchHfCurves(line, bp, wLaw, keep);
-        if ((int)bp.size() < width) return;
-
-        env.assign(width, 0.0);
-        for (int xi = 0; xi < width; ++xi)
-            env[xi] = std::hypot(bp[xi], bp[std::min(xi + 1, width - 1)])
-                      * invIreScale;
-
-        // The fit's own claim, for the failure test.
-        std::vector<double> envFit(width, 0.0);
-        for (int xi = 0; xi < width; ++xi)
-            envFit[xi] = std::hypot((double)fitRow[xi],
-                (double)fitRow[std::min(xi + 1, width - 1)]) * invIreScale;
-
-        // FILL THE HOLES, KEEP THE FEATURE. Author, 2026-08-11: "the two
-        // bright pixels are correct, we only want the two dark ones
-        // fixed." Earlier builds replaced whole features -- per-sample
-        // first, then per-run -- and both raised the checker gap
-        // (+0.0881 -> +0.0930 / +0.0931) while overshooting truth,
-        // because they substituted estimators that are systematically HOT.
-        //
-        // Co-occurrence census, 852 samples in confirmed compact features:
-        //   dark(<0.5x certified):  fit 19.0%   1D 2.0%   notch 0.8%
-        //   both dark together 0.6%   neither 97.8%
-        //   mean ratio to certified: 1D 1.24    notch complement 1.56
-        //
-        // Two facts follow. The crash is the FIT'S ALONE -- a partner is
-        // standing at essentially every hole, so the pairing works. And
-        // neither fallback may be adopted at its own level: both hand
-        // in-band luma to chroma along with the carrier, the notch worse
-        // for having the wider passband. So the fallbacks supply the
-        // WAVEFORM and the feature's own SOUND samples supply the LEVEL.
-        // The feature vouches for its own scale; a feature with no sound
-        // sample cannot, and is left entirely alone.
-        int runStart = -1;
-        for (int xi = 0; xi <= width; ++xi) {
-            const bool inRun = (xi < width) && env[xi] >= kStrongIRE &&
-                               keep[xi] >= kConfirmMin;
-            if (inRun) { if (runStart < 0) runStart = xi; continue; }
-            if (runStart < 0) continue;
-            const int rs = runStart, re = xi;
-            runStart = -1;
-            const int wRun = re - rs;
-            if (wRun < kCompactMin || wRun > kCompactMax) continue;
-
-            // TWO FILTERED CHROMA COORDINATES (author's precise
-            // statement, 2026-08-11, from the encoder's own construction):
-            //
-            //   "At 4fSC, a locally constant pair of filtered chroma
-            //    coordinates produces a four-sample alternation determined
-            //    by two numbers. Where samples of that alternation are
-            //    lost, infer those coordinates from surviving phases and
-            //    re-render the missing phases."
-            //
-            // Narrower than "every four carrier samples are two numbers",
-            // and it is what encoder/ntscencoder.cpp actually builds: C1
-            // and C2 are FILTERED (9-tap 1.3 MHz; C2 23-tap 0.6 MHz under
-            // narrowband Q) and then modulated with the local coordinates
-            // at each position, so four consecutive samples generally come
-            // from four different coordinate pairs. A source feature may be
-            // one colour, but its ENCODED boundary is a filtered mixture of
-            // that colour and its surroundings -- which is why a constant
-            // model recovers the dominant local colour and stops around
-            // 0.885 rather than 1.0. The remainder is lawful within-feature
-            // variation, and admitting it requires two BAND-LIMITED
-            // coordinate fields under the mode's own kernel. A first-order
-            // slope was tried here (0.885 -> 0.911) and REMOVED: an
-            // unconstrained linear I(x),Q(x) is not an inverse of a
-            // symmetric FIR and extrapolates values the encoder could not
-            // emit, worst into an edge hole where it has least support.
-            // Accuracy bought with an unlawful model is not a gain.
-            //
-            // CLASSIFY AGAINST THE RENDER, NOT A SLIDING MAGNITUDE. The
-            // previous mask used hypot(fit[k], fit[k+1]) < frac*env, which
-            // for locally constant coordinates measures the carrier
-            // magnitude C[k]^2 + C[k+1]^2 -- a sound MEASUREMENT and an
-            // unsound per-sample MASK: an adjacent dark pair is definitive
-            // evidence of collapse (those two samples observe the two
-            // independent quadratures, so both cannot vanish inside a
-            // strong constant-colour carrier), yet the window at the
-            // second dark sample pairs it with the following BRIGHT one
-            // and it escaped classification entirely. Classification is now
-            // per sample against the value the inferred coordinates render
-            // at that lattice phase, which is correct even where the
-            // render is legitimately near zero: the threshold scales with
-            // it.
-            static const int cB4[4] = { 1, 0, -1, 0 };
-            static const int sB4[4] = { 0, 1, 0, -1 };
-            std::vector<std::uint8_t> use(wRun, 1);
-            double fI = 0.0, fQ = 0.0;
-            auto fitCoords = [&]() -> bool {
-                double Sii = 0, Siq = 0, Sqq = 0, SiY = 0, SqY = 0;
-                int n = 0;
-                for (int k = rs; k < re; ++k) {
-                    if (!use[k - rs]) continue;
-                    const int cls = carrierSampleClass(line, left + k);
-                    const double bi = cB4[cls], bq = sB4[cls];
-                    const double c = (double)fitRow[k];
-                    Sii += bi * bi; Siq += bi * bq; Sqq += bq * bq;
-                    SiY += c * bi;  SqY += c * bq;
-                    n++;
-                }
-                if (n < 2) return false;
-                const double det = Sii * Sqq - Siq * Siq;
-                if (std::fabs(det) < 1e-9) return false;
-                fI = ( Sqq * SiY - Siq * SqY) / det;
-                fQ = (-Siq * SiY + Sii * SqY) / det;
-                return true;
-            };
-            auto renderAt = [&](int k) {
-                const int cls = carrierSampleClass(line, left + k);
-                return fI * cB4[cls] + fQ * sB4[cls];
-            };
-            // Infer, classify, refit -- twice, because the first inference
-            // is biased low by the very samples it is trying to find.
-            if (!fitCoords()) continue;
-            int nDark = 0;
-            for (int pass = 0; pass < 2; ++pass) {
-                nDark = 0;
-                for (int k = rs; k < re; ++k) {
-                    const double r = std::fabs(renderAt(k));
-                    const bool hole = std::fabs((double)fitRow[k]) <
-                                      kFailFrac * r;
-                    use[k - rs] = hole ? 0 : 1;
-                    if (hole) nDark++;
-                }
-                if (nDark == 0) break;
-                if (!fitCoords()) { nDark = 0; break; }
-            }
-            if (nDark == 0) continue;      // feature intact
-
-            for (int k = rs; k < re; ++k) {
-                if (use[k - rs]) continue;          // survived: untouched
-                const double before = (double)fitRow[k];
-                const double after = renderAt(k);
-                fitRow[k] = static_cast<float>(after);
-                carrierFitRow[k] = after;
-                flattened[k] = rawWhole[k] - after;
-                if (probeOn && exRow && k + 1 < width) {
-                    const float ca = exRow[left + k];
-                    const float cb = exRow[left + k + 1];
-                    if (!std::isfinite(ca) || !std::isfinite(cb)) continue;
-                    const double eC = std::hypot((double)ca, (double)cb) *
-                                      invIreScale;
-                    if (eC < kStrongIRE) continue;
-                    const int k1 = std::min(k + 1, width - 1);
-                    const double eB = std::hypot(before, (double)fitRow[k1]) *
-                                      invIreScale;
-                    const double eA = std::hypot(after, (double)fitRow[k1]) *
-                                      invIreScale;
-                    nEsc++;
-                    sBefore += eB / eC; sAfter += eA / eC;
-                    if (eB / eC < 0.15) nCrashBefore++;
-                    if (eA / eC < 0.15) nCrashAfter++;
-                }
-            }
-        }
-    }
-
-    if (probeOn && nEsc > 0) {
-        std::fprintf(stderr,
-            "[ESCAPE] frame %d  escaped samples %ld   ratio to certified"
-            " %.3f -> %.3f   crash %.1f%% -> %.1f%%\n",
-            (int)heldSeq1, nEsc, sBefore / nEsc, sAfter / nEsc,
-            100.0 * nCrashBefore / nEsc, 100.0 * nCrashAfter / nEsc);
-        if (nPh > 0) {
-            const double k = 180.0 / M_PI;
-            std::fprintf(stderr,
-                "      phase-advance error vs the 90deg law:  all sites"
-                " cert %5.1f deg  fit %5.1f deg   |  at holes cert %5.1f"
-                "  fit %5.1f   (n=%ld/%ld)\n",
-                sPhC / nPh * k, sPhF / nPh * k,
-                nPhH ? sPhCH / nPhH * k : 0.0,
-                nPhH ? sPhFH / nPhH * k : 0.0, nPh, nPhH);
-        }
-    }
-}
-
 void Comb::FrameBuffer::buildNotchHfCurves(
     int line, std::vector<double> &bp,
     std::vector<double> &wLaw, std::vector<double> &keep,
-    std::vector<quint8> *heard) const
+    std::vector<quint8> *heard, int reach) const
 {
     // Confirmation ramp: removal begins at rho = -confirmLo and is full
     // at rho = -(confirmLo + confirmW). Sweepable for the referee.
@@ -5701,21 +5719,47 @@ void Comb::FrameBuffer::buildNotchHfCurves(
     if (w <= 8) return;
 
     const quint16 *rawC = rawbuffer.data() + size_t(line) * fullW;
-    const quint16 *rawU = (line >= 2)
-        ? rawbuffer.data() + size_t(line - 2) * fullW : nullptr;
-    const quint16 *rawD = (line + 2 < frameHeight)
-        ? rawbuffer.data() + size_t(line + 2) * fullW : nullptr;
+    // `reach` is the partner distance in FRAME lines. 2 is the same-field
+    // neighbour and reproduces the shipped conduct byte-exactly; 1 is the
+    // interfield partner — vertically half as far, and the opposite phase
+    // of a line-alternating artifact, so a collapsed sample's ±1 partner
+    // is the intact one (the compact escape's consumer).
+    const quint16 *rawU = (line - reach >= 0)
+        ? rawbuffer.data() + size_t(line - reach) * fullW : nullptr;
+    const quint16 *rawD = (line + reach < frameHeight)
+        ? rawbuffer.data() + size_t(line + reach) * fullW : nullptr;
+    // The confirming direction comes from the grammar per column at any
+    // reach other than 2. At reach 2 the same-field partner is Opposite by
+    // the line schedule itself and the shipped fixed anti-phase form is
+    // used unchanged — the grammar reports Same on a minority of those
+    // pairs (intrafield Field A/B sign territory, a separate question).
+    const CombCarrierGrammar *gC = carrierGrammarLine(line);
+    const CombCarrierGrammar *gU = (line - reach >= 0)
+        ? carrierGrammarLine(line - reach) : nullptr;
+    const CombCarrierGrammar *gD = (line + reach < frameHeight)
+        ? carrierGrammarLine(line + reach) : nullptr;
     auto bpOf = [](const quint16 *row, int h) {
         return 0.5 * (double)row[h] -
                0.25 * ((double)row[h - 2] + (double)row[h + 2]);
     };
 
+    // The band rows come from the canonical authority
+    // (locked1DRawBandpass_flat, half-sample edge reflection) so the
+    // testimony and its consumers share one source formula with the rest
+    // of the tree; the private doublet remains only as the standalone
+    // fallback when the flat is absent.
+    const double *bpC  = locked1DRawBandpass_line(line);
+    const double *bpCU = (line - reach >= 0)
+        ? locked1DRawBandpass_line(line - reach) : nullptr;
+    const double *bpCD = (line + reach < frameHeight)
+        ? locked1DRawBandpass_line(line + reach) : nullptr;
+
     std::vector<double> bpU(w, 0.0), bpD(w, 0.0), envObs(w), envLaw(w);
     for (int xi = 0; xi < w; ++xi) {
         const int h = left + xi;
-        bp[xi] = bpOf(rawC, h);
-        if (rawU) bpU[xi] = bpOf(rawU, h);
-        if (rawD) bpD[xi] = bpOf(rawD, h);
+        bp[xi] = bpC ? bpC[xi] : bpOf(rawC, h);
+        if (rawU) bpU[xi] = bpCU ? bpCU[xi] : bpOf(rawU, h);
+        if (rawD) bpD[xi] = bpCD ? bpCD[xi] : bpOf(rawD, h);
     }
     for (int xi = 0; xi < w; ++xi)
         envObs[xi] = std::hypot(bp[xi], bp[std::min(xi + 1, w - 1)]);
@@ -5768,14 +5812,31 @@ void Comb::FrameBuffer::buildNotchHfCurves(
             if (heard) (*heard)[xi] = 1;
             continue;
         }
+        // Per-column relation sign: at reach 2, the shipped fixed
+        // anti-phase form (−1). Elsewhere, the grammar names it — Opposite
+        // means confirmation is anti-phase, Same means in-phase; an
+        // unnameable relation contributes nothing to the numerator and its
+        // energy to the denominator, so it can only lower confirmation.
+        const int hCol = left + xi;
+        auto signOf = [&](const CombCarrierGrammar *gP) -> double {
+            if (reach == 2) return -1.0;
+            if (!gC || !gP) return 0.0;
+            switch (lddecode::carrierGrammarSignedPhaseRelation(
+                        gC, hCol, gP, hCol)) {
+                case lddecode::CarrierPhaseRelation::Opposite: return -1.0;
+                case lddecode::CarrierPhaseRelation::Same:     return  1.0;
+                default: return 0.0;
+            }
+        };
+        const double relU = signOf(gU), relD = signOf(gD);
         double rhoU = 0.0, rhoD = 0.0;
         bool haveU = false, haveD = false;
-        if (rawU && sUU >= noiseFloor * noiseFloor * 7) {
-            rhoU = sCU / std::sqrt(sCC * sUU);
+        if (rawU && relU != 0.0 && sUU >= noiseFloor * noiseFloor * 7) {
+            rhoU = -relU * sCU / std::sqrt(sCC * sUU);
             haveU = true;
         }
-        if (rawD && sDD >= noiseFloor * noiseFloor * 7) {
-            rhoD = sCD / std::sqrt(sCC * sDD);
+        if (rawD && relD != 0.0 && sDD >= noiseFloor * noiseFloor * 7) {
+            rhoD = -relD * sCD / std::sqrt(sCC * sDD);
             haveD = true;
         }
         // No testimony: luma stands. The witness rung is entitled to rest on
@@ -5787,8 +5848,12 @@ void Comb::FrameBuffer::buildNotchHfCurves(
         // removal in; anything short of clear anti-phase leaves the luma
         // alone. A decisive single-witness anti-phase still acquits
         // outright (the one honest partner at a vertical boundary).
+        // Pooling is unconditional in the denominator; the numerator folds
+        // each partner's grammar sign so that "confirmation" stays the
+        // negative direction at every reach. At reach 2 (rel = −1 both)
+        // this is bit-for-bit the shipped sCU + sCD.
         const double sPP2 = sUU + sDD;
-        const double sCP2 = sCU + sCD;
+        const double sCP2 = -(relU * sCU) - (relD * sCD);
         const double rhoP = (sPP2 > 1e-12)
             ? sCP2 / std::sqrt(sCC * sPP2) : 0.0;
         double kp = std::clamp((-rhoP - confirmLo) / confirmW, 0.0, 1.0);
@@ -5797,6 +5862,83 @@ void Comb::FrameBuffer::buildNotchHfCurves(
             kp = 1.0;
         keep[xi] = kp;
         if (heard) (*heard)[xi] = 1;
+    }
+}
+
+// BAND FACTS: the one head scan. Runs as the tail of buildCarrierAnalysis,
+// after every canonical band row exists, and publishes wLaw, both
+// testimony reaches, and the parallax consensus so no consumer rebuilds
+// them privately. Held FrameBuffers are recycled across frames, so every
+// sample is written on every build.
+void Comb::FrameBuffer::buildBandFacts()
+{
+    const int firstLine = videoParameters.firstActiveFrameLine;
+    const int lastLine  = videoParameters.lastActiveFrameLine;
+    const int left      = videoParameters.activeVideoStart;
+    const int right     = videoParameters.activeVideoEnd;
+    const int w         = right - left;
+    if (w <= 8 || demodWidth != w || bandWLaw_flat.empty()) return;
+
+    static const int cB4[4] = { 1, 0, -1, 0 };
+    static const int sB4[4] = { 0, 1, 0, -1 };
+    std::vector<double> bp, wLaw, keep;
+    std::vector<quint8> heard;
+    for (int line = firstLine; line < lastLine; ++line) {
+        double *wRow  = bandWLaw_flat.data()  + size_t(line) * demodWidth;
+        double *k1Row = bandKeep1_flat.data() + size_t(line) * demodWidth;
+        double *k2Row = bandKeep2_flat.data() + size_t(line) * demodWidth;
+        quint8 *h1Row = bandHeard1_flat.data() + size_t(line) * demodWidth;
+        quint8 *h2Row = bandHeard2_flat.data() + size_t(line) * demodWidth;
+        float  *pIRow = parallaxI_flat.data() + size_t(line) * demodWidth;
+        float  *pQRow = parallaxQ_flat.data() + size_t(line) * demodWidth;
+
+        buildNotchHfCurves(line, bp, wLaw, keep, &heard, 2);
+        if ((int)bp.size() != w) continue;
+        for (int xi = 0; xi < w; ++xi) {
+            wRow[xi]  = wLaw[xi];
+            k2Row[xi] = keep[xi];
+            h2Row[xi] = heard[xi];
+        }
+        // wLaw depends on the band row alone, so the reach-1 call's copy
+        // is identical and only its testimony is published.
+        buildNotchHfCurves(line, bp, wLaw, keep, &heard, 1);
+        for (int xi = 0; xi < w; ++xi) {
+            k1Row[xi] = keep[xi];
+            h1Row[xi] = heard[xi];
+        }
+
+        // Parallax consensus. Each covering aperture's zero-sum residual
+        // splits exactly into carrier (a,b,-a,-b) and its own luma
+        // deviation (s,-s,s,-s); the views' carrier readings are averaged
+        // with weight 1/(|s|+1) so views polluted by luma speak softly.
+        // Smooth weighting, never selection.
+        const quint16 *raw = rawbuffer.data() +
+            size_t(line) * videoParameters.fieldWidth;
+        const double *ap = lockedApertureMean_line(line);
+        for (int x = 0; x < w; ++x) {
+            double sI = 0.0, sQ = 0.0, sWt = 0.0;
+            if (ap) {
+                for (int v = std::max(0, x - 3);
+                     v <= std::min(x, w - 4); ++v) {
+                    const double r0 = (double)raw[left + v]     - ap[v];
+                    const double r1 = (double)raw[left + v + 1] - ap[v];
+                    const double r2 = (double)raw[left + v + 2] - ap[v];
+                    const double r3 = (double)raw[left + v + 3] - ap[v];
+                    const double a = 0.5 * (r0 - r2);
+                    const double b = 0.5 * (r1 - r3);
+                    const double s = 0.5 * (r0 + r2);
+                    const int c0 = carrierSampleClass(line, left + v);
+                    const int c1 = (c0 + 1) & 3;
+                    const double vI =  sB4[c1] * a - sB4[c0] * b;
+                    const double vQ = -cB4[c1] * a + cB4[c0] * b;
+                    const double wv =
+                        1.0 / (std::fabs(s) * invIreScale + 1.0);
+                    sI += wv * vI; sQ += wv * vQ; sWt += wv;
+                }
+            }
+            pIRow[x] = (sWt > 1e-12) ? (float)(sI / sWt) : 0.0f;
+            pQRow[x] = (sWt > 1e-12) ? (float)(sQ / sWt) : 0.0f;
+        }
     }
 }
 
@@ -5857,6 +5999,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // TEMPORARY INSTRUMENT (LDCD_PROBE_CARRIERBW=1), off by default.
     probeCarrierBandwidth();
     probeCompactSites();
+    probeCompactSpans();
     probeCoveredTruth();
 
     // Retained record from the removed LDCD_PROBE_YCAND census
@@ -6109,11 +6252,58 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // covered program material).
     std::vector<double> pyRow0(width), pyRow1(width), pyRow3(width),
                         pyRow4(width), pyRow5(width), pyRow6(width);
-    // Notch-HF construction, rebuilt once per line (raw-only: no fit, no
-    // solve, so it exists on every line the group is live on). nhCarrier is
-    // the published claim keep*wLaw*bp; plane 6 is raw minus it.
-    std::vector<double> nhBp, nhW, nhKeep, nhCarrier(width);
+    // Notch-HF construction, sampled per line from the head-published band
+    // facts (raw-only: no fit, no solve, so it exists on every line the
+    // group is live on). nhCarrier is the claim bp*wLaw*keep; plane 6 is
+    // raw minus it.
+    std::vector<double> nhCarrier(width);
     std::vector<quint8> nhHeard;
+
+    // COMPACT COLOUR STAGE, PHASE-LOCKED FORM (author, 2026-08-15:
+    // "misphase is the core of the issue ... we have the certified
+    // carrier nearby -- the phase shouldn't radically jump around in 4
+    // pixels. Let's lock in the phase part of this.").
+    //
+    // The first form of this stage was falsified the same day and
+    // removed: its value came from the current line's lawful band
+    // (bp*wLaw), and on the visual-luma axis (pair-mean deficits of Y,
+    // the crime itself) that source dug darkest-pair holes three times
+    // deeper than claiming ZERO carrier (p90 12.96 vs 4.32 IRE). The
+    // dg-discard bench then established, against certified truth:
+    //   - the constant-pair FORM is vindicated (truth's own pair leaves
+    //     0.28 IRE median darkest-pair residue);
+    //   - a mis-phased claim is visually WORSE than no claim; every
+    //     recipe protected itself by underclaiming amplitude ~0.7;
+    //   - the pair's PHASE at a compact site agrees across covers to
+    //     10 deg median / 91% within 30 deg once the deterministic
+    //     grammar sign relation is folded -- phase is raster-anchored
+    //     authority, amplitude (0.60..1.55 across covers) is content
+    //     and stays barred (the anticipation license: phase, never
+    //     values);
+    //   - with phase held by authority, amplitude reduces to a ONE
+    //     PARAMETER projection onto the certified direction, and the
+    //     ungated vertical comb of the canonical band is the projection
+    //     source that survives (raw band does not launder: its
+    //     contamination is not orthogonal enough at site support).
+    //   Bench standing: fit 2.30/5.87 IRE darkest-pair p50/p90 ->
+    //   1.39/3.14 for this construction.
+    //
+    // So the stage is: locate compact band bursts; take the site's
+    // phase from the covers' certified carrier (both covers sit in the
+    // triple buffer, and by parity complement one of them certifies
+    // THIS line directly; the per-column grammar relation supplies the
+    // fold); project the ungated +-2 comb onto that direction for
+    // amplitude; render one constant pair. Abstention (no cover, no
+    // grammar relation, empty projection) publishes nothing and the
+    // election proceeds. The amplitude side is the open upgrade (+-1
+    // legs, 2D feature pooling); the phase side is locked in.
+    const bool compactStageLive = !frameHasExactCoverage();
+    std::vector<double> compactRow(width);
+    // Per-pixel brightest COMPLETE luma among candidates that actually
+    // passed feasibility and admission. NaN means no election reference:
+    // certified, compact-stage, diagnostic and empty-roster paths must
+    // not be post-corrected by the crash guard.
+    std::vector<double> crashRefRow(width);
 
     // Retained record from the removed LDCD_PROBE_ROSTER census
     // (2026-08-11, Emissarymovie-s1x11 -s 2600, ntsc3d + phase-comp +
@@ -6513,17 +6703,184 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             // implementation of the candidate, which is the drift this
             // election's single-sampler discipline exists to prevent.
             if (notchLive) {
-                buildNotchHfCurves(line, nhBp, nhW, nhKeep, &nhHeard);
-                if ((int)nhBp.size() >= width &&
-                    (int)nhHeard.size() >= width) {
+                const double *nhBpRow = locked1DRawBandpass_line(line);
+                const double *nhWRow  = bandWLaw_line(line);
+                const double *nhKRow  = bandKeep_line(line, 2);
+                const quint8 *nhHRow  = bandHeard_line(line, 2);
+                if (nhBpRow && nhWRow && nhKRow && nhHRow) {
+                    nhHeard.assign(nhHRow, nhHRow + width);
                     for (int xx = 0; xx < width; ++xx)
-                        nhCarrier[xx] = nhBp[xx] * nhW[xx] * nhKeep[xx];
+                        nhCarrier[xx] =
+                            nhBpRow[xx] * nhWRow[xx] * nhKRow[xx];
                 } else {
                     // The construction could not run on this line. Claim
                     // nothing and be heard nowhere: the seat below goes
                     // unfilled rather than publishing raw as a candidate.
                     std::fill(nhCarrier.begin(), nhCarrier.end(), 0.0);
                     nhHeard.assign(width, 0);
+                }
+            }
+
+            std::fill(crashRefRow.begin(), crashRefRow.end(),
+                      std::numeric_limits<double>::quiet_NaN());
+
+            // Compact-colour row build, phase-locked form (see the stage
+            // comment above the line loop). Detection is unchanged from
+            // the first form: band-envelope bursts up to six samples
+            // bound across gaps up to two.
+            std::fill(compactRow.begin(), compactRow.end(),
+                      std::numeric_limits<double>::quiet_NaN());
+            if (compactStageLive) {
+                static const int cB4c[4] = { 1, 0, -1, 0 };
+                static const int sB4c[4] = { 0, 1, 0, -1 };
+                constexpr double kCompactIRE  = 2.0;
+                constexpr double kRefFloorIRE = 2.0;
+                constexpr int    kBurstMax    = 6;
+                constexpr int    kBindGapMax  = 2;
+                // The pad carries the encoder skirt: truth's envelope is
+                // still at ~1/3 peak at the detection boundary (measured
+                // profile 0.33..0.96..0.33 over 2737 certified sites).
+                constexpr int    kSkirtPad    = 4;
+                const double *cbp = locked1DRawBandpass_line(line);
+                const double *cbU = (line - 2 >= 0)
+                    ? locked1DRawBandpass_line(line - 2) : nullptr;
+                const double *cbD = (line + 2 < frameHeight)
+                    ? locked1DRawBandpass_line(line + 2) : nullptr;
+                std::vector<double> gSkirt;
+                // Site phase from one cover's certified carrier at THIS
+                // line, folded per column by the grammar relation. Facts
+                // supply PHASE only; the amplitude solved here is used
+                // solely to rank the two covers and gate soundness.
+                auto coverPair = [&](const FrameBuffer *cov, int r0,
+                                     int r1, double &pI,
+                                     double &pQ) -> double {
+                    if (!cov || !cov->holdsRealFrame() ||
+                        !cov->frameHasExactCoverage()) return -1.0;
+                    const float *ex = cov->exactCarrierRow(line);
+                    const CombCarrierGrammar *gC = carrierGrammarLine(line);
+                    const CombCarrierGrammar *gP =
+                        cov->carrierGrammarLine(line);
+                    if (!ex || !gC || !gP) return -1.0;
+                    double Sii = 0, Siq = 0, Sqq = 0, SiY = 0, SqY = 0;
+                    int n = 0;
+                    for (int k = r0; k < r1; ++k) {
+                        const int h = left + k;
+                        const float v = ex[h];
+                        if (!std::isfinite(v)) continue;
+                        double sgn;
+                        switch (lddecode::carrierGrammarSignedPhaseRelation(
+                                    gC, h, gP, h)) {
+                            case lddecode::CarrierPhaseRelation::Same:
+                                sgn = 1.0; break;
+                            case lddecode::CarrierPhaseRelation::Opposite:
+                                sgn = -1.0; break;
+                            default: continue;
+                        }
+                        const int cls = carrierSampleClass(line, h);
+                        const double bi = cB4c[cls], bq = sB4c[cls];
+                        const double c = sgn * (double)v;
+                        Sii += bi * bi; Siq += bi * bq; Sqq += bq * bq;
+                        SiY += c * bi;  SqY += c * bq;
+                        n++;
+                    }
+                    if (n < 2) return -1.0;
+                    const double det = Sii * Sqq - Siq * Siq;
+                    if (std::fabs(det) < 1e-9) return -1.0;
+                    pI = ( Sqq * SiY - Siq * SqY) / det;
+                    pQ = (-Siq * SiY + Sii * SqY) / det;
+                    return std::hypot(pI, pQ);
+                };
+                auto renderRegion = [&](int r0, int r1) {
+                    const int s2 = std::max(0, r0 - kSkirtPad);
+                    const int e2 = std::min(width, r1 + kSkirtPad);
+                    double aI, aQ, bI, bQ;
+                    const double ampP = coverPair(prevF, s2, e2, aI, aQ);
+                    const double ampN = coverPair(nextF, s2, e2, bI, bQ);
+                    double uI, uQ, amp;
+                    if (ampP >= ampN) { uI = aI; uQ = aQ; amp = ampP; }
+                    else              { uI = bI; uQ = bQ; amp = ampN; }
+                    if (amp * invIreScale < kRefFloorIRE) return;
+                    uI /= amp; uQ /= amp;
+                    // Skirted envelope: the detected support through the
+                    // encoder's own 9-tap chroma filter, peak-normalized.
+                    // A rectangle here is a shape the encoder cannot emit,
+                    // and it costs twice: contour edges in the render, and
+                    // matched-filter starvation in the projection (a
+                    // skirted truth read against a rect basis under-reads;
+                    // measured amp ratio 0.60 -> 0.79 on the bench when
+                    // the shape was corrected). Both sides of the
+                    // projection use the same skirted basis (scale rule).
+                    gSkirt.assign(size_t(e2 - s2), 0.0);
+                    double gMax = 0.0;
+                    for (int k = s2; k < e2; ++k) {
+                        double g = 0.0;
+                        for (int j = std::max(r0, k - 4);
+                             j < std::min(r1, k + 5); ++j)
+                            g += lddecode::kChromaEnvelopeFilter[4 + (k - j)];
+                        gSkirt[k - s2] = g;
+                        if (g > gMax) gMax = g;
+                    }
+                    if (gMax < 1e-9) return;
+                    // Amplitude: matched projection of the ungated +-2
+                    // comb onto the skirted certified direction.
+                    double num = 0.0, den = 0.0;
+                    for (int k = s2; k < e2; ++k) {
+                        double row;
+                        const double c0 = cbp ? cbp[k] : 0.0;
+                        if (cbU && cbD)
+                            row = 0.5 * c0 - 0.25 * (cbU[k] + cbD[k]);
+                        else if (cbU) row = 0.5 * (c0 - cbU[k]);
+                        else if (cbD) row = 0.5 * (c0 - cbD[k]);
+                        else          row = c0;
+                        const int cls = carrierSampleClass(line, left + k);
+                        const double basis = (gSkirt[k - s2] / gMax) *
+                            (uI * cB4c[cls] + uQ * sB4c[cls]);
+                        num += row * basis;
+                        den += basis * basis;
+                    }
+                    if (den < 1e-9) return;
+                    const double A = num / den;
+                    if (A <= 0.0) return;      // nothing along the
+                                               // certified direction:
+                                               // abstain, never a zero claim
+                    // Retained record from the removed firing census
+                    // (LDCD_COMPACT_DEBUG, 2026-08-15): 1047 phase-vouched
+                    // regions per 30 frames on Emissarymovie-s1x11 -s 2650,
+                    // including dense coverage of the engines band (f17,
+                    // lines 264-293, cols 357-477, A 0.4-5.9 IRE) -- the
+                    // site every earlier form of this stage left untouched.
+                    // The render carries the skirt: the claim extends over
+                    // the padded window at the encoder-shaped envelope.
+                    for (int k = s2; k < e2; ++k) {
+                        const int cls = carrierSampleClass(line, left + k);
+                        compactRow[k] = A * (gSkirt[k - s2] / gMax) *
+                            (uI * cB4c[cls] + uQ * sB4c[cls]);
+                    }
+                };
+                if (cbp) {
+                    int rs = -1, regS = -1, regE = -1;
+                    auto flushRegion = [&]() {
+                        if (regS < 0) return;
+                        renderRegion(regS, regE);
+                        regS = regE = -1;
+                    };
+                    for (int xi = 0; xi <= width; ++xi) {
+                        const bool in = (xi < width) &&
+                            std::hypot(cbp[xi],
+                                cbp[std::min(xi + 1, width - 1)]) *
+                                invIreScale >= kCompactIRE;
+                        if (in) { if (rs < 0) rs = xi; continue; }
+                        if (rs < 0) continue;
+                        const int b0 = rs, b1 = xi; rs = -1;
+                        if (b1 - b0 > kBurstMax) { flushRegion(); continue; }
+                        if (regS >= 0 && b0 - regE <= kBindGapMax) {
+                            regE = b1;
+                        } else {
+                            flushRegion();
+                            regS = b0; regE = b1;
+                        }
+                    }
+                    flushRegion();
                 }
             }
 
@@ -6875,6 +7232,17 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // certified sample costs one compare and one subtraction.
                 if (certLineActive && std::isfinite(certExactRow[h])) {
                     Y[h] = rawH - (double)certExactRow[h];
+                    continue;
+                }
+
+                // Compact-colour arm: in a located compact region whose
+                // phase the covers' certified carrier vouches, the
+                // phase-locked constant-pair render IS the carrier claim
+                // and Y takes it ahead of the election (whose instruments
+                // are structurally blind below the 4-sample aperture).
+                // NaN = the stage abstained and the election proceeds.
+                if (compactStageLive && std::isfinite(compactRow[xi])) {
+                    Y[h] = rawH - compactRow[xi];
                     continue;
                 }
 
@@ -7307,6 +7675,9 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
 
                 if (nIn == 1 && !returnedAdmitted) {
                     Y[h] = reconstructTop(candPlane[inIdx[0]], candY[inIdx[0]]);
+                    // The only admitted candidate is both the output and the
+                    // brightest live reference, so the later guard is a no-op.
+                    crashRefRow[xi] = Y[h];
                     continue;
                 }
 
@@ -7344,6 +7715,22 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         carrierCleanlinessOf(4, h);
                     ++nIn;
                 }
+
+                // Publish the crash guard's reference from this pixel's
+                // ACTUAL roster, after feasibility, admission and abstention.
+                // Reconstruct each candidate in the same geometry the election
+                // uses; source-row presence alone does not make a candidate live.
+                double brightestLive =
+                    -std::numeric_limits<double>::infinity();
+                for (int k = 0; k < nIn; ++k) {
+                    const int plane = (k < baseNIn)
+                        ? candPlane[inIdx[k]] : 4;
+                    const double complete = reconstructTop(plane, inHF[k]);
+                    if (std::isfinite(complete) && complete > brightestLive)
+                        brightestLive = complete;
+                }
+                if (std::isfinite(brightestLive))
+                    crashRefRow[xi] = brightestLive;
 
                 // Let the named cross-colour evidence affect scoring according
                 // to what each candidate actually does. The comb plane defines
@@ -7886,6 +8273,40 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 Y[h] = (blendDen > 1e-12)
                     ? blendNum / blendDen
                     : reconstructTop(winnerPlane, resultHF);
+            }
+
+            // CRASH GUARD (author, 2026-08-15): "these dark pixels aren't
+            // just that, they crash to zero -- that's a pathology...
+            // darker than the competition is also a valid measure. We're
+            // blocking these dark spots from reaching output." A pixel
+            // the election renders far darker than the brightest live
+            // candidate is switched to that candidate. Per pixel, because
+            // the crime is per pixel and blocking it outranks uniformity
+            // here. The reference is recorded from the actual admitted
+            // roster inside the election; source-present but rejected,
+            // abstaining or seatless planes cannot trigger it. Uncovered
+            // frames only -- covered frames are facts and never enter this
+            // path.
+            if (!coveredFrame) {
+                // The margin scales with the local band: a deficit no
+                // larger than the carrier a candidate might have left in
+                // is honest disagreement; one that EXCEEDS it cannot be
+                // explained by any lawful claim -- that is the crash.
+                const double *gbp = locked1DRawBandpass_line(line);
+                const double kCrashFloor = 3.0 * irescale;
+                for (int h = left; h < right; ++h) {
+                    const int xx = h - left;
+                    const double ref = crashRefRow[xx];
+                    if (!std::isfinite(ref)) continue;
+                    double tau = kCrashFloor;
+                    if (gbp) {
+                        const int x1 = std::min(xx + 1, width - 1);
+                        const double e =
+                            1.2 * std::hypot(gbp[xx], gbp[x1]);
+                        if (e > tau) tau = e;
+                    }
+                    if (ref - Y[h] > tau) Y[h] = ref;
+                }
             }
         } else if (carrierComp) {
             for (int h = left; h < right; ++h) {
@@ -11933,17 +12354,11 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
             }
         }
 
-        // Compact-colour escape: the fit stands aside where its aperture
-        // cannot reach. Placed HERE -- last act of the line's
-        // construction, immediately before the carrier-cancelled floor is
-        // derived from `flattened` -- so the floor, and every Pass 2 gate
-        // that reads it, describes the REPAIRED fit. Run later as a
-        // whole-plane pass it left flatFloor stale, and repaired samples
-        // were then judged on pre-repair evidence. Every law below still
-        // polices what it publishes.
-        applyCompactColorEscapeLine(line, carrierFit, flattened,
-                                    rawWhole, fitRow);
-
+        // The compact-colour ESCAPE stood here (fit-side repair, opt-in
+        // LDCD_COMPACT_ESCAPE) and was retired 2026-08-15 in favour of the
+        // produceY compact-colour stage: the flaw expresses as LUMA, so
+        // the Y build is the last word on it, and one mechanism answers
+        // one flaw.
         // Build the carrier-cancelled floor from every legal 4-sample mean of
         // the final flattened waveform.
         if (width >= 4) {
@@ -13702,11 +14117,16 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
         // than removing it.
         const double *obs1D = locked1DSource_line(line);
 
-        // Notch-HF rung curves, built once per line (raw-only; independent
-        // of the fit solve, so the fit's NaN abstention does not apply).
-        std::vector<double> lawBp, lawW, lawKeep;
-        if (retractedSource == 4)
-            buildNotchHfCurves(line, lawBp, lawW, lawKeep);
+        // Notch-HF rung, sampled from the head-published band facts
+        // (raw-only; independent of the fit solve, so the fit's NaN
+        // abstention does not apply).
+        const double *lawBpRow = nullptr, *lawWRow = nullptr,
+                     *lawKRow = nullptr;
+        if (retractedSource == 4) {
+            lawBpRow = locked1DRawBandpass_line(line);
+            lawWRow  = bandWLaw_line(line);
+            lawKRow  = bandKeep_line(line, 2);
+        }
 
         for (int xi = 0; xi < width; ++xi) {
             // The certified plane has exactly three rungs: measured twin
@@ -13770,7 +14190,9 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                         ? static_cast<double>(ex)
                         : (std::isfinite(certComp[xi])
                             ? certComp[xi]
-                            : lawBp[xi] * lawW[xi] * lawKeep[xi]);
+                            : ((lawBpRow && lawWRow && lawKRow)
+                                ? lawBpRow[xi] * lawWRow[xi] * lawKRow[xi]
+                                : 0.0));
                     break;
                 case 3:
                     // THE WITNESS AND THE LADDER PART COMPANY AT THE LAST
@@ -14051,6 +14473,89 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                     thPden > 1e-12 ? thP / std::sqrt(thPden) : 0.0,
                     a.nP ? std::sqrt(a.spe2 / a.nP) : 0.0,
                     safeDiv(a.sFP, a.sTP));
+            }
+        }
+    }
+
+    // TEMPORARY INSTRUMENT: mirror dump for the compact-collapse bench
+    // (author's loop, 2026-08-15: iteratively distort the uncovered
+    // waveform offline, scoring each distortion against certified truth).
+    // In a --dg-discard run every frame is uncovered; at the (seq, line)
+    // keys where the paired NORMAL run dumped certified truth
+    // (LDCD_THEFT_DUMP), append this run's own rows so the bench can
+    // re-derive any candidate claim from exactly the samples the decoder
+    // saw. Record: hdr {seq, line, width, nPlanes=6}, float irescale,
+    // then rows raw / canonical band / law weight / reach-1 testimony /
+    // published fit / combed carrier / lattice sample class. Consumed by
+    // compactbench.py; strip both together when the question closes.
+    {
+        static const char *depPath = std::getenv("LDCD_THEFT_DEP");
+        if (depPath && !frameHasExactCoverage()) {
+            using DepKey = std::pair<int, int>;
+            static const std::map<DepKey, char> truthKeys = []{
+                std::map<DepKey, char> s;
+                const char *p = std::getenv("LDCD_THEFT_TRUTH");
+                if (!p) return s;
+                FILE *f = std::fopen(p, "rb");
+                if (!f) return s;
+                std::int32_t hdr[3];
+                while (std::fread(hdr, sizeof(hdr), 1, f) == 1) {
+                    if (std::fseek(f, (long)hdr[2] * sizeof(float),
+                                   SEEK_CUR))
+                        break;
+                    s[{hdr[0], hdr[1]}] = 1;
+                }
+                std::fclose(f);
+                return s;
+            }();
+            if (!truthKeys.empty()) {
+                static std::mutex depMu;
+                std::lock_guard<std::mutex> lk(depMu);
+                if (FILE *f = std::fopen(depPath, "ab")) {
+                    std::vector<float> row(width);
+                    auto writeD = [&](const double *src) {
+                        for (int xi = 0; xi < width; ++xi)
+                            row[xi] = src ? (float)src[xi]
+                                : std::numeric_limits<float>::quiet_NaN();
+                        std::fwrite(row.data(), sizeof(float), width, f);
+                    };
+                    auto writeF = [&](const float *src) {
+                        for (int xi = 0; xi < width; ++xi)
+                            row[xi] = src ? src[xi]
+                                : std::numeric_limits<float>::quiet_NaN();
+                        std::fwrite(row.data(), sizeof(float), width, f);
+                    };
+                    for (int line = firstLine; line < lastLine; ++line) {
+                        if (!truthKeys.count({(int)heldSeq1, line}))
+                            continue;
+                        const std::int32_t hdr[4] = {
+                            (std::int32_t)heldSeq1, (std::int32_t)line,
+                            (std::int32_t)width, 7 };
+                        std::fwrite(hdr, sizeof(hdr), 1, f);
+                        const float sc = (float)irescale;
+                        std::fwrite(&sc, sizeof(float), 1, f);
+                        const quint16 *raw = rawbuffer.data() +
+                            static_cast<size_t>(line) *
+                            videoParameters.fieldWidth;
+                        for (int xi = 0; xi < width; ++xi)
+                            row[xi] = (float)raw[left + xi];
+                        std::fwrite(row.data(), sizeof(float), width, f);
+                        writeD(locked1DRawBandpass_line(line));
+                        writeD(bandWLaw_line(line));
+                        writeD(bandKeep_line(line, 1));
+                        writeF(carrierFit_flat.empty() ? nullptr
+                            : carrierFit_flat.data() +
+                              static_cast<size_t>(line) * demodWidth);
+                        writeF(combedCarrier_flat.empty() ? nullptr
+                            : combedCarrier_flat.data() +
+                              static_cast<size_t>(line) * demodWidth);
+                        for (int xi = 0; xi < width; ++xi)
+                            row[xi] = (float)carrierSampleClass(
+                                line, left + xi);
+                        std::fwrite(row.data(), sizeof(float), width, f);
+                    }
+                    std::fclose(f);
+                }
             }
         }
     }

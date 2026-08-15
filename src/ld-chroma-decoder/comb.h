@@ -1183,6 +1183,21 @@ private:
 	// conservation condition a desaturating suppressor cannot satisfy).
 	// DIAGNOSTIC ONLY for now: no consumer, so the render is unchanged.
 	std::vector<double> lockedCornerLeak_flat;
+	// BAND FACTS: one head-scan producer (buildBandFacts, the tail of
+	// buildCarrierAnalysis) publishes the per-sample facts band consumers
+	// used to rebuild privately per line:
+	//   bandWLaw    -- encoder-law loudness bound on the canonical bandpass
+	//   bandKeep1/2 -- notch testimony ramp at the interfield (+-1) and
+	//                  same-field (+-2) partner reaches
+	//   bandHeard1/2 -- testimony was actually consulted there. keep == 0
+	//                  is a VERDICT only where heard is set; otherwise it
+	//                  is an absence of evidence and raw stands
+	//   parallaxI/Q -- deviation-weighted consensus of the four aperture
+	//                  views' carrier coordinates (raw units, common IQ)
+	std::vector<double> bandWLaw_flat;
+	std::vector<double> bandKeep1_flat, bandKeep2_flat;
+	std::vector<quint8> bandHeard1_flat, bandHeard2_flat;
+	std::vector<float>  parallaxI_flat, parallaxQ_flat;
 	bool lockedLumaCacheValid = false;
 
 	inline double *lockedLumaBaseY4_line(int line) {
@@ -1227,6 +1242,40 @@ private:
 	inline const double *lockedApertureMean_line(int line) const {
 		if (lockedApertureMean_flat.empty()) return nullptr;
 		return lockedApertureMean_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const double *bandWLaw_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    bandWLaw_flat.empty()) return nullptr;
+		return bandWLaw_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const double *bandKeep_line(int line, int reach) const {
+		const std::vector<double> &f =
+		    (reach == 1) ? bandKeep1_flat : bandKeep2_flat;
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    f.empty()) return nullptr;
+		return f.data() + size_t(line) * demodWidth;
+	}
+
+	inline const quint8 *bandHeard_line(int line, int reach) const {
+		const std::vector<quint8> &f =
+		    (reach == 1) ? bandHeard1_flat : bandHeard2_flat;
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    f.empty()) return nullptr;
+		return f.data() + size_t(line) * demodWidth;
+	}
+
+	inline const float *parallaxI_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    parallaxI_flat.empty()) return nullptr;
+		return parallaxI_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline const float *parallaxQ_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    parallaxQ_flat.empty()) return nullptr;
+		return parallaxQ_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline float *lockedLumaHDeltaIRE_line(int line) {
@@ -1425,45 +1474,45 @@ private:
 	// test: do the carrier fit and the notch complement err in opposite
 	// directions at compact features, or reinforce? Read-only.
 	void probeCompactSites() const;
+	// TEMPORARY INSTRUMENT (LDCD_PROBE_SPAN=1). The compact-span locator:
+	// notch-identified chroma regions shorter than 4 samples, censused and
+	// precision-graded against the exact carrier on certified lines.
+	void probeCompactSpans() const;
 	// TEMPORARY INSTRUMENT (LDCD_PROBE_COVTRUTH=1). Covered-frame truth
 	// decomposition: certified carrier vs certified luma at the sites the
 	// uncovered machinery fails on. Read-only.
 	void probeCoveredTruth() const;
-	// Notch-HF witness curves for one line (the notch group's HF-preserving
-	// member; its sibling notch-fsc is the fixed cos^2 kernel that nulls the
-	// fSC band wholesale). bp = the recording's own wiggle (fixed bandpass
-	// on raw, no solved phase); wLaw = the encoder-law loudness bound;
-	// keep = the grammar-schedule testimony under the PRESUMPTION OF LUMA:
-	// nothing is subtracted unless partners positively confirm carrier, so a
-	// thin feature the schedule cannot vouch against is never touched (the
-	// phaser-beam dash class, made impossible rather than tuned away). One
-	// implementation serves the witness rung
-	// (LDCD_RETRACTED_SOURCE=notchhf). Carrier object = bp*wLaw*keep.
-	// `heard` (optional) marks the samples where testimony was actually
-	// consulted. keep == 0 has TWO meanings -- "the partners convicted this
-	// as luma" and "no partner could be reached" -- and a consumer that
-	// seats the construction as a candidate must tell them apart: the first
-	// is a verdict, the second publishes raw with its carrier intact.
+	// BAND FACTS producer, the tail of buildCarrierAnalysis: one scan
+	// publishes what band consumers used to rebuild privately per line
+	// (the notch-HF curves and the parallax consensus). bandWLaw = the
+	// encoder-law loudness bound on the canonical bandpass; bandKeep1/2 =
+	// the grammar-schedule testimony at the interfield (+-1) and
+	// same-field (+-2) partner reaches, under the PRESUMPTION OF LUMA:
+	// nothing is subtracted unless partners positively confirm carrier, so
+	// a thin feature the schedule cannot vouch against is never touched
+	// (the phaser-beam dash class, made impossible rather than tuned
+	// away). The notch-HF carrier object remains bp*wLaw*keep, sampled
+	// from the flats. bandHeard marks samples where testimony was actually
+	// consulted: keep == 0 there is a VERDICT ("partners convicted this as
+	// luma"); elsewhere it is an absence of evidence, and a consumer that
+	// seats the construction must tell the two apart (the second publishes
+	// raw with its carrier intact). Reach 2 is the same-field neighbour
+	// with the shipped fixed anti-phase form; reach 1 is the interfield
+	// partner, vertically half as far and the opposite phase of a
+	// line-alternating artifact, so a collapsed sample's +-1 partner is
+	// the intact one; its confirming correlation sign comes from the
+	// grammar per column, never from the reach. parallaxI/Q is the
+	// deviation-weighted consensus of the four aperture views' carrier
+	// coordinates (each view's own luma deviation weights it down;
+	// smooth weighting, never selection).
+	void buildBandFacts();
+	// The single implementation of the testimony curves. Its sole caller
+	// is buildBandFacts; every consumer reads the published flats.
 	void buildNotchHfCurves(int line, std::vector<double> &bp,
 	                        std::vector<double> &wLaw,
 	                        std::vector<double> &keep,
-	                        std::vector<quint8> *heard = nullptr) const;
-	// Compact-colour ESCAPE (author, 2026-08-11: "for the compact color
-	// case, we need detection and escape"). The fit has no native capacity
-	// below its 4-sample aperture, so at a schedule-CONFIRMED compact
-	// carrier run it stands aside rather than being repaired: the claim is
-	// rebuilt from the narrowest apertures available -- 1D's +-2 taps where
-	// they agree, the notch's +-1 complement where they do not. Detection
-	// and arbitration both read the frame's OWN bandpass, so it needs no
-	// covers and works on every frame. Escape LDCD_COMPACT_ESCAPE=0.
-	// Per LINE, called from inside the fit's construction loop so the
-	// carrier-cancelled luma floor is built from the REPAIRED fit. Run as
-	// a later whole-plane pass it left flatFloor describing the
-	// pre-repair state, and Pass 2's content-break and reach gates then
-	// judged repaired samples on stale evidence.
-	void applyCompactColorEscapeLine(int line, double *carrierFit,
-	                                 double *flattened,
-	                                 const double *rawWhole, float *fitRow);
+	                        std::vector<quint8> *heard = nullptr,
+	                        int reach = 2) const;
 	// Per-frame build marker so the ceiling is computed once per held
 	// frame regardless of which consumer asks first (the retraction
 	// stage's fit hull runs long before produceY). Reset in loadFields().

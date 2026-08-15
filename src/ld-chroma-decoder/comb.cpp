@@ -597,6 +597,16 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
                 lockedLumaSharp_flat.clear();
             lockedLumaHDeltaIRE_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
             lockedCornerLeak_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            // Band facts: filled by buildBandFacts() at the tail of
+            // buildCarrierAnalysis(), read by the notch-HF consumers and
+            // the produceY compact-colour stage.
+            bandWLaw_flat.assign(size_t(lines + 1) * size_t(width), 1.0);
+            bandKeep1_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            bandKeep2_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            bandHeard1_flat.assign(size_t(lines + 1) * size_t(width), 0);
+            bandHeard2_flat.assign(size_t(lines + 1) * size_t(width), 0);
+            parallaxI_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
+            parallaxQ_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
             lockedLumaCacheValid = false;
         }
         // Collected pool: sliding four-sample aperture means. UNCONDITIONAL --
