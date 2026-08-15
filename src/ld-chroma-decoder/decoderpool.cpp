@@ -539,10 +539,28 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
             }
         }
         
+        // The seam is a PREFERENCE, never a precondition (author, 2026-08-14:
+        // "take the tidy seam where it exists, take the untidy one where it
+        // doesn't"). A trim that returns the entire fetch makes no forward
+        // progress: inputFrameNumber rewinds by exactly what it advanced, and
+        // this pump refetches the identical fields forever -- a livelock at
+        // 100% CPU under the input mutex, triggered whenever an edit boundary
+        // sits in the scan window of a final partial batch (reproduced on
+        // three discs; the geometry is boundary-at-range-end, so short -s/-l
+        // slices hit it and full decodes almost never do). The no-seam path
+        // below this already hands over an untidy batch, and both downstream
+        // owners digest it: the assembler's window carries partial groups
+        // across pushes (this trim's own set-cadence comment concedes it) and
+        // isSegStart re-adjudicates edit boundaries per work item. So a seam
+        // that cannot be taken with progress is treated as no seam at all.
         if (trimEnd < rawSize) {
             const int fieldsReturned = rawSize - trimEnd;
-            inputFrameNumber -= fieldsReturned / 2;
-            rawVec.resize(trimEnd);
+            if (fieldsReturned / 2 >= fetchFrames) {
+                trimEnd = rawSize;   // untidy seam accepted
+            } else {
+                inputFrameNumber -= fieldsReturned / 2;
+                rawVec.resize(trimEnd);
+            }
         }
         if (cadenceAssembler) {
             cadenceAssembler->push(rawVec);
