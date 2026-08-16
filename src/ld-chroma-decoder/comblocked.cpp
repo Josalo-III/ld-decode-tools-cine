@@ -1935,6 +1935,47 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             return static_cast<double>(rawLine[left + r]);
         };
 
+        // ------------------------------------------------------------------
+        // ONE DECISION, PER LINE.
+        //
+        // A merged def line is certified: the assembler's field is already
+        // separated and arrives here as a conservation fact.  It does not need
+        // 1D and must not be given one.  Everything below reads a bandpass,
+        // grades it for cross-colour impurity and prescribes a parallax
+        // repair -- on a def line all three are corrections computed against
+        // truth.  So the def line copies the merge untouched and publishes
+        // "no correction required" for the three planes this block writes.
+        // A fact needs no correction (author, 2026-08-16).
+        //
+        // The def line never combs itself; it is available to others -- the
+        // comp lines comb against these legs, and 3D reads the field as
+        // prev/next.
+        //
+        // MEASURED: certifiedDefLine() selects exactly the fully-covered
+        // lines (0 mismatches/frame) and no line is ever partially covered,
+        // so this is a line-class decision with no per-sample exception.  The
+        // per-sample isfinite(certExRow[h]) test that used to stand in for it
+        // ran 368,600 times a frame to answer a question with 485 answers,
+        // and it made the half-frame skip below impossible to see.
+        // ------------------------------------------------------------------
+        const bool certifiedDef =
+            certifiedOneDLevel() >= 1 && frameHasExactCoverage() &&
+            certifiedDefLine(line);
+        const float *certExRow =
+            certifiedDef ? exactCarrierRow(line) : nullptr;
+        const bool useCertRow = (certExRow != nullptr);
+
+        if (useCertRow) {
+            if (float *impurityRow = carrierImpurity_line(line))
+                std::fill(impurityRow, impurityRow + width, 0.0f);
+            if (float *repairStrengthRow =
+                    locked1DParallaxRepairStrength_line(line))
+                std::fill(repairStrengthRow, repairStrengthRow + width, 0.0f);
+            if (float *repairDeltaRow =
+                    locked1DParallaxRepairDelta_line(line))
+                std::fill(repairDeltaRow, repairDeltaRow + width, 0.0f);
+        } else {
+
         // Pass 1: consume the canonical full-resolution baseline harvested by
         // buildCarrierAnalysis(). The fallback preserves standalone safety but
         // normal locked orchestration has exactly one producer.
@@ -2289,10 +2330,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         // corrector already owns, not a policy seam. Every product derived
         // below -- demod caches, magnitude, attribution, clpbuffer[0] --
         // inherits truth from this one site.
-        const float *certExRow =
-            (certifiedOneDLevel() >= 1 && frameHasExactCoverage())
-                ? exactCarrierRow(line)
-                : nullptr;
+        }   // end of the comp-line estimate; def lines skipped all of it
 
         // Stage 1b -- comp-line HEAD phase snap (user, 2026-07-30: "move the
         // snap earlier... Frame B is equally important"). On comp lines of
@@ -2345,9 +2383,10 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         for (int rel = 0; rel < width; ++rel) {
             const int h = left + rel;
             const int phase = carrierSampleClass(line, h);
-            double source = restrainedLine[rel];
-            if (certExRow && std::isfinite(certExRow[h]))
-                source = (double)certExRow[h];
+            // Decided once per line above, not once per sample here.
+            const double source = useCertRow
+                ? static_cast<double>(certExRow[h])
+                : restrainedLine[rel];
 
             const double i = source * lutI[phase];
             const double q = source * lutQ[phase];
