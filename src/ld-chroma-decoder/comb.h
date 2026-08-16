@@ -126,7 +126,10 @@ public:
             FieldBSimple,     // Field B: direct same-field +/-2 comb
             FrameAAdaptiveIQ, // Frame A: column-phase-aligned adaptive interframe IQ comb
             FrameBDirectIQ,   // Frame B: direct interframe IQ comb with IRE-domain reach-floor inputs
-            FieldVsFrame      // FVF (Default)
+            // FVF (Default). Three-way election; the ballot is regime-set:
+            //   progressive -- Frame A (+/-1), Field A (+/-2), Frame B (+/-1)
+            //   interlace   -- Field A (+/-2), Field B (+/-2), Frame B (+/-1)
+            FieldVsFrame
         };
         TwoDVariant twoDVariant = FieldVsFrame;
 
@@ -1716,15 +1719,17 @@ private:
 								 double neighborBaseMeanIRE = -1.0,
 								 double lineForwardErrorIRE = 0.0) const;
 
-	// Field-vs-Frame elects scalar bandpass candidates. Candidate A is the
-	// same-regime buddy: Field A in interlace, Frame A in progressive.
+	// Field-vs-Frame elects scalar bandpass candidates. Both field slots are
+	// regime-dependent and are named for the seat, not for a comb:
+	//   candidate A -- Field A in interlace, Frame A in progressive
+	//   candidate B -- Field B in interlace, Field A in progressive
 	// IQ evidence can inform the scores, but IQ-derived candidates must be
 	// remodulated before entry.
 	void scoreFieldVsFrame(
 	    int line,
 	    const CombTapLine &tapLine,
 	    const std::vector<double> &candidateA,
-	    const double *fieldB,
+	    const double *candidateB,
 	    const std::vector<double> *frameB,
 	    double *outMixed,
 	    bool writeWeights,

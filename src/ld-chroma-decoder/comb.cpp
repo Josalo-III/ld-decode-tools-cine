@@ -1092,7 +1092,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     int line,
     const CombTapLine &tapLine,
     const std::vector<double> &candidateA,
-    const double *fieldB,
+    const double *candidateB,
     const std::vector<double> *frameB,
     double *outMixed,
     bool writeWeights,
@@ -1104,7 +1104,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int width = right - left;
 
     if (width <= 0) return;
-    if (!fieldB || !frameB || (int)candidateA.size() < width ||
+    if (!candidateB || !frameB || (int)candidateA.size() < width ||
         (int)frameB->size() < width || !outMixed)
         return;
 
@@ -1294,14 +1294,14 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
     for (int r = 0; r < width; ++r) {
         notchCandidateA[r] = getNotchLumaEven2(candidateAData, r, width);
-        notchFieldB[r] = getNotchLumaEven2(fieldB, r, width);
+        notchFieldB[r] = getNotchLumaEven2(candidateB, r, width);
         notchFrame[r] = getNotchLumaEven2Vec(frameB2, r);
         notchSource[r] = getNotchLumaEven2(srcLine, r, width);
     }
 
     for (int rel = 0; rel < width; ++rel) {
         double FA = candidateA[rel];
-        double FB = fieldB[rel];
+        double FB = candidateB[rel];
         double FR = frameB2[rel];
         double L1 = sample1D(rel);
 
@@ -1310,7 +1310,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             : std::fabs(FR);
 
         const Cond1D FA_c = condSamePhase(candidateAData, rel);
-        const Cond1D FB_c = condSamePhase(fieldB, rel);
+        const Cond1D FB_c = condSamePhase(candidateB, rel);
         const Cond1D FR_c = condSamePhaseVec(frameB2, rel);
 
         // Use conditioned candidates for scoring only; output still uses raw winners.
@@ -1417,7 +1417,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     if (localUseFrameModel)
                         return frameB2[std::clamp(r, 0, width - 1)];
                     else
-                        return fieldB[std::clamp(r, 0, width - 1)];
+                        return candidateB[std::clamp(r, 0, width - 1)];
                 };
                 double m_l = getM(rel - 1);
                 double m_r = getM(rel + 1);
@@ -1430,8 +1430,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
                 double FA_l = candidateA[std::clamp(rel - 1, 0, width - 1)];
                 double FA_r = candidateA[std::clamp(rel + 1, 0, width - 1)];
-                double FB_l = fieldB[std::clamp(rel - 1, 0, width - 1)];
-                double FB_r = fieldB[std::clamp(rel + 1, 0, width - 1)];
+                double FB_l = candidateB[std::clamp(rel - 1, 0, width - 1)];
+                double FB_r = candidateB[std::clamp(rel + 1, 0, width - 1)];
                 double FR_l = frameB2[std::clamp(rel - 1, 0, width - 1)];
                 double FR_r = frameB2[std::clamp(rel + 1, 0, width - 1)];
 
@@ -1456,7 +1456,12 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // ------------------------------------------------------------
             // Model-aware regime scoring.
             // Progressive protects the frame regime: Frame A participates,
-            // and only Field B is measured against the Frame B model.
+            // and only the seated +/-2 comb -- Field A here -- is measured
+            // against the Frame B model.  That measurement is the price of
+            // the same-field seat, not a verdict on Field A: it is the one
+            // candidate on this ballot whose geometry is orthogonal to the
+            // model's, so its distance from the model is what it must earn
+            // its win against.
             // Interlace treats Field B as the model, lets Field A participate
             // on its own image-shaping merits, and gives Frame B only a small
             // score bump when it is very close to Field B.
@@ -1525,15 +1530,23 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // the least visually toxic when coherent, but Field B tends to
             // introduce zipper/alternation more readily than Field A.
             // Apply a soft bias rather than a hard override.
+            //
+            // OPEN, carried unchanged into the Field A promotion: the heavier
+            // B penalty was seated on FIELD B's zipper habit, and the
+            // progressive seat now holds the comb that asymmetry favoured.
+            // The number is deliberately NOT retuned here -- the promotion is
+            // the single variable under test, and a constant re-derived in the
+            // same edit would hide inside it.  Revisit once the seat is judged.
             // ------------------------------------------------------------
             if (sat_t > 0.0) {
-                // Frame A gets a mild saturation penalty (underperforms there)
-                // but no reward — regime-neutral on the upside.  Field B gets
-                // the heavier penalty; Frame B gets the coherent-frame reward.
-                const double SAT_FIELD_A_PEN = 0.06;
-                const double SAT_FIELD_B_PEN = 0.14;
-                scoreA *= (1.0 + SAT_FIELD_A_PEN * sat_t);
-                scoreB *= (1.0 + SAT_FIELD_B_PEN * sat_t);
+                // Candidate A gets a mild saturation penalty (underperforms
+                // there) but no reward — regime-neutral on the upside.
+                // Candidate B gets the heavier penalty; Frame B gets the
+                // coherent-frame reward.
+                const double SAT_CANDIDATE_A_PEN = 0.06;
+                const double SAT_CANDIDATE_B_PEN = 0.14;
+                scoreA *= (1.0 + SAT_CANDIDATE_A_PEN * sat_t);
+                scoreB *= (1.0 + SAT_CANDIDATE_B_PEN * sat_t);
 
                 if (!managementVeto && b2VertCoherent && !frameInsane) {
                     const double SAT_FRAME_BONUS = 0.18;
@@ -1638,7 +1651,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     };
 
                     applySharpReward(scoreA, candidateAData, nullptr);
-                    applySharpReward(scoreB, fieldB, nullptr);
+                    applySharpReward(scoreB, candidateB, nullptr);
                     applySharpReward(scoreR, nullptr, &frameB2);
                 }
                 no_sharp_reward: ;
@@ -1772,7 +1785,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const int xp1 = std::min(width - 1, rel + 1);
 
                 const double aAnchor = 0.5 * (candidateAData[xm1] + candidateAData[xp1]);
-                const double bAnchor = 0.5 * (fieldB[xm1]     + fieldB[xp1]);
+                const double bAnchor = 0.5 * (candidateB[xm1]     + candidateB[xp1]);
                 const double rAnchor = 0.5 * (frameB2[xm1]    + frameB2[xp1]);
                 const double cAnchor = 0.5 * (sample1D(xm1)   + sample1D(xp1));
 
@@ -2022,7 +2035,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             for (int rel = 0; rel < width; ++rel) {
                 int idx = winner[rel];
                 if      (idx == 0) { outVal[rel] = candidateA[rel]; outShade[rel] = 0.25f; }
-                else if (idx == 1) { outVal[rel] = fieldB[rel];  outShade[rel] = 0.35f; }
+                else if (idx == 1) { outVal[rel] = candidateB[rel];  outShade[rel] = 0.35f; }
                 else               { outVal[rel] = frameB2[rel]; outShade[rel] = 0.8f;  }
             }
         }
@@ -2051,7 +2064,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     for (int r = b; r < e; ++r) {
                         winner[r] = blockIdx;
                         if (blockIdx == 0) { outVal[r] = candidateA[r]; outShade[r] = 0.25f; }
-                        else               { outVal[r] = fieldB[r]; outShade[r] = 0.35f; }
+                        else               { outVal[r] = candidateB[r]; outShade[r] = 0.35f; }
                     }
                 }
             }
@@ -2344,6 +2357,19 @@ void Comb::FrameBuffer::split2D()
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
     const bool fvfUseFrameModel = wantFvf && configuration.phaseCompensation &&
         (cadenceId >= 0 || cadenceId == -3);
+    // Progressive palette: Frame A (+/-1) + Field A (+/-2) + Frame B (+/-1).
+    // Field A takes the seat Field B held, because Field A is the same-field
+    // comb that was shown to clear the uncovered cube pillar and it brings an
+    // orthogonal +/-2 geometry to a ballot whose other two members are both
+    // interfield.  Field B stays computed -- it is the preclean ring both
+    // frame combs source from -- it is simply not a candidate here.
+    // LDCD_FVF_FIELD_B_MEMBER=1 restores the former Field B seat as a
+    // one-variable A/B.
+    static const bool fvfUseFieldBMember = []{
+        const char *e = std::getenv("LDCD_FVF_FIELD_B_MEMBER");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool fvfFieldAMember = fvfUseFrameModel && !fvfUseFieldBMember;
     const bool needFrameACompute = configuration.phaseCompensation &&
         (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ ||
          fvfUseFrameModel);
@@ -2471,8 +2497,13 @@ void Comb::FrameBuffer::split2D()
             combTapBuildFlags_ = TapBuildFrame | TapBuildFieldB;
             break;
         case V::FieldVsFrame:
+            // The tap layer is derived from the seat, never set beside it: a
+            // seated Field A that is not built is not an abstention, it is a
+            // zero plane on the ballot, and a zero candidate WINS on any score
+            // that reads chroma magnitude.
             combTapBuildFlags_ = fvfUseFrameModel
-                ? (TapBuildFrame | TapBuildFieldB)
+                ? (TapBuildFrame | TapBuildFieldB |
+                   (fvfFieldAMember ? TapBuildFieldA : 0u))
                 : TapBuildAll;
             break;
         default:
@@ -2636,10 +2667,18 @@ void Comb::FrameBuffer::split2D()
             (wantFvf && fvfUseFrameModel && (int)scratch_frameAAdaptiveIQComposite.size() >= width)
                 ? scratch_frameAAdaptiveIQComposite.data()
                 : scratch_lineWorkA.data();
+        // Attribution slots track the BALLOT, not the comb names: slot A
+        // already carries Frame A in the frame regime, so slot B carries
+        // whichever +/-2 comb is seated.  The alignment terms in
+        // scoreFieldVsFrame reward a candidate against its own fact, and a
+        // fact describing a plane that is not standing is not evidence.
+        const double *candidateBPlane = fvfFieldAMember
+            ? scratch_lineWorkA.data()
+            : scratch_lineWorkC.data();
         collectCombAttributionEvidence(
             line,
             candidateAForAttr,
-            scratch_lineWorkC.data(),
+            candidateBPlane,
             needFrameIQCompute ? frameAttrScalar : scratch_frameBDirectIQComposite,
             frameAttrIQ);
 
@@ -2686,7 +2725,7 @@ void Comb::FrameBuffer::split2D()
                         (wantFvf && fvfUseFrameModel)
                             ? scratch_frameAAdaptiveIQComposite   // Frame A in the frame regime
                             : scratch_lineWorkA,                  // Field A in the interlace regime
-                        scratch_lineWorkC.data(),                 // Field B / simple field
+                        candidateBPlane,                        // Field A in frame regime; Field B in interlace
                         &scratch_frameBDirectIQComposite,         // Frame B / direct IQ composite
                         scratch_outMixed.data(),
                         writeWeights,
