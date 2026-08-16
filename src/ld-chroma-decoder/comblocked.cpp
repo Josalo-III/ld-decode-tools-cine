@@ -11065,37 +11065,74 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
         return;
 
     const size_t need = static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
-    if (carrierFit_flat.size() < need)
-        carrierFit_flat.assign(need, 0.0f);
+
+    // Every plane WRITTEN HERE is reset here, unconditionally, before the
+    // coverage gate below -- the same rule carrierFitLineValid and
+    // certRegistration already carried, for the same reason they carried it,
+    // now applied to every plane this stage writes.  Size-if-undersized was
+    // safe only while every frame walked the stage and overwrote its own
+    // values; a frame that publishes nothing must not be able to serve a
+    // neighbour's model, and that hazard is created by the gate, not by the
+    // frame.
+    //
+    // carrierImpurity is deliberately NOT in this set: buildPhaseCorrected1D
+    // writes the provisional 1D read before this stage runs (~line 2068), so
+    // this stage sizes it and never clears it -- it is not written here.
+    auto resetStagePlane = [need](auto &plane, const auto &value) {
+        if (plane.size() < need) plane.assign(need, value);
+        else std::fill(plane.begin(), plane.end(), value);
+    };
+
+    resetStagePlane(carrierFit_flat, 0.0f);
     // Zeroed EVERY frame, not merely sized: a line that takes a no-model
     // path writes no marker, so a stale 1 from the previous frame would
     // certify a model that was never solved.
     carrierFitLineValid.assign(static_cast<size_t>(lastLine), 0);
     if (configuration.lumaWitness) {
-        if (carrierRetracted_flat.size() < need)
-            carrierRetracted_flat.assign(need, 0.0f);
+        resetStagePlane(carrierRetracted_flat, 0.0f);
     } else {
         carrierRetracted_flat.clear();
     }
-    if (flatFloor_flat.size() < need)
-        flatFloor_flat.assign(need, 0.0f);
-    if (combedCarrier_flat.size() < need)
-        combedCarrier_flat.assign(need, 0.0f);
-    if (carrierCorroboration_flat.size() < need)
-        carrierCorroboration_flat.assign(need, 0.0f);
-    if (carrierEligibility_flat.size() < need)
-        carrierEligibility_flat.assign(need, 0.0f);
+    resetStagePlane(flatFloor_flat, 0.0f);
+    resetStagePlane(combedCarrier_flat, 0.0f);
+    resetStagePlane(carrierCorroboration_flat, 0.0f);
+    resetStagePlane(carrierEligibility_flat, 0.0f);
     // Certified registration (see comb.h): reset to "no fact" every frame,
     // so a line that declines to measure can never serve a stale aim.
-    if (certRegistration_flat.size() < need)
-        certRegistration_flat.assign(need, kCertRegNone);
-    else
-        std::fill(certRegistration_flat.begin(),
-                  certRegistration_flat.end(), kCertRegNone);
-    if (coarseYEvidence_flat.size() < need)
-        coarseYEvidence_flat.assign(need, lddecode::FourViewPixelEvidence{});
+    resetStagePlane(certRegistration_flat, kCertRegNone);
+    resetStagePlane(coarseYEvidence_flat, lddecode::FourViewPixelEvidence{});
     if (carrierImpurity_flat.size() < need)
         carrierImpurity_flat.assign(need, 0.0f);
+
+    // ------------------------------------------------------------------
+    // COVERED-ONLY, BY CONSTRUCTION.
+    //
+    // A frame without certified coverage may not generate any member of the
+    // certified family.  Everything below solves a carrier model, grades it,
+    // and publishes fit / eligibility / floor / corroboration / coarse-Y
+    // evidence -- products whose whole authority comes from resting on
+    // conservation facts.  Run on an uncovered frame, the same code emits the
+    // same products from uncertified data, and every downstream consumer reads
+    // them at certified authority.  That is a counterfeit, not a degraded
+    // estimate, and no consumer can tell the difference by inspection.
+    //
+    // This completes the author's 2026-08-08 directive quoted above -- "the
+    // only gating should be on the presence of certified".  The level test is
+    // whether the FAMILY is enabled; this is whether certified is PRESENT on
+    // this frame, which is the thing that directive names.
+    //
+    // The planes are cleared above rather than left behind, so "no plane is
+    // the built result" is literally true for an uncovered frame instead of
+    // being a claim a stale buffer can contradict.
+    //
+    // MEASURED (cube shot @2790, locked 1D, 2x2 Nyquist-corner projection on
+    // luma): uncovered frames 2544 with this stage running, 905 with the
+    // certified family off entirely, covered frames 918 either way.  The
+    // uncovered elevation is this stage's counterfeit and nothing else.
+    // ------------------------------------------------------------------
+    if (!frameHasExactCoverage())
+        return;
+
     if (configuration.lumaWitness && carrierAnalysis_flat.size() < need)
         return; // shared analysis must already have been produced
 
