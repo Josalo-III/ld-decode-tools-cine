@@ -492,7 +492,9 @@ public:
 	void copy2DTo3D();
 	void split3D(const FrameBuffer &previousFrame,
 				 const FrameBuffer &nextFrame);
-	void measurePostCombImpurity();
+	// Cross-colour return (opt-in, --cross-color-return). Its head; the
+	// rest lives in splitIQlocked / filterIQLocked / produceY.
+	void buildCrossColorReturn();
 
 	void setComponentFrame(ComponentFrame &_componentFrame) { componentFrame = &_componentFrame; }
 
@@ -853,7 +855,7 @@ private:
 	// the carrier removed from luma is exactly the carrier rendered as colour.
 	std::vector<double> lockedCarrierComposite_flat;
 	// Render-facing cross-color impurity [0,1] per pixel. Seeded from locked 1D
-	// as a provisional read; measurePostCombImpurity() overwrites it with the
+	// written only when cross-colour return is engaged, by
 	// elected-comb reading before splitIQlocked() consumes it.
 	std::vector<float> carrierImpurity_flat;
 	// Same-region vertical partner evidence [0,1] per pixel: 1 when two

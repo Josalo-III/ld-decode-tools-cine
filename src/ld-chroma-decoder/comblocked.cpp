@@ -1848,7 +1848,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     // The metric is published as carrierImpurity (a provisional oracle).
     // It is NEVER applied to the carrier source; the source is emitted clean.
     // Suppression happens downstream as alpha at color demod and Y subtraction.
-    // measurePostCombImpurity() later replaces this provisional 1D read with
+    // buildCrossColorReturn() measures impurity over the elected comb with
     // the elected-comb measurement that splitIQlocked() actually consumes.
     // The doc's exact form is used with no shaping: any shape made it
     // unresponsive somewhere.
@@ -2106,9 +2106,11 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
         }
 
-        float *impurityRow = carrierImpurity_line(line);
-
-        // Pass 2: wide-window cross-color detector.  Publishes carrierImpurity;
+        // Pass 2: wide-window cross-color detector.  gA feeds the FVF intake
+        // risk and the attribution facts below; it no longer publishes
+        // carrierImpurity, which belongs to cross-colour return and is
+        // measured once, there, over the elected comb (buildCrossColorReturn).
+        // This copy was overwritten before any consumer read it.
         // the emitted source is the bandpass under the envelope-legality
         // restraint below (an envelope-scale weight, never a carrier-rate gain).
         //
@@ -2244,9 +2246,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             // thin detail. With the hull and the Pass-1.5 repair both out, the
             // locked 1D luma is BIT-IDENTICAL to bucket.
             restrainedLine[rel] = bpLine[rel];
-
-            if (impurityRow)
-                impurityRow[rel] = static_cast<float>(gA);
 
             if (fvfLineRow && rel < fvfRelLimit) {
                 fvfLineRow[rel].intakeNyquistRiskIRE = gA * narrowMag;
@@ -2562,9 +2561,39 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     }
 }
 
-void Comb::FrameBuffer::measurePostCombImpurity()
+// ---------------------------------------------------------------------------
+// CROSS-COLOUR RETURN.
+//
+// The feature transfers MEASURED cross-colour contamination out of chroma and
+// back into luma.  It is opt-in: --cross-color-return sets
+// CC_SUPPRESSION_WEIGHT, which defaults to 0, and at 0 the storage below is
+// never even allocated (see the FrameBuffer constructor).
+//
+// This function is the feature's head, and the rest of it lives at:
+//   * splitIQlocked -- the per-sample committed verdict, written to
+//     lockedCcMaskRaw; then the vertical mix that renders maskRaw into
+//     lockedCcMask; then the star-footprint clear that revokes both.
+//   * filterIQLocked and produceY -- the consumers, where the transfer is
+//     scaled by CC_SUPPRESSION_WEIGHT and hard-ceilinged at the evidence.
+//
+// The impurity detector is HERE rather than in the pipeline proper because
+// its only two readers are cross-colour's own -- the gA aperture read and the
+// mask build, both in splitIQlocked.  It used to run unconditionally, twice:
+// once provisionally in buildPhaseCorrected1D against the 1D bandpass, and
+// again over the elected comb.  The provisional copy was overwritten before
+// anything read it, and on a default render BOTH were discarded, because
+// gA's only destination is lockedCcMaskRaw and that plane does not exist
+// unless the feature is engaged.  Every locked render was paying for a
+// full-frame narrow/wide coherence pass twice to produce a value nobody
+// could read.  It is measured once now, and only when it is wanted.
+// ---------------------------------------------------------------------------
+void Comb::FrameBuffer::buildCrossColorReturn()
 {
     if (!configuration.phaseCompensation) return;
+    // Opt-in. Not engaged means not measured.
+    if (std::max(0.0, configuration.tunables.CC_SUPPRESSION_WEIGHT) <= 0.0)
+        return;
+
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
@@ -2751,7 +2780,7 @@ void Comb::FrameBuffer::measurePostCombImpurity()
 //     soft 1.0 IRE   hard 4.0 IRE    -- chosen to bracket that gap
 
 // Carrier-presence floor for the return. Numerically the aperture read's own
-// kImpurityFloorIRE (buildPhaseCorrected1D / measurePostCombImpurity) -- the
+// kImpurityFloorIRE (buildPhaseCorrected1D / buildCrossColorReturn) -- the
 // amplitude below which carrier-band energy is not a measurement. Named here
 // so the composite verdict can obey the same law the aperture read already
 // obeys internally.

@@ -390,9 +390,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
          * Output path.
          *
         * splitIQlocked() is the post-election demod of the selected comb.
+         * buildCrossColorReturn() measures the contamination the opt-in
+         * return transfers; it is inert unless the feature is engaged.
          */
         if (configuration.phaseCompensation) {
-            current->measurePostCombImpurity();
+            current->buildCrossColorReturn();
             current->splitIQlocked(
                 previous->holdsRealFrame() ? previous.get() : nullptr,
                 next->holdsRealFrame() ? next.get() : nullptr);
