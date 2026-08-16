@@ -5997,6 +5997,44 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
 
+    // ------------------------------------------------------------------
+    // 1D IS THE SAFE RETREAT -- and everything below this branch is comb
+    // machinery.  produceY reads attributionEvidence and chromaBoundaryBand,
+    // both of them built inside split2D from cross-line comb evidence, and
+    // it runs its HF election on top.  Routing a 1D render through that put
+    // comb-derived evidence into 1D luma, which is the one thing the bottom
+    // rung must never contain: the retreat stops being a retreat if it
+    // depends on the thing it is retreating from.
+    //
+    // For 1D the composite carrier IS clpbuffer[0], so the whole luma
+    // production is the conservation identity, stated once:
+    //
+    //     Y = raw - carrier          (so Y + chroma == raw, exactly)
+    //
+    // This is what adjustY reaches by remodulating I/Q on the bucket path;
+    // taken directly off the composite plane it needs no remodulation and
+    // no demod convention to agree.
+    //
+    // LDCD_1D_PRODUCEY=1 routes 1D back through the full election as a
+    // one-variable A/B.
+    // ------------------------------------------------------------------
+    static const bool oneDThroughProduceY = []{
+        const char *e = std::getenv("LDCD_1D_PRODUCEY");
+        return e && std::atoi(e) != 0;
+    }();
+    if (configuration.dimensions == 1 && !oneDThroughProduceY) {
+        for (int line = firstLine; line < lastLine; ++line) {
+            const quint16 *raw = rawbuffer.constData()
+                                 + static_cast<size_t>(line) * fullWidth;
+            const double *carrier = clpbuffer[0].pixel[line];
+            double *Y = componentFrame->y(line);
+            if (!carrier || !Y) continue;
+            for (int h = left; h < right; ++h)
+                Y[h] = static_cast<double>(raw[h]) - carrier[h];
+        }
+        return;
+    }
+
     // splitIQlocked owns the star decision.  produceY only consumes its
     // published zero-carrier footprint as the complementary raw-luma value.
     buildStarFootprint(prevF, nextF); // idempotent safety for direct callers
