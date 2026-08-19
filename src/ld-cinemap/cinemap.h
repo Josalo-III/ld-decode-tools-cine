@@ -591,24 +591,27 @@ class CineMap {
     bool found = false;
     int outgoingPhase = -1;
     int incomingPhase = -1;
-    int outgoingLastField = -1;  // final evidence of the outgoing pattern
-    int incomingFirstField = -1; // first corroboration of the incoming one
-    // A cut leaves a GAP between those two; a dissolve makes them OVERLAP.
-    // Through a dissolve each field is A*a + B*(1-a), so A.s twins still
-    // cancel in the A component and B.s in the B component: both lattices
-    // stay valid at once. Such a span is not short of an answer, it holds
-    // two, and neither can be assigned to it.
-    bool overlapping = false;
-    double alternationRatio = 1.0;  // observed / expected-by-chance
-    int incomingVotes = 0;
+    int outgoingLastField = -1;   // last site the outgoing cadence held
+    int incomingFirstField = -1;  // first site the incoming cadence held
+
+    // True when the two cadences were BOTH saturated across a span, which
+    // is what a dissolve is: a blended field is A*a + B*(1-a), so A's twins
+    // still cancel in the A component and B's in the B component, and both
+    // lattices stay whole. Such a span holds two answers, not none.
+    bool dissolve = false;
+    int zoneStart = -1;  // the contested span, when there is one
+    int zoneEnd = -1;
+    int outgoingBins = 0;  // how durably each side held the picture
+    int incomingBins = 0;
   };
 
   CadenceSegregation findCadenceSegregation(SourceVideo& sv, int segStart,
                                             int segEnd,
                                             const SegmentCaptureCache& cache);
 
-  // Act on a segregation: rescan for the edit between the two evidence sites,
-  // and impose one there if the rescan comes up empty.
+  // Act on a segregation: for a cut, rescan for the edit between the two
+  // evidence sites and impose one there if the rescan comes up empty; for a
+  // dissolve, place it in the middle of the insoluble span.
   int splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
                               const SegmentCaptureCache& cache);
 
@@ -787,6 +790,41 @@ class CineMap {
   // A site speaks only when it is quieter than its own neighbours; this is
   // the log ratio at which it is counted as having spoken at all.
   static constexpr double SEGREGATION_VOTE_DIP = -0.05;
+
+  // The picture is read in bins, and each bin is owned by whichever offset
+  // holds the largest share of the sites it could hold. Twenty-five fields
+  // is five sites per offset -- enough to be owned, short enough to place
+  // the boundary within.
+  static constexpr int SEGREGATION_BIN_FIELDS = 25;
+
+  // A bin is CONTESTED when the runner-up comes this close to the owner.
+  // A dissolve saturates both cadences at once, so its bins are ties; noise
+  // never comes near, because a rival that cannot lead a single bin has not
+  // shown a cadence at all.
+  static constexpr double SEGREGATION_CONTEST_FRAC = 0.8;
+
+  // A cadence that holds a shot accounts for very nearly ALL the twin sites
+  // it predicts, because in 3:2 every frame has a twin at its own site.
+  // Ownership well below that is a different situation, not a weaker version
+  // of the same one.
+  //
+  // The case that matters is a frame carrying two sources at once: a set on
+  // one cadence and, on a viewscreen within it, video on another. Each
+  // cadence owns only the part of the frame it occupies, so neither can
+  // account for all its sites, and ownership flips bin to bin as one region
+  // or the other happens to dominate the residual. Both run the whole shot,
+  // so there is no moment where one gives way to the other and nothing for
+  // a boundary to mark -- splitting such a shot would cut it in an
+  // arbitrary place and gain nothing. Two half-owned bins in a row would
+  // otherwise pose as a transition; requiring the owner to hold nearly all
+  // its sites is what tells a shot apart from a composite.
+  static constexpr double SEGREGATION_MIN_OWN_OCCUPANCY = 0.8;
+
+  // Ownership has to last to mean anything. This is the shortest run of
+  // bins that counts as a side holding the picture, not the shortest shot
+  // the solver will accept -- a shot is admitted on its evidence, not its
+  // length.
+  static constexpr int SEGREGATION_MIN_RUN_BINS = 2;
 
   // Enough votes that a contiguous run is a claim rather than an accident.
   static constexpr int SEGREGATION_MIN_VOTES = 5;

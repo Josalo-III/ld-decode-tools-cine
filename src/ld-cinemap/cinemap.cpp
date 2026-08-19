@@ -5107,7 +5107,7 @@ CineMap::CadenceSegregation CineMap::findCadenceSegregation(
   }
   if (anchorFrameIdx < 0) return out;
 
-  // Gather every site as one vote for the single offset its geometry admits.
+  // Every site is one vote for the single offset its geometry admits.
   std::map<int, double> chan[2];
   std::map<int, int> fieldOf[2];
   for (int p = 0; p < 5; ++p) {
@@ -5131,7 +5131,6 @@ CineMap::CadenceSegregation CineMap::findCadenceSegregation(
       if (prev == chan[c].end() || next == chan[c].end()) continue;
       const double local = 0.5 * (prev->second + next->second);
       if (!(local > 0.0) || !(ire > 0.0)) continue;
-      // A site only speaks when it is quieter than its own neighbours.
       if (std::log(ire / local) >= SEGREGATION_VOTE_DIP) continue;
       const int want = (c == 0) ? 0 : 2;
       int p = (want - (fi - anchorFrameIdx)) % 5;
@@ -5139,10 +5138,149 @@ CineMap::CadenceSegregation CineMap::findCadenceSegregation(
       votes.push_back({fieldOf[c][fi], p});
     }
   }
-  if (votes.size() < 2) return out;
+  if (votes.empty()) return out;
   std::sort(votes.begin(), votes.end(),
             [](const Vote& a, const Vote& b) { return a.field < b.field; });
 
+  // OCCUPANCY, not headcount.
+  //
+  // A cadence either holds the picture or it does not, and what says so is
+  // the share of the sites it COULD hold that it actually does. Counting
+  // votes instead lets a rival with a handful of them, bunched by chance,
+  // look like a shot: measured on the Emissary cold open, nine to thirty
+  // such votes put three boundaries inside a shot whose own cadence was
+  // saturated from end to end. Occupancy cannot be fooled that way, because
+  // a rival that never leads a single bin has never held the picture at all.
+  const int nBins =
+      (segEnd - segStart) / SEGREGATION_BIN_FIELDS + 1;
+  if (nBins < 2 * SEGREGATION_MIN_RUN_BINS) return out;
+  const double sitesPerBin = SEGREGATION_BIN_FIELDS / 5.0;
+
+  std::vector<std::array<double, 5>> occ(nBins, {0.0, 0.0, 0.0, 0.0, 0.0});
+  for (const Vote& v : votes) {
+    const int b = (v.field - segStart) / SEGREGATION_BIN_FIELDS;
+    if (b >= 0 && b < nBins) occ[b][v.offset] += 1.0 / sitesPerBin;
+  }
+
+  std::vector<int> owner(nBins, -1);
+  std::vector<int> rival(nBins, -1);
+  std::vector<bool> contested(nBins, false);
+  for (int b = 0; b < nBins; ++b) {
+    int best = -1, second = -1;
+    for (int p = 0; p < 5; ++p) {
+      if (best < 0 || occ[b][p] > occ[b][best]) {
+        second = best;
+        best = p;
+      } else if (second < 0 || occ[b][p] > occ[b][second]) {
+        second = p;
+      }
+    }
+    if (best < 0 || occ[b][best] < SEGREGATION_MIN_OWN_OCCUPANCY) continue;
+    owner[b] = best;
+    rival[b] = second;
+    contested[b] =
+        (second >= 0 && occ[b][second] >= SEGREGATION_CONTEST_FRAC * occ[b][best]);
+  }
+
+  // Collapse the bins into runs of ownership.
+  //
+  // Contested bins belong to no side -- they are the join itself -- so they
+  // are passed over rather than ending a run, and a side that resumes after
+  // one is the same side it was before. Reading it any other way lets a
+  // dissolve's own ties fragment the shot that surrounds them, which is how
+  // a plain o1-to-o3 change went unseen: the sporadic ties broke o1 into
+  // pieces too short to be recognised as holding anything.
+  struct Run {
+    int owner;
+    int firstBin;
+    int lastBin;
+    int bins;
+  };
+  std::vector<Run> runs;
+  for (int b = 0; b < nBins; ++b) {
+    if (owner[b] < 0 || contested[b]) continue;
+    if (!runs.empty() && runs.back().owner == owner[b]) {
+      runs.back().lastBin = b;
+      runs.back().bins++;
+    } else {
+      runs.push_back({owner[b], b, b, 1});
+    }
+  }
+
+  int bestSpan = 0;
+  for (size_t i = 0; i + 1 < runs.size(); ++i) {
+    const Run& A = runs[i];
+    const Run& B = runs[i + 1];
+    if (A.owner == B.owner) continue;
+    if (A.bins < SEGREGATION_MIN_RUN_BINS ||
+        B.bins < SEGREGATION_MIN_RUN_BINS) {
+      continue;
+    }
+    // Contested bins between the two sides ARE a dissolve: both cadences
+    // saturated at once. Their absence means the two abut instead, which is
+    // a cut -- and durable ownership either side says so just as well here
+    // as contested bins say dissolve. Both are reported; what differs is
+    // only where the boundary can go.
+    int firstC = -1, lastC = -1;
+    for (int k = A.lastBin + 1; k < B.firstBin; ++k) {
+      if (contested[k]) {
+        if (firstC < 0) firstC = k;
+        lastC = k;
+      }
+    }
+    if (A.bins + B.bins <= bestSpan) continue;
+    bestSpan = A.bins + B.bins;
+
+    out.found = true;
+    out.outgoingPhase = A.owner;
+    out.incomingPhase = B.owner;
+    out.outgoingBins = A.bins;
+    out.incomingBins = B.bins;
+
+    // Contested bins between the two sides ARE the dissolve: both cadences
+    // saturated at once, so no field in them is the one where a shot ends.
+    out.dissolve = (firstC >= 0);
+    out.zoneStart = -1;
+    out.zoneEnd = -1;
+    if (out.dissolve) {
+      out.zoneStart = segStart + firstC * SEGREGATION_BIN_FIELDS;
+      out.zoneEnd = segStart + (lastC + 1) * SEGREGATION_BIN_FIELDS - 1;
+      if (out.zoneEnd > segEnd) out.zoneEnd = segEnd;
+    }
+
+    // The evidence sites that bracket the join.
+    const int aLastField =
+        segStart + (A.lastBin + 1) * SEGREGATION_BIN_FIELDS - 1;
+    const int bFirstField = segStart + B.firstBin * SEGREGATION_BIN_FIELDS;
+    out.outgoingLastField = -1;
+    out.incomingFirstField = -1;
+    for (const Vote& v : votes) {
+      if (v.offset == A.owner && v.field <= aLastField)
+        out.outgoingLastField = v.field;
+      if (v.offset == B.owner && v.field >= bFirstField &&
+          out.incomingFirstField < 0) {
+        out.incomingFirstField = v.field;
+      }
+    }
+  }
+
+  if (out.found) return out;
+
+  // Ownership found nothing, which happens when a segment is too short to
+  // bin -- a cut's two sides can be a couple of hundred fields each, and
+  // neither owns enough bins to be durable. The alternation test answers
+  // that case from the votes' positions alone, without binning at all, and
+  // it is how the Civil Defense cut at 88231 is found.
+  //
+  // Ask the cut question instead, which is a different
+  // question and wants its own instrument: a cut SEGREGATES the two
+  // cadences in position, so the rival's votes fall on one side and the
+  // winner's on the other, and alternation against a chance null model
+  // says so. Occupancy cannot answer this one -- a cut's two sides are
+  // often only a few bins each, too short to own anything durably --
+  // and it was by replacing this test rather than adding to it that the
+  // Civil Defense cut at 88231 was lost.
+  double bestRatio = 1e9;
   int tally[5] = {0, 0, 0, 0, 0};
   for (const Vote& v : votes) tally[v.offset]++;
   int winner = 0;
@@ -5191,15 +5329,24 @@ CineMap::CadenceSegregation CineMap::findCadenceSegregation(
     cand.incomingPhase = winnerLeads ? q : winner;
     // The rescan is bounded by evidence and nothing else: the last field the
     // outgoing pattern was seen at, and the first the incoming was.
+    cand.outgoingBins = winnerLeads ? a : b;
+    cand.incomingBins = winnerLeads ? b : a;
+    cand.dissolve = false;
     cand.outgoingLastField = winnerLeads ? lastWinner : lastRival;
     cand.incomingFirstField = winnerLeads ? firstRival : firstWinner;
-    cand.alternationRatio = ratio;
-    cand.incomingVotes = winnerLeads ? b : a;
 
-    cand.overlapping = (cand.outgoingLastField >= cand.incomingFirstField);
-    if (!out.found || ratio < out.alternationRatio) out = cand;
+    // A cut leaves a GAP. If the two sides overlap, this is not a cut,
+    // and the dissolve test above is the one entitled to answer.
+    if (cand.outgoingLastField >= cand.incomingFirstField) continue;
+    if (!out.found || ratio < bestRatio) {
+      bestRatio = ratio;
+      out = cand;
+    }
   }
 
+
+  if (out.found && (out.outgoingLastField < 0 || out.incomingFirstField < 0))
+    out.found = false;
   return out;
 }
 
@@ -5225,12 +5372,11 @@ int CineMap::splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
       int placeAt = -1;
       const char* how = "";
 
-      if (!seg.overlapping) {
-        // A cut: the patterns abut, so there is a gap between the last
-        // evidence of one and the first of the other, and that gap is
-        // where the edit must be. Ask detection to look again there --
-        // the same detector at the same settings, the cadence only
-        // saying where.
+      if (!seg.dissolve) {
+        // A cut: the cadences abut, so a gap sits between the last evidence
+        // of one and the first of the other, and the edit is in it. Ask
+        // detection to look again there -- the same detector at the same
+        // settings, the cadence saying only where.
         const int before = countEditBoundaries(segStart, segEnd);
         visualEdits::analyseVisualEdits(*m_disc, m_editSensitivity,
                                         m_editStrong, m_editPeak, false,
@@ -5249,28 +5395,29 @@ int CineMap::splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
           changedThisPass = true;
           continue;
         }
-        // Nothing seen, but the cadence changed and that is not in
-        // dispute. The incoming pattern is known from its first
-        // corroboration, so the edit goes there.
+        // Nothing seen, but the cadence changed and that is not in dispute.
+        // The incoming pattern is known from its first corroboration, so
+        // the edit goes there.
         placeAt = seg.incomingFirstField;
         how = "rescan empty; incoming pattern's first known field";
       } else {
-        // A dissolve, and it is left alone.
+        // A dissolve. Both cadences are saturated across the contested span,
+        // so no field in it is the one where a shot ends -- there is not too
+        // little evidence here but too much, and no placement is right for
+        // the fields it covers.
         //
-        // Both cadences hold across the overlap -- each blended field is
-        // A*a + B*(1-a), so A's twins still cancel in the A component and
-        // B's in the B component -- so there is no field where one ends and
-        // the other begins, and no placement that is right for the fields it
-        // covers. Sound handling wants a signature of its own: mutual
-        // saturation across a bounded span, which is what a dissolve is and
-        // what neither a cut nor noise can imitate. Until that exists this
-        // arm would be guessing, and a guessed boundary is a resynchronised
-        // frame drop in the middle of a shot.
+        // Detection is not asked. A dissolve has no cut in it to find, and
+        // the ramp veto exists precisely to stop it inventing one.
         //
-        // Restoring such a sequence properly wants --set-cadence per offset
-        // and the dissolves composited by hand; leaving it whole keeps the
-        // solve honest about what it does not know.
-        continue;
+        // The middle is chosen because a misplaced cadence shows least
+        // there: at the centre of the blend each shot is half present, so
+        // whichever way the fields are assigned they are already half wrong
+        // to the eye, and the error grows the further the boundary sits
+        // from it. Restoring such a sequence properly wants --set-cadence
+        // per offset and the dissolves composited by hand; this is the most
+        // usable single output an autosolve can give.
+        placeAt = seg.zoneStart + (seg.zoneEnd - seg.zoneStart) / 2;
+        how = "dissolve; middle of the insoluble span";
       }
 
       if (placeAt < segStart || placeAt > segEnd) continue;
@@ -5282,14 +5429,14 @@ int CineMap::splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
       m_md->updateField(fld, placeAt);
       qInfo().noquote()
           << QString(
-                 "CineMap: segment [%1..%2] holds two cadences, offset %3 to "
-                 "%4 (alternation %5 of chance, %6 votes) — edit at %7: %8")
+                 "CineMap: segment [%1..%2] holds two cadences, offset %3 "
+                 "(%4 bins) to %5 (%6 bins) — edit at %7: %8")
                  .arg(segStart)
                  .arg(segEnd)
                  .arg(seg.outgoingPhase)
+                 .arg(seg.outgoingBins)
                  .arg(seg.incomingPhase)
-                 .arg(seg.alternationRatio, 0, 'f', 2)
-                 .arg(seg.incomingVotes)
+                 .arg(seg.incomingBins)
                  .arg(placeAt)
                  .arg(how);
       imposed++;
