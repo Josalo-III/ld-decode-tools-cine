@@ -13,5 +13,6 @@ class CineDisc;
 
 namespace visualEdits {
 int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
-                       double peakFactor, bool traceEnabled = false);
+                       double peakFactor, bool traceEnabled = false,
+                       int windowStart = 0, int windowEnd = 0);
 }

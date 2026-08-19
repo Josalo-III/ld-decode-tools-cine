@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "visualedits.h"
 #include "cadencedefs.h"
 #include "cinedisc.h"
 #include "fieldorder.h"
@@ -146,12 +147,22 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
 
   const int hardMaxField = computeHardMaxField();
 
-  // 1. Initial segmentation by edit boundaries
+  // 1. Build frame/field capture cache
+  auto cache = buildCaptureCache(hardMaxField);
+
+  // 2. Split any segment that holds two cadences.
+  //
+  // This runs BEFORE the solve because a segment spanning a missed edit
+  // elects one phase for two shots, and no later pass can undo that: the
+  // election is a sum, and the larger shot outvotes the smaller. Splitting
+  // first is what lets each shot own its own cadence.
+  const int splits = splitSegregatedSegments(sv, hardMaxField, cache);
+  if (splits > 0)
+    qInfo() << "Cadence segregation imposed" << splits << "edit boundary(s).";
+
+  // 3. Segmentation by edit boundaries
   auto segments = identifySegments(hardMaxField);
   qInfo() << "Initially identified" << segments.size() << "segments";
-
-  // 2. Build frame/field capture cache
-  auto cache = buildCaptureCache(hardMaxField);
 
   // 3. Initial solve loop (per segment)
   std::vector<SegmentResult> solvedSegments;
@@ -2251,6 +2262,79 @@ int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges) {
 
   fflush(stdout);
   return reported;
+}
+
+int CineMap::probeSplitRange(const QString& tbcFilePath, int startField,
+                             int endField) {
+  if (!m_md || !m_disc) return 0;
+
+  SourceVideo sv;
+  if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) {
+    qWarning() << "Failed to open TBC file";
+    return 0;
+  }
+
+  const int total = m_md->getNumberOfFields();
+  startField = std::max(1, startField);
+  endField = std::min(total, endField);
+
+  const int hardMax = computeHardMaxField();
+  const SegmentCaptureCache cache = buildCaptureCache(hardMax);
+
+  int anchorFrameIdx = -1;
+  for (int s = startField; s <= total && anchorFrameIdx < 0; ++s) {
+    if (cache.validSeq(s)) anchorFrameIdx = cache.cap[s].frameIndex;
+  }
+  if (anchorFrameIdx < 0) {
+    sv.close();
+    return 0;
+  }
+
+  // A site is a vote for exactly one offset, so gather them keyed that way.
+  struct Vote {
+    int frameIdx;
+    int fieldA;
+    int offset;
+    double dip;  // negative = quieter than its same-parity neighbours
+  };
+  std::map<int, double> chan[2];
+  std::map<int, int> fieldOf[2];
+  for (int p = 0; p < 5; ++p) {
+    for (const TwinSite& s :
+         twinSitesForPhase(sv, startField, endField, p, cache)) {
+      const int c = (s.cyclePos == 0) ? 0 : 1;
+      chan[c][s.frameIdx] = s.grainIre;
+      fieldOf[c][s.frameIdx] = s.a;
+    }
+  }
+
+  std::vector<Vote> votes;
+  for (int c = 0; c < 2; ++c) {
+    for (const auto& [fi, ire] : chan[c]) {
+      auto prev = chan[c].find(fi - 1);
+      auto next = chan[c].find(fi + 1);
+      if (prev == chan[c].end() || next == chan[c].end()) continue;
+      const double local = 0.5 * (prev->second + next->second);
+      if (!(local > 0.0) || !(ire > 0.0)) continue;
+      // Which offset does this site confirm?  cyclePos 0 wants pos 0,
+      // cyclePos 2 wants pos 2, and pos = (fi - anchor + p) mod 5.
+      const int want = (c == 0) ? 0 : 2;
+      int p = (want - (fi - anchorFrameIdx)) % 5;
+      if (p < 0) p += 5;
+      votes.push_back({fi, fieldOf[c][fi], p, std::log(ire / local)});
+    }
+  }
+  std::sort(votes.begin(), votes.end(),
+            [](const Vote& a, const Vote& b) { return a.fieldA < b.fieldA; });
+
+  printf("# every site is one vote for one offset; dip<0 = quieter than "
+         "neighbours\n");
+  printf("field,frame,offset,dip\n");
+  for (const Vote& v : votes)
+    printf("%d,%d,%d,%.4f\n", v.fieldA, v.frameIdx, v.offset, v.dip);
+
+  sv.close();
+  return static_cast<int>(votes.size());
 }
 
 int CineMap::probeDgRange(const QString& tbcFilePath, int startField,
@@ -4999,6 +5083,225 @@ std::vector<CineMap::TwinSite> CineMap::twinSitesForPhase(
   }
 
   return sites;
+}
+
+int CineMap::countEditBoundaries(int fromField, int toField) const {
+  if (!m_md) return 0;
+  int n = 0;
+  for (int s = std::max(1, fromField);
+       s <= std::min(m_md->getNumberOfFields(), toField); ++s) {
+    if (m_md->getField(s).cinemap.isEditBoundary) n++;
+  }
+  return n;
+}
+
+CineMap::CadenceSegregation CineMap::findCadenceSegregation(
+    SourceVideo& sv, int segStart, int segEnd,
+    const SegmentCaptureCache& cache) {
+  CadenceSegregation out;
+  if (!m_md || !m_disc) return out;
+
+  int anchorFrameIdx = -1;
+  for (int s = segStart; s <= segEnd && anchorFrameIdx < 0; ++s) {
+    if (cache.validSeq(s)) anchorFrameIdx = cache.cap[s].frameIndex;
+  }
+  if (anchorFrameIdx < 0) return out;
+
+  // Gather every site as one vote for the single offset its geometry admits.
+  std::map<int, double> chan[2];
+  std::map<int, int> fieldOf[2];
+  for (int p = 0; p < 5; ++p) {
+    for (const TwinSite& s :
+         twinSitesForPhase(sv, segStart, segEnd, p, cache)) {
+      const int c = (s.cyclePos == 0) ? 0 : 1;
+      chan[c][s.frameIdx] = s.grainIre;
+      fieldOf[c][s.frameIdx] = s.a;
+    }
+  }
+
+  struct Vote {
+    int field;
+    int offset;
+  };
+  std::vector<Vote> votes;
+  for (int c = 0; c < 2; ++c) {
+    for (const auto& [fi, ire] : chan[c]) {
+      auto prev = chan[c].find(fi - 1);
+      auto next = chan[c].find(fi + 1);
+      if (prev == chan[c].end() || next == chan[c].end()) continue;
+      const double local = 0.5 * (prev->second + next->second);
+      if (!(local > 0.0) || !(ire > 0.0)) continue;
+      // A site only speaks when it is quieter than its own neighbours.
+      if (std::log(ire / local) >= SEGREGATION_VOTE_DIP) continue;
+      const int want = (c == 0) ? 0 : 2;
+      int p = (want - (fi - anchorFrameIdx)) % 5;
+      if (p < 0) p += 5;
+      votes.push_back({fieldOf[c][fi], p});
+    }
+  }
+  if (votes.size() < 2) return out;
+  std::sort(votes.begin(), votes.end(),
+            [](const Vote& a, const Vote& b) { return a.field < b.field; });
+
+  int tally[5] = {0, 0, 0, 0, 0};
+  for (const Vote& v : votes) tally[v.offset]++;
+  int winner = 0;
+  for (int p = 1; p < 5; ++p)
+    if (tally[p] > tally[winner]) winner = p;
+  if (tally[winner] < SEGREGATION_MIN_VOTES) return out;
+
+  for (int q = 0; q < 5; ++q) {
+    if (q == winner) continue;
+    // A handful of votes forms a "block" by accident; only a rival with
+    // enough of them is claiming a shot of its own.
+    if (tally[q] < SEGREGATION_MIN_VOTES) continue;
+
+    int alternations = 0, a = 0, b = 0, prev = -1;
+    for (const Vote& v : votes) {
+      if (v.offset != winner && v.offset != q) continue;
+      if (prev >= 0 && v.offset != prev) alternations++;
+      (v.offset == winner ? a : b)++;
+      prev = v.offset;
+    }
+    if (a < 1 || b < 1) continue;
+
+    // Interleaving expected if the two were shuffled together at random.
+    // The null model sets the scale, so no bar has to be invented for it.
+    const double expected = 2.0 * a * b / static_cast<double>(a + b);
+    if (!(expected > 0.0)) continue;
+    const double ratio = alternations / expected;
+    if (ratio >= SEGREGATION_MAX_RATIO) continue;
+
+    // Which side is outgoing?  The one whose votes come first.
+    int firstWinner = -1, firstRival = -1, lastWinner = -1, lastRival = -1;
+    for (const Vote& v : votes) {
+      if (v.offset == winner) {
+        if (firstWinner < 0) firstWinner = v.field;
+        lastWinner = v.field;
+      } else if (v.offset == q) {
+        if (firstRival < 0) firstRival = v.field;
+        lastRival = v.field;
+      }
+    }
+    const bool winnerLeads = (firstWinner < firstRival);
+
+    CadenceSegregation cand;
+    cand.found = true;
+    cand.outgoingPhase = winnerLeads ? winner : q;
+    cand.incomingPhase = winnerLeads ? q : winner;
+    // The rescan is bounded by evidence and nothing else: the last field the
+    // outgoing pattern was seen at, and the first the incoming was.
+    cand.outgoingLastField = winnerLeads ? lastWinner : lastRival;
+    cand.incomingFirstField = winnerLeads ? firstRival : firstWinner;
+    cand.alternationRatio = ratio;
+    cand.incomingVotes = winnerLeads ? b : a;
+
+    cand.overlapping = (cand.outgoingLastField >= cand.incomingFirstField);
+    if (!out.found || ratio < out.alternationRatio) out = cand;
+  }
+
+  return out;
+}
+
+int CineMap::splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
+                                     const SegmentCaptureCache& cache) {
+  if (!m_md || !m_disc) return 0;
+
+  int imposed = 0;
+
+  // One boundary at a time: splitting a segment changes the segments, and a
+  // title sequence can hold several dissolves in what began as one span.
+  // Each pass re-reads the segmentation and takes the strongest case it
+  // finds, until nothing is left to say.
+  for (int pass = 0; pass < SEGREGATION_MAX_PASSES; ++pass) {
+    bool changedThisPass = false;
+    const auto segments = identifySegments(hardMaxField);
+
+    for (const auto& [segStart, segEnd] : segments) {
+      const CadenceSegregation seg =
+          findCadenceSegregation(sv, segStart, segEnd, cache);
+      if (!seg.found) continue;
+
+      int placeAt = -1;
+      const char* how = "";
+
+      if (!seg.overlapping) {
+        // A cut: the patterns abut, so there is a gap between the last
+        // evidence of one and the first of the other, and that gap is
+        // where the edit must be. Ask detection to look again there --
+        // the same detector at the same settings, the cadence only
+        // saying where.
+        const int before = countEditBoundaries(segStart, segEnd);
+        visualEdits::analyseVisualEdits(*m_disc, m_editSensitivity,
+                                        m_editStrong, m_editPeak, false,
+                                        seg.outgoingLastField,
+                                        seg.incomingFirstField);
+        if (countEditBoundaries(segStart, segEnd) > before) {
+          qInfo().noquote()
+              << QString(
+                     "CineMap: rescan found the edit between %1 and %2 "
+                     "(offset %3 to %4)")
+                     .arg(seg.outgoingLastField)
+                     .arg(seg.incomingFirstField)
+                     .arg(seg.outgoingPhase)
+                     .arg(seg.incomingPhase);
+          imposed++;
+          changedThisPass = true;
+          continue;
+        }
+        // Nothing seen, but the cadence changed and that is not in
+        // dispute. The incoming pattern is known from its first
+        // corroboration, so the edit goes there.
+        placeAt = seg.incomingFirstField;
+        how = "rescan empty; incoming pattern's first known field";
+      } else {
+        // A dissolve, and it is left alone.
+        //
+        // Both cadences hold across the overlap -- each blended field is
+        // A*a + B*(1-a), so A's twins still cancel in the A component and
+        // B's in the B component -- so there is no field where one ends and
+        // the other begins, and no placement that is right for the fields it
+        // covers. Sound handling wants a signature of its own: mutual
+        // saturation across a bounded span, which is what a dissolve is and
+        // what neither a cut nor noise can imitate. Until that exists this
+        // arm would be guessing, and a guessed boundary is a resynchronised
+        // frame drop in the middle of a shot.
+        //
+        // Restoring such a sequence properly wants --set-cadence per offset
+        // and the dissolves composited by hand; leaving it whole keeps the
+        // solve honest about what it does not know.
+        continue;
+      }
+
+      if (placeAt < segStart || placeAt > segEnd) continue;
+      auto fld = m_md->getField(placeAt);
+      if (fld.pad || fld.cinemap.isEditVetoed) continue;
+      if (fld.cinemap.isEditBoundary) continue;
+
+      fld.cinemap.assertEditBoundary();
+      m_md->updateField(fld, placeAt);
+      qInfo().noquote()
+          << QString(
+                 "CineMap: segment [%1..%2] holds two cadences, offset %3 to "
+                 "%4 (alternation %5 of chance, %6 votes) — edit at %7: %8")
+                 .arg(segStart)
+                 .arg(segEnd)
+                 .arg(seg.outgoingPhase)
+                 .arg(seg.incomingPhase)
+                 .arg(seg.alternationRatio, 0, 'f', 2)
+                 .arg(seg.incomingVotes)
+                 .arg(placeAt)
+                 .arg(how);
+      imposed++;
+      changedThisPass = true;
+    }
+
+    if (!changedThisPass) break;
+    m_disc->refreshFrameCache();
+  }
+
+  if (imposed > 0) m_disc->refreshFrameCache();
+  return imposed;
 }
 
 CineMap::GrainPhaseElection CineMap::electPhaseByGrain(

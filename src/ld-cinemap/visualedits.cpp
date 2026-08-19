@@ -157,7 +157,8 @@ FieldDescriptor computeFieldDescriptor(
 }
 
 int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
-                       double peakFactor, bool traceEnabled) {
+                       double peakFactor, bool traceEnabled, int windowStart,
+                       int windowEnd) {
   auto& md = disc.getMetaData();
 
   // Logging controls. The noisy per-edit/per-candidate detail is gated by
@@ -168,7 +169,7 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
       false;  // every candidate that passes isChange
   constexpr bool LOG_VERBOSE_REJECT = false;  // why we rejected a candidate
   constexpr bool LOG_RAMP_VETO = false;       // when ramp veto fires
-  const bool LOG_PROGRESS = true;  // heartbeat/progress line (always on)
+  const bool LOG_PROGRESS = (windowStart <= 0);  // quiet for windowed rescans
 
   // Debug target: set to a field index to enable per-field trace; -1 = off.
   constexpr int DBG_FIELD = -1;
@@ -423,7 +424,15 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
   hb.start();
 
   // 3. Main Streaming Loop
-  for (int i = 5; i <= totalFields - 2; ++i) {
+  // A window confines the scan without changing what the scan is. The
+  // cadence can point at a field range and ask it to be looked at again;
+  // it cannot ask for a different detector.
+  const bool windowed = (windowStart > 0 && windowEnd >= windowStart);
+  const int scanFrom = windowed ? std::max(5, windowStart) : 5;
+  const int scanTo = windowed ? std::min(totalFields - 2, windowEnd)
+                              : (totalFields - 2);
+
+  for (int i = scanFrom; i <= scanTo; ++i) {
     if (LOG_PROGRESS && hb.elapsed() >= 1000) {
       const double pct = 100.0 * double(i) / double(totalFields);
       qInfo().noquote()

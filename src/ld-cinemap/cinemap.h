@@ -39,6 +39,13 @@ class CineMap {
   int probeDgRange(const QString& tbcFilePath, int startField, int endField);
 
 
+  // TEMPORARY INSTRUMENT: per-site twin evidence across a field range.
+  // Each candidate twin is a theory; confirmed, geometry admits exactly one
+  // offset, so every site is a vote for that one offset and for no other.
+  // This dumps those votes WITH THEIR POSITIONS, so the sequencing can be
+  // read before any code acts on it. Strip when the split arc closes.
+  int probeSplitRange(const QString& tbcFilePath, int startField, int endField);
+
   // Instrument: calibrate the disc's twin/noise floor and report it. If ranges
   // is non-empty ("a-b,c-d,..."), also report each range's twin share at both
   // operating points. Read-only — no solve, no metadata write.
@@ -62,6 +69,13 @@ class CineMap {
   // warm field cache, plus the cold field-I/O cost both sit on top of.
   int benchComb(const QString& tbcFilePath, int startField, int endField);
   void setVbi(vbiProbe::ProbeResult vbi) { m_vbi = std::move(vbi); }
+  // The rescan must run the detector the user asked for, not a private copy
+  // of its defaults.
+  void setEditParams(double sensitivity, double strong, double peak) {
+    m_editSensitivity = sensitivity;
+    m_editStrong = strong;
+    m_editPeak = peak;
+  }
   void setDecisionTraceEnabled(bool enabled) {
     m_decisionTraceEnabled = enabled;
   }
@@ -558,6 +572,46 @@ class CineMap {
                                           int segEnd, int phaseOffset,
                                           const SegmentCaptureCache& cache);
 
+  // Where a segment holds two cadences, and what to do about it.
+  //
+  // A segment that spans a missed cut still elects one phase: the election
+  // is a sum, and the larger shot outvotes the smaller. What the sum throws
+  // away is POSITION. The losing shot.s twins are still there, and they are
+  // all in one place -- so a rival offset whose support forms a contiguous
+  // block, with the winner.s before it, after it, or both, is not noise. It
+  // is a second cadence, and the boundary between them is an edit that
+  // detection missed.
+  //
+  // Noise cannot imitate this. A wrong offset scores on scattered singletons
+  // and interleaves with the winner at chance; measured against a lightning
+  // storm that flashes for three hundred fields without a cut, no rival ever
+  // fell below chance, while a real second shot sat an order of magnitude
+  // under it.
+  struct CadenceSegregation {
+    bool found = false;
+    int outgoingPhase = -1;
+    int incomingPhase = -1;
+    int outgoingLastField = -1;  // final evidence of the outgoing pattern
+    int incomingFirstField = -1; // first corroboration of the incoming one
+    // A cut leaves a GAP between those two; a dissolve makes them OVERLAP.
+    // Through a dissolve each field is A*a + B*(1-a), so A.s twins still
+    // cancel in the A component and B.s in the B component: both lattices
+    // stay valid at once. Such a span is not short of an answer, it holds
+    // two, and neither can be assigned to it.
+    bool overlapping = false;
+    double alternationRatio = 1.0;  // observed / expected-by-chance
+    int incomingVotes = 0;
+  };
+
+  CadenceSegregation findCadenceSegregation(SourceVideo& sv, int segStart,
+                                            int segEnd,
+                                            const SegmentCaptureCache& cache);
+
+  // Act on a segregation: rescan for the edit between the two evidence sites,
+  // and impose one there if the rescan comes up empty.
+  int splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
+                              const SegmentCaptureCache& cache);
+
   // The five phases, scored against each other by how quiet their own twin
   // sites are. No candidate is disqualified and nothing is thresholded.
   struct GrainPhaseElection {
@@ -730,6 +784,29 @@ class CineMap {
   Policy m_policy = Policy::Tv;
   LdDecodeMetaData* m_md =
       nullptr;  // non-owning alias of m_disc->getMetaData()
+  // A site speaks only when it is quieter than its own neighbours; this is
+  // the log ratio at which it is counted as having spoken at all.
+  static constexpr double SEGREGATION_VOTE_DIP = -0.05;
+
+  // Enough votes that a contiguous run is a claim rather than an accident.
+  static constexpr int SEGREGATION_MIN_VOTES = 5;
+
+  // Alternations as a fraction of what random interleaving would give. This
+  // is a comparison against a null model, not a bar: measured, a real second
+  // shot sits near 0.08 while a lightning storm with no cut in it never fell
+  // below 1.09, so the two populations do not approach each other.
+  static constexpr double SEGREGATION_MAX_RATIO = 0.35;
+
+  // A title sequence can hold several dissolves in one span; each pass takes
+  // the strongest case and re-reads the segmentation.
+  static constexpr int SEGREGATION_MAX_PASSES = 12;
+
+  int countEditBoundaries(int fromField, int toField) const;
+
+  double m_editSensitivity = 8.0;
+  double m_editStrong = 1.5;
+  double m_editPeak = 1.6;
+
   bool m_decisionTraceEnabled = false;
 
   // Per-run sensitivity overrides (0.0 = use defaults)

@@ -181,12 +181,15 @@ static bool runDetectEditsOnly(CineDisc& disc, const QFileInfo& outputFileInfo,
 // -----------------------------------------------------------------------------
 static bool runSolveOnly(CineDisc& disc, CineMap::Policy policy,
                          double threshold, bool decisionTraceEnabled,
+                         double editSensitivity, double editStrong,
+                         double editPeak,
                          const QStringList& cadenceOverrideArgs) {
   qInfo() << "ld-cinemap: running cadence solver (--skip-edits; using "
              "pre-annotated boundaries).";
 
   CineMap solver(&disc, policy);
   solver.setDecisionTraceEnabled(decisionTraceEnabled);
+  solver.setEditParams(editSensitivity, editStrong, editPeak);
   const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
   qInfo() << "Cadence solver locked" << locked << "field(s).";
 
@@ -231,6 +234,7 @@ static bool runFullPipeline(CineDisc& disc, const QFileInfo& outputFileInfo,
   // 4) Cadence / twin / mixedness solve
   CineMap solver(&disc, policy);
   solver.setDecisionTraceEnabled(decisionTraceEnabled);
+  solver.setEditParams(editSensitivity, editStrong, editPeak);
   const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
   qInfo() << "Cadence solver locked" << locked << "field(s).";
 
@@ -367,6 +371,14 @@ int main(int argc, char* argv[]) {
       "spec is fieldStart-fieldEnd.",
       "range");
 
+  QCommandLineOption splitProbeOpt(
+      QStringList() << "split-probe",
+      "Instrument: dump every twin site as a vote for the one offset its "
+      "geometry admits, with its position. Range spec is "
+      "fieldStart-fieldEnd. Read-only.",
+      "range");
+
+  parser.addOption(splitProbeOpt);
   parser.addOption(benchCombOpt);
   parser.addOption(combAxesOpt);
   parser.addOption(dgFloorOpt);
@@ -528,6 +540,26 @@ int main(int argc, char* argv[]) {
     return rows > 0 ? 0 : 1;
   }
 
+  if (parser.isSet(splitProbeOpt)) {
+    const QString spec = parser.value(splitProbeOpt);
+    const auto parts = spec.split(QChar(0x2D), Qt::SkipEmptyParts);
+    if (parts.size() != 2) {
+      qCritical("Error: --split-probe expects fieldStart-fieldEnd");
+      return 1;
+    }
+    bool okA = false, okB = false;
+    const int startField = parts.at(0).toInt(&okA);
+    const int endField = parts.at(1).toInt(&okB);
+    if (!okA || !okB || startField < 1 || endField <= startField) {
+      qCritical("Error: --split-probe range is not valid");
+      return 1;
+    }
+    CineMap solver(disc.get(), policy);
+    solver.setDecisionTraceEnabled(decisionTraceEnabled);
+    const int n = solver.probeSplitRange(disc->getTbcPath(), startField, endField);
+    return n > 0 ? 0 : 1;
+  }
+
   if (!parser.isSet(overrideOnlyOpt)) {
     const auto vbi = vbiProbe::probe(*disc);
     // probe() calls disc->setIsDiscCav() internally.
@@ -584,6 +616,7 @@ int main(int argc, char* argv[]) {
 
   if (parser.isSet(skipEditsOpt)) {
     const bool ok = runSolveOnly(*disc, policy, threshold, decisionTraceEnabled,
+                                 editSensitivity, editStrong, editPeak,
                                  cadenceOverrideArgs);
     return ok ? 0 : 1;
   }
