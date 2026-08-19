@@ -5688,16 +5688,28 @@ int CineMap::healContinuity(SourceVideo& sv,
           const GrainPhaseElection el =
               electPhaseByGrain(sv, span.startField, span.endField, cache);
 
+          // What decided the join is the answer; a number cannot hold it.
+          // Agreement, a contest the twins settled, and a candidate that ran
+          // unopposed are three different accounts of the same field range,
+          // and a caller that reads only a score cannot tell them apart --
+          // nor recover that the span was never examined at all. So the
+          // mechanism is recorded by name and travels with the run.
           int chosen = -1;
-          const char* side = "";
+          QString why;
+
           if (leftPhase >= 0 && rightPhase >= 0) {
             if (leftPhase == rightPhase) {
+              // Both sides project the same phase: the cadence runs through
+              // this span and the boundaries around it never interrupted it.
+              // Nothing was contested, so nothing measured it -- this is a
+              // structural fact about the two projections, not a reading.
               chosen = leftPhase;
-              side = "both (agree)";
+              why = QStringLiteral("join-agree");
             } else if (el.informative) {
               const bool leftWins = el.score[leftPhase] >= el.score[rightPhase];
               chosen = leftWins ? leftPhase : rightPhase;
-              side = leftWins ? "left" : "right";
+              why = leftWins ? QStringLiteral("join-elect-left")
+                             : QStringLiteral("join-elect-right");
             } else {
               // Nothing measurable to separate them. The mixedness fit is the
               // remaining evidence; it too only ranks the two candidates.
@@ -5707,26 +5719,44 @@ int CineMap::healContinuity(SourceVideo& sv,
                                                      span.startField, cache);
               const bool leftWins = lFit >= rFit;
               chosen = leftWins ? leftPhase : rightPhase;
-              side = leftWins ? "left (fit)" : "right (fit)";
+              why = leftWins ? QStringLiteral("join-fit-left")
+                             : QStringLiteral("join-fit-right");
             }
           } else {
+            // One neighbour, no rival, nothing consulted. The span joins
+            // because there is nowhere else for it to go, and that is the
+            // whole of the evidence.
             chosen = (leftPhase >= 0) ? leftPhase : rightPhase;
-            side = (leftPhase >= 0) ? "left (sole)" : "right (sole)";
+            why = (leftPhase >= 0) ? QStringLiteral("join-sole-left")
+                                   : QStringLiteral("join-sole-right");
           }
 
           qInfo() << "Healer: joined span" << spanIdx << "fields"
-                  << span.startField << ".." << span.endField << "to" << side
-                  << "neighbour at phase" << chosen
-                  << (el.informative ? "(twin election)" : "(no twin power)");
+                  << span.startField << ".." << span.endField << "phase"
+                  << chosen << qPrintable(why);
 
           demoteSegmentRange(span, 0.4);
 
           span.run.type = PhaseRun::Type::Pulldown32;
           span.run.phaseOffset = chosen;
-          // An uncontested join is a weaker claim than a contested one the
-          // twins actually decided; the margin says which this was.
-          span.run.confidence = el.informative ? (0.80 + 0.15 * el.margin)
-                                               : 0.70;
+          span.run.reason = why;
+
+          // Confidence here is precedence for overwrite and nothing more, so
+          // it ranks the KINDS of account above -- it does not restate them.
+          // The margin belonged to one branch only and described a contest
+          // the other branches never held; carrying it everywhere dressed an
+          // unexamined join in a measurement it never made, and let one
+          // outrank a contest the twins had actually settled. An account that
+          // consulted no evidence must sit below every account that did.
+          if (why == QStringLiteral("join-agree")) {
+            span.run.confidence = 0.90;  // two projections concur
+          } else if (why.startsWith(QStringLiteral("join-elect"))) {
+            span.run.confidence = 0.85;  // the twins chose
+          } else if (why.startsWith(QStringLiteral("join-fit"))) {
+            span.run.confidence = 0.75;  // mixedness chose
+          } else {
+            span.run.confidence = 0.70;  // unopposed, unexamined
+          }
           changes++;
           if (spanIsNext) {
             nextLocked = true;
