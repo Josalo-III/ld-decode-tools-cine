@@ -46,6 +46,15 @@ class CineMap {
   // read before any code acts on it. Strip when the split arc closes.
   int probeSplitRange(const QString& tbcFilePath, int startField, int endField);
 
+  // TEMPORARY INSTRUMENT: the twin dip measured PER REGION of the frame.
+  // A composite carries its two cadences in different AREAS -- a set here, a
+  // viewscreen there -- while a dissolve lays both across the whole screen
+  // evenly. Pooling the frame into one number cannot tell those apart; this
+  // dumps the dip cell by cell so the difference can be seen before any code
+  // acts on it. Strip when the composite question closes.
+  int probeRegionRange(const QString& tbcFilePath, int startField,
+                       int endField);
+
   // Instrument: calibrate the disc's twin/noise floor and report it. If ranges
   // is non-empty ("a-b,c-d,..."), also report each range's twin share at both
   // operating points. Read-only — no solve, no metadata write.
@@ -819,6 +828,43 @@ class CineMap {
   // otherwise pose as a transition; requiring the owner to hold nearly all
   // its sites is what tells a shot apart from a composite.
   static constexpr double SEGREGATION_MIN_OWN_OCCUPANCY = 0.8;
+
+  // OPEN: composites are still split, and should not be.
+  //
+  // A composite carries two cadences at once because two SOURCES share the
+  // frame -- a set on one, a viewscreen within it on another -- and an
+  // ownership change inside it is a change of which element dominates, not
+  // a change of shot. Splitting there cuts a whole shot at an arbitrary
+  // field, and preponderance can then hand the two halves different
+  // cadences. Known cases: Civil Defense 88439, 94742, 158012; Emissary
+  // 23206, 147291.
+  //
+  // The distinction is GLOBAL vs REGIONAL: a composite has each cadence
+  // dominant in a different AREA of the screen, while a dissolve lays both
+  // across the whole screen evenly. That is a spatial fact and wants a
+  // spatial measurement; every temporal one tried here failed. Occupancy
+  // leak in any form trades keepers against composites monotonically and
+  // separates neither -- a dissolve genuinely IS a span carrying two
+  // cadences, so presence cannot tell them apart.
+  //
+  // Nor will any average over regions: pooling is what destroys the
+  // structure being looked for. What does show promise is nine independent
+  // elections, one per cell of a 3x3 grid, with nothing reduced across
+  // them -- measured, the composites' cells agree on one cadence while the
+  // dissolves' cells disagree, because a composite's dominant source
+  // covers most of every cell while a dissolve leaves both cadences
+  // partially present everywhere and the per-cell winner falls to local
+  // noise.
+  //
+  // Not yet sufficient: Civil Defense's composites read 9/9 against 5-6/9
+  // for dissolves, but Emissary's read 7/9 and 6/9, and a plain film cut
+  // reads 9/9 -- a window in which one shot dominates looks unanimous for
+  // the same reason a composite does. It wants the window taken from the
+  // ownership runs themselves rather than chosen by hand, and the two
+  // CANDIDATE offsets scored per cell rather than a free winner.
+  // --region-probe is the instrument for that.
+  //
+  // Left out of the path rather than left in it half-working.
 
   // Ownership has to last to mean anything. This is the shortest run of
   // bins that counts as a side holding the picture, not the shortest shot

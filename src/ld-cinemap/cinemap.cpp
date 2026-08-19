@@ -243,6 +243,38 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
         classifyAsProgressive(segStart, segEnd, mixedness);
       }
 
+      // PREPONDERANCE.
+      //
+      // A segment its own scan could not name is not thereby unusable, and
+      // leaving it blank is the one outcome with no value at all: the export
+      // is 24p, so a field without a cadence is a field the restorer cannot
+      // have. Where the grain election can still say which offset holds the
+      // most of the picture, that answer is taken.
+      //
+      // It is taken as what it is. A composite -- a set on one cadence with
+      // video on a viewscreen on another -- has no single right answer, and
+      // this names the dominant one, which is the background plate. The
+      // other elements want scoped --set-cadence exports and recompositing;
+      // what this owes them is a plate that is solved, not a hole.
+      if (run.type == PhaseRun::Type::Unknown) {
+        const GrainPhaseElection el =
+            electPhaseByGrain(sv, segStart, segEnd, cache);
+        if (el.informative && el.bestPhase >= 0) {
+          run.type = PhaseRun::Type::Pulldown32;
+          run.phaseOffset = el.bestPhase;
+          run.confidence = 0.55;
+          run.reason = QStringLiteral("preponderance");
+          qInfo().noquote()
+              << QString(
+                     "CineMap: segment [%1..%2] unnamed by its own scan; "
+                     "preponderance gives offset %3 (margin %4)")
+                     .arg(segStart)
+                     .arg(segEnd)
+                     .arg(el.bestPhase)
+                     .arg(el.margin, 0, 'f', 3);
+        }
+      }
+
       solvedSegments.push_back({segStart, segEnd, run, mixedness});
 
       if (run.type == PhaseRun::Type::Pulldown32 && run.confidence > 0.5) {
@@ -2262,6 +2294,93 @@ int CineMap::probeDgFloor(const QString& tbcFilePath, const QString& ranges) {
 
   fflush(stdout);
   return reported;
+}
+
+int CineMap::probeRegionRange(const QString& tbcFilePath, int startField,
+                              int endField) {
+  if (!m_md || !m_disc) return 0;
+
+  SourceVideo sv;
+  if (!sv.open(tbcFilePath, m_disc->getVideoFieldLength())) return 0;
+
+  const auto& vp = m_md->getVideoParameters();
+  const int W = vp.fieldWidth, H = vp.fieldHeight;
+  const int total = m_md->getNumberOfFields();
+  startField = std::max(1, startField);
+  endField = std::min(total, endField);
+
+  const double black = (vp.black16bIre > 0) ? vp.black16bIre : 0.0;
+  const double white = (vp.white16bIre > black) ? vp.white16bIre : 65535.0;
+  const double scaleToIre = 100.0 / (white - black);
+
+  constexpr int N = 8, HW = N / 2, GRID = 3;
+  const int x0 = W / 8, x1 = (W * 7) / 8;
+  const int y0 = H / 8, y1 = (H * 7) / 8;
+
+  printf("field,cell,grainIre\n");
+  int rows = 0;
+  for (int a = startField; a + 2 <= endField; ++a) {
+    const int b = a + 2;
+    auto fa = m_md->getField(a);
+    auto fb = m_md->getField(b);
+    if (fa.pad || fb.pad || fa.isFirstField != fb.isFirstField) continue;
+
+    SourceVideo::Data d1 = sv.getVideoField(a);
+    SourceVideo::Data d2 = sv.getVideoField(b);
+    if (d1.size() < W * H || d2.size() < W * H) continue;
+    const uint16_t* p1 = reinterpret_cast<const uint16_t*>(d1.constData());
+    const uint16_t* p2 = reinterpret_cast<const uint16_t*>(d2.constData());
+
+    double sumSq[GRID * GRID] = {0.0};
+    uint64_t cnt[GRID * GRID] = {0};
+
+    std::vector<double> D(W), sI(W), sQ(W), PI(W + 1), PQ(W + 1);
+    for (int y = y0; y < y1; y += 2) {
+      const uint16_t* l1 = p1 + y * W;
+      const uint16_t* l2 = p2 + y * W;
+      for (int x = 0; x < W; ++x) {
+        const double d = double(l1[x]) - double(l2[x]);
+        D[x] = d;
+        switch (x & 3) {
+          case 0: sI[x] = d;  sQ[x] = 0;  break;
+          case 1: sI[x] = 0;  sQ[x] = d;  break;
+          case 2: sI[x] = -d; sQ[x] = 0;  break;
+          default: sI[x] = 0; sQ[x] = -d; break;
+        }
+      }
+      PI[0] = PQ[0] = 0.0;
+      for (int x = 0; x < W; ++x) {
+        PI[x + 1] = PI[x] + sI[x];
+        PQ[x + 1] = PQ[x] + sQ[x];
+      }
+      const int gy = std::min(GRID - 1, ((y - y0) * GRID) / (y1 - y0));
+      for (int x = x0; x < x1; ++x) {
+        const int lo = std::max(0, x - HW), hi = std::min(W, x + HW);
+        const int ev = ((hi + 1) >> 1) - ((lo + 1) >> 1), od = (hi - lo) - ev;
+        const double Ih = ev > 0 ? (PI[hi] - PI[lo]) / ev : 0.0;
+        const double Qh = od > 0 ? (PQ[hi] - PQ[lo]) / od : 0.0;
+        double carrier;
+        switch (x & 3) {
+          case 0: carrier = Ih;  break;
+          case 1: carrier = Qh;  break;
+          case 2: carrier = -Ih; break;
+          default: carrier = -Qh; break;
+        }
+        const double g = D[x] - carrier;
+        const int gx = std::min(GRID - 1, ((x - x0) * GRID) / (x1 - x0));
+        sumSq[gy * GRID + gx] += g * g;
+        cnt[gy * GRID + gx]++;
+      }
+    }
+    for (int c = 0; c < GRID * GRID; ++c) {
+      if (!cnt[c]) continue;
+      printf("%d,%d,%.4f\n", a, c,
+             std::sqrt(sumSq[c] / cnt[c]) * scaleToIre);
+      rows++;
+    }
+  }
+  sv.close();
+  return rows;
 }
 
 int CineMap::probeSplitRange(const QString& tbcFilePath, int startField,

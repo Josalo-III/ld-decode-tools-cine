@@ -371,6 +371,14 @@ int main(int argc, char* argv[]) {
       "spec is fieldStart-fieldEnd.",
       "range");
 
+  QCommandLineOption regionProbeOpt(
+      QStringList() << "region-probe",
+      "Instrument: twin dip per 3x3 region of the frame, as CSV. Range spec "
+      "is fieldStart-fieldEnd. Read-only.",
+      "range");
+
+  parser.addOption(regionProbeOpt);
+
   QCommandLineOption splitProbeOpt(
       QStringList() << "split-probe",
       "Instrument: dump every twin site as a vote for the one offset its "
@@ -538,6 +546,14 @@ int main(int argc, char* argv[]) {
                .arg(startField)
                .arg(endField);
     return rows > 0 ? 0 : 1;
+  }
+
+  if (parser.isSet(regionProbeOpt)) {
+    const auto pr = parser.value(regionProbeOpt).split(QChar(0x2D), Qt::SkipEmptyParts);
+    if (pr.size() != 2) { qCritical("Error: --region-probe expects a-b"); return 1; }
+    CineMap solver(disc.get(), policy);
+    const int n = solver.probeRegionRange(disc->getTbcPath(), pr.at(0).toInt(), pr.at(1).toInt());
+    return n > 0 ? 0 : 1;
   }
 
   if (parser.isSet(splitProbeOpt)) {
