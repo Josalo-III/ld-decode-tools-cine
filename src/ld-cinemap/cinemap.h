@@ -38,6 +38,7 @@ class CineMap {
   // before it is wired into any decision.
   int probeDgRange(const QString& tbcFilePath, int startField, int endField);
 
+
   // Instrument: calibrate the disc's twin/noise floor and report it. If ranges
   // is non-empty ("a-b,c-d,..."), also report each range's twin share at both
   // operating points. Read-only — no solve, no metadata write.
@@ -533,27 +534,69 @@ class CineMap {
   void classifyAsProgressive(int segStartField, int segEndField,
                              const std::vector<FrameMixedness>& mixedness);
 
-  // Fraction of the twin sites a phase PREDICTS that actually sit at the floor.
+  // One measured twin site: the pair a phase named, and what it read.
+  //
+  // The measurement is kept as the value it is. A boolean "was it under the
+  // floor" cannot be pooled, compared against a neighbour, or counted into an
+  // election, and those are the questions the cadence actually answers to —
+  // so the site carries its residual and lets the caller decide what to ask.
+  struct TwinSite {
+    int frameIdx = -1;      // frame the site opens on
+    int a = -1;             // the pair, in field sequence numbers
+    int b = -1;
+    int cyclePos = -1;      // 0 (AA first-field twin) or 2 (BC second-field)
+    double grainIre = 0.0;  // RMS(D - carrier): the dip itself
+  };
+
+  // Every twin site a phase PREDICTS, with its measurement intact.
   //
   // A projected phase names the pairs that must be twins — roughly two per
   // 5-frame cycle — so it can be checked directly instead of asking mixedness
-  // whether it looks plausible. One measurement per site against the generous
-  // floor, which for a sub-60-field rescue is a dozen or so pairs, nearly all
-  // of them already cached.
+  // whether it looks plausible. For a sub-60-field rescue that is a dozen or
+  // so pairs, nearly all of them already cached.
+  std::vector<TwinSite> twinSitesForPhase(SourceVideo& sv, int segStart,
+                                          int segEnd, int phaseOffset,
+                                          const SegmentCaptureCache& cache);
+
+  // The five phases, scored against each other by how quiet their own twin
+  // sites are. No candidate is disqualified and nothing is thresholded.
+  struct GrainPhaseElection {
+    std::array<double, 5> score = {0.0, 0.0, 0.0, 0.0, 0.0};
+    int bestPhase = -1;
+    double margin = 0.0;  // (best - runnerUp) / |best|, a pure proportion
+    int sites = 0;
+    bool informative = false;  // too few sites to compare, not "no dip found"
+  };
+
+  // Elect the phase whose predicted twins are quietest RELATIVE TO THEIR OWN
+  // NEIGHBOURS.
   //
-  // Returns -1.0 when the test had no power (too few measurable sites), which
-  // is darkness and must fall back to presumption rather than reject.
-  double verifyPhaseByTwins(SourceVideo& sv, int segStart, int segEnd,
-                            int phaseOffset, const SegmentCaptureCache& cache);
+  // A dip is inherently relative, so it is measured as one: each site against
+  // the mean of its same-parity neighbours, pooled geometrically across the
+  // phase. That removes content level from the comparison — a shot that runs
+  // 4 IRE quiet and 25 IRE through an effect contributes the same way from
+  // both stretches, where a pooled mean would let the loud stretch decide.
+  //
+  // Nothing here asks whether a dip is "big enough". A fixed fraction is
+  // arbitrary and content-insensitive: the same 8% dip that a gate discards is
+  // decisive when every one of a phase's sites shows it and no rival phase
+  // does. The election is between the diffs, and the margin it returns is
+  // evidence for the caller to weigh — never a licence the sites had to earn.
+  GrainPhaseElection electPhaseByGrain(SourceVideo& sv, int segStart,
+                                       int segEnd,
+                                       const SegmentCaptureCache& cache);
 
   // P is a demanding verdict; this is its bar, shared by the scan's crash
   // candidate and the full-raster verification that grants it.
   static constexpr double PROGRESSIVE_CRASH_P90 = 0.15;
 
-  // Majority of predicted sites must actually be twins. Perfect telecine
-  // gives 1.0; this leaves room for dropouts and pad fields without admitting a
-  // phase whose predicted sites are mostly empty.
-  static constexpr double PHASE_VERIFY_MIN = 0.50;
+
+  // A fragment span holds no twin of its own. These govern how far the
+  // election opens its aperture into the neighbouring segments to find the
+  // context that decides which of them the fragment belongs to.
+  static constexpr int MIN_ELECT_SITES_PER_PHASE = 3;
+  static constexpr int ELECT_APERTURE_STEP_FIELDS = 20;
+  static constexpr int ELECT_APERTURE_MAX_FIELDS = 240;
 
   // A twin that cancels names its own film frame outright.
   //

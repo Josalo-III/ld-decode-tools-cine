@@ -4945,13 +4945,11 @@ void CineMap::detectAndEncodeInvertedCadenceRuns() {
   }
 }
 
-double CineMap::verifyPhaseByTwins(SourceVideo& sv, int segStart, int segEnd,
-                                   int phaseOffset,
-                                   const SegmentCaptureCache& cache) {
-  if (!m_md || !m_disc) return -1.0;
-
-  const NoiseFloor& nf = calibrateTwinFloor(sv);
-  if (!nf.valid) return -1.0;
+std::vector<CineMap::TwinSite> CineMap::twinSitesForPhase(
+    SourceVideo& sv, int segStart, int segEnd, int phaseOffset,
+    const SegmentCaptureCache& cache) {
+  std::vector<TwinSite> sites;
+  if (!m_md || !m_disc) return sites;
 
   int startFrameIdx = -1, fStart = -1, fEnd = -1;
   for (int s = segStart; s <= segEnd; ++s) {
@@ -4966,12 +4964,9 @@ double CineMap::verifyPhaseByTwins(SourceVideo& sv, int segStart, int segEnd,
       break;
     }
   }
-  if (startFrameIdx < 0 || fEnd < 0) return -1.0;
+  if (startFrameIdx < 0 || fEnd < 0) return sites;
 
   const auto& vp = m_md->getVideoParameters();
-  const double floorIre = nf.ire * FLOOR_MULT_RECALL;
-
-  int sites = 0, hits = 0;
 
   // The same site geometry pattern harvest uses: within the 5-frame cycle, pos
   // 0 carries the AA first-field twin and pos 2 the BC second-field twin.
@@ -4994,27 +4989,154 @@ double CineMap::verifyPhaseByTwins(SourceVideo& sv, int segStart, int segEnd,
         demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
     if (!m.valid) continue;
 
-    sites++;
-    if (m.grainIre < floorIre) hits++;
+    TwinSite site;
+    site.frameIdx = fi;
+    site.a = a;
+    site.b = b;
+    site.cyclePos = pos;
+    site.grainIre = m.grainIre;
+    sites.push_back(site);
   }
+
+  return sites;
+}
+
+CineMap::GrainPhaseElection CineMap::electPhaseByGrain(
+    SourceVideo& sv, int segStart, int segEnd,
+    const SegmentCaptureCache& cache) {
+  GrainPhaseElection out;
+  if (!m_md || !m_disc) return out;
+
+  const int totalFields = m_md->getNumberOfFields();
+
+  // The phase index is meaningless without a reference, and the caller's
+  // projection is expressed against the span it asked about. The anchor stays
+  // on segStart no matter how far the aperture opens, so a widened
+  // measurement still answers the question that was put.
+  int anchorFrameIdx = -1;
+  for (int s = segStart; s <= totalFields && anchorFrameIdx < 0; ++s) {
+    if (cache.validSeq(s)) anchorFrameIdx = cache.cap[s].frameIndex;
+  }
+  if (anchorFrameIdx < 0) return out;
+
+  // Measure over [lo..hi], pooling each site against its own same-parity
+  // neighbours. Returns the per-phase site counts alongside the scores.
+  auto measure = [&](int lo, int hi, std::array<double, 5>* score,
+                     std::array<int, 5>* counts) {
+    std::map<int, double> chan[2];  // [0] AA first-field, [1] BC second-field
+    for (int p = 0; p < 5; ++p) {
+      for (const TwinSite& s : twinSitesForPhase(sv, lo, hi, p, cache)) {
+        chan[s.cyclePos == 0 ? 0 : 1][s.frameIdx] = s.grainIre;
+      }
+    }
+
+    auto localDip = [&](int c, int fi, double* dipOut) -> bool {
+      auto here = chan[c].find(fi);
+      auto prev = chan[c].find(fi - 1);
+      auto next = chan[c].find(fi + 1);
+      if (here == chan[c].end() || prev == chan[c].end() ||
+          next == chan[c].end()) {
+        return false;
+      }
+      const double local = 0.5 * (prev->second + next->second);
+      if (!(local > 0.0) || !(here->second > 0.0)) return false;
+      *dipOut = std::log(here->second / local);
+      return true;
+    };
+
+    for (int p = 0; p < 5; ++p) {
+      double sum = 0.0;
+      int n = 0;
+      for (int c = 0; c < 2; ++c) {
+        const int wanted = (c == 0) ? 0 : 2;
+        for (const auto& [fi, unusedIre] : chan[c]) {
+          int pos = (fi - anchorFrameIdx + p) % 5;
+          if (pos < 0) pos += 5;
+          if (pos != wanted) continue;
+          double dip = 0.0;
+          if (!localDip(c, fi, &dip)) continue;
+          sum += dip;
+          ++n;
+        }
+      }
+      // Quieter than its neighbours is a NEGATIVE log ratio, so negate: a
+      // higher score is a better-supported phase.
+      (*score)[p] = (n > 0) ? -(sum / n) : 0.0;
+      (*counts)[p] = n;
+    }
+  };
+
+  // A one- or two-field span carries no twin at all, and refusing on that
+  // ground would answer the wrong question. Edits that short are rare; a
+  // fragment is nearly always the residue of a mistaken boundary, and what
+  // the healer needs to know is whether it belongs with the segment before
+  // or the one after. So the aperture opens into that context until there is
+  // enough to hold an election. Crossing a boundary is the point, not a
+  // hazard: the fragment is on trial precisely because its boundary is
+  // doubted.
+  int lo = segStart, hi = segEnd;
+  std::array<double, 5> score = {0.0, 0.0, 0.0, 0.0, 0.0};
+  std::array<int, 5> counts = {0, 0, 0, 0, 0};
+  int aperture = 0;
+
+  while (true) {
+    measure(lo, hi, &score, &counts);
+    const int minSites = *std::min_element(counts.begin(), counts.end());
+    if (minSites >= MIN_ELECT_SITES_PER_PHASE) break;
+    if ((hi - lo + 1) >= ELECT_APERTURE_MAX_FIELDS) break;
+    if (lo <= 1 && hi >= totalFields) break;
+    lo = std::max(1, lo - ELECT_APERTURE_STEP_FIELDS);
+    hi = std::min(totalFields, hi + ELECT_APERTURE_STEP_FIELDS);
+    aperture++;
+  }
+
+  out.score = score;
+  out.sites = 0;
+  for (int p = 0; p < 5; ++p) out.sites += counts[p];
+  const int minSites = *std::min_element(counts.begin(), counts.end());
+
+  // Informative is a question about how much was measured, never about how
+  // large the dips were.
+  out.informative = (minSites >= MIN_ELECT_SITES_PER_PHASE);
+
+  int best = 0;
+  for (int p = 1; p < 5; ++p) {
+    if (out.score[p] > out.score[best]) best = p;
+  }
+  out.bestPhase = best;
+
+  double runnerUp = -std::numeric_limits<double>::infinity();
+  for (int p = 0; p < 5; ++p) {
+    if (p != best && out.score[p] > runnerUp) runnerUp = out.score[p];
+  }
+  out.margin = (out.score[best] > 0.0)
+                   ? (out.score[best] - runnerUp) / std::fabs(out.score[best])
+                   : 0.0;
 
   if (m_decisionTraceEnabled) {
     qInfo().noquote()
         << QString(
-               "CineMap decision: PHASE_VERIFY fields [%1..%2] phase=%3 "
-               "frames=[%4..%5] sites=%6 hits=%7 floor=%8")
+               "CineMap decision: GRAIN_ELECT asked [%1..%2] measured [%3..%4] "
+               "scores={%5} best=%6 margin=%7 sites=%8 minPerPhase=%9 "
+               "informative=%10")
                .arg(segStart)
                .arg(segEnd)
-               .arg(phaseOffset)
-               .arg(fStart)
-               .arg(fEnd)
-               .arg(sites)
-               .arg(hits)
-               .arg(floorIre, 0, 'f', 4);
+               .arg(lo)
+               .arg(hi)
+               .arg(QString("%1,%2,%3,%4,%5")
+                        .arg(out.score[0], 0, 'f', 4)
+                        .arg(out.score[1], 0, 'f', 4)
+                        .arg(out.score[2], 0, 'f', 4)
+                        .arg(out.score[3], 0, 'f', 4)
+                        .arg(out.score[4], 0, 'f', 4))
+               .arg(out.bestPhase)
+               .arg(out.margin, 0, 'f', 3)
+               .arg(out.sites)
+               .arg(minSites)
+               .arg(out.informative);
   }
 
-  if (sites < 2) return -1.0;  // no power: darkness, not a rejection
-  return static_cast<double>(hits) / sites;
+  return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -5513,91 +5635,104 @@ int CineMap::healContinuity(SourceVideo& sv,
         changes++;
       }
     }
-
     // -----------------------------------------------------------------
-    // CASE 2: Rescue Short Segment (Curr is Short/Unknown, Next is Locked)
-    // Try to extend 'Next' BACKWARDS into 'Curr'.
+    // CASE 2/3: Adjudicate a short unlocked span between its neighbours.
+    //
+    // The span cannot be left as it is. --export-24p resynchronises at every
+    // boundary, so an unhealed span keeps a boundary that costs a frame at
+    // the resync — and a frame dropped in the middle of a shot is the very
+    // defect this solver exists to prevent. Refusing is therefore not the
+    // cautious answer; it is the one guaranteed to do damage.
+    //
+    // So the question is never WHETHER to join, only WHICH side to join to.
+    // Both neighbours name a phase by projection, the span's own twins score
+    // all five, and the higher-scoring projection wins. That is a comparison
+    // between two named candidates: no bar to clear, nothing that can
+    // disqualify itself, and no threshold whose units would drift with
+    // content. Where only one neighbour is locked it stands unopposed and
+    // still wins — an uncontested candidate is elected, not audited.
     // -----------------------------------------------------------------
-    if (!currLocked && nextLocked) {
-      int lenFields = curr.endField - curr.startField + 1;
-      if (lenFields < 60) {  // Only heal short gaps (< 1 sec)
-        int startA = getFrameIdx(curr.startField);
-        int startB = getFrameIdx(next.startField);
-        if (startA < 0 || startB < 0) continue;
+    if (currLocked != nextLocked) {
+      const bool spanIsNext = currLocked;
+      SegmentResult& span = spanIsNext ? next : curr;
+      const size_t spanIdx = spanIsNext ? (i + 1) : i;
 
-        int projectedPhase = (next.run.phaseOffset - (startB - startA)) % 5;
-        if (projectedPhase < 0) projectedPhase += 5;
-
-        // Verify the projection against the twin sites it names. Where that
-        // test has power it decides, because it checks the actual claim; the
-        // mixedness fit only asks whether the phase looks plausible, and it
-        // was the criterion that let cadences extend into non-film. Where it
-        // has no power the span is dark, and darkness presumes — that is what
-        // solve-in-the-dark is for — so the fit still carries it.
-        const double twinFit = verifyPhaseByTwins(
-            sv, curr.startField, curr.endField, projectedPhase, cache);
-
-        double fitScore = scoreSpecificPhase(curr.mixedness, projectedPhase,
-                                             curr.startField, cache);
-
-        const bool accept = (twinFit >= 0.0) ? (twinFit >= PHASE_VERIFY_MIN)
-                                             : (fitScore > 0.15);
-
-        if (accept) {
-          qInfo() << "Healer: Back-projected phase" << projectedPhase
-                  << "into segment" << (i + 1)
-                  << (twinFit >= 0.0 ? "(twins:" : "(mixedness fit:")
-                  << (twinFit >= 0.0 ? twinFit : fitScore) << ")";
-
-          demoteSegmentRange(curr, 0.4);
-
-          curr.run.type = PhaseRun::Type::Pulldown32;
-          curr.run.phaseOffset = projectedPhase;
-          curr.run.confidence = 0.85;  // Healed!
-          changes++;
-          currLocked = true;
-        }
-      }
-    }
-
-    // -----------------------------------------------------------------
-    // CASE 3: Rescue Short Segment (Curr is Locked, Next is Short/Unknown)
-    // Try to extend 'Curr' FORWARDS into 'Next'.
-    // -----------------------------------------------------------------
-    if (currLocked && !nextLocked) {
-      int lenFields = next.endField - next.startField + 1;
+      const int lenFields = span.endField - span.startField + 1;
       if (lenFields < 60) {
-        int startA = getFrameIdx(curr.startField);
-        int startB = getFrameIdx(next.startField);
-        if (startA < 0 || startB < 0) continue;
+        const int spanStartFrame = getFrameIdx(span.startField);
 
-        int projectedPhase = (curr.run.phaseOffset + (startB - startA)) % 5;
-        if (projectedPhase < 0) projectedPhase += 5;
+        // Each locked neighbour projects its own phase onto the span.
+        auto project = [&](const SegmentResult& from) -> int {
+          const int fromFrame = getFrameIdx(from.startField);
+          if (fromFrame < 0 || spanStartFrame < 0) return -1;
+          int p = (from.run.phaseOffset + (spanStartFrame - fromFrame)) % 5;
+          if (p < 0) p += 5;
+          return p;
+        };
 
-        // Same rule as the back-projection: the twin sites the phase names
-        // decide where they can be measured, mixedness presumes where dark.
-        const double twinFit = verifyPhaseByTwins(
-            sv, next.startField, next.endField, projectedPhase, cache);
+        const SegmentResult* leftNb =
+            (spanIdx > 0 && segments[spanIdx - 1].run.type ==
+                                PhaseRun::Type::Pulldown32)
+                ? &segments[spanIdx - 1]
+                : nullptr;
+        const SegmentResult* rightNb =
+            (spanIdx + 1 < segments.size() &&
+             segments[spanIdx + 1].run.type == PhaseRun::Type::Pulldown32)
+                ? &segments[spanIdx + 1]
+                : nullptr;
 
-        double fitScore = scoreSpecificPhase(next.mixedness, projectedPhase,
-                                             next.startField, cache);
+        const int leftPhase = leftNb ? project(*leftNb) : -1;
+        const int rightPhase = rightNb ? project(*rightNb) : -1;
 
-        const bool accept = (twinFit >= 0.0) ? (twinFit >= PHASE_VERIFY_MIN)
-                                             : (fitScore > 0.15);
+        if (leftPhase >= 0 || rightPhase >= 0) {
+          const GrainPhaseElection el =
+              electPhaseByGrain(sv, span.startField, span.endField, cache);
 
-        if (accept) {
-          qInfo() << "Healer: Forward-projected phase" << projectedPhase
-                  << "into segment" << (i + 2)
-                  << (twinFit >= 0.0 ? "(twins:" : "(mixedness fit:")
-                  << (twinFit >= 0.0 ? twinFit : fitScore) << ")";
+          int chosen = -1;
+          const char* side = "";
+          if (leftPhase >= 0 && rightPhase >= 0) {
+            if (leftPhase == rightPhase) {
+              chosen = leftPhase;
+              side = "both (agree)";
+            } else if (el.informative) {
+              const bool leftWins = el.score[leftPhase] >= el.score[rightPhase];
+              chosen = leftWins ? leftPhase : rightPhase;
+              side = leftWins ? "left" : "right";
+            } else {
+              // Nothing measurable to separate them. The mixedness fit is the
+              // remaining evidence; it too only ranks the two candidates.
+              const double lFit = scoreSpecificPhase(span.mixedness, leftPhase,
+                                                     span.startField, cache);
+              const double rFit = scoreSpecificPhase(span.mixedness, rightPhase,
+                                                     span.startField, cache);
+              const bool leftWins = lFit >= rFit;
+              chosen = leftWins ? leftPhase : rightPhase;
+              side = leftWins ? "left (fit)" : "right (fit)";
+            }
+          } else {
+            chosen = (leftPhase >= 0) ? leftPhase : rightPhase;
+            side = (leftPhase >= 0) ? "left (sole)" : "right (sole)";
+          }
 
-          demoteSegmentRange(next, 0.4);
+          qInfo() << "Healer: joined span" << spanIdx << "fields"
+                  << span.startField << ".." << span.endField << "to" << side
+                  << "neighbour at phase" << chosen
+                  << (el.informative ? "(twin election)" : "(no twin power)");
 
-          next.run.type = PhaseRun::Type::Pulldown32;
-          next.run.phaseOffset = projectedPhase;
-          next.run.confidence = 0.85;
+          demoteSegmentRange(span, 0.4);
+
+          span.run.type = PhaseRun::Type::Pulldown32;
+          span.run.phaseOffset = chosen;
+          // An uncontested join is a weaker claim than a contested one the
+          // twins actually decided; the margin says which this was.
+          span.run.confidence = el.informative ? (0.80 + 0.15 * el.margin)
+                                               : 0.70;
           changes++;
-          nextLocked = true;
+          if (spanIsNext) {
+            nextLocked = true;
+          } else {
+            currLocked = true;
+          }
         }
       }
     }
