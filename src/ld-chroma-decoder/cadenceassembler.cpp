@@ -169,9 +169,36 @@ namespace {
             }
         };
 
+        // Twin sanity counts PICTURE only.
+        //
+        // getFirstActiveLine() lands on field line 20, which is still
+        // blanking, and field line 21 carries closed captions / VITC /
+        // other disc metadata on both fields. That data is not picture: it
+        // legitimately differs between the two captures, so counting it as
+        // twin disagreement convicts fields whose image is perfectly sound.
+        // Measured across five scenes, every "one-line fault" the sanity
+        // test found sat on field line 21 and nowhere else -- a full-width
+        // caption line read as damage, on every disc tested.
+        //
+        // Count from the first line of NTSC image. The merge itself still
+        // processes these lines; only the verdict ignores them.
+        // Expressed relative to the active range, not as an absolute line
+        // number: y0 itself is still blanking and y0+1 carries the caption,
+        // so image begins at y0+2. Measured on the exported frame -- rows 0-1
+        // flat at black, rows 2-3 bimodal caption data with steep
+        // transitions, rows 4+ picture. An absolute constant got this wrong
+        // by a line because the def field's parity moves the mapping.
+        // getFirstActiveLine() lands ON the caption line -- verified against
+        // the exported frame: y0 maps to output rows 2-3 (bimodal caption
+        // data), y0+1 to rows 4-5 (picture), and output rows 0-1 sit below
+        // the merge's active range entirely. One line to skip, not two.
+        constexpr int kNonImageFieldLines = 1;   // the caption line
+        const int ys = y0 + kNonImageFieldLines;
+        if (ys >= y1) return false;
+
         // Pass 1: twin sanity on the out-of-band residual of chat.
         std::int64_t total = 0, outliers = 0;
-        for (int lf = y0; lf < y1; ++lf) {
+        for (int lf = ys; lf < y1; ++lf) {
             buildLine(lf);
             for (int h = activeLeft; h < activeRight; ++h) {
                 if (std::fabs(chat[h] - bp[h]) > outlierThreshCode) outliers++;
@@ -184,16 +211,12 @@ namespace {
             return false;
         }
 
-        // Twin-agreement audit (the dump instrument, which printed
-        // field-line and FULL-raw-column values under -t 1, has since been
-        // removed). The (D-S)/2 channel is a
-        // carrier measurement ONLY where the twins share content: the BP
-        // makes the emitted value carrier-BAND by construction, so band
-        // structure alone proves nothing. The out-of-band residual
-        // |chat - BP(chat)| is the honest witness -- for true twins it is
-        // just twin noise, and where content differs (a video-rate element
-        // composited over film-rate frames, say) it is large and the
-        // "carrier" reading there is a content difference in disguise.
+        // NOTE: no field-level refusal here. A bad cinemap solve is not
+        // the merge's to salvage -- the remedy is --set-cadence or fixing
+        // the edit/cadence in ld-cinemap, and a gate that refuses those
+        // fields also refuses correct solves whose twins carry ordinary
+        // disc damage. The per-sample repair below is what handles damage,
+        // and it runs only on lines that need it.
 
         // Pass 2: merged = Lhat + BP(chat); emit the exact-carrier channel.
         // Minor-disagreement error correction runs per line before emission.
@@ -209,6 +232,11 @@ namespace {
 
         std::vector<std::uint8_t> errMask(width), denyExact(width);
         std::vector<double> chatFix(width), lhatFix(width), bpFix(width);
+        // Baseband IQ for the twin arbitration: def, spare, the two comp
+        // rows, and their positional mean.
+        std::vector<double> aI(width), aQ(width), bI(width), bQ(width),
+                            uI(width), uQ(width), vI(width), vQ(width),
+                            cI(width), cQ(width);
 
         // Twin phase capture (the dump instrument has since been removed;
         // this feeds the sync tracker).
@@ -239,7 +267,16 @@ namespace {
         static const double phCB[4] = { 1, 0, -1, 0 };
         static const double phSB[4] = { 0, 1, 0, -1 };
 
-        for (int lf = y0; lf < y1; ++lf) {
+        // Emission starts at the first image line, so the spare is DISCARDED
+        // on the caption lines. Closed captions / VITC are data, and the two
+        // captures carry different data there; merging them averages two
+        // unlike waveforms into an illegible one. def's own samples are
+        // already in def.data, so skipping the write keeps the caption
+        // exactly as the def field carried it. dgExactCarrier stays NaN on
+        // those lines, which makes certifiedDefLine() false for them, so no
+        // candidate cedes to a data line either. The phase pools below
+        // likewise must not read caption data as carrier.
+        for (int lf = ys; lf < y1; ++lf) {
             buildLine(lf);
             quint16* out = defw + (size_t)lf * width;
 
@@ -304,45 +341,98 @@ namespace {
                 std::copy(chat.begin(), chat.end(), chatFix.begin());
                 std::copy(lhat.begin(), lhat.end(), lhatFix.begin());
 
-                // Carrier refill at error samples from the nearest valid
-                // samples one or more full cycles away (same phase class).
-                auto chatRefill = [&](int h) -> double {
-                    for (int k = 4; k <= 16; k += 4) {
-                        const int a = h - k, b = h + k;
-                        const bool va = a >= activeLeft && !errMask[a];
-                        const bool vb = b < activeRight && !errMask[b];
-                        if (va && vb) return 0.5 * (chat[a] + chat[b]);
-                        if (va) return chat[a];
-                        if (vb) return chat[b];
-                    }
-                    return 0.0;
-                };
+                const quint16* dl = defp + (size_t)lf * width;
+                const quint16* sl = sparep + (size_t)lf * width;
 
-                // Arbitrate per error RUN (majority over the run): the twin
-                // more dissimilar to the phase-matched comp reference is
-                // the error.
+                // Demodulate FIRST, interpolate SECOND.
+                //
+                // The comp field has no line at the def line's height --
+                // a field carries half the frame's lines -- so the two
+                // bracketing comp rows are averaged to reach that height.
+                // That is positional interpolation and nothing else. Done
+                // in COMPOSITE it also cancels the carrier, because
+                // adjacent scan lines sit 227.5 cycles apart, which is why
+                // the old form had to reflect def about the mean to put a
+                // carrier term back. Demodulated per row and averaged
+                // afterwards, the result keeps the comp's chroma at that
+                // height and both twins compare against it directly.
+                static const double kCB[4] = { 1, 0, -1, 0 };
+                static const double kSB[4] = { 0, 1, 0, -1 };
+                auto demodRow = [&](const quint16* row, int scanLine,
+                                    std::vector<double>& oI,
+                                    std::vector<double>& oQ) {
+                    const double rs = (scanLine & 1) ? -1.0 : 1.0;
+                    for (int x = activeLeft; x < activeRight; ++x) {
+                        double si = 0.0, sq = 0.0;
+                        int n = 0;
+                        // One full carrier cycle: cancels the alternating
+                        // product image and the luma pedestal together.
+                        for (int k = -2; k <= 1; ++k) {
+                            const int xx = x + k;
+                            if (xx < activeLeft || xx >= activeRight) continue;
+                            const double v = rs * (double)row[xx];
+                            si += v * kCB[xx & 3];
+                            sq += v * kSB[xx & 3];
+                            ++n;
+                        }
+                        oI[x] = n ? si / n : 0.0;
+                        oQ[x] = n ? sq / n : 0.0;
+                    }
+                };
+                const int defScan = 2 * lf   + (defIsTop ? 0 : 1);
+                const int upScan  = 2 * cUp  + (defIsTop ? 1 : 0);
+                const int dnScan  = 2 * cDn  + (defIsTop ? 1 : 0);
+                demodRow(dl, defScan, aI, aQ);
+                demodRow(sl, defScan, bI, bQ);
+                demodRow(ru, upScan,  uI, uQ);
+                demodRow(rd, dnScan,  vI, vQ);
+                for (int x = activeLeft; x < activeRight; ++x) {
+                    cI[x] = 0.5 * (uI[x] + vI[x]);
+                    cQ[x] = 0.5 * (vQ[x] + uQ[x]);
+                }
+
+                // No phase correction on either twin: whatever offset comp
+                // carries is common to both comparisons, so it cancels out
+                // of "which twin is closer". Measured over 52 lines, def
+                // and spare always took the SAME sign against comp and were
+                // never opposed, so a per-twin correction could only ever
+                // scale both sides of the same inequality.
+                //
+                // Caveat on that measurement: the demod is a 4-tap mean of
+                // value x basis, which rejects luma only where luma is flat
+                // across the window. Both twins carry the same luma, so the
+                // agreement above may be luma correlation rather than proof
+                // about carrier phase. It is sufficient to show the
+                // correction was inert here; it is NOT a claim about the
+                // def/spare phase relation, which the (def-spare)/2 =
+                // carrier framework answers with far better evidence.
+
+                // Arbitrate per error RUN: whichever twin's chroma sits
+                // closer to the comp's at that height is signal; the
+                // outlier is the error and is discarded.
                 int h = activeLeft;
                 while (h < activeRight) {
                     if (!errMask[h]) { ++h; continue; }
                     int rEnd = h;
                     while (rEnd + 1 < activeRight && errMask[rEnd + 1]) ++rEnd;
                     double eDef = 0.0, eSpare = 0.0;
-                    const quint16* dl = defp + (size_t)lf * width;
-                    const quint16* sl = sparep + (size_t)lf * width;
                     for (int x = h; x <= rEnd; ++x) {
-                        const double r = R(x);
-                        const double refSpare = r;                 // cophased
-                        const double refDef = 2.0 * Rmean(x) - r;  // flipped
-                        eDef += std::fabs((double)dl[x] - refDef);
-                        eSpare += std::fabs((double)sl[x] - refSpare);
+                        eDef   += std::hypot(aI[x] - cI[x], aQ[x] - cQ[x]);
+                        eSpare += std::hypot(bI[x] - cI[x], bQ[x] - cQ[x]);
                     }
                     const bool badIsDef = eDef > eSpare;
                     for (int x = h; x <= rEnd; ++x) {
-                        const double cf = chatRefill(x);
-                        chatFix[x] = cf;
-                        lhatFix[x] = badIsDef
-                            ? (double)sl[x] + cf   // spare = L - c
-                            : (double)dl[x] - cf;  // def   = L + c
+                        // Keep the surviving twin's OWN sample -- its own
+                        // carrier, not one interpolated from a cycle away.
+                        // def is already in the emitted field's phase and
+                        // is taken verbatim; spare is anti-phased, so it is
+                        // reflected about the carrier-free local luma R to
+                        // express the same reading in def phase.
+                        const double kept = badIsDef
+                            ? 2.0 * R(x) - (double)sl[x]
+                            : (double)dl[x];
+                        lhatFix[x] = R(x);
+                        chatFix[x] = kept - R(x);
                     }
                     h = rEnd + 1;
                 }

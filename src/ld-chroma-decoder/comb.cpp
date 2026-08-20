@@ -326,6 +326,12 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 if (FrameBuffer::certifiedOneDLevel() >= 1)
                     next->buildCertifiedCarrierLadder(
                         current->holdsRealFrame() ? current.get() : nullptr);
+                // The witness runs on its OWN option, after the ladder and
+                // independent of it. Not inside it, and not behind the
+                // certified level: --luma-witness is the only thing that
+                // decides whether this frame gets a witness view, on covered
+                // and uncovered frames alike.
+                next->buildLumaWitnessModel();
             }
 
             if (!configuration.diagnosticOnly())

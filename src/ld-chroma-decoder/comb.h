@@ -404,6 +404,13 @@ public:
 	// This is the comb's own 3D structure. Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCertifiedCarrierStage(const FrameBuffer *prevF = nullptr);
+	// The luma-witness model (restored to its 2026-07-23 shape, 95e292f).
+	// Gated on configuration.lumaWitness ALONE and complete in itself: it
+	// solves the fit, publishes carrierRetracted and sets
+	// carrierRetractedValid, so no gate placed on the certified family can
+	// withdraw it or leave it half-published.
+	void buildLumaWitnessModel();
+
 
 	// Corner-leak corrector. The locked bandpass reads luma CURVATURE as false
 	// carrier: leak[x] = -0.25 * (Y[x-2] - 2Y[x] + Y[x+2]), exactly. A

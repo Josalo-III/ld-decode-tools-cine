@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <vector>
 
 namespace lddecode {
 
@@ -187,15 +189,78 @@ inline constexpr double kChromaEnvelopeFilter[kChromaEnvelopeTaps] = {
 // The residue (in - out) is not returned or stored anywhere: whatever the
 // encoder could not have modulated simply never enters the carrier model, and
 // therefore remains in luma by construction.
+// TEMPORARY SWEEP KNOB (LDCD_ENV_TAPS, 2026-08-17): resample the encoder
+// kernel to an arbitrary odd tap count so the envelope law's effective
+// aperture can be swept against certified truth. 0/unset = the shipped 9-tap
+// kernel, untouched. The resampled kernel keeps unit DC gain, so only the
+// cutoff moves. Instrument only -- strip with the sweep.
+inline std::vector<double> buildResampledEnvelopeKernel(int ov)
+{
+    std::vector<double> k;
+    if (ov < 3) return k;
+    k.resize(ov);
+    const double scale = double(kChromaEnvelopeTaps - 1) / double(ov - 1);
+    double sum = 0.0;
+    for (int i = 0; i < ov; ++i) {
+        const double src = i * scale;
+        const int    j   = (int)src;
+        const double f   = src - j;
+        const double a   = kChromaEnvelopeFilter[j];
+        const double b   = (j + 1 < kChromaEnvelopeTaps)
+                             ? kChromaEnvelopeFilter[j + 1] : 0.0;
+        k[i] = a + f * (b - a);
+        sum += k[i];
+    }
+    for (double &v : k) v /= sum;
+    return k;
+}
+
+inline int envelopeTapsFor(int chan)
+{
+    auto rd = [](const char *n) {
+        const char *e = std::getenv(n);
+        int v = e ? std::atoi(e) : 0;
+        return v < 3 ? 0 : (v | 1);
+    };
+    static const int base = rd("LDCD_ENV_TAPS");
+    static const int tI   = rd("LDCD_ENV_TAPS_I");
+    static const int tQ   = rd("LDCD_ENV_TAPS_Q");
+    if (chan == 0 && tI >= 3) return tI;
+    if (chan == 1 && tQ >= 3) return tQ;
+    return base;
+}
+
+// chan 0 = the I-side channel, 1 = the Q-side channel, -1 = unattributed
+// (magnitude observables, cascades).  Per-channel apertures exist because the
+// two channels are NOT bandlimited alike: the encoder gave them different
+// allowances and the material fills them differently.
+inline const double *envelopeKernel(int &taps, int chan = -1)
+{
+    static const std::vector<double> kDef =
+        buildResampledEnvelopeKernel(envelopeTapsFor(-1));
+    static const std::vector<double> kI =
+        buildResampledEnvelopeKernel(envelopeTapsFor(0));
+    static const std::vector<double> kQ =
+        buildResampledEnvelopeKernel(envelopeTapsFor(1));
+    const std::vector<double> *k =
+        (chan == 0) ? &kI : (chan == 1) ? &kQ : &kDef;
+    if (!k->empty()) { taps = (int)k->size(); return k->data(); }
+    taps = kChromaEnvelopeTaps;
+    return kChromaEnvelopeFilter;
+}
+
 inline void projectExpressibleChromaEnvelope(const double *in,
                                              const std::uint8_t *valid,
                                              int n,
-                                             double *out)
+                                             double *out,
+                                             int chan = -1)
 {
     if (!in || !out || n <= 0)
         return;
 
-    constexpr int half = kChromaEnvelopeTaps / 2;
+    int kChromaEnvelopeTaps_ = 0;
+    const double *kern = envelopeKernel(kChromaEnvelopeTaps_, chan);
+    const int half = kChromaEnvelopeTaps_ / 2;
 
     for (int i = 0; i < n; ++i) {
         if (valid && !valid[i]) {
@@ -205,13 +270,13 @@ inline void projectExpressibleChromaEnvelope(const double *in,
 
         double acc = 0.0;
         double used = 0.0;
-        for (int k = 0; k < kChromaEnvelopeTaps; ++k) {
+        for (int k = 0; k < kChromaEnvelopeTaps_; ++k) {
             const int j = i + k - half;
             if (j < 0 || j >= n)
                 continue;
             if (valid && !valid[j])
                 continue;
-            const double w = kChromaEnvelopeFilter[k];
+            const double w = kern[k];
             acc += w * in[j];
             used += w;
         }
