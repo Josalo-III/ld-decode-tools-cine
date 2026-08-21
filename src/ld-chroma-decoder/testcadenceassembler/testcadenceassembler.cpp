@@ -83,7 +83,7 @@ void testPassthroughPreservesIdentityButForbidsFrameComb()
 {
     LdDecodeMetaData::VideoParameters videoParameters;
     CadenceAssembler::Configuration configuration;
-    configuration.noPA = true;
+    configuration.noCinemap = true;
 
     CadenceAssembler assembler(videoParameters, configuration);
     assembler.push(QVector<SourceField>({makeField(4), makeField(5)}));

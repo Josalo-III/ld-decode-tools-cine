@@ -15,13 +15,12 @@ class CadenceAssembler
 {
 public:
     struct Configuration {
-        bool noPA = false;
+        bool noCinemap = false;
         bool dgDiscard = false;
         bool export24p = false;
         int setCadence = 0;
 		bool reverseFieldOrder = false;
 		bool emitMax24p = false;
-        double dgOutlierThreshIre = 6.0;
         double dgMaxOutlierFrac   = 0.10;
     };
 

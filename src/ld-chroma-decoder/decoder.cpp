@@ -50,7 +50,7 @@ void DecoderThread::run()
             outputWriter.convert(componentFrames[i], outputFrames[i]);
         }
 
-        if (!decoderPool.getCadenceConfig().noPA &&
+        if (!decoderPool.getCadenceConfig().noCinemap &&
             !decoderPool.getCadenceConfig().export24p) {
             if (!decoderPool.putOutputFrames(startFrameNumber, componentFrames, outputFrames)) {
                 abort = true;

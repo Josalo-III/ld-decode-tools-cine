@@ -78,7 +78,7 @@ bool DecoderPool::process()
         cadenceConfig,
         [this](qint32 seqNo) {
             // Called under inputMutex (from pumpAssembler inside getInputFrames).
-            if (!cadenceConfig.export24p && !cadenceConfig.noPA)
+            if (!cadenceConfig.export24p && !cadenceConfig.noCinemap)
                 enqueueBaselinePassthrough(seqNo);
         }
     );
@@ -178,7 +178,7 @@ bool DecoderPool::process()
         targetVideo.close();
         return false;
     }
-    if (!cadenceConfig.noPA && !cadenceConfig.export24p) {
+    if (!cadenceConfig.noCinemap && !cadenceConfig.export24p) {
         if (outputFrameNumber <= lastFrameNumber) {
             const qint32 s1 = ldDecodeMetaData.getFirstFieldNumber(outputFrameNumber);
             const qint32 s2 = ldDecodeMetaData.getSecondFieldNumber(outputFrameNumber);
@@ -928,7 +928,7 @@ bool DecoderPool::putOutputFrame(qint32 frameNumber,
 {
     QMutexLocker locker(&outputMutex);
 
-    if (cadenceConfig.noPA) {
+    if (cadenceConfig.noCinemap) {
         pendingOutputFrames[frameNumber] = outputFrame;
 
         while (pendingOutputFrames.contains(outputFrameNumber)) {

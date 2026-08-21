@@ -12318,8 +12318,9 @@ void Comb::FrameBuffer::applyToneToFit(const FrameBuffer *prevF)
 //
 // IT OWNS carrierFit. Nothing in the decode path reads that plane --
 // verified 2026-08-17, every external reader is an instrument
-// (probeCompactSpans, its census, LDCD_YVIEW=native, and the
-// --carrier-fit-only diagnostic render). The certified ladder does not
+// (probeCompactSpans, its census, and LDCD_YVIEW=native; the
+// --carrier-fit-only diagnostic render was retired 2026-08-20). The
+// certified ladder does not
 // consume it: its anchored plane is written from certifiedCarrier, a
 // fact. So the fit is the witness's own working product, as it was here.
 //

@@ -51,9 +51,42 @@ ld-chroma-decoder [options] <input.tbc> <output.rgb>
 - `--chroma-nr <number>`: NTSC: Chroma noise reduction level in dB (default 0.0)
 - `--luma-nr <number>`: Luma noise reduction level in dB (default 0.0)
 - `--ntsc-phase-comp`: NTSC: Adjust phase per-line using burst phase
-- `--luma-witness`: NTSC locked mode: Enable the carrier-retraction luma path and diagnostics. Requires `--ntsc-phase-comp`.
-- `--carrier-fit-only`: NTSC diagnostic: Write the fitted carrier model directly as centered GRAY16.
-- `--carrier-retracted-only`: NTSC diagnostic: Write raw minus the promoted carrier model directly as GRAY16.
+- `--luma-witness`: *(deprecated — see `--y-election`)* Adds the `rcy` and `lsc` candidates. Requires `--ntsc-phase-comp`.
+- `--cross-color-return`: *(deprecated — see `--y-election`)* Adds the `ccr` candidate. Transfers detected false chroma back to Y, restoring high-frequency luma detail.
+
+#### NTSC Y-Election (locked mode)
+
+In locked mode (`--ntsc-phase-comp`) the decoder reconstructs high-frequency
+luma by letting several candidate reconstructions compete for each pixel,
+rather than committing to one. The comb's own coherent reconstruction always
+competes; `--y-election` names which others join it.
+
+- `--y-election <set>`: comma-separated candidate names, or a preset.
+
+| value | candidate | what it contributes |
+|---|---|---|
+| `ccr` | cross-colour return | False chroma transferred back to luma, restoring high-frequency detail that leaked into the chroma band. Carries the colour-side suppression it pairs with. |
+| `rcy` | retracted carrier Y | An independent view of luma, formed by subtracting a separately modelled carrier instead of the comb's. Contributes near-carrier detail the comb removes. |
+| `lsc` | lurch-sharpened coarse | A sharpened low-frequency platform, so a confirmed luma step lands on one column instead of smearing across four. |
+| `ntc` | notch-HF | A fixed-kernel notch candidate that estimates nothing — it reads the picture and a constant. Seated by default. |
+
+Presets:
+
+- `fast` — comb + `ntc`. The default roster.
+- `max` (or `archival`) — all four candidates. Best quality, slowest.
+
+Notes:
+
+- Implies `--ntsc-phase-comp`.
+- A set **fully replaces** the default roster, so `--y-election=rcy,lsc` runs
+  *without* the notch — something the older flags could not express.
+- Cost is not evenly spread. `rcy` and `lsc` bring up the carrier-retraction
+  machinery and dominate the runtime; `ntc` is nearly free.
+
+```bash
+# everything, without typing three flags
+ld-chroma-decoder -f ntsc3d --ntsc-phase-comp --y-election=max in.tbc out.y4m
+```
 
 #### NTSC-Specific 3D Options for Adaptive Threshold:
 - `-f ntsc3d`:  Default behavior (threshold = 1.0)

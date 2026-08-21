@@ -177,10 +177,10 @@ inline void demodSample(double v, int phaseIdx, int xi,
 Comb::Comb() : configurationSet(false) {}
 
 qint32 Comb::Configuration::getLookBehind() const {
-    return (dimensions == 3 && !diagnosticOnly()) ? 1 : 0;
+    return (dimensions == 3) ? 1 : 0;
 }
 qint32 Comb::Configuration::getLookAhead() const {
-    return (dimensions == 3 && !diagnosticOnly()) ? 1 : 0;
+    return (dimensions == 3) ? 1 : 0;
 }
 
 const Comb::Configuration &Comb::getConfiguration() const { return configuration; }
@@ -246,7 +246,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     // overhead at its previous level). Determinism holds: batch
     // composition depends only on queue order, never on thread count.
     qint32 preRollFields = 2;
-    if (configuration.dimensions == 3 && !configuration.diagnosticOnly())
+    if (configuration.dimensions == 3)
         preRollFields = 4;
     // Follows the retraction gate below: the certified chain needs the
     // look-behind, and starving it is the batch-head chain loss. This now
@@ -334,8 +334,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->buildLumaWitnessModel();
             }
 
-            if (!configuration.diagnosticOnly())
-                next->split2D();
+            next->split2D();
         } else {
             // Nothing to load into the recycled buffer, so whatever it still
             // holds belongs to an earlier call.  Say so, rather than leaving a
@@ -370,8 +369,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             current->buildIcebergReturn(pf, nf);
         }
 
-        if (configuration.dimensions == 3 &&
-            !configuration.diagnosticOnly()) {
+        if (configuration.dimensions == 3) {
             current->copy2DTo3D();
 
             if (temporalContextReady)
@@ -379,18 +377,9 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         }
 
         const qint32 frameIndex = (fieldIndex - startIndex) / 2;
-        componentFrames[frameIndex].init(videoParameters,
-                                         configuration.diagnosticOnly());
+        componentFrames[frameIndex].init(videoParameters);
         current->setComponentFrame(componentFrames[frameIndex]);
 
-
-        // Diagnostic fast path: witness/carrier analysis is complete before
-        // the comb/election render stages below. Publish the selected signal
-        // directly as monochrome output and skip the normal render path.
-        if (configuration.diagnosticOnly()) {
-            current->outputDiagnosticFrame();
-            continue;
-        }
 
         /*
          * Output path.

@@ -158,7 +158,14 @@ namespace {
 
         const double ireScale = (vp.white16bIre - vp.black16bIre) / 100.0;
         if (!(ireScale > 0.0)) return false;
-        const double outlierThreshCode = cfg.dgOutlierThreshIre * ireScale;
+        // Twin-disagreement threshold: above this the sample is CORRECTED
+        // from the good twin rather than averaged. 6.0 IRE is the author's
+        // value from the pre-VCS cadence_assembler (2025-12-11) and has never
+        // moved. It was briefly a user knob (--dg-outlier-thresh); the merge's
+        // per-sample arbitration was reworked since, and exposing the
+        // threshold is neither necessary nor desirable.
+        constexpr double kDgOutlierThreshIre = 6.0;
+        const double outlierThreshCode = kDgOutlierThreshIre * ireScale;
         const double maxOutlierFrac    = std::clamp(cfg.dgMaxOutlierFrac, 0.0, 1.0);
         if (!(outlierThreshCode >= 0.0)) return false;
 
@@ -622,7 +629,7 @@ void CadenceAssembler::handOffCaptureFrameToBaseline(int pos)
 
 void CadenceAssembler::push(const QVector<SourceField>& newFields)
 {
-    if (config.setCadence != 0 && !config.noPA) {
+    if (config.setCadence != 0 && !config.noCinemap) {
         if (config.reverseFieldOrder) {
             // -r delivers each capture frame second-field-first, so the field
             // stream arrives with every pair TRANSPOSED (seq 3,2,5,4,7,6...),
@@ -664,7 +671,7 @@ void CadenceAssembler::push(const QVector<SourceField>& newFields)
 
 void CadenceAssembler::flush()
 {
-    if (config.setCadence != 0 && !config.noPA) {
+    if (config.setCadence != 0 && !config.noCinemap) {
         processWindowForced(true);
     } else {
         processHistory(true);
@@ -967,7 +974,7 @@ int CadenceAssembler::findComplementPos(int i0) const {
 // spare was still in the next push cost one certified cover per batch.
 void CadenceAssembler::processWindowForced(bool flushMode)
 {
-    if (config.noPA) return;
+    if (config.noCinemap) return;
 
     const int start = forcedStartIndex();
 
@@ -1216,7 +1223,7 @@ void CadenceAssembler::processHistory(bool flushMode)
 // complement relationship; spare fields are merged where available.
 bool CadenceAssembler::tryExtractFilmFrameAtCursor()
 {
-    if (config.noPA) return false;
+    if (config.noCinemap) return false;
 
     const int i0 = nextUnconsumedIndex(cursor);
     if (i0 < 0) return false;

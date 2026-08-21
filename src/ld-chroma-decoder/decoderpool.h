@@ -128,7 +128,7 @@ struct StoredFieldPayload
 struct DecodeTicket
 {
     enum class Kind {
-        BaselinePair,   // passthrough / no-pa style result for exactly these homes
+        BaselinePair,   // passthrough / no-cinemap style result for exactly these homes
         UpgradePair     // telecine result that may improve these homes
     };
 

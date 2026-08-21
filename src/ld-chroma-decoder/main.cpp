@@ -252,21 +252,16 @@ int main(int argc, char *argv[])
 
     QCommandLineOption yElectionOption(QStringList() << "y-election",
         QCoreApplication::translate("main",
-            "NTSC locked mode: Y-election roster as a comma list of candidates "
-            "(ccr,rcy,lsc,ntc) or a preset (base, max, archival). comb is always "
-            "seated. Implies --ntsc-phase-comp. ice is reserved pending promotion."),
+            "NTSC locked mode: select which luma candidates compete to reconstruct "
+            "high-frequency detail. The comb's own reconstruction is the base; this "
+            "names what joins it. Comma list of: ccr (cross-colour return - false "
+            "chroma restored to luma), rcy (retracted carrier Y - the independent "
+            "witness view), lsc (lurch-sharpened coarse platform), ntc "
+            "(fixed-kernel notch; the default). Presets: fast = comb + ntc; max or "
+            "archival = all four, slowest. A set fully replaces the default roster"),
         QCoreApplication::translate("main", "set"));
     parser.addOption(yElectionOption);
 
-    QCommandLineOption carrierFitOnlyOption(QStringList() << "carrier-fit-only",
-        QCoreApplication::translate("main",
-            "NTSC diagnostic: output the fitted carrier model directly as centered GRAY16"));
-    parser.addOption(carrierFitOnlyOption);
-
-    QCommandLineOption carrierRetractedOnlyOption(QStringList() << "carrier-retracted-only",
-        QCoreApplication::translate("main",
-            "NTSC diagnostic: output raw minus the promoted carrier model directly as GRAY16"));
-    parser.addOption(carrierRetractedOnlyOption);
 
     QCommandLineOption adaptThresholdOption(QStringList() << "adapt-threshold",
         QCoreApplication::translate("main",
@@ -289,7 +284,9 @@ int main(int argc, char *argv[])
     QCommandLineOption twoDVariantOption(
         QStringList() << QCoreApplication::translate("main", "two-d-variant"),
         QCoreApplication::translate("main",
-            "2D comb variant: line | field-a-contour | field-b-simple | frame-a-adaptive-iq | frame-b-direct-iq | frame-c-direct-iq | fvf (default)"),
+            "Select 2D comb variant: line | fielda | fieldb | framea | frameb | "
+            "fvf (default). line=phase corrected 1D, Fields are intrafield, "
+            "Frames are interfield, FVF is an election amongst them"),
         QCoreApplication::translate("main", "variant"),
         QCoreApplication::translate("main", "fvf"));
     parser.addOption(twoDVariantOption);
@@ -298,56 +295,57 @@ int main(int argc, char *argv[])
     QCommandLineOption setCadenceOption(
         QStringList() << "set-cadence",
         QCoreApplication::translate("main",
-            "Impose a pulldown interpretation, overriding cadenceId metadata from CineMap. "
-            "The value is the position of THIS RENDER'S FIRST FRAME within the 5-frame "
-            "pulldown cycle, counted from 1: 1 means the render opens on the complete A "
-            "frame (CineMap's phase p0), 2 means one frame further into the cycle, and so "
-            "on to 5. Counted from --start, so a scoped re-render names its own opening "
-            "frame - which is how a multicadence composite is built, one render per "
-            "pattern. Nothing validates the choice: twins that disagree simply leave that "
-            "frame uncovered, and --dg-discard turns the merge off wholesale."),
+            "Impose a pulldown interpretation, overriding cadenceId metadata from "
+            "CineMap. Values are offsets of the pulldown cadence pattern, 1-5; "
+            "1=AA, 2=AB, 3=BC, 4=CC, 5=DD. Counted from --start, so a scoped "
+            "re-render names its own opening frame."),
         QCoreApplication::translate("main", "number"));
     parser.addOption(setCadenceOption);
 
     QCommandLineOption export24pOption(QStringList() << "export-24p",
-        QCoreApplication::translate("main", "Export 23.976 fps direct from consolidated telecine"
-        "- this version re-syncs to the original timing, trimming as needed)"));
+        QCoreApplication::translate("main",
+            "Export 23.976 fps direct from internal progressive processing. Default "
+            "performs per-segment synchronization with source tbc timing, dropping "
+            "frames as needed."));
     parser.addOption(export24pOption);
 
     // Max 24p option: emit every possible film frame (can be very long)
     QCommandLineOption emitMax24pOption(QStringList() << "emit-max-24p",
         QCoreApplication::translate("main",
-            "Use with --export-24p: outputs every film frame for which two opposite fields are available, "
-            "bypassing the per-segment resync (with trims) pass; thus produces longer, asynchronous output."));
+            "Use with --export-24p: outputs every film frame for which two opposite "
+            "fields are available, without regard to timing - this produces longer, "
+            "asynchronous output."));
     parser.addOption(emitMax24pOption);
 
     // Option to enable visual cadence debugging
     QCommandLineOption debugCadenceOption(QStringList() << "debug-cadence",
-                                    QCoreApplication::translate("main", "Overlay the detected film frame (A, B, C, D) as well as edit boundaries on the image. For assessing ld-cinemap errors"));
+                                    QCoreApplication::translate("main",
+                                        "Overlay film frame (A, B, C, D), or \"i\" for interlace, "
+                                        "\"P\" for progressive, and edit boundaries as stored in "
+                                        "metadata, assessing ld-cinemap errors"));
     parser.addOption(debugCadenceOption);
 
-    QCommandLineOption debugInterfieldFlipOption(QStringList() << "debug-interfield-flip",
-                                    QCoreApplication::translate("main", "NTSC locked mode: log per-leg benefit of carrier alignment on the ±1 interfield pair (center-relative counterfactual)"));
-    parser.addOption(debugInterfieldFlipOption);
-
     QCommandLineOption crossColorReturnOption(QStringList() << "cross-color-return",
-                                    QCoreApplication::translate("main", "NTSC locked mode: Transfers detected false chroma back to Y, restoring high-frequency luma detail. (omitted 0.0; bare flag 1.0 = the full measured fraction; 2.0 effective max)"),
+                                    QCoreApplication::translate("main", "NTSC locked mode: Transfers detected false chroma back to Y, restoring high-frequency luma detail."),
                                     QCoreApplication::translate("main", "number"));
     parser.addOption(crossColorReturnOption);
 
-    QCommandLineOption noPAOption(QStringList() << "no-pa",
-        QCoreApplication::translate("main", "Disable pulldown awareness - reverts to original 29.97 video process"));
-    parser.addOption(noPAOption);
+    // "Pulldown Awareness" was the original conceptual header for telecine
+    // handling (and the ld-decode-PA repo name). Retired in favour of
+    // ld-cinemap; "no-pa" survives only as an undocumented alias so existing
+    // invocations keep working.
+    QCommandLineOption noCinemapOption(QStringList() << "no-cinemap",
+        QCoreApplication::translate("main", "Disable telecine handling - reverts to original 29.97 video process"));
+    parser.addOption(noCinemapOption);
+    QCommandLineOption noPALegacyOption(QStringList() << "no-pa",
+        QCoreApplication::translate("main", "Deprecated alias for --no-cinemap"));
+    noPALegacyOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(noPALegacyOption);
 
     QCommandLineOption dgDiscardOption(QStringList() << "dg-discard",
         QCoreApplication::translate("main", "Skip pulldown consolidation and discard spare fields"
         " - trades quality for speed"));
     parser.addOption(dgDiscardOption);
-
-    QCommandLineOption dgOutlierOption(QStringList() << "dg-outlier-thresh",
-        QCoreApplication::translate("main", "When duplicate fields are merged, pixels are corrected instead of averaged when difference between twins is above this threshold (default 6 IRE)"),
-        QCoreApplication::translate("main", "number"));
-    parser.addOption(dgOutlierOption);
 
     // ---- PAL decoder options ----------
 
@@ -435,10 +433,11 @@ int main(int argc, char *argv[])
         cadenceConfig.export24p = true;
         outputConfig.export24p = true; // Tell output writer to use 24p mode
     }
-    if (parser.isSet(noPAOption)) cadenceConfig.noPA = true;
+    if (parser.isSet(noCinemapOption) || parser.isSet(noPALegacyOption))
+        cadenceConfig.noCinemap = true;
     if (parser.isSet(dgDiscardOption)) cadenceConfig.dgDiscard = true;
     // Parsed here, with the rest of the cadence options, because both the
-    // --no-pa conflict check below and the decoder construction that consumes
+    // --no-cinemap conflict check below and the decoder construction that consumes
     // combConfig happen before the end of option parsing. Sited further down, as
     // it was, it reached neither: the check could never fire and the comb never
     // learned the cadence was imposed.
@@ -459,9 +458,6 @@ int main(int argc, char *argv[])
                 val);
         std::fflush(stderr);
     }
-    if (parser.isSet(dgOutlierOption)) {
-        cadenceConfig.dgOutlierThreshIre = parser.value(dgOutlierOption).toDouble();
-    }
     if (parser.isSet(emitMax24pOption)) {
         cadenceConfig.emitMax24p = true;
         if (!parser.isSet(export24pOption)) {
@@ -473,10 +469,6 @@ int main(int argc, char *argv[])
         combConfig.debugCadence = true;
     }
 
-    if (parser.isSet(debugInterfieldFlipOption)) {
-        combConfig.debugInterfieldFlip = true;
-    }
-
     if (parser.isSet(crossColorReturnOption)) {
         const double v = parser.value(crossColorReturnOption).toDouble();
         if (v < 0.0) {
@@ -486,8 +478,8 @@ int main(int argc, char *argv[])
         combConfig.tunables.CC_SUPPRESSION_WEIGHT = v;
     }
 
-    if (cadenceConfig.noPA && cadenceConfig.setCadence != 0) {
-    qCritical() << "--set-cadence is incompatible with --no-pa (pulldown processing disabled)";
+    if (cadenceConfig.noCinemap && cadenceConfig.setCadence != 0) {
+    qCritical() << "--set-cadence is incompatible with --no-cinemap (telecine handling disabled)";
     return -1;
     }
     
@@ -589,25 +581,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    int diagnosticOptionCount = 0;
-    auto selectDiagnostic = [&](const QCommandLineOption &option,
-                                Comb::Configuration::DiagnosticOutput mode) {
-        if (parser.isSet(option)) {
-            combConfig.diagnosticOutput = mode;
-            diagnosticOptionCount++;
-        }
-    };
-    selectDiagnostic(carrierFitOnlyOption,
-        Comb::Configuration::DiagnosticOutput::CarrierFit);
-    selectDiagnostic(carrierRetractedOnlyOption,
-        Comb::Configuration::DiagnosticOutput::CarrierRetracted);
-
-    if (diagnosticOptionCount > 1) {
-        qCritical("Only one NTSC diagnostic output mode may be selected at a time");
-        return -1;
-    }
-
-    if (parser.isSet(ntscPhaseCompOption) || combConfig.diagnosticOnly()) {
+    if (parser.isSet(ntscPhaseCompOption)) {
         combConfig.phaseCompensation = true;
     }
 
@@ -633,7 +607,7 @@ int main(int argc, char *argv[])
             else if (tok == QLatin1String("rcy")) combConfig.yElection.rcy = true;
             else if (tok == QLatin1String("lsc")) combConfig.yElection.lsc = true;
             else if (tok == QLatin1String("ntc")) combConfig.yElection.ntc = true;
-            else if (tok == QLatin1String("base"))
+            else if (tok == QLatin1String("fast"))
                 combConfig.yElection.ntc = true;
             else if (tok == QLatin1String("max") ||
                      tok == QLatin1String("archival")) {
@@ -648,7 +622,7 @@ int main(int argc, char *argv[])
                 return -1;
             } else {
                 qCritical("--y-election: unknown candidate '%s' (valid: "
-                          "ccr, rcy, lsc, ntc; presets: base, max, "
+                          "ccr, rcy, lsc, ntc; presets: fast, max, "
                           "archival)", qPrintable(tok));
                 return -1;
             }
@@ -658,8 +632,7 @@ int main(int argc, char *argv[])
         combConfig.phaseCompensation = true;
     }
 
-    if (parser.isSet(lumaWitnessOption) ||
-        combConfig.diagnosticOnly()) {
+    if (parser.isSet(lumaWitnessOption)) {
         if (!combConfig.phaseCompensation) {
             qCritical("--luma-witness requires --ntsc-phase-comp");
             return -1;
@@ -761,11 +734,6 @@ int main(int argc, char *argv[])
         decoderName = "pal2d";
     }
 
-    if (combConfig.diagnosticOnly() && !decoderName.startsWith("ntsc")) {
-        qCritical("The selected diagnostic output mode requires an NTSC decoder");
-        return -1;
-    }
-    
     // Field B reason overlays can be shown in ntsc2d; the adaptive candidate
     // map still rides the same switch for ntsc3d.
     if (combConfig.showMap && decoderName != "ntsc3d" && decoderName != "ntsc2d") {
@@ -841,10 +809,6 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    if (combConfig.diagnosticOnly()) {
-        outputConfig.pixelFormat = OutputWriter::PixelFormat::GRAY16;
-    }
-    
     if (parser.isSet(outputPaddingOption)) {
         outputConfig.paddingAmount = parser.value(outputPaddingOption).toInt();
         if (outputConfig.paddingAmount < 1 || outputConfig.paddingAmount > 32) {

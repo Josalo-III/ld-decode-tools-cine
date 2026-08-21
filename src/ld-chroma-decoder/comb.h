@@ -75,7 +75,6 @@ public:
         bool   adaptive    = true; // If true, the 3D adaptive candidate selection is used.
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
-        bool   debugInterfieldFlip = false; // Log per-leg benefit of carrier alignment on ±1 interfield pair
         // --set-cadence is live. The /AA-is-film, A/A-is-not, A/B-drops-the-A
         // rule for edit boundaries belongs to the AUTOSOLVE, which is reasoning
         // from evidence it trusts. A jam is a different beast: the typical
@@ -102,12 +101,6 @@ public:
             bool ice = false;   // RESERVED: iceberg, not yet promoted
         };
         YElection yElection;
-        enum class DiagnosticOutput {
-            None,
-            CarrierFit,
-            CarrierRetracted
-        };
-        DiagnosticOutput diagnosticOutput = DiagnosticOutput::None;
 
         // Per-axis product gains: multipliers applied to locked I and Q before
         // filtering.  This is the sole authority for product tuning — do not
@@ -160,9 +153,6 @@ public:
 
         qint32 getLookBehind() const;
         qint32 getLookAhead()  const;
-        bool diagnosticOnly() const {
-            return diagnosticOutput != DiagnosticOutput::None;
-        }
         struct Tunables {
             // =========================================================================
             // 1D / Lateral baseline
@@ -499,7 +489,6 @@ public:
 	// licensed recovered-luma sample was published.
 	bool buildIcebergReturn(const FrameBuffer *prevF,
 	                       const FrameBuffer *nextF);
-	void outputDiagnosticFrame();
 
 	void lurchSharpenCoarsePrior(const double *means,
 	                             int meanCount,
