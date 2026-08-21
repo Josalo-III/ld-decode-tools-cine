@@ -17,6 +17,11 @@ We detect edits and telecine pulldown in a new tool, ld-cinemap, best run after 
 The new ld-chroma-decoder expands the options when --ntsc-phase-comp is enabled. The phase-corrected 1D source feeds the ordinary full-band 1D/2D/3D scalar comb ladder; the exact selected scalar is then subtracted from raw for coherent Y, while separately centred I and Q pass through bandwidth-tailored FIRs before rotation. Optional luma-witness and cross-color-return views can challenge only the elected HF band. Before comb is where the Cadence Assembler will merge telecine's duplicate fields for improving SNR, and also diff the duplicates for error correction. The process can follow metadata written by ld-cinemap, or alternatively the user can force a telecine pattern in the cli with --set-cadence. The default sends out the same frames that came in, but is processed as 24p where ever possible, so that every field that can be is upgraded. For --export-24p mode, Assembler resyncs each segment by default to compensate for excess frames due to 29.97 edits offset from film frames boundaries. User can override to get every frame and go long with --emit-max24p. Alternatively, all telecine handling can be disabled with --no-PA (PA is for pulldown awareness).
 
 The new 2D comb section is a complex election between different combs: the interfield "Frame" combs are favored for progressive footage (including telecine), while the "Field" intrafield combs, are favored for interlaced material (as detected in ld-cinemap, or otherwise via field differencing). The user can pick the Field vs Frame election or any of its constituent combs via --two-d-variant. 3D now has a 2D similarity curve, favoring next and previous as they near current, but vetoing them if they drift too far; this removes many checkerboard errors and sharpens the comb. With the rebase, the new 3D controls in 7.2 have been rigged to this mechanism.
+### Feedback / Questions
+Reach out to me on Discord if you have any questions or feedback on the code:
+
+
+[![Discord](https://img.shields.io/badge/Discord-@Josalo--III-5865F2?logo=discord&logoColor=white)](https://discordapp.com/users/662030236522643476)
 
 ## Tool Categories
 
