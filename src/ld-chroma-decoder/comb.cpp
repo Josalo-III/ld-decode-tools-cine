@@ -599,7 +599,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             // cheap baseY4 floor. Allocate sharp only under witness so the
             // baseline path pays neither its buffer nor its build. baseY4 and
             // the geometry-only smooth/hDelta services stay unconditional.
-            if (configuration.lumaWitness)
+            if (configuration.yElection.lsc)
                 lockedLumaSharp_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             else
                 lockedLumaSharp_flat.clear();

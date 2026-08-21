@@ -89,6 +89,19 @@ public:
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
         bool lumaWitness = false;
+        // Y-election roster (--y-election, 2026-08-20). comb is always
+        // seated and is not a member. Bare default reproduces the historic
+        // no-flag render (notch-HF seated, rest off). lumaWitness above is
+        // DERIVED in main.cpp as (rcy || lsc) -- the witness machinery
+        // serves both; nothing below main sets it independently.
+        struct YElection {
+            bool ccr = false;   // cross-colour return pair (Y return + mask)
+            bool rcy = false;   // retracted carrier Y (witness candidate)
+            bool lsc = false;   // lurch-sharpened coarse platform
+            bool ntc = true;    // notch-HF candidate (uncovered frames only)
+            bool ice = false;   // RESERVED: iceberg, not yet promoted
+        };
+        YElection yElection;
         enum class DiagnosticOutput {
             None,
             CarrierFit,

@@ -521,7 +521,7 @@ void Comb::FrameBuffer::phaseLocked()
         // column instead of smearing across four. The gate is scaled by the
         // sweep level.
         const bool buildSharp =
-            configuration.lumaWitness && !lockedLumaSharp_flat.empty();
+            configuration.yElection.lsc && !lockedLumaSharp_flat.empty();
 
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
@@ -6418,9 +6418,10 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // reasoning from either. The seat rests on the notch's construction
     // independence and on the roster arithmetic above, neither of which is a
     // fidelity claim.
-    static const bool notchCandidate = []{
-        const char *s = std::getenv("LDCD_Y_NOTCH");
-        return !(s && std::atoi(s) == 0);
+    const bool notchCandidate = [&]{
+        const char *s = std::getenv("LDCD_Y_NOTCH");   // A/B override wins
+        if (s) return std::atoi(s) != 0;
+        return configuration.yElection.ntc;            // roster (--y-election)
     }();
     // CERTIFIED CEDE for the notch (user, 2026-08-09: "pulling notch out
     // of covered frames altogether, given its ungovernability"): the same
@@ -6770,7 +6771,11 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
         // is false on every frame and the feature could never appear on the
         // very footage a user enables it for.
         const bool coveredFrame = frameHasExactCoverage();
-        const float *retractedRow = carrierRetractedValid
+        // The roster owns the seat (--y-election rcy): the witness machinery
+        // may be running for lsc alone, and a running plane is not a seated
+        // candidate.
+        const float *retractedRow =
+            (carrierRetractedValid && configuration.yElection.rcy)
             ? carrierRetracted_line(line) : nullptr;
         const float *ccMaskRow = lockedCcMask_line(line);
         const float *icebergYRow = icebergRecoveredY_line(line);
@@ -6993,7 +6998,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             // authority and defines the top-band coordinate. No second coarse
             // is mixed into reconstruction.
             const bool useSharpCoarse =
-                configuration.lumaWitness && !lockedLumaSharp_flat.empty();
+                configuration.yElection.lsc && !lockedLumaSharp_flat.empty();
             auto coarseFloor_line = [&](int l) -> const double * {
                 return useSharpCoarse ? lockedLumaSharp_line(l)
                                       : lockedLumaBaseY4_line(l);

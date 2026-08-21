@@ -246,8 +246,17 @@ int main(int argc, char *argv[])
 
     QCommandLineOption lumaWitnessOption(QStringList() << "luma-witness",
         QCoreApplication::translate("main",
-            "NTSC locked mode: enable the carrier-retraction luma path and diagnostics"));
+            "NTSC locked mode: enable the carrier-retraction luma path and diagnostics "
+            "(deprecated alias for --y-election members rcy,lsc)"));
     parser.addOption(lumaWitnessOption);
+
+    QCommandLineOption yElectionOption(QStringList() << "y-election",
+        QCoreApplication::translate("main",
+            "NTSC locked mode: Y-election roster as a comma list of candidates "
+            "(ccr,rcy,lsc,ntc) or a preset (base, max, archival). comb is always "
+            "seated. Implies --ntsc-phase-comp. ice is reserved pending promotion."),
+        QCoreApplication::translate("main", "set"));
+    parser.addOption(yElectionOption);
 
     QCommandLineOption carrierFitOnlyOption(QStringList() << "carrier-fit-only",
         QCoreApplication::translate("main",
@@ -602,14 +611,74 @@ int main(int argc, char *argv[])
         combConfig.phaseCompensation = true;
     }
 
+    // ---- Y-election roster resolution (2026-08-20) ----
+    // --y-election=SET fully specifies the roster (replacing the bare
+    // default of {ntc}); the legacy flags then OR their members in, so a
+    // legacy invocation is byte-identical to its historic render and
+    // combining forms never subtracts. ccr's strength scalar is retired:
+    // the committed verdict is binary, no measurement ever supported an
+    // intermediate value, and the knob's only lawful settings were 0 and 1.
+    if (parser.isSet(yElectionOption)) {
+        combConfig.yElection = Comb::Configuration::YElection{};
+        combConfig.yElection.ntc = false;
+        const QStringList toks = parser.value(yElectionOption)
+            .toLower().split(QLatin1Char(','), Qt::SkipEmptyParts);
+        if (toks.isEmpty()) {
+            qCritical("--y-election: empty set");
+            return -1;
+        }
+        for (const QString &t : toks) {
+            const QString tok = t.trimmed();
+            if      (tok == QLatin1String("ccr")) combConfig.yElection.ccr = true;
+            else if (tok == QLatin1String("rcy")) combConfig.yElection.rcy = true;
+            else if (tok == QLatin1String("lsc")) combConfig.yElection.lsc = true;
+            else if (tok == QLatin1String("ntc")) combConfig.yElection.ntc = true;
+            else if (tok == QLatin1String("base"))
+                combConfig.yElection.ntc = true;
+            else if (tok == QLatin1String("max") ||
+                     tok == QLatin1String("archival")) {
+                combConfig.yElection.ccr = true;
+                combConfig.yElection.rcy = true;
+                combConfig.yElection.lsc = true;
+                combConfig.yElection.ntc = true;
+            } else if (tok == QLatin1String("ice")) {
+                qCritical("--y-election: 'ice' is reserved -- the iceberg "
+                          "vector process is not yet promoted to an "
+                          "election consumer");
+                return -1;
+            } else {
+                qCritical("--y-election: unknown candidate '%s' (valid: "
+                          "ccr, rcy, lsc, ntc; presets: base, max, "
+                          "archival)", qPrintable(tok));
+                return -1;
+            }
+        }
+        // A roster is meaningless in bucket mode; asking for one asks for
+        // the locked path.
+        combConfig.phaseCompensation = true;
+    }
+
     if (parser.isSet(lumaWitnessOption) ||
         combConfig.diagnosticOnly()) {
         if (!combConfig.phaseCompensation) {
             qCritical("--luma-witness requires --ntsc-phase-comp");
             return -1;
         }
-        combConfig.lumaWitness = true;
+        combConfig.yElection.rcy = true;
+        combConfig.yElection.lsc = true;
     }
+    if (combConfig.tunables.CC_SUPPRESSION_WEIGHT > 0.0) {
+        if (combConfig.tunables.CC_SUPPRESSION_WEIGHT != 1.0)
+            qInfo("--cross-color-return: the strength value is retired; "
+                  "the committed verdict is binary. Using 1.0.");
+        combConfig.yElection.ccr = true;
+    }
+    // Derivations: the witness machinery serves rcy and lsc; the ccr pair
+    // engages at exactly 1.0 or not at all.
+    combConfig.lumaWitness =
+        combConfig.yElection.rcy || combConfig.yElection.lsc;
+    combConfig.tunables.CC_SUPPRESSION_WEIGHT =
+        combConfig.yElection.ccr ? 1.0 : 0.0;
 
     if (parser.isSet(adaptThresholdOption)) {
         const double v = parser.value(adaptThresholdOption).toDouble();
