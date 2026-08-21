@@ -5868,9 +5868,49 @@ void Comb::FrameBuffer::buildNotchHfCurves(
         envObs[xi] = std::hypot(bp[xi], bp[std::min(xi + 1, w - 1)]);
     lddecode::projectExpressibleChromaEnvelope(
         envObs.data(), nullptr, w, envLaw.data());
+    // A/B ESCAPE FOR THE ONE-WAY BIAS (LDCD_ENV_UNBIASED=1, 2026-08-19,
+    // author-authorised). Default is UNCHANGED -- the exclusion-only hull.
+    // Set the flag and this becomes the actual band-limiting projection,
+    // envLaw/envObs, unbiased in expectation and able to take carrier OUT
+    // of Y as well as leave it in. That asymmetry is the whole question:
+    // see the retained wLaw census immediately below (mean 0.924, a 7.6%
+    // one-way attenuation = 7.6% of the carrier left in Y as cross-luma).
+    //
+    // TRUTH-REFERENCED MOTIVATION (2026-08-19). Certified def lines carry
+    // Y = raw - exact through the early-out, so the same lines rendered
+    // under --dg-discard give the estimator's error against a conservation
+    // fact, with no probe in the loop. Claimed carrier envelope over
+    // certified, |C| > 2 IRE, Gilgol beach, 10 covered frames:
+    //
+    //     |d|C|/dx|      claim/truth p50     fraction under-claiming
+    //       0-2 codes         0.996                 52.3%   <- a coin toss
+    //       2-5               0.976                 59.3%
+    //       5-10              0.918                 69.9%
+    //      10+                0.911                 67.8%
+    //
+    // Unbiased on flat chroma; ~9% of the true carrier left in Y at big
+    // chroma deltas. Same one-way shape and very nearly the same magnitude
+    // as this limiter's own 0.924. Whether they are the same defect is
+    // what the flag exists to decide -- the fit's inability to corner
+    // produces a similar signature and both are present.
+    //
+    // PRECEDENT: the 1D envelope hull was removed 2026-07-25 for this
+    // exact mechanism on this exact feature (see the beach-strap note at
+    // the restrainedLine publish: hull on 148 rms / peak 1383, hull off
+    // 83 / 230). This is the one-way hull that survived it.
+    //
+    // The 4.0 is a NUMERIC ceiling only -- envObs near a null would
+    // otherwise divide into an unbounded claim. It is not a policy hull
+    // and must not be tuned as one.
+    static const bool envUnbiased = []{
+        const char *s = std::getenv("LDCD_ENV_UNBIASED");
+        return s && std::atoi(s) != 0;
+    }();
     for (int xi = 0; xi < w; ++xi)
         if (envObs[xi] > 1e-9)
-            wLaw[xi] = std::min(1.0, envLaw[xi] / envObs[xi]);
+            wLaw[xi] = envUnbiased
+                ? std::min(4.0, envLaw[xi] / envObs[xi])
+                : std::min(1.0, envLaw[xi] / envObs[xi]);
 
     // RETAINED RECORD from the removed LDCD_PROBE_WLAW census
     // (2026-08-11, 514k samples with real band energy, cube segment).
@@ -6043,6 +6083,22 @@ void Comb::FrameBuffer::buildBandFacts()
             pQRow[x] = (sWt > 1e-12) ? (float)(sQ / sWt) : 0.0f;
         }
     }
+}
+
+// TEMPORARY INSTRUMENT: in vector mode (the default; LDCD_ICE_LEGACY=1
+// restores the snip path) the iceberg plane holds an ADDITIVE CORRECTION to
+// the incumbent estimate, not a complete luma value (author, 2026-08-20:
+// "the estimate from comb and other signals constitute another anchor ...
+// that our iceberg vector can correct"). Consumers must ask which semantic
+// is live; the legacy CCR consumers read complete-Y and stand down in
+// correction mode until the semantics are resolved at promotion.
+static bool ldcdIceVectorMode()
+{
+    static const bool v = []{
+        const char *e = std::getenv("LDCD_ICE_LEGACY");
+        return !(e && std::atoi(e) != 0);
+    }();
+    return v;
 }
 
 void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
@@ -6269,11 +6325,22 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // group. Two corrections are recorded here because the gate this
     // replaces was wrong on both counts:
     //
-    // First, the case for these planes is LINEAGE, not the checkerboard.
-    // comb, retracted and returned all descend from one IQ lineage, so they
-    // can agree for a common reason rather than a corroborating one; the
-    // notch group is the only entry on the ballot that reads raw and a
-    // constant. A long arc tested whether it cured the uncovered Nyquist
+    // First, the case for these planes is CONSTRUCTION INDEPENDENCE, not
+    // the checkerboard. comb and returned share one lineage -- returned is
+    // built FROM comb -- so those two can agree for a common reason rather
+    // than a corroborating one; the notch group is the only entry on the
+    // ballot that reads raw and a constant.
+    //
+    // RETRACTED IS NOT IN THAT FAMILY (author, 2026-08-19): "retracted was
+    // created as a completely independent view, designed for the purpose of
+    // presenting none of 1D's error classes." The sentence that stood here
+    // claimed comb, retracted and returned all descend from one IQ lineage.
+    // It is false by design intent, and the catalog had already convicted
+    // the same sentence once -- it describes LDCD_RETRACTED_SOURCE=2, a mode
+    // nobody runs. Measured 2026-08-19 on covered comp lines: comb and
+    // retracted stand 1.07 IRE rms apart, so they neither agree nor dedup.
+    //
+    // A long arc tested whether it cured the uncovered Nyquist
     // excess, found the excess is COMMON-MODE across every estimator
     // (comb 1314 / retracted 1278 / elected 1270 absolute, spread <= 3.5%)
     // and correctly concluded that no seating can remove it -- then wrongly
@@ -6359,14 +6426,22 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // of covered frames altogether, given its ungovernability"): the same
     // rule every comb candidate carries, in the only shape a raw-only
     // kernel can carry it. On a covered frame the def lines are fact
-    // (the early-out below) and the comp lines' candidates all descend
-    // from the certified ladder, so they dedup into ONE roster entry —
-    // which made the notch the lone dissenter with its largest blend
+    // (the early-out below), so the notch's whole remaining reach was the
+    // comp lines, where it stood as the lone raw-only dissenter with its
+    // largest blend
     // share exactly where the material is already separated, and its
     // touch, confined to every other line, rendered as interline
     // alternation on the certified fields. A plane that cannot inherit
     // certification has no franchise on a covered frame. Per-frame, never
     // per-line: uniform provenance.
+    //
+    // This paragraph used to credit the cede to the comp lines' candidates
+    // "all descending from the certified ladder" and deduping into one
+    // roster entry. They do not dedup -- measured 2026-08-19, comb and
+    // retracted 1.07 IRE rms apart on covered comp lines -- and retracted
+    // shares no lineage with comb by design. The cede is right; that reason
+    // for it was not, and the same false premise is precisely what let the
+    // WITNESS keep a covered-frame franchise until 2026-08-19.
     const bool notchLive = notchCandidate && !frameHasExactCoverage();
     // Blindness scale for the notch's alpha withdrawal, IRE. Tight by
     // design: chromaT treats 10 IRE as high chroma, and the notch's own
@@ -6542,6 +6617,144 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
         double *Y = componentFrame->y(line);
         const double *clpLine = clpbuffer[srcBuf].pixel[line];
         const double *carrierComp = lockedCarrierComposite_line(line);
+
+        // TEMPORARY INSTRUMENT (LDCD_ATTR_VIEW=1, 2026-08-20). The
+        // attributed-carrier construction, round 1, emitted through an
+        // inspection port for the selective-denial harness to grade. NOT a
+        // seat, NOT policy; strip or promote on the harness verdict.
+        //
+        // Design (author, 2026-08-19/20): at a strong chroma boundary the
+        // true carrier corners faster than any aperture. The encoder made
+        // that boundary by filtering the colour-difference pair with its own
+        // 9-tap kernel, so the LAWFUL carrier across it is two coordinate
+        // pairs joined by that kernel's step response -- nothing else. The
+        // construction measures (I,Q) on each side from interior windows
+        // (2 full cycles, offsets 3..10), locates the boundary by fitting
+        // the modelled carrier against the UNSMOOTHED composite residual
+        // (raw minus a legal 4-mean -- composite is the reference; the
+        // ±2-smoothed bandpass is the plateau under indictment), and
+        // publishes the modelled carrier across ±4 of the fitted boundary.
+        // Round 1 is unscaled by the witness panel (eligibility, parallax,
+        // iceberg): grade the bare construction first, add verdicts second.
+        static const bool attrView = []{
+            const char *e = std::getenv("LDCD_ATTR_VIEW");
+            return e && std::atoi(e) != 0;
+        }();
+        std::vector<double> attrC;
+        std::vector<std::uint8_t> attrOn;
+        if (attrView && !frameHasExactCoverage() &&
+            configuration.phaseCompensation) {
+            const CombCarrierGrammar *gr = carrierGrammarLine(line);
+            lddecode::CarrierGrammarDemodCoefficients dc;
+            if (gr && lddecode::carrierGrammarLockedDemodCoefficients(
+                          gr, left, dc)) {
+                attrC.assign(width, 0.0);
+                attrOn.assign(width, 0);
+                // Composite residual against a legal 4-mean and its
+                // unsmoothed point envelope.
+                std::vector<double> r(width, 0.0), E(width, 0.0),
+                    Es(width, 0.0), ti(width, 0.0), tq(width, 0.0);
+                for (int x = 0; x < width; ++x) {
+                    const int h = left + x;
+                    if (h - 1 < 0 || h + 2 >= fullWidth) continue;
+                    const double m = 0.25 *
+                        ((double)rawLine[h - 1] + (double)rawLine[h] +
+                         (double)rawLine[h + 1] + (double)rawLine[h + 2]);
+                    r[x] = (double)rawLine[h] - m;
+                    lddecode::carrierGrammarLockedDemodCoefficients(
+                        gr, h, dc);
+                    ti[x] = dc.ti; tq[x] = dc.tq;
+                }
+                for (int x = 0; x + 1 < width; ++x)
+                    E[x] = std::hypot(r[x], r[x + 1]);
+                for (int x = 1; x + 1 < width; ++x)
+                    Es[x] = 0.25 * (E[x - 1] + 2.0 * E[x] + E[x + 1]);
+                // Step response of the encoder kernel, fractional lookup.
+                static const std::array<double, 10> stepCum = []{
+                    std::array<double, 10> c{}; double t = 0.0;
+                    for (int j = 0; j < lddecode::kChromaEnvelopeTaps; ++j)
+                        t += lddecode::kChromaEnvelopeFilter[j];
+                    double a = 0.0; c[0] = 0.0;
+                    for (int j = 0; j < lddecode::kChromaEnvelopeTaps; ++j) {
+                        a += lddecode::kChromaEnvelopeFilter[j] / t;
+                        c[j + 1] = a;
+                    }
+                    return c;
+                }();
+                auto stepAt = [&](double d) -> double {
+                    const double u = d + 4.5;   // tap centres at -4..+4
+                    if (u <= 0.0) return 0.0;
+                    if (u >= 9.0) return 1.0;
+                    const int j = (int)u;
+                    const double f = u - j;
+                    return stepCum[j] + f * (stepCum[std::min(j + 1, 9)] -
+                                             stepCum[j]);
+                };
+                const double stepThr = 5.0 * irescale;
+                const double hiThr   = 10.0 * irescale;
+                int lastB = -100;
+                for (int x = 12; x < width - 13; ++x) {
+                    const double g  = Es[x + 2] - Es[x - 2];
+                    const double gl = Es[x + 1] - Es[x - 3];
+                    const double gr2 = Es[x + 3] - Es[x - 1];
+                    if (std::fabs(g) < stepThr) continue;
+                    if (std::fabs(g) < std::fabs(gl) ||
+                        std::fabs(g) < std::fabs(gr2)) continue;
+                    double hi = 0.0;
+                    for (int k = -3; k <= 3; ++k)
+                        hi = std::max(hi, Es[x + k]);
+                    if (hi < hiThr) continue;
+                    if (x - lastB < 8) continue;
+                    lastB = x;
+                    // Side coordinates from 2-cycle interior windows.
+                    // Least-squares projection against the basis's own
+                    // power -- convention-free whatever amplitude the fused
+                    // LUT carries. (A fixed 2x demod assumption measured the
+                    // model 3.09x hot with corr +0.82: right shape, wrong
+                    // ruler.)
+                    double sIa = 0, sQa = 0, sIb = 0, sQb = 0;
+                    double nTa = 0, nQa2 = 0, nTb = 0, nQb2 = 0;
+                    for (int k = 3; k <= 10; ++k) {
+                        sIa += r[x - k] * ti[x - k];
+                        sQa += r[x - k] * tq[x - k];
+                        nTa += ti[x - k] * ti[x - k];
+                        nQa2 += tq[x - k] * tq[x - k];
+                        sIb += r[x + k] * ti[x + k];
+                        sQb += r[x + k] * tq[x + k];
+                        nTb += ti[x + k] * ti[x + k];
+                        nQb2 += tq[x + k] * tq[x + k];
+                    }
+                    if (nTa < 1e-9 || nQa2 < 1e-9 ||
+                        nTb < 1e-9 || nQb2 < 1e-9) continue;
+                    const double Ia = sIa / nTa, Qa = sQa / nQa2;
+                    const double Ib = sIb / nTb, Qb = sQb / nQb2;
+                    // Boundary position: fit the modelled carrier against
+                    // the composite residual over the transition.
+                    double bestJ = 1e300, bestX0 = (double)x;
+                    for (double x0 = x - 2.0; x0 <= x + 2.0; x0 += 0.25) {
+                        double J = 0.0;
+                        for (int u = -4; u <= 4; ++u) {
+                            const int xx = x + u;
+                            const double Sv = stepAt(xx - x0);
+                            const double Cm =
+                                (Ia + (Ib - Ia) * Sv) * ti[xx] +
+                                (Qa + (Qb - Qa) * Sv) * tq[xx];
+                            const double d = r[xx] - Cm;
+                            J += d * d;
+                        }
+                        if (J < bestJ) { bestJ = J; bestX0 = x0; }
+                    }
+                    for (int u = -4; u <= 4; ++u) {
+                        const int xx = x + u;
+                        const double Sv = stepAt(xx - bestX0);
+                        attrC[xx] =
+                            (Ia + (Ib - Ia) * Sv) * ti[xx] +
+                            (Qa + (Qb - Qa) * Sv) * tq[xx];
+                        attrOn[xx] = 1;
+                    }
+                }
+            }
+        }
 
         // --luma-witness IS the access to this candidate, and the only gate
         // it needs (author, 2026-08-08). carrierRetractedValid now tracks the
@@ -6854,7 +7067,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     const double comb = (double)rawLine[hh] -
                         (std::isfinite(c) ? c : 0.0);
                     const double m = std::clamp((double)ccMaskRow[xx], 0.0, 1.0);
-                    if (!coveredFrame && icebergYRow && icebergWRow &&
+                    if (!coveredFrame && !ldcdIceVectorMode() &&
+                        icebergYRow && icebergWRow &&
                         std::isfinite((double)icebergYRow[xx])) {
                         const double iw = icebergPolicyWeight * std::clamp(
                             (double)icebergWRow[xx], 0.0, 1.0);
@@ -6902,14 +7116,18 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 } else if (plane == 5) {
                     // Fixed-kernel notch: cos^2(w) = [1,0,2,0,1]/4 on raw.
                     //
-                    // The one contestant with NO lineage. No fit, no mask, no
-                    // phase solve, nothing estimated -- it reads raw and a
-                    // constant, so it carries no per-pixel claim that can be
-                    // wrong, and its behaviour is known in closed form at
-                    // every frequency. That independence is the whole case
-                    // for it: comb, retracted and returned all descend from
-                    // one IQ lineage and can therefore agree for a common
-                    // reason rather than a corroborating one.
+                    // The one contestant with NO estimate inside it. No fit,
+                    // no mask, no phase solve, nothing estimated -- it reads
+                    // raw and a constant, so it carries no per-pixel claim
+                    // that can be wrong, and its behaviour is known in closed
+                    // form at every frequency. That is the whole case for it:
+                    // comb and returned share one lineage -- returned is built
+                    // FROM comb -- and can therefore agree for a common reason
+                    // rather than a corroborating one. RETRACTED IS NOT IN
+                    // THAT FAMILY: it is an independent view by design, built
+                    // to present none of 1D's error classes (author,
+                    // 2026-08-19). The claim that it descends from comb's IQ
+                    // lineage stood here and was false.
                     //
                     // WHY THE SQUARE. The bare [1,0,1]/2 notch is |cos w| in
                     // MAGNITUDE but cos w in SIGN, and cos w is NEGATIVE from
@@ -7561,17 +7779,70 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // It joins the return policy after the legacy detector audit;
                 // the audit grades that detector, not the independent matched-
                 // luma construction.
-                if (!coveredFrame && icebergYRow && icebergWRow &&
+                if (!coveredFrame && !ldcdIceVectorMode() &&
+                    icebergYRow && icebergWRow &&
                     std::isfinite((double)icebergYRow[xi])) {
                     const double iceReturn = icebergPolicyWeight * std::clamp(
                         (double)icebergWRow[xi], 0.0, 1.0);
                     ccReturn = std::max(ccReturn, iceReturn);
                 }
-                // A mask buffer exists for the whole frame whenever the feature
-                // is enabled. Do not let that allocation alone activate the
-                // larger election at an unmarked pixel when no retracted luma
-                // plane otherwise requires it.
-                if (!retractedRow && ccReturn <= 0.0) {
+                // THE SAME DOOR AS THE LINE GATE, AT PIXEL SCOPE.
+                //
+                // This read `!retractedRow && ccReturn <= 0.0` -- comb wins by
+                // default unless one of two OPTIONAL planes is present. Its
+                // stated purpose is sound and is kept: a mask ALLOCATION must
+                // not by itself convene the expensive election at a pixel that
+                // has no challenger. But absence-of-those-two is not the same
+                // fact as absence-of-a-challenger, and once notch-hf took a
+                // seat this door was refusing it entry -- measured, seat count
+                // exactly 0 on every uncovered frame with notchLive true on
+                // every line.
+                //
+                // So the question is asked directly instead: is there anyone
+                // for comb to run against? Each optional member answers for
+                // itself, which is the same discipline the roster below uses,
+                // and a member added later is admitted by naming itself here
+                // rather than by a future reader noticing this line.
+                const bool notchSeatable =
+                    notchLive && !nhHeard.empty() && nhHeard[xi];
+                // A COVERED FRAME HOLDS NO ELECTION (author, 2026-08-19:
+                // "witness needs to only apply to uncovered like everything
+                // else ... interfield 2D comb uplifts the comp and afterwards
+                // we are satisfied there").
+                //
+                // The certified early-out above already cedes DEF lines to
+                // fact. Left at that, it is a per-LINE cure on a lattice that
+                // alternates BY LINE: def lines emit truth and skip the
+                // election entirely, while comp lines run the full election
+                // with the witness on the ballot and the sharpened platform
+                // under it. Provenance keyed on line parity is the parity law
+                // broken by construction, and it measured as a one-parity
+                // rewrite -- covered frame, bikini strap zone, --luma-witness
+                // against the same render without it:
+                //
+                //     even lines  1.07 IRE rms, 11.16 IRE peak
+                //     odd  lines  0.0000        BIT-IDENTICAL
+                //
+                // which beads the shoulder straps that the witness-free
+                // render carries clean.
+                //
+                // On a covered frame the comp lines have already been combed
+                // against certified def neighbours, so combY is the settled
+                // answer and an election can only dilute it. This withdraws
+                // no facts: the def lines' fact is emitted by the early-out
+                // above, and every candidate withdrawn here is an estimate.
+                //
+                // NOTE THE POLARITY against the coverage gate deleted from
+                // the retracted row above. That gate demanded coverage BEFORE
+                // the witness could be heard, which silenced it on interlaced
+                // footage where no frame is ever covered. This is the
+                // converse and leaves that material untouched:
+                // frameHasExactCoverage() is false on every interlaced frame,
+                // so the election runs there exactly as it does today.
+                const bool haveChallenger =
+                    !coveredFrame &&
+                    (retractedRow || ccReturn > 0.0 || notchSeatable);
+                if (!haveChallenger) {
                     Y[h] = combY;
                     continue;
                 }
@@ -8657,17 +8928,58 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     if (ref - Y[h] > tau) Y[h] = ref;
                 }
             }
-        } else if (carrierComp) {
-            for (int h = left; h < right; ++h) {
-                const double c = carrierComp[h - left];
-                Y[h] = std::isfinite(c)
-                    ? (double)rawLine[h] - c
-                    : (double)rawLine[h] - clpLine[h];
-            }
         } else {
+            // No comb on this line at all, so there is no senior hypothesis
+            // and no band reference -- the one case the election cannot be
+            // held. The bare `raw - carrierComp` branch that used to sit here
+            // is gone with the door above: it was where every default locked
+            // render actually landed, and its predicate is now the election's
+            // own. A line reaching this point has no carrier estimate of any
+            // kind, so it takes the split's scalar directly.
             for (int h = left; h < right; ++h) {
                 const double c = clpLine[h];
                 Y[h] = std::isfinite(c) ? (double)rawLine[h] - c : (double)rawLine[h];
+            }
+        }
+
+        // TEMPORARY INSTRUMENT (LDCD_ATTR_VIEW): emit the attributed
+        // construction AS Y at licensed samples, after every Y branch and
+        // before the star footprint pass, so the star's zero still wins on
+        // its own ground. Inspection port; bypasses the election by design.
+        if (!attrOn.empty()) {
+            for (int x = 0; x < width; ++x)
+                if (attrOn[x])
+                    Y[left + x] = (double)rawLine[left + x] - attrC[x];
+        }
+
+        // TEMPORARY INSTRUMENT (LDCD_ICE_VIEW=1, 2026-08-20): emit the
+        // iceberg LUMA DETERMINATION as Y wherever it published a value and
+        // a nonzero licence -- the luma-forward inversion of the falsified
+        // carrier-first round 1, per the doctrine reiterated 2026-08-20:
+        // "we are determining with iceberg what carrier-free luma looks
+        // like; carrier can then come from subtraction." Inspection port,
+        // bypasses the election and the CCR policy scalar; one view at a
+        // time; strip with the harness.
+        static const bool iceView = []{
+            const char *e = std::getenv("LDCD_ICE_VIEW");
+            return e && std::atoi(e) != 0;
+        }();
+        if (iceView && icebergYRow && icebergWRow) {
+            const bool vecCorr = ldcdIceVectorMode();
+            for (int h = left; h < right; ++h) {
+                const int xx = h - left;
+                if (!(icebergWRow[xx] > 0.0f) ||
+                    !std::isfinite((double)icebergYRow[xx])) continue;
+                if (vecCorr) {
+                    // Additive correction on the incumbents' own Y --
+                    // observation everywhere, the modelled sliver only
+                    // where the licence says the summit was shaved.
+                    const double w = std::min(1.0,
+                        (double)icebergWRow[xx]);
+                    Y[h] += w * (double)icebergYRow[xx];
+                } else {
+                    Y[h] = (double)icebergYRow[xx];
+                }
             }
         }
 
@@ -8738,6 +9050,176 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     //           edges -- the width question, re-asked against truth after
     //           the bucket-referenced version was falsified by the user
     //   err     mean |envRender - envTruth| in IRE
+
+    // TEMPORARY INSTRUMENT (LDCD_YREF_BANK / LDCD_YREF, 2026-08-20). The
+    // harness referee, IN-DECODER per the author's law of the same day:
+    // python may prototype a construction, never test our video. Two-pass,
+    // the THEFT_DUMP/_TRUTH idiom:
+    //   pass A  normal render, LDCD_YREF_BANK=path -- covered frames bank
+    //           truth Y (the certified early-out emits raw - exact), the
+    //           def-line flags, and the certified-envelope lateral delta
+    //           (the restricted-regime axis, from the conservation fact).
+    //   pass B  harness render (selective denial), LDCD_YREF=path -- a
+    //           banked frame now running UNCOVERED is a denied frame; its
+    //           emitted Y grades against banked truth on def lines,
+    //           stratified by the banked envelope delta and by the iceberg
+    //           licence footprint. Cumulative census printed per frame;
+    //           the last [YREF] lines are the run's verdict. A/B between
+    //           two pass-B runs = compare their printed censuses.
+    // Strip with the harness.
+    {
+        static const char *yrefBank = std::getenv("LDCD_YREF_BANK");
+        static const char *yrefPath = std::getenv("LDCD_YREF");
+        const int rFirst = videoParameters.firstActiveFrameLine;
+        const int rLast  = videoParameters.lastActiveFrameLine;
+        const int rLeft  = videoParameters.activeVideoStart;
+        const int rWidth = videoParameters.activeVideoEnd - rLeft;
+        const int rNl    = rLast - rFirst;
+        const float rNaN = std::numeric_limits<float>::quiet_NaN();
+        if (yrefBank && holdsRealFrame() && frameHasExactCoverage() &&
+            rWidth > 0 && rNl > 0) {
+            std::vector<unsigned char> df(rNl, 0);
+            std::vector<float> ty((size_t)rNl * rWidth, rNaN);
+            std::vector<float> ed((size_t)rNl * rWidth, rNaN);
+            std::vector<double> env(rWidth), envS(rWidth);
+            for (int line = rFirst; line < rLast; ++line) {
+                const int li = line - rFirst;
+                df[li] = certifiedDefLine(line) ? 1 : 0;
+                const double *Yr = componentFrame->y(line);
+                float *tr = ty.data() + (size_t)li * rWidth;
+                for (int x = 0; x < rWidth; ++x)
+                    tr[x] = (float)Yr[rLeft + x];
+                const float *ex = exactCarrierRow(line);
+                if (!ex) continue;
+                for (int x = 0; x < rWidth; ++x) {
+                    const int h = rLeft + x;
+                    const float a = ex[h];
+                    const float b = (h + 1 < videoParameters.fieldWidth)
+                        ? ex[h + 1] : rNaN;
+                    env[x] = (std::isfinite(a) && std::isfinite(b))
+                        ? std::hypot((double)a, (double)b) : -1.0;
+                }
+                for (int x = 2; x < rWidth - 2; ++x) {
+                    double s5 = 0; int n5 = 0;
+                    for (int k = -2; k <= 2; ++k)
+                        if (env[x + k] >= 0) { s5 += env[x + k]; ++n5; }
+                    envS[x] = (n5 == 5) ? s5 / 5.0 : -1.0;
+                }
+                float *er = ed.data() + (size_t)li * rWidth;
+                for (int x = 4; x < rWidth - 4; ++x)
+                    if (envS[x - 2] >= 0 && envS[x + 2] >= 0)
+                        er[x] = (float)(std::fabs(envS[x + 2] -
+                                                  envS[x - 2]) / 4.0);
+            }
+            static std::mutex yrefMtx;
+            std::lock_guard<std::mutex> lk(yrefMtx);
+            static std::FILE *bf = std::fopen(yrefBank, "wb");
+            if (bf) {
+                const qint32 hdr[5] = { heldSeq1, rFirst, rLast,
+                                        rLeft, rWidth };
+                std::fwrite(hdr, sizeof(hdr), 1, bf);
+                std::fwrite(df.data(), 1, df.size(), bf);
+                std::fwrite(ty.data(), sizeof(float), ty.size(), bf);
+                std::fwrite(ed.data(), sizeof(float), ed.size(), bf);
+                std::fflush(bf);
+            }
+        }
+        if (yrefPath && holdsRealFrame() && !frameHasExactCoverage() &&
+            rWidth > 0 && rNl > 0) {
+            struct YRefRec {
+                int f0, f1, left, width;
+                std::vector<unsigned char> df;
+                std::vector<float> ty, ed;
+            };
+            static const std::map<qint32, YRefRec> *bank = []()
+                -> const std::map<qint32, YRefRec> * {
+                const char *pp = std::getenv("LDCD_YREF");
+                std::FILE *f = pp ? std::fopen(pp, "rb") : nullptr;
+                if (!f) return nullptr;
+                auto *m = new std::map<qint32, YRefRec>();
+                for (;;) {
+                    qint32 hdr[5];
+                    if (std::fread(hdr, sizeof(hdr), 1, f) != 1) break;
+                    YRefRec r;
+                    r.f0 = hdr[1]; r.f1 = hdr[2];
+                    r.left = hdr[3]; r.width = hdr[4];
+                    const size_t nl = (size_t)std::max(r.f1 - r.f0, 0);
+                    r.df.resize(nl);
+                    r.ty.resize(nl * r.width);
+                    r.ed.resize(nl * r.width);
+                    if (std::fread(r.df.data(), 1, nl, f) != nl ||
+                        std::fread(r.ty.data(), sizeof(float),
+                                   r.ty.size(), f) != r.ty.size() ||
+                        std::fread(r.ed.data(), sizeof(float),
+                                   r.ed.size(), f) != r.ed.size()) break;
+                    (*m)[hdr[0]] = std::move(r);
+                }
+                std::fclose(f);
+                if (m->empty()) { delete m; return nullptr; }
+                return m;
+            }();
+            auto it = bank ? bank->find(heldSeq1)
+                           : std::map<qint32, YRefRec>::const_iterator{};
+            if (bank && it != bank->end() && it->second.f0 == rFirst &&
+                it->second.f1 == rLast && it->second.left == rLeft &&
+                it->second.width == rWidth) {
+                struct Cell { long n = 0; double s2 = 0, mx = 0; long big = 0; };
+                static std::mutex cMtx;
+                static Cell all[4], lic[4];
+                static long framesGraded = 0;
+                const YRefRec &R = it->second;
+                const bool haveLic = icebergReturnWeight_flat.size() >=
+                    (size_t)rLast * demodWidth;
+                std::lock_guard<std::mutex> lk(cMtx);
+                for (int line = rFirst; line < rLast; ++line) {
+                    const int li = line - rFirst;
+                    if (!R.df[li]) continue;
+                    const double *Yr = componentFrame->y(line);
+                    const float *tr = R.ty.data() + (size_t)li * rWidth;
+                    const float *er = R.ed.data() + (size_t)li * rWidth;
+                    for (int x = 8; x < rWidth - 8; ++x) {
+                        if (!std::isfinite(tr[x])) continue;
+                        const double e =
+                            (Yr[rLeft + x] - (double)tr[x]) / irescale;
+                        const double dIRE = std::isfinite(er[x])
+                            ? er[x] / irescale : 0.0;
+                        const int b = (dIRE < 0.5) ? 0 : (dIRE < 1.0) ? 1
+                                    : (dIRE < 2.0) ? 2 : 3;
+                        auto upd = [&](Cell &c) {
+                            c.n++; c.s2 += e * e;
+                            if (std::fabs(e) > c.mx) c.mx = std::fabs(e);
+                            if (std::fabs(e) > 3.0) c.big++;
+                        };
+                        upd(all[b]);
+                        if (haveLic && icebergReturnWeight_flat[
+                                (size_t)line * demodWidth + x] > 0.0f)
+                            upd(lic[b]);
+                    }
+                }
+                ++framesGraded;
+                double s2 = 0; long n = 0, big = 0; double mx = 0;
+                double ls2 = 0; long ln = 0;
+                for (int b = 0; b < 4; ++b) {
+                    s2 += all[b].s2; n += all[b].n; big += all[b].big;
+                    mx = std::max(mx, all[b].mx);
+                    ls2 += lic[b].s2; ln += lic[b].n;
+                }
+                std::fprintf(stderr,
+                    "[YREF] f%d cum: frames %ld n %ld rms %.4f max %.2f "
+                    ">3IRE %.3f%% | bins rms %.3f/%.3f/%.3f/%.3f "
+                    "(n %ld/%ld/%ld/%ld) | LIC n %ld rms %.4f\n",
+                    (int)heldSeq1, framesGraded, n,
+                    n ? std::sqrt(s2 / n) : 0.0, mx,
+                    n ? 100.0 * big / n : 0.0,
+                    all[0].n ? std::sqrt(all[0].s2 / all[0].n) : 0.0,
+                    all[1].n ? std::sqrt(all[1].s2 / all[1].n) : 0.0,
+                    all[2].n ? std::sqrt(all[2].s2 / all[2].n) : 0.0,
+                    all[3].n ? std::sqrt(all[3].s2 / all[3].n) : 0.0,
+                    all[0].n, all[1].n, all[2].n, all[3].n,
+                    ln, ln ? std::sqrt(ls2 / ln) : 0.0);
+            }
+        }
+    }
 }
 // Lurch preconditioner for the coarse luma prior.
 //
@@ -9916,6 +10398,59 @@ double ldcdP6CrEval(const T *row, int W, double pos)
 
 } // namespace
 
+// TEMPORARY INSTRUMENT (LDCD_ICE_BORROW, 2026-08-20): banked-cover records
+// for the +-2 borrow. See the comment at the bank writer below. Strip with it.
+namespace {
+struct IceBankRec {
+    int lines0 = 0, lines1 = 0, left = 0, width = 0;
+    bool platValid = false, rawValid = false;
+    std::vector<float> lhat, plat, rawm;
+};
+const std::map<qint32, IceBankRec> *ldcdIceBankLoad()
+{
+    static const std::map<qint32, IceBankRec> *bank = []()
+        -> const std::map<qint32, IceBankRec> * {
+        const char *p = std::getenv("LDCD_ICE_BORROW");
+        if (!p || !p[0]) return nullptr;
+        std::FILE *f = std::fopen(p, "rb");
+        if (!f) return nullptr;
+        auto *m = new std::map<qint32, IceBankRec>();
+        for (;;) {
+            qint32 hdr[6];
+            if (std::fread(hdr, sizeof(hdr), 1, f) != 1) break;
+            IceBankRec r;
+            r.lines0 = hdr[1]; r.lines1 = hdr[2];
+            r.left = hdr[3]; r.width = hdr[4];
+            r.platValid = (hdr[5] & 1) != 0;
+            r.rawValid  = (hdr[5] & 2) != 0;
+            const size_t nl = (size_t)std::max(r.lines1 - r.lines0, 0);
+            r.lhat.resize(nl * r.width);
+            r.plat.resize(nl * r.width);
+            r.rawm.resize(nl * (r.width + 2));
+            if (std::fread(r.lhat.data(), sizeof(float), r.lhat.size(), f)
+                    != r.lhat.size() ||
+                std::fread(r.plat.data(), sizeof(float), r.plat.size(), f)
+                    != r.plat.size() ||
+                std::fread(r.rawm.data(), sizeof(float), r.rawm.size(), f)
+                    != r.rawm.size())
+                break;
+            (*m)[hdr[0]] = std::move(r);
+        }
+        std::fclose(f);
+        if (m->empty()) { delete m; return nullptr; }
+        return m;
+    }();
+    return bank;
+}
+const float *ldcdIceBankRow(const IceBankRec *r,
+                            const std::vector<float> &plane,
+                            int line, int rowWidth)
+{
+    if (!r || line < r->lines0 || line >= r->lines1) return nullptr;
+    return plane.data() + (size_t)(line - r->lines0) * rowWidth;
+}
+} // namespace
+
 bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                                            const FrameBuffer *nextF)
 {
@@ -9929,14 +10464,138 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
         return e && std::atoi(e) != 0;
     }();
     if (!icebergTween) return false;
-    if (frameHasExactCoverage()) return false;
+    // TEMPORARY INSTRUMENT (LDCD_ICE_BANK / LDCD_ICE_BORROW, 2026-08-20).
+    // The covered-frame proxy for B/D inverts the neighbourhood: a denied
+    // cover's +-1 frames are genuinely uncovered, so the tween's twin
+    // attestation can never form and the harness would grade the panel with
+    // the temporal luma witness dark. Pass 1 (LDCD_ICE_BANK=path) banks each
+    // covered frame's certified luma (direct-or-bracket, the consumer's own
+    // rule), its smoothed platform, and its raw notch margin. Pass 2
+    // (LDCD_ICE_BORROW=path) lets a frame with NO covered neighbour on
+    // EITHER side stand the banked +-2 covers in -- the kept covers of the
+    // selective-denial run. The native occlusion guard then reads the two
+    // covers' disagreement at +-2 spacing, which IS the low-motion licence.
+    // Real uncovered frames (one covered side) are untouched and abstain as
+    // before. Two-pass only -- never bank and borrow in one run. Unset =
+    // inert. Strip when the cross-luma question closes.
+    if (frameHasExactCoverage()) {
+        static const char *bankPath = std::getenv("LDCD_ICE_BANK");
+        if (bankPath && holdsRealFrame()) {
+            const int firstLine = videoParameters.firstActiveFrameLine;
+            const int lastLine  = videoParameters.lastActiveFrameLine;
+            const int left      = videoParameters.activeVideoStart;
+            const int right     = videoParameters.activeVideoEnd;
+            const int width     = right - left;
+            const int nl        = lastLine - firstLine;
+            if (width > 0 && nl > 0) {
+                const bool rawOK = left >= 1 &&
+                    left + width + 1 <= videoParameters.fieldWidth;
+                std::vector<float> lh((size_t)nl * width,
+                    std::numeric_limits<float>::quiet_NaN());
+                std::vector<float> pl((size_t)nl * width,
+                    std::numeric_limits<float>::quiet_NaN());
+                std::vector<float> rm((size_t)nl * (width + 2), 0.0f);
+                for (int line = firstLine; line < lastLine; ++line) {
+                    const int li = line - firstLine;
+                    const float *pex0 = exactCarrierRow(line);
+                    const float *pexU = (line - 1 >= firstLine)
+                        ? exactCarrierRow(line - 1) : nullptr;
+                    const float *pexD = (line + 1 < lastLine)
+                        ? exactCarrierRow(line + 1) : nullptr;
+                    const quint16 *rw = rawbuffer.data()
+                        + (size_t)line * videoParameters.fieldWidth;
+                    const quint16 *rwU = rawbuffer.data()
+                        + (size_t)std::max(line - 1, 0) *
+                          videoParameters.fieldWidth;
+                    const quint16 *rwD = rawbuffer.data()
+                        + (size_t)std::min(line + 1,
+                              videoParameters.lastActiveFrameLine - 1) *
+                          videoParameters.fieldWidth;
+                    float *lrow = lh.data() + (size_t)li * width;
+                    for (int xi = 0; xi < width; ++xi) {
+                        const int h = left + xi;
+                        if (pex0 && std::isfinite(pex0[h])) {
+                            lrow[xi] = (float)((double)rw[h] -
+                                               (double)pex0[h]);
+                        } else if (pexU && pexD &&
+                                   std::isfinite(pexU[h]) &&
+                                   std::isfinite(pexD[h])) {
+                            lrow[xi] = (float)(0.5 *
+                                (((double)rwU[h] - (double)pexU[h]) +
+                                 ((double)rwD[h] - (double)pexD[h])));
+                        }
+                    }
+                    if (lockedLumaCacheValid) {
+                        const double *ps = lockedLumaSmooth_line(line);
+                        if (ps) {
+                            float *prow = pl.data() + (size_t)li * width;
+                            for (int xi = 0; xi < width; ++xi)
+                                prow[xi] = (float)ps[xi];
+                        }
+                    }
+                    if (rawOK) {
+                        float *rrow = rm.data() + (size_t)li * (width + 2);
+                        for (int xi = 0; xi < width + 2; ++xi)
+                            rrow[xi] = (float)rw[left - 1 + xi];
+                    }
+                }
+                static std::mutex bankMtx;
+                std::lock_guard<std::mutex> lk(bankMtx);
+                static std::FILE *bf = std::fopen(bankPath, "wb");
+                if (bf) {
+                    const qint32 hdr[6] = { heldSeq1, firstLine, lastLine,
+                        left, width,
+                        (qint32)((lockedLumaCacheValid ? 1 : 0) |
+                                 (rawOK ? 2 : 0)) };
+                    std::fwrite(hdr, sizeof(hdr), 1, bf);
+                    std::fwrite(lh.data(), sizeof(float), lh.size(), bf);
+                    std::fwrite(pl.data(), sizeof(float), pl.size(), bf);
+                    std::fwrite(rm.data(), sizeof(float), rm.size(), bf);
+                    std::fflush(bf);
+                }
+            }
+        }
+        return false;
+    }
     const FrameBuffer *nb[2] = {
         (prevF && prevF->frameHasExactCoverage()) ? prevF : nullptr,
         (nextF && nextF->frameHasExactCoverage()) ? nextF : nullptr,
     };
     // Both certified neighbours are required. At stream or batch edges the
     // feature abstains and ordinary comb Y remains untouched.
-    if (!nb[0] || !nb[1]) return false;
+    //
+    // TEMPORARY INSTRUMENT (LDCD_ICE_BORROW): a frame with no covered
+    // neighbour on EITHER side -- the selective-denial proxy signature --
+    // may stand the banked +-2 covers in. One-real-side frames untouched.
+    const IceBankRec *borrow[2] = { nullptr, nullptr };
+    if (!nb[0] && !nb[1] && holdsRealFrame()) {
+        if (const auto *bank = ldcdIceBankLoad()) {
+            const int gFirst = videoParameters.firstActiveFrameLine;
+            const int gLast  = videoParameters.lastActiveFrameLine;
+            const int gLeft  = videoParameters.activeVideoStart;
+            const int gWidth = videoParameters.activeVideoEnd - gLeft;
+            auto geomOK = [&](const IceBankRec &r) {
+                return r.lines0 == gFirst && r.lines1 == gLast &&
+                       r.left == gLeft && r.width == gWidth;
+            };
+            auto it = bank->lower_bound(heldSeq1);
+            if (it != bank->end() && geomOK(it->second))
+                borrow[1] = &it->second;
+            if (it != bank->begin() && geomOK(std::prev(it)->second))
+                borrow[0] = &std::prev(it)->second;
+            static const bool borrowStats = []{
+                const char *e = std::getenv("LDCD_ICEBERG_STATS");
+                return e && std::atoi(e) != 0;
+            }();
+            if (borrowStats && (borrow[0] || borrow[1]))
+                std::fprintf(stderr,
+                    "[ICEBORROW] frame %d: prev %d next %d\n",
+                    (int)heldSeq1,
+                    borrow[0] ? (int)std::prev(it)->first : -1,
+                    borrow[1] ? (int)it->first : -1);
+        }
+    }
+    if ((!nb[0] && !borrow[0]) || (!nb[1] && !borrow[1])) return false;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
@@ -10089,7 +10748,21 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
             sideVal[1].assign(width, std::numeric_limits<double>::quiet_NaN());
             for (int side = 0; side < 2; ++side) {
                 const FrameBuffer *fb = nb[side];
-                if (!fb) continue;
+                if (!fb) {
+                    // TEMPORARY INSTRUMENT: the banked +-2 cover's certified
+                    // luma (direct-or-bracket applied at bank time) stands in.
+                    if (borrow[side]) {
+                        const float *bl = ldcdIceBankRow(borrow[side],
+                            borrow[side]->lhat, line, width);
+                        if (bl)
+                            for (int xi = 0; xi < width; ++xi)
+                                if (std::isfinite(bl[xi])) {
+                                    lhatN[xi] += 1;
+                                    sideVal[side][xi] = (double)bl[xi];
+                                }
+                    }
+                    continue;
+                }
                 const float *pex0 = fb->exactCarrierRow(line);
                 const float *pexU = (line - 1 >= firstLine)
                     ? fb->exactCarrierRow(line - 1) : nullptr;
@@ -10173,11 +10846,29 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                 const char *e = std::getenv("LDCD_ICEBERG_STATS");
                 return e && std::atoi(e) != 0;
             }();
-            if (icebergTween && nb[0] && nb[1] && lockedLumaCacheValid &&
-                nb[0]->lockedLumaCacheValid && nb[1]->lockedLumaCacheValid) {
+            // TEMPORARY INSTRUMENT (LDCD_ICE_BORROW): a borrowed side's
+            // platform arrives from the bank; validity travels per record.
+            std::vector<double> platBorrowBuf[2];
+            auto sidePlatOK = [&](int k) -> bool {
+                if (nb[k]) return nb[k]->lockedLumaCacheValid;
+                return borrow[k] && borrow[k]->platValid &&
+                       ldcdIceBankRow(borrow[k], borrow[k]->plat,
+                                      line, width) != nullptr;
+            };
+            auto sidePlatRow = [&](int k) -> const double * {
+                if (nb[k]) return nb[k]->lockedLumaSmooth_line(line);
+                const float *r = ldcdIceBankRow(borrow[k], borrow[k]->plat,
+                                                line, width);
+                platBorrowBuf[k].resize(width);
+                for (int x = 0; x < width; ++x)
+                    platBorrowBuf[k][x] = (double)r[x];
+                return platBorrowBuf[k].data();
+            };
+            if (icebergTween && sidePlatOK(0) && sidePlatOK(1) &&
+                lockedLumaCacheValid) {
                 const double *platC = lockedLumaSmooth_line(line);
-                const double *platP = nb[0]->lockedLumaSmooth_line(line);
-                const double *platN = nb[1]->lockedLumaSmooth_line(line);
+                const double *platP = sidePlatRow(0);
+                const double *platN = sidePlatRow(1);
 
                 // Kept as the BELOW-fSC platform even when the locator below
                 // switches to the notch: the match is made on the notch, so
@@ -10230,24 +10921,307 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                     left + width + 1 <= videoParameters.fieldWidth) {
                     const size_t stride = videoParameters.fieldWidth;
                     const quint16 *rawC = rawLine;
-                    const quint16 *rawP = nb[0]->rawbuffer.data()
-                        + static_cast<size_t>(line) * stride;
-                    const quint16 *rawN = nb[1]->rawbuffer.data()
-                        + static_cast<size_t>(line) * stride;
                     auto notchAt = [](const quint16 *r, int i) {
                         return 0.5 * (static_cast<double>(r[i - 1]) +
                                       static_cast<double>(r[i + 1]));
                     };
-                    for (int x = 0; x < width; ++x) {
-                        const int i = left + x;
-                        notchC[x] = notchAt(rawC, i);
-                        notchP[x] = notchAt(rawP, i);
-                        notchN[x] = notchAt(rawN, i);
+                    // TEMPORARY INSTRUMENT: a borrowed side's raw margin
+                    // row (rawm[x] = raw[left-1+x]) supplies its notch as
+                    // 0.5*(rawm[x] + rawm[x+2]). The switch stays all-or-
+                    // nothing across the three rows, preserving the
+                    // fall-back-silently contract.
+                    auto fillSide = [&](int k, std::vector<double> &dst) {
+                        if (nb[k]) {
+                            const quint16 *r = nb[k]->rawbuffer.data()
+                                + static_cast<size_t>(line) * stride;
+                            for (int x = 0; x < width; ++x)
+                                dst[x] = notchAt(r, left + x);
+                            return true;
+                        }
+                        if (!borrow[k] || !borrow[k]->rawValid) return false;
+                        const float *r = ldcdIceBankRow(borrow[k],
+                            borrow[k]->rawm, line, width + 2);
+                        if (!r) return false;
+                        for (int x = 0; x < width; ++x)
+                            dst[x] = 0.5 * ((double)r[x] + (double)r[x + 2]);
+                        return true;
+                    };
+                    if (fillSide(0, notchP) && fillSide(1, notchN)) {
+                        for (int x = 0; x < width; ++x)
+                            notchC[x] = notchAt(rawC, left + x);
+                        platC = notchC.data();
+                        platP = notchP.data();
+                        platN = notchN.data();
                     }
-                    platC = notchC.data();
-                    platP = notchP.data();
-                    platN = notchN.data();
                 }
+                // ==== THE VECTOR DELIVERY (default, 2026-08-20) ====
+                // The rebuild of the delivery half per plan sec 11.4-11.9
+                // and the author's core statement: anchors are parsed from
+                // the luma waveform into vector control points; ONLY the
+                // control points and their derivative data are interpolated
+                // -- never the data, never the curves -- and the vector
+                // waveform is rasterized ONCE at the tweened, pinned
+                // position. The pin locates (this frame's own evidence);
+                // the covers describe (height and width, never placement).
+                // LDCD_ICE_LEGACY=1 restores the convicted snip path for
+                // A/B; sec 11.9's correspondence machinery is dead code in
+                // vector mode and runs only under that escape.
+                static const bool iceLegacy = []{
+                    const char *e = std::getenv("LDCD_ICE_LEGACY");
+                    return e && std::atoi(e) != 0;
+                }();
+                if (!iceLegacy) {
+                    // Current-frame rows: the elementary notch luma nl
+                    // (carrier nulled, summits FLATTENED -- the mesa is the
+                    // theft's own signature, sec 11.8) and the band remnant
+                    // envelope (the stolen material itself, sec 11.5).
+                    std::vector<double> nl(width, 0.0), env(width, 0.0);
+                    for (int x = 0; x < width; ++x) {
+                        const int h = left + x;
+                        if (h - 1 < 0 ||
+                            h + 1 >= videoParameters.fieldWidth) continue;
+                        nl[x] = 0.5 * ((double)rawLine[h - 1] +
+                                       (double)rawLine[h + 1]);
+                    }
+                    const double *bpR = locked1DRawBandpass_line(line);
+                    if (bpR)
+                        for (int x = 0; x + 1 < width; ++x)
+                            env[x] = std::hypot(bpR[x], bpR[x + 1]);
+                    std::vector<double> vRow(width,
+                        std::numeric_limits<double>::quiet_NaN());
+                    std::vector<double> wRow(width, 0.0);
+                    const double riseThr = 3.0 * irescale;   // mesa height
+                    const double kMesaCurv = 0.30;           // flat-top gate
+                    const double envFloor = 2.0 * irescale;  // remnant floor
+                    for (int x = 10; x < width - 11; ++x) {
+                        // -- SKIP TEST / PIN (sec 11.8): a local crest whose
+                        // top is flatter than a bandlimited peak of its own
+                        // rise can be, with stranded band energy present.
+                        if (nl[x] < nl[x - 1] || nl[x] < nl[x + 1]) continue;
+                        const double base0 =
+                            0.5 * (nl[x - 4] + nl[x + 4]);
+                        const double rise = nl[x] - base0;
+                        if (rise < riseThr) continue;
+                        const double curv = std::fabs(
+                            nl[x - 1] - 2.0 * nl[x] + nl[x + 1]);
+                        if (curv > kMesaCurv * rise) continue;   // intact top
+                        if (env[x] < envFloor) continue;         // no remnant
+                        gIceStat.anchors++;
+                        // Pin refinement from the remnant envelope (parabolic
+                        // on the local env crest; the vector never places).
+                        double p = (double)x;
+                        {
+                            int xe = x;
+                            for (int k = -2; k <= 2; ++k)
+                                if (env[x + k] > env[xe]) xe = x + k;
+                            const double e0 = env[xe - 1], e1 = env[xe],
+                                         e2 = env[xe + 1];
+                            const double den = e0 - 2.0 * e1 + e2;
+                            if (std::fabs(den) > 1e-9) {
+                                double d = 0.5 * (e0 - e2) / den;
+                                if (std::fabs(d) <= 1.0) p = xe + d;
+                            }
+                        }
+                        // -- THE SEC 11.5 FIT: three parameters (position,
+                        // height, width) against four constraints (each
+                        // cover's shape, the current base's flanks, the band
+                        // remnant's amplitude), with the residual as the
+                        // honesty check. Description-by-proximity was
+                        // convicted by the in-decoder referee (10.7 vs 1.7
+                        // IRE at its own footprint): on patterned material
+                        // the nearest summit is often a DIFFERENT feature,
+                        // and both covers can agree about the wrong one. A
+                        // fit over the whole neighbourhood turns that
+                        // mismatch into residual, and residual into
+                        // abstention. Position is the PIN's throughout;
+                        // covers align their own windows (description) and
+                        // never place. HARNESS CAVEAT (author, 2026-08-20):
+                        // the calibration runs at +-2 borrowed covers; the
+                        // real thing ships at +-1, so harness inaccuracy
+                        // overstates the shipping geometry's.
+                        auto shapeAt = [](double u, double wf) {
+                            double t2 = 1.0 - std::fabs(u) / wf;
+                            if (t2 <= 0.0) return 0.0;
+                            return t2 * t2 * (3.0 - 2.0 * t2);
+                        };
+                        struct FitR { double h, w, del, J; bool ok; };
+                        auto fitCover = [&](const std::vector<double> &cov)
+                            -> FitR {
+                            FitR best{0, 2.0, 0, 1e9, false};
+                            for (double del = -2.0; del <= 2.01;
+                                 del += 0.5) {
+                                for (double wf = 1.5; wf <= 4.01;
+                                     wf += 0.5) {
+                                    const int span = (int)std::ceil(wf) + 1;
+                                    const double c0 = p + del;
+                                    const int lo = (int)std::floor(
+                                        c0 - span - 2);
+                                    const int hi = (int)std::ceil(
+                                        c0 + span + 2);
+                                    if (lo < 0 || hi >= width) continue;
+                                    double bacc = 0; int bn = 0;
+                                    bool bad = false;
+                                    for (int xx = lo; xx <= hi; ++xx) {
+                                        if (!std::isfinite(cov[xx]))
+                                            { bad = true; break; }
+                                        if (std::fabs(xx - c0) >
+                                            (double)span) {
+                                            bacc += cov[xx]; ++bn;
+                                        }
+                                    }
+                                    if (bad || bn < 3) continue;
+                                    const double bs = bacc / bn;
+                                    double num = 0, den = 0;
+                                    for (int xx = lo; xx <= hi; ++xx) {
+                                        const double sh = shapeAt(
+                                            xx - c0, wf);
+                                        num += (cov[xx] - bs) * sh;
+                                        den += sh * sh;
+                                    }
+                                    if (den < 1e-9) continue;
+                                    const double hh = num / den;
+                                    if (hh <= 0.0) continue;
+                                    double ss = 0; int nn = 0;
+                                    for (int xx = lo; xx <= hi; ++xx) {
+                                        if (std::fabs(xx - c0) >
+                                            (double)span) continue;
+                                        const double d2 = cov[xx] - bs -
+                                            hh * shapeAt(xx - c0, wf);
+                                        ss += d2 * d2; ++nn;
+                                    }
+                                    const double J = std::sqrt(ss /
+                                        std::max(nn, 1)) /
+                                        std::max(hh, 1.0 * irescale);
+                                    if (J < best.J)
+                                        best = {hh, wf, del, J, true};
+                                }
+                            }
+                            return best;
+                        };
+                        const FitR A = fitCover(sideVal[0]);
+                        const FitR B = fitCover(sideVal[1]);
+                        if (!A.ok || !B.ok) continue;
+                        if (A.h < riseThr || B.h < riseThr) continue;
+                        // Honesty check 1: the fit residual. A neighbourhood
+                        // that will not carry a bump is an occlusion, a new
+                        // object, or the wrong feature -- abstain.
+                        if (A.J > 0.35 || B.J > 0.35) continue;
+                        // Twin agreement; and under symmetric motion the two
+                        // alignments oppose, so their SUM is the drift test.
+                        if (std::fabs(A.h - B.h) >
+                            std::max(3.0 * irescale,
+                                     0.5 * std::max(A.h, B.h))) continue;
+                        if (std::fabs(A.del + B.del) > 2.0) continue;
+                        gIceStat.matched++;
+                        const double hT = 0.5 * (A.h + B.h);
+                        const double wT = std::max(1.5,
+                            0.5 * (A.w + B.w));
+                        const double deficit = hT - rise;
+                        if (deficit <= 1.0 * irescale) continue;
+                        // Honesty check 2 (constraint 4): the stolen
+                        // amplitude must be present in the band -- the
+                        // remnant IS the summit's own energy.
+                        const double aPred = hT *
+                            (1.0 - shapeAt(1.0, wT));
+                        if (env[x] < 0.4 * aPred) continue;
+                        // Honesty check 3 (constraint 3): the tweened bump,
+                        // pushed through the elementary notch, must match
+                        // the CURRENT frame's own mesa.
+                        double J2;
+                        {
+                            double ss = 0; int nn = 0; bool bad = false;
+                            const int span = (int)std::ceil(wT) + 1;
+                            const int qi = (int)std::lround(p);
+                            for (int u = -span; u <= span; ++u) {
+                                const int xx = qi + u;
+                                if (xx < 1 || xx >= width - 1)
+                                    { bad = true; break; }
+                                const double mObs = nl[xx] - base0;
+                                const double mPred = 0.5 *
+                                    (hT * shapeAt(xx - p - 1.0, wT) +
+                                     hT * shapeAt(xx - p + 1.0, wT));
+                                const double d2 = mObs - mPred;
+                                ss += d2 * d2; ++nn;
+                            }
+                            if (bad || !nn) continue;
+                            J2 = std::sqrt(ss / nn) /
+                                 std::max(hT, 1.0 * irescale);
+                        }
+                        if (J2 > 0.40) continue;
+                        gIceStat.licensed++;
+                        // -- RASTERIZE ONCE at the pin: feet on the CURRENT
+                        // frame's own flanks; two cubic half-arcs, zero
+                        // slope at crest and feet. The licence is a product
+                        // of RAMPED honesty margins -- no cliffs.
+                        auto ramp01 = [](double v) {
+                            v = std::clamp(v, 0.0, 1.0);
+                            return v * v * (3.0 - 2.0 * v);
+                        };
+                        double lic = std::clamp(
+                            deficit / (3.0 * irescale), 0.0, 1.0);
+                        lic *= ramp01((0.35 - std::max(A.J, B.J)) / 0.15);
+                        lic *= ramp01((0.40 - J2) / 0.15);
+                        if (lic <= 0.0) continue;
+                        // The plane carries the CORRECTION, not a value:
+                        // exactly the sliver the elementary notch shaves
+                        // off the fitted summit -- observation keeps every
+                        // sample, the model contributes only what was
+                        // stolen. Amplitude clamped at the CALIBRATED
+                        // deviation scale (the certified-vs-denied
+                        // comparison read incumbent deviation rms 3.07 IRE
+                        // in the top regime bin; the bound is 2x that --
+                        // a fact entering as a BOUND).
+                        const double corrCap = 6.0 * irescale;
+                        const int xl = std::max(1,
+                            (int)std::floor(p - wT) - 1);
+                        const int xr = std::min(width - 2,
+                            (int)std::ceil(p + wT) + 1);
+                        for (int u = xl; u <= xr; ++u) {
+                            const double sh = shapeAt(u - p, wT);
+                            const double shN = 0.5 *
+                                (shapeAt(u - p - 1.0, wT) +
+                                 shapeAt(u - p + 1.0, wT));
+                            double corr = hT * (sh - shN);
+                            corr = std::clamp(corr, -corrCap, corrCap);
+                            const double w = lic * (0.5 + 0.5 * sh);
+                            if (w > wRow[u] && std::fabs(corr) > 1e-9) {
+                                wRow[u] = w;
+                                vRow[u] = corr;
+                            }
+                        }
+                    }
+                    // Taper the weight at run edges (value never smoothed).
+                    {
+                        std::vector<double> dist(width, 0.0);
+                        double run = 0.0;
+                        for (int x = 0; x < width; ++x) {
+                            run = (wRow[x] > 0.0) ? run + 1.0 : 0.0;
+                            dist[x] = run;
+                        }
+                        run = 0.0;
+                        for (int x = width - 1; x >= 0; --x) {
+                            run = (wRow[x] > 0.0) ? run + 1.0 : 0.0;
+                            dist[x] = std::min(dist[x], run);
+                        }
+                        for (int x = 0; x < width; ++x) {
+                            double t2 = std::clamp(dist[x] / 3.0, 0.0, 1.0);
+                            wRow[x] *= t2 * t2 * (3.0 - 2.0 * t2);
+                        }
+                    }
+                    for (int x = 0; x < width; ++x) {
+                        if (wRow[x] <= 0.0 || lhatN[x] < 2) continue;
+                        if (!std::isfinite(vRow[x])) continue;
+                        const double w = std::min(1.0, wRow[x]);
+                        const size_t oi =
+                            static_cast<size_t>(line) * demodWidth + x;
+                        icebergRecoveredY_flat[oi] =
+                            static_cast<float>(vRow[x]);
+                        icebergReturnWeight_flat[oi] =
+                            static_cast<float>(w);
+                        anyIcebergReturn = true;
+                        gIceStat.renderedSamples++;
+                    }
+                } else {
                 const auto *evRow = coarseYEvidence_line(line);
                 constexpr int kTwWin = 48, kTwStride = 16;
                 const double minRms = 1.5 * irescale;
@@ -10419,6 +11393,23 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                 extract(sideVal[1], ancN);
 
                 constexpr int kSnip = 5;   // shape support: pos +- 5
+                // CONVICTED IMPLEMENTATION -- RETAINED ONLY AS THE REBUILD
+                // SCAFFOLD (audit 2026-08-16, iceberg plan sec 11.2/11.3;
+                // truth-referenced confirmation 2026-08-20 on the selective-
+                // denial harness: delivered values 6.5 IRE rms vs incumbents
+                // 1.6 at its own touch, alternation +65%). The sec 8.3 peak
+                // model (position/height/width) was never built: the model
+                // below is used as a DETECTOR and discarded, and raw pixel
+                // snips are copied and cross-faded in its place -- an
+                // average, not a tween. The licence/detection half measured
+                // FIT FOR PURPOSE (error corr with the roster +0.26 vs
+                // +0.43..+0.94 -- the one independent voice); the value
+                // delivery below is the convicted half. Rebuild order:
+                // plan sec 11.11 (its item 1, the sec 11.10 blocker, was
+                // dissolved 2026-08-17 by the witness restoration --
+                // verified 2026-08-19). Do not consume the VALUES for new
+                // work; the licence field is the consumable product.
+                //
                 // SEGMENTS (2026-08-06): matched anchors are KNOTS of a
                 // per-line piecewise curve; spans render once each,
                 // assignment never accumulation (see the span pass below).
@@ -10833,6 +11824,7 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                     anyIcebergReturn = true;
                     gIceStat.renderedSamples++;
                 }
+                } // iceLegacy
             }
 
         }
