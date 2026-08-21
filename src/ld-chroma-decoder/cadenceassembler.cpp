@@ -21,6 +21,29 @@
 #include <cstdint>
 #include <utility>
 
+// TEMPORARY INSTRUMENT (LDCD_DG_DENY=A|C, 2026-08-20). Selective dG-merge
+// denial for the cross-luma calibration harness. --dg-discard turns the merge
+// off wholesale, which breaks the covered-frame proxy two ways: the frame
+// under test loses its facts (wanted) but so does every neighbour (not
+// wanted -- the iceberg witness and the sync tone need intact covers within
+// reach). Covered frames alternate A, C, A, C in output order, so denying one
+// LETTER denies every other covered frame while its +-2 covered neighbours
+// keep their facts. Two runs (=A, =C) cover the whole population. A denied
+// merge takes exactly the per-pair dg-discard path: spare released to
+// baseline, no certified plane, no tone anchor captured. Unset = inert.
+// Strip when the cross-luma question closes.
+static bool dgDenySelective(char letter)
+{
+    static const int mode = []{
+        const char *e = std::getenv("LDCD_DG_DENY");
+        if (!e || !e[0]) return 0;
+        if (e[0] == 'A' || e[0] == 'a') return 1;
+        if (e[0] == 'C' || e[0] == 'c') return 2;
+        return 0;
+    }();
+    return (mode == 1 && letter == 'A') || (mode == 2 && letter == 'C');
+}
+
 namespace {
 
     
@@ -1034,7 +1057,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
             if (!window.empty() && cycleIndex(forcedFieldIndex) == 2) {
                 SourceField spare = pop1();
                 stampForcedCadence(spare, regime + 2);
-                if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+                if (!config.dgDiscard && !dgDenySelective('A') &&
+                    mergeDgPairWithSanityWrapper(def, spare, comp)) {
                     ex = WorkItem::Expansion::Trailing;
                 } else {
                     // Twins disagreed (or the user asked for --dg-discard):
@@ -1074,7 +1098,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
             stampForcedCadence(def, regime + 7);
 
             WorkItem::Expansion ex = WorkItem::Expansion::None;
-            if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+            if (!config.dgDiscard && !dgDenySelective('C') &&
+                mergeDgPairWithSanityWrapper(def, spare, comp)) {
                 ex = WorkItem::Expansion::Leading;
             } else {
                 releaseToBaseline(std::move(spare));
@@ -1319,14 +1344,16 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
                 if (config.export24p) {
                     SourceField spare = std::move(history[i0].field); // 5
                     markHistoryConsumed(i0);
-                    if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+                    if (!config.dgDiscard && !dgDenySelective('C') &&
+                        mergeDgPairWithSanityWrapper(def, spare, comp)) {
                         spareUsed = true;
                     } else {
                         releaseToBaseline(std::move(spare));
                     }
                 } else {
                     SourceField spare = history[i0].field; // work on a copy; baseline retains original ownership
-                    if (!config.dgDiscard && mergeDgPairWithSanityWrapper(def, spare, comp)) {
+                    if (!config.dgDiscard && !dgDenySelective('C') &&
+                        mergeDgPairWithSanityWrapper(def, spare, comp)) {
                         spareUsed = true;
                     }
                     handOffCaptureFrameToBaseline(i0);
@@ -1481,7 +1508,7 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
             markHistoryConsumed(pos);
             SourceField spare = std::move(history[pos].field);
 
-            if (!config.dgDiscard) {
+            if (!config.dgDiscard && !dgDenySelective(letter)) {
                 SourceField defCopy   = *def;
                 SourceField spareCopy = spare;
                 SourceField compCopy  = *comp;
@@ -1497,7 +1524,7 @@ bool CadenceAssembler::tryExtractFilmFrameAtCursor()
         }
 
         SourceField spare = history[pos].field;
-        if (!config.dgDiscard) {
+        if (!config.dgDiscard && !dgDenySelective(letter)) {
             SourceField defCopy   = *def;
             SourceField spareCopy = spare;
             SourceField compCopy  = *comp;
