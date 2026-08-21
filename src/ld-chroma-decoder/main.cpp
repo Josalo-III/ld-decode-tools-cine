@@ -257,8 +257,10 @@ int main(int argc, char *argv[])
             "names what joins it. Comma list of: ccr (cross-colour return - false "
             "chroma restored to luma), rcy (retracted carrier Y - the independent "
             "witness view), lsc (lurch-sharpened coarse platform), ntc "
-            "(fixed-kernel notch; the default). Presets: fast = comb + ntc; max or "
-            "archival = all four, slowest. A set fully replaces the default roster"),
+            "(fixed-kernel notch; the default), ice (iceberg - stolen luma summits "
+            "restored from the certified covers; telecine only). Presets: fast = "
+            "comb + ntc; max or archival = everything, slowest. A set fully "
+            "replaces the default roster"),
         QCoreApplication::translate("main", "set"));
     parser.addOption(yElectionOption);
 
@@ -609,20 +611,18 @@ int main(int argc, char *argv[])
             else if (tok == QLatin1String("ntc")) combConfig.yElection.ntc = true;
             else if (tok == QLatin1String("fast"))
                 combConfig.yElection.ntc = true;
+            else if (tok == QLatin1String("ice")) combConfig.yElection.ice = true;
             else if (tok == QLatin1String("max") ||
                      tok == QLatin1String("archival")) {
                 combConfig.yElection.ccr = true;
                 combConfig.yElection.rcy = true;
                 combConfig.yElection.lsc = true;
                 combConfig.yElection.ntc = true;
-            } else if (tok == QLatin1String("ice")) {
-                qCritical("--y-election: 'ice' is reserved -- the iceberg "
-                          "vector process is not yet promoted to an "
-                          "election consumer");
-                return -1;
-            } else {
+                combConfig.yElection.ice = true;
+            }
+            else {
                 qCritical("--y-election: unknown candidate '%s' (valid: "
-                          "ccr, rcy, lsc, ntc; presets: fast, max, "
+                          "ccr, rcy, lsc, ntc, ice; presets: fast, max, "
                           "archival)", qPrintable(tok));
                 return -1;
             }

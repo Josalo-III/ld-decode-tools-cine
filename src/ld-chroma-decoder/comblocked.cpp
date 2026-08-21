@@ -6444,6 +6444,11 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // for it was not, and the same false premise is precisely what let the
     // WITNESS keep a covered-frame franchise until 2026-08-19.
     const bool notchLive = notchCandidate && !frameHasExactCoverage();
+    // The iceberg stage runs only on uncovered frames with both covers, and
+    // publishes nothing otherwise; a non-empty licence plane is the signal
+    // that it has something to say on this frame.
+    const bool iceLive = !frameHasExactCoverage() &&
+        !icebergReturnWeight_flat.empty();
     // Blindness scale for the notch's alpha withdrawal, IRE. Tight by
     // design: chromaT treats 10 IRE as high chroma, and the notch's own
     // failure mode (publishing a near-zero top just above the carrier, where
@@ -6472,7 +6477,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // verified against the pre-change binary, md5 dc131e1c on 24 frames of
     // covered program material).
     std::vector<double> pyRow0(width), pyRow1(width), pyRow3(width),
-                        pyRow4(width), pyRow5(width), pyRow6(width);
+                        pyRow4(width), pyRow5(width), pyRow6(width),
+                        pyRow7(width);
     // Notch-HF construction, sampled per line from the head-published band
     // facts (raw-only: no fit, no solve, so it exists on every line the
     // group is live on). nhCarrier is the claim bp*wLaw*keep; plane 6 is
@@ -6563,7 +6569,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // values per sample class (the per-tap grammar lookup, done once).
     std::vector<double> resRow0(width), resRow1(width), resRow3(width),
                         resRow4(width), resRow5(width), resRow6(width),
-                        spRowV(width), cpRowV(width);
+                        resRow7(width), spRowV(width), cpRowV(width);
 
 
     // produceY is a pure consumer. splitIQlocked() exports the selected comb
@@ -6828,6 +6834,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             if (std::strcmp(s, "returned") == 0)  return 4;
             if (std::strcmp(s, "notchhf") == 0)   return 6;
             if (std::strcmp(s, "notch") == 0)     return 5;
+            if (std::strcmp(s, "ice") == 0)       return 7;
             return -1;
         }();
         if (yViewMode == 100) {
@@ -7067,6 +7074,25 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 } else if (plane == 3 && oneDRow) {
                     const double o = oneDRow[xx];
                     if (std::isfinite(o)) return (double)rawLine[hh] - o;
+                } else if (plane == 7 && icebergYRow && icebergWRow) {
+                    // ICEBERG (plane 7). The stage publishes an ADDITIVE
+                    // CORRECTION -- the sliver the elementary notch shaved
+                    // off a summit the certified covers describe -- so the
+                    // candidate is the comb's own reconstruction plus that
+                    // sliver, licensed per sample. A COMPLETE luma hypothesis,
+                    // which is what makes this lawful: the correction reaches
+                    // the picture through a candidate the election can refuse,
+                    // never as a post-election patch on the elected value.
+                    const double w = std::clamp(
+                        (double)icebergWRow[xx], 0.0, 1.0);
+                    const double corr = (double)icebergYRow[xx];
+                    if (w > 0.0 && std::isfinite(corr)) {
+                        const double c = carrierComp ? carrierComp[xx]
+                                                     : clpLine[hh];
+                        const double comb = (double)rawLine[hh] -
+                            (std::isfinite(c) ? c : 0.0);
+                        return comb + w * corr;
+                    }
                 } else if (plane == 4 && ccMaskRow) {
                     const double c = carrierComp ? carrierComp[xx] : clpLine[hh];
                     const double comb = (double)rawLine[hh] -
@@ -7398,6 +7424,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     pyRow5[xx] = planeY(5, hh);
                     pyRow6[xx] = planeY(6, hh);
                 }
+                if (iceLive) pyRow7[xx] = planeY(7, hh);
             }
             const double *pyR0 = pyRow0.data();
             const double *pyR1 = retractedRow ? pyRow1.data() : pyRow0.data();
@@ -7405,6 +7432,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             const double *pyR4 = ccMaskRow    ? pyRow4.data() : pyRow0.data();
             const double *pyR5 = notchLive ? pyRow5.data() : pyRow0.data();
             const double *pyR6 = notchLive ? pyRow6.data() : pyRow0.data();
+            const double *pyR7 = iceLive ? pyRow7.data() : pyRow0.data();
             auto planeYc = [&](int plane, int hh) -> double {
                 const int xx = hh - left;
                 switch (plane) {
@@ -7413,6 +7441,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     case 4:  return pyR4[xx];
                     case 5:  return pyR5[xx];
                     case 6:  return pyR6[xx];
+                    case 7:  return pyR7[xx];
                     default: return pyR0[xx];
                 }
             };
@@ -7432,6 +7461,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 notchLive ? resRow5.data() : resRow0.data();
             const double *resR6 =
                 notchLive ? resRow6.data() : resRow0.data();
+            const double *resR7 = iceLive ? resRow7.data() : resRow0.data();
             if (coarseRow) {
                 for (int xx = 0; xx < width; ++xx) {
                     resRow0[xx] = pyR0[xx] - coarseRow[xx];
@@ -7442,6 +7472,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         resRow5[xx] = pyR5[xx] - coarseRow[xx];
                         resRow6[xx] = pyR6[xx] - coarseRow[xx];
                     }
+                    if (iceLive) resRow7[xx] = pyR7[xx] - coarseRow[xx];
                 }
             }
             auto resAt = [&](int plane, int xx) -> double {
@@ -7451,6 +7482,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     case 4:  return resR4[xx];
                     case 5:  return resR5[xx];
                     case 6:  return resR6[xx];
+                    case 7:  return resR7[xx];
                     default: return resR0[xx];
                 }
             };
@@ -7913,8 +7945,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // notch-fsc left the ballot 2026-08-12, and addBaseCandidate
                 // is unbounded by design, so keep the margin the roster had
                 // before the notch group joined.
-                double candY[5];
-                int    candPlane[5];
+                double candY[6];
+                int    candPlane[6];
                 int    nCand = 0;
                 const double identityTol = 1e-6 * irescale;
                 auto addBaseCandidate = [&](double completeY, int plane) {
@@ -7952,7 +7984,25 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // goes unfilled; the election is downstream of the comb, so
                 // the roster is the fallback and no candidate needs an
                 // internal retreat.
-                if (retractedRow && std::isfinite((double)retractedRow[xi])) {
+                //
+                // GILGOL BAND LAW (user, 2026-08-21). The discovered
+                // chroma-boundary band is a TRANSCENDENT term: it originates
+                // in the comb's own region machinery (Field B publishes it;
+                // the vertical pass smooths it) and belongs to no candidate.
+                // Inside the band, the election DQs any candidate whose
+                // construction violates the Gilgol lessons. Today that is
+                // retracted: its Pass-2 vertical comb and corroboration mix
+                // across region boundaries with none of 2D's restrictions
+                // (eye-indicted at the sentinel shadow). Teaching the law
+                // into retracted's own construction was tried and
+                // eye-falsified ("untaught is actually smoother") -- the
+                // cede regions could not help it internally, so the term
+                // stands independent, at the election's door. A DQ is a law,
+                // not a weight; the blend adjudicates among the lawful
+                // remainder.
+                const bool gilgolBandDQ = bandRow && bandRow[xi] != 0;
+                if (!gilgolBandDQ &&
+                    retractedRow && std::isfinite((double)retractedRow[xi])) {
                     // Evidence admission for retractedY (raw - combedCarrier),
                     // the leg that keeps near-carrier HF luma the comb strips.
                     //
@@ -8120,6 +8170,15 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     // reach the ballot wearing a candidate's plane number.
                     if (nhHeard[xi]) addBaseCandidate(planeYc(6, h), 6);
                 }
+
+                // ICEBERG. Seats only where the stage licensed a summit: its
+                // own mesa / fit-residual / band-corroboration gates already
+                // decided that, and an unlicensed sample has no correction to
+                // offer.
+                if (iceLive && icebergWRow && icebergYRow &&
+                    icebergWRow[xi] > 0.0f &&
+                    std::isfinite((double)icebergYRow[xi]))
+                    addBaseCandidate(planeYc(7, h), 7);
 
                 // Returned Y is derived from combY, so it is a selectable
                 // challenger but not another independent observation when the
@@ -10464,9 +10523,12 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
     // never retain a prior frame's opinion.
     icebergRecoveredY_flat.clear();
     icebergReturnWeight_flat.clear();
-    static const bool icebergTween = []{
+    // Roster owns the stage (--y-election ice); LDCD_ICEBERG remains an A/B
+    // override in both directions.
+    const bool icebergTween = [&]{
         const char *e = std::getenv("LDCD_ICEBERG");
-        return e && std::atoi(e) != 0;
+        if (e) return std::atoi(e) != 0;
+        return configuration.yElection.ice;
     }();
     if (!icebergTween) return false;
     // TEMPORARY INSTRUMENT (LDCD_ICE_BANK / LDCD_ICE_BORROW, 2026-08-20).
