@@ -2004,6 +2004,15 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
                         haveUpLine && certifiedDefLine(line - 1);
     const bool dnCert = certLegsOn && certifiedOneDLevel() >= 2 &&
                         haveDnLine && certifiedDefLine(line + 1);
+    // GILGOL BAND LAW (user, 2026-08-21: "when the comp combs with
+    // certified, there's no limit and a few small zippers show").
+    // Inside the discovered chroma-boundary band, certification stops
+    // being an exemption: a certified leg is a perfect VALUE from the
+    // wrong REGION, and the trust limits it bypasses (the correlation
+    // ramp, cohGate, the phase-protection agreement grant) are exactly
+    // the limits that would have caught the crossing. In-band, certified
+    // legs face the same conduct as model legs.
+    const std::uint8_t *gilgolBandRow = chromaBoundaryBand_line(line);
 
     // Signed correlation in [-1..1].  Caller supplies pre-computed magnitudes
     // to avoid recomputing hypot per call site.
@@ -2140,6 +2149,11 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
             continue;
         }
 
+        // In-band demotion of certified legs (band law above).
+        const bool gilgolBand = gilgolBandRow && gilgolBandRow[x] != 0;
+        const bool upCertX = upCert && !gilgolBand;
+        const bool dnCertX = dnCert && !gilgolBand;
+
         // Per-side signed correlation, hoisted for reuse by both the phase-
         // protection block and cohGate below.
         const double corrUp = useUp
@@ -2155,14 +2169,14 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         // correlation that fully passes the adaptive-strength gate.
         {
             const double agreeThresh = std::clamp(T.FRAME_IQ_COH_PASS_CORR, 0.0, 1.0);
-            const bool upAgrees = useUp && (upCert || corrUp >= agreeThresh);
-            const bool dnAgrees = useDn && (dnCert || corrDn >= agreeThresh);
+            const bool upAgrees = useUp && (upCertX || corrUp >= agreeThresh);
+            const bool dnAgrees = useDn && (dnCertX || corrDn >= agreeThresh);
             const double a0sq = a0 * a0;
 
-            if (upAgrees && !dnAgrees && useDn && !dnCert && a0sq > 1e-18) {
+            if (upAgrees && !dnAgrees && useDn && !dnCertX && a0sq > 1e-18) {
                 const double proj = dotIQ(ZDnRaw, Z0) / a0sq;
                 ZDnRaw = Z0 * proj;
-            } else if (dnAgrees && !upAgrees && useUp && !upCert && a0sq > 1e-18) {
+            } else if (dnAgrees && !upAgrees && useUp && !upCertX && a0sq > 1e-18) {
                 const double proj = dotIQ(ZUpRaw, Z0) / a0sq;
                 ZUpRaw = Z0 * proj;
             }
@@ -2195,8 +2209,8 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
                 wsum += w * reach;
             }
         };
-        if (useUp) legContrib(upCert, ZUpRaw, aUp, upReach);
-        if (useDn) legContrib(dnCert, ZDnRaw, aDn, dnReach);
+        if (useUp) legContrib(upCertX, ZUpRaw, aUp, upReach);
+        if (useDn) legContrib(dnCertX, ZDnRaw, aDn, dnReach);
 
         std::complex<double> Zframe = Zsum / wsum;
 
@@ -2227,7 +2241,7 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         cohGate = std::clamp(cohGate, 0.0, 1.0);
         // A certified leg's participation is not a confidence question;
         // only the content gate (disGate) may back the comb off it.
-        if ((useUp && upCert) || (useDn && dnCert))
+        if ((useUp && upCertX) || (useDn && dnCertX))
             cohGate = 1.0;
 
         const double disagreementStart = 5.0;

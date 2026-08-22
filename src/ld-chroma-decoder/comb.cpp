@@ -2815,6 +2815,17 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 continue;
             const double *lockedRow = configuration.phaseCompensation
                 ? combSource1D_line(line) : nullptr;
+            // GILGOL BAND LAW (user, 2026-08-21: "if vertical neighbors
+            // are allowed they have to submit to the same grail rule we
+            // just applied to the Y election"). The discovered
+            // chroma-boundary band is the transcendent term (Field B
+            // publishes it; the vertical pass smooths it). Inside the
+            // band, the FIELD members -- the temporal blend's vertical
+            // values (line -/+ 1, cross-frame or self-frame fallback) --
+            // are not evidence and take no seat. The FRAME centers reach
+            // along time at the same line and stay lawful, as does the 2D
+            // reference (Field B's own cede already governs it).
+            const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
             const TemporalEvidenceStanding standing =
                 temporalEvidenceStanding(line, previousFrame, nextFrame);
             for (int h = left; h < right; ++h) {
@@ -2919,8 +2930,12 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                     if (!(blendHull ? okHull : okFlat)) return;
                     outs[nT] = out; pens[nT] = sm.penalty; ++nT;
                 };
-                admit(ts.previousField, ts.nextField);
-                admit(ts.nextField,     ts.previousField);
+                const bool gilgolBand =
+                    bandRow && bandRow[h - left] != 0;
+                if (!gilgolBand) {
+                    admit(ts.previousField, ts.nextField);
+                    admit(ts.nextField,     ts.previousField);
+                }
                 admit(ts.previousFrame, ts.nextFrame);
                 admit(ts.nextFrame,     ts.previousFrame);
                 if (nT == 0) continue;
