@@ -1512,6 +1512,14 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
                         1.0)
                     : 0.0;
             tc = C * (1.0 - hEdgeT);
+            // A zero scalar claims there is no carrier at this sample,
+            // so Y = raw - 0 swaps the RAW COMPOSITE into luma -- carrier
+            // and all. The input-range hull and the cede blend below both
+            // sit inside if (combed), so neither catches this path. Zero
+            // cedes to the 1D center instead (user, 2026-08-22): the same
+            // law buildPhaseCorrected1D already states -- "Zero would
+            // claim there is no carrier at all and push it into luma."
+            if (tc == 0.0) tc = C;
         } else {
             tc = C;
         }
@@ -1565,15 +1573,12 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             if (wUp2 > 0.0 && wDn2 > 0.0)
                 tc = clampCarrierToInputLimits(
                     tc, rawC, { C, Cup2, Cdn2 }, { yC, yU, yD }, C);
-            else if (wUp2 > 0.0) {
+            else if (wUp2 > 0.0)
                 tc = clampCarrierToInputLimits(
                     tc, rawC, { C, Cup2 }, { yC, yU }, C);
-                tc = clampScalarTowardCenterHalf(tc, C, Cup2);
-            } else {
+            else
                 tc = clampCarrierToInputLimits(
                     tc, rawC, { C, Cdn2 }, { yC, yD }, C);
-                tc = clampScalarTowardCenterHalf(tc, C, Cdn2);
-            }
         }
         
         if (!std::isfinite(tc))
@@ -3478,6 +3483,93 @@ void Comb::FrameBuffer::computeFrameBLine(
         }
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// Frame C: the covered-frame comp-line bootstrap (user, 2026-08-22).
+//
+// Covered frames are handled unlike everything else in this file. The
+// certified def lines are conservation fact: they run nothing, and cede to
+// center in any system they are routed through. The comp lines between them
+// are not an election problem -- they are bootstrapped toward the defs.
+// Frame C is that bootstrap: a plain +-1 comb whose legs ARE the certified
+// defs' own published 1D (combSource1D serves the exact fact where the
+// anchored plane is live, the certified construction otherwise).
+//
+// It is deliberately not a candidate. No --two-d-variant access, no seat in
+// scoreFieldVsFrame, and none of Frame A/B's trust machinery: correlation
+// ramps, reach, licences and delta caps exist because a MODEL leg's carrier
+// can lie, and a certified leg cannot. The uncovered midpoint law does not
+// apply either: Frame B's 0.5 pull cap solves center C+E against partners
+// C-E, where past-midpoint re-injects inverted alien. Against certified
+// legs the partners carry C, so
+//
+//     out = (C + E) + p*(C - (C + E)) = C + (1 - p)*E
+//
+// and p past 0.5 is not overdrive -- it is the ratchet, driving the comp
+// line only one way: toward the certified defs. p = 0.67 with both legs;
+// a lone certified leg (frame edge) combs at the plain midpoint 0.5.
+//
+// Sign frame: composite scalars carry each line's raw carrier orientation,
+// so a leg whose grammar lineFlip differs from center's holds matched
+// chroma NEGATED; the relation sign folds it into center's orientation
+// before the average (the intrafield sign-frame lesson, 2026-07-02).
+//
+// Returns false when it does not own the line (uncovered frame, def line,
+// certified family off, no grammar, no certified leg); the caller proceeds
+// to the ordinary election. LDCD_FRAME_C=0 is the A/B escape.
+// ---------------------------------------------------------------------------
+bool Comb::FrameBuffer::computeFrameCLine(int line, std::vector<double> &out)
+{
+    static const bool frameCOn = []{
+        const char *e = std::getenv("LDCD_FRAME_C");
+        return !(e && std::atoi(e) == 0);
+    }();
+    if (!frameCOn) return false;
+    if (!configuration.phaseCompensation) return false;
+    if (certifiedOneDLevel() < 2) return false;
+    if (!frameHasExactCoverage()) return false;
+    if (certifiedDefLine(line)) return false;
+
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    if (width <= 0 || line < first || line >= last) return false;
+    if (line >= demodLines || demodWidth <= 0) return false;
+
+    const double *sC = combSource1D_line(line);
+    const auto *g0 = carrierGrammarLine(line);
+    if (!sC || !g0) return false;
+
+    auto legSource = [&](int ln, double &sign) -> const double * {
+        if (ln < first || ln >= last) return nullptr;
+        if (!certifiedDefLine(ln)) return nullptr;
+        const auto *g = carrierGrammarLine(ln);
+        if (!g) return nullptr;
+        sign = (g->lineFlip == g0->lineFlip) ? 1.0 : -1.0;
+        return combSource1D_line(ln);
+    };
+
+    double sgnU = 0.0, sgnD = 0.0;
+    const double *sU = legSource(line - 1, sgnU);
+    const double *sD = legSource(line + 1, sgnD);
+    if (!sU && !sD) return false;
+
+    constexpr double kFrameCPull = 0.67;
+    constexpr double kFrameCPullOneSided = 0.5;
+    const double p = (sU && sD) ? kFrameCPull : kFrameCPullOneSided;
+
+    if ((int)out.size() < width) out.resize(width);
+    for (int rel = 0; rel < width; ++rel) {
+        const double c = sC[rel];
+        const double target = (sU && sD)
+            ? 0.5 * (sgnU * sU[rel] + sgnD * sD[rel])
+            : (sU ? sgnU * sU[rel] : sgnD * sD[rel]);
+        out[rel] = c + p * (target - c);
+    }
+    return true;
 }
 
 // 3D Section

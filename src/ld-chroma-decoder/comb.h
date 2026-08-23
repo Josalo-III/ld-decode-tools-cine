@@ -1060,6 +1060,7 @@ private:
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
 	std::vector<double> scratch_fvf_notchFieldA; // per-line Field A notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchFieldB; // per-line Field B notch-luma pre-pass
+	std::vector<double> scratch_frameC;        // Frame C covered comp-line bootstrap (split2D emit)
 	std::vector<double> scratch_fvf_notchFrame;  // per-line Frame B notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchSource; // per-line source notch-luma pre-pass
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
@@ -1712,6 +1713,10 @@ private:
 	void computeFrameBLine(int line,
 								   std::vector<std::complex<double>> &outFrameIQ,
 								   std::vector<double> &outFrameScalar);
+	// Frame C: covered-frame comp-line bootstrap toward the certified defs.
+	// Not a candidate: no TwoDVariant entry, no scoreFieldVsFrame seat.
+	// Returns false when it does not own the line.
+	bool computeFrameCLine(int line, std::vector<double> &out);
 
 	void computeIQFrameAFromPreparedVectors(int line,
 											   const std::vector<std::complex<double>> &centerIQ,

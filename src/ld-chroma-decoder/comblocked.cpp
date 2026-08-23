@@ -6526,6 +6526,12 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     // legs, 2D feature pooling); the phase side is locked in.
     const bool compactStageLive = !frameHasExactCoverage();
     std::vector<double> compactRow(width);
+    // Notch-regime eligibility per sample (user definition, 2026-08-21:
+    // compact colour is 4 > element > 1 -- one-pixel elements are OUTSIDE
+    // the regime; they are impulses, not colour, and the notch replacement
+    // amplified them into random bits). 1 only where every element bound
+    // into the covering region measures 2-3 samples.
+    std::vector<std::uint8_t> compactRegime(width);
     // Per-pixel brightest COMPLETE luma among candidates that actually
     // passed feasibility and admission. NaN means no election reference:
     // certified, compact-stage, diagnostic and empty-roster paths must
@@ -7016,6 +7022,40 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     : nullptr;
             const double *oneDRow = locked1DSource_line(line); // may be null
             const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
+            // TEMPORARY INSTRUMENT (LDCD_BANDCENSUS=1): band coverage by
+            // zone, to answer whether the discovered band reaches a seam
+            // the law consumers are missing. Strip when answered.
+            {
+                static const bool bandCensus = []{
+                    const char *e = std::getenv("LDCD_BANDCENSUS");
+                    return e && e[0] == '1';
+                }();
+                if (bandCensus && bandRow) {
+                    static std::mutex bcMtx;
+                    static long bcN[3] = {0,0,0}, bcB[3] = {0,0,0};
+                    static const struct { int y0,y1,x0,x1; } bz[3] = {
+                        {140,320,560,745},   // shirt seam (right figure)
+                        {264,359,265,390},   // bikini/shadow
+                        {144,269,265,400},   // strap
+                    };
+                    std::lock_guard<std::mutex> lk(bcMtx);
+                    for (int z = 0; z < 3; ++z) {
+                        if (line < bz[z].y0 || line > bz[z].y1) continue;
+                        for (int x = bz[z].x0;
+                             x <= bz[z].x1 && x < demodWidth; ++x) {
+                            ++bcN[z];
+                            if (bandRow[x]) ++bcB[z];
+                        }
+                    }
+                    if (line + 1 == videoParameters.lastActiveFrameLine)
+                        std::fprintf(stderr,
+                            "[BANDC] f%d shirt %.1f%% bikini %.1f%% strap %.1f%%\n",
+                            (int)heldSeq1,
+                            bcN[0] ? 100.0*bcB[0]/bcN[0] : -1.0,
+                            bcN[1] ? 100.0*bcB[1]/bcN[1] : -1.0,
+                            bcN[2] ? 100.0*bcB[2]/bcN[2] : -1.0);
+                }
+            }
             const float *dsExactRow = exactCarrierRow(line);
             const float *anchorRow = anchorCeilingRow(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
@@ -7249,6 +7289,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             // bound across gaps up to two.
             std::fill(compactRow.begin(), compactRow.end(),
                       std::numeric_limits<double>::quiet_NaN());
+            std::fill(compactRegime.begin(), compactRegime.end(), 0);
             if (compactStageLive) {
                 static const int cB4c[4] = { 1, 0, -1, 0 };
                 static const int sB4c[4] = { 0, 1, 0, -1 };
@@ -7309,7 +7350,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     pQ = (-Siq * SiY + Sii * SqY) / det;
                     return std::hypot(pI, pQ);
                 };
-                auto renderRegion = [&](int r0, int r1) {
+                auto renderRegion = [&](int r0, int r1, bool regimeOK) {
                     const int s2 = std::max(0, r0 - kSkirtPad);
                     const int e2 = std::min(width, r1 + kSkirtPad);
                     double aI, aQ, bI, bQ;
@@ -7374,13 +7415,20 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         const int cls = carrierSampleClass(line, left + k);
                         compactRow[k] = A * (gSkirt[k - s2] / gMax) *
                             (uI * cB4c[cls] + uQ * sB4c[cls]);
+                        compactRegime[k] = regimeOK ? 1 : 0;
                     }
                 };
                 if (cbp) {
                     int rs = -1, regS = -1, regE = -1;
+                    // Regime bound (user, 2026-08-21): 4 > element > 1.
+                    // The region stays REGION-UNIFORM -- it qualifies only
+                    // if every element bound into it is 2-3 samples; one
+                    // one-pixel element disqualifies the whole region's
+                    // notch seat (the stage's own claim still renders).
+                    bool regOK = false;
                     auto flushRegion = [&]() {
                         if (regS < 0) return;
-                        renderRegion(regS, regE);
+                        renderRegion(regS, regE, regOK);
                         regS = regE = -1;
                     };
                     for (int xi = 0; xi <= width; ++xi) {
@@ -7391,12 +7439,16 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                         if (in) { if (rs < 0) rs = xi; continue; }
                         if (rs < 0) continue;
                         const int b0 = rs, b1 = xi; rs = -1;
+                        const bool elemOK =
+                            (b1 - b0 >= 2) && (b1 - b0 <= 3);
                         if (b1 - b0 > kBurstMax) { flushRegion(); continue; }
                         if (regS >= 0 && b0 - regE <= kBindGapMax) {
                             regE = b1;
+                            regOK = regOK && elemOK;
                         } else {
                             flushRegion();
                             regS = b0; regE = b1;
+                            regOK = elemOK;
                         }
                     }
                     flushRegion();
@@ -7767,6 +7819,27 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 // are structurally blind below the 4-sample aperture).
                 // NaN = the stage abstained and the election proceeds.
                 if (compactStageLive && std::isfinite(compactRow[xi])) {
+                    // Notch regime, TEST ROUND (user design, 2026-08-21:
+                    // targeted replacement of compact colour's luma by
+                    // notch; regime domain 4 > element > 1, so one-pixel
+                    // elements are excluded -- they are impulses, not
+                    // colour, and rendered them as random bits in the
+                    // first round). The renderer is notch-HF (plane 6)
+                    // ONLY: notch-fsc left the ballot 2026-08-12 on
+                    // measured performance and its band deletion is the
+                    // suspect for the round-one motion-blur collateral --
+                    // a convicted construction takes no seat here.
+                    // Promoted default: the qualified compact-colour regime
+                    // takes notch-HF unless LDCD_CREGIME=0 requests the prior
+                    // phase-locked claim for A/B comparison.
+                    static const bool cregimeOn = []{
+                        const char *e = std::getenv("LDCD_CREGIME");
+                        return !e || e[0] != '0';
+                    }();
+                    if (cregimeOn && notchLive && compactRegime[xi]) {
+                        Y[h] = planeYc(6, h);
+                        continue;
+                    }
                     Y[h] = rawH - compactRow[xi];
                     continue;
                 }
@@ -12506,6 +12579,10 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
     std::vector<std::uint8_t> boundaryMark;
     std::vector<double> winEnvScratch;
     std::vector<double> envI, envQ, envTmp;
+    // The fit's STATE, carried in components from attribution to publication.
+    // See "the carrier never leaves the basis span" below.
+    std::vector<double> fitCompI(static_cast<size_t>(std::max(0, width)), 0.0);
+    std::vector<double> fitCompQ(static_cast<size_t>(std::max(0, width)), 0.0);
     std::vector<double> partWeight(static_cast<size_t>(width), 1.0);
 
     auto median3 = [](double a, double b, double c) -> double {
@@ -13169,8 +13246,53 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                     }
                 }
 
-                auto finalizeCarrierSample = [&](double candidateI) {
-                    double sample = candidateI * basisI[xi] + modelQ * basisQ[xi];
+                // THE CARRIER NEVER LEAVES THE BASIS SPAN.
+                //
+                // A lawful carrier waveform lies in the span of the two
+                // grammar basis waveforms over every legal 4-sample window;
+                // off-span content is DC and 2fSC, which no carrier may hold.
+                // The fit's evidence arrives in components (winI/winQ ->
+                // views.carrierI/Q -> parallax.commonI/Q), but every fact
+                // that reached it afterwards used to arrive as a SCALAR
+                // patch on the remodulated sample: the commonSample anchor,
+                // the residual-consensus clamp, the amplitude clamp and the
+                // shared repair delta.  Those facts are all built from raw
+                // residuals (rawWhole - winFloor), which are full-band by
+                // construction, so adding them to the composite pushed the
+                // emitted carrier straight out of span -- and raw - fit then
+                // carried off-grid alternations into Y.  That is the leakage
+                // the off-grid census measured, and it is the reason
+                // retraction was not removing carrier faithfully.
+                //
+                // The facts are right; only their point of entry was wrong.
+                // A composite fact enters as the MINIMUM-NORM component
+                // delta that produces it: for a required composite change d,
+                //
+                //     dI = d * bI / (bI^2 + bQ^2),  dQ = d * bQ / (...)
+                //
+                // which remodulates to exactly d (so no fact is weakened, no
+                // bound is loosened, no clamp is escaped) while landing in
+                // the span by construction.  It is the pseudo-inverse, so it
+                // is unique, and it is basis-symmetric: no axis is privileged
+                // and no axis is frozen.  The pair is the state from here to
+                // publication; the one remaining remodulation is the one
+                // physics requires, because Y = raw - carrier is scalar.
+                const double bIxi = basisI[xi];
+                const double bQxi = basisQ[xi];
+                const double bNorm2 = bIxi * bIxi + bQxi * bQxi;
+                const double bInv = bNorm2 > 1e-12 ? (1.0 / bNorm2) : 0.0;
+                auto admitCompositeDelta = [&](double &cI, double &cQ,
+                                               double d) {
+                    cI += d * bIxi * bInv;
+                    cQ += d * bQxi * bInv;
+                };
+
+                auto finalizeCarrierPair = [&](double candidateI,
+                                               double candidateQ,
+                                               double &outI, double &outQ) {
+                    outI = candidateI;
+                    outQ = candidateQ;
+                    double sample = outI * bIxi + outQ * bQxi;
 
                     if (parallax.valid) {
                         constexpr double SAMPLE_DISC_SOFT_IRE = 1.5;
@@ -13201,18 +13323,27 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                                      sampleTrust *
                                      (0.25 + 0.75 * contextGate));
 
-                        sample = sample * (1.0 - sampleAnchor) +
-                                 parallax.commonSample * sampleAnchor;
+                        admitCompositeDelta(
+                            outI, outQ,
+                            (parallax.commonSample - sample) * sampleAnchor);
+                        sample = outI * bIxi + outQ * bQxi;
                     }
 
-                    if (residualTightenSupport > 0.0)
-                        sample = std::clamp(sample, residualCarrierLo, residualCarrierHi);
+                    if (residualTightenSupport > 0.0) {
+                        const double bounded = std::clamp(
+                            sample, residualCarrierLo, residualCarrierHi);
+                        admitCompositeDelta(outI, outQ, bounded - sample);
+                        sample = bounded;
+                    }
 
-                    return std::clamp(sample, -maxCarrierSamples, maxCarrierSamples);
+                    const double capped = std::clamp(
+                        sample, -maxCarrierSamples, maxCarrierSamples);
+                    admitCompositeDelta(outI, outQ, capped - sample);
                 };
 
-                const double baselineModelI = modelI;
-                const double baselineCf = finalizeCarrierSample(baselineModelI);
+                double cI = 0.0, cQ = 0.0;
+                finalizeCarrierPair(modelI, modelQ, cI, cQ);
+                const double baselineCf = cI * bIxi + cQ * bQxi;
                 double cf = baselineCf;
 
                 // Consume the same short-fit-selected residual feasibility that
@@ -13245,6 +13376,7 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                         target - cf,
                         -maxDelta,
                         maxDelta);
+                    admitCompositeDelta(cI, cQ, sharedDelta);
                     cf += sharedDelta;
                     sharedConstraintApplied = sharedDelta != 0.0;
                 }
@@ -13269,6 +13401,8 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                 }
 
                 carrierFit[xi] = cf;
+                fitCompI[xi] = cI;
+                fitCompQ[xi] = cQ;
                 flattened[xi] = rawWhole[xi] - cf;
 
                 fitRow[xi] = static_cast<float>(cf);
@@ -13277,9 +13411,9 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
             // ---------------------------------------------------------------
             // ENCODER BANDWIDTH LAW, enforced at publication.
             //
-            // Projecting winI/winQ above is not sufficient on its own:
-            // finalizeCarrierSample() then blends the sample toward
-            // parallax.commonSample and clamps it into the residual-consensus
+            // Projecting winI/winQ above was never sufficient on its own:
+            // the finalize step blends toward parallax.commonSample and
+            // clamps into the residual-consensus
             // bounds, and BOTH of those are built from raw residuals
             // (rawWhole - winFloor), which are full-band by construction.
             // Those steps are right on their own terms -- they pull a bad
@@ -13288,13 +13422,19 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
             // encoder could never have modulated.  Measured: the early
             // projection alone moved the fit only 23.5% -> 20.7% out of band.
             //
-            // So the law is applied last, to the published model, where
-            // nothing downstream can violate it.  Demodulate the finished fit
-            // against the line's own grammar basis, bandlimit the envelope,
-            // remodulate.  The 2x2 normal matrix is CONSTANT along the line:
-            // basisI/basisQ depend only on the carrier sample class, and any
-            // four consecutive samples span all four classes, so it is
-            // inverted once per line rather than per sample.
+            // Those facts now enter in span (admitCompositeDelta above), so
+            // this stage no longer has to REPAIR an off-span waveform, and it
+            // no longer has to GUESS the components it operates on.  It used
+            // to recover them by solving the 2x2 normal equations over each
+            // 4-sample window of the finished scalar -- a projection that
+            // discarded whatever the window could not express and then
+            // re-collapsed.  The components are the fit's own state; they are
+            // read directly.  The one thing this stage still owes the encoder
+            // law is the envelope bound: composite facts arrive per sample and
+            // can move the pair at pixel rate, while a legal chroma envelope
+            // cannot vary faster than ~1.3 MHz.  So bandlimit each component
+            // and remodulate once -- the only remodulation left, and the one
+            // Y = raw - carrier requires.
             // ---------------------------------------------------------------
             {
                 if ((int)envI.size() < width) {
@@ -13303,51 +13443,48 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                     envTmp.resize(width, 0.0);
                 }
 
-                double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
-                for (int k = 0; k < 4 && k < width; ++k) {
-                    sII += basisI[k] * basisI[k];
-                    sIQ += basisI[k] * basisQ[k];
-                    sQQ += basisQ[k] * basisQ[k];
-                }
-                const double det = sII * sQQ - sIQ * sIQ;
+                std::copy(fitCompI.begin(), fitCompI.begin() + width,
+                          envI.begin());
+                std::copy(fitCompQ.begin(), fitCompQ.begin() + width,
+                          envQ.begin());
 
-                if (std::fabs(det) > 1e-9) {
-                    const double inv = 1.0 / det;
-                    for (int xi = 0; xi < width; ++xi) {
-                        const int s = std::clamp(xi - 1, 0, width - 4);
-                        double sIY = 0.0, sQY = 0.0;
-                        for (int k = 0; k < 4; ++k) {
-                            const double v = carrierFit[s + k];
-                            sIY += basisI[s + k] * v;
-                            sQY += basisQ[s + k] * v;
-                        }
-                        envI[xi] = ( sQQ * sIY - sIQ * sQY) * inv;
-                        envQ[xi] = (-sIQ * sIY + sII * sQY) * inv;
-                    }
+                lddecode::projectExpressibleChromaEnvelope(
+                    envI.data(), nullptr, width, envTmp.data(), 0);
+                std::copy(envTmp.begin(), envTmp.begin() + width,
+                          envI.begin());
+                lddecode::projectExpressibleChromaEnvelope(
+                    envQ.data(), nullptr, width, envTmp.data(), 1);
+                std::copy(envTmp.begin(), envTmp.begin() + width,
+                          envQ.begin());
 
-                    lddecode::projectExpressibleChromaEnvelope(
-                        envI.data(), nullptr, width, envTmp.data(), 0);
-                    std::copy(envTmp.begin(), envTmp.begin() + width,
-                              envI.begin());
-                    lddecode::projectExpressibleChromaEnvelope(
-                        envQ.data(), nullptr, width, envTmp.data(), 1);
-                    std::copy(envTmp.begin(), envTmp.begin() + width,
-                              envQ.begin());
-
-                    for (int xi = 0; xi < width; ++xi) {
-                        const double cf = std::clamp(
-                            envI[xi] * basisI[xi] + envQ[xi] * basisQ[xi],
-                            -maxCarrierSamples, maxCarrierSamples);
-                        carrierFit[xi] = cf;
-                        flattened[xi] = rawWhole[xi] - cf;
-                        fitRow[xi] = static_cast<float>(cf);
-                    }
+                for (int xi = 0; xi < width; ++xi) {
+                    const double modelled =
+                        envI[xi] * basisI[xi] + envQ[xi] * basisQ[xi];
+                    // The amplitude cap is the last composite bound.  Applied
+                    // as a GAIN on the pair rather than a clamp on the sample:
+                    // a scaled pair is still the same carrier, only quieter,
+                    // and it stays in span exactly.  A clamped sample would
+                    // not.
+                    const double capped = std::clamp(
+                        modelled, -maxCarrierSamples, maxCarrierSamples);
+                    const double g = (modelled != 0.0)
+                        ? (capped / modelled)
+                        : 1.0;
+                    envI[xi] *= g;
+                    envQ[xi] *= g;
+                    fitCompI[xi] = envI[xi];
+                    fitCompQ[xi] = envQ[xi];
+                    carrierFit[xi] = capped;
+                    flattened[xi] = rawWhole[xi] - capped;
+                    fitRow[xi] = static_cast<float>(capped);
                 }
             }
         } else {
             for (int xi = 0; xi < width; ++xi) {
                 const double cf = 0.0;
                 carrierFit[xi] = cf;
+                fitCompI[xi] = 0.0;
+                fitCompQ[xi] = 0.0;
                 flattened[xi] = rawWhole[xi];
                 fitRow[xi] = 0.0f;
                 evidenceRow[xi].viewCount = 0;

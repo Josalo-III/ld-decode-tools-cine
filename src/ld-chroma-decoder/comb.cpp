@@ -2512,8 +2512,62 @@ void Comb::FrameBuffer::split2D()
 
     std::vector<std::complex<double>> frameIQ;
     std::vector<std::complex<double>> frameAIQ;
+    // A COVERED FRAME CALLS NO CANDIDATE AND HOLDS NO ELECTION (user,
+    // 2026-08-22): "split2D must only move the certified carrier into place
+    // and otherwise call nothing for that field, while it calls only Frame C
+    // for comp lines. The election and its candidates are not even called
+    // save for uncovered frames. 1D remains the fallback for the whole
+    // section."
+    //
+    // Frame C was created as the single, independently controllable 2D comb
+    // for covered frames, whose challenge is unlike the uncovered one. It had
+    // been reaching the picture as an emit-stage OVERRIDE -- every candidate
+    // was still built and the election still held, and Frame C then discarded
+    // the result on the lines it owned. Worse, where Frame C declined a comp
+    // line the full election stood. This is the gate that was intended: on a
+    // covered frame the candidates, scoreFieldVsFrame and
+    // collectCombAttributionEvidence are never entered at all, which is also
+    // where the wasted CPU was.
+    //
+    // Skipping the per-line plane writes is safe here: init() reassigns
+    // attributionEvidence_flat to default records per frame under wantLocked,
+    // so a line this path does not write reads as a default record, never a
+    // neighbour's (the 2026-08-16 cross-frame-drag lesson).
+    //
+    // Forced --two-d-variant renders are exempt: they exist to put one named
+    // candidate on screen for diagnosis, and that must keep working.
+    const bool coveredNoElection =
+        configuration.phaseCompensation &&
+        configuration.twoDVariant == Comb::Configuration::FieldVsFrame &&
+        certifiedOneDLevel() >= 2 &&
+        frameHasExactCoverage();
+
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
+
+        if (coveredNoElection) {
+            double *dstCov = clpbuffer[1].pixel[line];
+            const double *srcCov = nullptr;
+            float wCov = 0.0f;
+            if (certifiedDefLine(line)) {
+                // Def lines are conservation fact: move the certified carrier
+                // into place and comb with nothing. No luma to cancel.
+                srcCov = locked1DSource_line(line);
+            } else if (computeFrameCLine(line, scratch_frameC)) {
+                srcCov = scratch_frameC.data();
+                wCov = 0.9f;
+            }
+            // 1D is the fallback for the whole section -- a comp line Frame C
+            // declines takes the ordinary 1D, never an election.
+            if (!srcCov) srcCov = combSource1D_line(line);
+            if (srcCov)
+                for (int rel = 0; rel < width; ++rel)
+                    dstCov[left + rel] = srcCov[rel];
+            if (writeWeights && line < (int)w2d_frame_weight.size())
+                std::fill(w2d_frame_weight[line].begin(),
+                          w2d_frame_weight[line].end(), wCov);
+            continue;
+        }
 
         ensureCombTapLine(line);
         const CombTapLine &tapLine = tapLineCache[precleanRingSlot(line)];
@@ -2709,6 +2763,21 @@ void Comb::FrameBuffer::split2D()
                             w2d_frame_weight[line][rel] = 0.35f;
                         }
                     }
+                } else if (computeFrameCLine(line, scratch_frameC)) {
+                    // FRAME C (user, 2026-08-22): a covered frame is not an
+                    // election regime. Certified def lines pass through --
+                    // every candidate above already ceded to the certified
+                    // center, so the mix below is unanimous -- and comp
+                    // lines are bootstrapped toward the certified defs by
+                    // the plain Frame C comb. computeFrameCLine owns the
+                    // gate and declines every line that is not a covered
+                    // comp line with a certified leg, so the election below
+                    // is untouched everywhere else.
+                    for (int rel = 0; rel < width; ++rel)
+                        emitSelected(rel, scratch_frameC[rel]);
+                    if (writeWeights && line < (int)w2d_frame_weight.size())
+                        std::fill(w2d_frame_weight[line].begin(),
+                                  w2d_frame_weight[line].end(), 0.9f);
                 } else {
                     // MEASURED, on the produceY-level oracle: a
                     // mean-of-contestants comparison can look close while
