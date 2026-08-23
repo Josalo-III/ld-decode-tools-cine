@@ -1466,9 +1466,32 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             double dMag  = std::fabs(std::fabs(Cup2) - std::fabs(Cdn2));
             double sumUD = std::fabs(Cup2 + Cdn2);
 
-            if (dMag - std::fabs(sumUD * 0.2) <= 0.0) {
-                wUp2 = reachUp2;
-                wDn2 = reachDn2;
+            // REVIVAL IS EVIDENCE-BOUND (user, 2026-08-22). This branch is
+            // reached only when BOTH weights are already zero, so it exists
+            // solely to resurrect legs that something else rejected -- and it
+            // did so by ASSIGNMENT, discarding both the pair weight and the
+            // luma-edge attenuation applied above. Two corrections:
+            //
+            //   * The similarity test is degenerate at low carrier. As Cup2
+            //     and Cdn2 both approach zero, dMag and sumUD approach zero
+            //     with them and the test reads 0 - 0 <= 0, i.e. TRUE. Revival
+            //     therefore fired hardest exactly where there was least
+            //     carrier to justify it, and a full-strength comb there
+            //     subtracts neighbour content that was never carrier, which
+            //     desaturates. Real carrier must be present before leg
+            //     agreement is allowed to mean anything; the threshold is the
+            //     1D's own low-amplitude noise floor.
+            //
+            //   * Carrier agreement is not luma context. Two legs can agree
+            //     perfectly on carrier while sitting on opposite sides of a
+            //     luma edge, because a legal chroma transition is slow and a
+            //     luma feature can be thin. Revive SCALED by the same edge
+            //     evidence the near path obeys, never above it.
+            constexpr double kReviveCarrierFloorIRE = 2.0; // 1D noise floor
+            if (sumUD * invI > kReviveCarrierFloorIRE &&
+                dMag - std::fabs(sumUD * 0.2) <= 0.0) {
+                wUp2 = reachUp2 * (1.0 - 0.80 * eUp);
+                wDn2 = reachDn2 * (1.0 - 0.80 * eDn);
                 sc2 = 1.0;
             } else {
                 wUp2 = 0.0;
@@ -1512,14 +1535,6 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
                         1.0)
                     : 0.0;
             tc = C * (1.0 - hEdgeT);
-            // A zero scalar claims there is no carrier at this sample,
-            // so Y = raw - 0 swaps the RAW COMPOSITE into luma -- carrier
-            // and all. The input-range hull and the cede blend below both
-            // sit inside if (combed), so neither catches this path. Zero
-            // cedes to the 1D center instead (user, 2026-08-22): the same
-            // law buildPhaseCorrected1D already states -- "Zero would
-            // claim there is no carrier at all and push it into luma."
-            if (tc == 0.0) tc = C;
         } else {
             tc = C;
         }
@@ -1563,22 +1578,48 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
                 tc = tc * (1.0 - totalCede) + C * totalCede;
         }
 
-        if (combed) {
-            // Scalar comb outputs may not be brighter, darker, or larger in
-            // magnitude than the raw input pixels that formed the comb.
-            // Candidate/output clusters and excluded legs are not a legal range.
+        // THE HULL IS A PROPERTY OF THE OUTPUT, NOT OF THE COMB
+        // (user, 2026-08-23: "the fix should have lived outside of if
+        // combed").
+        //
+        // Scalar outputs may not be brighter, darker, or larger in magnitude
+        // than the raw input pixels that formed them. Candidate/output
+        // clusters and excluded legs are not a legal range.
+        //
+        // This ran under if (combed) from e1c4d90 (2026-07-12), which bounded
+        // a comb against its legs in the three leg configurations. The
+        // shadow-island fade had already existed since 9c7e223 (2026-07-02)
+        // and exits WITHOUT a comb, so it sat outside the bound for ten days
+        // and every day since: C * (1 - hEdgeT) walks toward zero, a zero
+        // scalar asserts there is no carrier at this sample, and Y = raw - 0
+        // publishes the raw composite as luma. That was not a special case,
+        // it was an omission -- the hull was scoped to the comb when it is
+        // really a law about what may leave this function.
+        //
+        // So the selector below is WHICH LEGS PARTICIPATED, never which
+        // branch produced the value. The no-leg case is a member of the law
+        // rather than an absence of it, and a future branch added above
+        // cannot escape it by construction.
+        {
             const double yC = rawC - C;
             const double yU = rawU2 - Cup2;
             const double yD = rawD2 - Cdn2;
-            if (wUp2 > 0.0 && wDn2 > 0.0)
+            const bool useUp = combed && wUp2 > 0.0;
+            const bool useDn = combed && wDn2 > 0.0;
+            if (useUp && useDn)
                 tc = clampCarrierToInputLimits(
                     tc, rawC, { C, Cup2, Cdn2 }, { yC, yU, yD }, C);
-            else if (wUp2 > 0.0)
+            else if (useUp)
                 tc = clampCarrierToInputLimits(
                     tc, rawC, { C, Cup2 }, { yC, yU }, C);
-            else
+            else if (useDn)
                 tc = clampCarrierToInputLimits(
                     tc, rawC, { C, Cdn2 }, { yC, yD }, C);
+            else
+                // Nothing combed here, so the center is the only input that
+                // formed this sample and the only legal value.
+                tc = clampCarrierToInputLimits(
+                    tc, rawC, { C }, { yC }, C);
         }
         
         if (!std::isfinite(tc))

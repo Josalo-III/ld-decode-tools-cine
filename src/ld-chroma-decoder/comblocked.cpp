@@ -530,19 +530,11 @@ void Comb::FrameBuffer::phaseLocked()
                                                 nullptr,
                                                 lockedLumaSmooth_line(line));
 
-            // Vertical-contrast service: the 1D is the first stage to cross a
-            // vertical contrast, so the lateral coarse delta is registered here
-            // once for every later client (Frame B reach exemption,
-            // hLumaDeltaIRE, cross-color, FVF vertical regime).
-            if (float *hDelta = lockedLumaHDeltaIRE_line(line)) {
-                const double *smooth = lockedLumaSmooth_line(line);
-                for (int rel = 0; rel < width; ++rel) {
-                    const int rm = std::max(0, rel - 2);
-                    const int rp = std::min(width - 1, rel + 2);
-                    hDelta[rel] = static_cast<float>(
-                        std::fabs(smooth[rp] - smooth[rm]) * invIreScale);
-                }
-            }
+            // Vertical-contrast service MOVED (user, 2026-08-23) to the tail
+            // of buildCarrierAnalysis, after buildBandFacts(). It was built
+            // here because phaseLocked runs one call earlier and had only
+            // lockedLumaSmooth in scope -- and that plane is the wrong
+            // bandwidth for the job. See the construction there.
 
             // The coarse-residual aperture-mean pool is built once for every
             // path by buildApertureMeans() (from split1D, before this runs);
@@ -948,6 +940,71 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
     // exists, so the one consolidated scan publishes wLaw, both testimony
     // reaches, and the parallax consensus for all downstream consumers.
     buildBandFacts();
+
+    // HORIZONTAL LUMA DELTA, BUILT ON NOTCH-HF (user, 2026-08-23).
+    //
+    // This is the lateral-contrast service every hEdge consumer reads:
+    // Field A's cede and shadow ramp, the bevel term, Frame B's reach
+    // exemption, cross-colour, and the FVF vertical regime.
+    //
+    // It used to live in phaseLocked, one call earlier, where the only
+    // luma-shaped plane in scope was lockedLumaSmooth -- a piecewise-linear
+    // interpolation between raster-aligned 4-sample block means. That is a
+    // lowpass whose corner sits INSIDE the band this measurement exists to
+    // detect: a luma transition fast enough to put energy in the bandpass is
+    // exactly what the block mean averages away, so the delta read low at
+    // precisely the transitions that need the defence, and every consumer
+    // above under-fired there. The aperture was consistent across the
+    // buildCombTapLine rungs; the source bandwidth was not.
+    //
+    // buildBandFacts() has just published wLaw and both testimony reaches,
+    // so notch-HF is available here and nowhere earlier: raw minus the
+    // carrier the band law confirmed. The fSC notch is deliberately NOT the
+    // source -- it carries carrier elements of its own (author, 2026-08-23),
+    // which is why buildCombTapLine's rung 3 cannot serve either.
+    //
+    // The +/-2 aperture is unchanged and load-bearing: at 4fSC
+    // cos(theta+2) = cos(theta-2), so the carrier terms subtract out. Do not
+    // narrow it -- see the rung-3 note in buildCombTapLine.
+    //
+    // Fallback is per ROW, never per sample: a sample-by-sample choice
+    // between two sources would manufacture deltas at the switch points,
+    // which is the failure this measurement is supposed to detect.
+    {
+        std::vector<double> nhLuma(width, 0.0);
+        for (int line = first; line < last; ++line) {
+            float *hDelta = lockedLumaHDeltaIRE_line(line);
+            if (!hDelta)
+                continue;
+
+            const double *bp   = locked1DRawBandpass_line(line);
+            const double *wLaw = bandWLaw_line(line);
+            const double *keep = bandKeep_line(line, 2);
+
+            if (bp && wLaw && keep) {
+                const quint16 *rawLine =
+                    rawbuffer.data() + static_cast<size_t>(line) * fullWidth;
+                for (int rel = 0; rel < width; ++rel) {
+                    nhLuma[rel] = static_cast<double>(rawLine[left + rel]) -
+                                  bp[rel] * wLaw[rel] * keep[rel];
+                }
+            } else if (const double *smooth = lockedLumaSmooth_line(line)) {
+                // The band construction could not run on this row. Fall back
+                // whole-row to the coherent coarse rather than claim a
+                // sharpness the facts do not support.
+                std::copy(smooth, smooth + width, nhLuma.begin());
+            } else {
+                continue;
+            }
+
+            for (int rel = 0; rel < width; ++rel) {
+                const int rm = std::max(0, rel - 2);
+                const int rp = std::min(width - 1, rel + 2);
+                hDelta[rel] = static_cast<float>(
+                    std::fabs(nhLuma[rp] - nhLuma[rm]) * invIreScale);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
