@@ -1060,7 +1060,13 @@ private:
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
 	std::vector<double> scratch_fvf_notchFieldA; // per-line Field A notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchFieldB; // per-line Field B notch-luma pre-pass
-	std::vector<double> scratch_frameC;        // Frame C covered comp-line bootstrap (split2D emit)
+	std::vector<double> scratch_frameC;
+	// Frame A cancellation-opportunity mask: 1 where the +-1 scalar legs agree
+	// with each other and oppose the centre, so the comb must take the [1,2,1]
+	// projection at pull 0.5 instead of the boosted range. Set by
+	// computeFrameALine (assigned fresh every line), consumed by
+	// computeIQFrameAFromPreparedVectors. Never read stale.
+	std::vector<std::uint8_t> scratch_frameACancel;        // Frame C covered comp-line bootstrap (split2D emit)
 	std::vector<double> scratch_fvf_notchFrame;  // per-line Frame B notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchSource; // per-line source notch-luma pre-pass
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
@@ -1594,12 +1600,9 @@ private:
 			return 1.0;
 		if (!grammar || !grammar->grammarLocked)
 			return 0.0;
-		double base = grammar->projectionValid
+		return grammar->projectionValid
 			? std::clamp(grammar->carrierFitRatio, 0.0, 1.0)
 			: std::clamp(grammar->phaseConfidence, 0.0, 1.0);
-		const double conflictPenalty =
-			1.0 - 0.5 * std::clamp(grammar->phaseScheduleConflict, 0.0, 1.0);
-		return base * conflictPenalty;
 	}
 
 	inline double remodUnsignedBucketToComposite(int line, int h,

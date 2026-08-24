@@ -221,10 +221,6 @@ inline T centeredCarrierCycle4Mean(const T &minus2,
 // both the locked demod path and candidate generation.
 inline constexpr double CAL_EPS_SAMPLES = -0.07;
 
-// Global LO trim in degrees applied during burst rotation in phaseLocked().
-// Negative values counteract a slight green bias. Zero = no trim.
-inline constexpr double CAL_LO_ROT_DEG = 0.0;
-
 // Locked-path per-axis chroma gain lives in Comb::Configuration
 // (gi_product / gq_product, comb.h).  combmath.h provides reusable
 // arithmetic only; it does not own decoder product tuning.

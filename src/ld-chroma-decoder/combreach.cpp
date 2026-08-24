@@ -49,10 +49,9 @@ double grammarAuthority(const CarrierGrammarState *center,
         return 0.0;
 
     auto lineAuthority = [](const CarrierGrammarState *grammar) -> double {
-        double base = grammar->grammarLocked
+        const double base = grammar->grammarLocked
             ? std::clamp(grammar->phaseConfidence, 0.0, 1.0)
             : 0.65;
-        base *= 1.0 - 0.5 * std::clamp(grammar->phaseScheduleConflict, 0.0, 1.0);
         return std::clamp(base, 0.0, 1.0);
     };
 

@@ -803,57 +803,7 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     anchorCeilingValid = false;
 }
 
-
-
-// 1D horizontal bandpass: isolates subcarrier energy by subtracting the average
-// of the samples two positions either side (a 2-tap comb at 2fsc), scaled by 0.5.
-// Result written to clpbuffer[0].
-// ---------------------------------------------------------------------------
-// APERTURE-CHROMA PHYSICS (the instrument that measured this, LDCD_PROBE_APERTURE,
-// has since been removed; it was measurement only -- it read state, wrote
-// nothing, and changed no output). The reasoning below is the record.
-//
-// The question (writeup S7): do the four demodulated aperture views bound the
-// chroma usefully at a hard luma step?
-//
-// Algebra answers half of it outright, so the probe does not need to ask it.
-// The four covering views of sample x are view_k[x] = raw[x] - apMean[x-3+k],
-// so their MEAN is
-//     m[x] = raw[x] - A[x],      A[x] = (1/4) * sum_k apMean[x-3+k]
-// and A is exactly the 7-tap triangle T = {1,2,3,4,3,2,1}/16 applied to LUMA:
-// four width-4 boxcars at unit offsets convolve to that triangle, and every
-// boxcar is chroma-free because a legal carrier nulls over any four samples.
-// Hence
-//     m[x] = C[x] + (I - T){Y}[x]
-// The four-view mean is the true carrier PLUS A HIGHPASS OF LUMA. T is
-// symmetric with unit gain and zero first moment, so it reproduces affine luma
-// exactly and m is unbiased on constant and on RAMP luma -- but not at a STEP,
-// where a unit step leaves the doublet {-1,-3,-6,+6,+3,+1}/16. That is the same
-// family of error the 1D bandpass itself makes (-0.25*D2_2 Y). So the naive
-// aperture reference is biased exactly where the edge colour band lives, and
-// averaging the views cannot be the instrument.
-//
-// What survives is the WIDTH of the feasible interval rather than its centre.
-// On flat luma the four covering means agree, the hull collapses to a POINT,
-// and the carrier is known EXACTLY -- raw minus luma, no filter and no
-// assumption. Ambiguity is confined to a narrow zone around each luma edge.
-// The envelope is bandlimited BY LAW, so the exact anchors flanking an edge
-// constrain the envelope through the zone -- provided the zone is narrower
-// than the envelope kernel's reach. That proviso is a measurement, not a
-// derivation, and it is the load-bearing one.
-//
-// Measured here, binned by hull width (which IS edge proximity -- it is the
-// luma spread over T's support -- so no edge detector is needed):
-//   (1) what fraction of the line is exact-anchor, and how the ambiguous run
-//       lengths compare with the 9-tap envelope kernel's +-4 reach;
-//   (2) E_mean -- the naive four-view-mean envelope (the biased reference);
-//   (3) E_ext  -- the SAME quantity restricted to anchors and extended
-//       lawfully by the envelope kernel (the proposed reference);
-//   against E_1d -- what the 1D bandpass actually emits.
-// E_mean and E_ext are built from one signal m and differ only in whether m is
-// trusted where it is provably exact, which isolates the step bias directly.
-// ---------------------------------------------------------------------------
-
+// 1D horizontal bandpass
 void Comb::FrameBuffer::split1D()
 {
     // Sample-column windows come from the metadata header, never from
@@ -1083,7 +1033,6 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
     lddecode::normalizeCombAttributionAssessment(a, rules);
 }
 
-// ----------------------------------------------------------------------------
 // FVF election 
 void Comb::FrameBuffer::scoreFieldVsFrame(
     int line,

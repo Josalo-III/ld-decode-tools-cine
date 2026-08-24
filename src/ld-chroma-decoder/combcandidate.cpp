@@ -1125,6 +1125,83 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     tapLine.builtFlags = flags;
 }
 
+// Nearest point on the closed segment [a,b] to p.
+static inline std::complex<double> clampIQProjectSegment(
+    const std::complex<double> &p,
+    const std::complex<double> &a,
+    const std::complex<double> &b)
+{
+    const std::complex<double> ab = b - a;
+    const double den = std::norm(ab);
+    if (!(den > 0.0)) return a;
+    const std::complex<double> ap = p - a;
+    double t = (ap.real() * ab.real() + ap.imag() * ab.imag()) / den;
+    t = std::clamp(t, 0.0, 1.0);
+    return a + ab * t;
+}
+
+// IQ-SPACE HULL for the IQ combs (user, 2026-08-23: "IQ combs ought not to
+// use luma, they should have a hull inside the IQ space that operates before
+// remod").
+//
+// The luma feasibility bound of fd71c90 cannot see this project's actual
+// failure. Its premise was that "an unsaturated excursion in IQ is not what
+// anyone sees", but the observed artifacts ARE unsaturated: a desaturated
+// excursion is a small |Z|, and the luma it implies sits comfortably inside
+// the legs' luma range, so the bound passes it as legal. A zero carrier is
+// the limiting case -- Y = raw - 0 republishes the composite as luma, and no
+// luma-domain range can catch it.
+//
+// In IQ the statement is available again: the answer must lie in the convex
+// hull of the legs that were actually combed. Where those legs carry real
+// chroma the hull excludes the origin, so a collapse toward zero is pulled
+// back to the nearest thing an input could have produced.
+//
+// The legs passed here MUST be the column-phase-aligned ones. Frame A's
+// +/-1 legs come from the other field, so unaligned their carrier can sit
+// near-opposite the centre and their hull would straddle the origin -- the
+// bound would then license exactly the collapse it exists to catch.
+// Alignment is a basis change upstream of the strength law, not a value
+// re-derived from it, so this does not repeat the fault that retired the old
+// guard: that box was built over candidates re-derived through
+// localStrength, the very quantity it bounded.
+static inline std::complex<double> clampIQToInputHull(
+    const std::complex<double> &Z,
+    const std::complex<double> &Z0,
+    const std::complex<double> *Zu,
+    const std::complex<double> *Zd)
+{
+    if (!std::isfinite(Z.real()) || !std::isfinite(Z.imag()))
+        return Z0;
+    if (!Zu && !Zd)
+        return Z0;                       // centre is the only input
+    if (!Zu || !Zd)
+        return clampIQProjectSegment(Z, Z0, Zu ? *Zu : *Zd);
+
+    auto cross = [](const std::complex<double> &o,
+                    const std::complex<double> &a,
+                    const std::complex<double> &b) {
+        return (a.real() - o.real()) * (b.imag() - o.imag()) -
+               (a.imag() - o.imag()) * (b.real() - o.real());
+    };
+    const double d1 = cross(Z0, *Zu, Z);
+    const double d2 = cross(*Zu, *Zd, Z);
+    const double d3 = cross(*Zd, Z0, Z);
+    const bool anyNeg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    const bool anyPos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    if (!(anyNeg && anyPos))
+        return Z;                        // inside the triangle, or on an edge
+
+    const std::complex<double> c1 = clampIQProjectSegment(Z, Z0, *Zu);
+    const std::complex<double> c2 = clampIQProjectSegment(Z, *Zu, *Zd);
+    const std::complex<double> c3 = clampIQProjectSegment(Z, *Zd, Z0);
+    const double n1 = std::norm(Z - c1);
+    const double n2 = std::norm(Z - c2);
+    const double n3 = std::norm(Z - c3);
+    if (n1 <= n2 && n1 <= n3) return c1;
+    return (n2 <= n3) ? c2 : c3;
+}
+
 static inline double clampCarrierToInputCarrierLimits(
     double v,
     std::initializer_list<double> inputs,
@@ -1993,6 +2070,8 @@ static inline std::complex<double> applyColumnPhaseAlignment(
         s * neighbor.real() + c * neighbor.imag());
 }
 
+// NOTE: scratch_frameACancel is consumed here and cleared on exit; only
+// computeFrameALine sets it, immediately before calling in.
 void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
@@ -2300,16 +2379,42 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
             (COMB_STRENGTH_LO +
              (COMB_STRENGTH_HI - COMB_STRENGTH_LO) * cohGate) * disGate;
 
+        // CANCELLATION OPPORTUNITY: TAKE THE PROJECTION, NEVER THE BOOST
+        // (user, 2026-08-23: "1.125 will overshoot. The red and green are
+        // equally wrong and must converge on a center that lives only in the
+        // math, not in the 1D as-is").
+        //
+        // Where the legs agree with each other and oppose the centre, the
+        // centre reads C+e and the legs read C-e: both are wrong by the same
+        // amount in opposite directions, and the truth is a midpoint present
+        // in no observation. This comb emits Z0 + s*(Zframe - Z0), which for
+        // that geometry is C + e*(1 - 2s). Only s = 0.5 lands on C.
+        //
+        // The ordinary range cannot get there. COMB_STRENGTH_LO is 0.8 and
+        // COMB_STRENGTH_HI is 1.125, giving C - 0.6e at the floor and
+        // C - 1.25e at the ceiling: the alternation survives with its sign
+        // inverted, worse at the ceiling than leaving it alone. That is
+        // Frame B's recorded law reaching Frame A -- "pull > 0.5 is not
+        // stronger cancellation, it re-injects inverted alien at (2p-1)" --
+        // and Frame B is capped at the projection while Frame A never was.
+        //
+        // disGate still applies: content disagreement may withdraw the comb,
+        // but it may not push it past the projection.
+        if (x < (int)scratch_frameACancel.size() && scratch_frameACancel[x])
+            localStrength = 0.5 * disGate;
+
         std::complex<double> Zcandidate = Z0 + (delta * localStrength);
         
-        // No bound in IQ.  Frame A's failures are judged as luma, and the
-        // reconstructed-luma feasibility bound is applied to its composite
-        // scalar in split2D() where the remod puts it one subtraction from Y.
-        // The box that used to sit here was over {Z0, ZupCand, ZdnCand}: two
-        // candidates re-derived from Frame A's own strength law, so a wrong
-        // strength moved the candidate and its bound together and the box
-        // admitted exactly the excursions it existed to catch.
-        outFrameIQ[x] = Zcandidate;
+        // BOUND IN IQ, BEFORE REMOD (user, 2026-08-23). The legs are the
+        // aligned ZUpRaw/ZDnRaw this comb actually worked from, selected by
+        // the same useUp/useDn that decided participation -- so the no-leg
+        // case is a member of the law rather than an absence of it. See
+        // clampIQToInputHull for why alignment does not repeat the fault
+        // that retired the box which used to sit here.
+        outFrameIQ[x] = clampIQToInputHull(
+            Zcandidate, Z0,
+            useUp ? &ZUpRaw : nullptr,
+            useDn ? &ZDnRaw : nullptr);
     }
 }
 // Frame A: adaptive interframe IQ comb fed by the Field B preclean ring.
@@ -2390,6 +2495,35 @@ void Comb::FrameBuffer::computeFrameALine(
     if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
     if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
     if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
+    // Fresh every line, so the mask can never be read stale.
+    scratch_frameACancel.assign(width, 0);
+    const double minCancelIRE = configuration.tunables.FRAME_CHROMA_MIN_IRE;
+
+    // THE 1D's OWN IQ, ALREADY PUBLISHED (user, 2026-08-23: "why did you add
+    // demods? we are in IQ space already").
+    //
+    // buildPhaseCorrected1D emits locked1DTI/TQ4fsc as its Pass-3b "pre-comb
+    // IQ authority": the 1D scalar demodulated on a 3-sample centred aperture
+    // that cancels the alternating product image. It is per line, it is
+    // upstream of Field B, and Frame A's own certified def-line cede already
+    // reads these same planes. Re-demodulating bucketScalar1D here would cost
+    // three products per sample, would carry the 2fSC image these do not, and
+    // would have to hand-manage cursor phase. Read the authority instead.
+    auto lockedI4Line = [&](int ln)->const float* {
+        return (ln >= first && ln < last) ? locked1DTI4fsc_line(ln) : nullptr;
+    };
+    auto lockedQ4Line = [&](int ln)->const float* {
+        return (ln >= first && ln < last) ? locked1DTQ4fsc_line(ln) : nullptr;
+    };
+    const float *oneDI0 = lockedI4Line(line);
+    const float *oneDQ0 = lockedQ4Line(line);
+    const float *oneDIu = verticalAllowed ? lockedI4Line(line - 1) : nullptr;
+    const float *oneDQu = verticalAllowed ? lockedQ4Line(line - 1) : nullptr;
+    const float *oneDId = verticalAllowed ? lockedI4Line(line + 1) : nullptr;
+    const float *oneDQd = verticalAllowed ? lockedQ4Line(line + 1) : nullptr;
+    const bool haveOneDTriple =
+        oneDI0 && oneDQ0 && oneDIu && oneDQu && oneDId && oneDQd;
+
     for (int x = 0; x < width; ++x) {
         if (preclean0)
             scratch_centerIQ[x] =
@@ -2425,6 +2559,45 @@ void Comb::FrameBuffer::computeFrameALine(
                     carrierGrammarDemodSignedCompositeTo4fsc(scalarDnCursor, scalarDn[x]);
             else
                 scratch_dnIQ[x] = std::complex<double>(0.0, 0.0);
+        }
+
+        // THE CANCELLATION ESCAPE (user, 2026-08-23).
+        //
+        // Preclean priority is right for workaday samples: the cleaner input,
+        // and no non-germane blending. But the 1D error is carrier-rate
+        // content, so Field B has already interpreted and split it before
+        // Frame A sees a leg -- the common-mode term a +-1 comb could null is
+        // consumed upstream, which is why every gate downstream can be open
+        // and the alternation still survives.
+        //
+        // The opportunity is visible in the 1D's own IQ: both legs agreeing
+        // with each other while opposing the centre is the signature of a term
+        // equally wrong in both directions, whose truth is a midpoint present
+        // in no observation. Two of the three tests are threshold-free --
+        // |Zu-Zd| <= |Zu+Zd| is "the legs are within 90 degrees of each
+        // other", dot(Zm,Z0) < 0 is "the leg mean opposes the centre" -- and
+        // the amplitude floor reuses FRAME_CHROMA_MIN_IRE rather than
+        // inventing a constant.
+        //
+        // Where it holds the legs come from the 1D authority so the term is
+        // present to be cancelled, and computeIQFrameAFromPreparedVectors
+        // takes the projection at pull 0.5 instead of the boosted range.
+        if (haveOneDTriple) {
+            const std::complex<double> Z0s((double)oneDI0[x], (double)oneDQ0[x]);
+            const std::complex<double> Zus((double)oneDIu[x], (double)oneDQu[x]);
+            const std::complex<double> Zds((double)oneDId[x], (double)oneDQd[x]);
+            const std::complex<double> Zm = 0.5 * (Zus + Zds);
+            const bool legsAgree = cmag(Zus - Zds) <= cmag(Zus + Zds);
+            const bool opposeCentre = dotIQ(Zm, Z0s) < 0.0;
+            const bool loudEnough =
+                cmag(Z0s) * invIreScale >= minCancelIRE &&
+                cmag(Zm) * invIreScale >= minCancelIRE;
+            if (legsAgree && opposeCentre && loudEnough) {
+                scratch_centerIQ[x] = Z0s;
+                scratch_upIQ[x] = Zus;
+                scratch_dnIQ[x] = Zds;
+                scratch_frameACancel[x] = 1;
+            }
         }
     }
 

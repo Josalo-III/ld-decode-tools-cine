@@ -125,6 +125,15 @@ struct CarrierGrammarState {
     // Authority and schedule-conflict diagnostics.
     CarrierPhaseAuthority lineFlipAuthority  = CarrierPhaseAuthority::Metadata;
     int    rigidScheduleLineFlip             = +1;
+    // Owned by ld-composite-decoder, which computes it from the unclamped
+    // burst-frame rotation's deviation from the rigid schedule (saturating
+    // at 45 degrees) and both gates lineFlipAuthority and attenuates
+    // grammar trust with it.  ld-chroma-decoder never writes it: its burst
+    // schedule was measured exact to 0.005 deg per line pair (2026-08-23
+    // census), so a conflict here would mean an edit or a skip -- the
+    // healer's jurisdiction, not the grammar's.  The comb's consumers of
+    // this field were removed the same day; the field stays because the
+    // struct is shared.
     double phaseScheduleConflict             = 0.0;
 
     // Implementation-specific carrier basis for the line.
