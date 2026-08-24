@@ -316,8 +316,17 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->buildCarrierAnalysis(
                     prevIterAnalyzed ? current.get() : nullptr);
                 // Corner-leak corrector: consumes the analysis record, the
-                // canonical bandpass and the aperture-mean pool. Diagnostic
-                // only -- publishes lockedCornerLeak_flat, changes no output.
+                // canonical bandpass and the aperture-mean pool, and
+                // publishes lockedCornerLeak_flat.  It is NO LONGER
+                // diagnostic: buildPhaseCorrected1D subtracts that plane
+                // from the raw bandpass, so an enabled leak reaches the 1D
+                // source and every product below it.  What keeps the
+                // default render unchanged is the opt-in gate
+                // (LDCD_CORNER_LEAK), not an absent consumer -- unset, the
+                // stage returns early and the plane stays zero, which makes
+                // the subtraction a no-op.  Enabling it DOES change output
+                // (verified 2026-08-23).  Cost when enabled is ~11% of a
+                // locked decode, the Van Cittert sweeps dominating.
                 next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
                 // Presence of certified, not the witness fork.  The ladder
