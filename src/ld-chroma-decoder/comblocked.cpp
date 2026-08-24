@@ -154,6 +154,28 @@ void Comb::FrameBuffer::phaseLocked()
     constexpr double MIN_PHASE_CONFIDENCE = 1e-6;
 
     // --- Pass 1: burst detection -> carrier grammar ---
+    //
+    // Schedule-locked burst pooling (2026-08-23). The three-census audit
+    // established that the per-line burst is the rigid schedule plus
+    // ~0.53 deg of gate noise, with real line-to-line wander bounded
+    // near zero: per-line freshness carries no information, only noise.
+    // So the phase REFERENCE is pooled per field through the exact
+    // schedule (same-field scan lines are 227.5 cycles apart -- a 180 deg
+    // flip per line pair), which divides the reference noise by ~sqrt(N)
+    // and makes it uniform across the field. Per-line facts stay
+    // per-line: carrierScale and phaseConfidence still report each
+    // line's own gate, so downstream trust is unchanged. A line whose
+    // own gate is dead inherits the field's reference (the schedule is
+    // raster law on a TBC'd capture); a line whose gate deviates beyond
+    // the trim is treated as a broken measurement, not a different
+    // carrier. The two fields pool separately -- on covered frames they
+    // are different captures. Eye-approved 2026-08-23 ("more solid");
+    // the per-line fallback below is for a field with no usable gates
+    // at all, not an alternative regime.
+
+    // Pass 1a: per-line gates. Rotated phasor cached, schedule-signed.
+    std::vector<double> gateC(lastLine, 1.0), gateS(lastLine, 0.0);
+    std::vector<double> gateW(lastLine, 0.0);
     for (int line = firstLine; line < lastLine; ++line) {
         const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
         auto burst = detectBurst(rawLine, videoParameters, floorEnable, floorFactor);
@@ -161,14 +183,69 @@ void Comb::FrameBuffer::phaseLocked()
         const double bc2 = bcos * cRb - bsin * sRb;
         const double bs2 = bcos * sRb + bsin * cRb;
         CombCarrierGrammar &grammar = carrierGrammar[line];
-        grammar.burstCos = bc2;
-        grammar.burstSin = bs2;
         grammar.carrierScale = burst.carrierScale * invIreScale;
         grammar.phaseConfidence =
             std::clamp((grammar.carrierScale - 3.0) / 7.0, 0.0, 1.0);
-        grammar.grammarLocked = grammar.phaseConfidence > MIN_PHASE_CONFIDENCE;
         grammar.phaseError = 0.0;
         grammar.affine.valid = false;
+        gateC[line] = bc2;
+        gateS[line] = bs2;
+        gateW[line] = grammar.phaseConfidence;
+    }
+
+    // Pass 1b: pool per field parity through the schedule. One trim
+    // round at 45 deg -- generous against 0.5 deg noise, so it drops
+    // only genuinely broken gates (dropouts, data lines).
+    double poolC[2] = { 1.0, 1.0 }, poolS[2] = { 0.0, 0.0 };
+    bool poolValid[2] = { false, false };
+    {
+        constexpr double kTrimCos = 0.70710678118654752440;  // cos 45 deg
+        for (int par = 0; par < 2; ++par) {
+            for (int round = 0; round < 2; ++round) {
+                double sumC = 0.0, sumS = 0.0, sumW = 0.0;
+                for (int line = firstLine + ((firstLine & 1) != par ? 1 : 0);
+                     line < lastLine; line += 2) {
+                    const double w = gateW[line];
+                    if (w <= 0.0) continue;
+                    const double sign = ((line >> 1) & 1) ? -1.0 : 1.0;
+                    const double c = sign * gateC[line];
+                    const double s = sign * gateS[line];
+                    if (round == 1 &&
+                        c * poolC[par] + s * poolS[par] < kTrimCos)
+                        continue;
+                    sumC += w * c;
+                    sumS += w * s;
+                    sumW += w;
+                }
+                const double mag = std::hypot(sumC, sumS);
+                if (sumW < 3.0 || mag < 1e-9) {
+                    poolValid[par] = false;
+                    break;
+                }
+                poolC[par] = sumC / mag;
+                poolS[par] = sumS / mag;
+                poolValid[par] = true;
+            }
+        }
+    }
+
+    // Pass 1c: publish each line's reference and its demod LUTs.
+    for (int line = firstLine; line < lastLine; ++line) {
+        CombCarrierGrammar &grammar = carrierGrammar[line];
+        double bc2, bs2;
+        if (poolValid[line & 1]) {
+            const double sign = ((line >> 1) & 1) ? -1.0 : 1.0;
+            bc2 = sign * poolC[line & 1];
+            bs2 = sign * poolS[line & 1];
+            grammar.grammarLocked = true;
+        } else {
+            bc2 = gateC[line];
+            bs2 = gateS[line];
+            grammar.grammarLocked =
+                grammar.phaseConfidence > MIN_PHASE_CONFIDENCE;
+        }
+        grammar.burstCos = bc2;
+        grammar.burstSin = bs2;
 
         double lutTi[4], lutTq[4];
         fusedDemodLUT(bc2, bs2, spLUT_locked, cpLUT_locked, lutTi, lutTq);
