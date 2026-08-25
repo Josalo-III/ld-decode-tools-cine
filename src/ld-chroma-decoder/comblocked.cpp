@@ -4270,10 +4270,9 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     grammarLine ? grammarLine->carrierScale : 0.0) * irescale;
 
             // Election tolerances (IRE -> samples).
-            const double inlierTol  = 4.0 * irescale; // medoid inlier gate
-            const double phasePenSamp =
-                std::max(0.0, configuration.tunables.PRODUCE_Y_PHASE_PENALTY_IRE)
-                * irescale; // capped phase hygiene penalty
+            // Retracted admission: how close its top must sit to a
+            // neighbour's testimony. Neighbour evidence, not consensus.
+            const double inlierTol  = 4.0 * irescale;
 
             // Carrier-basis window norms (constant per line: the 4-sample window
             // always spans the full set of phases regardless of start).
@@ -4621,32 +4620,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 return center - middle * 0.25;
             };
 
-            auto carrierCleanlinessOf = [&](int plane, int h0) -> double {
-                double hf5[5], s5[5], c5[5], w5[5];
-                double meanHF = 0.0;
-                for (int j = 0; j < 5; ++j) {
-                    const int k = j - 2;
-                    const int hh = std::clamp(h0 + k, left, right - 1);
-                    const double w = (j == 0 || j == 4) ? 0.5 : 1.0;
-                    hf5[j] = resAt(plane, hh - left);
-                    s5[j] = spRowP[hh - left];
-                    c5[j] = cpRowP[hh - left];
-                    w5[j] = w;
-                    meanHF += w * hf5[j];
-                }
-                meanHF *= 0.25;
-                double dotS = 0.0, dotC = 0.0, nrm = 0.0;
-                for (int j = 0; j < 5; ++j) {
-                    const double ac = hf5[j] - meanHF;
-                    dotS += w5[j] * ac * s5[j];
-                    dotC += w5[j] * ac * c5[j];
-                    nrm  += w5[j] * ac * ac;
-                }
-                const double carrierE =
-                    (basisSN > 1e-9 ? dotS * dotS / basisSN : 0.0) +
-                    (basisCN > 1e-9 ? dotC * dotC / basisCN : 0.0);
-                return std::clamp(1.0 - carrierE / (nrm + 1e-9), 0.0, 1.0);
-            };
             auto remainingCarrierMagnitudeOf = [&](int plane, int h0) -> double {
                 double dotS = 0.0, dotC = 0.0;
                 for (int k = -2; k <= 2; ++k) {
@@ -4764,17 +4737,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 return true;
             };
 
-            auto medoidD = [](const double *a, int n) -> double {
-                if (n == 1) return a[0];
-                if (n == 2) return 0.5 * (a[0] + a[1]);
-                int best = 0; double bestTot = 1e300;
-                for (int i = 0; i < n; ++i) {
-                    double t = 0.0;
-                    for (int j = 0; j < n; ++j) t += std::fabs(a[i] - a[j]);
-                    if (t < bestTot) { bestTot = t; best = i; }
-                }
-                return a[best];
-            };
             auto closestD = [](const double *a, int n, double target) -> double {
                 double best = a[0];
                 for (int i = 1; i < n; ++i)
@@ -5012,14 +4974,11 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     continue;
                 }
 
-                double inHF[5], inCarrierCleanliness[5];
+                double inHF[5];
                 double inCrossColorReturnEvidence[5] =
                     {0.0, 0.0, 0.0, 0.0, 0.0};
-                for (int k = 0; k < nIn; ++k) {
+                for (int k = 0; k < nIn; ++k)
                     inHF[k] = candY[inIdx[k]];
-                    inCarrierCleanliness[k] =
-                        carrierCleanlinessOf(candPlane[inIdx[k]], h);
-                }
                 const int baseNIn = nIn;
                 auto planeForTop = [&](double top) {
                     for (int k = 0; k < baseNIn; ++k)
@@ -5031,11 +4990,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     return 0;
                 };
 
-                const double selfAnchor = medoidD(inHF, baseNIn);
                 if (returnedAdmitted) {
                     inHF[nIn] = candidateTopAt(4, h);
-                    inCarrierCleanliness[nIn] =
-                        carrierCleanlinessOf(4, h);
                     ++nIn;
                 }
                 double brightestLive =
@@ -5139,17 +5095,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 const double kNotchHfTaperGain = kNotchHfTaperGainIRE * irescale;
                 const double kNotchHfKnee      = kNotchHfKneeIRE * irescale;
                 const double kNotchHfTaperTau  = kNotchHfTaperTauIRE * irescale;
-                double sw[5];
-                int refN = 0;
-                for (int i = 0; i < baseNIn && i < nIn; ++i) {
-                    if (candPlane[inIdx[i]] == 5) continue;
-                    sw[refN++] = inCarrierCleanliness[i];
-                }
-                double medianW = 0.0;
-                if (refN > 0) {
-                    std::sort(sw, sw + refN);
-                    medianW = sw[refN / 2];
-                }
 
                 const double combTopHere = combTop0;
                 const double illegalProof = analysisRow
@@ -5213,16 +5158,28 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                             const double dd = std::fabs(inHF[k] - dirHF[d]);
                             if (dd < nd) { nd = dd; }
                         }
+                        // No neighbour testimony: charge NOTHING.
+                        // CONSENSUS IS NOT A TERM IN THIS ELECTION (user
+                        // ruling; majority rule is a bankrupt heuristic).
+                        // Two terms were removed 2026-08-24: a median of
+                        // the seated candidates' cleanliness, which set a
+                        // bar each candidate was charged for falling
+                        // below -- the population's own centre pricing
+                        // deviation, moving with the roster, biting
+                        // hardest at HF where the departing candidate is
+                        // the one carrying detail the others lack; and a
+                        // medoid self-anchor, which made every
+                        // candidate's base cost its distance to the most
+                        // consensual member, applied exactly where no
+                        // evidence exists. Neighbour proximity (nd
+                        // against dirHF) is evidence and stays.
+                        // Agreement with the pack is not evidence.
                         if (nDir == 0)
-                            nd = std::fabs(inHF[k] - selfAnchor);
+                            nd = 0.0;
                         const double proximity01 =
                             1.0 - std::clamp(nd / proxTol, 0.0, 1.0);
 
                         double cost = nd;
-                        if (medianW > 0.0)
-                            cost += (std::max(0.0,
-                                         medianW - inCarrierCleanliness[k]) /
-                                     medianW) * phasePenSamp;
                         const double extra = std::isfinite(combTopHere)
                             ? std::max(0.0, std::fabs(inHF[k]) -
                                             std::fabs(combTopHere))

@@ -307,9 +307,11 @@ public:
             // carrier reduction under measured cross-colour. Raw and smoothed
             // detector values remain separately observable in diagnostics.
             double PRODUCE_Y_CC_RETURN_EVIDENCE_CAP_IRE = 3.0;
-            // Carrier-basis phase is only a hygiene/tie-break term in produceY;
-            // luma image continuity owns the election.
-            double PRODUCE_Y_PHASE_PENALTY_IRE = 0.75;
+            // PRODUCE_Y_PHASE_PENALTY_IRE was removed 2026-08-24 with the
+            // election's consensus terms: it scaled the charge a candidate
+            // paid for its carrier-basis cleanliness falling below the
+            // MEDIAN of the seated candidates, so it had no meaning once
+            // the population's centre stopped being a reference.
             double FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG = 10.0; // clamp for neighbor IQ column phase alignment in frame candidates
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
