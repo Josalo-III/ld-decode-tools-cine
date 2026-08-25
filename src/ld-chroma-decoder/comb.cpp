@@ -2492,11 +2492,12 @@ void Comb::FrameBuffer::split2D()
     // so a line this path does not write reads as a default record, never a
     // neighbour's (the 2026-08-16 cross-frame-drag lesson).
     //
-    // Forced --two-d-variant renders are exempt: they exist to put one named
-    // candidate on screen for diagnosis, and that must keep working.
+    // Named candidate renders obey the covered-frame construction too.  A
+    // diagnostic selector can choose a candidate only where candidates are
+    // lawful; covered def lines remain certified facts and covered comp lines
+    // remain Frame C.
     const bool coveredNoElection =
         configuration.phaseCompensation &&
-        configuration.twoDVariant == Comb::Configuration::FieldVsFrame &&
         certifiedOneDLevel() >= 2 &&
         frameHasExactCoverage();
 
