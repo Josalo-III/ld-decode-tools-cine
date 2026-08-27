@@ -130,7 +130,7 @@ public:
             Line,             // 1D only
             FieldAContour,    // Field A: contour-aware same-field +/-2 comb with +/-4 support
             FieldBSimple,     // Field B: direct same-field +/-2 comb
-            FrameAAdaptiveIQ, // Frame A: column-phase-aligned adaptive interframe IQ comb
+            FrameAAdaptiveIQ, // Frame A: precleaned, reach-gated interframe midpoint comb
             FrameBDirectIQ,   // Frame B: direct interframe IQ comb with IRE-domain reach-floor inputs
             // FVF (Default). Three-way election; the ballot is regime-set:
             //   progressive -- Frame A (+/-1), Field A (+/-2), Frame B (+/-1)
@@ -188,16 +188,16 @@ public:
             // =========================================================================
             // Frame comb on phase-corrected 1D
             // =========================================================================
-            double FRAME_COMB_STRENGTH        = 1.125; // interframe cancellation amplitude scale for Frame A (>1 boosts cancellation)
-            double FRAME_CHROMA_MIN_IRE       = 1.5;   // Frame A minimum chroma amplitude to engage the frame IQ path
-            double FRAME_IQ_RAW_MAX_DELTA_IRE = 70.0;  // Frame A max IQ mismatch between locked-1D and frame average before frame IQ is distrusted
-            double FRAME_IQ_COH_PASS_CORR     = 0.85;  // Frame A signed center/neighbor correlation at which cohGate fully passes (firm comb); ramp starts 0.30 below
-            double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B ±1: fraction of the EXACT projection (pull = 0.5 * strength * reachAuthority). 1.0 = the [1,2,1] solution of the two-line alternation model (alien nulled, Y luma at unit gain). Values are capped at the projection: pull > 0.5 is not stronger cancellation, it re-injects inverted alien at (2p−1) — the 0.80-era overdrive that serrated diagonals and manufactured diagonal cross-color.
+            double FRAME_COMB_STRENGTH        = 1.125; // RESERVED / inert: Frame A now uses a fixed 0.5 midpoint
+            double FRAME_CHROMA_MIN_IRE       = 1.5;   // RESERVED / inert for Frame A
+            double FRAME_IQ_RAW_MAX_DELTA_IRE = 70.0;  // RESERVED / inert for Frame A
+            double FRAME_IQ_COH_PASS_CORR     = 0.85;  // RESERVED / inert for Frame A
+            double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B signed-alien cancellation scale, capped at the measured correction
             double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
-            double FRAME_B_RAW_MAX_DELTA_IRE   = 100.0; // Frame B IRE-domain direct-IQ delta cap; flat, no lane-specific relax — the second line of defence behind the reach throttles
-            double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // chroma-weighted bevel reach throttle on Frame B ±1; gates near a horizontal luma step where the ±1 partners straddle different bevel phases (zipper guard)
-            double FRAME_BEVEL_SAT_PENALTY     = 0.50; // extra reach penalty at saturated non-straight edges; squared chroma tightening on the bevel gate (0 = off, 1 = aggressive)
-            double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // horizontal luma gradient for Frame ±1 cross-color gate; higher than Field's 18 because ±1 partners are closer (one TV line) and more resilient
+            double FRAME_B_RAW_MAX_DELTA_IRE   = 100.0; // RESERVED / inert: Frame B no longer performs a midpoint pull
+            double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // RESERVED / inert: retired with Frame B's midpoint blend
+            double FRAME_BEVEL_SAT_PENALTY     = 0.50; // RESERVED / inert: retired with Frame B's midpoint blend
+            double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // RESERVED / inert: retired with Frame B's midpoint blend
             double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // RESERVED / inert: the gate-side lateral-edge term was removed — a bare hLumaDeltaIRE step cannot separate a straight vertical misread column from a diagonal boundary, so it only stripped bevel protection off diagonals. Vertical-column restore now lives in the combine's partner-verified crossColorExempt (computeFrameBLine). Kept for ABI/tuning; not read by the reach gate.
 
             // =========================================================================
@@ -207,6 +207,11 @@ public:
 
             // Spatial neighbor shaping: pulls the FVF winner toward the local majority decision.
             double FVF_SHAPE_STRENGTH = 0.85; // 0 = disabled, 1 = full neighbor pull
+
+            // Candidate-relative same-phase topology penalty.  This does not
+            // alter a candidate: it only makes an isolated horizontal zipper
+            // costlier when another seated candidate renders the site cleanly.
+            double FVF_NEIGHBOR_ZIPPER_WEIGHT = 0.24;
 
             // Scale-regime biasing. The scale estimate is a horizontal proxy derived from
             // Frame B IQ magnitude, then applied as evidence for the vertical-reach election.
@@ -792,6 +797,21 @@ private:
 			std::vector<CombTapPair> pairU2;
 			std::vector<CombTapPair> pairD2;
 			std::vector<CombContentReach::IntrafieldRegionReach> intrafieldRegionReach;
+			// The SAME content evaluator at the interfield step: center against
+			// the +/-1 legs, relation-aligned.  The question it answers ("do
+			// these legs offer a common chroma to cancel against?") is a
+			// property of the leg pair alone at any vertical step -- see
+			// combreach.h -- so this is the shared instrument reaching one line
+			// instead of two, not a second detector.  Built only under
+			// TapBuildFrame, and read only through the *Measured verdicts:
+			// Frame B owns its own admission policy.
+			//
+			// chromaBoundarySeed/Band on THIS row do not carry Field B's seed
+			// law.  buildCombTapLine overwrites the seed with Frame B's
+			// three-way major-disagreement verdict before dilating, so the
+			// band published here is Frame B's alone.
+			std::vector<CombContentReach::IntrafieldRegionReach> interfieldRegionReach;
+			bool interfieldRegionValid = false;
 		// The shared line ends at observations. Each field comb interprets the
 		// region facts independently and owns any leg exclusion or center cede.
 		// Per-pixel ±4 region verdicts (center vs ±4 same-field partner).
@@ -1005,20 +1025,8 @@ private:
 	// center's own alien, error second-order/curvature) while the midpoint
 	// carries their difference (first-order on diagonals — the 2-px
 	// staircase).  fbPairDiff holds the diagonal-registered, window-normalized
-	// difference vector; fbAlienGate the windowed validity gate (Same leg must
-	// ride with center — a real vertical chroma gradient zeroes it);
-	// fbPairAgreeWinIRE the unregistered windowed pair-agreement magnitude
-	// consumed by the midpoint license; fbReg the chosen registration offset
-	// (diagnostic).
+	// difference vector; fbReg is the chosen registration offset (diagnostic).
 	std::vector<std::complex<double>> scratch_fbPairDiff;
-	std::vector<double> scratch_fbAlienGate;
-	std::vector<double> scratch_fbPairAgreeWinIRE;
-	// Frame B leg-deviation symmetry, dSame/dOpp in [0,1].  A published FACT
-	// about the ±1 pair, not a policy: 0 = asymmetric (Same leg rides centre,
-	// Opposite carries ~2a -> vertically-invariant image-locked alien), 1 =
-	// legs deviate together (diagonal advance or real vertical gradient).
-	// Absence of evidence reports 1, never 0.
-	std::vector<double> scratch_fbLegSymmetry;
 	std::vector<int> scratch_fbReg;
     // Prepass working rows: edge-replicated padded copies of the three
     // demodded IQ rows (padding reproduces the clamp-to-edge indexing, so
@@ -1028,7 +1036,6 @@ private:
     std::vector<std::complex<double>> scratch_fbPadCenter;
     std::vector<std::complex<double>> scratch_fbPadUp;
     std::vector<std::complex<double>> scratch_fbPadDn;
-    std::vector<std::complex<double>> scratch_fbDiff0;
     std::vector<std::complex<double>> scratch_fbDevRows;
     // Notch-locator rows for Frame B's own registration: [1,0,1]/2 on raw at
     // lines +-1, edge-replicated with the search's overhang. Luma-domain
@@ -1062,13 +1069,7 @@ private:
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
 	std::vector<double> scratch_fvf_notchFieldA; // per-line Field A notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchFieldB; // per-line Field B notch-luma pre-pass
-	std::vector<double> scratch_frameC;
-	// Frame A cancellation-opportunity mask: 1 where the +-1 scalar legs agree
-	// with each other and oppose the centre, so the comb must take the [1,2,1]
-	// projection at pull 0.5 instead of the boosted range. Set by
-	// computeFrameALine (assigned fresh every line), consumed by
-	// computeIQFrameAFromPreparedVectors. Never read stale.
-	std::vector<std::uint8_t> scratch_frameACancel;        // Frame C covered comp-line bootstrap (split2D emit)
+	std::vector<double> scratch_frameC;        // Frame C covered comp-line bootstrap (split2D emit)
 	std::vector<double> scratch_fvf_notchFrame;  // per-line Frame B notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchSource; // per-line source notch-luma pre-pass
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
@@ -1086,8 +1087,6 @@ private:
 	std::vector<double> scratch_attrBandYClaim;
 	std::vector<double> scratch_attrMembershipY;
 	std::vector<double> scratch_impulseExempt;
-	std::vector<double> scratch_frameBReachUp;
-	std::vector<double> scratch_frameBReachDown;
 	std::vector<std::uint8_t> fieldBDecisionReason_flat;
 	// Exact-carrier side channel (full fieldWidth per frame line, NaN =
 	// absent). Filled by loadFields from the assembler's dG-merge twin

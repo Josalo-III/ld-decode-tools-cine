@@ -1785,6 +1785,62 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     scoreB *= (1.0 + wAnchor * anchorPenalty(dB));
                     scoreR *= (1.0 + wAnchor * anchorPenalty(dR));
                 }
+
+                // The consensus anchor above is intentionally withdrawn at a
+                // strong transition, but that also leaves election-generated
+                // horizontal zippers unopposed there.  Add a separate
+                // candidate-topology fact which is safe at a true edge:
+                // compare center with its same-carrier-phase +/-4 neighbours,
+                // and give the test authority only when those neighbours agree.
+                // A real crossing makes them disagree; an alternating tooth
+                // leaves two agreeing neighbours on the other side of center.
+                const int xm4 = std::max(0, rel - 4);
+                const int xp4 = std::min(width - 1, rel + 4);
+                auto zipperRisk = [&](double center,
+                                      double leftSamePhase,
+                                      double rightSamePhase) {
+                    const double neighborDisagreementIRE =
+                        std::fabs(leftSamePhase - rightSamePhase) * invI;
+                    const double agreementAuthority = 1.0 - std::clamp(
+                        (neighborDisagreementIRE - 1.5) / (6.0 - 1.5),
+                        0.0,
+                        1.0);
+
+                    const double lo =
+                        std::min(leftSamePhase, rightSamePhase);
+                    const double hi =
+                        std::max(leftSamePhase, rightSamePhase);
+                    const double hullExcursionIRE =
+                        ((center < lo) ? (lo - center)
+                         : (center > hi) ? (center - hi)
+                                         : 0.0) * invI;
+                    const double excursion = std::clamp(
+                        (hullExcursionIRE - 1.0) / (6.0 - 1.0),
+                        0.0,
+                        1.0);
+                    return agreementAuthority * excursion;
+                };
+
+                const double riskA = zipperRisk(
+                    FA, candidateAData[xm4], candidateAData[xp4]);
+                const double riskB = zipperRisk(
+                    FB, candidateB[xm4], candidateB[xp4]);
+                const double riskR = zipperRisk(
+                    FR, frameB2[xm4], frameB2[xp4]);
+                const double cleanestRisk = std::min({riskA, riskB, riskR});
+                const double zipperWeight =
+                    std::max(0.0, T.FVF_NEIGHBOR_ZIPPER_WEIGHT);
+
+                // Relative-only: if every candidate carries the same narrow
+                // legitimate detail, none can self-certify the others as bad.
+                // Where one seat avoids the tooth, only the tooth-producing
+                // seats pay.  Output remains the untouched elected candidate.
+                scoreA *= 1.0 + zipperWeight *
+                    std::max(0.0, riskA - cleanestRisk);
+                scoreB *= 1.0 + zipperWeight *
+                    std::max(0.0, riskB - cleanestRisk);
+                scoreR *= 1.0 + zipperWeight *
+                    std::max(0.0, riskR - cleanestRisk);
             }
             // ------------------------------------------------------------
             // Impulse scoring.
@@ -2623,41 +2679,11 @@ void Comb::FrameBuffer::split2D()
                 configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
                 left);
 
-            // Reconstructed-luma feasibility, applied here because this is
-            // where Frame A's IQ becomes the composite carrier that produceY
-            // subtracts from raw.  The legs are the preclean carriers Frame A
-            // actually combed, so raw-minus-preclean is each leg's luma.
-            const bool frameAVertical = carrierFrameVerticalAllowed(line);
-            const double *precleanC = precleanLinePtr(line, width);
-            const double *precleanU = frameAVertical
-                ? precleanLinePtr(line - 1, width) : nullptr;
-            const double *precleanD = frameAVertical
-                ? precleanLinePtr(line + 1, width) : nullptr;
-            const quint16 *rawC = rawbuffer.constData() + line * videoParameters.fieldWidth;
-            const quint16 *rawU = (precleanU && line - 1 >= 0)
-                ? rawbuffer.constData() + (line - 1) * videoParameters.fieldWidth : nullptr;
-            const quint16 *rawD = precleanD
-                ? rawbuffer.constData() + (line + 1) * videoParameters.fieldWidth : nullptr;
-
             for (int rel = 0; rel < width; ++rel) {
                 if (rel < (int)frameAIQ.size()) {
                     const auto &Z = frameAIQ[rel];
-                    double carrier =
+                    const double carrier =
                         carrierGrammarRemodSigned4fscToComposite(phaseCursor, Z.real(), Z.imag());
-
-                    if (precleanC) {
-                        const int h = left + rel;
-                        const double yC = (double)rawC[h] - precleanC[rel];
-                        const double yU = (rawU && precleanU)
-                            ? (double)rawU[h] - precleanU[rel]
-                            : std::numeric_limits<double>::quiet_NaN();
-                        const double yD = (rawD && precleanD)
-                            ? (double)rawD[h] - precleanD[rel]
-                            : std::numeric_limits<double>::quiet_NaN();
-                        carrier = clampCarrierToInputLumaRangeShared(
-                            carrier, (double)rawC[h], { yC, yU, yD }, precleanC[rel]);
-                    }
-
                     scratch_frameAAdaptiveIQComposite[rel] = carrier;
                 } else {
                     scratch_frameAAdaptiveIQComposite[rel] = 0.0;

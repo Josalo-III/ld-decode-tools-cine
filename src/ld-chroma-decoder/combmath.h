@@ -520,49 +520,4 @@ struct DemodResult {
     double bcos = 1.0;
 };
 
-// Reconstructed-luma feasibility bound: the one safety net every comb shares.
-//
-// A comb failure is visible as a zipper, and a zipper is a luma artifact --
-// light and dark, not saturated colour.  So the bound belongs on the luma the
-// comb implies, Y = rawCentre - carrier, and nowhere else.  Chroma may swing
-// freely: an unsaturated excursion in IQ is not what anyone sees.
-//
-// This is deliberately NOT a bound on the carrier interval of the inputs.  A
-// comb that subtracts a contaminant common to all of its legs must be free to
-// land outside their carrier range -- clamping it back is an under-comb, not a
-// safety check.  Reconstructed luma is the domain where "the output must be
-// something the inputs could have produced" is both true and worth enforcing.
-//
-// Only the legs that actually participated may define the range, and the
-// values passed must be raw-minus-carrier for each of them.  Candidates,
-// blended outputs, and excluded legs are not evidence.
-static inline double clampCarrierToInputLumaRangeShared(
-    double carrier,
-    double centreRaw,
-    std::initializer_list<double> inputLuma,
-    double fallbackCarrier)
-{
-    if (!std::isfinite(centreRaw))
-        return std::isfinite(fallbackCarrier) ? fallbackCarrier : 0.0;
-
-    double lo = std::numeric_limits<double>::infinity();
-    double hi = -std::numeric_limits<double>::infinity();
-    for (double y : inputLuma) {
-        if (!std::isfinite(y))
-            continue;
-        lo = std::min(lo, y);
-        hi = std::max(hi, y);
-    }
-
-    if (!std::isfinite(lo) || !std::isfinite(hi))
-        return std::isfinite(fallbackCarrier) ? fallbackCarrier : 0.0;
-
-    double out = std::isfinite(carrier) ? carrier : fallbackCarrier;
-    if (!std::isfinite(out))
-        out = 0.0;
-
-    const double yOut = std::clamp(centreRaw - out, lo, hi);
-    return centreRaw - yOut;
-}
-
 #endif // COMBMATH_H

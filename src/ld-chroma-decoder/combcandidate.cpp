@@ -178,6 +178,180 @@ std::uint8_t fieldARegionCedeFlags(
     return flags;
 }
 
+// ---------------------------------------------------------------------------
+// Frame B's ±1 operand admission (user, 2026-08-24).
+//
+// Frame A's good behaviour is inherent to being an average: its output cannot
+// leave the hull of its operands, so a leg from the wrong chroma region costs
+// half its error and no more. Frame B is the opposite estimator by design --
+// FVF needs the choice -- and a subtractor leaves that hull as a matter of
+// course. With centre at 0, a Same leg at +10 sitting in another region and
+// the Opposite leg at 0, Frame B publishes -5: colour of a sign no
+// participating line carried.
+//
+// The one thing that DOES port from Frame A is its separation of powers --
+// "reach decides which complementary observations are safe; it does not scale
+// the midpoint itself". So this is operand ADMISSION, hard, and never a
+// strength scaler. Frame B has already falsified the continuous form: every
+// gate it used to carry (ratioGate, rideGate, midLicense) multiplied the
+// correction, and its own note records the outcome -- "a gate that lingers at
+// half strength subtracts half the alien and leaves a parity-alternating
+// residue: partial correction is the worst geometry".
+//
+// ONE floor governs both rungs below. They answer the same question, and a
+// second threshold would only be a second thing to be wrong. It sits at twice
+// Field B's evidence floor because ±1 partners are one TV line apart and share
+// more content than the ±2 pair, so a separation that convicts at the
+// intrafield step is not yet major here -- the same reasoning that puts
+// FRAME_LUMA_EDGE_THRESH_IRE at 28 against Field's 18.
+constexpr double kFrameBMajorIRE = 12.0;
+constexpr double kFrameBRegionChromaFloorIRE = 5.0;
+
+// Independent carrier-free luma evidence.  One differing leg is an ordinary
+// coverage transition; two same-signed departures prove that center itself is
+// outside the rational luma range of its vertical neighbourhood.  Keep each
+// leg beyond the measured 4-5 IRE noise floor, while allowing the island to be
+// asymmetric when the two departures together retain the former 2 * 6 IRE
+// corroboration.  This catches a partial middle band without turning a moving
+// one-sided edge into a Frame B cancellation outage.
+constexpr double kFrameBLumaIslandNearIRE = 5.0;
+constexpr double kFrameBLumaIslandTotalIRE = 12.0;
+
+inline bool frameBLumaIslandSeed(double centerIRE,
+                                 double upIRE,
+                                 double downIRE)
+{
+    if (!std::isfinite(centerIRE) || !std::isfinite(upIRE) ||
+        !std::isfinite(downIRE))
+        return false;
+    const double dUp = upIRE - centerIRE;
+    const double dDown = downIRE - centerIRE;
+    const bool sameDirection =
+        (dUp > 0.0 && dDown > 0.0) ||
+        (dUp < 0.0 && dDown < 0.0);
+    if (!sameDirection)
+        return false;
+
+    const double nearDeparture =
+        std::min(std::abs(dUp), std::abs(dDown));
+    const double totalDeparture = std::abs(dUp) + std::abs(dDown);
+    return nearDeparture >= kFrameBLumaIslandNearIRE &&
+           totalDeparture >= kFrameBLumaIslandTotalIRE;
+}
+
+// SYMMETRY LAW (author, 2026-08-25): "If same and opposite alternate per
+// column, they cannot behave differently or the zippers are inevitable."
+//
+// The two legs cannot be refused INDIVIDUALLY, because refusing one is not the
+// same operation as refusing the other and never can be. Only the Opposite leg
+// carries the alien with a flipped sign, so it is the only leg that can expose
+// it: refuse the Same leg and centre stands in for it exactly (centre is
+// Same-relation to itself) and the correction keeps full strength; refuse the
+// Opposite leg and there is no alien measurement left at all. Full correction
+// versus none -- and which leg is refused varies per column, so adjacent
+// columns alternate between the two. That alternation is the zipper, and it
+// cannot be symmetrised away: the asymmetry is physical, not a policy choice.
+//
+// So this verdict is a BAND INPUT ONLY. It decides nothing on its own; it
+// contributes to frameBBandSeed, where both legs are refused together and the
+// operation is identical whichever leg fails. Measured on the beach: as a
+// standalone rung it fired on 2.9% of columns, 43-69% of them at a 20-40 IRE
+// lateral luma step -- a per-column asymmetry concentrated exactly along the
+// garment edges where the zippers were seen.
+inline bool frameBLegAdmitted(CombContentReach::RegionRelation measured,
+                              double differenceIRE)
+{
+    return !(measured == CombContentReach::RegionRelation::DifferentRegion &&
+             differenceIRE >= kFrameBMajorIRE);
+}
+
+// RELATION-LOCKING: what separates the alien from a chroma region.
+//
+// The author, 2026-08-24: "the error alternates hue, real chroma alternates
+// phase" -- and of the cheek case, "not regional at all". A region evaluator
+// cannot make that distinction, because it is built to answer "regional?" and
+// the thing it must never convict is not regional at all. On the Opposite leg
+// the two are literally the same measurement: centre reads (C + a) against
+// (C - a), so no hue or magnitude threshold can separate a region break from
+// the very alien the interfield comb exists to cancel.
+//
+// The separation this file already recorded is that the alien is RELATION-
+// LOCKED: it "leaves the Same leg riding center (dSame ~ 0) while displacing
+// the Opposite leg by twice the alien (dOpp ~ 2a)". Real chroma has no such
+// preference. Measured at the columns being convicted, mean dSame/dOpp:
+//
+//     lateral luma delta   <5    5-10   10-20   20-40   40+
+//     dSame/dOpp          0.83-  0.48-  0.24-   0.10-   0.08-
+//                          1.00   0.67   0.41    0.24    0.11
+//
+// Flat material convicts symmetric differences -- real regions. Jennifer's
+// cheek convicts at 10:1 -- the alien, every time.
+//
+// This is the measurement the retired ratioGate made. What was wrong with that
+// gate was never the measurement but the ACTUATOR: it multiplied the
+// correction, and a lingering half-strength subtraction "leaves a
+// parity-alternating residue: partial correction is the worst geometry". Here
+// the same fact admits or refuses an OPERAND, which is Frame A's separation of
+// powers and the one thing that ports.
+constexpr double kFrameBRelationLockRatio = 0.5;
+
+// True when the column's vertical difference belongs to the carrier rather
+// than to the picture. Consumes only facts already published on the row.
+inline bool frameBRelationLocked(
+    const CombContentReach::IntrafieldRegionReach &r, bool sameIsUp)
+{
+    const double dSame = sameIsUp ? r.upDifferenceIRE : r.downDifferenceIRE;
+    const double dOpp  = sameIsUp ? r.downDifferenceIRE : r.upDifferenceIRE;
+    return dOpp > 1e-6 && dSame <= kFrameBRelationLockRatio * dOpp;
+}
+
+// The chroma branch of the band seed: up, down and centre in three different
+// regions, every pairwise separation major. Deliberately NOT the evaluator's
+// own `threeRegion`, which carries Field B's triplet promotions and fires with
+// one leg still continuing centre -- the one-legged case, which combs rather
+// than cedes.  The independent luma-island branch is ORed below.
+//
+// Left on the region evaluator deliberately. "Changes and stays" IS the region
+// signature, and the three-way seed demands all three pairwise separations at
+// once -- corroboration the single-leg test never had.
+inline bool frameBBandSeed(const CombContentReach::IntrafieldRegionReach &r,
+                           bool sameIsUp,
+                           bool lumaIsland)
+{
+    // The alien is never a region boundary. A relation-locked triplet -- Same
+    // leg riding centre while the Opposite leg is displaced by twice the alien
+    // -- is the cross-colour this comb exists to cancel, whatever its hue and
+    // magnitude say. This exemption used to sit on the per-leg rung; it lives
+    // here now, because the band is the only refusal left and it must not be
+    // the thing that stands the comb down at a luma transition.
+    const bool strictThreeRegionViolation =
+        !frameBLegAdmitted(r.upMeasured, r.upDifferenceIRE) &&
+        !frameBLegAdmitted(r.downMeasured, r.downDifferenceIRE) &&
+        r.outerComparable &&
+        r.upDownDifferenceIRE >= kFrameBMajorIRE &&
+        r.upDownHueDifferenceDeg >=
+            CombContentReach::kRegionDifferentHueDeg;
+
+    // Cancellable alternation may be imperfectly balanced, but it still
+    // carries loosely comparable saturation.  A decisive magnitude collapse
+    // on BOTH legs is therefore contrary evidence in its own right: center is
+    // outside the rational saturation range of its vertical neighbourhood.
+    // One collapsed leg is only a coverage transition; making it cede both
+    // operands causes moving edges to switch Frame B off and strobe against
+    // uncovered frames.  Less extreme chroma differences retain the existing
+    // relation-lock exemption and strict three-region requirement.
+    const bool twoSidedStrongAsym =
+        r.upStrongAsym && r.downStrongAsym;
+    const bool chromaViolation =
+        twoSidedStrongAsym ||
+        (!frameBRelationLocked(r, sameIsUp) &&
+         strictThreeRegionViolation);
+
+    // The two facts are independent.  Relation locking can explain an IQ
+    // difference as alien, but it cannot erase a carrier-free luma island.
+    return chromaViolation || lumaIsland;
+}
+
 double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
                         bool up)
 {
@@ -187,24 +361,11 @@ double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
 }
 
 // ---------------------------------------------------------------------------
-// Retained record from the removed LDCD_PROBE_FRAMEB census.
+// Retained physical record from the removed LDCD_PROBE_FRAMEB census.
 //
-// The Frame B engagement/throttle census that gathered the notes below has
-// been removed; the notes themselves are the physical/measured record it
-// produced and are kept here.
-//
-// Frame B's job is to cancel the vertically-invariant image-locked alien --
-// the 1D debris that stands in columns -- and its authority is a product of
-// four terms:
-//     pull = clamp(0.5 * combStrength * reachAuthority, 0, 0.5) * midLicense
-// so any one of them at zero silences it. The census split by leg symmetry:
-// sym -> 0 IS the signature class (alien vertically invariant, midpoint safe
-// and needed); sym -> 1 is diagonal advance, where refusal is correct.
-//
-// STRONG IMAGE VERTICALS (large carrier-free lateral luma step) are the
-// columns where 1D debris stands and interfield is supposed to cancel it.
-// That is also exactly where the bevel/cross-colour throttle collapses reach,
-// so the authority terms were reported separately there.
+// Frame B's job is to cancel vertically-invariant image-locked colour left by
+// 1D without softening the picture.  Its registered signed pair difference
+// estimates that alien directly; Frame A owns the separate midpoint model.
 //
 // Standing vs alternating decomposition of the blind 1D bandpass at the
 // Frame B (+-1) and Field B (+-2) geometries. Real chroma ALTERNATES
@@ -466,7 +627,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.tapD1);
         ensureWidth(tapLine.pairU1);
         ensureWidth(tapLine.pairD1);
+        ensureWidth(tapLine.interfieldRegionReach);
     }
+    // Cleared on every build: a stale true would hand Frame B a previous
+    // line's admission verdicts as if they were this line's.
+    tapLine.interfieldRegionValid = false;
 
     if (wantContour) {
         ensureWidth(tapLine.tapU2);
@@ -557,6 +722,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     };
 
     const double *luma0  = getLumaRow(tapLine.ln0);
+    const double *lumaU1 = tapLine.haveU1 ? getLumaRow(tapLine.lnU1) : nullptr;
+    const double *lumaD1 = tapLine.haveD1 ? getLumaRow(tapLine.lnD1) : nullptr;
     const double *lumaU2 = getLumaRow(tapLine.lnU2);
     const double *lumaD2 = getLumaRow(tapLine.lnD2);
     const double *lumaU4 = getLumaRow(tapLine.lnU4);
@@ -892,6 +1059,149 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     }
 
+    // ±1 interfield content census, for Frame B's operand admission.  The same
+    // evaluator at a different vertical step: center against the ±1 legs,
+    // relation-aligned by the reach grammar exactly as the ±2 pass above.
+    //
+    // The raw-scalar AlienCancel shortcut is deliberately NOT passed here.  It
+    // reads a near-zero raw leg difference as vertically coherent non-carrier
+    // energy, and that inference is specific to ±2 same-field legs, which are
+    // ANTI-PHASE carriers: there, raw-identical can only mean the carrier
+    // cancelled.  ±1 legs are one TV line apart in the opposite field and
+    // carry no such guarantee.  Omitting the argument falls the evaluator back
+    // to the smoothed-IQ hue test, which is frame-agnostic.
+    if (wantFrame) {
+        const size_t iqCount =
+            static_cast<size_t>(demodLines) * static_cast<size_t>(demodWidth);
+        const bool haveSignedIQ =
+            configuration.phaseCompensation &&
+            demodWidth >= width &&
+            tapLine.haveU1 && tapLine.haveD1 &&
+            tapLine.ln0 >= 0 && tapLine.ln0 < demodLines &&
+            tapLine.lnU1 >= 0 && tapLine.lnU1 < demodLines &&
+            tapLine.lnD1 >= 0 && tapLine.lnD1 < demodLines &&
+            locked1DTI4fsc_flat.size() >= iqCount &&
+            locked1DTQ4fsc_flat.size() >= iqCount &&
+            carrierAnalysis_flat.size() >= iqCount;
+
+        if (haveSignedIQ) {
+            const lddecode::CombReachReply up1Reach = combReachIndex.query(
+                {lineNumber, tapLine.lnU1, left, left,
+                 lddecode::CombReachUse::IQCompare, iqSource});
+            const lddecode::CombReachReply dn1Reach = combReachIndex.query(
+                {lineNumber, tapLine.lnD1, left, left,
+                 lddecode::CombReachUse::IQCompare, iqSource});
+
+            ensureSmoothedLockedRow(tapLine.ln0);
+            ensureSmoothedLockedRow(tapLine.lnU1);
+            ensureSmoothedLockedRow(tapLine.lnD1);
+            const float *sI0  = smoothedLockedTI_line(tapLine.ln0);
+            const float *sQ0  = smoothedLockedTQ_line(tapLine.ln0);
+            const float *sIUp = smoothedLockedTI_line(tapLine.lnU1);
+            const float *sQUp = smoothedLockedTQ_line(tapLine.lnU1);
+            const float *sIDn = smoothedLockedTI_line(tapLine.lnD1);
+            const float *sQDn = smoothedLockedTQ_line(tapLine.lnD1);
+            const auto *analysis0  = carrierAnalysis_line(tapLine.ln0);
+            const auto *analysisUp = carrierAnalysis_line(tapLine.lnU1);
+            const auto *analysisDn = carrierAnalysis_line(tapLine.lnD1);
+            auto trustAt = [](const lddecode::CarrierAnalysisRecord *row,
+                              int rel) {
+                return row
+                    ? lddecode::carrierTrust(row[rel].carrierConformance,
+                                             row[rel].conformanceUsableAxisFraction)
+                    : 0.5;
+            };
+
+            // Relation sign is a LINE fact -- one grammar lookup per leg,
+            // hoisted. Zero means the grammar does not authorise the
+            // comparison, which the evaluator reports as Unknown and no
+            // policy here can convict.
+            auto legSign = [](const lddecode::CombReachReply &rep) {
+                if (!rep.allowIQCompare) return 0.0;
+                if (rep.carrierRelation ==
+                    lddecode::CarrierPhaseRelation::Same) return 1.0;
+                if (rep.carrierRelation ==
+                    lddecode::CarrierPhaseRelation::Opposite) return -1.0;
+                return 0.0;
+            };
+            const double upSgn = legSign(up1Reach);
+            const double dnSgn = legSign(dn1Reach);
+            const bool sameIsUp = up1Reach.carrierRelation ==
+                lddecode::CarrierPhaseRelation::Same;
+
+            for (int rel = 0; rel < width; ++rel) {
+                auto &r = tapLine.interfieldRegionReach[rel];
+                const std::complex<double> z0(sI0[rel], sQ0[rel]);
+
+                const bool lumaIsland = luma0 && lumaU1 && lumaD1 &&
+                    frameBLumaIslandSeed(
+                        luma0[rel] * invI,
+                        lumaU1[rel] * invI,
+                        lumaD1[rel] * invI);
+
+                const std::complex<double> zUp(sIUp[rel], sQUp[rel]);
+                const std::complex<double> zDown(sIDn[rel], sQDn[rel]);
+                const double centerMagIRE = boundedMag(z0) * invI;
+                const bool possibleStrongAsym =
+                    CombContentReach::isStrongRegionMagnitudeAsym(
+                        centerMagIRE, boundedMag(zUp) * invI,
+                        kFrameBRegionChromaFloorIRE) ||
+                    CombContentReach::isStrongRegionMagnitudeAsym(
+                        centerMagIRE, boundedMag(zDown) * invI,
+                        kFrameBRegionChromaFloorIRE);
+
+                // CHEAP CHROMA GUARD.  Below the major IQ floor no hue geometry
+                // can create the strict three-region branch, so skip its
+                // evaluator unless a strong saturation asymmetry can create
+                // the independent chroma branch.  The carrier-free luma branch
+                // has already been decided above and must survive this path.
+                const double dU = (upSgn != 0.0)
+                    ? boundedMag(z0 - upSgn * zUp) * invI
+                    : 0.0;
+                const double dD = (dnSgn != 0.0)
+                    ? boundedMag(z0 - dnSgn * zDown) * invI
+                    : 0.0;
+                if (dU < kFrameBMajorIRE && dD < kFrameBMajorIRE &&
+                    !possibleStrongAsym) {
+                    r = CombContentReach::IntrafieldRegionReach{};
+                    r.chromaBoundarySeed = lumaIsland;
+                    r.chromaBoundaryBand = lumaIsland;
+                    continue;
+                }
+
+                r = CombContentReach::evaluateIntrafieldRegionReach(
+                        z0,
+                        zUp,
+                        zDown,
+                        up1Reach.carrierRelation,
+                        dn1Reach.carrierRelation,
+                        up1Reach.allowIQCompare,
+                        dn1Reach.allowIQCompare,
+                        trustAt(analysis0, rel),
+                        trustAt(analysisUp, rel),
+                        trustAt(analysisDn, rel),
+                        invI,
+                        kFrameBRegionChromaFloorIRE);
+
+                // Frame B's own seed replaces the evaluator's Field-B one on
+                // this row.  Both name the same field because the dilation
+                // below is the shared one; the LAW written into it is Frame
+                // B's, and nothing else reads this row.
+                r.chromaBoundarySeed =
+                    frameBBandSeed(r, sameIsUp, lumaIsland);
+                r.chromaBoundaryBand = r.chromaBoundarySeed;
+            }
+
+            // Band-uniform, same radius as Field B's.  A per-column cede at a
+            // chroma boundary is the beading mechanism; the run gets one
+            // verdict or the switching inside it becomes the artifact.
+            CombContentReach::markIntrafieldChromaBoundaryBand(
+                tapLine.interfieldRegionReach, 4);
+            tapLine.interfieldRegionValid = true;
+
+        }
+    }
+
     if (wantFieldB || wantFrame) {
         // Carrier-free lateral luma delta.
         //
@@ -1125,83 +1435,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     tapLine.builtFlags = flags;
 }
 
-// Nearest point on the closed segment [a,b] to p.
-static inline std::complex<double> clampIQProjectSegment(
-    const std::complex<double> &p,
-    const std::complex<double> &a,
-    const std::complex<double> &b)
-{
-    const std::complex<double> ab = b - a;
-    const double den = std::norm(ab);
-    if (!(den > 0.0)) return a;
-    const std::complex<double> ap = p - a;
-    double t = (ap.real() * ab.real() + ap.imag() * ab.imag()) / den;
-    t = std::clamp(t, 0.0, 1.0);
-    return a + ab * t;
-}
-
-// IQ-SPACE HULL for the IQ combs (user, 2026-08-23: "IQ combs ought not to
-// use luma, they should have a hull inside the IQ space that operates before
-// remod").
-//
-// The luma feasibility bound of fd71c90 cannot see this project's actual
-// failure. Its premise was that "an unsaturated excursion in IQ is not what
-// anyone sees", but the observed artifacts ARE unsaturated: a desaturated
-// excursion is a small |Z|, and the luma it implies sits comfortably inside
-// the legs' luma range, so the bound passes it as legal. A zero carrier is
-// the limiting case -- Y = raw - 0 republishes the composite as luma, and no
-// luma-domain range can catch it.
-//
-// In IQ the statement is available again: the answer must lie in the convex
-// hull of the legs that were actually combed. Where those legs carry real
-// chroma the hull excludes the origin, so a collapse toward zero is pulled
-// back to the nearest thing an input could have produced.
-//
-// The legs passed here MUST be the column-phase-aligned ones. Frame A's
-// +/-1 legs come from the other field, so unaligned their carrier can sit
-// near-opposite the centre and their hull would straddle the origin -- the
-// bound would then license exactly the collapse it exists to catch.
-// Alignment is a basis change upstream of the strength law, not a value
-// re-derived from it, so this does not repeat the fault that retired the old
-// guard: that box was built over candidates re-derived through
-// localStrength, the very quantity it bounded.
-static inline std::complex<double> clampIQToInputHull(
-    const std::complex<double> &Z,
-    const std::complex<double> &Z0,
-    const std::complex<double> *Zu,
-    const std::complex<double> *Zd)
-{
-    if (!std::isfinite(Z.real()) || !std::isfinite(Z.imag()))
-        return Z0;
-    if (!Zu && !Zd)
-        return Z0;                       // centre is the only input
-    if (!Zu || !Zd)
-        return clampIQProjectSegment(Z, Z0, Zu ? *Zu : *Zd);
-
-    auto cross = [](const std::complex<double> &o,
-                    const std::complex<double> &a,
-                    const std::complex<double> &b) {
-        return (a.real() - o.real()) * (b.imag() - o.imag()) -
-               (a.imag() - o.imag()) * (b.real() - o.real());
-    };
-    const double d1 = cross(Z0, *Zu, Z);
-    const double d2 = cross(*Zu, *Zd, Z);
-    const double d3 = cross(*Zd, Z0, Z);
-    const bool anyNeg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
-    const bool anyPos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
-    if (!(anyNeg && anyPos))
-        return Z;                        // inside the triangle, or on an edge
-
-    const std::complex<double> c1 = clampIQProjectSegment(Z, Z0, *Zu);
-    const std::complex<double> c2 = clampIQProjectSegment(Z, *Zu, *Zd);
-    const std::complex<double> c3 = clampIQProjectSegment(Z, *Zd, Z0);
-    const double n1 = std::norm(Z - c1);
-    const double n2 = std::norm(Z - c2);
-    const double n3 = std::norm(Z - c3);
-    if (n1 <= n2 && n1 <= n3) return c1;
-    return (n2 <= n3) ? c2 : c3;
-}
-
 static inline double clampCarrierToInputCarrierLimits(
     double v,
     std::initializer_list<double> inputs,
@@ -1315,219 +1548,26 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             return;
         }
     }
-    const auto  &T   = configuration.tunables;
-    const double invI = invIreScale;
-    const double hEdgeThreshIRE = std::max(1.0, T.FIELD_LUMA_EDGE_THRESH_IRE);
-
     for (int rel = 0; rel < width; ++rel) {
-        const double rawC  = tapLine.tap0[rel].raw;
-        const double rawU2 = tapLine.tapU2[rel].raw;
-        const double rawD2 = tapLine.tapD2[rel].raw;
         const double C    = tapLine.tap0[rel].comp;
         const double Cup2 = tapLine.tapU2[rel].comp;
         const double Cdn2 = tapLine.tapD2[rel].comp;
         const double Cup4 = tapLine.tapU4[rel].comp;
         const double Cdn4 = tapLine.tapD4[rel].comp;
 
-        const auto &movingContour = tapLine.movingCoarseContour[rel];
-        const double reachUp2 = tapLine.pairU2[rel].reachLegalGate *
-                                fieldContourGate(movingContour, true);
-        const double reachDn2 = tapLine.pairD2[rel].reachLegalGate *
-                                fieldContourGate(movingContour, false);
+        // Construction and safety have separate jobs.  Field A keeps the
+        // legacy near-leg estimator intact; only hard source/grammar legality
+        // can remove an operand here.  The +/-4 contour below shapes the value
+        // directly instead of throttling the whole filter at ordinary edges.
+        const double reachUp2 = tapLine.pairU2[rel].reachLegalGate;
+        const double reachDn2 = tapLine.pairD2[rel].reachLegalGate;
 
         double wUp2 = tapLine.pairU2[rel].weight * reachUp2;
         double wDn2 = tapLine.pairD2[rel].weight * reachDn2;
 
-        const CombTapContour &curve = tapLine.contour[rel];
-
-        // Per-side coarse-luma-edge facts.  Mild mismatch can shape Field A,
-        // but a real vertical context break invalidates the same-context
-        // vertical comb premise.  Do not let one surviving side normalize into
-        // a full-strength ordered comb artifact.
-        const double chromaT =
-            (rel < (int)tapLine.centerAdmittedChromaT.size())
-                ? tapLine.centerAdmittedChromaT[rel]
-                : 0.0;
-
-        double eUp = 0.0;
-        double eDn = 0.0;
-        double verticalContextBreak = 0.0;
-        bool hardVerticalBreak = false;
-
-        // Size is not evidence -- see coarseLumaValid.  Without it an absent
-        // neighbour row reads as a flat zero delta, i.e. "no vertical break",
-        // which is the permissive answer.
-        if (tapLine.coarseLumaValid &&
-            rel < (int)tapLine.coarse0IRE.size() &&
-            rel < (int)tapLine.coarseU2IRE.size() &&
-            rel < (int)tapLine.coarseD2IRE.size())
-        {
-            const double LUMA_EDGE_LO_IRE = 6.0;
-            const double LUMA_EDGE_HI_IRE = 20.0;
-
-            const double dUpIRE = std::fabs(
-                tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel]);
-            const double dDnIRE = std::fabs(
-                tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel]);
-
-            eUp = std::clamp(
-                (dUpIRE - LUMA_EDGE_LO_IRE) /
-                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
-                0.0,
-                1.0);
-
-            eDn = std::clamp(
-                (dDnIRE - LUMA_EDGE_LO_IRE) /
-                (LUMA_EDGE_HI_IRE - LUMA_EDGE_LO_IRE),
-                0.0,
-                1.0);
-
-            verticalContextBreak = std::max(eUp, eDn);
-
-            // Same starting point as Field B.  If this cedes too much, try
-            // 16.0; avoid 20.0 as the first stop because the ordered-column
-            // failure is already eligible before the old HI threshold.
-            const double HARD_VERTICAL_BREAK_IRE = 14.0;
-            hardVerticalBreak = (std::max(dUpIRE, dDnIRE) >= HARD_VERTICAL_BREAK_IRE);
-
-            if (!hardVerticalBreak) {
-                // Mild contrast remains flexible, but do not fully kill a side
-                // here.  Full side loss plus sc2 normalization is the failure.
-                wUp2 *= (1.0 - 0.80 * eUp);
-                wDn2 *= (1.0 - 0.80 * eDn);
-            }
-        }
-
-        double boundaryCede = 0.0;
-
-        if (!hardVerticalBreak &&
-            rel < (int)tapLine.pairU2.size() &&
-            rel < (int)tapLine.pairD2.size() &&
-            rel < (int)tapLine.hLumaDeltaIRE.size())
-        {
-            const double hEdge = std::clamp(
-                (tapLine.hLumaDeltaIRE[rel] - 0.45 * hEdgeThreshIRE) /
-                (0.55 * hEdgeThreshIRE),
-                0.0,
-                1.0);
-
-            if (hEdge > 0.0) {
-                const double dUp0IRE = tapLine.pairU2[rel].diffIRE;
-                const double dDn0IRE = tapLine.pairD2[rel].diffIRE;
-                const double scalarUpDn = std::fabs(Cup2 - Cdn2) * invI;
-
-                const double lumaUpDn =
-                    (rel < (int)tapLine.coarseU2IRE.size() &&
-                     rel < (int)tapLine.coarseD2IRE.size())
-                        ? std::fabs(tapLine.coarseU2IRE[rel] - tapLine.coarseD2IRE[rel])
-                        : scalarUpDn;
-
-                const double dUpDnIRE =
-                    scalarUpDn * (1.0 - chromaT) + lumaUpDn * chromaT;
-
-                const double diffGapIRE = std::fabs(dUp0IRE - dDn0IRE);
-                const double bestDiffIRE = std::min(dUp0IRE, dDn0IRE);
-                const double worstDiffIRE = std::max(dUp0IRE, dDn0IRE);
-                const double diffRatio =
-                    (worstDiffIRE > 1e-9) ? (bestDiffIRE / worstDiffIRE) : 1.0;
-
-                const double wBest = std::min(tapLine.pairU2[rel].weight,
-                                              tapLine.pairD2[rel].weight);
-                const double wWorst = std::max(tapLine.pairU2[rel].weight,
-                                               tapLine.pairD2[rel].weight);
-                const double wRatio =
-                    (wWorst > 1e-9) ? (wBest / wWorst) : 1.0;
-
-                const double matchIRE = 3.5;
-                const double betweenIRE = 6.0;
-                const double edgeUdIRE = 8.0;
-
-                if (dUpDnIRE > edgeUdIRE) {
-                    const bool preferUp = (dUp0IRE <= dDn0IRE);
-                    const bool hardPreferUp =
-                        preferUp &&
-                        ((dUp0IRE < matchIRE && dDn0IRE > betweenIRE) ||
-                         (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
-                         (bestDiffIRE < 5.0 && wRatio < 0.45));
-                    const bool hardPreferDn =
-                        !preferUp &&
-                        ((dDn0IRE < matchIRE && dUp0IRE > betweenIRE) ||
-                         (bestDiffIRE < 4.5 && diffGapIRE > 2.5 && diffRatio < 0.55) ||
-                         (bestDiffIRE < 5.0 && wRatio < 0.45));
-
-                    bool allowOneSidedBoundary = false;
-                    if (rel < (int)tapLine.intrafieldRegionReach.size()) {
-                        const auto &region = tapLine.intrafieldRegionReach[rel];
-                        allowOneSidedBoundary = region.valid &&
-                            ((preferUp &&
-                              region.up == CombContentReach::RegionRelation::SameRegion &&
-                              region.down == CombContentReach::RegionRelation::DifferentRegion) ||
-                             (!preferUp &&
-                              region.down == CombContentReach::RegionRelation::SameRegion &&
-                              region.up == CombContentReach::RegionRelation::DifferentRegion));
-                    }
-
-                    if ((hardPreferUp || hardPreferDn) && !allowOneSidedBoundary) {
-                        wUp2 = 0.0;
-                        wDn2 = 0.0;
-                        boundaryCede = 1.0;
-                    } else if (hardPreferUp) {
-                        wDn2 = 0.0;
-                        wUp2 = std::max(wUp2, 0.40 + 0.60 * hEdge);
-                    } else if (hardPreferDn) {
-                        wUp2 = 0.0;
-                        wDn2 = std::max(wDn2, 0.40 + 0.60 * hEdge);
-                    } else {
-                        const double sideGapT =
-                            std::clamp((diffGapIRE - 1.0) / 4.0, 0.0, 1.0);
-                        const double cedeT =
-                            std::clamp((bestDiffIRE - 3.0) / 6.0, 0.0, 1.0);
-
-                        if (preferUp)
-                            wDn2 *= std::max(0.0, 1.0 - 0.85 * hEdge * (0.35 + 0.65 * sideGapT));
-                        else
-                            wUp2 *= std::max(0.0, 1.0 - 0.85 * hEdge * (0.35 + 0.65 * sideGapT));
-
-                        boundaryCede = std::max(boundaryCede, 0.70 * hEdge * cedeT);
-                    }
-                }
-            }
-        }
-
-        // Windowed OR of the no-valid-partner flag: three-region cedes
-        // (drop shadows) must hold a uniform height, not flicker column to
-        // column, so cede outranks one-sided anywhere in the window.
-        // Bit1 marks the drop-shadow (strong magnitude-asymmetry) islands
-        // that qualify for the zero-chroma render.
-        bool centerIsland = false;
-        bool shadowIsland = false;
-        if ((int)tapLine.intrafieldRegionReach.size() >= width) {
-            const int lo = std::max(rel - 4, 0);
-            const int hi = std::min(rel + 4, width - 1);
-            for (int k = lo; k <= hi; ++k) {
-                const std::uint8_t v =
-                    fieldARegionCedeFlags(tapLine.intrafieldRegionReach[k]);
-                if (v & FieldACedeCenter)
-                    centerIsland = true;
-                if (v & FieldACedeStrongAsym)
-                    shadowIsland = true;
-            }
-        }
-
         double sc2 = 1.0;
 
-        if (hardVerticalBreak || centerIsland) {
-            // A hard vertical context break means Field A has no valid
-            // same-context answer here.  Signed-IQ center islands carry the
-            // same verdict: neither +/-2 leg belongs to the center region.
-            // Both cases also block the revive path.
-            wUp2 = 0.0;
-            wDn2 = 0.0;
-            boundaryCede = 1.0;
-        } else if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
-            // Keep the old strong-asymmetry handling only when the hard
-            // vertical context veto has not fired.  Otherwise this becomes
-            // the ordered one-sided comb failure.
+        if ((wUp2 > 0.0) || (wDn2 > 0.0)) {
             if (wDn2 > 3.0 * wUp2)      wUp2 = 0.0;
             else if (wUp2 > 3.0 * wDn2) wDn2 = 0.0;
 
@@ -1543,32 +1583,14 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             double dMag  = std::fabs(std::fabs(Cup2) - std::fabs(Cdn2));
             double sumUD = std::fabs(Cup2 + Cdn2);
 
-            // REVIVAL IS EVIDENCE-BOUND (user, 2026-08-22). This branch is
-            // reached only when BOTH weights are already zero, so it exists
-            // solely to resurrect legs that something else rejected -- and it
-            // did so by ASSIGNMENT, discarding both the pair weight and the
-            // luma-edge attenuation applied above. Two corrections:
-            //
-            //   * The similarity test is degenerate at low carrier. As Cup2
-            //     and Cdn2 both approach zero, dMag and sumUD approach zero
-            //     with them and the test reads 0 - 0 <= 0, i.e. TRUE. Revival
-            //     therefore fired hardest exactly where there was least
-            //     carrier to justify it, and a full-strength comb there
-            //     subtracts neighbour content that was never carrier, which
-            //     desaturates. Real carrier must be present before leg
-            //     agreement is allowed to mean anything; the threshold is the
-            //     1D's own low-amplitude noise floor.
-            //
-            //   * Carrier agreement is not luma context. Two legs can agree
-            //     perfectly on carrier while sitting on opposite sides of a
-            //     luma edge, because a legal chroma transition is slow and a
-            //     luma feature can be thin. Revive SCALED by the same edge
-            //     evidence the near path obeys, never above it.
+            // The legacy agreement recovery remains, but it cannot override a
+            // physically illegal leg and it cannot self-certify at the 1D
+            // noise floor.
             constexpr double kReviveCarrierFloorIRE = 2.0; // 1D noise floor
-            if (sumUD * invI > kReviveCarrierFloorIRE &&
+            if (sumUD * invIreScale > kReviveCarrierFloorIRE &&
                 dMag - std::fabs(sumUD * 0.2) <= 0.0) {
-                wUp2 = reachUp2 * (1.0 - 0.80 * eUp);
-                wDn2 = reachDn2 * (1.0 - 0.80 * eDn);
+                wUp2 = reachUp2;
+                wDn2 = reachDn2;
                 sc2 = 1.0;
             } else {
                 wUp2 = 0.0;
@@ -1576,127 +1598,36 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             }
         }
 
-        auto refineNearWithFar = [&](double nearS, double farS, double influence)->double {
-            if (influence <= 0.0) return nearS;
-            if (nearS == 0.0) return nearS;
-            if ((nearS > 0.0) != (farS > 0.0)) return nearS;
-
-            const double nearMag = std::fabs(nearS);
-            const double farMag  = std::fabs(farS);
-            const double mag = (nearMag + influence * farMag) / (1.0 + influence);
-            return std::copysign(mag, nearS);
-        };
-
-        const double Cup2Adj = refineNearWithFar(Cup2, Cup4, curve.upInfluence);
-        const double Cdn2Adj = refineNearWithFar(Cdn2, Cdn4, curve.dnInfluence);
-
         double tc = 0.0;
         const bool combed = (wUp2 > 0.0 || wDn2 > 0.0);
 
         if (combed) {
-            double t2  = ((C - Cup2Adj) * wUp2 * sc2);
-            t2        += ((C - Cdn2Adj) * wDn2 * sc2);
-            tc        += 0.25 * t2;
-        } else if (shadowIsland && chromaT < 0.375) {
-            // Same law as Field B: at a drop-shadow island the 1D holds
-            // genuine partial chroma unless horizontal luma structure can
-            // generate cross-color, so the render follows the carrier-free
-            // hEdge ramp — 1D fade where flat, zero where a luma edge
-            // would bead through the 1D.
-            const double hEdgeT =
-                (rel < (int)tapLine.hLumaDeltaIRE.size())
-                    ? std::clamp(
-                        (tapLine.hLumaDeltaIRE[rel] - 0.35 * hEdgeThreshIRE) /
-                        (0.65 * hEdgeThreshIRE),
-                        0.0,
-                        1.0)
-                    : 0.0;
-            tc = C * (1.0 - hEdgeT);
+            const CombTapContour &curve = tapLine.contour[rel];
+            auto refineNearWithFar = [](double nearS,
+                                        double farS,
+                                        double influence) {
+                if (influence <= 0.0 || nearS == 0.0)
+                    return nearS;
+                if ((nearS > 0.0) != (farS > 0.0))
+                    return nearS;
+
+                const double nearMag = std::fabs(nearS);
+                const double farMag = std::fabs(farS);
+                const double mag =
+                    (nearMag + influence * farMag) / (1.0 + influence);
+                return std::copysign(mag, nearS);
+            };
+
+            const double Cup2Adj =
+                refineNearWithFar(Cup2, Cup4, curve.upInfluence);
+            const double Cdn2Adj =
+                refineNearWithFar(Cdn2, Cdn4, curve.dnInfluence);
+
+            double t2 = (C - Cup2Adj) * wUp2 * sc2;
+            t2 += (C - Cdn2Adj) * wDn2 * sc2;
+            tc = 0.25 * t2;
         } else {
             tc = C;
-        }
-
-        // Zipper defense: cede on either participating vertical luma break,
-        // not only the both-sides case.  min(eUp,eDn) asked "are both sides
-        // bad?"  Field A's model validity needs "did either side cross a real
-        // context boundary?"
-        if (combed) {
-            const double lumaEdgeCede = std::max(eUp, eDn);
-
-            double bevelCede = 0.0;
-            if (rel < (int)tapLine.movingCoarseContour.size() &&
-                tapLine.movingCoarseContour[rel].valid &&
-                rel < (int)tapLine.hLumaDeltaIRE.size())
-            {
-                const auto &mc = tapLine.movingCoarseContour[rel];
-                const double hEdge = std::clamp(
-                    (tapLine.hLumaDeltaIRE[rel] - 0.30 * hEdgeThreshIRE) /
-                    (0.70 * hEdgeThreshIRE),
-                    0.0,
-                    1.0);
-
-                const double sideBalance =
-                    1.0 - std::fabs(
-                        std::clamp(mc.upTrust, 0.0, 1.0) -
-                        std::clamp(mc.downTrust, 0.0, 1.0));
-
-                const double bevelRisk =
-                    chromaT *
-                    hEdge *
-                    (1.0 - std::clamp(mc.straightness, 0.0, 1.0)) *
-                    (0.35 + 0.65 * std::clamp(sideBalance, 0.0, 1.0));
-
-                bevelCede =
-                    std::clamp(T.FIELD_A_BEVEL_CEDE_STRENGTH * bevelRisk, 0.0, 1.0);
-            }
-
-            const double totalCede = std::max({lumaEdgeCede, bevelCede, boundaryCede});
-            if (totalCede > 0.0)
-                tc = tc * (1.0 - totalCede) + C * totalCede;
-        }
-
-        // THE HULL IS A PROPERTY OF THE OUTPUT, NOT OF THE COMB
-        // (user, 2026-08-23: "the fix should have lived outside of if
-        // combed").
-        //
-        // Scalar outputs may not be brighter, darker, or larger in magnitude
-        // than the raw input pixels that formed them. Candidate/output
-        // clusters and excluded legs are not a legal range.
-        //
-        // This ran under if (combed) from e1c4d90 (2026-07-12), which bounded
-        // a comb against its legs in the three leg configurations. The
-        // shadow-island fade had already existed since 9c7e223 (2026-07-02)
-        // and exits WITHOUT a comb, so it sat outside the bound for ten days
-        // and every day since: C * (1 - hEdgeT) walks toward zero, a zero
-        // scalar asserts there is no carrier at this sample, and Y = raw - 0
-        // publishes the raw composite as luma. That was not a special case,
-        // it was an omission -- the hull was scoped to the comb when it is
-        // really a law about what may leave this function.
-        //
-        // So the selector below is WHICH LEGS PARTICIPATED, never which
-        // branch produced the value. The no-leg case is a member of the law
-        // rather than an absence of it, and a future branch added above
-        // cannot escape it by construction.
-        {
-            const double yC = rawC - C;
-            const double yU = rawU2 - Cup2;
-            const double yD = rawD2 - Cdn2;
-            const bool useUp = combed && wUp2 > 0.0;
-            const bool useDn = combed && wDn2 > 0.0;
-            if (useUp && useDn)
-                tc = clampCarrierToInputLimits(
-                    tc, rawC, { C, Cup2, Cdn2 }, { yC, yU, yD }, C);
-            else if (useUp)
-                tc = clampCarrierToInputLimits(
-                    tc, rawC, { C, Cup2 }, { yC, yU }, C);
-            else if (useDn)
-                tc = clampCarrierToInputLimits(
-                    tc, rawC, { C, Cdn2 }, { yC, yD }, C);
-            else
-                // Nothing combed here, so the center is the only input that
-                // formed this sample and the only legal value.
-                tc = clampCarrierToInputLimits(
-                    tc, rawC, { C }, { yC }, C);
         }
         
         if (!std::isfinite(tc))
@@ -1709,8 +1640,8 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
         if (outGate) outGate[rel] = gateA;
     }
 
-    // (FieldAStats per-line logging removed: Field A is no longer in the
-    // election, and the per-line spam buried the active diagnostics.)
+    // FieldAStats per-line logging remains removed; the per-line spam buried
+    // the active diagnostics.
 }
 
 // Field B
@@ -1747,47 +1678,11 @@ void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
 
 
 // ============================== FIELD B ====================================
-// Ground-up rebuild, promoted 2026-07-27 after the beach sentinel battery.
-// It replaced a policy that ceded 79-93% of pixels to 1D on program material
-// and therefore rendered ~1D everywhere; this one combs by default and stands
-// down only on named physical evidence.
-//
-// Measured premises (2026-07-26, beach s1x11 battery):
-//   - The predecessor ceded 79-93% of pixels through the chroma-boundary
-//     band blanket and rendered ~1D (alternation within 2-3% of line).
-//   - The old adaptive comb cancels 25-45% of line-alternating chroma error
-//     but never stands down (two-leg 100%), paying +40% Y-alternation at
-//     boundaries and luma detail.
-//   - Region verdicts at lurch-covered columns carry a leak term of
-//     kappa*h (kappa ~= 0.35 measured, 0.45 conservative) and the bare-column
-//     noise floor sits at 4-5 IRE, at the legacy thresholds themselves.
-//
-// Stance: COMB BY DEFAULT (the interiors were never the problem). A leg is
-// excluded only by:
-//   - grammar illegality (absolute, reachLegalGate), or
-//   - a Different-region verdict whose measured differenceIRE clears the
-//     evidence floor kBase PLUS the leak bound kappa*h*gate at columns under
-//     a vertically corroborated lurch run, or
-//   - a per-leg coarse-luma break (the Y-alternation guard), from which an
-//     AlienCancel leg is exempt: raw-identical legs share the center's leak
-//     and cancel it exactly.
-// Legs proven different from EACH OTHER (no shared chroma to cancel) render
-// one-sided with the nearer leg instead of blending a colour present on
-// neither line. Full cede to 1D only when no leg survives.
-//
-// Vertical taps come mirror-resolved from the tap system, so the active
-// top/bottom lines comb against the inward partner instead of black --
-// no jagged first/last bands.
-//
-// RENDER GRANULARITY: per column. The band-uniform alternative (one verdict
-// for a whole chroma-boundary band, which by construction cannot interleave)
-// was built and measured -- it removes the 5.6-11.3 decision switches per
-// band run that manufacture edge beading -- but the per-column render was
-// preferred on the canonical sentinel and showed no crawl in motion. If edge
-// beading ever returns, the switching rate inside a band is the instrument
-// that sees it (the LDCD_PROBE_CEDE census, since removed), and band-uniform
-// verdicts are the remedy; alternation energy is blind to that class. See
-// git history for the pass.
+// Sharp adaptive three-line constructor: center against same-field +/-2.
+// Pair similarity chooses one or both legs; the 3:1 decision preserves the
+// legacy split2D edge shape, and the normalized half-difference preserves full
+// comb authority.  Content-region facts act only as binary admission/cede
+// decisions so unsafe preclean never reaches either Frame constructor.
 void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                                           double *outFieldLine,
                                           std::uint8_t *outReasonLine)
@@ -1838,27 +1733,17 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         return;
     }
 
-    // Boundary-evidence floor and leak transfer.
-    //
-    // kBaseIRE sits above the region evaluator's measured bare-column
-    // difference noise floor (4-5 IRE on program material) so a verdict must
-    // clear the noise it is made of. kKappa is the conservative end of the
-    // measured leak-transfer slope (0.26-0.46 across five zones and three
-    // chroma bins, pooled ~0.35): each IRE of corroborated along-line step
-    // height contributes this much spurious separation to the evaluator's
-    // per-leg difference, so it must be cleared on top of the floor.
+    // Region admission has a measured noise floor plus the luma-leak carried
+    // by a corroborated lateral step.  This is a binary operand test, not a
+    // strength control: admitted samples retain the original filter exactly.
     constexpr double kBaseIRE = 6.0;
     constexpr double kKappa = 0.45;
-
-    // Per-column leak bound contribution from vertically corroborated
-    // along-line step runs: max h*gate over covering runs (means coordinate
-    // v spans rel v..v+3).
     std::vector<float> hgAt(width, 0.0f);
     for (const LurchStepRun &run : corroborateLurchEdges(lineNumber)) {
         if (run.suppressed) continue;
-        const double g = std::clamp(run.gate, 0.0, 1.0);
-        if (g <= 0.0) continue;
-        const float hg = static_cast<float>(run.stepAbsIRE * g);
+        const double gate = std::clamp(run.gate, 0.0, 1.0);
+        if (gate <= 0.0) continue;
+        const float hg = static_cast<float>(run.stepAbsIRE * gate);
         const int xa = std::max(0, run.a);
         const int xb = std::min(width - 1, run.b + 3);
         for (int x = xa; x <= xb; ++x)
@@ -1875,11 +1760,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     std::uint8_t *bandOut = chromaBoundaryBand_line(lineNumber);
 
     for (int rel = 0; rel < width; ++rel) {
-        const double rawCenter = tapLine.tap0[rel].raw;
         const double center = tapLine.tap0[rel].comp;
-        const double rawUp = haveU ? tapLine.tapU2[rel].raw : 0.0;
         const double up = haveU ? tapLine.tapU2[rel].comp : 0.0;
-        const double rawDown = haveD ? tapLine.tapD2[rel].raw : 0.0;
         const double down = haveD ? tapLine.tapD2[rel].comp : 0.0;
 
         const auto &region =
@@ -1892,11 +1774,6 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             haveD && tapLine.pairD2[rel].reachLegalGate > 0.0;
 
         const double bound = kBaseIRE + kKappa * hgAt[rel];
-
-        // A Different verdict stands only above the evidence floor plus the
-        // leak bound; below it the measured difference is explainable as the
-        // 1D bandpass leak of a corroborated luma step (or texture noise),
-        // and the comb proceeds.
         const bool upBoundary =
             region.up == RR::DifferentRegion &&
             region.upDifferenceIRE >= bound;
@@ -1904,42 +1781,62 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             region.down == RR::DifferentRegion &&
             region.downDifferenceIRE >= bound;
 
-        // Per-leg coarse-luma break: the Y-alternation guard. A leg whose
-        // carrier-free luma departs from center carries a different bandpass
-        // leak, and combing it moves that difference into Y. AlienCancel legs
-        // are exempt (raw-identical content shares the leak).
+        // A real carrier-free vertical context break is also binary.  The
+        // AlienCancel relation is exempt because raw-identical content shares
+        // the center's leak and is precisely what the comb should cancel.
+        constexpr double kLumaHardBreakIRE = 14.0;
         const bool haveCoarse =
             tapLine.coarseLumaValid &&
             rel < static_cast<int>(tapLine.coarse0IRE.size()) &&
             rel < static_cast<int>(tapLine.coarseU2IRE.size()) &&
             rel < static_cast<int>(tapLine.coarseD2IRE.size());
-        constexpr double kLumaLo = 6.0;
-        constexpr double kLumaHi = 20.0;
-        constexpr double kLumaHardBreak = 14.0;
-        auto lumaGate = [&](double deltaIRE, bool alien) {
-            if (alien) return 1.0;
-            if (deltaIRE >= kLumaHardBreak) return 0.0;
-            const double t = std::clamp(
-                (deltaIRE - kLumaLo) / (kLumaHi - kLumaLo), 0.0, 1.0);
-            return 1.0 - 0.65 * t;
-        };
-        const double upCoarseDelta = haveCoarse
-            ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseU2IRE[rel])
-            : 0.0;
-        const double downCoarseDelta = haveCoarse
-            ? std::fabs(tapLine.coarse0IRE[rel] - tapLine.coarseD2IRE[rel])
-            : 0.0;
+        const bool upLumaBreak =
+            haveCoarse && region.up != RR::AlienCancel &&
+            std::fabs(tapLine.coarse0IRE[rel] -
+                      tapLine.coarseU2IRE[rel]) >= kLumaHardBreakIRE;
+        const bool downLumaBreak =
+            haveCoarse && region.down != RR::AlienCancel &&
+            std::fabs(tapLine.coarse0IRE[rel] -
+                      tapLine.coarseD2IRE[rel]) >= kLumaHardBreakIRE;
 
-        double wUp = (upLegal && !upBoundary)
-            ? lumaGate(upCoarseDelta, region.up == RR::AlienCancel)
-            : 0.0;
-        double wDown = (downLegal && !downBoundary)
-            ? lumaGate(downCoarseDelta, region.down == RR::AlienCancel)
-            : 0.0;
+        const bool bandCede = region.chromaBoundaryBand;
+        const bool upAdmitted =
+            upLegal && !upBoundary && !upLumaBreak && !bandCede;
+        const bool downAdmitted =
+            downLegal && !downBoundary && !downLumaBreak && !bandCede;
 
-        // Legs proven different from each other offer no common chroma to
-        // cancel: render one-sided with the nearer leg. Magnitude-bounded so
-        // a leak-manufactured outer difference cannot split a real pair.
+        // Field B is the sharp legacy three-line estimator.  Content-region
+        // evidence changes only operand admission; it never scales an admitted
+        // leg or the resulting half-difference.
+        double wUp = upAdmitted ? tapLine.pairU2[rel].weight : 0.0;
+        double wDown = downAdmitted ? tapLine.pairD2[rel].weight : 0.0;
+
+        // Legacy split2D's decisive shape: when one local match is more than
+        // three times stronger, do not average a laterally displaced second
+        // leg into the edge.  This is selection, not a strength throttle.
+        if (wDown > 3.0 * wUp)
+            wUp = 0.0;
+        else if (wUp > 3.0 * wDown)
+            wDown = 0.0;
+
+        bool recovered = false;
+        if (wUp <= 0.0 && wDown <= 0.0) {
+            const double dMag =
+                std::fabs(std::fabs(up) - std::fabs(down));
+            const double sumUD = std::fabs(up + down);
+            constexpr double kReviveCarrierFloorIRE = 2.0;
+            if (sumUD * invIreScale > kReviveCarrierFloorIRE &&
+                dMag - std::fabs(sumUD * 0.2) <= 0.0)
+            {
+                wUp = upAdmitted ? 1.0 : 0.0;
+                wDown = downAdmitted ? 1.0 : 0.0;
+                recovered = wUp > 0.0 || wDown > 0.0;
+            }
+        }
+
+        // When both operands remain legal but demonstrably belong to
+        // different regions, use the one closer to center rather than mixing
+        // a carrier no participating line contained.
         if (wUp > 0.0 && wDown > 0.0 &&
             region.outerComparable &&
             region.upDownHueDifferenceDeg >= 20.0 &&
@@ -1951,20 +1848,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 wUp = 0.0;
         }
 
+        // Publish the same Gilgol/region fact for downstream band and election
+        // laws; the constructor has used it only as the hard admission above.
         if (bandOut) bandOut[rel] = region.chromaBoundaryBand ? 1 : 0;
-
-        // A chroma-boundary band cedes to center. Both evidence-driven
-        // reclaims of band territory were built and failed on real renders:
-        // per-column verdicts manufacture the fishboning/lapel interleave,
-        // and band-wide admission manufactures lateral mixing across the
-        // boundary (bikini diagonal, 2026-07-27). The band's original law
-        // stands -- one region, one render, and that render is the 1D.
-        // Detail at boundaries is a job for a separate election candidate,
-        // not for this comb.
-        if (region.chromaBoundaryBand) {
-            wUp = 0.0;
-            wDown = 0.0;
-        }
 
         const bool useUp = wUp > 1e-9;
         const bool useDown = wDown > 1e-9;
@@ -1973,29 +1859,17 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         std::uint8_t reason;
         if (!useUp && !useDown) {
             output = center;
-            reason = (upBoundary || downBoundary || region.chromaBoundaryBand)
+            reason = (bandCede || upBoundary || downBoundary ||
+                      upLumaBreak || downLumaBreak)
                 ? FieldBReasonCede : FieldBReasonCenter;
         } else {
             const double denom = wUp + wDown;
             const double neighbor = (up * wUp + down * wDown) / denom;
-            const double combed = 0.5 * (center - neighbor);
-
-            // Physical feasibility only: the half-difference is amplitude-
-            // bounded by construction; retain the reconstructed-luma bound
-            // from the raw samples that participated.
-            const double yCenter = rawCenter - center;
-            const double yUp = rawUp - up;
-            const double yDown = rawDown - down;
-            output = (useUp && useDown)
-                ? clampCarrierToInputLumaRange(
-                    combed, rawCenter, { yCenter, yUp, yDown }, center)
-                : (useUp
-                    ? clampCarrierToInputLumaRange(
-                        combed, rawCenter, { yCenter, yUp }, center)
-                    : clampCarrierToInputLumaRange(
-                        combed, rawCenter, { yCenter, yDown }, center));
-            reason = (useUp && useDown)
-                ? FieldBReasonBlend : FieldBReasonOneLeg;
+            output = 0.5 * (center - neighbor);
+            reason = recovered
+                ? FieldBReasonRecovery
+                : ((useUp && useDown)
+                    ? FieldBReasonBlend : FieldBReasonOneLeg);
         }
 
         if (!std::isfinite(output)) {
@@ -2022,56 +1896,10 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
 
 
 static inline double cmag(const std::complex<double> &z) { return boundedMag(z); }
-static inline double cmag2(const std::complex<double> &z) { return z.real() * z.real() + z.imag() * z.imag(); }
-static inline double dotIQ(const std::complex<double> &a, const std::complex<double> &b) { return a.real()*b.real() + a.imag()*b.imag(); }
-
-struct ColumnPhaseAlignmentLimits {
-    double minFitIRE = 0.0;
-    double pMax = 0.0;
-    double tanPMax = 0.0;
-};
-
-static inline std::complex<double> applyColumnPhaseAlignment(
-    const std::complex<double> &center,
-    const std::complex<double> &neighbor,
-    double invI,
-    const ColumnPhaseAlignmentLimits &limits)
-{
-    const double a0 = cmag(center);
-    const double an = cmag(neighbor);
-    if (a0 * invI < limits.minFitIRE || an * invI < limits.minFitIRE)
-        return neighbor;
-
-    const double dot = dotIQ(neighbor, center);
-    const double cross = neighbor.real() * center.imag() - neighbor.imag() * center.real();
-
-    // The rotation we want is by phase = atan2(cross, dot).  When the clamp
-    // doesn't bind, cos(phase) = dot/h and sin(phase) = cross/h where
-    // h = |(dot, cross)| — so one magnitude replaces atan2 + cos + sin.
-    // The clamp binds iff |phase| > pMax, equivalent to
-    //   dot < 0  (phase in second/third quadrant, always > pMax for pMax<90°)
-    //   or  |cross| > dot * tan(pMax).
-    // Only then do we fall back to atan2+cos+sin to honor the clamp.
-    double c, s;
-    if (dot > 0.0 && std::fabs(cross) <= dot * limits.tanPMax) {
-        const double h = boundedMag(dot, cross);
-        if (h <= 1e-18) return neighbor;
-        c = dot / h;
-        s = cross / h;
-    } else {
-        double phase = std::atan2(cross, dot);
-        phase = std::clamp(phase, -limits.pMax, limits.pMax);
-        c = std::cos(phase);
-        s = std::sin(phase);
-    }
-
-    return std::complex<double>(
-        c * neighbor.real() - s * neighbor.imag(),
-        s * neighbor.real() + c * neighbor.imag());
-}
-
-// NOTE: scratch_frameACancel is consumed here and cleared on exit; only
-// computeFrameALine sets it, immediately before calling in.
+// Frame A is a plain reach-gated midpoint comb.  The preclean stage has
+// already sharpened each field and placed all three operands in the same IQ
+// coordinate.  Reach decides which complementary observations are safe; it
+// does not scale the midpoint itself.
 void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
@@ -2090,334 +1918,47 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         outFrameIQ.clear();
         return;
     }
-    outFrameIQ.resize(width);
 
-    auto clearFrameIQ = [&]() {
-        std::fill(outFrameIQ.begin(), outFrameIQ.end(), std::complex<double>(0.0, 0.0));
-    };
-    if (line < first || line >= last) {
-        clearFrameIQ();
+    outFrameIQ.assign(width, std::complex<double>(0.0, 0.0));
+    if (line < first || line >= last ||
+        line >= demodLines || demodWidth <= 0 ||
+        (int)centerIQ.size() < width ||
+        (int)upIQ.size() < width ||
+        (int)dnIQ.size() < width)
         return;
-    }
-    if (line >= demodLines || demodWidth <= 0) {
-        clearFrameIQ();
-        return;
-    }
-
-    const auto  &T    = configuration.tunables;
-    const double invI = invIreScale;
 
     const bool verticalAllowed = carrierFrameVerticalAllowed(line);
     const bool haveUpLine = verticalAllowed && (line - 1 >= first);
-    const bool haveDnLine = verticalAllowed && (line + 1 <  last);
-
-    // HQ-leg treatment (user, 2026-07-30: "certified legs are ideally
-    // positioned for comb as no other"). A certified leg removes half the
-    // comb's unknowns: its luma AND carrier are conservation facts, so every
-    // trust-based discount below -- phase alignment toward the center, the
-    // correlation ramp, hue projection, the coherence strength gate -- is
-    // vestigial against it. Those cautions exist because a MODEL leg's
-    // carrier can lie; a certified leg cannot. Content-based gates (the
-    // vertical-transition selector, reach legality, disGate) remain: they
-    // answer "is the image continuous here", which certification does not
-    // decide. Escape LDCD_CERT_LEGS=0 (active only with LDCD_CERT_1D >= 2).
-    static const bool certLegsOn = []{
-        const char *e = std::getenv("LDCD_CERT_LEGS");
-        return !(e && std::atoi(e) == 0);
-    }();
-    const bool upCert = certLegsOn && certifiedOneDLevel() >= 2 &&
-                        haveUpLine && certifiedDefLine(line - 1);
-    const bool dnCert = certLegsOn && certifiedOneDLevel() >= 2 &&
-                        haveDnLine && certifiedDefLine(line + 1);
-    // GILGOL BAND LAW (user, 2026-08-21: "when the comp combs with
-    // certified, there's no limit and a few small zippers show").
-    // Inside the discovered chroma-boundary band, certification stops
-    // being an exemption: a certified leg is a perfect VALUE from the
-    // wrong REGION, and the trust limits it bypasses (the correlation
-    // ramp, cohGate, the phase-protection agreement grant) are exactly
-    // the limits that would have caught the crossing. In-band, certified
-    // legs face the same conduct as model legs.
-    const std::uint8_t *gilgolBandRow = chromaBoundaryBand_line(line);
-
-    // Signed correlation in [-1..1].  Caller supplies pre-computed magnitudes
-    // to avoid recomputing hypot per call site.
-    auto corrSignedMags = [&](const std::complex<double> &a,
-                              const std::complex<double> &b,
-                              double ma, double mb)->double {
-        if (ma <= 1e-12 || mb <= 1e-12) return 0.0;
-        return dotIQ(a, b) / (ma*mb + 1e-12);
-    };
-
-    // Soft signed contribution and its weight, computed together so the shared
-    // (c, ac, w) calculation is not run twice per neighbor.  Magnitudes are
-    // supplied by the caller (precomputed once per pixel).
-    auto softAlignBoth = [&](const std::complex<double> &Z0,
-                             const std::complex<double> &Zn,
-                             double a0, double an,
-                             std::complex<double> &contribOut,
-                             double &weightOut)
-    {
-        if (a0 <= 1e-12 || an <= 1e-12) {
-            contribOut = {0.0, 0.0};
-            weightOut  = 0.0;
-            return;
-        }
-        const double c  = dotIQ(Z0, Zn) / (a0*an + 1e-12); // signed corr [-1..1]
-        const double ac = std::fabs(c);
-
-        const double t0 = 0.55;
-        const double t1 = 0.85;
-
-        double w = (ac - t0) / (t1 - t0);
-        w = std::clamp(w, 0.0, 1.0);
-
-        // No floor: if correlation is below the ramp start, the neighbor
-        // does not contribute.  Edge safety is reach's job; a wFloor here
-        // leaks badly-correlated material through throttled-but-nonzero reach.
-
-        const double s = (c >= 0.0) ? 1.0 : -1.0;
-        contribOut = Zn * (w * s);
-        weightOut  = w;
-    };
-
-    const double COMB_STRENGTH  = std::max(0.0, T.FRAME_COMB_STRENGTH);
-    const double MAX_DELTA_IRE  = T.FRAME_IQ_RAW_MAX_DELTA_IRE;
-    const double MIN_CHROMA_IRE = T.FRAME_CHROMA_MIN_IRE;
-    const double phaseAlignMax = T.FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG * M_PI / 180.0;
-    const ColumnPhaseAlignmentLimits phaseAlignLimits{
-        std::max(2.0, 0.5 * MIN_CHROMA_IRE),
-        phaseAlignMax,
-        std::tan(phaseAlignMax)
-    };
-
-    // ------------------------------------------------------------
-    // Build IQ vectors for center and 1 neighbors
-    // ------------------------------------------------------------
-    if ((int)centerIQ.size() < width || (int)upIQ.size() < width || (int)dnIQ.size() < width) {
-        clearFrameIQ();
-        return;
-    }
-
-    std::copy(centerIQ.begin(), centerIQ.begin() + width, outFrameIQ.begin());
-
-    // Column-local phase alignment. A certified leg is never aligned toward
-    // the center: its phase is exact, and rotating truth toward a model
-    // estimate is the alignment running backwards.
-    for (int x = 0; x < width; ++x) {
-        if (!upCert)
-            upIQ[x] = applyColumnPhaseAlignment(centerIQ[x], upIQ[x], invI, phaseAlignLimits);
-        if (!dnCert)
-            dnIQ[x] = applyColumnPhaseAlignment(centerIQ[x], dnIQ[x], invI, phaseAlignLimits);
-    }
-
-    // ------------------------------------------------------------
-    // Combine (soft signed contributions + boundary-aware asymmetry)
-    // ------------------------------------------------------------
-    // NOTE (user, 2026-07-30): the comp-line bracket phase rotation was
-    // briefly candidate-local here and was MOVED TO THE HEAD (stage 1b in
-    // buildPhaseCorrected1D) -- "Frame B is equally important" and a
-    // candidate-local rotation cannot reach it. The centerIQ arriving here
-    // already carries bracket phase on comp lines of covered frames.
+    const bool haveDnLine = verticalAllowed && (line + 1 < last);
 
     for (int x = 0; x < width; ++x) {
-        const std::complex<double> Z0 = centerIQ[x];
-        const double a0 = cmag(Z0);
-        const double a0_ire = a0 * invI;
-
-        if (a0_ire <= MIN_CHROMA_IRE) {
-            outFrameIQ[x] = Z0;
-            continue;
-        }
-
-        std::complex<double> ZUpRaw = upIQ[x];
-        std::complex<double> ZDnRaw = dnIQ[x];
-
-        const double aUp = cmag(ZUpRaw);
-        const double aDn = cmag(ZDnRaw);
-
-        // Reach contributes physical legality only. Frame A owns the method:
-        // select the center-continuing side at a vertical transition, retain a
-        // small contribution from the other side, then let signed correlation
-        // and phase protection decide how strongly to use what remains.
+        const std::complex<double> center = centerIQ[x];
         double upReach = 0.0;
         double dnReach = 0.0;
         if (reachTapLine &&
             x < (int)reachTapLine->pairU1.size() &&
             x < (int)reachTapLine->pairD1.size())
         {
-            upReach = haveUpLine
-                ? std::clamp(reachTapLine->pairU1[x].reachLegalGate, 0.0, 1.0)
-                : 0.0;
-            dnReach = haveDnLine
-                ? std::clamp(reachTapLine->pairD1[x].reachLegalGate, 0.0, 1.0)
-                : 0.0;
+            if (haveUpLine)
+                upReach = std::clamp(
+                    reachTapLine->pairU1[x].reachLegalGate, 0.0, 1.0);
+            if (haveDnLine)
+                dnReach = std::clamp(
+                    reachTapLine->pairD1[x].reachLegalGate, 0.0, 1.0);
         }
 
-        const double dUp0IRE = cmag(ZUpRaw - Z0) * invI;
-        const double dDn0IRE = cmag(ZDnRaw - Z0) * invI;
-        const double dUpDnIRE = cmag(ZUpRaw - ZDnRaw) * invI;
-        constexpr double kTransitionPairIRE = 8.0;
-        constexpr double kTransitionMatchIRE = 4.0;
-        constexpr double kTransitionSuppress = 0.35;
-        if (dUpDnIRE > kTransitionPairIRE) {
-            if (dUp0IRE + 1.0 < dDn0IRE && dUp0IRE < kTransitionMatchIRE)
-                dnReach *= kTransitionSuppress;
-            else if (dDn0IRE + 1.0 < dUp0IRE && dDn0IRE < kTransitionMatchIRE)
-                upReach *= kTransitionSuppress;
-        }
-
-        const bool useUp = (upReach > 0.0) && (aUp > 1e-9);
-        const bool useDn = (dnReach > 0.0) && (aDn > 1e-9);
-
-        if (!useUp && !useDn) {
-            outFrameIQ[x] = Z0;
+        const double legWeight = upReach + dnReach;
+        if (legWeight <= 0.0) {
+            outFrameIQ[x] = center;
             continue;
         }
 
-        // In-band demotion of certified legs (band law above).
-        const bool gilgolBand = gilgolBandRow && gilgolBandRow[x] != 0;
-        const bool upCertX = upCert && !gilgolBand;
-        const bool dnCertX = dnCert && !gilgolBand;
-
-        // Per-side signed correlation, hoisted for reuse by both the phase-
-        // protection block and cohGate below.
-        const double corrUp = useUp
-            ? std::fabs(corrSignedMags(Z0, ZUpRaw, a0, aUp)) : 0.0;
-        const double corrDn = useDn
-            ? std::fabs(corrSignedMags(Z0, ZDnRaw, a0, aDn)) : 0.0;
-
-        // Phase protection: when center and one neighbor agree on phase,
-        // the other neighbor must not rotate the hue.  Project the
-        // disagreeing neighbor onto center's phase axis so it can still
-        // contribute amplitude (luma-slope influence) but not alter hue.
-        // The threshold for "agrees" is the cohGate pass point — the same
-        // correlation that fully passes the adaptive-strength gate.
-        {
-            const double agreeThresh = std::clamp(T.FRAME_IQ_COH_PASS_CORR, 0.0, 1.0);
-            const bool upAgrees = useUp && (upCertX || corrUp >= agreeThresh);
-            const bool dnAgrees = useDn && (dnCertX || corrDn >= agreeThresh);
-            const double a0sq = a0 * a0;
-
-            if (upAgrees && !dnAgrees && useDn && !dnCertX && a0sq > 1e-18) {
-                const double proj = dotIQ(ZDnRaw, Z0) / a0sq;
-                ZDnRaw = Z0 * proj;
-            } else if (dnAgrees && !upAgrees && useUp && !upCertX && a0sq > 1e-18) {
-                const double proj = dotIQ(ZUpRaw, Z0) / a0sq;
-                ZUpRaw = Z0 * proj;
-            }
-        }
-
-        // Combine neighbors with soft signed contributions, weighted by reach
-        // (no integer dilution).  softAlignBoth returns contribution and weight
-        // together so the shared correlation calc isn't repeated per side; the
-        // reach gate scales both, so a throttled side pulls less without any
-        // separate boundary heuristic.
-        std::complex<double> Zsum = Z0;
-        double wsum = 1.0;
-
-        auto legContrib = [&](bool cert, const std::complex<double> &Zn,
-                              double an, double reach) {
-            std::complex<double> contrib;
-            double w;
-            if (cert) {
-                // Certified leg: the correlation RAMP is a trust instrument
-                // and does not apply; the sign is content (a genuine hue
-                // reversal must not be averaged as agreement).
-                const double c = corrSignedMags(Z0, Zn, a0, an);
-                contrib = (c >= 0.0) ? Zn : -Zn;
-                w = 1.0;
-            } else {
-                softAlignBoth(Z0, Zn, a0, an, contrib, w);
-            }
-            if (w * reach > 0.0) {
-                Zsum += contrib * reach;
-                wsum += w * reach;
-            }
-        };
-        if (useUp) legContrib(upCertX, ZUpRaw, aUp, upReach);
-        if (useDn) legContrib(dnCertX, ZDnRaw, aDn, dnReach);
-
-        std::complex<double> Zframe = Zsum / wsum;
-
-        std::complex<double> delta = Zframe - Z0;
-        const double deltaMagIRE = cmag(delta) * invI;
-
-        if (MAX_DELTA_IRE > 0.0 && deltaMagIRE > MAX_DELTA_IRE && deltaMagIRE > 1e-9)
-            delta *= (MAX_DELTA_IRE / deltaMagIRE);
-
-        // --------------------------------------------------------
-        // Adaptive comb strength: COMB_STRENGTH_LO .. COMB_STRENGTH.
-        // This is Frame A's signature: signed correlation sets confidence and
-        // up/down disagreement backs off the candidate at a context break.
-        // --------------------------------------------------------
-        const double COMB_STRENGTH_HI = COMB_STRENGTH;
-        const double COMB_STRENGTH_LO = std::min(0.8, COMB_STRENGTH_HI);
-
-        // Coherence: reuse the hoisted per-side correlations.
-        const double coh = std::max(corrUp, corrDn);
-
-        // Map coherence -> [0..1].  cohPass is the correlation required to pass
-        // cohGate fully; the ramp starts a fixed 0.30 below it.
-        const double cohPass  = std::clamp(T.FRAME_IQ_COH_PASS_CORR, 0.0, 1.0);
-        const double cohStart = std::max(0.0, cohPass - 0.30);
-        double cohGate = (cohPass > cohStart)
-            ? (coh - cohStart) / (cohPass - cohStart)
-            : (coh >= cohPass ? 1.0 : 0.0);
-        cohGate = std::clamp(cohGate, 0.0, 1.0);
-        // A certified leg's participation is not a confidence question;
-        // only the content gate (disGate) may back the comb off it.
-        if ((useUp && upCertX) || (useDn && dnCertX))
-            cohGate = 1.0;
-
-        const double disagreementStart = 5.0;
-        const double disagreementFull = 18.0;
-        const double disGate = 1.0 - std::clamp(
-            (dUpDnIRE - disagreementStart) /
-                (disagreementFull - disagreementStart),
-            0.0, 1.0);
-        double localStrength =
-            (COMB_STRENGTH_LO +
-             (COMB_STRENGTH_HI - COMB_STRENGTH_LO) * cohGate) * disGate;
-
-        // CANCELLATION OPPORTUNITY: TAKE THE PROJECTION, NEVER THE BOOST
-        // (user, 2026-08-23: "1.125 will overshoot. The red and green are
-        // equally wrong and must converge on a center that lives only in the
-        // math, not in the 1D as-is").
-        //
-        // Where the legs agree with each other and oppose the centre, the
-        // centre reads C+e and the legs read C-e: both are wrong by the same
-        // amount in opposite directions, and the truth is a midpoint present
-        // in no observation. This comb emits Z0 + s*(Zframe - Z0), which for
-        // that geometry is C + e*(1 - 2s). Only s = 0.5 lands on C.
-        //
-        // The ordinary range cannot get there. COMB_STRENGTH_LO is 0.8 and
-        // COMB_STRENGTH_HI is 1.125, giving C - 0.6e at the floor and
-        // C - 1.25e at the ceiling: the alternation survives with its sign
-        // inverted, worse at the ceiling than leaving it alone. That is
-        // Frame B's recorded law reaching Frame A -- "pull > 0.5 is not
-        // stronger cancellation, it re-injects inverted alien at (2p-1)" --
-        // and Frame B is capped at the projection while Frame A never was.
-        //
-        // disGate still applies: content disagreement may withdraw the comb,
-        // but it may not push it past the projection.
-        if (x < (int)scratch_frameACancel.size() && scratch_frameACancel[x])
-            localStrength = 0.5 * disGate;
-
-        std::complex<double> Zcandidate = Z0 + (delta * localStrength);
-        
-        // BOUND IN IQ, BEFORE REMOD (user, 2026-08-23). The legs are the
-        // aligned ZUpRaw/ZDnRaw this comb actually worked from, selected by
-        // the same useUp/useDn that decided participation -- so the no-leg
-        // case is a member of the law rather than an absence of it. See
-        // clampIQToInputHull for why alignment does not repeat the fault
-        // that retired the box which used to sit here.
-        outFrameIQ[x] = clampIQToInputHull(
-            Zcandidate, Z0,
-            useUp ? &ZUpRaw : nullptr,
-            useDn ? &ZDnRaw : nullptr);
+        const std::complex<double> complement =
+            (upIQ[x] * upReach + dnIQ[x] * dnReach) / legWeight;
+        outFrameIQ[x] = 0.5 * (center + complement);
     }
 }
-// Frame A: adaptive interframe IQ comb fed by the Field B preclean ring.
+// Frame A: reach-gated midpoint comb fed by the Field B preclean ring.
 void Comb::FrameBuffer::computeFrameALine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ)
@@ -2446,10 +1987,8 @@ void Comb::FrameBuffer::computeFrameALine(
 	        return;
 	    }
 
-    // Frame A reads only the shared physical tap facts. Its transition,
-    // disagreement, correlation, and phase policy lives in
-    // computeIQFrameAFromPreparedVectors; Frame B cannot shape this candidate.
-    // The tap line is already built with TapBuildFrame, so ensure is a cache hit.
+    // Frame A reads only the shared physical reach facts.  The tap line is
+    // already built with TapBuildFrame, so ensure is a cache hit.
     const CombTapLine &reachTapLine = ensureCombTapLine(line);
 
     auto tiLine = [&](int ln)->const float* { return demodTI4fsc_line(ln); };
@@ -2495,35 +2034,6 @@ void Comb::FrameBuffer::computeFrameALine(
     if ((int)scratch_centerIQ.size() != width) scratch_centerIQ.resize(width);
     if ((int)scratch_upIQ.size() != width) scratch_upIQ.resize(width);
     if ((int)scratch_dnIQ.size() != width) scratch_dnIQ.resize(width);
-    // Fresh every line, so the mask can never be read stale.
-    scratch_frameACancel.assign(width, 0);
-    const double minCancelIRE = configuration.tunables.FRAME_CHROMA_MIN_IRE;
-
-    // THE 1D's OWN IQ, ALREADY PUBLISHED (user, 2026-08-23: "why did you add
-    // demods? we are in IQ space already").
-    //
-    // buildPhaseCorrected1D emits locked1DTI/TQ4fsc as its Pass-3b "pre-comb
-    // IQ authority": the 1D scalar demodulated on a 3-sample centred aperture
-    // that cancels the alternating product image. It is per line, it is
-    // upstream of Field B, and Frame A's own certified def-line cede already
-    // reads these same planes. Re-demodulating bucketScalar1D here would cost
-    // three products per sample, would carry the 2fSC image these do not, and
-    // would have to hand-manage cursor phase. Read the authority instead.
-    auto lockedI4Line = [&](int ln)->const float* {
-        return (ln >= first && ln < last) ? locked1DTI4fsc_line(ln) : nullptr;
-    };
-    auto lockedQ4Line = [&](int ln)->const float* {
-        return (ln >= first && ln < last) ? locked1DTQ4fsc_line(ln) : nullptr;
-    };
-    const float *oneDI0 = lockedI4Line(line);
-    const float *oneDQ0 = lockedQ4Line(line);
-    const float *oneDIu = verticalAllowed ? lockedI4Line(line - 1) : nullptr;
-    const float *oneDQu = verticalAllowed ? lockedQ4Line(line - 1) : nullptr;
-    const float *oneDId = verticalAllowed ? lockedI4Line(line + 1) : nullptr;
-    const float *oneDQd = verticalAllowed ? lockedQ4Line(line + 1) : nullptr;
-    const bool haveOneDTriple =
-        oneDI0 && oneDQ0 && oneDIu && oneDQu && oneDId && oneDQd;
-
     for (int x = 0; x < width; ++x) {
         if (preclean0)
             scratch_centerIQ[x] =
@@ -2560,45 +2070,6 @@ void Comb::FrameBuffer::computeFrameALine(
             else
                 scratch_dnIQ[x] = std::complex<double>(0.0, 0.0);
         }
-
-        // THE CANCELLATION ESCAPE (user, 2026-08-23).
-        //
-        // Preclean priority is right for workaday samples: the cleaner input,
-        // and no non-germane blending. But the 1D error is carrier-rate
-        // content, so Field B has already interpreted and split it before
-        // Frame A sees a leg -- the common-mode term a +-1 comb could null is
-        // consumed upstream, which is why every gate downstream can be open
-        // and the alternation still survives.
-        //
-        // The opportunity is visible in the 1D's own IQ: both legs agreeing
-        // with each other while opposing the centre is the signature of a term
-        // equally wrong in both directions, whose truth is a midpoint present
-        // in no observation. Two of the three tests are threshold-free --
-        // |Zu-Zd| <= |Zu+Zd| is "the legs are within 90 degrees of each
-        // other", dot(Zm,Z0) < 0 is "the leg mean opposes the centre" -- and
-        // the amplitude floor reuses FRAME_CHROMA_MIN_IRE rather than
-        // inventing a constant.
-        //
-        // Where it holds the legs come from the 1D authority so the term is
-        // present to be cancelled, and computeIQFrameAFromPreparedVectors
-        // takes the projection at pull 0.5 instead of the boosted range.
-        if (haveOneDTriple) {
-            const std::complex<double> Z0s((double)oneDI0[x], (double)oneDQ0[x]);
-            const std::complex<double> Zus((double)oneDIu[x], (double)oneDQu[x]);
-            const std::complex<double> Zds((double)oneDId[x], (double)oneDQd[x]);
-            const std::complex<double> Zm = 0.5 * (Zus + Zds);
-            const bool legsAgree = cmag(Zus - Zds) <= cmag(Zus + Zds);
-            const bool opposeCentre = dotIQ(Zm, Z0s) < 0.0;
-            const bool loudEnough =
-                cmag(Z0s) * invIreScale >= minCancelIRE &&
-                cmag(Zm) * invIreScale >= minCancelIRE;
-            if (legsAgree && opposeCentre && loudEnough) {
-                scratch_centerIQ[x] = Z0s;
-                scratch_upIQ[x] = Zus;
-                scratch_dnIQ[x] = Zds;
-                scratch_frameACancel[x] = 1;
-            }
-        }
     }
 
     // Product demodulation is sample-local and still carries its 2fSC image.
@@ -2613,19 +2084,10 @@ void Comb::FrameBuffer::computeFrameALine(
                                       outFrameIQ, &reachTapLine);
 }
 
-// Frame B: direct interframe IQ comb.
-// Sources from the Field B preclean ring, with locked-1D IQ as optional
-// diagnostic center fallback.
-//
-// Frame B's intended strong case is opposed-field contamination:
-//
-//     current:        Z0 = C + E
-//     frame partners: Zp = C - E
-//     neutral:        C  = 0.5 * (Z0 + Zp)
-//
-// Therefore the correction remains an exact midpoint projection with maximum
-// pull 0.5.  The relaxation here is not overdrive; it is permission for Frame B
-// to complete that midpoint projection when both ±1 frame legs agree.
+// Frame B: sharp signed cancellation of image-locked colour inherited from
+// the precleaned 1D center.  The registered ±1 pair estimates the alien term;
+// Frame B subtracts that estimate without blending either neighbour into the
+// picture.  Frame A owns the interfield midpoint candidate.
 void Comb::FrameBuffer::computeFrameBLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ,
@@ -2679,6 +2141,13 @@ void Comb::FrameBuffer::computeFrameBLine(
             gFbRegStat = LdcdFbRegStat();
     }
 
+    // ±1 operand admission. LDCD_FB_BAND_CEDE=0 is the A/B escape: it restores
+    // the unadmitted pair difference in one variable, so the census below and
+    // the render can be attributed to this change and nothing else.
+    static const bool fbAdmitOn = []{
+        const char *e = std::getenv("LDCD_FB_BAND_CEDE");
+        return !(e && std::atoi(e) == 0);
+    }();
     // Certified cede (construction): on a def line the Frame B candidate IS
     // the center; IQ from the stage-1 locked products of the same scalar.
     if (certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
@@ -2741,6 +2210,28 @@ void Comb::FrameBuffer::computeFrameBLine(
 
     const CombTapLine &reachTapLine = ensureCombTapLine(line);
 
+    // Close Frame B's refusal band over the aperture that can consume it.
+    // A boundary verdict on line L protects more than a Frame-B candidate
+    // centred on L: candidates centred on L-1 and L+1 would otherwise still
+    // take L as one of their operands and pull that region into the picture
+    // on the other side.  Those are exactly the dark-band reaches visible at
+    // a skin / narrow-band / turquoise transition.
+    //
+    // The horizontal band has already been dilated for registration.  Taking
+    // the OR of the adjacent centre-line bands here is the corresponding
+    // vertical dilation by Frame B's physical +/-1 reach -- no farther.  The
+    // three cache slots are line-mod-3, so current/up/down remain resident
+    // together while this candidate is built.
+    const CombTapLine *reachTapUp = haveUpLine
+        ? &ensureCombTapLine(line - 1) : nullptr;
+    const CombTapLine *reachTapDn = haveDnLine
+        ? &ensureCombTapLine(line + 1) : nullptr;
+    auto frameBBandAt = [](const CombTapLine *tap, int x) {
+        return tap && tap->interfieldRegionValid &&
+               x >= 0 && x < (int)tap->interfieldRegionReach.size() &&
+               tap->interfieldRegionReach[x].chromaBoundaryBand;
+    };
+
     const double *preclean0  = precleanLinePtr(line, width);
     const double *precleanUp = haveUpLine ? precleanLinePtr(line - 1, width) : nullptr;
     const double *precleanDn = haveDnLine ? precleanLinePtr(line + 1, width) : nullptr;
@@ -2765,8 +2256,7 @@ void Comb::FrameBuffer::computeFrameBLine(
         }
     }
 
-    // Raw rows for the reconstructed-luma feasibility bound at the output.
-    const quint16 *rawCenterRow = rawbuffer.constData() + line * videoParameters.fieldWidth;
+    // Raw bracket rows feed the carrier-free luma registration locator.
     const quint16 *rawUpRow = haveUpLine
         ? rawbuffer.constData() + (line - 1) * videoParameters.fieldWidth : nullptr;
     const quint16 *rawDnRow = haveDnLine
@@ -2797,13 +2287,8 @@ void Comb::FrameBuffer::computeFrameBLine(
 
     const auto &T = configuration.tunables;
 
-    const double combStrength =
+    const double cancelStrength =
         std::clamp(std::max(0.0, T.FRAME_B_COMB_STRENGTH), 0.0, 1.0);
-
-    // Ordinary ambiguous-case cap remains tunable.  Verified cancellation
-    // pairs get a wider local cap so the midpoint projection is not clipped.
-    const double maxDeltaIRE =
-        std::max(0.0, T.FRAME_B_RAW_MAX_DELTA_IRE);
 
     static const bool forceFrameBLocked1D = [] {
         const char *s = std::getenv("LD_FRAME_B_FORCE_LOCKED_1D");
@@ -2838,92 +2323,22 @@ void Comb::FrameBuffer::computeFrameBLine(
     }
 
     // Put all three operands on the same native integer coordinate before
-    // either Frame-B estimator sees them.  This cancels the carrier-product
+    // the Frame-B estimator sees them.  This cancels the carrier-product
     // image without the h-0.5 delay of a previous/current average.
     centerCarrierProductRowInPlace(scratch_centerIQ.data(), width);
     centerCarrierProductRowInPlace(scratch_upIQ.data(), width);
     centerCarrierProductRowInPlace(scratch_dnIQ.data(), width);
 
-    // Frame B takes its reach from the shared tap service's physical legality
-    // and throttles the midpoint at close luma bevels.
-    //
-    // There was an alien-IQ reach policy here that could only ever RAISE that
-    // baseline (max'd against it).  Measured over 7.37M samples of interfield
-    // material, reachLegalGate was 1.0 everywhere and the policy never once
-    // exceeded it, so every one of its per-pixel evaluations was discarded.
-    // Lowering the baseline instead is not open to it: Frame B's +/-1 comb
-    // must run wherever a legal partner exists, so an IQ observation may not
-    // veto a legal leg.  A gate that can only raise a saturated baseline has
-    // no expressible effect, and it is gone.
-    scratch_frameBReachUp.resize(width);
-    scratch_frameBReachDown.resize(width);
+    // Preserve the shared luma-impulse observation consumed later by the
+    // attribution/election path.  It is evidence only and does not soften or
+    // throttle Frame B's signed correction.
     scratch_impulseExempt.resize(width);
     const double *frameLuma0 = lockedLumaCacheValid
         ? lockedLumaSmooth_line(line) : nullptr;
-    const double *frameLumaU1 = frameLuma0 && haveUpLine
-        ? lockedLumaSmooth_line(line - 1) : nullptr;
-    const double *frameLumaD1 = frameLuma0 && haveDnLine
-        ? lockedLumaSmooth_line(line + 1) : nullptr;
-    const double *frameLumaU2 = frameLuma0 && line - 2 >= first
-        ? lockedLumaSmooth_line(line - 2) : nullptr;
-    const double *frameLumaD2 = frameLuma0 && line + 2 < last
-        ? lockedLumaSmooth_line(line + 2) : nullptr;
-    const bool haveCloseLuma = frameLuma0 && frameLumaU1 && frameLumaD1 &&
-                               frameLumaU2 && frameLumaD2;
-    const double bevelPenalty =
-        std::clamp(T.FRAME_B_BEVEL_REACH_PENALTY, 0.0, 1.0);
-    const double satPenalty =
-        std::clamp(T.FRAME_BEVEL_SAT_PENALTY, 0.0, 1.0);
-
-    // One producer for the existing lumaImpulseRisk channel.  Field B reads
-    // this scratch below, and collectCombAttributionEvidence publishes the
-    // same samples for FVF and later cross-colour consumers.
     for (int x = 0; x < width; ++x) {
         scratch_impulseExempt[x] = compactLumaExcursionEvidence(
             frameLuma0, x, width, invIreScale);
     }
-
-    for (int x = 0; x < width; ++x) {
-        const double legalUp = x < (int)reachTapLine.pairU1.size()
-            ? reachTapLine.pairU1[x].reachLegalGate : 0.0;
-        const double legalDown = x < (int)reachTapLine.pairD1.size()
-            ? reachTapLine.pairD1[x].reachLegalGate : 0.0;
-        double upGate = haveUpLine ? legalUp : 0.0;
-        double downGate = haveDnLine ? legalDown : 0.0;
-
-        const double impulseExempt = scratch_impulseExempt[x];
-
-        if (haveCloseLuma && bevelPenalty > 0.0) {
-            const auto contour = CombContentReach::evaluateMovingCoarseContour(
-                frameLuma0[x] * invIreScale,
-                frameLumaU1[x] * invIreScale,
-                frameLumaD1[x] * invIreScale,
-                frameLumaU2[x] * invIreScale,
-                frameLumaD2[x] * invIreScale,
-                true, true, true, true,
-                T.FIELD_CONTOUR_SOFT_IRE, T.FIELD_CONTOUR_HARD_IRE);
-            if (contour.valid) {
-                const double chromaWeight =
-                    x < (int)reachTapLine.centerAdmittedChromaT.size()
-                        ? reachTapLine.centerAdmittedChromaT[x] : 0.0;
-                const double curvature =
-                    1.0 - std::clamp(contour.straightness, 0.0, 1.0);
-                double bevelGate = std::clamp(
-                    1.0 - bevelPenalty * chromaWeight * curvature, 0.0, 1.0);
-                bevelGate *= std::clamp(
-                    1.0 - satPenalty * chromaWeight * chromaWeight *
-                          curvature * curvature,
-                    0.0, 1.0);
-                const double effective =
-                    bevelGate + (1.0 - bevelGate) * impulseExempt;
-                upGate *= effective;
-                downGate *= effective;
-            }
-        }
-        scratch_frameBReachUp[x] = std::clamp(upGate, 0.0, 1.0);
-        scratch_frameBReachDown[x] = std::clamp(downGate, 0.0, 1.0);
-    }
-
     // =====================================================================
     // Signed-subtractor prepass.
     //
@@ -2941,8 +2356,8 @@ void Comb::FrameBuffer::computeFrameBLine(
     //
     // So the pair difference is a direct signed estimator of exactly the
     // contamination Frame B exists to remove; the combine subtracts it from
-    // center BEFORE the midpoint projection.  σ comes from grammar lineFlip
-    // polarity — a scalar-domain fact, which is the part of alignment the
+    // center and publishes that sharp corrected center.  σ comes from grammar
+    // lineFlip polarity — a scalar-domain fact, which is the part of alignment the
     // grammar genuinely owns.  Evidence requires exactly one Same + one
     // Opposite relation across the pair; σ = +1 iff up is the Same leg.
     //
@@ -2980,12 +2395,6 @@ void Comb::FrameBuffer::computeFrameBLine(
     if (havePairIQ) {
         if ((int)scratch_fbPairDiff.size() < width)
             scratch_fbPairDiff.resize(width);
-        if ((int)scratch_fbAlienGate.size() < width)
-            scratch_fbAlienGate.resize(width);
-        if ((int)scratch_fbPairAgreeWinIRE.size() < width)
-            scratch_fbPairAgreeWinIRE.resize(width);
-        if ((int)scratch_fbLegSymmetry.size() < width)
-            scratch_fbLegSymmetry.resize(width);
         if ((int)scratch_fbReg.size() < width)
             scratch_fbReg.resize(width);
 
@@ -3030,17 +2439,10 @@ void Comb::FrameBuffer::computeFrameBLine(
         const std::complex<double> *pU = scratch_fbPadUp.data() + kPad;
         const std::complex<double> *pD = scratch_fbPadDn.data() + kPad;
 
-        // Hoisted d = 0 pair-difference row: every column takes the
-        // unregistered windowed pair agreement, so the per-tap subtraction
-        // moves out of the window loop.  Rows carry the window overhang:
-        // index j in [-3, width + 2].
+        // Working rows carry the registration window overhang: index j in
+        // [-3, width + 2].
         constexpr int kRowPad = 3;
         const int rowWidth = width + 2 * kRowPad;
-        if ((int)scratch_fbDiff0.size() < rowWidth)
-            scratch_fbDiff0.resize(rowWidth);
-        std::complex<double> *f0 = scratch_fbDiff0.data() + kRowPad;
-        for (int j = -kRowPad; j < width + kRowPad; ++j)
-            f0[j] = pU[j] - pD[j];
 
         // Leg roles are line-level facts (alienSign is per line), so the
         // Same/Opposite selection and the deviation rows the registration
@@ -3048,7 +2450,6 @@ void Comb::FrameBuffer::computeFrameBLine(
         // g_s[j] = same[j + s] - center[j] for s in [-2, 2].
         const bool sameIsUp = (alienSign > 0.0);
         const std::complex<double> *pSame = sameIsUp ? pU : pD;
-        const std::complex<double> *pOpp = sameIsUp ? pD : pU;
         std::complex<double> *devRows[5] = {nullptr, nullptr, nullptr,
                                             nullptr, nullptr};
         if (haveSignedAlien) {
@@ -3182,23 +2583,9 @@ void Comb::FrameBuffer::computeFrameBLine(
         };
 
         for (int x = 0; x < width; ++x) {
-            // Unregistered (d = 0) windowed pair agreement.  Diagnostic only:
-            // this is |ZUp - ZDn|, the aliens' SUM, which is NOT the midpoint's
-            // error term -- see the licence in the combine below.
-            std::complex<double> S0(0.0, 0.0);
-            for (int k = -3; k <= 3; ++k)
-                S0 += kWin[k + 3] * f0[x + k];
-            scratch_fbPairAgreeWinIRE[x] =
-                (cmag(S0) / kWinSum) * invIreScale;
-
             if (!haveSignedAlien) {
                 scratch_fbPairDiff[x] = std::complex<double>(0.0, 0.0);
-                scratch_fbAlienGate[x] = 0.0;
                 scratch_fbReg[x] = 0;
-                // No signed evidence: no symmetry fact either.  Report
-                // symmetric so the midpoint licence cannot read the absence
-                // of evidence as permission.
-                scratch_fbLegSymmetry[x] = 1.0;
                 continue;
             }
 
@@ -3235,11 +2622,8 @@ void Comb::FrameBuffer::computeFrameBLine(
             // covered frame, so the IQ search below still serves every other
             // line and the un-covered case is unchanged.
             //
-            // bestSi is set FROM the adopted d rather than left where the
-            // search put it: dSame = devMag[bestSi] feeds the ratio and ride
-            // gates below, and a gate read at a different shift from the
-            // correction it licenses is the incoherence this whole change is
-            // about.
+            // bestSi is set from the adopted d so the correction waveform and
+            // the registration fact always use the same shift.
             const qint8 *certRegRow = certRegistration_line(line);
             const qint8 certReg = certRegRow ? certRegRow[x] : kCertRegNone;
             int bestSi;
@@ -3304,107 +2688,68 @@ void Comb::FrameBuffer::computeFrameBLine(
             const int sStar = bestSi - 2;
             const int d = sameIsUp ? -sStar : sStar;
 
-            // Registration and the Same/Opposite discriminator need a
-            // multi-axis aperture, but the correction waveform must retain
+            // OPERAND ADMISSION (see frameBBandSeed).
+            //
+            // TWO outcomes, and deliberately only two:
+            //   outside the band   Zsame - Zopp   full comb, both legs
+            //   aperture touches band
+            //                      Z0    - Z0 = 0 Frame B publishes centre
+            //
+            // No one-legged rung. Refusing a single leg is not one operation
+            // but two different ones -- centre substitutes for a refused SAME
+            // leg exactly and the correction keeps full strength, while a
+            // refused OPPOSITE leg leaves no alien measurement at all -- and
+            // which leg fails varies per column. Adjacent columns would then
+            // alternate between full correction and none, which is a zipper.
+            // The band is the only refusal that is identical in both legs,
+            // because it takes them together.  A neighbouring line's band
+            // also refuses both: that line is an operand of this candidate,
+            // so allowing the reach would merely move the forbidden material
+            // one line across the boundary.
+            //
+            // The coefficient never moves either: the 0.5 applied at the
+            // combine is the reciprocal of the sigma FOLD, not a leg count.
+            bool upAdmit = true;
+            bool dnAdmit = true;
+            const bool refusePair =
+                frameBBandAt(&reachTapLine, x) ||
+                frameBBandAt(reachTapUp, x) ||
+                frameBBandAt(reachTapDn, x);
+            if (refusePair) {
+                upAdmit = false;
+                dnAdmit = false;
+            }
+            // Outside the band BOTH legs stand. Per-leg refusal is
+            // forbidden, and not as a tuning choice -- see
+            // frameBLegAdmitted.
+            // The escape reports what admission WOULD do, so coverage can
+            // be read off an unchanged render.
+            if (!fbAdmitOn) {
+                upAdmit = true;
+                dnAdmit = true;
+            }
+
+            // Registration needs a multi-axis aperture, but the correction waveform must retain
             // the sample that was measured.  Using the seven-tap average here
             // moved energy away from narrow vertical details: carrier-like
             // peaks were under-subtracted while adjacent columns received a
             // correction belonging to their neighbours.  Read the registered
-            // pair pointwise; the windowed facts above still decide whether
-            // this sample is an image-locked alien before it can be applied.
+            // pair pointwise; physical pair reach decides whether it applies.
             const std::complex<double> pairDiff =
-                pU[x - d] - pD[x + d];
+                (upAdmit ? pU[x - d] : pC[x]) -
+                (dnAdmit ? pD[x + d] : pC[x]);
             scratch_fbPairDiff[x] = pairDiff;
             scratch_fbReg[x] = d;
 
-            // Validity gate on the SAME/OPPOSITE deviation asymmetry, both
-            // legs read at their registered positions (up aligns to center at
-            // −d, down at +d).  The signed fold makes the two failure modes
-            // separable: image-locked alien leaves the Same leg riding center
-            // (dSame ≈ 0) while displacing the Opposite leg by twice the
-            // alien (dOpp ≈ 2a) — gate → 1.  A real vertical chroma gradient
-            // displaces both legs symmetrically (dSame ≈ dOpp ≈ g) — gate →
-            // 0, so real chroma structure is never subtracted.  Comparing
-            // dSame against the pair difference instead (the earlier form)
-            // conflates these, because the pair difference carries both the
-            // alien sum and the gradient.
-            const int oppShift = sameIsUp ? d : -d;
-            std::complex<double> oppAcc(0.0, 0.0);
-            for (int k = -3; k <= 3; ++k) {
-                oppAcc += kWin[k + 3] *
-                    (pOpp[x + k + oppShift] - pC[x + k]);
-            }
-            const double dSame = devMag[bestSi];
-            const double dOpp = cmag(oppAcc) / kWinSum;
-            // Commit once the signature is decisive (dSame ≤ 0.4·dOpp reads
-            // as pure alien — full retraction), proportional below.  A gate
-            // that lingers at half strength subtracts half the alien and
-            // leaves a parity-alternating residue: partial correction is the
-            // worst geometry, per the round-1 lesson.
-            const double ratioGate =
-                (dOpp > 1e-12)
-                    ? std::clamp((1.0 - dSame / dOpp) / 0.6, 0.0, 1.0)
-                    : 0.0;
-            // "Rides with center" is an ABSOLUTE condition, not merely
-            // relative: the ratio alone still commits at horizontal content
-            // boundaries where BOTH legs deviate hugely and the Opposite one
-            // happens to deviate 2.5× more — subtracting the neighbours'
-            // carrier content there paints negative vertical ghosts of the
-            // ±1 lines onto center (measured on the bridge figures,
-            // 2026-07-12).  Full retraction requires the Same leg near
-            // center in IRE terms; fades out by 5 IRE of windowed deviation.
-            constexpr double kSameRideFullIRE = 1.25;
-            constexpr double kSameRideZeroIRE = 5.0;
-            const double dSameIRE = dSame * invIreScale;
-            const double rideGate = std::clamp(
-                (kSameRideZeroIRE - dSameIRE) /
-                    (kSameRideZeroIRE - kSameRideFullIRE),
-                0.0, 1.0);
 
-            scratch_fbAlienGate[x] = ratioGate * rideGate;
-
-            // Publish the leg-deviation SYMMETRY as a fact for the midpoint
-            // estimator downstream.  This is the same pair of measurements the
-            // ratioGate above consumes, but published raw: the two estimators
-            // have different failure geometry and must own their own policy,
-            // so the subtractor's commit ramp is NOT reused as a licence.
-            //
-            //   symmetry -> 0 : legs asymmetric.  The Same leg rides centre
-            //                   while the Opposite carries ~2a -- the signature
-            //                   of a vertically-invariant image-locked alien
-            //                   (a_up == a_dn).
-            //   symmetry -> 1 : legs deviate together.  Diagonal advance or a
-            //                   real vertical gradient (a_up != a_dn).
-            //
-            // Below the noise floor there is nothing to arbitrate; report
-            // symmetric so no consumer reads absence as positive evidence.
-            constexpr double kSymNoiseFloorIRE = 0.75;
-            scratch_fbLegSymmetry[x] =
-                (dOpp * invIreScale > kSymNoiseFloorIRE)
-                    ? std::clamp(dSame / dOpp, 0.0, 1.0)
-                    : 1.0;
         }
     }
 
     for (int x = 0; x < width; ++x) {
         const bool useLockedCenter = forceFrameBLocked1D;
 
-        const std::complex<double> &ZUp = scratch_upIQ[x];
-        const std::complex<double> &ZDn = scratch_dnIQ[x];
-
         const std::complex<double> &Z0 = scratch_centerIQ[x];
         const std::complex<double> &Z0Preclean = Z0;
-
-        double upReachRaw = 0.0;
-        double dnReachRaw = 0.0;
-
-        if (x < (int)reachTapLine.pairU1.size() &&
-            x < (int)reachTapLine.pairD1.size())
-        {
-            upReachRaw = haveUpLine ? scratch_frameBReachUp[x] : 0.0;
-
-            dnReachRaw = haveDnLine ? scratch_frameBReachDown[x] : 0.0;
-        }
 
         const bool haveUpSignal =
             haveUpLine && precleanUp;
@@ -3412,11 +2757,8 @@ void Comb::FrameBuffer::computeFrameBLine(
         const bool haveDnSignal =
             haveDnLine && precleanDn;
 
-        // Estimator (1): signed alien retraction.  Subtract the registered
-        // pair-difference alien estimate from center before any midpoint
-        // geometry. Scaled by physical legality only; Frame B's midpoint
-        // reach policy models a different estimator and must not leak into
-        // this signed-subtractor authority.
+        // Subtract the registered pair-difference alien estimate from center.
+        // Reach supplies physical legality; no picture-forming blend follows.
         std::complex<double> Zc = Z0;
 
         if (!useLockedCenter && haveSignedAlien &&
@@ -3427,12 +2769,11 @@ void Comb::FrameBuffer::computeFrameBLine(
             const double pairLegalGate = std::min(
                 std::clamp(reachTapLine.pairU1[x].reachLegalGate, 0.0, 1.0),
                 std::clamp(reachTapLine.pairD1[x].reachLegalGate, 0.0, 1.0));
-            const double aGate = scratch_fbAlienGate[x];
 
-            if (pairLegalGate > 0.0 && aGate > 0.0) {
+            if (pairLegalGate > 0.0) {
                 const std::complex<double> corr =
                     ((0.5 * alienSign) * scratch_fbPairDiff[x]) *
-                    (combStrength * aGate * pairLegalGate);
+                    (cancelStrength * pairLegalGate);
                 if (std::isfinite(corr.real()) && std::isfinite(corr.imag()))
                     Zc = Z0 - corr;
             }
@@ -3440,212 +2781,9 @@ void Comb::FrameBuffer::computeFrameBLine(
 
         std::complex<double> Zout = Zc;
 
-        // Estimator (2): plain ±1 interfield midpoint — the grail law, one
-        // combine for both regimes, now operating from the alien-retracted
-        // center.  Per project_frameb_comb_must_run: when a legal partner
-        // exists this MUST run — never gate to bare center via confidence
-        // correlations.  The regime discrimination does not live here: the
-        // reach gates decide WHERE (bevel/cross-color throttles collapse reach
-        // at horizontal color edges; verticals keep full reach), the flat
-        // delta cap decides HOW MUCH, and the midpoint license reserves full
-        // pull for the verified center-owned-alien geometry (partners agree,
-        // center differs).
-        if (!useLockedCenter && (upReachRaw > 0.0 || dnReachRaw > 0.0)) {
-            const bool haveUp = haveUpSignal && upReachRaw > 0.0;
-            const bool haveDn = haveDnSignal && dnReachRaw > 0.0;
-
-            double wsum = 0.0;
-            std::complex<double> target(0.0, 0.0);
-
-            if (haveUp) {
-                target += ZUp * upReachRaw;
-                wsum += upReachRaw;
-            }
-
-            if (haveDn) {
-                target += ZDn * dnReachRaw;
-                wsum += dnReachRaw;
-            }
-
-            if (wsum > 1e-12) {
-                target /= wsum;
-
-                std::complex<double> delta = target - Zc;
-                const double deltaIRE = cmag(delta) * invIreScale;
-
-                // Midpoint license: the midpoint estimator's own premise is
-                // partners carrying common C ± E (agree with each other,
-                // differ from center).  Pair disagreement measures the
-                // premise violation directly — the antisymmetric alien the
-                // midpoint would inject — so the pull is licensed only where
-                // the partners agree within a quarter of the delta being
-                // pulled: the same 0.25 agreement fraction as the delta-cap
-                // verify band and crossColorExempt, so all three
-                // verified-cancellation tests share one geometry.  The
-                // canonical opposed-field case (pairAgree ≈ 0, delta large)
-                // keeps license ≈ 1.  Attribution measured 2026-07-12 on the
-                // bridge braces: with retraction active, the residual Y-plane
-                // staircase was ENTIRELY midpoint-injected — Zc-only decoded
-                // at the intrafield parity floor.
-                // Diagnostic A/B only (LD_RETRACTED_ADMIT family):
-                // LD_FRAMEB_MIDLIC=1 forces the midpoint license fully open so
-                // a decode can attribute an artifact to license refusal in one
-                // variable.
-                static const bool forceMidLicense = []{
-                    const char *s = std::getenv("LD_FRAMEB_MIDLIC");
-                    return s && s[0] == '1';
-                }();
-                double midLicense = 1.0;
-                if (!forceMidLicense &&
-                    havePairIQ && haveUp && haveDn &&
-                    x < (int)scratch_fbLegSymmetry.size())
-                {
-                    // The midpoint is licensed on the LEG-DEVIATION SYMMETRY,
-                    // because that is the quadratic form carrying its error.
-                    //
-                    // From the prepass algebra at the head of this function:
-                    //   midpoint  (ZUp+ZDn)/2 = chroma + (a_up - a_dn)/2
-                    //   pair diff (ZUp-ZDn)/2 = +-(a_up + a_dn)/2
-                    // The midpoint's error is the aliens' DIFFERENCE; the pair
-                    // disagreement is their SUM.  The previous licence gated on
-                    // the SUM (scratch_fbPairAgreeWinIRE), which is large in
-                    // BOTH the cases it needed to separate, so it could only
-                    // ever refuse:
-                    //   vertical/lateral edge - alien vertically invariant,
-                    //     a_up == a_dn, DIFFERENCE ~ 0, midpoint clean and
-                    //     NEEDED; SUM = 2a large -> wrongly refused.  This is
-                    //     Frame B's signature class (limb and garment edges),
-                    //     and refusing it is what stopped Frame B cancelling
-                    //     there: measured 93% of columns carrying a clear
-                    //     image-locked-alien signature had licence == 0
-                    //     (Sisko's arm, 2026-07-19).
-                    //   diagonal advance - a_up != a_dn, DIFFERENCE non-zero,
-                    //     midpoint injects the 2-px staircase; correctly
-                    //     refused, but by accident of the SUM also being large.
-                    //
-                    // Leg symmetry answers the DIFFERENCE question directly:
-                    // asymmetric legs mean the alien is vertically invariant
-                    // (midpoint safe), symmetric deviation means the legs carry
-                    // genuinely different content (midpoint injects).
-                    //
-                    // Note also that the old form normalised by deltaIRE - the
-                    // very distance being pulled.  Per the blend-weight
-                    // doctrine a licence is candidate CONFIDENCE and must not
-                    // be a function of inter-candidate distance; the form below
-                    // is a property of the measurement alone.
-                    constexpr double kMidSymOpen  = 0.35; // below: alien, licence
-                    constexpr double kMidSymClose = 0.70; // above: differing legs, refuse
-                    const double sym = scratch_fbLegSymmetry[x];
-                    midLicense = std::clamp(
-                        (kMidSymClose - sym) / (kMidSymClose - kMidSymOpen),
-                        0.0, 1.0);
-                }
-
-                double effectiveMaxDeltaIRE = maxDeltaIRE;
-                if (haveUp && haveDn &&
-                    maxDeltaIRE > 0.0 && deltaIRE > maxDeltaIRE)
-                {
-                    constexpr double kVerifyAgreeFrac = 0.25;
-
-                    const double pairAgreeIRE =
-                        cmag(ZUp - ZDn) * invIreScale;
-
-                    const double verifyBand =
-                        kVerifyAgreeFrac * deltaIRE;
-
-                    const double t = (verifyBand > 1e-9)
-                        ? std::clamp(
-                              1.0 - pairAgreeIRE / verifyBand,
-                              0.0,
-                              1.0)
-                        : 0.0;
-
-                    effectiveMaxDeltaIRE =
-                        maxDeltaIRE +
-                        (deltaIRE - maxDeltaIRE) * t;
-                }
-
-                if (effectiveMaxDeltaIRE > 0.0 &&
-                    deltaIRE > effectiveMaxDeltaIRE &&
-                    deltaIRE > 1e-9)
-                {
-                    delta *= effectiveMaxDeltaIRE / deltaIRE;
-                }
-
-                // Reach selected and weighted the target above. Do not apply the
-                // same authority a second time to the exact midpoint projection.
-                // Preserve full midpoint authority when either interfield leg is fully
-                // admitted, while allowing a common reach throttle to suppress bevel
-                // zippers at horizontal colour transitions.
-                // Normal Frame B authority supplied by reach policy.
-                const double baseReachAuthority = std::max(
-                    haveUp ? upReachRaw : 0.0,
-                    haveDn ? dnReachRaw : 0.0);
-
-                // A strong lateral luma transition is a likely source of cross-colour.
-                // Do not treat it as an exemption by itself: require both precleaned
-                // interfield partners to agree with one another while differing from center.
-                double crossColorExempt = 0.0;
-
-                if (haveUp && haveDn &&
-                    x < static_cast<int>(reachTapLine.hLumaDeltaIRE.size()))
-                {
-                    const double hEdgeThreshIRE =
-                        std::max(1.0, T.FRAME_LUMA_EDGE_THRESH_IRE);
-
-                    const double hEdge = std::clamp(
-                        (reachTapLine.hLumaDeltaIRE[x] -
-                         0.30 * hEdgeThreshIRE) /
-                        (0.70 * hEdgeThreshIRE),
-                        0.0,
-                        1.0);
-
-                    const double pairAgreeIRE =
-                        cmag(ZUp - ZDn) * invIreScale;
-
-                    const double centerDisagreeIRE =
-                        0.5 * (cmag(ZUp - Z0) + cmag(ZDn - Z0)) *
-                        invIreScale;
-
-                    // The partners must agree within one quarter of their average
-                    // disagreement with center. This is the same geometry already used
-                    // to recognize a verified cancellation pair for the delta cap.
-                    const double verifyBand =
-                        0.25 * centerDisagreeIRE;
-
-                    const double verifiedCancellation =
-                        (verifyBand > 1e-9)
-                            ? std::clamp(
-                                  1.0 - pairAgreeIRE / verifyBand,
-                                  0.0,
-                                  1.0)
-                            : 0.0;
-
-                    crossColorExempt =
-                        hEdge * verifiedCancellation;
-                }
-
-                // Verified edge-generated cross-colour restores authority withdrawn by
-                // the generic horizontal-transition/bevel throttle. It cannot create a
-                // Frame B engagement where reach supplied no partner at all.
-                const double reachAuthority =
-                    baseReachAuthority +
-                    (1.0 - baseReachAuthority) * crossColorExempt;
-
-                const double pull = std::clamp(
-                    0.5 * combStrength * reachAuthority,
-                    0.0,
-                    0.5);
-                Zout = Zc + delta * (pull * midLicense);
-
-                if (!std::isfinite(Zout.real()) ||
-                    !std::isfinite(Zout.imag()))
-                {
-                    Zout = Zc;
-                }
-            }
-        }
-
+        // Frame B publishes the corrected center directly.  Its ±1 rows are
+        // evidence for the alien term, never picture material to average into
+        // the result; the plain midpoint is Frame A's distinct candidate.
         // Graceful failure at highlights.  No magnitude clamp here: cmag(Zout)
         // is fullSignedIQ scale, not composite-scalar scale.
         if (!std::isfinite(Zout.real()) || !std::isfinite(Zout.imag())) {
@@ -3672,29 +2810,6 @@ void Comb::FrameBuffer::computeFrameBLine(
             lddecode::carrierGrammarAdvanceRemodCursor(gridRemodCursor);
         }
 
-        // Reconstructed-luma feasibility on the composite Frame B just made.
-        //
-        // Deliberately not a bound in IQ.  Frame B's signed-subtractor path
-        // removes an alien present in ALL of its legs, so the correct carrier
-        // routinely sits outside the legs' carrier range; clamping there was
-        // measured binding on 53% of pixels, which is an under-comb, not a
-        // net.  In luma the statement is true again: whatever the comb does
-        // to the chroma, the luma it implies must be a luma its own legs
-        // could have produced.  Unsaturated light/dark zippers are the
-        // failure this is here to catch.
-        if (preclean0) {
-            const int h = left + x;
-            const double yC = (double)rawCenterRow[h] - preclean0[x];
-            const double yU = (rawUpRow && precleanUp)
-                ? (double)rawUpRow[h] - precleanUp[x]
-                : std::numeric_limits<double>::quiet_NaN();
-            const double yD = (rawDnRow && precleanDn)
-                ? (double)rawDnRow[h] - precleanDn[x]
-                : std::numeric_limits<double>::quiet_NaN();
-            outFrameScalar[x] = clampCarrierToInputLumaRangeShared(
-                outFrameScalar[x], (double)rawCenterRow[h],
-                { yC, yU, yD }, preclean0[x]);
-        }
     }
 
 }
@@ -3714,7 +2829,7 @@ void Comb::FrameBuffer::computeFrameBLine(
 // scoreFieldVsFrame, and none of Frame A/B's trust machinery: correlation
 // ramps, reach, licences and delta caps exist because a MODEL leg's carrier
 // can lie, and a certified leg cannot. The uncovered midpoint law does not
-// apply either: Frame B's 0.5 pull cap solves center C+E against partners
+// apply either: Frame A's 0.5 pull cap solves center C+E against partners
 // C-E, where past-midpoint re-injects inverted alien. Against certified
 // legs the partners carry C, so
 //

@@ -456,14 +456,13 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     (void)upCarrierTrust;
     (void)downCarrierTrust;
 
-    constexpr double kSameHueDeg = 15.0;
-    constexpr double kDifferentHueDeg = 20.0;
+    constexpr double kSameHueDeg = kRegionSameHueDeg;
+    constexpr double kDifferentHueDeg = kRegionDifferentHueDeg;
     constexpr double kRadiansToDegrees = 57.2957795130823208768;
 
     // Saturation-boundary evidence. Hue is meaningless below the chroma floor,
     // but a clearly saturated side whose color does not continue into the
     // other side is a region break in its own right.
-    constexpr double kDifferentMagRatio = 0.35;
     constexpr double kStrongSideFloorScale = 2.0;
 
     // First-pass AlienCancel gate. ±2 same-field legs are anti-phase carriers:
@@ -489,7 +488,8 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
                         bool haveLeg,
                         double legRawDiffIRE,
                         double &differenceIRE,
-                        double &hueDifferenceDeg) {
+                        double &hueDifferenceDeg,
+                        bool &strongAsym) {
         if (!haveLeg)
             return RegionRelation::Unknown;
 
@@ -503,44 +503,52 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
 
         differenceIRE = boundedMag(center - leg) * scale;
 
+        // Hue opposition is the signature of phase-dependent 1D luma
+        // misappropriation.  Publish that fact before treating magnitude
+        // asymmetry as a region break whenever both vectors support a useful
+        // angle.  Loose saturation agreement is enough; only a genuinely
+        // collapsed member cuts against the cancellation case.
+        bool haveHue = false;
+        if (magLo >= chromaFloor) {
+            const double denom = centerMagRaw * legMagRaw;
+            if (denom > 1e-12) {
+                const double hueCos = std::clamp(
+                    std::real(center * std::conj(leg)) / denom,
+                    -1.0,
+                    1.0);
+                hueDifferenceDeg =
+                    std::acos(hueCos) * kRadiansToDegrees;
+                haveHue = true;
+
+                constexpr double kAlienHueDeg = 165.0;
+                const bool saturationNotCollapsed =
+                    magLo > kRegionStrongAsymMagRatio * magHi;
+                if (hueDifferenceDeg >= kAlienHueDeg &&
+                    saturationNotCollapsed)
+                    return RegionRelation::AlienCancel;
+            }
+        }
+
         // Saturation collapse / shadow band. This is ratio-driven, not simply
         // floor-driven: a weak member beside a strong saturated member is a
         // region break even when the weak side is still above the chroma floor.
-        constexpr double kBandStrongScale = 2.5;
-        if (magLo <= kDifferentMagRatio * magHi) {
-            if (magHi >= kBandStrongScale * chromaFloor) {
-                out.strongAsym = true;
-                return RegionRelation::DifferentRegion;
-            }
+        // Opposed, non-collapsed vectors have already been recognized above.
+        if (isStrongRegionMagnitudeAsym(
+                centerMagIRE, legMagIRE, chromaFloor)) {
+            strongAsym = true;
+            return RegionRelation::DifferentRegion;
+        }
+        if (magLo <= kRegionStrongAsymMagRatio * magHi) {
             if (magLo < chromaFloor &&
                 magHi >= kStrongSideFloorScale * chromaFloor)
                 return RegionRelation::DifferentRegion;
         }
 
-        if (magLo < chromaFloor)
+        if (!haveHue)
             return RegionRelation::Unknown;
-
-        const double denom = centerMagRaw * legMagRaw;
-        if (denom <= 1e-12)
-            return RegionRelation::Unknown;
-
-        const double hueCos = std::clamp(
-            std::real(center * std::conj(leg)) / denom,
-            -1.0,
-            1.0);
-        hueDifferenceDeg = std::acos(hueCos) * kRadiansToDegrees;
 
         if (hueDifferenceDeg <= kSameHueDeg)
             return RegionRelation::SameRegion;
-
-        // Anti-aligned at comparable magnitude means raw-identical content:
-        // vertically coherent luma/cross-color, the comb's ideal cancellation
-        // partner. This is not one-sided authority.
-        constexpr double kAlienHueDeg = 165.0;
-        constexpr double kAlienMagRatio = 0.60;
-        if (hueDifferenceDeg >= kAlienHueDeg &&
-            magLo >= kAlienMagRatio * magHi)
-            return RegionRelation::AlienCancel;
 
         if (hueDifferenceDeg >= kDifferentHueDeg)
             return RegionRelation::DifferentRegion;
@@ -549,11 +557,19 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     };
 
     out.up = classify(alignedUp, upMagRaw, upMagIRE, haveUp, upRawDiffIRE,
-                      out.upDifferenceIRE, out.upHueDifferenceDeg);
+                      out.upDifferenceIRE, out.upHueDifferenceDeg,
+                      out.upStrongAsym);
     out.down = classify(alignedDown, downMagRaw, downMagIRE, haveDown, downRawDiffIRE,
-                        out.downDifferenceIRE, out.downHueDifferenceDeg);
+                        out.downDifferenceIRE, out.downHueDifferenceDeg,
+                        out.downStrongAsym);
+    out.strongAsym = out.upStrongAsym || out.downStrongAsym;
     out.valid = (out.up != RegionRelation::Unknown ||
                  out.down != RegionRelation::Unknown);
+
+    // Snapshot the measurements before the Field-B triplet laws below can
+    // promote either leg.  See combreach.h.
+    out.upMeasured = out.up;
+    out.downMeasured = out.down;
 
     if (haveUp && haveDown) {
         // Leg-vs-leg coherence via the shared evaluator: the same primitive

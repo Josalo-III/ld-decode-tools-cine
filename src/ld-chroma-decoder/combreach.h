@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <complex>
 #include <cstdint>
 #include <vector>
@@ -187,6 +188,26 @@ struct MovingCoarseContour {
     double straightness = 0.0;
 };
 
+// The hue geometry every region verdict in this file is measured against,
+// published so a comb forming its OWN verdict from the raw coherence numbers
+// (rather than from a RegionRelation) asks the same question the evaluator
+// asked, instead of holding a second opinion about what "different" means.
+constexpr double kRegionSameHueDeg = 15.0;
+constexpr double kRegionDifferentHueDeg = 20.0;
+constexpr double kRegionStrongAsymMagRatio = 0.35;
+constexpr double kRegionStrongAsymFloorScale = 2.5;
+
+inline bool isStrongRegionMagnitudeAsym(double aIRE,
+                                        double bIRE,
+                                        double chromaFloorIRE)
+{
+    const double magHi = std::max(aIRE, bIRE);
+    const double magLo = std::min(aIRE, bIRE);
+    return magHi >= kRegionStrongAsymFloorScale *
+                        std::max(0.0, chromaFloorIRE) &&
+           magLo <= kRegionStrongAsymMagRatio * magHi;
+}
+
 enum class RegionRelation {
     Unknown,
     SameRegion,
@@ -235,6 +256,16 @@ struct IntrafieldRegionReach {
     RegionRelation up = RegionRelation::Unknown;
     RegionRelation down = RegionRelation::Unknown;
 
+    // The same two verdicts AS MEASURED, before the Field-B triplet laws at
+    // the foot of the evaluator may promote a leg to DifferentRegion.  Those
+    // promotions are Field B's cede policy expressed as reach evidence, not
+    // observations: they can overwrite a measured SameRegion or AlienCancel.
+    // A consumer that owns a DIFFERENT policy on the same measurements --
+    // Frame B's +/-1 operand admission -- must read these, or it inherits a
+    // cede law written for another comb at another vertical step.
+    RegionRelation upMeasured = RegionRelation::Unknown;
+    RegionRelation downMeasured = RegionRelation::Unknown;
+
     double upDifferenceIRE = 0.0;
     double downDifferenceIRE = 0.0;
     double upDownDifferenceIRE = 0.0;
@@ -245,6 +276,11 @@ struct IntrafieldRegionReach {
 
     bool centerIsland = false;
     bool threeRegion = false;
+    // Per-leg saturation-collapse observations.  `strongAsym` remains their
+    // aggregate for consumers that treat either boundary as sufficient;
+    // Frame B keeps the legs separate because it cedes both operands at once.
+    bool upStrongAsym = false;
+    bool downStrongAsym = false;
     bool strongAsym = false;
 
     // A local sample whose vertical chroma geometry proves that the
