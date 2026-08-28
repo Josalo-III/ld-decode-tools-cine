@@ -232,12 +232,16 @@ public:
             double FVF_VERT_FRAME_A_BONUS    = 0.16; // Frame A (precleaned) bonus under vertical contrast (unaffected by vertical luma)
             double FVF_HEDGE_FIELD_B_PENALTY = 0.0; // Field B penalty at horizontal luma edges (zipper risk)
             double FVF_HEDGE_FRAME_B_BONUS   = 0.18; // Frame B bonus at horizontal luma edges (interframe is stable there)
+            // Election-only reward when the same signed edge crosses at a
+            // coherent sub-line progression on the neighbouring same-field
+            // rows. Frame B renders that geometry smoothly where Frame A can
+            // staircase it; ordinary vertical disagreement is not enough.
+            double FVF_DIAGONAL_FRAME_B_BONUS = 0.14;
 
-            // Transition sharpness reward strength.
-            // 0.16 (was 0.10, 2026-08-02): the transition-crossing award is
-            // the safe lever on uncovered-frame softness -- a scoring term,
-            // so it cannot manufacture edges, only prefer the candidate that
-            // already crossed faster. LDCD_FVF_SHARP_W overrides at runtime.
+            // Transition-run sharpness reward strength. The plateau detector
+            // supplies both the comparison and the complete commitment
+            // footprint, so the election cannot mix a sharp crossing with a
+            // softer candidate's shoulders. LDCD_FVF_SHARP_W overrides.
             double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.16;
 
             // Saturation regime biasing.
@@ -1028,6 +1032,11 @@ private:
 	// difference vector; fbReg is the chosen registration offset (diagnostic).
 	std::vector<std::complex<double>> scratch_fbPairDiff;
 	std::vector<int> scratch_fbReg;
+	// Frame B publishes the reach verdict separately from its candidate value.
+	// The candidate keeps the full registered cancellation; FVF consumes this
+	// aperture-level bit to disqualify it (and, in progressive runs, promote
+	// Frame A) wherever the old construction would have ceded both operands.
+	std::vector<std::uint8_t> scratch_frameBReachUnsafe;
     // Prepass working rows: edge-replicated padded copies of the three
     // demodded IQ rows (padding reproduces the clamp-to-edge indexing, so
     // the windowed sums read straight pointers), the hoisted d = 0
@@ -1066,12 +1075,26 @@ private:
 	std::vector<float>  scratch_fvf_outShade;
 	std::vector<double> scratch_fvf_diffFVF;
 	std::vector<double> scratch_fvf_satMap;
+	// Completed per-pixel ballots are retained until the final transition-run
+	// election.  A transition must choose from the scores which produced the
+	// ordinary ballot; recomputing a smaller proxy here would create a second,
+	// inconsistent election.
+	std::vector<double> scratch_fvf_scoreA;
+	std::vector<double> scratch_fvf_scoreB;
+	std::vector<double> scratch_fvf_scoreFrame;
+	std::vector<std::uint8_t> scratch_fvf_frameEligible;
 	std::vector<double> scratch_fvf_iqMag;     // per-line IQ magnitude pre-pass (scoreFieldVsFrame)
 	std::vector<double> scratch_fvf_notchFieldA; // per-line Field A notch-luma pre-pass
 	std::vector<double> scratch_fvf_notchFieldB; // per-line Field B notch-luma pre-pass
 	std::vector<double> scratch_frameC;        // Frame C covered comp-line bootstrap (split2D emit)
 	std::vector<double> scratch_fvf_notchFrame;  // per-line Frame B notch-luma pre-pass
-	std::vector<double> scratch_fvf_notchSource; // per-line source notch-luma pre-pass
+	// Exact produceY-domain rows for transition-run scoring: raw composite
+	// minus each candidate carrier. Source Y is the shared carrier-free coarse
+	// row, expressed in the same raw units.
+	std::vector<double> scratch_fvf_visibleYA;
+	std::vector<double> scratch_fvf_visibleYB;
+	std::vector<double> scratch_fvf_visibleYFrame;
+	std::vector<double> scratch_fvf_visibleYSource;
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
 	std::vector<double> scratch_coe_frameIQMag; // pre-computed |frameIQ[r]| magnitudes (collectCombAttributionEvidence)
 		std::vector<double> scratch_lineWorkD; // Generic per-line filter scratch.

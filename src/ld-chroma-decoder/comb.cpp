@@ -587,6 +587,14 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             scratch_fvf_outShade.assign(width, 0.35f);
             scratch_fvf_diffFVF.assign(width, 0.0);
             scratch_fvf_satMap.assign(width, 0.0);
+            scratch_fvf_scoreA.assign(width, 0.0);
+            scratch_fvf_scoreB.assign(width, 0.0);
+            scratch_fvf_scoreFrame.assign(width, 0.0);
+            scratch_fvf_frameEligible.assign(width, 0);
+            scratch_fvf_visibleYA.assign(width, 0.0);
+            scratch_fvf_visibleYB.assign(width, 0.0);
+            scratch_fvf_visibleYFrame.assign(width, 0.0);
+            scratch_fvf_visibleYSource.assign(width, 0.0);
         }
         // Locked-path-only stable 1D source.
         if (wantLocked) {
@@ -694,6 +702,7 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         }
         scratch_frameBDirectIQComposite.assign(width, 0.0);
         scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
+		scratch_frameBReachUnsafe.assign(width, 0);
     }
 }
 
@@ -1123,7 +1132,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int up2Line = std::clamp(line - 2, firstLine, lastLine - 1);
     const int dn2Line = std::clamp(line + 2, firstLine, lastLine - 1);
     const bool haveVert2 = (line - 2 >= firstLine) && (line + 2 < lastLine);
-    const double *srcLine = clpbuffer[srcBufIndex].pixel[line] + left;
     const double *srcUp1 = clpbuffer[srcBufIndex].pixel[up1Line] + left;
     const double *srcDn1 = clpbuffer[srcBufIndex].pixel[dn1Line] + left;
     const double *srcUp2 = clpbuffer[srcBufIndex].pixel[up2Line] + left;
@@ -1145,12 +1153,20 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         scratch_fvf_outShade.assign(width, 0.35f);
         scratch_fvf_diffFVF.assign(width, 0.0);
         scratch_fvf_satMap.assign(width, 0.0);
+        scratch_fvf_scoreA.assign(width, 0.0);
+        scratch_fvf_scoreB.assign(width, 0.0);
+        scratch_fvf_scoreFrame.assign(width, 0.0);
+        scratch_fvf_frameEligible.assign(width, 0);
     } else {
         std::fill(scratch_fvf_winner.begin(), scratch_fvf_winner.end(), 1);
         std::fill(scratch_fvf_outVal.begin(), scratch_fvf_outVal.end(), 0.0);
         std::fill(scratch_fvf_outShade.begin(), scratch_fvf_outShade.end(), 0.35f);
         std::fill(scratch_fvf_diffFVF.begin(), scratch_fvf_diffFVF.end(), 0.0);
         std::fill(scratch_fvf_satMap.begin(), scratch_fvf_satMap.end(), 0.0);
+        std::fill(scratch_fvf_scoreA.begin(), scratch_fvf_scoreA.end(), 0.0);
+        std::fill(scratch_fvf_scoreB.begin(), scratch_fvf_scoreB.end(), 0.0);
+        std::fill(scratch_fvf_scoreFrame.begin(), scratch_fvf_scoreFrame.end(), 0.0);
+        std::fill(scratch_fvf_frameEligible.begin(), scratch_fvf_frameEligible.end(), 0);
     }
     if ((int)scratch_fvf_notchFieldA.size() != width)
         scratch_fvf_notchFieldA.resize(width);
@@ -1158,18 +1174,31 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         scratch_fvf_notchFieldB.resize(width);
     if ((int)scratch_fvf_notchFrame.size() != width)
         scratch_fvf_notchFrame.resize(width);
-    if ((int)scratch_fvf_notchSource.size() != width)
-        scratch_fvf_notchSource.resize(width);
+    if ((int)scratch_fvf_visibleYA.size() != width)
+        scratch_fvf_visibleYA.resize(width);
+    if ((int)scratch_fvf_visibleYB.size() != width)
+        scratch_fvf_visibleYB.resize(width);
+    if ((int)scratch_fvf_visibleYFrame.size() != width)
+        scratch_fvf_visibleYFrame.resize(width);
+    if ((int)scratch_fvf_visibleYSource.size() != width)
+        scratch_fvf_visibleYSource.resize(width);
 
     std::vector<int>    &winner   = scratch_fvf_winner;
     std::vector<double> &outVal   = scratch_fvf_outVal;
     std::vector<float>  &outShade = scratch_fvf_outShade;
     std::vector<double> &diffFVF  = scratch_fvf_diffFVF;
     std::vector<double> &satMap   = scratch_fvf_satMap;
+    std::vector<double> &scoreMapA = scratch_fvf_scoreA;
+    std::vector<double> &scoreMapB = scratch_fvf_scoreB;
+    std::vector<double> &scoreMapFrame = scratch_fvf_scoreFrame;
+    std::vector<std::uint8_t> &frameEligible = scratch_fvf_frameEligible;
     std::vector<double> &notchCandidateA = scratch_fvf_notchFieldA;
     std::vector<double> &notchFieldB = scratch_fvf_notchFieldB;
     std::vector<double> &notchFrame  = scratch_fvf_notchFrame;
-    std::vector<double> &notchSource = scratch_fvf_notchSource;
+    std::vector<double> &visibleYA = scratch_fvf_visibleYA;
+    std::vector<double> &visibleYB = scratch_fvf_visibleYB;
+    std::vector<double> &visibleYFrame = scratch_fvf_visibleYFrame;
+    std::vector<double> &visibleYSource = scratch_fvf_visibleYSource;
     int fieldCountTotal = 0, frameCountTotal = 0;
 
     const double SAT_FALLBACK_START = 6.0;
@@ -1251,7 +1280,22 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         notchCandidateA[r] = getNotchLumaEven2(candidateAData, r, width);
         notchFieldB[r] = getNotchLumaEven2(candidateB, r, width);
         notchFrame[r] = getNotchLumaEven2Vec(frameB2, r);
-        notchSource[r] = getNotchLumaEven2(srcLine, r, width);
+        // Transition quality belongs to the image the candidate would render,
+        // not to its carrier plane. produceY consumes raw - carrier exactly;
+        // construct that same value for every seated candidate. The source
+        // plateau is the tap line's shared carrier-free coarse luma, converted
+        // back from IRE so all four rows share one unit and registration.
+        const double raw = r < (int)tapLine.tap0.size()
+            ? tapLine.tap0[r].raw
+            : 0.0;
+        visibleYA[r] = raw - candidateAData[r];
+        visibleYB[r] = raw - candidateB[r];
+        visibleYFrame[r] = raw - frameB2[r];
+        visibleYSource[r] =
+            r < (int)tapLine.coarse0IRE.size() && invI > 1e-12
+                ? tapLine.coarse0IRE[r] / invI
+                : raw - (r < (int)tapLine.tap0.size()
+                    ? tapLine.tap0[r].comp : 0.0);
     }
 
     for (int rel = 0; rel < width; ++rel) {
@@ -1509,109 +1553,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
-            // ------------------------------------------------------------
-            // Transition sharpness reward:
-            // Detect stable region transitions along the scanline and reward
-            // candidates that make a fast (sharp) step and settle on both sides.
-            // This acts as a proxy for "sharpness" without applying a filter.
-            // ------------------------------------------------------------
-            {
-                constexpr int EDGE_GAP = 2;   // pixels excluded around the transition
-                // Use same-phase notch probes on the source line to detect a stable step.
-                // This reuses our existing notch architecture and avoids per-pixel window scans.
-                constexpr int EDGE_PROBE_NEAR = 2;
-                constexpr int EDGE_PROBE_FAR  = 6;
-                const bool canEval =
-                    (hIRE >= 0.75 * HEDGE_THRESH_IRE) &&
-                    (rel >= (EDGE_GAP + EDGE_PROBE_FAR)) &&
-                    (rel + (EDGE_GAP + EDGE_PROBE_FAR) < width) &&
-                    (line >= firstLine && line < lastLine);
-
-                if (canEval) {
-                    auto srcNotch = [&](int r)->double {
-                        return notchSource[std::clamp(r, 0, width - 1)];
-                    };
-
-                    const double lNear = srcNotch(rel - (EDGE_GAP + EDGE_PROBE_NEAR));
-                    const double lFar  = srcNotch(rel - (EDGE_GAP + EDGE_PROBE_FAR));
-                    const double rNear = srcNotch(rel + (EDGE_GAP + EDGE_PROBE_NEAR));
-                    const double rFar  = srcNotch(rel + (EDGE_GAP + EDGE_PROBE_FAR));
-
-                    const double stepIRE = std::fabs(rNear - lNear) * invI;
-                    const double lJitterIRE = std::fabs(lNear - lFar) * invI;
-                    const double rJitterIRE = std::fabs(rNear - rFar) * invI;
-
-                    // Require a meaningful step with stable plateaus (discount small fluctuations).
-                    const double EDGE_STEP_THRESH_IRE = std::max(2.0, 0.9 * HEDGE_THRESH_IRE);
-                    const double EDGE_PLATEAU_JITTER_MAX_IRE = 1.2;
-                    const bool stableStep =
-                        (stepIRE >= EDGE_STEP_THRESH_IRE) &&
-                        (lJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE) &&
-                        (rJitterIRE <= EDGE_PLATEAU_JITTER_MAX_IRE);
-
-                    if (!stableStep) goto no_sharp_reward;
-
-                    // Candidate step measured using notch luma (reduces composite phase chatter).
-                    const int rm2 = std::max(0, rel - 2);
-                    const int rp2 = std::min(width - 1, rel + 2);
-                    const double lmeanIRE = lNear * invI;
-                    const double rmeanIRE = rNear * invI;
-
-                    auto applySharpReward = [&](double &score,
-                                                const double *arr,
-                                                const std::vector<double> *vec)
-                    {
-                        const double *notch = arr
-                            ? (arr == candidateAData ? notchCandidateA.data() : notchFieldB.data())
-                            : notchFrame.data();
-                        const double m2 = notch[rm2];
-                        const double p2 = notch[rp2];
-                        const double candStepIRE = std::fabs(p2 - m2) * invI;
-
-                        // Reward only if candidate has plausibly settled to the two plateaus.
-                        const double settleL = std::fabs(m2 * invI - lmeanIRE);
-                        const double settleR = std::fabs(p2 * invI - rmeanIRE);
-                        const double SETTLE_MAX_IRE = 0.35 * stepIRE + 1.0;
-                        if (settleL > SETTLE_MAX_IRE || settleR > SETTLE_MAX_IRE) return;
-
-                        // Normalize: prefer candidates that reach most of the step quickly.
-                        const double ratio = candStepIRE / std::max(1e-9, stepIRE);
-                        const double sharp = std::clamp((ratio - 0.70) / 0.30, 0.0, 1.0);
-                        const double stepStrength = std::clamp((stepIRE - EDGE_STEP_THRESH_IRE) / 6.0, 0.0, 1.0);
-                        // User's transition-crossing award: reward a comb
-                        // that crosses a regional transition along the line
-                        // MORE QUICKLY. It buys edge clarity without the
-                        // usual sharpening costs (halos, instability)
-                        // precisely because it is a SCORING term -- it can
-                        // only change which existing candidate wins, never
-                        // manufacture an edge that no candidate produced.
-                        //
-                        // Boosted 2026-08-02 (user): uncovered frames carry a
-                        // lateral-motion-blur-like softness, and the
-                        // covered/uncovered quality gap is what strobes. This
-                        // is the safe lever on it.
-                        //
-                        // Also wires the DECLARED tunable, which was dead: a
-                        // hardcoded local shadowed
-                        // FVF_TRANSITION_SHARPNESS_WEIGHT so the knob in
-                        // comb.h did nothing. LDCD_FVF_SHARP_W overrides.
-                        static const double kSharpWEnv = []{
-                            const char *e = std::getenv("LDCD_FVF_SHARP_W");
-                            return e ? std::atof(e) : -1.0;
-                        }();
-                        const double W_EDGE_SHARP = (kSharpWEnv >= 0.0)
-                            ? kSharpWEnv
-                            : T.FVF_TRANSITION_SHARPNESS_WEIGHT;
-                        score *= (1.0 - W_EDGE_SHARP * sharp * stepStrength);
-                    };
-
-                    applySharpReward(scoreA, candidateAData, nullptr);
-                    applySharpReward(scoreB, candidateB, nullptr);
-                    applySharpReward(scoreR, nullptr, &frameB2);
-                }
-                no_sharp_reward: ;
-            }
-            
             // Attribution alignment scoring.
             // Attribution alignment scoring.
             //
@@ -1908,6 +1849,20 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
+            // Preserve the completed ballot for the transition-run election
+            // below.  Sharpness used to modify these scores one pixel at a
+            // time, which allowed Frame B to win the crossing while a softer
+            // candidate won its shoulders.  The final pass consumes the same
+            // scores but awards one candidate to the detector's whole support.
+            scoreMapA[rel] = scoreA;
+            scoreMapB[rel] = scoreB;
+            scoreMapFrame[rel] = scoreR;
+			const bool frameReachUnsafe =
+				rel < (int)scratch_frameBReachUnsafe.size() &&
+				scratch_frameBReachUnsafe[rel] != 0;
+            frameEligible[rel] =
+				(!frameInsane && !managementVeto && !frameReachUnsafe) ? 1 : 0;
+
             auto pickCandidate = [&](int candIdx, double candVal, float candShade) {
                 idx   = candIdx;
                 val   = candVal;
@@ -1918,11 +1873,19 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // must not settle the election by itself.  The candidate still has
             // to beat both interfield combs on the accumulated merit score.
             const bool frameHasBestScore =
-                !frameInsane && !managementVeto &&
+				!frameInsane && !managementVeto && !frameReachUnsafe &&
                 scoreR + 1e-12 < scoreA &&
                 scoreR + 1e-12 < scoreB;
 
-            if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
+			// Reach safety is a candidate-identity fact, not another score.
+			// In the progressive roster seat A is Frame A, so it owns an
+			// unsafe Frame-B pixel even when no stable plateau run can be
+			// established.  A detected transition below expands the same
+			// verdict to the detector's complete support.  In interlace this
+			// bit only removes Frame B; the two field seats keep competing.
+			if (localUseFrameModel && frameReachUnsafe) {
+				pickCandidate(0, FA, 0.25f);
+			} else if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
                 double dF1 = std::fabs(lumFR - L1) * invI;
                 if (dF1 <= 3.5 && frameFieldCandidateDistIRE <= 5.0 &&
                     frameHasBestScore)
@@ -1965,6 +1928,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (prevIdx >= 0 && prevIdx <= 2 && idx != prevIdx) {
 
                     const bool hystOk =
+						!frameReachUnsafe &&
                         (chromaMagIRE <= SAT_FALLBACK_START) &&
                         !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) &&
                         !((chromaMagIRE > CHROMA_STRONG_IRE) && (vIRE > VERT_THRESH_IRE));
@@ -2024,6 +1988,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         bool changed = false;
 
         for (int rel = 1; rel < width - 1; ++rel) {
+			if (rel < (int)scratch_frameBReachUnsafe.size() &&
+				scratch_frameBReachUnsafe[rel] != 0)
+				continue;
             if (satMap[rel] > SAT_FALLBACK_START) continue;
             const double hEdgeIRE = (rel < (int)tapLine.hLumaDeltaIRE.size())
                 ? tapLine.hLumaDeltaIRE[rel]
@@ -2081,6 +2048,386 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Transition-run election.
+    //
+    // The old sharpness term awarded each pixel independently.  On the beach
+    // arm transition that selected Frame B at the crossing and softer field
+    // candidates on its shoulders, synthesising a halo which existed in none
+    // of the candidates.  Detection, scoring and commitment now share one
+    // footprint: the stable plateaus which license the sharpness comparison
+    // also delimit every pixel that receives its winner.
+    // ---------------------------------------------------------------------
+    static const double kSharpWEnv = []{
+        const char *e = std::getenv("LDCD_FVF_SHARP_W");
+        return e ? std::atof(e) : -1.0;
+    }();
+    const double transitionSharpWeight = (kSharpWEnv >= 0.0)
+        ? kSharpWEnv
+        : T.FVF_TRANSITION_SHARPNESS_WEIGHT;
+
+    if (transitionSharpWeight > 0.0) {
+        constexpr int kEdgeGap = 2;
+        constexpr int kProbeNear = 2;
+        constexpr int kProbeFar = 6;
+        constexpr int kNearSupport = kEdgeGap + kProbeNear;
+        constexpr int kFarSupport = kEdgeGap + kProbeFar;
+        constexpr double kPlateauJitterMaxIRE = 1.2;
+        const double stepThresholdIRE =
+            std::max(2.0, 0.9 * HEDGE_THRESH_IRE);
+
+        auto stableTransitionCenter = [&](int x) {
+            if (x < kFarSupport || x + kFarSupport >= width)
+                return false;
+            const double hIRE = (x < (int)tapLine.hLumaDeltaIRE.size())
+                ? tapLine.hLumaDeltaIRE[x]
+                : 0.0;
+            if (hIRE < 0.75 * HEDGE_THRESH_IRE)
+                return false;
+
+            const double lNear = visibleYSource[x - kNearSupport];
+            const double lFar  = visibleYSource[x - kFarSupport];
+            const double rNear = visibleYSource[x + kNearSupport];
+            const double rFar  = visibleYSource[x + kFarSupport];
+            const double visibleStepIRE = std::fabs(rNear - lNear) * invI;
+            if (visibleStepIRE < stepThresholdIRE)
+                return false;
+            const bool plateau =
+                std::fabs(lNear - lFar) * invI <= kPlateauJitterMaxIRE &&
+                std::fabs(rNear - rFar) * invI <= kPlateauJitterMaxIRE;
+            return plateau;
+        };
+
+        struct TransitionQuality {
+            bool valid = false;
+            double sharpness = 0.0;
+            double settleNorm = 1.0;
+            double overshootNorm = 1.0;
+            double zipperNorm = 1.0;
+            double qualityCost = std::numeric_limits<double>::infinity();
+        };
+
+        auto meanRange = [](const std::vector<double> &row, int b, int e) {
+            double sum = 0.0;
+            for (int x = b; x <= e; ++x) sum += row[x];
+            return sum / std::max(1, e - b + 1);
+        };
+
+        auto meanScore = [](const std::vector<double> &row, int b, int e) {
+            double sum = 0.0;
+            int count = 0;
+            for (int x = b; x <= e; ++x) {
+                if (!std::isfinite(row[x])) continue;
+                sum += std::max(0.0, row[x]);
+                ++count;
+            }
+            return count > 0
+                ? sum / count
+                : std::numeric_limits<double>::infinity();
+        };
+
+        auto installRunWinner = [&](int runWinner, int b, int e) {
+            for (int x = b; x <= e; ++x) {
+                winner[x] = runWinner;
+                if (runWinner == 0) {
+                    outVal[x] = candidateA[x];
+                    outShade[x] = 0.25f;
+                } else if (runWinner == 1) {
+                    outVal[x] = candidateB[x];
+                    outShade[x] = 0.35f;
+                } else {
+                    outVal[x] = frameB2[x];
+                    outShade[x] = 0.8f;
+                }
+            }
+        };
+
+        int x = kFarSupport;
+        int committedThrough = -1;
+        while (x + kFarSupport < width) {
+            if (!stableTransitionCenter(x)) {
+                ++x;
+                continue;
+            }
+
+            const int seedBegin = x;
+            while (x + 1 + kFarSupport < width &&
+                   stableTransitionCenter(x + 1))
+                ++x;
+            const int seedEnd = x;
+            ++x;
+
+            // The far plateau probes are the complete support of the fact.
+            // Awarding only the crossing would recreate the shoulder switch;
+            // extending beyond these probes would claim pixels the detector
+            // did not establish as members of this transition.
+            const int runBegin = seedBegin - kFarSupport;
+            const int runEnd = seedEnd + kFarSupport;
+            if (runBegin <= committedThrough)
+                continue;
+
+            const int leftPlateauEnd = seedBegin - kNearSupport;
+            const int rightPlateauBegin = seedEnd + kNearSupport;
+            const double sourceLeft =
+                meanRange(visibleYSource, runBegin, leftPlateauEnd);
+            const double sourceRight =
+                meanRange(visibleYSource, rightPlateauBegin, runEnd);
+            const double sourceDelta = sourceRight - sourceLeft;
+            const double stepIRE = std::fabs(sourceDelta) * invI;
+            if (stepIRE < stepThresholdIRE || std::fabs(sourceDelta) < 1e-12)
+                continue;
+
+            auto measureTransition = [&](const std::vector<double> &row) {
+                TransitionQuality q;
+                const double leftMean =
+                    meanRange(row, runBegin, leftPlateauEnd);
+                const double rightMean =
+                    meanRange(row, rightPlateauBegin, runEnd);
+                const double settleL = std::fabs(leftMean - sourceLeft) * invI;
+                const double settleR = std::fabs(rightMean - sourceRight) * invI;
+                const double settleMaxIRE = 0.35 * stepIRE + 1.0;
+                q.settleNorm = std::clamp(
+                    std::max(settleL, settleR) /
+                        std::max(1e-9, settleMaxIRE),
+                    0.0, 2.0);
+
+                int x10 = -1;
+                int x90 = -1;
+                double totalVariation = 0.0;
+                double prevT = (row[runBegin] - sourceLeft) / sourceDelta;
+                double maxOvershootIRE = 0.0;
+                for (int r = runBegin; r <= runEnd; ++r) {
+                    const double t = (row[r] - sourceLeft) / sourceDelta;
+                    if (r > runBegin)
+                        totalVariation += std::fabs(t - prevT);
+                    prevT = t;
+                    if (r >= leftPlateauEnd && r <= rightPlateauBegin) {
+                        if (x10 < 0 && t >= 0.10) x10 = r;
+                        if (x10 >= 0 && x90 < 0 && t >= 0.90) x90 = r;
+                    }
+                    const double overshoot = std::max(-t, t - 1.0);
+                    maxOvershootIRE = std::max(
+                        maxOvershootIRE,
+                        std::max(0.0, overshoot) * stepIRE);
+                }
+
+                const double overshootMaxIRE = 0.25 * stepIRE + 1.0;
+                q.overshootNorm = std::clamp(
+                    maxOvershootIRE / std::max(1e-9, overshootMaxIRE),
+                    0.0, 2.0);
+
+                // A monotone crossing has unit total variation.  Excess is
+                // the transition-level form of the horizontal zipper fact.
+                q.zipperNorm = std::clamp(
+                    std::max(0.0, totalVariation - 1.0), 0.0, 2.0);
+
+                if (x10 >= 0 && x90 >= x10) {
+                    const int crossingWidth = x90 - x10;
+                    q.sharpness = 1.0 - std::clamp(
+                        (crossingWidth - 1.0) / 6.0, 0.0, 1.0);
+                }
+
+                q.valid = x10 >= 0 && x90 >= x10 &&
+                          settleL <= settleMaxIRE &&
+                          settleR <= settleMaxIRE &&
+                          maxOvershootIRE <= overshootMaxIRE;
+                q.qualityCost =
+                    (1.0 - q.sharpness) +
+                    0.35 * q.settleNorm +
+                    0.25 * q.overshootNorm +
+                    0.25 * q.zipperNorm;
+                return q;
+            };
+
+            const TransitionQuality qualityA =
+                measureTransition(visibleYA);
+            const TransitionQuality qualityB =
+                measureTransition(visibleYB);
+            const TransitionQuality qualityFrame =
+                measureTransition(visibleYFrame);
+
+            // Diagonal geometry is not generic vertical disagreement.  Find
+            // the same signed lateral crossing on the neighbouring same-field
+            // source rows and require its position to progress monotonically
+            // through this line.  That is the geometry on which Frame B's
+            // interframe construction visibly antialiases while Frame A can
+            // staircase.  The award remains in the election; no candidate is
+            // filtered or weakened.
+            auto crossingFromRow = [&](auto valueAt) {
+                double left = 0.0;
+                double right = 0.0;
+                int leftCount = 0;
+                int rightCount = 0;
+                for (int r = runBegin; r <= leftPlateauEnd; ++r) {
+                    left += valueAt(r);
+                    ++leftCount;
+                }
+                for (int r = rightPlateauBegin; r <= runEnd; ++r) {
+                    right += valueAt(r);
+                    ++rightCount;
+                }
+                left /= std::max(1, leftCount);
+                right /= std::max(1, rightCount);
+                const double delta = right - left;
+                if (std::fabs(delta) * invI < stepThresholdIRE ||
+                    delta * sourceDelta <= 0.0)
+                    return std::numeric_limits<double>::quiet_NaN();
+
+                double prevT =
+                    (valueAt(leftPlateauEnd) - left) / delta;
+                for (int r = leftPlateauEnd + 1;
+                     r <= rightPlateauBegin; ++r) {
+                    const double t = (valueAt(r) - left) / delta;
+                    if (prevT < 0.5 && t >= 0.5) {
+                        const double frac = std::clamp(
+                            (0.5 - prevT) /
+                                std::max(1e-12, t - prevT),
+                            0.0, 1.0);
+                        return (r - 1) + frac;
+                    }
+                    prevT = t;
+                }
+                return std::numeric_limits<double>::quiet_NaN();
+            };
+
+            double diagonalStrength = 0.0;
+            if (haveVert2) {
+                const double crossing0 = crossingFromRow(
+                    [&](int r) { return visibleYSource[r]; });
+                const double crossingUp = crossingFromRow(
+                    [&](int r) {
+                        return r < (int)tapLine.coarseU2IRE.size() &&
+                               invI > 1e-12
+                            ? tapLine.coarseU2IRE[r] / invI
+                            : visibleYSource[r];
+                    });
+                const double crossingDown = crossingFromRow(
+                    [&](int r) {
+                        return r < (int)tapLine.coarseD2IRE.size() &&
+                               invI > 1e-12
+                            ? tapLine.coarseD2IRE[r] / invI
+                            : visibleYSource[r];
+                    });
+                if (std::isfinite(crossing0) &&
+                    std::isfinite(crossingUp) &&
+                    std::isfinite(crossingDown)) {
+                    const double upStep = crossing0 - crossingUp;
+                    const double downStep = crossingDown - crossing0;
+                    const double totalShift =
+                        std::fabs(crossingDown - crossingUp);
+                    const bool monotone = upStep * downStep >= -0.20;
+                    const bool local = std::fabs(upStep) <= 4.0 &&
+                                       std::fabs(downStep) <= 4.0;
+                    if (monotone && local && totalShift >= 0.75) {
+                        diagonalStrength = std::clamp(
+                            (totalShift - 0.75) / 3.25, 0.0, 1.0);
+                    }
+                }
+            }
+
+            bool frameRunEligible = true;
+            bool frameReachUnsafe = false;
+            double maxVertIRE = 0.0;
+            for (int r = runBegin; r <= runEnd; ++r) {
+                frameRunEligible = frameRunEligible && frameEligible[r] != 0;
+                maxVertIRE = std::max(maxVertIRE, vertContrastIRE(r));
+				if (r < (int)scratch_frameBReachUnsafe.size() &&
+					scratch_frameBReachUnsafe[r] != 0)
+					frameReachUnsafe = true;
+            }
+
+            // In the progressive roster seat A is Frame A, the reach-safe
+            // construction.  Physical Frame-B refusal outranks apparent
+            // sharpness and owns the detector's whole run.  In interlace the
+            // same seat is Field A, so the existing field-divergence DQ remains
+            // the authority instead of pretending that Field A is Frame A.
+            if (localUseFrameModel && frameReachUnsafe) {
+                installRunWinner(0, runBegin, runEnd);
+                committedThrough = runEnd;
+                continue;
+            }
+
+            const double stepStrength = std::clamp(
+                (stepIRE - stepThresholdIRE) / 6.0, 0.0, 1.0);
+            auto runMerit = [&](const std::vector<double> &scoreRow,
+                                const TransitionQuality &quality) {
+                if (!quality.valid)
+                    return std::numeric_limits<double>::infinity();
+                const double ordinary = meanScore(scoreRow, runBegin, runEnd);
+                const double sharpReward = std::clamp(
+                    1.0 - transitionSharpWeight *
+                        quality.sharpness * stepStrength,
+                    0.05, 1.0);
+                const double conductPenalty =
+                    1.0 + 0.08 * quality.settleNorm +
+                          0.08 * quality.overshootNorm +
+                          0.08 * quality.zipperNorm;
+                return ordinary * sharpReward * conductPenalty;
+            };
+
+            double meritA = runMerit(scoreMapA, qualityA);
+            const double meritB = runMerit(scoreMapB, qualityB);
+            double meritFrame = frameRunEligible
+                ? runMerit(scoreMapFrame, qualityFrame)
+                : std::numeric_limits<double>::infinity();
+
+            if (std::isfinite(meritFrame) && diagonalStrength > 0.0) {
+                meritFrame *= 1.0 -
+                    std::clamp(T.FVF_DIAGONAL_FRAME_B_BONUS, 0.0, 0.9) *
+                    diagonalStrength;
+            }
+
+            // Correct orientation: lateral contrast supplies the stable-step
+            // sharpness measurement above, where Frame B's narrower crossing
+            // can win without an identity bonus.  Between-line disagreement
+            // instead raises the prior for progressive Frame A, whose reach
+            // is the safe construction.
+            if (localUseFrameModel && std::isfinite(meritA)) {
+                const double verticalSafetyPrior = std::clamp(
+                    (maxVertIRE - VERT_THRESH_IRE) /
+                        std::max(1e-9, VERT_THRESH_IRE),
+                    0.0, 1.0);
+                meritA *= 1.0 -
+                    std::clamp(T.FVF_VERT_FRAME_A_BONUS, 0.0, 0.9) *
+                    verticalSafetyPrior * (1.0 - diagonalStrength);
+            }
+
+            int runWinner = -1;
+            double bestMerit = std::numeric_limits<double>::infinity();
+            double bestQuality = std::numeric_limits<double>::infinity();
+            auto consider = [&](int candidate,
+                                double merit,
+                                const TransitionQuality &quality) {
+                if (!std::isfinite(merit)) return;
+                if (runWinner < 0) {
+                    runWinner = candidate;
+                    bestMerit = merit;
+                    bestQuality = quality.qualityCost;
+                    return;
+                }
+                const double tie = 1e-9 * std::max(1.0, bestMerit);
+                if (merit + tie < bestMerit ||
+                    (std::fabs(merit - bestMerit) <= tie &&
+                     quality.qualityCost < bestQuality)) {
+                    runWinner = candidate;
+                    bestMerit = merit;
+                    bestQuality = quality.qualityCost;
+                }
+            };
+            consider(0, meritA, qualityA);
+            consider(1, meritB, qualityB);
+            consider(2, meritFrame, qualityFrame);
+
+            // No plateau-valid candidate means no transition-level fact.  The
+            // ordinary per-pixel ballot remains untouched in that case.
+            if (runWinner >= 0) {
+                installRunWinner(runWinner, runBegin, runEnd);
+                committedThrough = runEnd;
+            }
+        }
+    }
+
     for (int rel = 0; rel < width; ++rel) {
         outMixed[rel] = outVal[rel];
         if (line >= 0 && line < (int)fvfMetrics.size() &&

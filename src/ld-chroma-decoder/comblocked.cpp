@@ -1525,6 +1525,18 @@ void Comb::FrameBuffer::buildCrossColorReturn()
         return s && std::atoi(s) != 0;
     }();
 
+    // Run the detector in the carrier plane's actual coordinates.  The
+    // legacy narrow/wide comparison pools the two interleaved raster lanes
+    // into one IQ magnitude.  In this mode each sample is compared only with
+    // the de-alternated stream to which it belongs; the return machinery
+    // downstream remains unchanged.  The lane-discrete reading is the default;
+    // LDCD_CC_DISCRETE_FITS=0 retains the conflated IQ comparison as an escape
+    // hatch while this detector awaits its larger reform.
+    static const bool ccDiscreteFits = []{
+        const char *s = std::getenv("LDCD_CC_DISCRETE_FITS");
+        return !(s && std::atoi(s) == 0);
+    }();
+
     std::vector<double> demI(width), demQ(width);
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
@@ -1532,6 +1544,8 @@ void Comb::FrameBuffer::buildCrossColorReturn()
     std::vector<double> pvI(size_t(4) * width), pvQ(size_t(4) * width);
     std::vector<double> psI(size_t(4) * width), psQ(size_t(4) * width);
     std::vector<double> parRatio(width);            // aperture parallax ratio
+    std::vector<double> ccLane[2], ccLanePrefix[2], ccLaneAbsPrefix[2];
+    std::vector<int> ccLaneId(width), ccLaneIndex(width);
 
     for (int line = firstLine; line < lastLine; ++line) {
         const double *combLine = clpbuffer[srcBuf].pixel[line];
@@ -1548,6 +1562,29 @@ void Comb::FrameBuffer::buildCrossColorReturn()
             env[rel] = std::sqrt(s * s + sN * sN);
         }
 
+        if (ccDiscreteFits) {
+            decomposeCarrierLanes(
+                combLine + left, left, width, ccLane[0], ccLane[1]);
+            for (int lane = 0; lane < 2; ++lane) {
+                const int n = static_cast<int>(ccLane[lane].size());
+                ccLanePrefix[lane].assign(static_cast<size_t>(n + 1), 0.0);
+                ccLaneAbsPrefix[lane].assign(static_cast<size_t>(n + 1), 0.0);
+                for (int i = 0; i < n; ++i) {
+                    ccLanePrefix[lane][i + 1] =
+                        ccLanePrefix[lane][i] + ccLane[lane][i];
+                    ccLaneAbsPrefix[lane][i + 1] =
+                        ccLaneAbsPrefix[lane][i] +
+                        std::fabs(ccLane[lane][i]);
+                }
+            }
+            int nextLaneIndex[2] = {0, 0};
+            for (int rel = 0; rel < width; ++rel) {
+                const int lane = (left + rel) & 1;
+                ccLaneId[rel] = lane;
+                ccLaneIndex[rel] = nextLaneIndex[lane]++;
+            }
+        }
+
         preI[0] = 0.0;
         preQ[0] = 0.0;
         preEnv[0] = 0.0;
@@ -1557,7 +1594,7 @@ void Comb::FrameBuffer::buildCrossColorReturn()
             preEnv[rel + 1] = preEnv[rel] + env[rel];
         }
 
-        if (bwCrossColor) {
+        if (bwCrossColor && !ccDiscreteFits) {
             lddecode::projectExpressibleChromaEnvelope(
                 demI.data(), nullptr, width, lawI.data(), 0);
             lddecode::projectExpressibleChromaEnvelope(
@@ -1568,20 +1605,48 @@ void Comb::FrameBuffer::buildCrossColorReturn()
             apertureParallaxLine(line, pvI, pvQ, psI, psQ, parRatio.data());
 
         for (int rel = 0; rel < width; ++rel) {
-            const double ZwI = centeredEvenWeightMean(
-                demI.data(), preI.data(), width, rel, kWideWin);
-            const double ZwQ = centeredEvenWeightMean(
-                demQ.data(), preQ.data(), width, rel, kWideWin);
+            double narrowMag;
+            double wideMag;
+            if (ccDiscreteFits) {
+                const int lane = ccLaneId[rel];
+                const int li = ccLaneIndex[rel];
+                const int n = static_cast<int>(ccLane[lane].size());
 
-            // env[k] is centred at k+0.5, so this asymmetric index range is
-            // the integer-centred physical aperture.
-            const int na = std::clamp(rel - kNarrowWin / 2, 0, width);
-            const int nb = std::clamp(na + kNarrowWin, 0, width);
-            const double nn = std::max(1, nb - na);
-            const double narrowMag =
-                ((preEnv[nb] - preEnv[na]) / nn) * invIreScale;
+                // The old 16-sample narrow box contains eight samples from
+                // this lane: li-4 .. li+3.  Preserve that physical aperture
+                // and its edge truncation, but never borrow the other lane.
+                const int na = std::clamp(li - kNarrowWin / 4, 0, n);
+                const int nb = std::clamp(
+                    na + kNarrowWin / 2, 0, n);
+                const double nn = static_cast<double>(std::max(1, nb - na));
+                narrowMag =
+                    ((ccLaneAbsPrefix[lane][nb] -
+                      ccLaneAbsPrefix[lane][na]) / nn) * invIreScale;
 
-            const double wideMag = 2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
+                // The coherent 32-sample IQ fit becomes a 16-effective-
+                // sample mean on the one de-alternated lane.  No rotation,
+                // interpolation, or adjacent-lane magnitude enters.
+                const double wideLane = centeredEvenWeightMean(
+                    ccLane[lane].data(), ccLanePrefix[lane].data(),
+                    n, li, kWideWin / 2);
+                wideMag = std::fabs(wideLane) * invIreScale;
+            } else {
+                const double ZwI = centeredEvenWeightMean(
+                    demI.data(), preI.data(), width, rel, kWideWin);
+                const double ZwQ = centeredEvenWeightMean(
+                    demQ.data(), preQ.data(), width, rel, kWideWin);
+
+                // env[k] is centred at k+0.5, so this asymmetric index range
+                // is the integer-centred physical aperture.
+                const int na = std::clamp(
+                    rel - kNarrowWin / 2, 0, width);
+                const int nb = std::clamp(na + kNarrowWin, 0, width);
+                const double nn = std::max(1, nb - na);
+                narrowMag =
+                    ((preEnv[nb] - preEnv[na]) / nn) * invIreScale;
+                wideMag =
+                    2.0 * boundedMag(ZwI, ZwQ) * invIreScale;
+            }
 
             double gA = 0.0;
             if (narrowMag > kImpurityFloorIRE && wideMag < narrowMag) {
@@ -1590,7 +1655,7 @@ void Comb::FrameBuffer::buildCrossColorReturn()
                     std::max(kImpurityFloorIRE, narrowMag));
             }
 
-            if (bwCrossColor) {
+            if (bwCrossColor && !ccDiscreteFits) {
                 const int rm = std::max(0, rel - 1);
                 const int rp = std::min(width - 1, rel + 1);
                 const double ifI = 0.25 * (demI[rm] + 2.0 * demI[rel] + demI[rp]);
@@ -7552,6 +7617,16 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
         const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
         return s ? std::atof(s) : 0.35;
     }();
+    // The residual analysis supplies a discrete set of legal four-sample
+    // carrier readings.  The legacy repair treats the endpoints of that set
+    // as a continuous interval, so a fit can survive in a gap no aperture
+    // actually observed.  Keep this experiment local to the retracted-luma
+    // fit.  The discrete reading is the default pending the larger reform;
+    // LDCD_RETRACTED_DISCRETE_REPAIR=0 retains the interval treatment.
+    static const bool discreteResidualRepair = []{
+        const char *s = std::getenv("LDCD_RETRACTED_DISCRETE_REPAIR");
+        return !(s && std::atoi(s) == 0);
+    }();
     static const int crDiagLine = []{
         const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
         return s ? std::atoi(s) : -1;
@@ -8232,14 +8307,47 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                     sharedSurvivors > 0 &&
                     sharedSurvivors < sharedResidual.optionCount &&
                     sharedResidual.movingCompatible;
-                if (sharedUseful &&
+                double nearestSurvivor = 0.0;
+                double nearestSurvivorDistance =
+                    std::numeric_limits<double>::infinity();
+                if (sharedUseful && discreteResidualRepair) {
+                    // The interval is only the extent of the surviving
+                    // apertures.  Find the nearest actual survivor instead
+                    // of treating every value between its endpoints as an
+                    // observed carrier reading.  This is a constraint on
+                    // the native fit, not a residual-as-carrier substitute.
+                    for (int oi = 0; oi < sharedResidual.optionCount; ++oi) {
+                        if ((sharedResidual.survivorMask &
+                             static_cast<std::uint8_t>(1u << oi)) == 0)
+                            continue;
+                        const double option =
+                            static_cast<double>(sharedResidual.optionSamples[oi]);
+                        const double distance = std::fabs(option - cf);
+                        if (distance < nearestSurvivorDistance) {
+                            nearestSurvivor = option;
+                            nearestSurvivorDistance = distance;
+                        }
+                    }
+                }
+
+                const bool intervalMiss =
                     !(cf >= sharedResidual.survivorLo &&
-                      cf <= sharedResidual.survivorHi))
+                      cf <= sharedResidual.survivorHi);
+                const double discreteTolerance =
+                    static_cast<double>(sharedResidual.toleranceIRE) * irescale;
+                // In discrete mode a value in a gap between survivors is a
+                // miss too.  A fit within tolerance of one actual residual
+                // remains untouched; this is deliberately not a snap grid.
+                const bool discreteGap =
+                    discreteResidualRepair &&
+                    nearestSurvivorDistance > discreteTolerance;
+                if (sharedUseful && (intervalMiss || discreteGap))
                 {
-                    const double target = std::clamp(
-                        cf,
-                        sharedResidual.survivorLo,
-                        sharedResidual.survivorHi);
+                    const double target = discreteResidualRepair
+                        ? nearestSurvivor
+                        : std::clamp(cf,
+                                     sharedResidual.survivorLo,
+                                     sharedResidual.survivorHi);
                     const double maxDelta =
                         std::max(0.0, parallaxRepairMaxDeltaIRE) * irescale;
                     sharedDelta = std::clamp(
@@ -8259,7 +8367,8 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                         "CARRIERRETRACTREPAIR line=%d rel=%d before=%.6f "
                         "after=%.6f applied=%d deltaIRE=%.6f "
                         "optionCount=%d survivorCount=%d survivorLo=%.6f "
-                        "survivorHi=%.6f movingCompatible=%d\n",
+                        "survivorHi=%.6f movingCompatible=%d discrete=%d "
+                        "nearest=%.6f nearestDistanceIRE=%.6f\n",
                         line, xi, baselineCf, cf,
                         sharedConstraintApplied ? 1 : 0,
                         sharedDelta * invIreScale,
@@ -8267,7 +8376,10 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                         sharedSurvivors,
                         sharedResidual.survivorLo,
                         sharedResidual.survivorHi,
-                        sharedResidual.movingCompatible ? 1 : 0);
+                        sharedResidual.movingCompatible ? 1 : 0,
+                        discreteResidualRepair ? 1 : 0,
+                        nearestSurvivor,
+                        nearestSurvivorDistance * invIreScale);
                 }
 
                 carrierFit[xi] = cf;

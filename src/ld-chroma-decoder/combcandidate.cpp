@@ -2107,6 +2107,11 @@ void Comb::FrameBuffer::computeFrameBLine(
 
     outFrameIQ.resize(width);
     outFrameScalar.resize(width);
+	if ((int)scratch_frameBReachUnsafe.size() != width)
+		scratch_frameBReachUnsafe.assign(width, 0);
+	else
+		std::fill(scratch_frameBReachUnsafe.begin(),
+		          scratch_frameBReachUnsafe.end(), 0);
 
     static const bool fbRegProbe = []{
         const char *e = std::getenv("LDCD_PROBE_FBREG");
@@ -2141,13 +2146,16 @@ void Comb::FrameBuffer::computeFrameBLine(
             gFbRegStat = LdcdFbRegStat();
     }
 
-    // ±1 operand admission. LDCD_FB_BAND_CEDE=0 is the A/B escape: it restores
-    // the unadmitted pair difference in one variable, so the census below and
-    // the render can be attributed to this change and nothing else.
-    static const bool fbAdmitOn = []{
-        const char *e = std::getenv("LDCD_FB_BAND_CEDE");
-        return !(e && std::atoi(e) == 0);
-    }();
+	// The refusal band is now election evidence, not a Frame-B construction
+	// actuator.  Frame B's purpose is the aggressive registered subtraction;
+	// suppressing it here merely republishes the contaminated center.  FVF sees
+	// the exact aperture-level verdict through scratch_frameBReachUnsafe and can
+	// give the whole transition run to Frame A.  Keep the former construction
+	// cede as an explicit A/B mode only.
+	static const bool frameBBandCede = []{
+		const char *e = std::getenv("LDCD_FB_BAND_CEDE");
+		return e && std::atoi(e) != 0;
+	}();
     // Certified cede (construction): on a def line the Frame B candidate IS
     // the center; IQ from the stage-1 locked products of the same scalar.
     if (certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
@@ -2688,24 +2696,22 @@ void Comb::FrameBuffer::computeFrameBLine(
             const int sStar = bestSi - 2;
             const int d = sameIsUp ? -sStar : sStar;
 
-            // OPERAND ADMISSION (see frameBBandSeed).
-            //
-            // TWO outcomes, and deliberately only two:
-            //   outside the band   Zsame - Zopp   full comb, both legs
-            //   aperture touches band
-            //                      Z0    - Z0 = 0 Frame B publishes centre
-            //
-            // No one-legged rung. Refusing a single leg is not one operation
-            // but two different ones -- centre substitutes for a refused SAME
-            // leg exactly and the correction keeps full strength, while a
-            // refused OPPOSITE leg leaves no alien measurement at all -- and
-            // which leg fails varies per column. Adjacent columns would then
-            // alternate between full correction and none, which is a zipper.
-            // The band is the only refusal that is identical in both legs,
-            // because it takes them together.  A neighbouring line's band
-            // also refuses both: that line is an operand of this candidate,
-            // so allowing the reach would merely move the forbidden material
-            // one line across the boundary.
+			// REACH EVIDENCE (see frameBBandSeed).
+			//
+			// Frame B now always constructs Zsame - Zopp at full strength.
+			// If this registered aperture touches a refusal band, the exact
+			// fact is published separately for FVF: progressive gives Frame A
+			// the unsafe pixel/run, while interlace disqualifies Frame B and
+			// leaves its two field seats live.
+			//
+			// There is still no one-legged rung. Refusing a single leg is not
+			// one operation but two different ones -- centre substitutes for
+			// a refused SAME leg exactly and the correction keeps full
+			// strength, while a refused OPPOSITE leg leaves no alien
+			// measurement at all -- and which leg fails varies per column.
+			// The old band cede therefore remains available only under
+			// LDCD_FB_BAND_CEDE=1 for comparison; it is no longer the
+			// production actuator.
             //
             // The coefficient never moves either: the 0.5 applied at the
             // combine is the reciprocal of the sigma FOLD, not a leg count.
@@ -2715,19 +2721,14 @@ void Comb::FrameBuffer::computeFrameBLine(
                 frameBBandAt(&reachTapLine, x) ||
                 frameBBandAt(reachTapUp, x) ||
                 frameBBandAt(reachTapDn, x);
-            if (refusePair) {
+			scratch_frameBReachUnsafe[x] = refusePair ? 1 : 0;
+			if (frameBBandCede && refusePair) {
                 upAdmit = false;
                 dnAdmit = false;
             }
-            // Outside the band BOTH legs stand. Per-leg refusal is
-            // forbidden, and not as a tuning choice -- see
-            // frameBLegAdmitted.
-            // The escape reports what admission WOULD do, so coverage can
-            // be read off an unchanged render.
-            if (!fbAdmitOn) {
-                upAdmit = true;
-                dnAdmit = true;
-            }
+			// Outside the opt-in legacy cede BOTH legs always stand. Per-leg
+			// refusal remains forbidden; the unsafe bit above is the separate
+			// election fact.
 
             // Registration needs a multi-axis aperture, but the correction waveform must retain
             // the sample that was measured.  Using the seven-tap average here
@@ -2769,6 +2770,8 @@ void Comb::FrameBuffer::computeFrameBLine(
             const double pairLegalGate = std::min(
                 std::clamp(reachTapLine.pairU1[x].reachLegalGate, 0.0, 1.0),
                 std::clamp(reachTapLine.pairD1[x].reachLegalGate, 0.0, 1.0));
+			if (pairLegalGate <= 0.0)
+				scratch_frameBReachUnsafe[x] = 1;
 
             if (pairLegalGate > 0.0) {
                 const std::complex<double> corr =
