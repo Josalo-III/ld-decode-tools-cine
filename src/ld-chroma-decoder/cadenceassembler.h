@@ -147,5 +147,8 @@ private:
 	    // Always use this instead of directly assigning history[pos].consumed = true,
 	    // because the seq->index map must be updated to avoid stale lookups.
 	    void markHistoryConsumed(int pos);
+	    // Drop a consumed entry's sample planes. Must follow any move out of
+	    // history, never be folded into markHistoryConsumed.
+	    void releaseHistoryPayload(int pos);
 		void handOffCaptureFrameToBaseline(int pos);
 	};

@@ -605,6 +605,32 @@ void CadenceAssembler::markHistoryConsumed(int pos)
     history[pos].consumed = true;
 }
 
+// Release a consumed entry's sample planes while leaving its slot, and its
+// metadata, in place.  history is indexed POSITIONALLY and seqNoToHistoryIndex
+// stores those positions, so erasing an entry would invalidate every stored
+// index -- which is why the front has never been pruned, and why a side-long
+// render ends up carrying every field it has ever seen.
+//
+// Nothing reads a consumed entry's samples: nextUnconsumedIndex skips it, and
+// findComplementPos and tryConsumeSpare both refuse it outright.  The two
+// callers are the only consumption paths that do NOT move the field out of
+// history, and both hand it to the baseline decoder, which reloads the field
+// from the TBC rather than borrowing this copy.  From that point the planes are
+// dead weight.
+//
+// Call only AFTER any move out of history.  markHistoryConsumed deliberately
+// runs BEFORE the move because it needs the seqNo, so this must never be folded
+// into it -- that would empty the field before the comb ever receives it.
+// Fresh containers rather than clear(): clear() keeps the capacity.
+void CadenceAssembler::releaseHistoryPayload(int pos)
+{
+    if (pos < 0 || pos >= history.size()) return;
+    SourceField &f = history[pos].field;
+    f.data            = SourceVideo::Data();
+    f.dgExactCarrier  = QVector<float>();
+    f.dgSyncIncrement = QVector<float>();
+}
+
 void CadenceAssembler::handOffCaptureFrameToBaseline(int pos)
 {
     if (pos < 0 || pos >= history.size()) return;
@@ -625,6 +651,7 @@ void CadenceAssembler::handOffCaptureFrameToBaseline(int pos)
     releaseSeqToBaseline(seqNo);
 
     markHistoryConsumed(pos);
+    releaseHistoryPayload(pos);
 }
 
 void CadenceAssembler::push(const QVector<SourceField>& newFields)
@@ -1594,6 +1621,7 @@ bool CadenceAssembler::tryEmitPassthroughAtCursor(bool flushMode, bool force)
     const qint32 seqNo = history[i0].field.field.seqNo;
     if (baselineOwnedSeqNos.contains(seqNo)) {
         markHistoryConsumed(i0);
+        releaseHistoryPayload(i0);
         return true;
     }
 
