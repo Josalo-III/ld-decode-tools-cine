@@ -830,6 +830,12 @@ private:
 		std::vector<double> coarse0IRE;
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
+		// Narrow-notch coarse for the centre row, published ALONGSIDE
+		// coarse0IRE and never in place of it -- the contour and vertical
+		// work keep the locked decomposition where it is the better
+		// instrument. Built identically on both paths, so a consumer that
+		// needs one construction in locked and bucket alike can have it.
+		std::vector<double> notchCoarse0IRE;
 		// True only when BOTH neighbour coarse rows carry real luma evidence
 		// (a locked decomposition row, or a notch luma from a tap that exists).
 		// An absent neighbour row falls back to the centre value, which reads

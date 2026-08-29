@@ -1283,8 +1283,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         // Transition quality belongs to the image the candidate would render,
         // not to its carrier plane. produceY consumes raw - carrier exactly;
         // construct that same value for every seated candidate. The source
-        // plateau is the tap line's shared carrier-free coarse luma, converted
-        // back from IRE so all four rows share one unit and registration.
+        // plateau is the tap line's narrow-notch medoid coarse, converted back
+        // from IRE so all four rows share one unit and registration. It is the
+        // same construction on the locked and bucket paths, and it is a filter
+        // on raw rather than a decomposition product, so the reference does not
+        // inherit the assumptions of the candidates it referees.
         const double raw = r < (int)tapLine.tap0.size()
             ? tapLine.tap0[r].raw
             : 0.0;
@@ -1292,8 +1295,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         visibleYB[r] = raw - candidateB[r];
         visibleYFrame[r] = raw - frameB2[r];
         visibleYSource[r] =
-            r < (int)tapLine.coarse0IRE.size() && invI > 1e-12
-                ? tapLine.coarse0IRE[r] / invI
+            r < (int)tapLine.notchCoarse0IRE.size() && invI > 1e-12
+                ? tapLine.notchCoarse0IRE[r] / invI
                 : raw - (r < (int)tapLine.tap0.size()
                     ? tapLine.tap0[r].comp : 0.0);
     }
@@ -2068,35 +2071,55 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         : T.FVF_TRANSITION_SHARPNESS_WEIGHT;
 
     if (transitionSharpWeight > 0.0) {
-        constexpr int kEdgeGap = 2;
-        constexpr int kProbeNear = 2;
-        constexpr int kProbeFar = 6;
-        constexpr int kNearSupport = kEdgeGap + kProbeNear;
-        constexpr int kFarSupport = kEdgeGap + kProbeFar;
+        // TRANSITIONS ARE WHAT WE SEARCH FOR; PLATEAUS ARE THE QUALIFIER
+        // (author, 2026-08-28).  The seed is the lateral gradient alone.  The
+        // plateau's only job is to demonstrate that what was found is a
+        // transition between two settled regions and not fine texture, and
+        // five flat samples are enough to say so -- there is nothing to grow
+        // beyond that, because the plateau is never the measurement target.
+        //
+        // Each side DISCOVERS where its plateau begins by walking outward
+        // until five consecutive samples are flat.  Nothing here is a fixed
+        // offset from the crossing, which matters twice over: transitions are
+        // of variable width, and the source row carries its own lateral
+        // support (a narrow notch inside a four-cycle medoid), so a fixed gap
+        // sized against one row silently reads across the edge when the row
+        // changes.  Contamination from either cause presents as non-flatness,
+        // so the search steps past it without being told the support radius.
+        constexpr int kPlateauSamples = 5;
+        constexpr int kPlateauSearchMax = 16;
         constexpr double kPlateauJitterMaxIRE = 1.2;
         const double stepThresholdIRE =
             std::max(2.0, 0.9 * HEDGE_THRESH_IRE);
 
-        auto stableTransitionCenter = [&](int x) {
-            if (x < kFarSupport || x + kFarSupport >= width)
-                return false;
+        auto transitionSeed = [&](int x) {
             const double hIRE = (x < (int)tapLine.hLumaDeltaIRE.size())
                 ? tapLine.hLumaDeltaIRE[x]
                 : 0.0;
-            if (hIRE < 0.75 * HEDGE_THRESH_IRE)
-                return false;
+            return hIRE >= 0.75 * HEDGE_THRESH_IRE;
+        };
 
-            const double lNear = visibleYSource[x - kNearSupport];
-            const double lFar  = visibleYSource[x - kFarSupport];
-            const double rNear = visibleYSource[x + kNearSupport];
-            const double rFar  = visibleYSource[x + kFarSupport];
-            const double visibleStepIRE = std::fabs(rNear - lNear) * invI;
-            if (visibleStepIRE < stepThresholdIRE)
-                return false;
-            const bool plateau =
-                std::fabs(lNear - lFar) * invI <= kPlateauJitterMaxIRE &&
-                std::fabs(rNear - rFar) * invI <= kPlateauJitterMaxIRE;
-            return plateau;
+        // Returns the plateau's INNER index (the sample nearest the
+        // transition), or -1 when no settled run exists within reach -- which
+        // is the fine-texture verdict, and declines the transition.
+        auto findPlateauInner = [&](int from, int dir) {
+            for (int step = 1; step <= kPlateauSearchMax; ++step) {
+                const int inner = from + dir * step;
+                const int outer = inner + dir * (kPlateauSamples - 1);
+                if (inner < 0 || inner >= width) break;
+                if (outer < 0 || outer >= width) break;
+                const int b = std::min(inner, outer);
+                const int e = std::max(inner, outer);
+                double lo = visibleYSource[b];
+                double hi = lo;
+                for (int r = b + 1; r <= e; ++r) {
+                    lo = std::min(lo, visibleYSource[r]);
+                    hi = std::max(hi, visibleYSource[r]);
+                }
+                if ((hi - lo) * invI <= kPlateauJitterMaxIRE)
+                    return inner;
+            }
+            return -1;
         };
 
         struct TransitionQuality {
@@ -2108,10 +2131,15 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             double qualityCost = std::numeric_limits<double>::infinity();
         };
 
-        auto meanRange = [](const std::vector<double> &row, int b, int e) {
-            double sum = 0.0;
-            for (int x = b; x <= e; ++x) sum += row[x];
-            return sum / std::max(1, e - b + 1);
+        // A plateau is reduced by choosing one of its samples, never by
+        // averaging them: the published reference is then a value that was
+        // actually observed, and a single stray sample cannot drag it.
+        auto medoidRange = [](const std::vector<double> &row, int b, int e) {
+            double buf[kPlateauSamples];
+            int n = 0;
+            for (int x = b; x <= e && n < kPlateauSamples; ++x)
+                buf[n++] = row[x];
+            return coarseCycleMedoid(buf, n);
         };
 
         auto meanScore = [](const std::vector<double> &row, int b, int e) {
@@ -2143,36 +2171,45 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
         };
 
-        int x = kFarSupport;
+        int x = 0;
         int committedThrough = -1;
-        while (x + kFarSupport < width) {
-            if (!stableTransitionCenter(x)) {
+        while (x < width) {
+            if (!transitionSeed(x)) {
                 ++x;
                 continue;
             }
 
             const int seedBegin = x;
-            while (x + 1 + kFarSupport < width &&
-                   stableTransitionCenter(x + 1))
+            while (x + 1 < width && transitionSeed(x + 1))
                 ++x;
             const int seedEnd = x;
             ++x;
 
-            // The far plateau probes are the complete support of the fact.
-            // Awarding only the crossing would recreate the shoulder switch;
-            // extending beyond these probes would claim pixels the detector
-            // did not establish as members of this transition.
-            const int runBegin = seedBegin - kFarSupport;
-            const int runEnd = seedEnd + kFarSupport;
-            if (runBegin <= committedThrough)
+            // No settled region on a side means this was texture, not a
+            // transition between two things. Decline and leave the pixels to
+            // the ordinary per-pixel ballot.
+            const int leftPlateauEnd = findPlateauInner(seedBegin, -1);
+            const int rightPlateauBegin = findPlateauInner(seedEnd, +1);
+            if (leftPlateauEnd < 0 || rightPlateauBegin < 0)
                 continue;
 
-            const int leftPlateauEnd = seedBegin - kNearSupport;
-            const int rightPlateauBegin = seedEnd + kNearSupport;
+            // The plateaus bracket the fact, so they are its full measurement
+            // support. The AWARD is narrower: the crossing plus the inner half
+            // of each plateau. Awarding only the crossing recreates the
+            // shoulder switch, but awarding the whole support would hand one
+            // candidate every settled region that happens to adjoin an edge
+            // and leave the ordinary election with nothing to decide.
+            const int runBegin = leftPlateauEnd - (kPlateauSamples - 1);
+            const int runEnd = rightPlateauBegin + (kPlateauSamples - 1);
+            const int awardBegin = leftPlateauEnd - (kPlateauSamples / 2);
+            const int awardEnd = rightPlateauBegin + (kPlateauSamples / 2);
+            if (awardBegin <= committedThrough)
+                continue;
+
             const double sourceLeft =
-                meanRange(visibleYSource, runBegin, leftPlateauEnd);
+                medoidRange(visibleYSource, runBegin, leftPlateauEnd);
             const double sourceRight =
-                meanRange(visibleYSource, rightPlateauBegin, runEnd);
+                medoidRange(visibleYSource, rightPlateauBegin, runEnd);
             const double sourceDelta = sourceRight - sourceLeft;
             const double stepIRE = std::fabs(sourceDelta) * invI;
             if (stepIRE < stepThresholdIRE || std::fabs(sourceDelta) < 1e-12)
@@ -2181,9 +2218,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             auto measureTransition = [&](const std::vector<double> &row) {
                 TransitionQuality q;
                 const double leftMean =
-                    meanRange(row, runBegin, leftPlateauEnd);
+                    medoidRange(row, runBegin, leftPlateauEnd);
                 const double rightMean =
-                    meanRange(row, rightPlateauBegin, runEnd);
+                    medoidRange(row, rightPlateauBegin, runEnd);
                 const double settleL = std::fabs(leftMean - sourceLeft) * invI;
                 const double settleR = std::fabs(rightMean - sourceRight) * invI;
                 const double settleMaxIRE = 0.35 * stepIRE + 1.0;
@@ -2255,20 +2292,16 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // staircase.  The award remains in the election; no candidate is
             // filtered or weakened.
             auto crossingFromRow = [&](auto valueAt) {
-                double left = 0.0;
-                double right = 0.0;
-                int leftCount = 0;
-                int rightCount = 0;
-                for (int r = runBegin; r <= leftPlateauEnd; ++r) {
-                    left += valueAt(r);
-                    ++leftCount;
-                }
-                for (int r = rightPlateauBegin; r <= runEnd; ++r) {
-                    right += valueAt(r);
-                    ++rightCount;
-                }
-                left /= std::max(1, leftCount);
-                right /= std::max(1, rightCount);
+                double lbuf[kPlateauSamples], rbuf[kPlateauSamples];
+                int ln = 0, rn = 0;
+                for (int r = runBegin;
+                     r <= leftPlateauEnd && ln < kPlateauSamples; ++r)
+                    lbuf[ln++] = valueAt(r);
+                for (int r = rightPlateauBegin;
+                     r <= runEnd && rn < kPlateauSamples; ++r)
+                    rbuf[rn++] = valueAt(r);
+                const double left = coarseCycleMedoid(lbuf, ln);
+                const double right = coarseCycleMedoid(rbuf, rn);
                 const double delta = right - left;
                 if (std::fabs(delta) * invI < stepThresholdIRE ||
                     delta * sourceDelta <= 0.0)
@@ -2329,7 +2362,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             bool frameRunEligible = true;
             bool frameReachUnsafe = false;
             double maxVertIRE = 0.0;
-            for (int r = runBegin; r <= runEnd; ++r) {
+            for (int r = awardBegin; r <= awardEnd; ++r) {
                 frameRunEligible = frameRunEligible && frameEligible[r] != 0;
                 maxVertIRE = std::max(maxVertIRE, vertContrastIRE(r));
 				if (r < (int)scratch_frameBReachUnsafe.size() &&
@@ -2343,8 +2376,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // same seat is Field A, so the existing field-divergence DQ remains
             // the authority instead of pretending that Field A is Frame A.
             if (localUseFrameModel && frameReachUnsafe) {
-                installRunWinner(0, runBegin, runEnd);
-                committedThrough = runEnd;
+                installRunWinner(0, awardBegin, awardEnd);
+                committedThrough = awardEnd;
                 continue;
             }
 
@@ -2354,7 +2387,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                                 const TransitionQuality &quality) {
                 if (!quality.valid)
                     return std::numeric_limits<double>::infinity();
-                const double ordinary = meanScore(scoreRow, runBegin, runEnd);
+                const double ordinary =
+                    meanScore(scoreRow, awardBegin, awardEnd);
                 const double sharpReward = std::clamp(
                     1.0 - transitionSharpWeight *
                         quality.sharpness * stepStrength,
@@ -2422,8 +2456,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // No plateau-valid candidate means no transition-level fact.  The
             // ordinary per-pixel ballot remains untouched in that case.
             if (runWinner >= 0) {
-                installRunWinner(runWinner, runBegin, runEnd);
-                committedThrough = runEnd;
+                installRunWinner(runWinner, awardBegin, awardEnd);
+                committedThrough = awardEnd;
             }
         }
     }

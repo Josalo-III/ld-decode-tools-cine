@@ -657,6 +657,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.coarse0IRE);
         ensureWidth(tapLine.coarseU2IRE);
         ensureWidth(tapLine.coarseD2IRE);
+        ensureWidth(tapLine.notchCoarse0IRE);
     }
 
     if (wantFieldB || wantFrame) {
@@ -1367,6 +1368,49 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         else std::copy(outCoarse0, outCoarse0 + width, outCoarseD2);
 
         tapLine.coarseLumaValid = coarseU2Real && coarseD2Real;
+
+        // ---- Narrow-notch coarse (centre row only) ----------------------
+        // A luma question wants luma specificity, so the carrier concern is
+        // secondary here and the notch must be the NARROWEST kind. The
+        // two-stride form used elsewhere, 0.5 * (raw[-2] + raw[+2]), never
+        // reads the centre at all: at a transition it interpolates ACROSS
+        // the feature it is being asked to report. This is the Y election's
+        // plane-5 notch instead, which keeps the centre at half weight over
+        // the same support, so the value belongs to THIS sample.
+        //
+        // The reduction is a MEDOID over the four complete carrier cycles
+        // the sample is a member of, not a mean of them. The mean above
+        // (centeredCarrierCycle4Mean) is a fifth, centred construction that
+        // is none of the memberships, and it blends in cycles skewed by an
+        // outlier sitting at their far edge. Choosing one membership leaves
+        // no mixing, just a preferred coarse. Within three samples of the
+        // active edge a sample has fewer than four complete memberships, so
+        // only the complete ones vote.
+        auto narrowNotchAt = [&](const CombTapScalar *tap, int i)->double {
+            const int c  = std::clamp(i,     0, width - 1);
+            const int cm = std::clamp(i - 2, 0, width - 1);
+            const int cp = std::clamp(i + 2, 0, width - 1);
+            return 0.25 * (tap[cm].raw + 2.0 * tap[c].raw + tap[cp].raw);
+        };
+        {
+            double *outNotch0 = tapLine.notchCoarse0IRE.data();
+            for (int rel = 0; rel < width; ++rel) {
+                double cycles[4];
+                int nCycles = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int a = rel - 3 + k;
+                    if (a < 0 || a + 3 > width - 1) continue;
+                    cycles[nCycles++] =
+                        0.25 * (narrowNotchAt(t0, a) +
+                                narrowNotchAt(t0, a + 1) +
+                                narrowNotchAt(t0, a + 2) +
+                                narrowNotchAt(t0, a + 3));
+                }
+                outNotch0[rel] =
+                    (nCycles > 0 ? coarseCycleMedoid(cycles, nCycles)
+                                 : narrowNotchAt(t0, rel)) * invI;
+            }
+        }
 
         for (int rel = 0; rel < width; ++rel) {
             const CombTapScalar &sC  = t0[rel];

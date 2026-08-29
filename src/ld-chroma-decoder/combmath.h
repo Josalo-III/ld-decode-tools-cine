@@ -217,6 +217,26 @@ inline T centeredCarrierCycle4Mean(const T &minus2,
            (minus1 + center + plus1) * 0.25;
 }
 
+// Reduce the complete carrier cycles a sample is a MEMBER of by choosing one
+// of them, never by averaging them.  A mean publishes a value none of the
+// memberships measured, and lets a cycle skewed by an outlier at its far edge
+// pull the result; the medoid returns the membership the others agree with, so
+// what is published was actually observed.  Ties resolve to the lowest index,
+// so the choice is deterministic.
+inline double coarseCycleMedoid(const double *cycles, int count)
+{
+    if (count <= 0) return 0.0;
+    int best = 0;
+    double bestCost = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < count; ++i) {
+        double cost = 0.0;
+        for (int j = 0; j < count; ++j)
+            cost += std::fabs(cycles[i] - cycles[j]);
+        if (cost < bestCost) { bestCost = cost; best = i; }
+    }
+    return cycles[best];
+}
+
 // Shared fractional-basis demod helpers. These are tiny math utilities used by
 // both the locked demod path and candidate generation.
 inline constexpr double CAL_EPS_SAMPLES = -0.07;
