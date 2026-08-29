@@ -58,6 +58,18 @@ struct DistCensus {
     }
 };
 DistCensus g_distCensus;
+
+// The legacy 2D reader is the one default-off consumer that addresses the 1D
+// plane by absolute h, so the buffer setup has to know about it before split2D
+// runs.  One reader, one answer.
+bool ldcdOldSplit2D()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_OLD_SPLIT2D");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
 } // namespace
 
 #include "combmath.h"
@@ -695,6 +707,16 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             regionAlienPartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
+            // The h-indexed view of the locked 1D export exists only where a
+            // consumer addresses the 1D plane by absolute h: --ntsc1d, where
+            // the elected comb scalar IS the 1D scalar, and the legacy 2D
+            // reader.  Locked 2D/3D reads clpbuffer[1]/[2] and pays nothing.
+            if (configuration.dimensions == 1 || ldcdOldSplit2D()) {
+                lockedScalarH_flat.assign(
+                    size_t(demodLines) * videoParameters.fieldWidth, 0.0);
+            } else {
+                lockedScalarH_flat.clear();
+            }
             locked1DParallaxRepairStrength_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DParallaxRepairDelta_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             attributionEvidence_flat.assign(
@@ -872,6 +894,18 @@ void Comb::FrameBuffer::split1D()
 
         if (applyBucketHull)
             applyCarrierFeasibilityHull(line, dst + left);
+
+        // MIRROR THE MARGIN, matching the taps above (h-2 reflects to
+        // left+1 at the boundary) and the locked export's own margin.  The
+        // plane is only ever cleared and written across [left, right), so
+        // anything reading one sample past the boundary used to get whatever
+        // the previous frame left there.  Reflection is the policy everywhere
+        // else in this decoder; a stale sample is not a policy at all.
+        const int w = right - left;
+        for (int h = 0; h < left; ++h)
+            dst[h] = dst[left + std::clamp(left - h - 1, 0, w - 1)];
+        for (int h = right; h < fullWidth; ++h)
+            dst[h] = dst[left + std::clamp(2 * w - 1 - (h - left), 0, w - 1)];
     }
 }
 
@@ -2809,20 +2843,29 @@ void Comb::FrameBuffer::split2D()
     // the UNPROTECTED error catalogue (e.g. the bikini-bottom upper shadow)
     // that the chroma-boundary band was installed to quash, so the 2D
     // threshold revisit can compare against what the guards actually buy.
-    static const bool oldSplit2D = []{
-        const char *s = std::getenv("LDCD_OLD_SPLIT2D");
-        return s && std::atoi(s) != 0;
-    }();
-    if (oldSplit2D) {
-        static constexpr double blackLine[MAX_WIDTH] = {0};
+    if (ldcdOldSplit2D()) {
+        // MIRROR AT THE VERTICAL BOUNDS, NOT A BLACK LINE (author,
+        // 2026-08-28: "Main uses a black line for the bounds, I prefer
+        // mirroring; the black line produces a visible edge change").  A zero
+        // row is a maximal fake difference to a comb, so kp/kn saturate on the
+        // first and last active rows and the decision flips there for a reason
+        // that is not in the picture.  This is the rule resolveSameFieldTap
+        // already applies to the live path -- top row takes D2 for U2, bottom
+        // row takes U2 for D2 -- and the mirrored partner is the same field,
+        // so the ±2 anti-phase relation the comb needs is preserved.  Falling
+        // back to the centre row covers only a frame too short to hold either
+        // partner, where the difference terms go to zero rather than to a
+        // fabricated edge.
         for (int lineNumber = firstLine; lineNumber < lastLine; lineNumber++) {
-            const double *previousLine = blackLine;
-            if (lineNumber - 2 >= firstLine)
-                previousLine = clpbuffer[0].pixel[lineNumber - 2];
-            const double *currentLine = clpbuffer[0].pixel[lineNumber];
-            const double *nextLine = blackLine;
-            if (lineNumber + 2 < lastLine)
-                nextLine = clpbuffer[0].pixel[lineNumber + 2];
+            const int prevLn = (lineNumber - 2 >= firstLine) ? lineNumber - 2
+                             : (lineNumber + 2 <  lastLine)  ? lineNumber + 2
+                                                             : lineNumber;
+            const int nextLn = (lineNumber + 2 <  lastLine)  ? lineNumber + 2
+                             : (lineNumber - 2 >= firstLine) ? lineNumber - 2
+                                                             : lineNumber;
+            const double *previousLine = scalar1DRow_h(prevLn);
+            const double *currentLine  = scalar1DRow_h(lineNumber);
+            const double *nextLine     = scalar1DRow_h(nextLn);
 
             for (int h = left; h < right; h++) {
                 double kp, kn;

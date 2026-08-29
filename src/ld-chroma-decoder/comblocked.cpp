@@ -1376,9 +1376,35 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         if (grammar)
             grammar->projectionValid = false;
 
-        double *published = clpbuffer[0].pixel[line];
-        for (int rel = 0; rel < width; ++rel)
-            published[left + rel] = lockedSource[rel];
+        // The locked 1D export is published to locked1DSource_flat above and
+        // is NOT copied onto clpbuffer[0]: that plane means the blind 1D
+        // bandpass in both modes.  Where a consumer addresses the 1D plane by
+        // absolute h (--ntsc1d, the legacy 2D reader) the h-indexed view is
+        // allocated and mirrored here; otherwise there is nothing to mirror.
+        //
+        // EDGE POLICY IS MIRROR (author, 2026-08-28: "the locked mode edge
+        // handling was supposed to be mirroring").  The margin outside the
+        // active region is filled by the same half-sample reflection the
+        // canonical bandpass builder uses (rawMirror in buildCarrierAnalysis)
+        // and that split1D applies to the bucket plane: rel -1 reads rel 0,
+        // rel -2 reads rel 1.  A consumer that steps one sample past the
+        // boundary then gets the designed value instead of a zero -- and
+        // instead of what clpbuffer[0] served it before this plane existed,
+        // which was whatever the previous frame had left in the margin, since
+        // that plane is only ever cleared and written across [left, right).
+        if (double *publishedH = lockedScalarH_line(line)) {
+            for (int rel = 0; rel < width; ++rel)
+                publishedH[left + rel] = lockedSource[rel];
+            auto mirrorRel = [&](int rel) {
+                if (rel < 0)           rel = -rel - 1;
+                else if (rel >= width) rel = 2 * width - 1 - rel;
+                return std::clamp(rel, 0, width - 1);
+            };
+            for (int h = 0; h < left; ++h)
+                publishedH[h] = lockedSource[mirrorRel(h - left)];
+            for (int h = right; h < fullWidth; ++h)
+                publishedH[h] = lockedSource[mirrorRel(h - left)];
+        }
     }
 
     static const bool regionKeepEnabled = []{
@@ -1513,8 +1539,6 @@ void Comb::FrameBuffer::buildCrossColorReturn()
         return std::clamp(v, 0.0, 1.0);
     };
 
-    const int srcBuf = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
-
     static const bool bwCrossColor = []{
         const char *s = std::getenv("LDCD_BW_CROSSCOLOR");
         return s && std::atoi(s) != 0;
@@ -1548,7 +1572,7 @@ void Comb::FrameBuffer::buildCrossColorReturn()
     std::vector<int> ccLaneId(width), ccLaneIndex(width);
 
     for (int line = firstLine; line < lastLine; ++line) {
-        const double *combLine = clpbuffer[srcBuf].pixel[line];
+        const double *combLine = activeCombScalarRow(line);
         float *impurityRow = carrierImpurity_line(line);
         if (!impurityRow) continue;
 
@@ -1696,7 +1720,6 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
     const auto &T       = configuration.tunables;
-    const int srcBuf    = std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
 
     if (width <= 0 || firstLine >= lastLine) return;
 
@@ -1736,7 +1759,7 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
     }();
 
     for (int line = firstLine; line < lastLine; ++line) {
-        const double *src = clpbuffer[srcBuf].pixel[line];
+        const double *src = activeCombScalarRow(line);
 
         const CombCarrierGrammar *grammar = carrierGrammarLine(line);
         const bool grammarLocked = grammar && grammar->grammarLocked;
@@ -3967,7 +3990,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
     const int width     = right - left;
     if (width <= 0) return;
 
-    const int srcBuf = std::clamp((int)configuration.dimensions - 1, 0, 2);
     const bool showMap = configuration.showMap;
     static const bool oneDThroughProduceY = []{
         const char *e = std::getenv("LDCD_1D_PRODUCEY");
@@ -3977,7 +3999,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *raw = rawbuffer.constData()
                                  + static_cast<size_t>(line) * fullWidth;
-            const double *carrier = clpbuffer[0].pixel[line];
+            const double *carrier = scalar1DRow_h(line);
             double *Y = componentFrame->y(line);
             if (!carrier || !Y) continue;
             for (int h = left; h < right; ++h)
@@ -4050,7 +4072,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
 
         const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
         double *Y = componentFrame->y(line);
-        const double *clpLine = clpbuffer[srcBuf].pixel[line];
+        const double *clpLine = activeCombScalarRow(line);
         const double *carrierComp = lockedCarrierComposite_line(line);
         static const bool attrView = []{
             const char *e = std::getenv("LDCD_ATTR_VIEW");
@@ -4721,7 +4743,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 if (!n.have) return n;
                 n.raw = rawbuffer.data() + l * fullWidth;
                 n.cc = lockedCarrierComposite_line(l);
-                n.clp = clpbuffer[srcBuf].pixel[l];
+                n.clp = activeCombScalarRow(l);
                 n.ret = carrierRetracted_line(l);
                 n.coarse = coarseFloor_line(l);
                 n.analysis = carrierAnalysis_line(l);

@@ -669,12 +669,14 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         // Fact-family injection is covered-only. On uncovered frames this is
         // the ordinary 1D observation; no two-sided estimate may become a tap
         // base.
-        // LDCD_TAP_FACTS=0 restores the pre-injection base for A/B.
-        static const bool tapFactsOn = []{
-            const char *s = std::getenv("LDCD_TAP_FACTS");
-            return !(s && std::atoi(s) == 0);
-        }();
-        if (configuration.phaseCompensation && !tapFactsOn)
+        //
+        // LDCD_TAP_FACTS is gone (2026-08-28).  It selected between
+        // clpbuffer[0] and locked1DSource_line and was described as
+        // post-injection versus pre-injection, but the locked publish copied
+        // one onto the other verbatim over the same active region, so both
+        // branches addressed the same numbers and the escape could not change
+        // a render.  The locked export is now named directly.
+        if (configuration.phaseCompensation)
             return locked1DSource_line(ln);
         return bucketScalar1D_line(ln) + left;
     };
@@ -2048,11 +2050,14 @@ void Comb::FrameBuffer::computeFrameALine(
     auto scalarLine = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
         // Covered frames may carry their certified construction here;
-        // uncovered frames retain the ordinary 1D observation. +left keeps
-        // this branch's rel-indexing convention.
+        // uncovered frames retain the ordinary 1D observation.  Both branches
+        // are rel-indexed: the locked export already is, and the bucket row
+        // takes +left to match.  (Frame B is locked-only -- needFrameBCompute
+        // requires phaseCompensation -- so the second branch is a guard, not
+        // a path.)
         return configuration.phaseCompensation
-            ? bucketScalar1D_line(ln) + left
-            : bucketScalar1D_line(ln);
+            ? locked1DSource_line(ln)
+            : bucketScalar1D_line(ln) + left;
     };
 
     const double *preclean0  = precleanLinePtr(line, width);

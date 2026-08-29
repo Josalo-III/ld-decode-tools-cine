@@ -689,6 +689,14 @@ private:
 		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
 	} clpbuffer[3];
 	// clpbuffer[0]: 1D scalar plane, filled by split1D() (blind 1D bandpass).
+	//               ONE MEANING, BOTH MODES.  The locked path used to
+	//               publish its phase-corrected 1D export over this plane, so
+	//               the buffer meant two different things depending on
+	//               phaseCompensation and the blind bandpass was unreachable
+	//               downstream in locked mode.  The locked export now lives
+	//               only in locked1DSource_flat (rel-indexed), with
+	//               lockedScalarH_flat as its h-indexed view where one is
+	//               needed.
 	// clpbuffer[1]: 2D candidate plane, filled by split2D().
 	// clpbuffer[2]: 3D temporal refinement plane, filled by split3D().
 
@@ -1152,6 +1160,15 @@ private:
 		//     scalarReachSource(); grammar answers per line pair.
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
+		// H-INDEXED VIEW of locked1DSource_flat, in clpbuffer geometry
+		// (fieldWidth stride), for the sites that address the active comb scalar
+		// by absolute h.  Allocated ONLY where such a site can read the 1D
+		// plane: locked --ntsc1d (where the active comb source IS the 1D
+		// scalar) and the LDCD_OLD_SPLIT2D legacy reader.  The shipping locked
+		// 2D/3D path reads clpbuffer[1]/[2] and never allocates this, so it
+		// costs nothing there.  Empty means "not this configuration", never
+		// "not yet built".
+		std::vector<double> lockedScalarH_flat;
 		std::vector<float> locked1DParallaxRepairStrength_flat; // [0,1] actual Pass-1.5 applied repair strength
 		// Signed Pass-1.5 applied repair delta (signal units) per sample.
 		// Published so the retraction stage can align carrierFit with the
@@ -1443,9 +1460,55 @@ private:
 		return locked1DParallaxRepairDelta_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
-	// Bucket-path 1D scalar: valid only after split1D().
+	// The blind 1D bandpass from split1D(), h-indexed.  This is now its
+	// meaning in BOTH modes -- in locked mode it is the pre-locked-head
+	// observation, not the locked export.  A consumer that wants the locked
+	// scalar must ask for it by name.
 	inline const double *bucketScalar1D_line(int line) const {
 		return clpbuffer[0].pixel[line];
+	}
+
+	// The locked 1D export in h geometry.  Null unless this configuration
+	// allocated the view (see lockedScalarH_flat).
+	inline double *lockedScalarH_line(int line) {
+		if (line < 0 || line >= demodLines || lockedScalarH_flat.empty())
+			return nullptr;
+		return lockedScalarH_flat.data() +
+		       static_cast<size_t>(line) * videoParameters.fieldWidth;
+	}
+
+	inline const double *lockedScalarH_line(int line) const {
+		if (line < 0 || line >= demodLines || lockedScalarH_flat.empty())
+			return nullptr;
+		return lockedScalarH_flat.data() +
+		       static_cast<size_t>(line) * videoParameters.fieldWidth;
+	}
+
+	// The 1D scalar source for this mode, h-indexed: locked export where one
+	// exists, blind bandpass otherwise.  Callers holding a rel-indexed
+	// convention should use locked1DSource_line() directly instead.
+	inline const double *scalar1DRow_h(int line) const {
+		if (configuration.phaseCompensation) {
+			const double *locked = lockedScalarH_line(line);
+			if (locked) return locked;
+		}
+		return bucketScalar1D_line(line);
+	}
+
+	// Which clpbuffer plane holds the elected comb scalar for this
+	// dimensionality.  Kept in one place so no site does its own arithmetic
+	// on the plane index.
+	inline int activeCombPlaneIndex() const {
+		return std::clamp(static_cast<int>(configuration.dimensions) - 1, 0, 2);
+	}
+
+	// The elected comb scalar row, h-indexed.  At dimensions == 1 the elected
+	// comb IS the 1D scalar, so in locked mode this resolves to the locked
+	// export rather than to the blind bandpass sitting in clpbuffer[0].
+	inline const double *activeCombScalarRow(int line) const {
+		const int plane = activeCombPlaneIndex();
+		if (plane == 0) return scalar1DRow_h(line);
+		return clpbuffer[plane].pixel[line];
 	}
 
 	inline AttributionEvidence *attributionEvidence_line(int line) {
