@@ -812,7 +812,11 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
     const bool cadenceEditSplit = editSplit && !configuration.imposedCadence;
     cadenceId = lddecode::mergeCadenceIdForInterleavedFrame(
         cidA, cidB, cadenceEditSplit);
-    if (!progressiveFrameRegimeAllowed)
+    // Preserve the explicit progressive cadence through passthrough.  The
+    // allowance still blocks rejected film-cadenced pairs, while mergeCadenceId
+    // above already maps edit splits and ordinary video pairs to video.
+    if (!progressiveFrameRegimeAllowed &&
+        cadenceId != lddecode::kCadenceProgressive)
         cadenceId = lddecode::kCadenceVideo;
     // Clear working planes only in active region for safety
     for (int buf = 0; buf < 3; ++buf) {

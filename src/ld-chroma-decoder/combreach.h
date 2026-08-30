@@ -101,6 +101,42 @@ struct CombReachSourceFrame {
     const char *tag = "unset-source";
 };
 
+// ---------------------------------------------------------------------------
+// Cancel planning: which legal legs, in what combination, cancel vertical luma.
+//
+// Every vertical comb in the tree is the same small problem.  Given the centre
+// and a set of legs whose carrier relation the grammar knows, choose weights w
+// satisfying
+//
+//     sum(w_i * s_i) = 1     carrier gain one     s = +1 Same, -1 Opposite
+//     sum(w_i)       = 0     constant luma cancels
+//     sum(w_i * d_i) = 0     linear vertical luma cancels    d = line offset
+//
+// Three equations, so centre plus two legs is determined.  The familiar shapes
+// all fall out of it rather than being written down separately:
+//
+//     {c, -2, +2}   0.50, -0.25, -0.25    the symmetric +-2 comb
+//     {c, +2, +4}   0.25, -0.50, +0.25    one-sided, gradient from its own side
+//     {c, +2, -4}   0.75, -0.50, -0.25    one-sided, gradient from the far side
+//
+// The +-4 legs are Same, so they carry no separable carrier; they earn their
+// place by supplying the gradient term, carrier-free by construction.  A pair
+// of Same legs alone cannot satisfy row one and row two together -- which is
+// the algebra's way of saying +-4 is a luma instrument.
+//
+struct CombReachCancelLeg {
+	int offset = 0;          // admitted line offset from centre
+};
+
+struct CombReachCancelPlan {
+    bool   valid   = false;
+    int    leg2    = 0;      // the Opposite leg carrying the carrier, 0 if none
+    int    leg4    = 0;      // the Same leg supplying the gradient, 0 if none
+	double wCenter = 0.0;
+	double wLeg2   = 0.0;
+	double wLeg4   = 0.0;
+};
+
 struct CombReachRequest {
     int centerLine = -1;
     int targetLine = -1;
@@ -149,6 +185,12 @@ public:
               int lastActiveLine);
 
     CombReachReply query(const CombReachRequest &request) const;
+    // See CombReachCancelPlan.  h selects the sample class for the relation
+    // lookup; the answer is constant along a line pair whose samplePhase0 agrees.
+    CombReachCancelPlan planCancel(int centerLine, int h,
+                                   const CombReachCancelLeg *legs,
+                                   int legCount) const;
+
     CombReachReply queryAgainst(const CombReachIndex &targetIndex,
                                  const CombReachRequest &request) const;
 

@@ -838,6 +838,41 @@ private:
 		std::vector<double> coarse0IRE;
 		std::vector<double> coarseU2IRE;
 		std::vector<double> coarseD2IRE;
+		// Carrier-free coarse luma at the +-4 reach.  These rows provide the
+		// vertical gradient needed by the clean-slate one-sided +-2 cancel.
+		std::vector<double> coarseU4IRE;
+		std::vector<double> coarseD4IRE;
+
+		// SHARED TRIGGER FACTS.  One scan publishes the grammar-folded reach
+		// residuals and lateral cornering without thresholds or gating.  Each
+		// candidate owns its policy instead of rebuilding the measurements.
+		//
+		// One definition serves all three distances: fold the neighbour by the
+		// grammar's relation and publish what that relation does not explain.
+		//
+		//   Opposite  ->  |bp[L] + bp[L+-k]|   the carrier should have
+		//                                      cancelled; what remains is the
+		//                                      premise violation -- a CHROMA
+		//                                      trigger.
+		//   Same      ->  |bp[L] - bp[L+-k]|   the carrier cancels by identity;
+		//                                      what remains is the vertical
+		//                                      LUMA gradient.
+		//
+		// So +-2 (always Opposite) publishes a chroma trigger and +-4 (always
+		// Same) publishes the gradient term the one-sided cancel needs, from
+		// the same line of code.  +-1 is Same on one side and Opposite on the
+		// other, which is why the fold is asked PER SIDE rather than per
+		// distance.
+		//
+		// The magnitude uses a canonical non-overlapping stride-2 vector pair,
+		// lattice-aligned by samplePhase0, so hue rotation at constant
+		// saturation registers.  +-1 is a corroborating observation of the
+		// trigger, not an additional reach.
+		std::vector<double> vReachResid1IRE;
+		std::vector<double> vReachResid2IRE;
+		std::vector<double> vReachResid4IRE;
+		std::vector<double> lateralCornerIRE;
+		bool triggerFacts1Valid = false;   // +-1 taps exist (frame regime)
 		// Narrow-notch coarse for the centre row, published ALONGSIDE
 		// coarse0IRE and never in place of it -- the contour and vertical
 		// work keep the locked decomposition where it is the better
@@ -1800,6 +1835,14 @@ private:
 	void computeFieldBLine(int lineNumber,
 						  double *outFieldLine,
 						  std::uint8_t *outReasonLine = nullptr);
+	// Clean-slate Field B experiment (LDCD_FIELDB_CLEAN=1).  It applies
+	// per-side content evidence directly and uses +-4 coarse luma to restore
+	// the gradient missing from a one-sided +-2 cancel.  It deliberately omits
+	// the shipped path's accumulated cede and recovery policy.
+	void computeFieldBLineClean(const CombTapLine &tapLine,
+	                            double *outFieldLine,
+	                            std::uint8_t *outReasonLine);
+
 	void computeFieldBLine(const CombTapLine &tapLine,
 						  double *outFieldLine,
 						  std::uint8_t *outReasonLine = nullptr);

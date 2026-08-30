@@ -17,6 +17,7 @@
  * live in a single translation unit.
  ******************************************************************************/
 
+#include <string>
 #include "comb.h"
 #include "combmath.h"
 
@@ -657,6 +658,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.coarse0IRE);
         ensureWidth(tapLine.coarseU2IRE);
         ensureWidth(tapLine.coarseD2IRE);
+        ensureWidth(tapLine.coarseU4IRE);
+        ensureWidth(tapLine.coarseD4IRE);
+        ensureWidth(tapLine.vReachResid1IRE);
+        ensureWidth(tapLine.vReachResid2IRE);
+        ensureWidth(tapLine.vReachResid4IRE);
+        ensureWidth(tapLine.lateralCornerIRE);
         ensureWidth(tapLine.notchCoarse0IRE);
     }
 
@@ -1312,6 +1319,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         double *outCoarse0 = tapLine.coarse0IRE.data();
         double *outCoarseU2 = tapLine.coarseU2IRE.data();
         double *outCoarseD2 = tapLine.coarseD2IRE.data();
+        double *outCoarseU4 = tapLine.coarseU4IRE.data();
+        double *outCoarseD4 = tapLine.coarseD4IRE.data();
 
         // ---- Coarse luma rows -------------------------------------------
         // Locked mode publishes a dedicated carrier-free decomposition row.
@@ -1370,6 +1379,87 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         else std::copy(outCoarse0, outCoarse0 + width, outCoarseD2);
 
         tapLine.coarseLumaValid = coarseU2Real && coarseD2Real;
+
+        // Same rules at +-4: an absent row falls back to the centre so a
+        // zero row can never read as a huge false gradient, and the validity
+        // flag reports whether either neighbour was real.
+        const bool coarseU4Real = (lumaU4 != nullptr) || tapLine.haveU4;
+        const bool coarseD4Real = (lumaD4 != nullptr) || tapLine.haveD4;
+        if (lumaU4)            fillLockedCoarse(lumaU4, outCoarseU4);
+        else if (coarseU4Real) fillNotchCoarse(tU4, outCoarseU4);
+        else std::copy(outCoarse0, outCoarse0 + width, outCoarseU4);
+        if (lumaD4)            fillLockedCoarse(lumaD4, outCoarseD4);
+        else if (coarseD4Real) fillNotchCoarse(tD4, outCoarseD4);
+        else std::copy(outCoarse0, outCoarse0 + width, outCoarseD4);
+        // ---- Shared trigger facts (see comb.h) --------------------------
+        {
+            const CombCarrierGrammar *tgGram = carrierGrammarLine(lineNumber);
+            const int sp0 = tgGram ? (tgGram->samplePhase0 & 1) : 0;
+            // The tap's `comp` IS the carrier at that sample -- the locked
+            // path publishes it and leaves `raw` unfetched, so reconstructing
+            // a bandpass here would both duplicate the math and (in locked
+            // mode) read an empty row.  Take the published product.
+            auto carrierRow = [&](const CombTapScalar *tap,
+                                  std::vector<double> &out) {
+                out.assign(width, 0.0);
+                for (int i = 0; i < width; ++i) out[i] = tap[i].comp * invI;
+            };
+            // Magnitude of the residual VECTOR: canonical non-overlapping
+            // stride-2 pair, lattice-aligned, held over the pair.
+            auto envelope = [&](const std::vector<double> &v,
+                                std::vector<double> &out) {
+                out.assign(width, 0.0);
+                for (int i = sp0; i + 1 < width; i += 2) {
+                    const double e = std::hypot(v[i], v[i + 1]);
+                    out[i] = e; out[i + 1] = e;
+                }
+                if (sp0 == 1 && width > 1) out[0] = out[1];
+            };
+            std::vector<double> bp0, bpN, res, env;
+            carrierRow(t0, bp0);
+            // The fold is ASKED of the grammar per side; nothing here assumes
+            // a relation from the distance.
+            auto foldSide = [&](const CombTapScalar *tap, bool have, int dLine,
+                                std::vector<double> &dst) {
+                if (!have) return;
+                const CombCarrierGrammar *gN =
+                    carrierGrammarLine(lineNumber + dLine);
+                if (!tgGram || !gN) return;
+                const int h0 = videoParameters.activeVideoStart;
+                const lddecode::CarrierPhaseRelation rel =
+                    lddecode::carrierGrammarSignedPhaseRelation(
+                        tgGram, h0, gN, h0);
+                double sgn;
+                if (rel == lddecode::CarrierPhaseRelation::Opposite) sgn = +1.0;
+                else if (rel == lddecode::CarrierPhaseRelation::Same) sgn = -1.0;
+                else return;
+                carrierRow(tap, bpN);
+                res.assign(width, 0.0);
+                for (int i = 0; i < width; ++i) res[i] = bp0[i] + sgn * bpN[i];
+                envelope(res, env);
+                for (int i = 0; i < width; ++i)
+                    dst[i] = std::max(dst[i], env[i]);
+            };
+            tapLine.vReachResid1IRE.assign(width, 0.0);
+            tapLine.vReachResid2IRE.assign(width, 0.0);
+            tapLine.vReachResid4IRE.assign(width, 0.0);
+            foldSide(tapLine.tapU1.data(), tapLine.haveU1, -1, tapLine.vReachResid1IRE);
+            foldSide(tapLine.tapD1.data(), tapLine.haveD1, +1, tapLine.vReachResid1IRE);
+            foldSide(tU2, haveU2, -2, tapLine.vReachResid2IRE);
+            foldSide(tD2, haveD2, +2, tapLine.vReachResid2IRE);
+            foldSide(tU4, tapLine.haveU4, -4, tapLine.vReachResid4IRE);
+            foldSide(tD4, tapLine.haveD4, +4, tapLine.vReachResid4IRE);
+            // Lateral cornering: second difference of the CARRIER-FREE luma
+            // at stride 2, taken from the coarse row this same pass already
+            // published rather than re-derived.
+            for (int i = 0; i < width; ++i) {
+                const int m  = std::clamp(i - 2, 0, width - 1);
+                const int p2 = std::clamp(i + 2, 0, width - 1);
+                tapLine.lateralCornerIRE[i] = std::fabs(
+                    outCoarse0[i] - 0.5 * (outCoarse0[m] + outCoarse0[p2]));
+            }
+            tapLine.triggerFacts1Valid = tapLine.haveU1 || tapLine.haveD1;
+        }
 
         // ---- Narrow-notch coarse (centre row only) ----------------------
         // A luma question wants luma specificity, so the carrier concern is
@@ -1729,10 +1819,198 @@ void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
 // legacy split2D edge shape, and the normalized half-difference preserves full
 // comb authority.  Content-region facts act only as binary admission/cede
 // decisions so unsafe preclean never reaches either Frame constructor.
+static bool ldcdFieldBClean()
+{
+    static const bool v = []{
+        const char *e = std::getenv("LDCD_FIELDB_CLEAN");
+        return e && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+// Refusal threshold on a leg's own measured chroma step.
+static double ldcdFieldBCleanStepIRE()
+{
+    static const double v = []{
+        const char *e = std::getenv("LDCD_FIELDB_CLEAN_STEP");
+        return e ? std::atof(e) : 11.0;
+    }();
+    return v;
+}
+
+// ISOLATION HARNESS.  The clean baseline admits a leg on grammar LEGALITY
+// alone; LDCD_FIELDB_CLEAN_ADD names ONE mechanism to add on top, so each can
+// be judged by itself rather than inside the stack that grew around it.
+// Broad band cede, revive, and 3x leg-selection policies are deliberately not
+// offered here; this isolates the per-column mechanisms.
+static bool ldcdFieldBCleanAdd(const char *who)
+{
+    static const std::string spec = []{
+        const char *e = std::getenv("LDCD_FIELDB_CLEAN_ADD");
+        return std::string(e ? e : "");
+    }();
+    if (spec.empty()) return false;
+    return spec.find(who) != std::string::npos;
+}
+
+void Comb::FrameBuffer::computeFieldBLineClean(const CombTapLine &tapLine,
+                                               double *outFieldLine,
+                                               std::uint8_t *outReasonLine)
+{
+    const int width =
+        videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
+    const int lineNumber = tapLine.cacheLine;
+    if (width <= 0 || !outFieldLine) return;
+
+    const bool haveU = tapLine.haveU2 &&
+        static_cast<int>(tapLine.tapU2.size()) >= width;
+    const bool haveD = tapLine.haveD2 &&
+        static_cast<int>(tapLine.tapD2.size()) >= width;
+    const bool have4 =
+        static_cast<int>(tapLine.coarseU4IRE.size()) >= width &&
+        static_cast<int>(tapLine.coarseD4IRE.size()) >= width &&
+        static_cast<int>(tapLine.tapU4.size()) >= width &&
+        static_cast<int>(tapLine.tapD4.size()) >= width;
+
+    const double stepIRE = ldcdFieldBCleanStepIRE();
+    constexpr double kSlopeTolIRE = 3.0;
+    constexpr double kGradMinIRE  = 1.0;
+    constexpr double kBaseIRE = 6.0;
+    constexpr double kKappa = 0.45;
+    constexpr double kLumaHardBreakIRE = 14.0;
+    const bool addRegion    = ldcdFieldBCleanAdd("region");
+    const bool addStep      = ldcdFieldBCleanAdd("step");
+    const bool addBoundary  = ldcdFieldBCleanAdd("boundary");
+    const bool addLumaBreak = ldcdFieldBCleanAdd("lumabreak");
+    const bool haveCoarse =
+        tapLine.coarseLumaValid &&
+        static_cast<int>(tapLine.coarse0IRE.size()) >= width &&
+        static_cast<int>(tapLine.coarseU2IRE.size()) >= width &&
+        static_cast<int>(tapLine.coarseD2IRE.size()) >= width;
+    // The lurch step gate the boundary bound rides on: a published service,
+    // read here, not rebuilt.
+    std::vector<float> hgAt(width, 0.0f);
+    for (const LurchStepRun &run : corroborateLurchEdges(lineNumber)) {
+        if (run.suppressed) continue;
+        const double gate = std::clamp(run.gate, 0.0, 1.0);
+        if (gate <= 0.0) continue;
+        const float hg = static_cast<float>(run.stepAbsIRE * gate);
+        const int xa = std::max(0, run.a);
+        const int xb = std::min(width - 1, run.b + 3);
+        for (int x = xa; x <= xb; ++x) hgAt[x] = std::max(hgAt[x], hg);
+    }
+    using RR = CombContentReach::RegionRelation;
+    const CombContentReach::IntrafieldRegionReach unknownRegion;
+    std::uint8_t *bandOut = chromaBoundaryBand_line(lineNumber);
+
+    for (int rel = 0; rel < width; ++rel) {
+        const double center = tapLine.tap0[rel].comp;
+        const auto &region =
+            rel < static_cast<int>(tapLine.intrafieldRegionReach.size())
+                ? tapLine.intrafieldRegionReach[rel] : unknownRegion;
+        if (bandOut) bandOut[rel] = region.chromaBoundaryBand ? 1 : 0;
+
+        // Per side, on the MEASURED evidence -- never the promoted verdicts,
+        // which carry the old policy.  A side is refused on its own account;
+        // the other side is not consulted and never surrenders with it.
+        const double bound = kBaseIRE + kKappa * hgAt[rel];
+        auto sideOk = [&](bool have, bool legal, RR measured, double diffIRE,
+                          double coarseNeighbour) {
+            if (!have || !legal) return false;
+            if (addRegion && measured == RR::DifferentRegion) return false;
+            if (addStep && diffIRE >= stepIRE) return false;
+            if (addBoundary && measured == RR::DifferentRegion &&
+                diffIRE >= bound) return false;
+            if (addLumaBreak && haveCoarse && measured != RR::AlienCancel &&
+                std::fabs(tapLine.coarse0IRE[rel] - coarseNeighbour) >=
+                    kLumaHardBreakIRE) return false;
+            return true;
+        };
+        const bool upOk = sideOk(haveU,
+            haveU && tapLine.pairU2[rel].reachLegalGate > 0.0,
+            region.upMeasured, region.upDifferenceIRE,
+            haveCoarse ? tapLine.coarseU2IRE[rel] : 0.0);
+        const bool downOk = sideOk(haveD,
+            haveD && tapLine.pairD2[rel].reachLegalGate > 0.0,
+            region.downMeasured, region.downDifferenceIRE,
+            haveCoarse ? tapLine.coarseD2IRE[rel] : 0.0);
+
+        double output = center;
+        std::uint8_t reason = FieldBReasonCenter;
+
+        if (upOk || downOk) {
+            lddecode::CombReachCancelLeg legs[4];
+            int n = 0;
+            if (upOk)   legs[n++] = { -2 };
+            if (downOk) legs[n++] = {  2 };
+            if (have4 && !(upOk && downOk)) {
+                if (tapLine.haveU4) legs[n++] = { -4 };
+                if (tapLine.haveD4) legs[n++] = {  4 };
+            }
+            const lddecode::CombReachCancelPlan plan =
+                combReachIndex.planCancel(
+                    lineNumber, videoParameters.activeVideoStart + rel,
+                    legs, n);
+            if (plan.valid) {
+                bool take = true;
+                if (plan.leg4 != 0 && (plan.leg4 % 4) == 0 && have4) {
+                    const double c0  = tapLine.coarse0IRE[rel];
+                    const double cL2 = (plan.leg2 > 0) ? tapLine.coarseD2IRE[rel]
+                                                       : tapLine.coarseU2IRE[rel];
+                    const double cL4 = (plan.leg4 > 0) ? tapLine.coarseD4IRE[rel]
+                                                       : tapLine.coarseU4IRE[rel];
+                    const double gradient = c0 - cL4;
+                    const bool nearSide = (plan.leg4 * plan.leg2) > 0;
+                    const double predicted = nearSide ? 0.5 * gradient
+                                                      : -0.5 * gradient;
+                    const double mismatch = std::fabs((cL2 - c0) - predicted);
+                    take = std::fabs(gradient) >= kGradMinIRE &&
+                           (nearSide || mismatch < kSlopeTolIRE);
+                }
+                if (take) {
+                    auto legValue = [&](int off) {
+                        switch (off) {
+                            case -2: return tapLine.tapU2[rel].comp;
+                            case  2: return tapLine.tapD2[rel].comp;
+                            case -4: return tapLine.tapU4[rel].comp;
+                            case  4: return tapLine.tapD4[rel].comp;
+                        }
+                        return 0.0;
+                    };
+                    const double v = plan.wCenter * center +
+                                     plan.wLeg2 * legValue(plan.leg2) +
+                                     plan.wLeg4 * legValue(plan.leg4);
+                    if (std::isfinite(v)) {
+                        output = v;
+                        reason = (upOk && downOk) ? FieldBReasonBlend
+                                                  : FieldBReasonOneLeg;
+                    }
+                } else if (upOk != downOk) {
+                    // Gradient refused: the plain one-sided cancel stands.
+                    const double leg = upOk ? tapLine.tapU2[rel].comp
+                                            : tapLine.tapD2[rel].comp;
+                    output = 0.5 * (center - leg);
+                    reason = FieldBReasonOneLeg;
+                }
+            }
+        } else {
+            reason = FieldBReasonCede;
+        }
+
+        if (!std::isfinite(output)) { output = center; reason = FieldBReasonCenter; }
+        outFieldLine[rel] = output;
+        if (outReasonLine) outReasonLine[rel] = reason;
+    }
+}
+
 void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                                           double *outFieldLine,
                                           std::uint8_t *outReasonLine)
 {
+    if (ldcdFieldBClean()) {
+        computeFieldBLineClean(tapLine, outFieldLine, outReasonLine);
+        return;
+    }
     const int width =
         videoParameters.activeVideoEnd - videoParameters.activeVideoStart;
     const int first = videoParameters.firstActiveFrameLine;
@@ -1916,6 +2194,7 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                 ? FieldBReasonRecovery
                 : ((useUp && useDown)
                     ? FieldBReasonBlend : FieldBReasonOneLeg);
+
         }
 
         if (!std::isfinite(output)) {

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "combmath.h"
 
@@ -214,6 +215,66 @@ CombReachReply CombReachIndex::query(const CombReachRequest &request) const
     const CarrierGrammarState *target = grammarLine(request.targetLine);
 
     return queryGrammarPair(request, center, target);
+}
+
+CombReachCancelPlan CombReachIndex::planCancel(
+    int centerLine, int h,
+    const CombReachCancelLeg *legs, int legCount) const
+{
+    CombReachCancelPlan best;
+    const CarrierGrammarState *gc = grammarLine(centerLine);
+    if (!gc || !legs || legCount <= 0) return best;
+
+    struct Cand { int off; double s; };
+    Cand c[8]; int n = 0;
+    for (int i = 0; i < legCount && n < 8; ++i) {
+        const CarrierGrammarState *g = grammarLine(centerLine + legs[i].offset);
+        if (!g) continue;
+        // ASKED, once per line pair.  Nothing here rebuilds a schedule.
+        const CarrierPhaseRelation rel =
+            carrierGrammarSignedPhaseRelation(gc, h, g, h);
+        double sgn;
+        if (rel == CarrierPhaseRelation::Same)          sgn = +1.0;
+        else if (rel == CarrierPhaseRelation::Opposite) sgn = -1.0;
+        else continue;
+        c[n++] = { legs[i].offset, sgn };
+    }
+    if (n < 2) return best;
+
+    // centre plus two legs determines the three rows exactly.
+    double bestNoiseGain = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            const double s1 = c[i].s, s2 = c[j].s;
+            const double d1 = c[i].off, d2 = c[j].off;
+            // [ 1  s1  s2 ][w0]   [1]
+            // [ 1   1   1 ][w1] = [0]
+            // [ 0  d1  d2 ][w2]   [0]
+            const double det = (s1 - 1.0) * d2 - (s2 - 1.0) * d1;
+            if (std::fabs(det) < 1e-9) continue;      // e.g. two Same legs
+            const double w1 =  d2 / det;
+            const double w2 = -d1 / det;
+            const double w0 = -(w1 + w2);
+            const double gain = w0 * w0 + w1 * w1 + w2 * w2;
+            if (gain >= bestNoiseGain) continue;
+            best.valid = true;
+            bestNoiseGain = gain;
+            best.wCenter = w0;
+            // Name the Opposite leg as the carrier operand and the Same leg as
+            // the gradient; with two Opposite legs it is the symmetric pair.
+            if (s1 < 0.0 && s2 > 0.0) {
+                best.leg2 = c[i].off; best.wLeg2 = w1;
+                best.leg4 = c[j].off; best.wLeg4 = w2;
+            } else if (s2 < 0.0 && s1 > 0.0) {
+                best.leg2 = c[j].off; best.wLeg2 = w2;
+                best.leg4 = c[i].off; best.wLeg4 = w1;
+            } else {
+                best.leg2 = c[i].off; best.wLeg2 = w1;
+                best.leg4 = c[j].off; best.wLeg4 = w2;
+            }
+        }
+    }
+    return best;
 }
 
 CombReachReply CombReachIndex::queryAgainst(const CombReachIndex &targetIndex,

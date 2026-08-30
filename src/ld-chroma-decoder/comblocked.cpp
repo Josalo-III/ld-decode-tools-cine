@@ -6686,9 +6686,24 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                                        (double)rawLine[h + 1]);
                     }
                     const double *bpR = locked1DRawBandpass_line(line);
-                    if (bpR)
+                    // Centre the envelope on the sample used by the iceberg's
+                    // parabolic pin.  At 4fSC the x-1 and x+1 samples are 180
+                    // degrees apart, so the orthogonal component is their
+                    // half-difference.  This pooling is local to pin placement;
+                    // cross-colour return retains its independent lanes.
+                    static const bool iceEnvCentred = []{
+                        const char *e = std::getenv("LDCD_ICE_ENV_CENTRED");
+                        return !(e && std::atoi(e) == 0);   // DEFAULT ON
+                    }();
+                    if (bpR && iceEnvCentred) {
+                        for (int x = 1; x + 1 < width; ++x)
+                            env[x] = std::hypot(
+                                bpR[x], 0.5 * (bpR[x + 1] - bpR[x - 1]));
+                        if (width > 1) env[0] = env[1];
+                    } else if (bpR) {
                         for (int x = 0; x + 1 < width; ++x)
                             env[x] = std::hypot(bpR[x], bpR[x + 1]);
+                    }
                     std::vector<double> vRow(width,
                         std::numeric_limits<double>::quiet_NaN());
                     std::vector<double> wRow(width, 0.0);
