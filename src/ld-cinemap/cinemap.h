@@ -118,7 +118,7 @@ class CineMap {
   // Per-frame mixedness / combing metric, produced by computeFrameMixedness().
   struct FrameMixedness {
     int frameIndex = -1;  // 0-based frame index within capture
-    double score = 0.0;  // lips mixedness: does this frame comb (detail masked)
+    double score = 0.0;  // positive-only Lips field-difference evidence
 
     // The same read over the ACTIVE raster. The pattern machinery keeps the
     // centre ROI it was calibrated on; the VERDICT amplitude gates read this
@@ -332,11 +332,11 @@ class CineMap {
   static constexpr double FLOOR_MULT_RECALL = 2.00;
   static constexpr double FLOOR_MULT_GEOMETRY = 1.35;
 
-  // Lips owns mixedness, and unlike notch its zero is absolute: lips is a
-  // residual measured after masking the image's own vertical detail per pixel
-  // and after subtracting its own noise floor, so lips ~ 0 means "no comb"
-  // rather than merely "no vertical structure". That is what makes these two
-  // absolute constants legitimate where notch-scaled ones were not.
+  // Lips owns mixedness, but it is field difference rather than a comb
+  // detector. It masks the image's own vertical detail per pixel, subtracts
+  // its noise floor, discards negative evidence, and sums only the positive
+  // residual. Thus lips ~ 0 means no measurable field difference under that
+  // model, not proof that the frame is progressive.
   //
   // Measured across five discs:
   //   progressive / clean telecine frames  0.0002 - 0.008
@@ -345,13 +345,11 @@ class CineMap {
   //   genuine locks (max over window)      >= 0.189
   //   telecine mixed positions (cad 2,4)   3.3    - 25.3
   //
-  // LIPS_SILENCE gates a whole window: below it nothing in the window combs at
-  // all, so the segment carries no phase information and must abstain rather
-  // than let the percentile stretch invent one. LIPS_COMB is the per-frame
-  // question "does this frame comb", used by the 59.94i / progressive
-  // classifiers and by the CLV mixed-frame harvest.
+  // LIPS_SILENCE gates a whole window before percentile stretching can invent
+  // a phase from noise. LIPS_DIFFERENCE is the per-frame meaningful-residual
+  // threshold used by the regime classifiers and CLV mixed-frame harvest.
   static constexpr double LIPS_SILENCE = 0.05;
-  static constexpr double LIPS_COMB = 0.05;
+  static constexpr double LIPS_DIFFERENCE = 0.05;
 
   struct TwinDemodCacheKey {
     int a, b;
@@ -388,6 +386,14 @@ class CineMap {
 
   double calculateNotchScore(SourceVideo& sv, int f1, int f2, int width,
                              int height) const;
+
+  // Local field-vs-frame deviation, modelled on the 2D chroma decoder's
+  // interlace guard.  The interfield (opposite-parity, +/-1 frame-line)
+  // aperture and the intrafield (same-parity, +/-2 frame-line) aperture each
+  // estimate the same location.  Only positive disagreement above the guard
+  // floor accrues; quiet picture cannot average sparse motion away.
+  double calculateFieldDeviationScore(SourceVideo& sv, int f1, int f2,
+                                      int width, int height) const;
 
   double calculateLipsScore(SourceVideo& sv, int f1, int f2, int width,
                             int height, bool fullRaster = false) const;
@@ -652,8 +658,8 @@ class CineMap {
                                        int segEnd,
                                        const SegmentCaptureCache& cache);
 
-  // P is a demanding verdict; this is its bar, shared by the scan's crash
-  // candidate and the full-raster verification that grants it.
+  // P is a demanding verdict; this is the central Lips distribution's crash
+  // bar. Deviation formation and d=2 twins adjudicate the candidate.
   static constexpr double PROGRESSIVE_CRASH_P90 = 0.15;
 
 
@@ -749,6 +755,13 @@ class CineMap {
   int healContinuity(SourceVideo& sv, std::vector<SegmentResult>& segments,
                      const SegmentCaptureCache& cache);
 
+  // Replace only whole short -3 segments (or contiguous groups of whole
+  // segments) when film on both sides projects one uninterrupted cadence
+  // through them. Six fields is the three clean-looking frames in one 3:2
+  // cycle; a winning regime is never split internally by this repair.
+  int healProgressiveCadenceIslands(
+      const std::vector<SegmentResult>& segments, int maxSpanFields);
+
   // Paints CADENCE_PROGRESSIVE over every field still UNKNOWN after pattern,
   // facts, anchored healing, and cut recovery have declined — the unanchored
   // residue. Low confidence by design: this is the weakest claim in the
@@ -770,6 +783,13 @@ class CineMap {
   PhaseRun scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
                            int startField, int endField,
                            const SegmentCaptureCache& cache);
+
+  // A progressive crash is a claim that the two fields never diverge.  Before
+  // granting it, compare the local interfield and intrafield apertures over the
+  // run.  A 2-of-5 formation of positive deviation is film evidence and names
+  // the phase that the low-amplitude Lips scan could not see.
+  PhaseRun scanForDeviationRun(SourceVideo& sv, int startField, int endField,
+                               const SegmentCaptureCache& cache);
 
   PhaseRun solveSegment(SourceVideo& sv, int segStart, int segEnd,
                         const SegmentCaptureCache& cache,

@@ -386,7 +386,6 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
   // 6. Post-processing
   detectAndEncodeInvertedCadenceRuns();
   const int cutTruncatedAHeads = recoverCutTruncatedAHeads();
-  assignPulldownRoles();
 
   // What remains unknown after pattern, facts, anchored healing, and cut
   // recovery have all declined is the unanchored residue, and it reads
@@ -403,6 +402,23 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
     qInfo() << "Progressive residual painted" << residualFields
             << "unanchored field(s).";
   }
+
+  // A 3:2 cycle contains three capture frames whose two fields are from one
+  // film frame.  Sparse solvers can strand any of those as tiny -3 islands;
+  // the assembler must never be asked to change regimes inside an otherwise
+  // coherent cycle.  Once the residual is visible, strong film anchors on
+  // both sides get one final continuity pass.
+  constexpr int MAX_PROGRESSIVE_ISLAND_FIELDS = 6;
+  const int healedProgressiveFields =
+      healProgressiveCadenceIslands(solvedSegments,
+                                    MAX_PROGRESSIVE_ISLAND_FIELDS);
+  if (healedProgressiveFields > 0) {
+    qInfo() << "Cadence healer replaced" << healedProgressiveFields
+            << "field(s) in short progressive islands.";
+  }
+
+  // Roles describe the final cadence, including the islands just repaired.
+  assignPulldownRoles();
 
   // ld-cinemap does not write back to DiscMap frame flags; that is DiscMap's
   // domain.
@@ -1297,6 +1313,81 @@ double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width,
   return score;
 }
 
+double CineMap::calculateFieldDeviationScore(SourceVideo& sv, int f1, int f2,
+                                             int width, int height) const {
+  if (!m_md || f1 < 1 || f2 < 1 || width <= 0 || height <= 0) return 0.0;
+
+  const auto d1 = sv.getVideoField(f1);
+  const auto d2 = sv.getVideoField(f2);
+  if (d1.size() < width * height || d2.size() < width * height) return 0.0;
+
+  const uint16_t* p1 = reinterpret_cast<const uint16_t*>(d1.constData());
+  const uint16_t* p2 = reinterpret_cast<const uint16_t*>(d2.constData());
+  const auto& vp = m_md->getVideoParameters();
+
+  const double black = (vp.black16bIre > 0) ? vp.black16bIre : 0.0;
+  const double white = (vp.white16bIre > black) ? vp.white16bIre : 65535.0;
+  const double scaleToIre =
+      (white > black) ? (100.0 / (white - black)) : (100.0 / 65535.0);
+
+  const int ax0 = (vp.activeVideoStart > 0) ? vp.activeVideoStart : 0;
+  const int ax1 = (vp.activeVideoEnd > ax0) ? vp.activeVideoEnd : width;
+  const int ay0 =
+      (vp.firstActiveFieldLine > 0) ? vp.firstActiveFieldLine : 0;
+  const int ay1 =
+      (vp.lastActiveFieldLine > ay0) ? vp.lastActiveFieldLine : height;
+  const int mx = (ax1 - ax0) / 40;
+  const int my = (ay1 - ay0) / 40;
+  const int startX = std::max(0, ax0 + mx);
+  const int endX = std::min(width, ax1 - mx);
+  const int startY = std::max(1, ay0 + my);
+  const int endY = std::min(height - 1, ay1 - my);
+  if (startX >= endX || startY >= endY) return 0.0;
+
+  // The 2D decoder refuses an interfield candidate once its local field-model
+  // deviation exceeds four IRE.  Use the same physical operating point here.
+  // This is not a per-raster mean: every excess pixel adds evidence and no
+  // quiet pixel subtracts or dilutes it.
+  constexpr double DEVIATION_FLOOR_IRE = 4.0;
+  constexpr double SCORE_SCALE = 0.00002;
+
+  std::vector<double> f1m1(width), f10(width), f1p1(width);
+  std::vector<double> f2m1(width), f20(width), f2p1(width);
+  double positiveEnergy = 0.0;
+
+  for (int y = startY; y < endY; y += 2) {
+    computeLumaLine_Bucket(p1 + (y - 1) * width, f1m1, width);
+    computeLumaLine_Bucket(p1 + y * width, f10, width);
+    computeLumaLine_Bucket(p1 + (y + 1) * width, f1p1, width);
+    computeLumaLine_Bucket(p2 + (y - 1) * width, f2m1, width);
+    computeLumaLine_Bucket(p2 + y * width, f20, width);
+    computeLumaLine_Bucket(p2 + (y + 1) * width, f2p1, width);
+
+    for (int x = startX; x < endX; ++x) {
+      // Stored first field is the upper parity.  Around a lower-parity line,
+      // the interfield bracket is first[y], first[y+1]; around an upper line
+      // it is second[y-1], second[y].  The same-field brackets are +/- one
+      // field line, i.e. +/- two lines in the woven frame.
+      const double frameAtSecond = 0.5 * (f10[x] + f1p1[x]);
+      const double fieldAtSecond = 0.5 * (f2m1[x] + f2p1[x]);
+      const double frameAtFirst = 0.5 * (f2m1[x] + f20[x]);
+      const double fieldAtFirst = 0.5 * (f1m1[x] + f1p1[x]);
+
+      const double dSecond =
+          std::abs(frameAtSecond - fieldAtSecond) * scaleToIre;
+      const double dFirst =
+          std::abs(frameAtFirst - fieldAtFirst) * scaleToIre;
+
+      const double eSecond = dSecond - DEVIATION_FLOOR_IRE;
+      const double eFirst = dFirst - DEVIATION_FLOOR_IRE;
+      if (eSecond > 0.0) positiveEnergy += eSecond * eSecond;
+      if (eFirst > 0.0) positiveEnergy += eFirst * eFirst;
+    }
+  }
+
+  return positiveEnergy * SCORE_SCALE;
+}
+
 // This excludes the top and bottom quarters of title-safe and takes the middle
 // half where a speaking person's lips might be, and do a more expensive
 // alternate method of comparing fields
@@ -1411,10 +1502,10 @@ std::vector<CineMap::FrameMixedness> CineMap::computeFrameMixedness(
   //
   // It masks the image's own vertical detail per pixel — metric = temporalDiff
   // - max(spatialDetail, noiseFloor), accumulated only where positive — so it
-  // answers "does this frame comb" rather than "does this frame have vertical
-  // structure". A detailed progressive frame reads ~zero here where notch read
-  // whatever its edges amounted to, which is what used to paint such shots
-  // as 59.94i.
+  // answers "where does positive field-difference evidence remain" rather
+  // than "does this frame have vertical structure". It does not itself prove
+  // combing. A detailed progressive frame normally reads ~zero here where
+  // notch read whatever its edges amounted to.
   //
   // Notch previously ran first as a cheap prefilter, consulting lips only in a
   // middle band and skipping it entirely once notch exceeded 0.10 — i.e.
@@ -1432,8 +1523,8 @@ std::vector<CineMap::FrameMixedness> CineMap::computeFrameMixedness(
   // across time. On the stills it sits at 1.3x the twin floor — nothing
   // moves — while every genuinely combing segment measured on two discs
   // reads 1.9x or more. A frame whose flanking same-parity pairs both rest
-  // at the floor cannot comb from motion, and whatever lips would report
-  // there is structure, not divergence.
+  // at the floor cannot diverge from motion, and whatever Lips would report
+  // there is structure rather than temporal divergence.
   const NoiseFloor& nf = calibrateTwinFloor(sv);
   const double stillIre = nf.valid ? nf.ire * 1.5 : 0.0;
   const int totalFields = m_md->getNumberOfFields();
@@ -1714,7 +1805,7 @@ void CineMap::collectClvTwinPairsFromMixedness(
   // "Clearly mixed" frames. Same per-frame comb question the classifiers ask,
   // so it reads the same constant rather than carrying its own notch-scaled
   // one.
-  constexpr double THRESH_MIXED = LIPS_COMB;
+  constexpr double THRESH_MIXED = LIPS_DIFFERENCE;
 
   const int nFrames = m_disc->getNumberOfFrames();
 
@@ -1969,7 +2060,8 @@ int CineMap::probeCombAxes(const QString& tbcFilePath, int startField,
   // whenever notch >= 0.10 on the assumption that a large notch is self-evident
   // — the case this column tests.
   printf(
-      "frame,f1,f2,cad,notchWithin,notchAcross,ratio,lipsWithin,lipsAcross,lipsWide\n");
+      "frame,f1,f2,cad,notchWithin,notchAcross,ratio,lipsWithin,lipsAcross,"
+      "lipsWide,deviationWithin,deviationAcross\n");
 
   int rows = 0;
   for (int fi = startFrame; fi < endFrame; ++fi) {
@@ -1991,10 +2083,15 @@ int CineMap::probeCombAxes(const QString& tbcFilePath, int startField,
     const double lipsWide = calculateLipsScore(sv, f1, f2, vp.fieldWidth,
                                                vp.fieldHeight,
                                                /*fullRaster=*/true);
+    const double deviationWithin = calculateFieldDeviationScore(
+        sv, f1, f2, vp.fieldWidth, vp.fieldHeight);
+    const double deviationAcross = calculateFieldDeviationScore(
+        sv, n1, f2, vp.fieldWidth, vp.fieldHeight);
 
-    printf("%d,%d,%d,%d,%.5f,%.5f,%.4f,%.5f,%.5f,%.5f\n", fi, f1, f2,
-           m_md->getField(f1).cinemap.cadenceId, within, across,
-           (across > 1e-9) ? (within / across) : 0.0, lipsW, lipsA, lipsWide);
+    printf("%d,%d,%d,%d,%.5f,%.5f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f\n",
+           fi, f1, f2, m_md->getField(f1).cinemap.cadenceId, within, across,
+           (across > 1e-9) ? (within / across) : 0.0, lipsW, lipsA, lipsWide,
+           deviationWithin, deviationAcross);
     rows++;
   }
 
@@ -3760,27 +3857,33 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // ABSOLUTE silence gate, and it must come BEFORE the percentile stretch.
   //
   // The stretch below rescales whatever spread exists into [0,1], so it cannot
-  // tell "no comb anywhere" from "comb varies" — it manufactures a pattern from
-  // a noise floor. That was survivable while mixedness was notch, whose floor
+  // tell "no field difference" from "field difference varies" — it manufactures
+  // a pattern from a noise floor. That was survivable while mixedness was notch, whose floor
   // is the image's own vertical structure and therefore never small. Lips goes
   // properly to zero on clean content, so without this gate the stretch
   // amplifies pure numerical noise into confident locks.
   //
   // Lips is what makes an absolute test legitimate here: it is a residual
   // measured AFTER masking vertical detail and after subtracting its own noise
-  // floor, so its zero means "no comb", not merely "no structure". Measured
+  // floor, so its zero means "no detected difference", not "no structure". Measured
   // over 40 windows on four discs, locks conjured from noise topped out at max
   // lips 0.028 while every genuine lock had max lips >= 0.189 — this sits in
   // that gap.
   if (percentile(1.0) < LIPS_SILENCE) {
-    run.type = PhaseRun::Type::Unknown;
-    run.reason = "silence";
+    // This is the only absolute progressive candidate: Lips found no
+    // meaningful field difference anywhere in the window.  It is not yet a
+    // verdict. solveSegment subjects it to the deviation formation and to
+    // same-parity d=2 twin evidence before allowing -3 to be painted.
+    run.type = PhaseRun::Type::Progressive;
+    run.confidence = 0.70;
+    run.reason = "silence-progressive-candidate";
 
     if (m_decisionTraceEnabled) {
       qInfo().noquote()
           << QString(
                  "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
-                 "result=unknown reason=silence maxLips=%4 threshold=%5")
+                 "result=progressive-candidate reason=silence maxLips=%4 "
+                 "threshold=%5")
                  .arg(startField)
                  .arg(endField)
                  .arg(numFrames)
@@ -4101,8 +4204,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
     // 2x margin to both. Skips the election like the -2 verdict does, so
     // harvest junk cannot commit a phase on ground the scan measured and
     // found empty.
-    if (allNegative && numFrames >= INTERLACE_MIN_FRAMES &&
-        wideP90 < PROGRESSIVE_CRASH_P90) {
+    if (allNegative && p90 < PROGRESSIVE_CRASH_P90) {
       // A widened LIPS check was tried here and was poisoned by letterbox
       // matte edges (a static matte reads 37 IRE-units of "comb" through the
       // mask's blind spot), so the whole-frame duty lives in the stillness
@@ -4115,11 +4217,12 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
       if (m_decisionTraceEnabled) {
         qInfo().noquote()
             << QString(
-                   "CineMap decision: MIXEDNESS_PROGRESSIVE fields [%1..%2] "
-                   "frames=%3 wideP90=%4 result=progressive")
+                 "CineMap decision: MIXEDNESS_PROGRESSIVE fields [%1..%2] "
+                 "frames=%3 lipsP90=%4 wideP90=%5 result=progressive-candidate")
                    .arg(startField)
                    .arg(endField)
                    .arg(numFrames)
+                   .arg(p90, 0, 'f', 4)
                    .arg(wideP90, 0, 'f', 4);
       }
       return r;
@@ -4302,6 +4405,152 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   return interlaceThirdReading(bumpSecondReading(run));
 }
 
+CineMap::PhaseRun CineMap::scanForDeviationRun(
+    SourceVideo& sv, int startField, int endField,
+    const SegmentCaptureCache& cache) {
+  PhaseRun run;
+  run.type = PhaseRun::Type::Unknown;
+  run.endField = endField;
+  run.reason = QStringLiteral("no-deviation-formation");
+
+  if (!m_md || !m_disc || startField >= endField) return run;
+
+  int startFrameIdx = -1;
+  if (cache.validSeq(startField)) startFrameIdx = cache.cap[startField].frameIndex;
+  if (startFrameIdx < 0) startFrameIdx = frameIndexForField(startField);
+  int endFrameIdx = frameIndexForField(endField);
+  if (startFrameIdx < 0 || endFrameIdx <= startFrameIdx) return run;
+
+  const auto& vp = m_md->getVideoParameters();
+
+  // A frame is a positive deviation site only when its within-frame aperture
+  // disagrees while the across-frame control does not.  The across read carries
+  // the same image texture through the same operator, so the retired Notch
+  // failure (large vertical detail everywhere) is common-mode rather than a
+  // ballot.  Nothing below the floor votes, and no negative sample is averaged
+  // into a sparse hand.
+  constexpr double SITE_MIN = 0.10;
+  constexpr double WITHIN_OVER_ACROSS = 2.0;
+  constexpr int MIN_FRAMES = 15;
+  constexpr int MIN_EXPECTED_HITS = 4;
+  constexpr int MIN_PHASE_MARGIN_HITS = 2;
+
+  struct Site {
+    int relFrame = 0;
+    double excess = 0.0;
+  };
+  std::vector<Site> sites;
+  int framesRead = 0;
+
+  // The across control needs the following frame.  Do not reach across the
+  // segment boundary: a cut is genuine deviation but says nothing about the
+  // segment's cadence.
+  for (int fi = startFrameIdx; fi < endFrameIdx; ++fi) {
+    if (fi < 0 || fi + 1 >= m_disc->getNumberOfFrames()) continue;
+    if (m_disc->isPadded(fi) || m_disc->isPadded(fi + 1)) continue;
+
+    const int f1 = m_disc->getFirstFieldNumber(fi + 1);
+    const int f2 = m_disc->getSecondFieldNumber(fi + 1);
+    const int n1 = m_disc->getFirstFieldNumber(fi + 2);
+    if (f1 < startField || f2 > endField || n1 > endField) continue;
+
+    const double within = calculateFieldDeviationScore(
+        sv, f1, f2, vp.fieldWidth, vp.fieldHeight);
+    const double across = calculateFieldDeviationScore(
+        sv, n1, f2, vp.fieldWidth, vp.fieldHeight);
+    framesRead++;
+
+    if (within < SITE_MIN || within <= WITHIN_OVER_ACROSS * across) continue;
+    sites.push_back({fi - startFrameIdx,
+                     within - WITHIN_OVER_ACROSS * across});
+  }
+
+  std::array<int, 5> expectedHits = {0, 0, 0, 0, 0};
+  std::array<int, 5> cleanHits = {0, 0, 0, 0, 0};
+  std::array<int, 5> slotOneHits = {0, 0, 0, 0, 0};
+  std::array<int, 5> slotTwoHits = {0, 0, 0, 0, 0};
+  std::array<double, 5> weights = {0.0, 0.0, 0.0, 0.0, 0.0};
+
+  for (const Site& site : sites) {
+    for (int p = 0; p < 5; ++p) {
+      const int pos = normalizePhase(site.relFrame + p, 5);
+      if (pos == 1 || pos == 2) {
+        expectedHits[p]++;
+        weights[p] += site.excess;
+        if (pos == 1)
+          slotOneHits[p]++;
+        else
+          slotTwoHits[p]++;
+      } else {
+        cleanHits[p]++;
+      }
+    }
+  }
+
+  int bestP = -1;
+  int bestHits = -1;
+  double bestWeight = -1.0;
+  for (int p = 0; p < 5; ++p) {
+    const double score = std::max(0, expectedHits[p] - cleanHits[p]);
+    run.phaseScores[p] = score;
+    if (expectedHits[p] > bestHits ||
+        (expectedHits[p] == bestHits && weights[p] > bestWeight)) {
+      bestP = p;
+      bestHits = expectedHits[p];
+      bestWeight = weights[p];
+    }
+  }
+  run.phaseScoresInformative = !sites.empty();
+
+  int secondHits = -1;
+  for (int p = 0; p < 5; ++p) {
+    if (p != bestP) secondHits = std::max(secondHits, expectedHits[p]);
+  }
+
+  const int totalBestClassified =
+      (bestP >= 0) ? expectedHits[bestP] + cleanHits[bestP] : 0;
+  const double purity =
+      (totalBestClassified > 0)
+          ? static_cast<double>(expectedHits[bestP]) / totalBestClassified
+          : 0.0;
+  const bool formation =
+      framesRead >= MIN_FRAMES && bestP >= 0 &&
+      expectedHits[bestP] >= MIN_EXPECTED_HITS &&
+      slotOneHits[bestP] > 0 && slotTwoHits[bestP] > 0 && purity >= 0.75 &&
+      expectedHits[bestP] >= secondHits + MIN_PHASE_MARGIN_HITS;
+
+  if (formation) {
+    run.type = PhaseRun::Type::Pulldown32;
+    run.phaseOffset = bestP;
+    run.confidence = 0.80;
+    run.reason = QStringLiteral("deviation-run");
+  }
+
+  if (m_decisionTraceEnabled) {
+    qInfo().noquote()
+        << QString(
+               "CineMap decision: DEVIATION_SCAN fields [%1..%2] frames=%3 "
+               "sites=%4 bestPhase=%5 expected=%6 clean=%7 slots=%8/%9 "
+               "second=%10 purity=%11 weight=%12 result=%13")
+               .arg(startField)
+               .arg(endField)
+               .arg(framesRead)
+               .arg(sites.size())
+               .arg(bestP)
+               .arg(bestP >= 0 ? expectedHits[bestP] : 0)
+               .arg(bestP >= 0 ? cleanHits[bestP] : 0)
+               .arg(bestP >= 0 ? slotOneHits[bestP] : 0)
+               .arg(bestP >= 0 ? slotTwoHits[bestP] : 0)
+               .arg(std::max(0, secondHits))
+               .arg(purity, 0, 'f', 3)
+               .arg(std::max(0.0, bestWeight), 0, 'f', 4)
+               .arg(formation ? QString("lock phase=%1").arg(bestP)
+                              : QStringLiteral("decline-progressive-stands"));
+  }
+
+  return run;
+}
+
 CineMap::PhaseRun CineMap::solveSegment(
     SourceVideo& sv, int segStartField, int segEndField,
     const SegmentCaptureCache& cache,
@@ -4339,8 +4588,54 @@ CineMap::PhaseRun CineMap::solveSegment(
                              .arg(mixedness.size());
   }
 
-  // 1. Mixedness signal — produces a per-phase score vector (mixVec).
+  // 1. Lips difference signal — produces a per-phase score vector (mixVec).
+  // Lips proposes a regime; it does not measure combing.  A film proposal must
+  // be corroborated by either a field-deviation 2-of-5 formation or a standard
+  // same-parity d=2 twin.  Conversely, a crash to negligible/uniform Lips is
+  // only a progressive candidate until those same film tests decline it.
   run = scanForPhaseRun(mixedness, segStartField, segEndField, cache);
+  if (run.type == PhaseRun::Type::Progressive ||
+      run.type == PhaseRun::Type::Pulldown32) {
+    int certifiedTwins = 0;
+    for (const auto& t : m_certifiedTriples) {
+      if (t.loSeq >= segStartField && t.loSeq + 2 <= segEndField)
+        certifiedTwins++;
+    }
+
+    if (certifiedTwins > 0) {
+      // A progressive source has no repeated field at d=2.  Return a P
+      // candidate to the film election, where the twin geometry can name its
+      // phase; an already named Lips film phase simply retains its proposal.
+      if (run.type == PhaseRun::Type::Progressive) {
+        run.type = PhaseRun::Type::Unknown;
+        run.confidence = 0.0;
+        run.reason = QStringLiteral("progressive-veto-d2-twin");
+      }
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: D2_TWIN_EVIDENCE fields [%1..%2] "
+                   "certifiedTwins=%3 result=film")
+                   .arg(segStartField)
+                   .arg(segEndField)
+                   .arg(certifiedTwins);
+      }
+    } else {
+      const PhaseRun deviation =
+          scanForDeviationRun(sv, segStartField, segEndField, cache);
+      if (deviation.type == PhaseRun::Type::Pulldown32) {
+        run = deviation;
+      } else if (run.type == PhaseRun::Type::Pulldown32) {
+        // Lips difference alone can mistake coherent, textured kinetics for
+        // pulldown displacement.  With neither actual deviation at the two
+        // proposed mixed positions nor a d=2 duplicate, film is unproved.
+        run.type = PhaseRun::Type::Progressive;
+        run.phaseOffset = 0;
+        run.confidence = 0.70;
+        run.reason = QStringLiteral("lips-film-unconfirmed");
+      }
+    }
+  }
   const QString mixednessSummary = phaseRunSummary(run);
   const auto mixVec = run.phaseScores;
   const bool mixInformative = run.phaseScoresInformative;
@@ -4909,13 +5204,11 @@ void CineMap::classifyAsInterlaced(
 
   const int spanFields = segEndField - segStartField + 1;
 
-  // Fraction of frames that actually comb. On lips this is a real question
-  // about inter-field motion: the image's own vertical detail has already been
-  // masked out per pixel, so a detailed progressive frame scores ~zero here
-  // where notch scored whatever its edges amounted to.
+  // Fraction of frames with meaningful positive Lips field-difference
+  // evidence. This supports the regime verdict; it is not itself a comb test.
   int highMixedFrames = 0;
   for (const auto& m : mixedness) {
-    if (m.score > LIPS_COMB) {
+    if (m.score > LIPS_DIFFERENCE) {
       highMixedFrames++;
     }
   }
@@ -4970,7 +5263,7 @@ void CineMap::classifyAsProgressive(
   // throughout its body regardless of what happens at its ends.
   int combedFrames = 0;
   for (const auto& m : mixedness) {
-    if (m.score > LIPS_COMB) combedFrames++;
+    if (m.score > LIPS_DIFFERENCE) combedFrames++;
   }
   const double fracCombed = mixedness.empty()
                                 ? 0.0
@@ -6226,6 +6519,12 @@ int CineMap::healContinuity(SourceVideo& sv,
       SegmentResult& span = spanIsNext ? next : curr;
       const size_t spanIdx = spanIsNext ? (i + 1) : i;
 
+      // Interlaced and progressive are positive regime verdicts, not
+      // unsolved cadence gaps.  Only Unknown ground may be absorbed here;
+      // short -3 islands get their separate, field-exact continuity test
+      // after the progressive residue has been painted.
+      if (span.run.type != PhaseRun::Type::Unknown) continue;
+
       const int lenFields = span.endField - span.startField + 1;
       if (lenFields < 60) {
         const int spanStartFrame = getFrameIdx(span.startField);
@@ -6341,7 +6640,8 @@ int CineMap::healContinuity(SourceVideo& sv,
     // Look ahead to i+2; if the far segment matches the phase projection
     // from curr, we treat the middle as a dropout/glitch and bridge it.
     // -----------------------------------------------------------------
-    if (currLocked && !nextLocked && (i + 2) < segments.size()) {
+    if (currLocked && next.run.type == PhaseRun::Type::Unknown &&
+        (i + 2) < segments.size()) {
       SegmentResult& far = segments[i + 2];
       bool farLocked = (far.run.type == PhaseRun::Type::Pulldown32);
 
@@ -6537,6 +6837,104 @@ int CineMap::healContinuity(SourceVideo& sv,
   }
 
   return changes;
+}
+
+int CineMap::healProgressiveCadenceIslands(
+    const std::vector<SegmentResult>& segments, int maxSpanFields) {
+  if (!m_md || maxSpanFields <= 0) return 0;
+
+  const int total = m_md->getNumberOfFields();
+  if (total < 3) return 0;
+
+  auto predictCid = [](int srcSeq, int targetSeq, int srcCid) -> int {
+    if (!cadenceKnown(srcCid)) return CADENCE_UNKNOWN;
+    const int base = cadenceIsInverted(srcCid)
+                         ? CADENCE_NTSC_INVERTED_OFFSET
+                         : 0;
+    int idx = cadenceIndex(srcCid);
+    idx = normalizePhase(idx + (targetSeq - srcSeq), CADENCE_NTSC_CYCLE);
+    return base + idx;
+  };
+
+  int fixedFields = 0;
+  int fixedSpans = 0;
+
+  // Regime painting is segment-atomic.  Build the legal edges once so this
+  // repair can replace a whole short segment (or a contiguous group of whole
+  // segments) but can never cut a winning film/progressive/interlace segment
+  // merely because its local evidence goes sparse.
+  std::set<int> segmentStarts;
+  std::set<int> segmentEnds;
+  for (const auto& seg : segments) {
+    segmentStarts.insert(seg.startField);
+    segmentEnds.insert(seg.endField);
+  }
+
+  for (int start = 2; start < total;) {
+    const auto first = m_md->getField(start);
+    if (first.pad || first.cinemap.cadenceId != CADENCE_PROGRESSIVE) {
+      ++start;
+      continue;
+    }
+
+    int end = start;
+    while (end + 1 <= total) {
+      const auto next = m_md->getField(end + 1);
+      if (next.pad || next.cinemap.cadenceId != CADENCE_PROGRESSIVE) break;
+      ++end;
+    }
+
+    const int spanFields = end - start + 1;
+    const int leftSeq = start - 1;
+    const int rightSeq = end + 1;
+    bool repair = spanFields <= maxSpanFields && rightSeq <= total &&
+                  segmentStarts.count(start) != 0 &&
+                  segmentEnds.count(end) != 0;
+
+    auto left = m_md->getField(leftSeq);
+    auto right = m_md->getField(rightSeq);
+    repair = repair && !left.pad && !right.pad &&
+             cadenceKnown(left.cinemap.cadenceId) &&
+             cadenceKnown(right.cinemap.cadenceId) &&
+             predictCid(leftSeq, rightSeq, left.cinemap.cadenceId) ==
+                 right.cinemap.cadenceId;
+
+    if (repair) {
+      for (int seq = start; seq <= end; ++seq) {
+        auto f = m_md->getField(seq);
+        f.cinemap.cadenceId =
+            predictCid(leftSeq, seq, left.cinemap.cadenceId);
+        f.cinemap.cadenceIndexPresumed = true;
+        f.cinemap.pulldownRole.clear();
+        m_cadenceConfidence[seq] =
+            std::min(m_cadenceConfidence[leftSeq],
+                     m_cadenceConfidence[rightSeq]);
+        m_md->updateField(f, seq);
+        ++fixedFields;
+      }
+      ++fixedSpans;
+
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: PROGRESSIVE_ISLAND fields [%1..%2] "
+                   "left=%3 right=%4 result=film-continuity")
+                   .arg(start)
+                   .arg(end)
+                   .arg(left.cinemap.cadenceId)
+                   .arg(right.cinemap.cadenceId);
+      }
+    }
+
+    start = end + 1;
+  }
+
+  if (fixedFields > 0) m_disc->refreshFrameCache();
+  if (m_decisionTraceEnabled && fixedSpans > 0) {
+    qInfo() << "CineMap decision: PROGRESSIVE_ISLAND summary spans"
+            << fixedSpans << "fields" << fixedFields;
+  }
+  return fixedFields;
 }
 
 int CineMap::enforceSteadyCadenceAcrossBoundaries(int maxSpanFields) {
