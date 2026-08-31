@@ -160,3 +160,88 @@ static inline char cadenceFilmLetter(int cid)
         default:        return '?';
     }
 }
+
+// -----------------------------------------------------------------------------
+// 24p Timeline Position
+// -----------------------------------------------------------------------------
+//
+// A field's seqNo IS its 59.94 Hz time coordinate, and 23.976 / 59.94 = 2/5
+// exactly, so a frame's position on the 24p timeline is a function of its own
+// seqNo and nothing else: no run origin, no accumulator, no history. The
+// proportional relationship re-establishes exactly once per cadence cycle --
+// ten fields advance the index by exactly four, for ANY phase -- which is what
+// makes a stateless answer possible at all.
+//
+// Film frames anchor on the CYCLE HEAD, not on their own first field. Anchoring
+// per-frame rounds differently depending on (seqNo mod 5) and manufactures
+// collisions and gaps inside perfectly clean cadence; the head plus an ordinal
+// letter offset is exact at every phase. The head is DERIVED, never looked up,
+// so it may be virtual -- a shot lasting three fields still resolves correctly
+// even though its cycle head lies outside the shot, or outside the render.
+//
+// Integer arithmetic throughout: 2n/5 has fractional part in {0, .2, .4, .6,
+// .8}, so no tie can arise. This value gates which frames are emitted, and a
+// frame drop must never turn on a floating-point rounding mode -- a float form
+// disagrees with the exact answer on real discs, because 0.4 is not
+// representable in binary.
+
+// round(2n/5), half-up, correct for NEGATIVE n as well: C++ integer division
+// truncates toward zero, which is not floor, so the naive form is wrong below
+// the origin. A cycle head is virtual and legitimately negative for a field in
+// the file's first cycle (a slot-9 field at seqNo 1 heads at -8), so this must
+// not be guarded away -- only differences between indices carry meaning, and
+// the sequence has to stay monotonic across zero.
+static inline long long cadenceRoundTwoFifths(long long n)
+{
+    const long long num = 2 * n + 2;
+    return (num >= 0) ? (num / 5) : -(((-num) + 4) / 5);
+}
+
+// Ordinal position of a slot's film frame within its cycle: A=0, B=1, C=2, D=3.
+// Tracks cadenceFilmLetter's slot map exactly. -1 for any unknown cadence.
+static inline int cadenceFilmFrameOrdinal(int cid)
+{
+    if (!cadenceKnown(cid)) return -1;
+    switch (cadenceIndex(cid)) {
+        case 0: case 1: case 2: return 0; // A: def, comp, trailing spare
+        case 3: case 4:         return 1; // B: no twin, straddles two frames
+        case 5: case 6: case 7: return 2; // C: leading spare, comp, def
+        case 8: case 9:         return 3; // D: no twin
+        default:                return -1;
+    }
+}
+
+// seqNo of the slot-0 field of this field's cadence cycle. Virtual: the head
+// field need not be present in the stream, in this shot, or in this render.
+static inline long long cadenceCycleHeadSeq(int cid, long long seqNo)
+{
+    if (!cadenceKnown(cid)) return -1;
+    return seqNo - cadenceIndex(cid);
+}
+
+// 24p timeline index of the film frame a given field belongs to.
+//
+// EVERY field of a film frame returns the same value: B1 (slot 3, seq s) and
+// B2 (slot 4, seq s+1) both resolve to head s-3. So a caller may ask with
+// either field of an assembled pair, and the comb-ordering swap that puts B2
+// first is irrelevant to the answer. Callers holding both fields should assert
+// they agree; a disagreement means the pair is not one film frame.
+static inline long long filmFrameIndex24p(int cid, long long seqNo)
+{
+    const int ordinal = cadenceFilmFrameOrdinal(cid);
+    if (ordinal < 0) return -1;
+    const long long head = cadenceCycleHeadSeq(cid, seqNo);
+    return cadenceRoundTwoFifths(head) + ordinal;
+}
+
+// 24p timeline index of an unassembled capture frame -- video, progressive, or
+// telecine the assembler could not claim -- from its FIRST field's seqNo.
+//
+// One in every five collides with its predecessor. That collision IS the
+// 29.97 -> 23.976 decimation, arrived at by position and therefore evenly
+// spaced, rather than timed by an accumulator that fires wherever its running
+// sum happens to cross.
+static inline long long captureFrameIndex24p(long long firstFieldSeqNo)
+{
+    return cadenceRoundTwoFifths(firstFieldSeqNo);
+}
