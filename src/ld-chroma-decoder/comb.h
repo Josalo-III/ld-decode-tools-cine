@@ -39,6 +39,139 @@
 #include "decoder.h"
 #include "sourcefield.h"
 
+// The comb's coarse rows read the lurch-solved per-sample platform rather than
+// the block-centre scaffold.  Consulted by the allocation (comb.cpp), the
+// platform build (comblocked.cpp) and the tap line (combcandidate.cpp), so it
+// lives here rather than as a file-local escape in one of the three.
+// LDCD_COARSE_SOLVED=0 restores the scaffold byte-identically.
+inline bool ldcdSolvedCoarseEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_COARSE_SOLVED");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// The luma platform solve. DEFAULT ON, supplanting BOTH older floors -- the
+// block-mean baseY4 and lsc's lurch solve. It was built gated so the two could
+// be graded with it absent; measured against banked conservation truth on the
+// isolated platform it wins on every material, and it does not have to win by
+// much to replace them:
+//
+//     isolated platform, rms IRE      cube     shirt    beach
+//       baseY4 block mean            4.2905   1.7135   2.6237
+//       lsc lurch solve              2.6079   1.0764   1.2848
+//       this solve, lurch-weighted   2.5741   1.0393   1.2613
+//
+// LDCD_LUMA_SOLVE=0 restores the previous behaviour exactly: nothing it
+// touches is then allocated, built or read.
+//
+// The three floors, in priority order at the produceY floor site:
+//   LDCD_LUMA_SOLVE=1   the platform solve      (this gate)
+//   --y-election lsc    the lurch solve         (yElection.lsc)
+//   otherwise           baseY4, the block mean
+inline bool ldcdLumaSolveEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_LUMA_SOLVE");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// TEMPORARY instrument (LDCD_CCR_CONF=1): the distribution of schedule
+// non-conformity, split by whether the conservation fact says real chroma is
+// present. Places the two conformity constants on evidence.
+inline bool ldcdCcrConfCensusEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_CCR_CONF");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
+// TEMPORARY instrument (LDCD_CCR_VET=1), strip when the question closes:
+// CCR's error against banked truth, stratified by how much colour is actually
+// present. A pooled figure cannot see a return that buys luma accuracy by
+// draining saturation.
+inline bool ldcdCcrVetEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_CCR_VET");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
+// CCR checks whether the luma energy is STILL in the chroma after the comb
+// ran, so the same energy is not moved twice.
+//
+// DEFAULT OFF, on measurement. The PRINCIPLE is right; this estimator of
+// "already moved" is not. It uses |preC| - |postC| -- the magnitude drop
+// between the 1D carrier and the comb's -- which conflates two different
+// things: the comb REMOVING luma, and the comb simply producing a better
+// carrier estimate of different magnitude. Two carrier estimates differing in
+// size is not evidence that luma was moved.
+//
+// Measured: it throttles legitimate returns on the cube, where CCR does its
+// real work (CCR alone -13.9% vs no CCR; the check gives 1.3% of that back)
+// while gaining ~0.1% on shirt and beach.
+//
+// A correct estimator has to project the comb's change onto the component the
+// licence identifies as luma, rather than take a magnitude difference of the
+// whole carrier. LDCD_CCR_POSTCOMB=1 to re-enable as written.
+inline bool ldcdCcrPostCombCheck()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_CCR_POSTCOMB");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
+// The 2D reach and its evidence read the SOLVED luma rather than the block
+// scaffold or a privately-built notch. Default ON: determining a reach from a
+// worse estimate than the one available is the evidence failure the holdout
+// convicted at 1D. LDCD_REACH_SOLVED_LUMA=0 restores the old sources.
+inline bool ldcdReachUsesSolvedLuma()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_REACH_SOLVED_LUMA");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// The luma discriminator weights the platform solve's anchor term per sample.
+// Default ON -- it is an earlier client of the same evidence, and the earliest
+// place it can act. LDCD_SOLVE_LICENSE=0 gives the flat anchor.
+inline bool ldcdSolveLicenseWeighting()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_SOLVE_LICENSE");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// The carrier license scales Field B's leg weights -- the AVERAGING half of
+// that comb. DEFAULT OFF, on measurement: as a leg DEMOTION it costs
+// +0.23/+0.24/+0.34% on cube/shirt/beach against banked truth, so it does not
+// earn its place in this form. Down-weighting a leg discards that leg's good
+// carrier along with its luma, and the license is a confidence rather than an
+// amount, so it cannot subtract the luma energy while keeping the rest.
+// LDCD_COMB_LICENSE=1 to re-enable.
+inline bool ldcdCombLicenseEnabled()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_COMB_LICENSE");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
 // One detected luma step in a coarse aperture-mean sequence (the lurch
 // step-solve's output). PRODUCTION DATA: built once per line per frame from
 // the shared aperture pool (buildLurchStepRuns) and consumed by the witness
@@ -461,6 +594,11 @@ public:
 	// one shape out of it. Writes the platform to yOut[0..width).
 	void solveLurchYCurve(int line, const double *apMean, int meanCount,
 	                      int width, double *yOut);
+	// The luma platform solve: one banded system over the same-phase parallax
+	// facts and both lane diameters. Its own construction and its own gate,
+	// so the two existing floors can be graded without it in the path.
+	void solveLumaPlatformLine(int line, const double *apMean, int meanCount,
+	                           int width, double *yOut);
 	// Vertical snap corroboration: the lurch-snap was the last per-line hard
 	// quantizer -- run.edge jitters +-0.5-1 px line to line on texture noise
 	// and saw-tooths bright vertical contours. For each run with a matching
@@ -1151,6 +1289,29 @@ private:
 	std::vector<double> scratch_lurchCurve;    // Lurch solve: whole-line banded-LS Y curve per xi
 	std::vector<double> scratch_lurchWork;     // Lurch solve: Thomas workspace, 2 rows per phase chain
 	std::vector<double> scratch_lurchPin;      // Lurch solve: certified Y where pinned, NaN elsewhere
+	// Lurch solve: symmetric banded normal matrix, lower half-band 4 stored
+	// row-major as [j*(kLurchBand+1) + d] = A(j, j-d), plus its rhs and the
+	// LDL^T diagonal. Half-bandwidth 4 is set by the same-phase difference
+	// (stride 4) and the lane stencils' autocorrelation, which reach +-4 and
+	// +-2 respectively.
+	std::vector<double> scratch_lurchBand;
+	std::vector<double> scratch_lurchRhs;
+	std::vector<double> scratch_lurchDiag;
+	// Platform solve, feasibility sharpening: the residual's two quadrature
+	// lattice coordinates before and after the expressible-envelope
+	// projection. Lattice axes, NOT I and Q.
+	std::vector<double> scratch_platEnvA, scratch_platEnvB;
+	std::vector<double> scratch_platEnvAS, scratch_platEnvBS;
+	// Composite carrier implied by the coarse, after the coarse-residual
+	// bound and before the bandwidth law.
+	std::vector<double> scratch_platCarrier;
+	// Per-sample anchor trust in the platform solve, from the luma
+	// discriminator: how far the coarse deserves to pull at this sample.
+	std::vector<double> scratch_anchorTrust;
+	// apertureParallaxLine working set: four demodulated views, raw and
+	// smoothed, plus the spread ratio it publishes.
+	std::vector<double> scratch_aptVI, scratch_aptVQ;
+	std::vector<double> scratch_aptSI, scratch_aptSQ, scratch_aptRatio;
 	std::vector<lddecode::FourViewCarrierAttribution> scratch_carrierParallax; // line-local attribution working set
 	std::vector<double> scratch_hpI;
 	std::vector<double> scratch_hpQ;
@@ -1226,6 +1387,53 @@ private:
 	// this same base; only the top is replaceable. lockedLumaSmooth remains a
 	// geometry service.
 	std::vector<double> lockedLumaSharp_flat;
+	// THE LUMA PLATFORM SOLVE (solveLumaPlatformLine, comblocked.cpp): one
+	// banded system over every carrier-free fact the line affords -- the
+	// same-phase parallax differences AND both lane diameters. A third
+	// construction, gated separately so the two existing floors (baseY4 and
+	// lsc's lurch solve) can be graded in its absence; intended to supplant
+	// both rather than to compete inside either.
+	std::vector<double> lockedLumaSolved_flat;
+	// THE RESIDUAL LANE COARSES. Built from resid = raw - solvedPlatform, in
+	// COMPOSITE space, NOT from the 1D bandpass -- so they are an independent
+	// signal rather than an inheritance of 1D's error.
+	//
+	// Both are carrier-cancelling by the diameter property, under the WEAKER
+	// precondition a lane enjoys: an aperture needs both quadrature lattice
+	// axes stationary across stride 2, a lane needs only its own.
+	//
+	//   residLaneN   1/4 r[x-2] + 1/2 r[x] + 1/4 r[x+2]   x's own lane
+	//   residLane2   1/2 r[x-1]            + 1/2 r[x+1]   the other lane
+	//
+	// KEPT SEPARATE, ALWAYS. Their mean is the four-sample mean, which is
+	// identically zero on the 2fSC component -- and 2fSC is where no carrier
+	// can legally live, so that component is luma by law and these two reads
+	// are the only instruments that see it. They read it with OPPOSITE sign,
+	// so averaging them destroys precisely the degree of freedom they exist
+	// to reach. Published raw; consumers own the decision.
+	std::vector<double> residLaneN_flat, residLane2_flat;
+	// THE CARRIER LICENSE — a MINORITY REPORT on 1D, not a replacement for it.
+	//
+	// 1D stays the carrier basis. What this channel does is falsify it at
+	// samples where product demodulation has scooped luma into chroma: sine
+	// and cosine cannot tell luma sitting at fSC from carrier, because in that
+	// frame the two are the same thing, so 1D cannot detect the theft from
+	// inside itself.
+	//
+	// Aperture displacement can. A legal carrier cancels under EVERY legal
+	// four-sample window, so energy that fails to null as the window gains and
+	// loses neighbours is not behaving like carrier whatever the demodulation
+	// made of it. That is a statement about WHICH energy is carrier -- never
+	// about that carrier's waveform, which the same measurement is on record
+	// as estimating WORSE than an ordinary short fit (community doc, "the
+	// parallax is a license channel, not a value channel"). Used as a licence
+	// it roughly doubles real-detail retention and halves carrier error; used
+	// as a value it does the opposite. Same evidence, two roles, opposite
+	// verdicts -- so this plane scales participation and is never subtracted.
+	//
+	// 1.0 = the aperture evidence corroborates carrier here.
+	// 0.0 = it refuses; energy moved with the window, so it is luma.
+	std::vector<float> carrierLicense_flat;
 	// 1D vertical-contrast service: per-sample lateral coarse-luma delta in
 	// IRE (|smooth[rel+2] - smooth[rel-2]|), published once by the locked
 	// decomposition pass.  The 1D is the first stage to cross a vertical
@@ -1325,6 +1533,68 @@ private:
 
 	inline const double *lockedLumaSharp_line(int line) const {
 		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline float *carrierLicense_line(int line) {
+		if (carrierLicense_flat.empty()) return nullptr;
+		return carrierLicense_flat.data() + size_t(line) * demodWidth;
+	}
+	inline const float *carrierLicense_line(int line) const {
+		if (carrierLicense_flat.empty()) return nullptr;
+		return carrierLicense_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline double *residLaneN_line(int line) {
+		if (residLaneN_flat.empty()) return nullptr;
+		return residLaneN_flat.data() + size_t(line) * demodWidth;
+	}
+	inline const double *residLaneN_line(int line) const {
+		if (residLaneN_flat.empty()) return nullptr;
+		return residLaneN_flat.data() + size_t(line) * demodWidth;
+	}
+	inline double *residLane2_line(int line) {
+		if (residLane2_flat.empty()) return nullptr;
+		return residLane2_flat.data() + size_t(line) * demodWidth;
+	}
+	inline const double *residLane2_line(int line) const {
+		if (residLane2_flat.empty()) return nullptr;
+		return residLane2_flat.data() + size_t(line) * demodWidth;
+	}
+
+	inline double *lockedLumaSolved_line(int line) {
+		if (lockedLumaSolved_flat.empty()) return nullptr;
+		return lockedLumaSolved_flat.data() + size_t(line) * demodWidth;
+	}
+	inline const double *lockedLumaSolved_line(int line) const {
+		if (lockedLumaSolved_flat.empty()) return nullptr;
+		return lockedLumaSolved_flat.data() + size_t(line) * demodWidth;
+	}
+
+	// THE PLATFORM THE ICEBERG TWEEN IS ANCHORED ON.
+	//
+	// The tween needs one luma platform for three jobs -- banked from the
+	// covered frame, read from both neighbours, and read at the centre row
+	// where platformAgrees vets the correspondence -- and all three must be
+	// the SAME estimate or the vet compares vintages rather than positions.
+	// Hence one accessor, not three call sites naming a plane.
+	//
+	// It is the solved platform wherever the solve ran, and the smooth
+	// estimate otherwise. That is the swap: the origin of a vector process
+	// is exactly where a better estimate compounds, and the correspondence
+	// vet gets stricter for the same reason. Isolated rms IRE against the
+	// banked truth, cube/shirt/beach: smooth's own floor 4.2905/1.7135/2.6237
+	// against the solve's 2.5741/1.0393/1.2613.
+	//
+	// Eye verdict 2026-09-04: the solved origin is better. The A/B gate that
+	// carried the swap is gone; the solve is the origin wherever it ran.
+	inline const double *icebergPlatform_line(int line) const {
+		if (!lockedLumaSolved_flat.empty())
+			return lockedLumaSolved_flat.data() + size_t(line) * demodWidth;
+		if (lockedLumaSmooth_flat.empty()) return nullptr;
+		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
+	}
+	inline bool icebergPlatformValid() const {
+		return lockedLumaCacheValid || !lockedLumaSolved_flat.empty();
 	}
 
 	inline double *lockedApertureMean_line(int line) {

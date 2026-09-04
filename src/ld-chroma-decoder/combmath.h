@@ -237,6 +237,90 @@ inline double coarseCycleMedoid(const double *cycles, int count)
     return cycles[best];
 }
 
+// Weighted medoid: the same selection, with the voters carrying unequal
+// weight.  argmin_i sum_j W_j * |c_i - c_j|.
+//
+// A member whose window straddles a sudden luma change is not wrong about
+// nothing -- it is reporting two parts of the picture at once -- so its
+// opinion should count for less, not be struck out.  Striking members out
+// thins the ballot until the medoid has no majority to out-vote anything
+// with; weighting leaves all five standing and only loads the dice.
+//
+// With every W equal this is exactly coarseCycleMedoid, so the unlurched case
+// is not a special path.
+inline double coarseCycleMedoidWeighted(const double *cycles,
+                                        const double *w, int count)
+{
+    if (count <= 0) return 0.0;
+    if (!w) return coarseCycleMedoid(cycles, count);
+    int best = 0;
+    double bestCost = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < count; ++i) {
+        double cost = 0.0;
+        for (int j = 0; j < count; ++j)
+            cost += w[j] * std::fabs(cycles[i] - cycles[j]);
+        if (cost < bestCost) { bestCost = cost; best = i; }
+    }
+    return cycles[best];
+}
+
+// The coarse a sample stands on: the medoid of the complete carrier cycles it
+// is a MEMBER of. There are FIVE.
+//
+//   four offset apertures   starting at v in {x-3 .. x}, chord centres at
+//                           x-1.5, x-0.5, x+0.5, x+1.5
+//   the moving coarse       centeredCarrierCycle4Mean over [x-2 .. x+2],
+//                           centroid exactly x
+//
+// Each is itself a mean, and unavoidably so: cancelling the carrier requires
+// one complete cycle. What must never happen is averaging the coarses with
+// EACH OTHER -- their disagreement is the sub-block luma, and a mean of them
+// publishes a value no membership measured.
+//
+// They share one weakness: every window reaches four samples wide, so any of
+// them may include picture from a very different part of the image. The medoid
+// is the defence available to a selection -- it excludes the extreme outliers
+// and returns the membership the others agree with. The mean of the two
+// innermost apertures that stood here before had no defence at all against a
+// large delta landing on a window end.
+//
+// Five is also the right count: with an even set the medoid is degenerate --
+// for sorted a<=b<=c<=d the costs of b and c are both c+d-a-b, identically --
+// so the tie-break rather than the evidence would decide. An odd set has a
+// strict winner. The moving coarse is the member that both breaks the tie and
+// supplies a reading centred on the sample.
+//
+// Out-of-range members are SKIPPED rather than clamped: a clamped duplicate
+// would vote twice and bias the selection toward the edge.
+//
+// This is the coarse luma, and it is where lurch's involvement BEGINS rather
+// than ends. Lurch takes no part in the selection -- it is not a member, it
+// does not exclude members, and the ballot is always the full five. What it
+// does is carve the RESULT: the medoid is a reading built from four-sample
+// windows and so cannot resolve a transition sharper than one, and lurch
+// locates exactly those transitions and cuts them back into the finished
+// coarse. Selection first, sharpening second, and the two never mix.
+// `trust`, when supplied, carries one weight per MEMBER SLOT in the order the
+// members are gathered here: the covering apertures v = x-3 .. x that are in
+// range, then the moving coarse.  Null means an unweighted ballot.
+inline double coveringCycleMedoid(const double *apMean, int x, int lastStart,
+                                  bool haveMovingCoarse, double movingCoarse,
+                                  const double *trust = nullptr)
+{
+    if (!apMean || lastStart < 0) return 0.0;
+    double cycles[5];
+    int count = 0;
+    for (int k = 0; k < 4; ++k) {
+        const int v = x - 3 + k;
+        if (v < 0 || v > lastStart) continue;
+        cycles[count++] = apMean[v];
+    }
+    if (haveMovingCoarse) cycles[count++] = movingCoarse;
+    if (count == 0)
+        return apMean[x < 0 ? 0 : (x > lastStart ? lastStart : x)];
+    return coarseCycleMedoidWeighted(cycles, trust, count);
+}
+
 // Shared fractional-basis demod helpers. These are tiny math utilities used by
 // both the locked demod path and candidate generation.
 inline constexpr double CAL_EPS_SAMPLES = -0.07;

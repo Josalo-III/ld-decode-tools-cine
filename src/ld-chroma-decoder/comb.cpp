@@ -617,10 +617,27 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             // cheap baseY4 floor. Allocate sharp only under witness so the
             // baseline path pays neither its buffer nor its build. baseY4 and
             // the geometry-only smooth/hDelta services stay unconditional.
-            if (configuration.yElection.lsc)
+            // The comb's coarse rows now consume this platform too (see
+            // getLumaRow in combcandidate.cpp), so the solve is no longer a
+            // witness-only cost.  The aperture pool it reads was already
+            // unconditional; what is added here is the solve itself.
+            if (configuration.yElection.lsc || ldcdSolvedCoarseEnabled())
                 lockedLumaSharp_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             else
                 lockedLumaSharp_flat.clear();
+            // The platform solve is its own construction with its own gate;
+            // off, it costs neither buffer nor build.
+            if (ldcdLumaSolveEnabled()) {
+                lockedLumaSolved_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+                residLaneN_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+                residLane2_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+                carrierLicense_flat.assign(size_t(lines + 1) * size_t(width), 1.0f);
+            } else {
+                lockedLumaSolved_flat.clear();
+                residLaneN_flat.clear();
+                residLane2_flat.clear();
+                carrierLicense_flat.clear();
+            }
             lockedLumaHDeltaIRE_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
             lockedCornerLeak_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             // Band facts: filled by buildBandFacts() at the tail of

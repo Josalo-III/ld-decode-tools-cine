@@ -92,6 +92,111 @@ inline double lurchPlatformCutoffMHz()
     return mhz;
 }
 
+// Lane-constraint weights in the lurch solve. Both default to 1.0 -- the two
+// lane facts stand with the same-phase difference facts (wA = 1.0), because
+// they are the same KIND of fact: a combination the carrier provably cannot
+// reach, so y and raw must agree on it. Separately tunable because the two
+// lanes fail differently (yN leaks on envelope curvature, y2 on its gradient),
+// and a shared knob would hide which one a change was paying for. 0 removes
+// that family's constraints entirely.
+inline double lurchLaneWeightN()
+{
+    static const double w = []{
+        const char *s = std::getenv("LDCD_LURCH_WN");
+        return s ? std::atof(s) : 1.0;
+    }();
+    return w;
+}
+inline double lurchLaneWeight2()
+{
+    static const double w = []{
+        const char *s = std::getenv("LDCD_LURCH_W2");
+        return s ? std::atof(s) : 1.0;
+    }();
+    return w;
+}
+
+// Feasibility sharpening of the coarse. DEFAULT OFF, on measurement.
+//
+// Its two restrictions turned out to be one tautology and one wrong tool. The
+// coarse-residual bound is vacuous against this platform BY CONSTRUCTION: the
+// medoid is one of the covering coarses, so it lies between their min and max,
+// so the carrier it implies is always already inside the bound. That primitive
+// exists to clamp a carrier arriving from an INDEPENDENT source.
+//
+// The bandwidth law is live but pushes the wrong way. A coarse is already
+// carrier-free -- the full-cycle mean removes the carrier exactly -- so a law
+// that EXCLUDES carrier has nothing to take out of it, and can only decide
+// that part of the residual IS carrier. The in-band residual is largely the
+// fSC luma the coarse discarded, so attributing it to carrier is the leak.
+// Measured: cube -35%, shirt and beach 3x WORSE, because the platform stops
+// being a coarse and becomes raw-minus-carrier, carrying the whole
+// carrier-estimation error where a coarse carried none.
+inline bool feasibilitySharpensCoarse()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_FEAS_COARSE");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
+// Second restriction of the feasibility sharpening: the encoder bandwidth law
+// on what survived the coarse-residual bound. LDCD_FEAS_BAND=0 runs the
+// membership bound alone, so the two can be graded apart.
+inline bool feasibilityBandStep()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_FEAS_BAND");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// The fifth ballot member -- the moving coarse, centeredCarrierCycle4Mean,
+// weights 1/8 1/4 1/4 1/4 1/8 with its centroid exactly on the sample.
+//
+// It is provably 1/2*(apMean[x-2] + apMean[x-1]) -- the mean of the two centre
+// apertures -- so it contributes NO independent constraint on luma. It is not
+// nothing to a medoid, which is nonlinear: it changes which member wins, and
+// with four members the medoid is degenerate (for sorted a<=b<=c<=d the costs
+// of b and c are both c+d-a-b, identically) so an odd count gives a strict
+// winner. But the lurch weighting also breaks that tie, so whether the member
+// still earns its place is now an open question and this gate answers it.
+inline bool movingCoarseOnBallot()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_MOVING_COARSE");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// Lurch WEIGHTS the medoid ballot by how much of each coarse's window lies on
+// the sample's side of an abrupt change. Default ON: it adds information and
+// never removes a member. LDCD_LURCH_LOAD=0 gives the flat ballot.
+inline bool lurchLoadsMedoid()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_LURCH_LOAD");
+        return !(s && std::atoi(s) == 0);
+    }();
+    return on;
+}
+
+// Lurch carves located transitions into the coarse instead. DEFAULT OFF --
+// superseded by feasibility above, which does the same job without asserting
+// a step. Kept reachable (LDCD_LURCH_SHARPEN=1) because lurch's data still has
+// a role to play inside the feasible construction, not in front of it.
+inline bool lurchSharpensPlatform()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_LURCH_SHARPEN");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
 // A/B escape: 0 restores the plateau snap at both platform call sites.
 inline bool lurchSolveEnabled()
 {
@@ -114,6 +219,12 @@ inline bool lurchPinEnabled()
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
+// Parallax ratio: below soft the energy nulls in every aperture like legal
+// carrier (protect); above hard it fails to null (luma, act). Measured
+// populations: colour p50 0.05-0.12, pure luma p50 0.89.
+static constexpr double kCornerParallaxSoft   = 0.15;
+static constexpr double kCornerParallaxHard   = 0.45;
+
 void Comb::FrameBuffer::phaseLocked()
 {
     if (!configuration.phaseCompensation)
@@ -259,8 +370,11 @@ void Comb::FrameBuffer::phaseLocked()
         !lockedLumaSmooth_flat.empty() &&
         demodWidth == width)
     {
-        const bool buildSharp =
-            configuration.yElection.lsc && !lockedLumaSharp_flat.empty();
+        // Follow the ALLOCATION, not the witness flag: the comb's coarse rows
+        // are a second client of this platform, so whoever caused it to be
+        // allocated is entitled to have it filled.
+        const bool buildSharp = !lockedLumaSharp_flat.empty();
+        const bool buildSolved = !lockedLumaSolved_flat.empty();
 
         for (int line = firstLine; line < lastLine; ++line) {
             const quint16 *rawLine = rawbuffer.data() + line * fullWidth;
@@ -270,6 +384,78 @@ void Comb::FrameBuffer::phaseLocked()
                                                 lockedLumaSmooth_line(line));
 
             double *apMean = lockedApertureMean_line(line);
+
+            // The platform solve reads the same aperture pool and is otherwise
+            // independent of the lurch solve below -- separate construction,
+            // separate plane, so either can be built without the other.
+            if (buildSolved && apMean) {
+                double *solved = lockedLumaSolved_line(line);
+                // THE LICENSE. apertureParallaxLine already measures the
+                // thing: the spread of the four covering aperture
+                // residuals over their mean magnitude. Low = the
+                // carrier-band energy nulls in every legal aperture, so it
+                // behaves like carrier; high = it fails to null, so it is
+                // luma moving through the window. Reused rather than
+                // rebuilt -- one scan, many readers.
+                //
+                // Mapping to [0,1] uses the soft/hard cuts measured for
+                // buildCornerLeak (colour p50 0.05-0.12, pure luma p50
+                // 0.89). Those are INHERITED, and are a starting point for
+                // this consumer rather than a law of it.
+                if (float *lic = carrierLicense_line(line)) {
+                    const int w4 = 4 * width;
+                    if ((int)scratch_aptVI.size() < w4) {
+                        scratch_aptVI.resize(w4); scratch_aptVQ.resize(w4);
+                        scratch_aptSI.resize(w4); scratch_aptSQ.resize(w4);
+                        scratch_aptRatio.resize(width);
+                    }
+                    apertureParallaxLine(line, scratch_aptVI, scratch_aptVQ,
+                                         scratch_aptSI, scratch_aptSQ,
+                                         scratch_aptRatio.data());
+                    for (int xi = 0; xi < width; ++xi) {
+                        const double r = scratch_aptRatio[xi];
+                        double t = (kCornerParallaxHard - r) /
+                                   (kCornerParallaxHard - kCornerParallaxSoft);
+                        t = std::clamp(t, 0.0, 1.0);
+                        lic[xi] = (float)(t * t * (3.0 - 2.0 * t));
+                    }
+                }
+
+                if (width < 4)
+                    std::copy(lockedLumaSmooth_line(line),
+                              lockedLumaSmooth_line(line) + width, solved);
+                else
+                    solveLumaPlatformLine(line, apMean, width - 3, width, solved);
+
+                // THE RESIDUAL LANE COARSES -- an independent carrier signal.
+                //
+                // resid = raw - solvedPlatform, in composite space. The
+                // sharper the platform, the less luma is left in resid and the
+                // more the carrier stands out in it. Both lane reads cancel
+                // the carrier by the diameter property, so each returns what
+                // luma REMAINS in the residual; the complement resid - lane is
+                // then a carrier estimate owing nothing to the 1D bandpass.
+                //
+                // Kept apart, never averaged: their mean is the four-sample
+                // mean, identically zero on the 2fSC component that no legal
+                // carrier can occupy, and they read that component with
+                // opposite sign. No consumer yet -- published raw.
+                double *lnN = residLaneN_line(line);
+                double *ln2 = residLane2_line(line);
+                if (lnN && ln2) {
+                    const quint16 *rl = rawbuffer.data() + (size_t)line * fullWidth;
+                    auto resid = [&](int xi) -> double {
+                        const int c = std::clamp(xi, 0, width - 1);
+                        return (double)rl[left + c] - solved[c];
+                    };
+                    for (int xi = 0; xi < width; ++xi) {
+                        lnN[xi] = 0.25 * resid(xi - 2) + 0.5 * resid(xi)
+                                + 0.25 * resid(xi + 2);
+                        ln2[xi] = 0.5 * (resid(xi - 1) + resid(xi + 1));
+                    }
+
+                }
+            }
 
             if (!buildSharp)
                 continue;
@@ -289,9 +475,17 @@ void Comb::FrameBuffer::phaseLocked()
                 const int lastStart = width - 4; // last legal aperture start
 
                 for (int xi = 0; xi < width; ++xi) {
-                    const int s0 = std::clamp(xi - 2, 0, lastStart);
-                    const int s1 = std::clamp(xi - 1, 0, lastStart);
-                    sharp[xi] = 0.5 * (boxcar[s0] + boxcar[s1]);
+                    const bool haveMoving = (xi >= 2 && xi + 2 < width);
+                    const double moving = haveMoving
+                        ? centeredCarrierCycle4Mean(
+                              (double)rawLine[left + xi - 2],
+                              (double)rawLine[left + xi - 1],
+                              (double)rawLine[left + xi],
+                              (double)rawLine[left + xi + 1],
+                              (double)rawLine[left + xi + 2])
+                        : 0.0;
+                    sharp[xi] = coveringCycleMedoid(boxcar, xi, lastStart,
+                                                    haveMoving, moving);
                 }
                 const std::vector<LurchStepRun> corrRuns =
                     corroborateLurchEdges(line);
@@ -577,7 +771,25 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
             const double *wLaw = bandWLaw_line(line);
             const double *keep = bandKeep_line(line, 2);
 
-            if (bp && wLaw && keep) {
+            // THE REACH READS THE SOLVED LUMA.
+            //
+            // hDelta is the lateral-contrast service the 2D reach decides on
+            // -- Frame B's reach exemption, cross-colour, the FVF vertical
+            // regime all consult it. It was measuring contrast on a luma of
+            // its own: a band-law-weighted notch, falling back to the block
+            // scaffold whose second difference is a property of the block
+            // grid rather than the picture.
+            //
+            // Determining a reach from an estimate other than the best one
+            // available is the same evidence failure the holdout convicted at
+            // 1D -- the observation not representing the quantity it is taken
+            // for. The solved platform is built in phaseLocked, which runs
+            // before this pass, so it is simply here to be used.
+            const double *solvedLuma = ldcdReachUsesSolvedLuma()
+                ? lockedLumaSolved_line(line) : nullptr;
+            if (solvedLuma) {
+                std::copy(solvedLuma, solvedLuma + width, nhLuma.begin());
+            } else if (bp && wLaw && keep) {
                 const quint16 *rawLine =
                     rawbuffer.data() + static_cast<size_t>(line) * fullWidth;
                 for (int rel = 0; rel < width; ++rel) {
@@ -722,11 +934,6 @@ void Comb::FrameBuffer::apertureParallaxLine(
 static constexpr int    kCornerRecoveryDepth  = 60;
 // Outer rounds of the two-way contamination fix (see buildCornerLeak).
 static constexpr int    kCornerOuterRounds    = 2;
-// Parallax ratio: below soft the energy nulls in every aperture like legal
-// carrier (protect); above hard it fails to null (luma, act). Measured
-// populations: colour p50 0.05-0.12, pure luma p50 0.89.
-static constexpr double kCornerParallaxSoft   = 0.15;
-static constexpr double kCornerParallaxHard   = 0.45;
 
 void Comb::FrameBuffer::buildCornerLeak()
 {
@@ -4213,8 +4420,41 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             if (std::strcmp(s, "notchhf") == 0)   return 6;
             if (std::strcmp(s, "notch") == 0)     return 5;
             if (std::strcmp(s, "ice") == 0)       return 7;
+            // TEMPORARY (strip when the head's question closes): the solved
+            // luma platform emitted as Y, with nothing downstream of it. The
+            // head judged on its own, not through the comb's reaction to it.
+            if (std::strcmp(s, "platform") == 0)  return 102;
+            if (std::strcmp(s, "platlane") == 0)  return 103;
             return -1;
         }();
+        if (yViewMode == 103) {
+            // Platform + residual laneN, as a LUMA estimate, so the lane read
+            // can be graded in the uncertified regime against banked truth
+            // rather than against certified ground.
+            const double *plat = lockedLumaSolved_flat.empty()
+                ? nullptr : lockedLumaSolved_line(line);
+            const double *lnN  = residLaneN_line(line);
+            for (int h = left; h < right; ++h) {
+                const int xi = h - left;
+                Y[h] = (plat && lnN) ? plat[xi] + lnN[xi]
+                                     : (double)rawLine[h];
+            }
+            continue;
+        }
+        if (yViewMode == 102) {
+            // Whichever platform is active, isolated: the head alone, with
+            // nothing downstream of it. Grading tap for all three floors.
+            const double *plat = nullptr;
+            if (ldcdLumaSolveEnabled() && !lockedLumaSolved_flat.empty())
+                plat = lockedLumaSolved_line(line);
+            else if (!lockedLumaSharp_flat.empty())
+                plat = lockedLumaSharp_line(line);
+            else if (!lockedLumaBaseY4_flat.empty())
+                plat = lockedLumaBaseY4_line(line);
+            for (int h = left; h < right; ++h)
+                Y[h] = plat ? plat[h - left] : (double)rawLine[h];
+            continue;
+        }
         if (yViewMode == 100) {
             for (int h = left; h < right; ++h)
                 Y[h] = (double)rawLine[h];
@@ -4292,11 +4532,27 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             for (int h = left; h < right; ++h)
                 Y[h] = (double)rawLine[h] - (double)certExactRow[h];
         } else if (carrierComp) {
+            // The produceY floor follows the ALLOCATION, not the lsc flag.
+            //
+            // lsc's only effect in the tree was this line -- it swapped the
+            // floor from the block-mean baseY4 to the solved platform. But
+            // main.cpp derives lumaWitness = (rcy || lsc), so asking for the
+            // better floor also switched the whole witness machinery on. The
+            // two are unrelated: one is which luma the reconstruction stands
+            // on, the other is a candidate roster. Following the allocation
+            // separates them, so the floor can be graded on its own.
+            //
+            // Three floors, graded one at a time. The platform solve supplants
+            // both of the others when it is gated on; with it off, lsc and
+            // baseY4 behave exactly as they always did.
+            const bool useSolved =
+                ldcdLumaSolveEnabled() && !lockedLumaSolved_flat.empty();
             const bool useSharpCoarse =
                 configuration.yElection.lsc && !lockedLumaSharp_flat.empty();
             auto coarseFloor_line = [&](int l) -> const double * {
-                return useSharpCoarse ? lockedLumaSharp_line(l)
-                                      : lockedLumaBaseY4_line(l);
+                if (useSolved)       return lockedLumaSolved_line(l);
+                if (useSharpCoarse)  return lockedLumaSharp_line(l);
+                return lockedLumaBaseY4_line(l);
             };
             const double *coarseRow =
                 (lockedLumaCacheValid && demodWidth == width)
@@ -4871,6 +5127,169 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 double ccReturn = ccMaskRow
                     ? std::clamp((double)ccMaskRow[xi], 0.0, 1.0)
                     : 0.0;
+
+                // THE POST-COMB CHECK -- do not move the energy twice.
+                //
+                // CCR returns cross-colour to luma. The carrier licence says
+                // which energy is luma masquerading as carrier: a legal
+                // carrier nulls under every legal four-sample aperture, so
+                // energy that fails to null is not carrier whatever the
+                // demodulation made of it.
+                //
+                // But the comb runs FIRST, and may already have taken that
+                // energy out of the chroma. Returning it again on the strength
+                // of a licence measured BEFORE the comb would double-move it.
+                // So the test is not "was this luma?" -- it is "is it STILL
+                // in the chroma now?".
+                //
+                //   preC   the chroma before the comb (the 1D carrier)
+                //   postC  the chroma the comb actually assigned
+                //   lumaE  the part of preC the licence calls luma
+                //
+                // Whatever the comb removed comes off lumaE first; CCR is
+                // licensed only for the remainder. When the comb has already
+                // taken it all, the return goes to zero and CCR does nothing
+                // -- which is the correct answer, not an abstention.
+                //
+                // This makes the two consumers independent: comb may act or
+                // not, and this check is right either way, because it reads
+                // what is actually left rather than what was predicted.
+                // SCHEDULE CONFORMITY -- the screen the aperture test lacks.
+                //
+                // Period-4 luma is anti-symmetric at stride 2 exactly as
+                // carrier is, so it nulls in every legal four-sample aperture
+                // and the aperture licence scores it as genuine. That is why
+                // the cube's lattice gets past a purely lateral screen.
+                //
+                // The schedule has no such blind spot. The grammar fixes the
+                // carrier's phase relation between this line and its +-2
+                // neighbour -- Same or Opposite, ASKED, never inferred from
+                // the line distance -- so folding 1D's carrier against that
+                // neighbour by the stated relation must CANCEL if the energy
+                // is carrier. Luma has no reason to obey a schedule it is not
+                // party to: a lattice can imitate the carrier along a line
+                // and still fail to imitate the encoder's line-to-line
+                // alternation.
+                //
+                // So the return also requires non-conformity: the energy
+                // must fail the schedule it would have to obey to be carrier
+                // at all. With the aperture coherence detector this is the
+                // shipped pair -- one lateral character test, one vertical.
+                //
+                // Three other screens were built here and are gone. A
+                // MINORITY REPORT comparing 1D's carrier magnitude against
+                // the independent reading (raw - solvedPlatform -
+                // residLaneN); a SATURATION TAPER on that same independent
+                // magnitude; and a LICENCE KEYING on aperture parallax. All
+                // three were falsified against banked truth under
+                // --dg-discard, and for two related reasons worth keeping:
+                //
+                //   The independent carrier is TWO-THIRDS TRAPPED. residLaneN
+                //   cancels by the diameter property -- r[x+-2] = -r[x] at
+                //   fSC -- and that identity never asks what the energy IS,
+                //   so subcarrier-band LUMA is annihilated exactly as carrier
+                //   is and survives into the complement at full amplitude.
+                //   Where truth says there is no carrier at all, 1D claims
+                //   1.31 IRE and the independent claims 0.88. A witness that
+                //   repeats two thirds of the defendant's error corroborates
+                //   the misparse it was built to falsify.
+                //
+                //   Aperture parallax cannot untrap it. It reads envelope
+                //   MOTION across displaced apertures, and a geometric
+                //   lattice is stationary -- its band energy sits still
+                //   exactly as a carrier's does. Measured, the licence reads
+                //   0.455 on false colour against 0.444 on real, with the
+                //   full distribution matching within a couple of points in
+                //   every bin. It also calls genuine strong colour "luma" 44%
+                //   of the time.
+                //
+                // Record: luma-platform-solve-and-ccr-screens-research-record
+                // -2026-09-04.md. Do not rebuild any of the three.
+                if (ccReturn > 0.0) {
+                    const CombCarrierGrammar *g0 = carrierGrammarLine(line);
+                    const int lnN = (line - 2 >= firstLine) ? line - 2
+                                  : (line + 2 <  lastLine)  ? line + 2 : -1;
+                    const CombCarrierGrammar *gN =
+                        (lnN >= 0) ? carrierGrammarLine(lnN) : nullptr;
+                    const double *oneN = (lnN >= 0) ? locked1DSource_line(lnN)
+                                                    : nullptr;
+                    if (g0 && gN && oneN && std::isfinite(clpLine[h]) &&
+                        std::isfinite(oneN[xi])) {
+                        const lddecode::CarrierPhaseRelation rel =
+                            lddecode::carrierGrammarSignedPhaseRelation(g0, h, gN, h);
+                        if (rel == lddecode::CarrierPhaseRelation::Same ||
+                            rel == lddecode::CarrierPhaseRelation::Opposite) {
+                            const double sgn =
+                                (rel == lddecode::CarrierPhaseRelation::Opposite) ? 1.0 : -1.0;
+                            // RELATIVE non-conformity, and the polarity is
+                            // measured, not assumed. The BARE fold residual
+                            // scales with amplitude -- a large legal carrier
+                            // with any envelope motion leaves a large one --
+                            // so it ranks real chroma as the worst offender
+                            // (censused: mean 14.5 IRE on real chroma vs 2.1
+                            // in the false zone, i.e. exactly inverted). It is
+                            // an amplitude proxy wearing a schedule's name.
+                            //
+                            // Divided by the local carrier magnitude it asks
+                            // the real question -- what FRACTION of this
+                            // energy failed the relation it must obey to be
+                            // carrier -- and the populations then sit the
+                            // right way round: false zone mean 1.03, real
+                            // chroma 0.72, with 39% of false colour above 1.2
+                            // against 18.6% of real. About 2:1. A screen, not
+                            // a clean separation, and the constants below are
+                            // read off that census.
+                            const double mag = std::max(std::fabs(clpLine[h]),
+                                                        std::fabs(oneN[xi]));
+                            const double nonConf = (mag > 1e-9)
+                                ? std::fabs(clpLine[h] + sgn * oneN[xi]) / mag
+                                : 0.0;
+                            // A BROAD TAPER ACROSS THE MEASURED POPULATIONS.
+                            //
+                            // Real chroma sits at mean ratio 0.72, the false
+                            // zone at 1.03, so the cuts below are read off the
+                            // census rather than chosen. This is a CHARACTER
+                            // test -- did this energy obey the relation
+                            // carrier must obey -- which is the question
+                            // actually being asked, and it discriminates
+                            // 2.1:1 where a magnitude comparison against the
+                            // independent carrier manages only 1.45:1.
+                            //
+                            // A narrow high-confidence veto (act below 0.25,
+                            // stand aside above 0.40) was tried and is worse:
+                            // the coherence detector is the only screen
+                            // supplying coverage, and a veto that abstains on
+                            // the ambiguous majority leaves the false colour
+                            // standing. The taper is the shipped shape.
+                            constexpr double kConfClean  = 0.70; // conforms
+                            constexpr double kConfBroken = 1.20; // does not
+                            double t = (nonConf - kConfClean) /
+                                       (kConfBroken - kConfClean);
+                            t = std::clamp(t, 0.0, 1.0);
+                            ccReturn *= t * t * (3.0 - 2.0 * t);
+                        }
+                    }
+                }
+
+                if (ccReturn > 0.0 && ldcdCcrPostCombCheck()) {
+                    const float *licRow = carrierLicense_line(line);
+                    if (licRow) {
+                        const double lic =
+                            std::clamp((double)licRow[xi], 0.0, 1.0);
+                        const double preC = std::isfinite(clpLine[h])
+                            ? std::fabs(clpLine[h]) : 0.0;
+                        const double postC = (carrierComp &&
+                                              std::isfinite(carrierComp[xi]))
+                            ? std::fabs(carrierComp[xi]) : preC;
+                        const double lumaE = (1.0 - lic) * preC;
+                        const double removed = std::max(0.0, preC - postC);
+                        const double remaining = (lumaE > 1e-9)
+                            ? std::clamp(1.0 - removed / lumaE, 0.0, 1.0)
+                            : 0.0;
+                        ccReturn *= remaining;
+                    }
+                }
+
                 if (ccReturn > 0.0 && !ccAuditW_flat.empty() &&
                     ccAuditNX > 0) {
                     const double ry = std::clamp(
@@ -5531,6 +5950,234 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 const bool haveLic = icebergReturnWeight_flat.size() >=
                     (size_t)rLast * demodWidth;
                 std::lock_guard<std::mutex> lk(cMtx);
+                // TEMPORARY (strip when the question closes): where does
+                // schedule non-conformity actually SIT, for false colour
+                // versus real? This block runs under --dg-discard, where
+                // covered frames do not exist -- so CCR is active on every
+                // frame -- and truth comes from the bank, taken from the
+                // covered version of the same fields. That is the only place
+                // the two coexist, and it is what makes these two constants
+                // derivable rather than guessed.
+                //
+                // True carrier = raw - banked truth Y, a conservation fact.
+                if (ldcdCcrConfCensusEnabled()) {
+                    static std::atomic<long long> fn[2] = {};
+                    static std::atomic<long long> fs[2] = {};
+                    static std::atomic<long long> fq[2][6] = {};
+                    static std::atomic<bool> fdone{false};
+                    const quint16 *rw0 = rawbuffer.data();
+                    for (int line = rFirst; line < rLast; ++line) {
+                        const int li = line - rFirst;
+                        if (!R.df[li]) continue;
+                        const int lnN = (line - 2 >= rFirst) ? line - 2
+                                      : (line + 2 <  rLast) ? line + 2 : -1;
+                        if (lnN < 0) continue;
+                        const lddecode::CarrierGrammarState *g0 =
+                            carrierGrammarLine(line);
+                        const lddecode::CarrierGrammarState *gN =
+                            carrierGrammarLine(lnN);
+                        const double *o0 = locked1DSource_line(line);
+                        const double *oN = locked1DSource_line(lnN);
+                        if (!g0 || !gN || !o0 || !oN) continue;
+                        const float *tr = R.ty.data() + (size_t)li * rWidth;
+                        const quint16 *rw =
+                            rw0 + (size_t)line * videoParameters.fieldWidth;
+                        for (int x = 8; x < rWidth - 8; ++x) {
+                            if (!std::isfinite(tr[x])) continue;
+                            if (!std::isfinite(o0[x]) || !std::isfinite(oN[x]))
+                                continue;
+                            const int h = rLeft + x;
+                            const lddecode::CarrierPhaseRelation rel =
+                                lddecode::carrierGrammarSignedPhaseRelation(
+                                    g0, h, gN, h);
+                            if (rel != lddecode::CarrierPhaseRelation::Same &&
+                                rel != lddecode::CarrierPhaseRelation::Opposite)
+                                continue;
+                            const double sgn =
+                                (rel == lddecode::CarrierPhaseRelation::Opposite)
+                                    ? 1.0 : -1.0;
+                            // RELATIVE non-conformity. The bare fold residual
+                            // scales with amplitude -- a large legal carrier
+                            // with any envelope motion leaves a large one --
+                            // so it is an amplitude proxy, not a schedule
+                            // test. Dividing by the local carrier magnitude
+                            // asks the actual question: what FRACTION of this
+                            // energy failed the relation it would have to obey
+                            // to be carrier.
+                            const double mag = std::max(std::fabs(o0[x]),
+                                                        std::fabs(oN[x]));
+                            const double nonConf = (mag > 1e-9)
+                                ? std::fabs(o0[x] + sgn * oN[x]) / mag : 0.0;
+                            const double trueC =
+                                std::fabs((double)rw[h] - (double)tr[x]) / irescale;
+                            const int g = (trueC < 2.0) ? 0
+                                        : (trueC > 10.0) ? 1 : -1;
+                            if (g < 0) continue;
+                            // What does each estimator CLAIM here, against a
+                            // truth of ~0 in the false zone? A carrier reading
+                            // that is independent of this defect must read
+                            // near zero where the conservation fact says there
+                            // is no carrier. One that shares 1D's blind spot
+                            // will claim the lattice just as 1D does.
+                            {
+                                const double *plat2 =
+                                    lockedLumaSolved_flat.empty()
+                                        ? nullptr : lockedLumaSolved_line(line);
+                                const double *ln2 = residLaneN_line(line);
+                                const float *lc2 = carrierLicense_line(line);
+                                if (plat2 && ln2 && lc2) {
+                                    static std::atomic<long long> cn2[2] = {};
+                                    static std::atomic<long long> c1d[2] = {};
+                                    static std::atomic<long long> cin[2] = {};
+                                    static std::atomic<long long> clc[2] = {};
+                                    static std::atomic<long long> cim[2] = {};
+                                    static std::atomic<long long> clh[2][5] = {};
+                                    static std::atomic<bool> cd2{false};
+                                    const double oneDmag =
+                                        std::fabs(o0[x]) / irescale;
+                                    const double indMag =
+                                        std::fabs((double)rw[h] - plat2[x] - ln2[x])
+                                        / irescale;
+                                    // Does parallax actually separate the two
+                                    // zones? If the licence reads the same on
+                                    // false colour as on real, masking the
+                                    // independent by it cannot discriminate,
+                                    // whatever it does to the level.
+                                    const double L =
+                                        std::clamp((double)lc2[x], 0.0, 1.0);
+                                    cn2[g].fetch_add(1, std::memory_order_relaxed);
+                                    c1d[g].fetch_add(
+                                        (long long)std::llround(oneDmag*1000.0),
+                                        std::memory_order_relaxed);
+                                    cin[g].fetch_add(
+                                        (long long)std::llround(indMag*1000.0),
+                                        std::memory_order_relaxed);
+                                    clc[g].fetch_add(
+                                        (long long)std::llround(L*1000.0),
+                                        std::memory_order_relaxed);
+                                    // A smoothstep saturates at both ends, so
+                                    // equal means do not prove equal
+                                    // distributions. The histogram tells a
+                                    // failed MAPPING from a failed MECHANISM.
+                                    {
+                                        const int lb = (L >= 0.99) ? 4
+                                                     : (L >= 0.75) ? 3
+                                                     : (L >= 0.50) ? 2
+                                                     : (L >= 0.25) ? 1 : 0;
+                                        clh[g][lb].fetch_add(
+                                            1, std::memory_order_relaxed);
+                                    }
+                                    cim[g].fetch_add(
+                                        (long long)std::llround(L*indMag*1000.0),
+                                        std::memory_order_relaxed);
+                                    if (cn2[0].load()+cn2[1].load() > 250000 &&
+                                        !cd2.exchange(true)) {
+                                        for (int gg=0; gg<2; ++gg) {
+                                            const long long N = cn2[gg].load();
+                                            qInfo().noquote() << QString(
+                                              "CCR CLAIM %1: truth~%2 | 1D %3 IRE"
+                                              " | indep %4 IRE | licence %5"
+                                              " | masked indep %6 IRE  (n=%7)")
+                                              .arg(gg? "REAL >10":"FALSE <2")
+                                              .arg(gg? ">10":"~0")
+                                              .arg(N? c1d[gg].load()/(1000.0*N):0.0,0,'f',2)
+                                              .arg(N? cin[gg].load()/(1000.0*N):0.0,0,'f',2)
+                                              .arg(N? clc[gg].load()/(1000.0*N):0.0,0,'f',3)
+                                              .arg(N? cim[gg].load()/(1000.0*N):0.0,0,'f',2)
+                                              .arg(N);
+                                            QString hm = QString("CCR LICENCE %1 dist"
+                                              " [<.25 .25-.5 .5-.75 .75-.99 .99+]:")
+                                              .arg(gg? "REAL >10":"FALSE <2");
+                                            for (int bb = 0; bb < 5; ++bb)
+                                                hm += QString(" %1%%")
+                                                  .arg(N? 100.0*clh[gg][bb].load()/N
+                                                        : 0.0, 0, 'f', 1);
+                                            qInfo().noquote() << hm;
+                                        }
+                                    }
+                                }
+                            }
+                            fn[g].fetch_add(1, std::memory_order_relaxed);
+                            fs[g].fetch_add(
+                                (long long)std::llround(nonConf * 1000.0),
+                                std::memory_order_relaxed);
+                            const int q = (nonConf < 0.10) ? 0 : (nonConf < 0.25) ? 1
+                                        : (nonConf < 0.50) ? 2 : (nonConf < 0.80) ? 3
+                                        : (nonConf < 1.20) ? 4 : 5;
+                            fq[g][q].fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    if ((fn[0].load() + fn[1].load()) > 200000 &&
+                        !fdone.exchange(true)) {
+                        for (int gg = 0; gg < 2; ++gg) {
+                            const long long N = fn[gg].load();
+                            QString m = QString(
+                                "CCR CONF %1: mean ratio %2  dist [<.10 .10-.25 .25-.50 .50-.80 .80-1.2 1.2+]:")
+                                .arg(gg ? "REAL chroma >10" : "FALSE zone <2 ")
+                                .arg(N ? fs[gg].load()/(1000.0*N) : 0.0, 0, 'f', 2);
+                            for (int q = 0; q < 6; ++q)
+                                m += QString(" %1%%").arg(
+                                    N ? 100.0*fq[gg][q].load()/N : 0.0, 0, 'f', 1);
+                            m += QString("  (n=%1)").arg(N);
+                            qInfo().noquote() << m;
+                        }
+                    }
+                }
+
+                // TEMPORARY (strip when the question closes): CCR vetted
+                // against truth, STRATIFIED BY HOW MUCH COLOUR IS THERE.
+                //
+                // Y is the exact complement of chroma, so a pooled Y error can
+                // improve while colour drains -- the gain banked where there
+                // is no colour, the loss taken where there is. Pooling hides
+                // exactly the defect the eye sees. So bin by the TRUE chroma
+                // magnitude (raw - banked truth Y) and read the error in each
+                // bin: if CCR is over-returning it must show as error rising
+                // in the saturated bins while the flat bins improve.
+                if (ldcdCcrVetEnabled()) {
+                    static std::atomic<long long> cn[5] = {};
+                    static std::atomic<long long> ce[5] = {};
+                    static std::atomic<long long> ctot{0};
+                    const quint16 *rw0 = rawbuffer.data();
+                    for (int line = rFirst; line < rLast; ++line) {
+                        const int li = line - rFirst;
+                        if (!R.df[li]) continue;
+                        const double *Yr = componentFrame->y(line);
+                        const float *tr = R.ty.data() + (size_t)li * rWidth;
+                        const quint16 *rw =
+                            rw0 + (size_t)line * videoParameters.fieldWidth;
+                        for (int x = 8; x < rWidth - 8; ++x) {
+                            if (!std::isfinite(tr[x])) continue;
+                            // True chroma at this sample: raw minus true luma.
+                            const double trueC =
+                                std::fabs((double)rw[rLeft + x] - (double)tr[x])
+                                / irescale;
+                            const double err =
+                                std::fabs(Yr[rLeft + x] - (double)tr[x]) / irescale;
+                            const int b = (trueC < 2.0) ? 0 : (trueC < 5.0) ? 1
+                                        : (trueC < 10.0) ? 2 : (trueC < 20.0) ? 3 : 4;
+                            cn[b].fetch_add(1, std::memory_order_relaxed);
+                            ce[b].fetch_add((long long)std::llround(err * 1000.0),
+                                            std::memory_order_relaxed);
+                            ctot.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    if (ctot.load(std::memory_order_relaxed) > 200000) {
+                        static std::atomic<bool> cdone{false};
+                        if (!cdone.exchange(true)) {
+                            QString m = "CCR VET: mean |Y-truth| IRE by TRUE CHROMA "
+                                        "[<2 2-5 5-10 10-20 20+ IRE]:";
+                            for (int b = 0; b < 5; ++b) {
+                                const long long N = cn[b].load();
+                                m += QString(" %1(n=%2)")
+                                        .arg(N ? ce[b].load()/(1000.0*N) : 0.0, 0, 'f', 3)
+                                        .arg(N);
+                            }
+                            qInfo().noquote() << m;
+                        }
+                    }
+                }
+
                 for (int line = rFirst; line < rLast; ++line) {
                     const int li = line - rFirst;
                     if (!R.df[li]) continue;
@@ -6031,25 +6678,36 @@ void Comb::FrameBuffer::solveLurchYCurve(int line, const double *apMean,
 
     const int lastStart = meanCount - 1;
 
+    // The moving coarse is built from raw, so the row is resolved before the
+    // platform rather than after it. The guard's early-out stays BELOW the
+    // platform loop, exactly where it was: a line whose raw is unusable still
+    // leaves the platform filled from the aperture pool alone.
+    const int left      = videoParameters.activeVideoStart;
+    const int fullWidth = videoParameters.fieldWidth;
+    const bool rawOk = (line >= 0 && fullWidth > 0 && left >= 0 &&
+                        (size_t)(line + 1) * fullWidth <= rawbuffer.size());
+    const quint16 *rawLine =
+        rawOk ? rawbuffer.data() + (size_t)line * fullWidth : nullptr;
+    const auto raw = [&](int xi) -> double {
+        return (double)rawLine[left + xi];
+    };
+
     if ((int)scratch_lurchPlatform.size() < width)
         scratch_lurchPlatform.resize(width);
     double *platform = scratch_lurchPlatform.data();
     for (int xi = 0; xi < width; ++xi) {
-        const int s0 = std::clamp(xi - 2, 0, lastStart);
-        const int s1 = std::clamp(xi - 1, 0, lastStart);
-        platform[xi] = 0.5 * (apMean[s0] + apMean[s1]);
-        yOut[xi]   = platform[xi];
+        const bool haveMoving = rawOk && xi >= 2 && xi + 2 < width;
+        const double moving = haveMoving
+            ? centeredCarrierCycle4Mean(raw(xi - 2), raw(xi - 1), raw(xi),
+                                        raw(xi + 1), raw(xi + 2))
+            : 0.0;
+        platform[xi] = coveringCycleMedoid(apMean, xi, lastStart,
+                                           haveMoving, moving);
+        yOut[xi]     = platform[xi];
     }
 
-    const int left      = videoParameters.activeVideoStart;
-    const int fullWidth = videoParameters.fieldWidth;
-    if (line < 0 || fullWidth <= 0 || left < 0 ||
-        (size_t)(line + 1) * fullWidth > rawbuffer.size())
+    if (!rawOk)
         return;
-    const quint16 *rawLine = rawbuffer.data() + (size_t)line * fullWidth;
-    const auto raw = [&](int xi) -> double {
-        return (double)rawLine[left + xi];
-    };
 
     if ((int)scratch_lurchPin.size() < width)
         scratch_lurchPin.resize(width);
@@ -6144,6 +6802,539 @@ void Comb::FrameBuffer::solveLurchYCurve(int line, const double *apMean,
         if (clamped == 0)
             break;
         solveChains();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE LUMA PLATFORM SOLVE
+//
+// A third construction, not a variant of either floor above it. baseY4 is a
+// block mean -- one value per four samples, held flat across them -- so luma
+// detail finer than a block cannot survive it at all. lsc's lurch solve reads
+// the same-phase parallax facts, but as four independent stride-4 chains that
+// are tied to one another only through `platform`, which is itself an average
+// of two apertures. This solve answers to every carrier-free fact the line
+// affords, in one banded system, and is intended to supplant both.
+//
+// FACT FAMILIES
+//
+// SAME PHASE (stride 4, weight wA). x and x+4 are one full cycle apart and so
+// hold the SAME PHASE ROLE: whatever the carrier is doing at one it is doing
+// at the other, so it contributes exactly nothing to their difference, and
+// raw(x+4) - raw(x) is pure luma. It is the membership change at the ends that
+// makes the two signals move against each other -- the carrier is pinned by
+// its own periodicity and luma is not. That is the parallax.
+//
+// THE TWO LANES (weights wN, w2).
+//
+//   yN   1/4*(y[x-2] + 2y[x] + y[x+2])     same lane as x
+//   y2   1/2*(y[x-1] +        y[x+1])      the other lane
+//
+// Each is a DIAMETER on the phase circle -- opposite corners, whose midpoint
+// is the circle's centre at ANY rotation. So the carrier is annihilated by the
+// stencil exactly, at every phase, with no window and no mean over the cycle.
+// Phase invariance here is a property of diameters, not of smoothing.
+//
+// The constraint is NOT "this estimates the luma at x". That reading carries a
+// sagitta bias -- a chord's midpoint sits off the curve by an amount going as
+// the square of the chord width -- and asserting it would inject that bias. It
+// is the exact statement that a combination the carrier CANNOT REACH must read
+// the same on y as it does on raw. Nothing is claimed about where the value
+// belongs, so there is no bias to inject.
+//
+// Both lanes are here because they fail differently. yN spans its diameter
+// symmetrically about x, so envelope GRADIENT cancels and only its curvature
+// leaks; y2's diameter is not centred on a sample it reads, so gradient
+// survives. The aperture pool shares y2's blind spot, which makes yN the
+// member that adds an axis rather than a sixth view of one.
+//
+// Retention, not condensation: every fact enters as its own constraint and the
+// solve answers to all of them at once. Nothing is averaged, and no family is
+// reduced to a summary before the solve sees it.
+// ---------------------------------------------------------------------------
+void Comb::FrameBuffer::solveLumaPlatformLine(int line, const double *apMean,
+                                              int meanCount, int width,
+                                              double *yOut)
+{
+    if (!apMean || !yOut || width <= 0 || meanCount <= 0)
+        return;
+
+    const int lastStart = meanCount - 1;
+
+    // The moving coarse is built from raw, so the row is resolved before the
+    // platform rather than after it. The guard's early-out stays BELOW the
+    // platform loop, exactly where it was: a line whose raw is unusable still
+    // leaves the platform filled from the aperture pool alone.
+    const int left      = videoParameters.activeVideoStart;
+    const int fullWidth = videoParameters.fieldWidth;
+    const bool rawOk = (line >= 0 && fullWidth > 0 && left >= 0 &&
+                        (size_t)(line + 1) * fullWidth <= rawbuffer.size());
+    const quint16 *rawLine =
+        rawOk ? rawbuffer.data() + (size_t)line * fullWidth : nullptr;
+    const auto raw = [&](int xi) -> double {
+        return (double)rawLine[left + xi];
+    };
+
+    // Legal luma range, the physical limit the feasible box is built on.
+    // Named once and used by both the coarse projection below and the
+    // post-solve clamp at the tail of this function.
+    const double yFeasLo = (double)videoParameters.black16bIre -  25.0 * irescale;
+    const double yFeasHi = (double)videoParameters.black16bIre + 125.0 * irescale;
+
+    // LURCH LOADS THE DICE.
+    //
+    // Lurch is not a candidate, does not carve, and strikes nobody off. What
+    // it supplies is the sub-sample location of an abrupt change, and that
+    // matters because the five coarses meet the sample at five different
+    // places:
+    //
+    //     aperture x-3   centre x-1.5   x is its LAST sample
+    //     aperture x-2   centre x-0.5
+    //     moving coarse  centre x       x is its CENTRE
+    //     aperture x-1   centre x+0.5
+    //     aperture x     centre x+1.5   x is its FIRST sample
+    //
+    // So a change landing near x costs them unequally. An outer aperture can
+    // have three quarters of its window on the far side of the change while
+    // the moving coarse still has half its mass on each -- and the moving
+    // coarse is offset half a pixel from the aperture grid, so a sub-sample
+    // edge position separates them where a whole-sample one could not. What
+    // can be gleaned from the middle is not what can be gleaned from an edge.
+    //
+    // The weight is therefore the fraction of a member's OWN window mass lying
+    // on the sample's side of the nearest change -- 1 where no change is near,
+    // falling as more of the window reaches across. Several runs take the
+    // worst case. A weight is never zero: a straddling member still votes,
+    // just for less. That is the difference from the exclusion I built first,
+    // which thinned the ballot to one member on 12-17% of samples and took
+    // away the majority the medoid needs.
+    //
+    // Edges come from corroborateLurchEdges -- median-of-three across the two
+    // vertical neighbours, an order statistic, which is what stops the
+    // position saw-toothing line to line on texture noise.
+    const bool lurchLoads = lurchLoadsMedoid();
+    std::vector<LurchStepRun> loadRuns;
+    if (lurchLoads)
+        loadRuns = corroborateLurchEdges(line);
+
+    // Window mass of each member, at sample offsets relative to the member's
+    // own start. Apertures are flat quarters; the moving coarse is the
+    // one-cycle taper whose endpoints share a phase role.
+    auto memberTrust = [&](int firstSample, const double *massAt, int nMass,
+                           int xi) -> double {
+        if (!lurchLoads || loadRuns.empty()) return 1.0;
+        double worst = 1.0;
+        for (const LurchStepRun &r : loadRuns) {
+            if (r.suppressed) continue;
+            const double e = r.edge;
+            // Only a change actually inside the window can split it.
+            if (e <= firstSample || e >= firstSample + nMass - 1) continue;
+            const bool xLeft = ((double)xi < e);
+            double same = 0.0, total = 0.0;
+            for (int k = 0; k < nMass; ++k) {
+                const double p = firstSample + k;
+                total += massAt[k];
+                if ((p < e) == xLeft) same += massAt[k];
+            }
+            if (total > 0.0) worst = std::min(worst, same / total);
+        }
+        return worst;
+    };
+    static const double kApertureMass[4] = { 0.25, 0.25, 0.25, 0.25 };
+    static const double kMovingMass[5]   = { 0.125, 0.25, 0.25, 0.25, 0.125 };
+
+    if ((int)scratch_lurchPlatform.size() < width)
+        scratch_lurchPlatform.resize(width);
+    double *platform = scratch_lurchPlatform.data();
+    for (int xi = 0; xi < width; ++xi) {
+        const bool haveMoving = movingCoarseOnBallot() &&
+                                rawOk && xi >= 2 && xi + 2 < width;
+        const double moving = haveMoving
+            ? centeredCarrierCycle4Mean(raw(xi - 2), raw(xi - 1), raw(xi),
+                                        raw(xi + 1), raw(xi + 2))
+            : 0.0;
+        // Weights in the SAME slot order coveringCycleMedoid gathers members.
+        double trust[5];
+        int nT = 0;
+        for (int k = 0; k < 4; ++k) {
+            const int v = xi - 3 + k;
+            if (v < 0 || v > lastStart) continue;
+            trust[nT++] = memberTrust(v, kApertureMass, 4, xi);
+        }
+        if (haveMoving)
+            trust[nT++] = memberTrust(xi - 2, kMovingMass, 5, xi);
+        platform[xi] = coveringCycleMedoid(apMean, xi, lastStart,
+                                           haveMoving, moving,
+                                           lurchLoads ? trust : nullptr);
+    }
+
+
+    // LURCH SHARPENS THE COARSE.
+    //
+    // The medoid of five is the coarse luma. Every one of its members is a
+    // mean over four samples, so no member -- and therefore no selection among
+    // them -- can resolve a transition sharper than one window. A step inside
+    // a window is spread across it by construction, and that limit is shared
+    // by all five, so the medoid cannot vote its way out of it.
+    //
+    // Lurch is not another candidate and takes no part in the selection. It
+    // locates the sudden luma changes the coarses cannot see and cuts them
+    // back into the finished coarse -- carving the transition into the
+    // platform rather than choosing between readings of it. Selection first,
+    // sharpening second; the two never mix.
+    //
+    // Edges come from corroborateLurchEdges rather than the raw list: the
+    // median-of-three across the two vertical neighbours, an order statistic
+    // and a selection among measured values, which is what stops the carved
+    // edge saw-toothing line to line on texture noise.
+    //
+    // DEFAULT OFF. A located step is an ASSERTION, and the carrier moves
+    // within limits, which is the width of that assertion's ambiguity. Worse,
+    // a step is broadband, so it supplies values for exactly the fSC and 2fSC
+    // freedoms no coarse can measure -- meaning a misplaced edge writes into
+    // the one subspace where nothing else can contradict it. Feasibility does
+    // the same sharpening job while asserting nothing, so it goes first and
+    // lurch's data waits for a role inside it.
+    if (lurchSharpensPlatform()) {
+        const std::vector<LurchStepRun> corrRuns = corroborateLurchEdges(line);
+        applyLurchSteps(corrRuns, apMean, meanCount, width, 1.0,
+                        platform, nullptr);
+    }
+
+    // FEASIBILITY SHARPENS THE COARSE — in composite space, by exclusion.
+    //
+    // The carrier is what luma moves AGAINST, so the reasoning stays in
+    // composite units. Two restrictions apply, in order, and both work the
+    // same way: they bound the CARRIER, and whatever the carrier is forbidden
+    // to hold returns to luma. Neither asserts that anything is there.
+    //
+    // 1. COARSE-RESIDUAL BOUND (carrierFeasibleRange, feasibleband.h).
+    //    A legal carrier sums to zero over every legal four-sample window, so
+    //    each covering coarse is that window's LUMA mean exactly. The four
+    //    windows covering x share x's carrier and differ only in their luma,
+    //    so bounding the luma bounds the carrier:
+    //        carrier <= raw - min_v apMean[v]     (the clean, dark-side bound)
+    //        carrier >= raw - max_v apMean[v]     (the ambiguous bright side)
+    //    This is the membership itself doing the work -- no filter, no
+    //    assumption, and in composite space throughout.
+    //
+    // 2. ENCODER BANDWIDTH LAW. What survives (1) must also be expressible:
+    //    legal carrier is Re{C(x) e^{i a(x)} } with the envelope bandlimited,
+    //    because the encoder low-passes chroma before modulating and passes
+    //    luma through untouched. An envelope faster than that is
+    //    INEXPRESSIBLE, so energy there is luma the fit has taken.
+    //
+    //    The demod is confined to this step and nothing else -- it is how an
+    //    envelope law is stated at all -- and the platform it returns to is
+    //    composite, which is where the parallax residuals will be read.
+    //
+    //    kChromaLawWide, NOT the encoder's 9-tap uvFilter. That kernel is the
+    //    CREATION filter: legal chroma has already been through it once, and
+    //    applying it again attenuates what is by definition legal (-2.26 dB at
+    //    its own passband edge) while admitting out-of-band energy at only
+    //    -17 dB. A law wants a flat passband and a steep stop; that one has a
+    //    drooping passband and a lazy stop, failing in both directions at once
+    //    (feasibleband.h). The Wide law kernel is flat to 0.01 dB in band and
+    //    -59 dB in stop.
+    //
+    //    WIDE on BOTH coordinates. The lattice axes are quadrature but they
+    //    are not I and Q -- about 24 degrees off -- so a narrow kernel on
+    //    either would clip legal wide-axis carrier. The narrow bound is in any
+    //    case documented as an unjustified placeholder.
+    if (rawOk && feasibilitySharpensCoarse()) {
+        if ((int)scratch_platEnvA.size() < width) {
+            scratch_platEnvA.resize(width);
+            scratch_platEnvB.resize(width);
+            scratch_platEnvAS.resize(width);
+            scratch_platEnvBS.resize(width);
+            scratch_platCarrier.resize(width);
+        }
+        double *envA  = scratch_platEnvA.data();
+        double *envB  = scratch_platEnvB.data();
+        double *sEnvA = scratch_platEnvAS.data();
+        double *sEnvB = scratch_platEnvBS.data();
+        double *carr  = scratch_platCarrier.data();
+
+        // (1) The carrier implied by the coarse, clamped into what the
+        //     memberships permit. The excess is luma and is already out.
+        for (int xi = 0; xi < width; ++xi) {
+            const lddecode::CarrierFeasibleRange r =
+                lddecode::carrierFeasibleRange(raw(xi), apMean, xi, width);
+            carr[xi] = std::clamp(raw(xi) - platform[xi], r.floor, r.ceiling);
+        }
+
+        if (!feasibilityBandStep()) {
+            // Coarse-residual bound alone: the memberships doing the work,
+            // no filter anywhere in the path.
+            for (int xi = 0; xi < width; ++xi)
+                platform[xi] = raw(xi) - carr[xi];
+        } else {
+        // (2) What remains must also be expressible by the encoder.
+        for (int xi = 0; xi < width; ++xi) {
+            const int ph = carrierSampleClass(line, left + xi);
+            demod4fscFromComposite(carr[xi], ph, envA[xi], envB[xi]);
+        }
+        lddecode::projectLawfulChromaCoordinate(
+            envA, nullptr, width, sEnvA, lddecode::ChromaLawAxis::Wide);
+        lddecode::projectLawfulChromaCoordinate(
+            envB, nullptr, width, sEnvB, lddecode::ChromaLawAxis::Wide);
+
+        // Y is the complement of the carrier that survived both restrictions.
+        for (int xi = 0; xi < width; ++xi) {
+            const int ph = carrierSampleClass(line, left + xi);
+            platform[xi] =
+                raw(xi) - remod4fscToComposite(sEnvA[xi], sEnvB[xi], ph);
+        }
+        }
+    }
+
+    for (int xi = 0; xi < width; ++xi)
+        yOut[xi] = platform[xi];
+
+    if (!rawOk)
+        return;
+    if ((int)scratch_lurchPin.size() < width)
+        scratch_lurchPin.resize(width);
+    double *pin = scratch_lurchPin.data();
+    const float *exRow = lurchPinEnabled() ? exactCarrierRow(line) : nullptr;
+    int pinCount = 0;
+    for (int xi = 0; xi < width; ++xi) {
+        pin[xi] = std::numeric_limits<double>::quiet_NaN();
+        if (!exRow)
+            continue;
+        const float e = exRow[left + xi];
+        if (!std::isfinite(e))
+            continue;
+        pin[xi]  = raw(xi) - (double)e;
+        yOut[xi] = pin[xi];
+        ++pinCount;
+    }
+    if (pinCount >= width)
+        return;                     // fully certified: conservation answered
+
+    constexpr double wA = 1.0;
+    const double wc = std::clamp(
+        8.0 * M_PI * lurchPlatformCutoffMHz() / kSampleRateMHz, 1e-4, M_PI);
+    const double wB = 2.0 * (1.0 - std::cos(wc));
+    const double wN = lurchLaneWeightN();
+    const double w2 = lurchLaneWeight2();
+
+    // Half-bandwidth 4: set by the same-phase difference (stride 4) and by the
+    // lane stencils' autocorrelation, which reach +-4 and +-2 respectively.
+    // A banded symmetric factorisation fills in no further than the original
+    // band, so 4 is exact here, not an approximation.
+    // Per-sample anchor trust from the luma discriminator (floored).
+    if ((int)scratch_anchorTrust.size() < width)
+        scratch_anchorTrust.resize(width);
+    double *anchorTrust = scratch_anchorTrust.data();
+    {
+        const float *lic = ldcdSolveLicenseWeighting()
+            ? carrierLicense_line(line) : nullptr;
+        constexpr double kAnchorFloor = 0.20;
+        for (int x = 0; x < width; ++x)
+            anchorTrust[x] = lic
+                ? kAnchorFloor + (1.0 - kAnchorFloor) *
+                                 std::clamp((double)lic[x], 0.0, 1.0)
+                : 1.0;
+    }
+
+    constexpr int kBand = 4;
+    const int bandStride = kBand + 1;
+    if ((int)scratch_lurchBand.size() < width * bandStride)
+        scratch_lurchBand.resize(width * bandStride);
+    if ((int)scratch_lurchRhs.size() < width)
+        scratch_lurchRhs.resize(width);
+    if ((int)scratch_lurchDiag.size() < width)
+        scratch_lurchDiag.resize(width);
+    double *A = scratch_lurchBand.data();
+    double *rhs = scratch_lurchRhs.data();
+    double *dg = scratch_lurchDiag.data();
+
+    // A(j, j-d) for d in [0, kBand]; the upper half follows by symmetry, so
+    // each symmetric position is written ONCE.
+    const auto addA = [&](int i, int j, double v) {
+        if (i < j) std::swap(i, j);
+        const int d = i - j;
+        if (d <= kBand) A[i * bandStride + d] += v;
+    };
+    const auto getA = [&](int i, int j) -> double {
+        if (i < j) std::swap(i, j);
+        const int d = i - j;
+        return (d <= kBand) ? A[i * bandStride + d] : 0.0;
+    };
+
+    struct Stencil { int n; int off[3]; double c[3]; double w; };
+    const Stencil lanes[2] = {
+        { 3, { -2, 0, 2 }, { 0.25, 0.5, 0.25 }, wN },   // yN, same lane
+        { 2, { -1, 1, 0 }, { 0.5,  0.5, 0.0  }, w2 },   // y2, other lane
+    };
+
+    const auto assemble = [&]() {
+        std::fill(A, A + width * bandStride, 0.0);
+        std::fill(rhs, rhs + width, 0.0);
+
+        // Soft anchor to the aperture platform, WEIGHTED BY THE LUMA
+        // DISCRIMINATOR.
+        //
+        // The anchor's job is to pin the three freedoms the same-phase facts
+        // cannot reach -- the relative levels of the four stride-4 chains. It
+        // does that with a COARSE, and a coarse is only as good as its window
+        // is uniform. Where the licence is low, energy is failing to null
+        // under aperture displacement, which is exactly the statement that
+        // picture is moving through these windows: the coarses disagree, and
+        // the medoid among them is a weaker answer. Where it is high, the
+        // windows agree and the platform deserves its pull.
+        //
+        // So the anchor is trusted per sample, and the exact difference facts
+        // -- which hold regardless -- carry more of the solve where the coarse
+        // does not. Floored, never zeroed: with no anchor at all those three
+        // freedoms float, and an unpinned chain level IS a lateral
+        // alternation in the output.
+        //
+        // NOTE the shape of this: the licence is derived from the spread of
+        // the same apertures the platform is selected from, so this is the
+        // coarses' own dispersion setting how far they are trusted. That is
+        // inverse-variance weighting and it flows one way -- no verdict feeds
+        // back into the measurement -- but it is content informing its own
+        // weight, and it is recorded here as such.
+        for (int x = 0; x < width; ++x) {
+            const double wBx = wB * anchorTrust[x];
+            addA(x, x, wBx);
+            rhs[x] += wBx * platform[x];
+        }
+
+        // Same-phase difference facts: +1 at x+4, -1 at x.
+        for (int x = 0; x + 4 < width; ++x) {
+            const double d4 = raw(x + 4) - raw(x);
+            addA(x, x, wA);
+            addA(x + 4, x + 4, wA);
+            addA(x + 4, x, -wA);
+            rhs[x]     -= wA * d4;
+            rhs[x + 4] += wA * d4;
+        }
+
+        // Lane facts. A constraint is placed only where its WHOLE stencil is
+        // in range -- an out-of-range member would have to be invented, and a
+        // manufactured sample is not a fact.
+        for (const Stencil &s : lanes) {
+            if (s.w <= 0.0) continue;
+            for (int x = 0; x < width; ++x) {
+                bool inRange = true;
+                for (int a = 0; a < s.n; ++a) {
+                    const int xa = x + s.off[a];
+                    if (xa < 0 || xa >= width) { inRange = false; break; }
+                }
+                if (!inRange) continue;
+                double b = 0.0;
+                for (int a = 0; a < s.n; ++a)
+                    b += s.c[a] * raw(x + s.off[a]);
+                for (int a = 0; a < s.n; ++a) {
+                    const int ia = x + s.off[a];
+                    rhs[ia] += s.w * s.c[a] * b;
+                    // b2 starts at a, not 0: addA stores each symmetric
+                    // position once, so looping the full range would write
+                    // every off-diagonal twice and double that coupling
+                    // relative to the diagonal.
+                    for (int b2 = a; b2 < s.n; ++b2)
+                        addA(ia, x + s.off[b2], s.w * s.c[a] * s.c[b2]);
+                }
+            }
+        }
+
+        // Pins are conservation facts, so they are exact, not weighted.
+        // Eliminate each pinned unknown by substitution -- its column moves to
+        // the right-hand side of every row that reaches it -- which keeps the
+        // system symmetric and positive definite for the factorisation.
+        for (int j = 0; j < width; ++j) {
+            if (!std::isfinite(pin[j])) continue;
+            const int lo = std::max(0, j - kBand);
+            const int hi = std::min(width - 1, j + kBand);
+            for (int i = lo; i <= hi; ++i) {
+                if (i == j || std::isfinite(pin[i])) continue;
+                rhs[i] -= getA(i, j) * pin[j];
+            }
+        }
+        for (int j = 0; j < width; ++j) {
+            if (!std::isfinite(pin[j])) continue;
+            const int lo = std::max(0, j - kBand);
+            const int hi = std::min(width - 1, j + kBand);
+            for (int i = lo; i <= hi; ++i) {
+                if (i < j) A[j * bandStride + (j - i)] = 0.0;
+                else if (i > j) A[i * bandStride + (i - j)] = 0.0;
+            }
+            A[j * bandStride] = 1.0;
+            rhs[j] = pin[j];
+        }
+    };
+
+    // Banded LDL^T. The matrix is a sum of squares plus wB*I with wB > 0, so it
+    // is symmetric positive definite and needs no pivoting.
+    const auto solveBanded = [&]() {
+        for (int j = 0; j < width; ++j) {
+            double d = A[j * bandStride];
+            for (int p = 1; p <= kBand && p <= j; ++p) {
+                const double ljp = A[j * bandStride + p];
+                d -= ljp * ljp * dg[j - p];
+            }
+            dg[j] = (std::fabs(d) > 1e-12) ? d : 1e-12;
+            for (int i = j + 1; i <= j + kBand && i < width; ++i) {
+                double v = A[i * bandStride + (i - j)];
+                for (int p = 1; p <= kBand; ++p) {
+                    const int k2 = j - p;
+                    if (k2 < 0) break;
+                    if (i - k2 > kBand) continue;
+                    v -= A[i * bandStride + (i - k2)] *
+                         A[j * bandStride + (j - k2)] * dg[k2];
+                }
+                A[i * bandStride + (i - j)] = v / dg[j];
+            }
+        }
+        for (int i = 0; i < width; ++i) {
+            double v = rhs[i];
+            for (int p = 1; p <= kBand && p <= i; ++p)
+                v -= A[i * bandStride + p] * yOut[i - p];
+            yOut[i] = v;
+        }
+        for (int i = 0; i < width; ++i)
+            yOut[i] /= dg[i];
+        for (int i = width - 1; i >= 0; --i) {
+            double v = yOut[i];
+            for (int p = 1; p <= kBand && i + p < width; ++p)
+                v -= A[(i + p) * bandStride + p] * yOut[i + p];
+            yOut[i] = v;
+        }
+    };
+
+    const auto solveAll = [&]() { assemble(); solveBanded(); };
+
+    solveAll();
+
+    const double yLo = yFeasLo;   // named once above
+    const double yHi = yFeasHi;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        int clamped = 0;
+        for (int xi = 0; xi < width; ++xi) {
+            if (std::isfinite(pin[xi]))
+                continue;
+            double nb[2];
+            int nbCount = 0;
+            if (xi - 2 >= 0)    nb[nbCount++] = raw(xi - 2);
+            if (xi + 2 < width) nb[nbCount++] = raw(xi + 2);
+            const lddecode::FeasibleInterval f =
+                lddecode::lumaFeasibleFromPairSums(raw(xi), nb, nbCount,
+                                                   yLo, yHi);
+            if (!f.valid())
+                continue;
+            const double c = f.clamp(yOut[xi]);
+            if (c != yOut[xi]) {
+                pin[xi] = c;
+                ++clamped;
+            }
+        }
+        if (clamped == 0)
+            break;
+        solveAll();
     }
 }
 
@@ -6407,8 +7598,8 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                                  ((double)rwD[h] - (double)pexD[h])));
                         }
                     }
-                    if (lockedLumaCacheValid) {
-                        const double *ps = lockedLumaSmooth_line(line);
+                    if (icebergPlatformValid()) {
+                        const double *ps = icebergPlatform_line(line);
                         if (ps) {
                             float *prow = pl.data() + (size_t)li * width;
                             for (int xi = 0; xi < width; ++xi)
@@ -6585,13 +7776,13 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
             }();
             std::vector<double> platBorrowBuf[2];
             auto sidePlatOK = [&](int k) -> bool {
-                if (nb[k]) return nb[k]->lockedLumaCacheValid;
+                if (nb[k]) return nb[k]->icebergPlatformValid();
                 return borrow[k] && borrow[k]->platValid &&
                        ldcdIceBankRow(borrow[k], borrow[k]->plat,
                                       line, width) != nullptr;
             };
             auto sidePlatRow = [&](int k) -> const double * {
-                if (nb[k]) return nb[k]->lockedLumaSmooth_line(line);
+                if (nb[k]) return nb[k]->icebergPlatform_line(line);
                 const float *r = ldcdIceBankRow(borrow[k], borrow[k]->plat,
                                                 line, width);
                 platBorrowBuf[k].resize(width);
@@ -6600,8 +7791,8 @@ bool Comb::FrameBuffer::buildIcebergReturn(const FrameBuffer *prevF,
                 return platBorrowBuf[k].data();
             };
             if (icebergTween && sidePlatOK(0) && sidePlatOK(1) &&
-                lockedLumaCacheValid) {
-                const double *platC = lockedLumaSmooth_line(line);
+                icebergPlatformValid()) {
+                const double *platC = icebergPlatform_line(line);
                 const double *platP = sidePlatRow(0);
                 const double *platN = sidePlatRow(1);
 

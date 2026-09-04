@@ -719,6 +719,28 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     RowRefs rU4 = rowRefs(tapLine.lnU4, tapLine.haveU4);
     RowRefs rD4 = rowRefs(tapLine.lnD4, tapLine.haveD4);
 
+    // The comb's coarse rows are the luma estimate its own decisions react to.
+    // lockedLumaSmooth is a block-centre scaffold: one mean per four samples,
+    // anchored at the block centre and LINEARLY INTERPOLATED between anchors
+    // (comb.cpp).  A piecewise-linear row has zero second difference inside
+    // every segment and a knot at every anchor, so lateralCornerIRE -- the
+    // second difference of coarse0IRE -- reports the block grid as much as the
+    // picture, and luma detail finer than a block is invisible to it.
+    //
+    // lockedLumaSharp is the same facts without that quantisation:
+    // solveLurchYCurve consumes the WHOLE aperture-membership sequence as
+    // same-phase difference facts and writes a per-sample platform.  Nothing is
+    // condensed on the way -- the memberships enter the solve as constraints.
+    // It was allocated only under --luma-witness because the default path was
+    // not paying for the solve; the coarse rows want it too.
+    //
+    // LDCD_COARSE_SOLVED=0 restores the scaffold byte-identically.
+    // Same three-way priority as the produceY floor: the platform solve when
+    // it is gated on, then lsc's lurch solve, then the scaffold.
+    const bool combUsesSolved =
+        ldcdLumaSolveEnabled() && !lockedLumaSolved_flat.empty();
+    const bool combUsesSharp =
+        ldcdSolvedCoarseEnabled() && !lockedLumaSharp_flat.empty();
     auto getLumaRow = [&](int ln)->const double* {
         if (!configuration.phaseCompensation ||
             !lockedLumaCacheValid ||
@@ -728,6 +750,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         {
             return nullptr;
         }
+        if (combUsesSolved) return lockedLumaSolved_line(ln);
+        if (combUsesSharp)  return lockedLumaSharp_line(ln);
         return lockedLumaSmooth_line(ln);
     };
 
@@ -2669,8 +2693,15 @@ void Comb::FrameBuffer::computeFrameBLine(
     // attribution/election path.  It is evidence only and does not soften or
     // throttle Frame B's signed correction.
     scratch_impulseExempt.resize(width);
-    const double *frameLuma0 = lockedLumaCacheValid
-        ? lockedLumaSmooth_line(line) : nullptr;
+    // The luma-impulse evidence reads the solved platform too: the block
+    // scaffold cannot resolve an impulse shorter than its own block, which is
+    // exactly what this observation is looking for.
+    const double *frameLuma0 = nullptr;
+    if (lockedLumaCacheValid) {
+        frameLuma0 = ldcdReachUsesSolvedLuma() ? lockedLumaSolved_line(line)
+                                               : nullptr;
+        if (!frameLuma0) frameLuma0 = lockedLumaSmooth_line(line);
+    }
     for (int x = 0; x < width; ++x) {
         scratch_impulseExempt[x] = compactLumaExcursionEvidence(
             frameLuma0, x, width, invIreScale);

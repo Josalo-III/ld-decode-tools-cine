@@ -646,10 +646,16 @@ int main(int argc, char *argv[])
                   "the committed verdict is binary. Using 1.0.");
         combConfig.yElection.ccr = true;
     }
-    // Derivations: the witness machinery serves rcy and lsc; the ccr pair
-    // engages at exactly 1.0 or not at all.
-    combConfig.lumaWitness =
-        combConfig.yElection.rcy || combConfig.yElection.lsc;
+    // Derivations: the witness machinery builds the RETRACTED carrier plane,
+    // which is rcy's input and nothing else's. lsc is the coarse platform
+    // floor and needs none of it -- the platform is built by the locked
+    // decomposition pass, not by buildLumaWitnessModel(). The old
+    // (rcy || lsc) derivation predates the Y election and was the half of
+    // that split which never landed: it made a request for the better floor
+    // run the retracted construction with its candidate unseated, which
+    // measured worse than plain default on every material. lsc no longer
+    // drags rcy's machinery in; --luma-witness still asks for both.
+    combConfig.lumaWitness = combConfig.yElection.rcy;
     combConfig.tunables.CC_SUPPRESSION_WEIGHT =
         combConfig.yElection.ccr ? 1.0 : 0.0;
 
