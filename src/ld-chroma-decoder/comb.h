@@ -172,6 +172,37 @@ inline bool ldcdCombLicenseEnabled()
     return on;
 }
 
+// FRAME B STAYS IN THE COLUMN (LDCD_FB_PIN_COLUMN=1). A test, default off.
+//
+// Frame B searches a lateral shift d in {-2..+2} and takes its pair
+// off-column at (up[x-d], dn[x+d]), on the account that a diagonal feature
+// advances between the +-1 lines. But Frame B's stated job is cancelling
+// VERTICALLY-INVARIANT image-locked colour, and a vertically-invariant term
+// has zero diagonal advance by definition -- that is the same sentence twice.
+// The carrier it subtracts is raster-locked, not content-locked, so it does
+// not ride a diagonal at all. d = 0 is already the detent for exactly this
+// reason -- "the vertical is Frame A's whole job" -- and a non-zero aim must
+// clear an 8% margin to displace it.
+//
+// The margin is cleared on notchAt = 0.5*(r[x-1] + r[x+1]) of the RAW row:
+// the two-tap diameter mean, which cancels fSC and nothing else, and whose
+// residue is period-4 in x. So the proof standard for leaving the column can
+// be met by phase-bucket structure rather than by content. d then flips with
+// the bucket, and an off-column-by-one pair resolves a horizontal dark edge
+// one line up on one bucket and one line down on the next -- an alternation
+// with everything combing and nothing ceding.
+//
+// The pin holds the pair in the column so that mechanism can be convicted or
+// exonerated in one render, without arguing about the search's material.
+inline bool ldcdFrameBPinColumn()
+{
+    static const bool on = []{
+        const char *s = std::getenv("LDCD_FB_PIN_COLUMN");
+        return s && std::atoi(s) != 0;
+    }();
+    return on;
+}
+
 // One detected luma step in a coarse aperture-mean sequence (the lurch
 // step-solve's output). PRODUCTION DATA: built once per line per frame from
 // the shared aperture pool (buildLurchStepRuns) and consumed by the witness

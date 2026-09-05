@@ -2819,7 +2819,11 @@ void Comb::FrameBuffer::computeFrameBLine(
         const std::complex<double> *pSame = sameIsUp ? pU : pD;
         std::complex<double> *devRows[5] = {nullptr, nullptr, nullptr,
                                             nullptr, nullptr};
-        if (haveSignedAlien) {
+        // Only the retired IQ argmin (LDCD_FB_IQ_REG=1) reads these. Built
+        // unconditionally they were five rows of complex differences per line
+        // feeding 35 complex MACs per pixel, every one of them discarded on a
+        // production render.
+        if (haveSignedAlien && iqRegistration) {
             if ((int)scratch_fbDevRows.size() < 5 * rowWidth)
                 scratch_fbDevRows.resize(5 * rowWidth);
             for (int si = 0; si < 5; ++si) {
@@ -2864,7 +2868,7 @@ void Comb::FrameBuffer::computeFrameBLine(
         const int notchWidth = width + 2 * kNotchPad;
         const double *nU = nullptr;
         const double *nD = nullptr;
-        if (rawUpRow && rawDnRow && left >= 1 &&
+        if (!ldcdFrameBPinColumn() && rawUpRow && rawDnRow && left >= 1 &&
             left + width < videoParameters.fieldWidth) {
             if ((int)scratch_fbNotchUp.size() < notchWidth) {
                 scratch_fbNotchUp.resize(notchWidth);
@@ -2968,13 +2972,15 @@ void Comb::FrameBuffer::computeFrameBLine(
             // down at +d, so d = −s* when the Same leg is up, +s* when down).
             // s* ≠ 0 must clear an 8% improvement margin so noise cannot
             // steer the registration off the d=0 default.
-            double devMag[5];
-            for (int si = 0; si < 5; ++si) {
-                const std::complex<double> *g = devRows[si];
-                std::complex<double> devAcc(0.0, 0.0);
-                for (int k = -3; k <= 3; ++k)
-                    devAcc += kWin[k + 3] * g[x + k];
-                devMag[si] = cmag(devAcc) / kWinSum;
+            double devMag[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+            if (iqRegistration) {
+                for (int si = 0; si < 5; ++si) {
+                    const std::complex<double> *g = devRows[si];
+                    std::complex<double> devAcc(0.0, 0.0);
+                    for (int k = -3; k <= 3; ++k)
+                        devAcc += kWin[k + 3] * g[x + k];
+                    devMag[si] = cmag(devAcc) / kWinSum;
+                }
             }
 
             // CERTIFIED REGISTRATION FIRST (2026-08-08). Where the frame
@@ -3053,7 +3059,12 @@ void Comb::FrameBuffer::computeFrameBLine(
             }
 
             const int sStar = bestSi - 2;
-            const int d = sameIsUp ? -sStar : sStar;
+            // The pin overrides every aim above, including the certified one:
+            // the question it asks is whether leaving the column is the fault
+            // at all, and a fact-grade off-column aim is still off-column.
+            const int d = ldcdFrameBPinColumn()
+                ? 0
+                : (sameIsUp ? -sStar : sStar);
 
 			// REACH EVIDENCE (see frameBBandSeed).
 			//
