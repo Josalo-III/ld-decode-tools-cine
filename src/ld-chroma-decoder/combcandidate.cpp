@@ -666,6 +666,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         ensureWidth(tapLine.coarseD4IRE);
         ensureWidth(tapLine.vReachResid1IRE);
         ensureWidth(tapLine.vReachResid2IRE);
+        ensureWidth(tapLine.vReachResid2UpIRE);
+        ensureWidth(tapLine.vReachResid2DownIRE);
         ensureWidth(tapLine.vReachResid4IRE);
         ensureWidth(tapLine.lateralCornerIRE);
         ensureWidth(tapLine.notchCoarse0IRE);
@@ -1470,11 +1472,17 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             };
             tapLine.vReachResid1IRE.assign(width, 0.0);
             tapLine.vReachResid2IRE.assign(width, 0.0);
+            tapLine.vReachResid2UpIRE.assign(width, 0.0);
+            tapLine.vReachResid2DownIRE.assign(width, 0.0);
             tapLine.vReachResid4IRE.assign(width, 0.0);
             foldSide(tapLine.tapU1.data(), tapLine.haveU1, -1, tapLine.vReachResid1IRE);
             foldSide(tapLine.tapD1.data(), tapLine.haveD1, +1, tapLine.vReachResid1IRE);
             foldSide(tU2, haveU2, -2, tapLine.vReachResid2IRE);
             foldSide(tD2, haveD2, +2, tapLine.vReachResid2IRE);
+            // The same folds kept apart.  The combined row above stays for
+            // the readers that already have it; admission uses these.
+            foldSide(tU2, haveU2, -2, tapLine.vReachResid2UpIRE);
+            foldSide(tD2, haveD2, +2, tapLine.vReachResid2DownIRE);
             foldSide(tU4, tapLine.haveU4, -4, tapLine.vReachResid4IRE);
             foldSide(tD4, tapLine.haveD4, +4, tapLine.vReachResid4IRE);
             // Lateral cornering: second difference of the CARRIER-FREE luma
@@ -2105,8 +2113,55 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     const float *centerRepairStrength =
         locked1DParallaxRepairStrength_line(lineNumber);
 
+    // The measured failure law (docs/comb-failure-arc-log.md).  At +-2 the
+    // grammar's relation is Opposite, so the carrier should have cancelled;
+    // vReachResid2IRE is the remainder the fold cannot explain, and that IS
+    // the violation of the premise this comb rests on.  The cut is in IRE so
+    // it means the same thing on every material.  Derived over 60 frames on
+    // three materials, set where the comb creates no more zipper than the
+    // gates it replaces.  LDCD_FIELDB_LEGACY_GATES=1 restores those gates.
+    static const double kResidCedeIRE = []{
+        const char *e = std::getenv("LDCD_FIELDB_RESID_IRE");
+        return e ? std::atof(e) : 3.0;
+    }();
+    static const bool residLaw = []{
+        const char *e = std::getenv("LDCD_FIELDB_LEGACY_GATES");
+        return !(e && std::atoi(e) != 0);
+    }();
+    const bool haveResidUp =
+        static_cast<int>(tapLine.vReachResid2UpIRE.size()) >= width;
+    const bool haveResidDown =
+        static_cast<int>(tapLine.vReachResid2DownIRE.size()) >= width;
+
     using RR = CombContentReach::RegionRelation;
     const CombContentReach::IntrafieldRegionReach unknownRegion;
+
+    // THE CARRIER LICENSE, ON THE AVERAGING HALF OF THIS COMB.
+    //
+    // Field B is two operations. `neighbor` is an AVERAGE of the two legs --
+    // an estimate -- and `center - neighbor` is a CANCEL. The two want
+    // opposite things from this evidence.
+    //
+    // A cancelling step needs no help: vertically coherent luma cancels in the
+    // difference by construction, so it stays in luma where it belongs. But an
+    // averaging step pulls whatever its operands contain INTO the result, so a
+    // leg whose energy is luma rather than carrier contributes that luma to
+    // the carrier estimate, and the comb then subtracts it out of the picture.
+    // That is the lateral fine-luma failure the holdout convicted -- worth ~6x
+    // the error of the vertical structure the reach gates were policing.
+    //
+    // So the license scales the leg WEIGHTS, per operand, at the leg's own
+    // line and sample. It is a selection among legal alternatives, not a gate:
+    // a contaminated leg loses the 3x comparison to its clean partner and the
+    // comb goes around it, and only if BOTH legs are refused does the existing
+    // path fall through to centre. Nothing is DQ'd that was legal.
+    //
+    // NOT a cede on low license. The license says 1D is wrong at this sample;
+    // ceding hands the sample to 1D. The asymmetric options -- the other leg
+    // first, centre only as a last resort -- are what avoid that.
+    const float *licUpRow = carrierLicense_line(tapLine.lnU2);
+    const float *licDnRow = carrierLicense_line(tapLine.lnD2);
+    const bool licenseOnComb = ldcdCombLicenseEnabled() && licUpRow && licDnRow;
 
     // Publish band membership for downstream band-uniform laws (Y election).
     std::uint8_t *bandOut = chromaBoundaryBand_line(lineNumber);
@@ -2152,16 +2207,31 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                       tapLine.coarseD2IRE[rel]) >= kLumaHardBreakIRE;
 
         const bool bandCede = region.chromaBoundaryBand;
-        const bool upAdmitted =
-            upLegal && !upBoundary && !upLumaBreak && !bandCede;
-        const bool downAdmitted =
-            downLegal && !downBoundary && !downLumaBreak && !bandCede;
+        // ADMISSION ONLY.  One measured fact replaces the four region gates;
+        // leg SELECTION below is untouched (2026-08-31 -- retiring a gate and
+        // a selection rule together is what crippled the picture before).
+        const bool residCedeUp =
+            residLaw && haveResidUp &&
+            tapLine.vReachResid2UpIRE[rel] >= kResidCedeIRE;
+        const bool residCedeDown =
+            residLaw && haveResidDown &&
+            tapLine.vReachResid2DownIRE[rel] >= kResidCedeIRE;
+        const bool upAdmitted = residLaw
+            ? (upLegal && !residCedeUp)
+            : (upLegal && !upBoundary && !upLumaBreak && !bandCede);
+        const bool downAdmitted = residLaw
+            ? (downLegal && !residCedeDown)
+            : (downLegal && !downBoundary && !downLumaBreak && !bandCede);
 
         // Field B is the sharp legacy three-line estimator.  Content-region
         // evidence changes only operand admission; it never scales an admitted
         // leg or the resulting half-difference.
         double wUp = upAdmitted ? tapLine.pairU2[rel].weight : 0.0;
         double wDown = downAdmitted ? tapLine.pairD2[rel].weight : 0.0;
+        if (licenseOnComb) {
+            wUp   *= std::clamp((double)licUpRow[rel], 0.0, 1.0);
+            wDown *= std::clamp((double)licDnRow[rel], 0.0, 1.0);
+        }
 
         // Legacy split2D's decisive shape: when one local match is more than
         // three times stronger, do not average a laterally displaced second
@@ -2211,7 +2281,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
         std::uint8_t reason;
         if (!useUp && !useDown) {
             output = center;
-            reason = (bandCede || upBoundary || downBoundary ||
+            reason = (residCedeUp || residCedeDown ||
+                      bandCede || upBoundary || downBoundary ||
                       upLumaBreak || downLumaBreak)
                 ? FieldBReasonCede : FieldBReasonCenter;
         } else {

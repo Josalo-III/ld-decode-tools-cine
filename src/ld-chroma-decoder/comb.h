@@ -1039,6 +1039,10 @@ private:
 		// trigger, not an additional reach.
 		std::vector<double> vReachResid1IRE;
 		std::vector<double> vReachResid2IRE;
+		// Per side, never collapsed: admission is per operand, so the
+		// up leg is judged on the -2 fact and the down leg on the +2.
+		std::vector<double> vReachResid2UpIRE;
+		std::vector<double> vReachResid2DownIRE;
 		std::vector<double> vReachResid4IRE;
 		std::vector<double> lateralCornerIRE;
 		bool triggerFacts1Valid = false;   // +-1 taps exist (frame regime)
