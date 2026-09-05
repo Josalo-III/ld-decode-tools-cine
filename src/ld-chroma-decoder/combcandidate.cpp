@@ -408,11 +408,15 @@ double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
 // fact -- including how often it correctly STAYS at the detent -- before that
 // search is trusted on the lines that carry no fact. Strip when it closes.
 struct LdcdFbRegStat {
-    long both = 0, exact = 0, missed = 0, falseAim = 0,
-         offByOne = 0, offMore = 0, certNonZero = 0, aimNonZero = 0;
-    // Detent distribution on the lines the search actually serves (no fact
-    // available). The shape to look for is monotonically decreasing; a bin
-    // pinned at the adoptable limit is a saturating search, not a picture.
+    // Detent distribution of the adopted aim. The shape to look for is
+    // monotonically decreasing; a bin pinned at the adoptable limit would be
+    // a saturating estimator, not a picture.
+    //
+    // There is no grading against fact here, and there cannot be: the only
+    // fact-grade registration lives on covered frames, and a covered frame
+    // calls no candidate. Grade the OUTCOME instead -- --dg-discard against a
+    // banked-truth reference, which removes covered frames so Frame B runs
+    // everywhere.
     long dist[3] = {0, 0, 0};   // |d| = 0, 1, 2
 };
 thread_local LdcdFbRegStat gFbRegStat;
@@ -2440,6 +2444,177 @@ void Comb::FrameBuffer::computeFrameALine(
 // the precleaned 1D center.  The registered ±1 pair estimates the alien term;
 // Frame B subtracts that estimate without blending either neighbour into the
 // picture.  Frame A owns the interfield midpoint candidate.
+// THE DIAGONAL FACT, MEASURED ONCE, BEFORE ANY CANDIDATE RUNS.
+//
+// This is the election's own diagonal test, lifted so Frame B can read it at
+// the moment it needs it. Find the same signed lateral crossing on this row
+// and on both +-2 same-field neighbours, and require its position to progress
+// MONOTONICALLY through the line. That last clause is the whole difference
+// from the argmin search this replaces: phase-bucket residue is raster-locked,
+// so it appears identically on every row and produces no row-to-row crossing
+// shift at all. It cannot fake a monotone progression, and so it cannot steer
+// this aim off the column the way it steered the notch search.
+//
+// It is a measurement, not a search -- there is no shift to try, only a
+// crossing position to read -- so it also costs nothing per candidate shift.
+//
+// UNITS. crossingUp comes from line-2 and crossingDown from line+2: four
+// FRAME line steps. Frame B's legs are +-1, so its per-line advance is a
+// quarter of the measured total, and the published value carries that
+// division. What that means numerically is worth stating, because it is the
+// reason the search was wrong rather than merely mis-fed:
+//
+//     totalShift 0.75 (the detector's floor)   advance 0.19   d = 0
+//     totalShift 2.00                          advance 0.50   d = 1
+//     totalShift 4.00 (the detector's ceiling) advance 1.00   d = 1
+//
+// Across the entire range the election is willing to call diagonal, the
+// correct integer shift for a +-1 comb is 0 for most of it and 1 at the top.
+// d = 2 would need totalShift >= 6, past what this detector can even report,
+// so the old search's +-2 range had nothing to find.
+//
+// Sign: advance > 0 means the feature moves right going down, so the up leg
+// aligns at x - advance and the down leg at x + advance -- which is exactly
+// the (up[x-d], dn[x+d]) convention already in use.
+void Comb::FrameBuffer::measureDiagonalAdvanceLine(int line)
+{
+    const int left  = videoParameters.activeVideoStart;
+    const int right = videoParameters.activeVideoEnd;
+    const int width = right - left;
+    if (width <= 0) return;
+
+    if ((int)scratch_fbDiagAdvance.size() != width) {
+        scratch_fbDiagAdvance.assign(width, 0.0);
+        scratch_fbDiagStrength.assign(width, 0.0);
+    } else {
+        std::fill(scratch_fbDiagAdvance.begin(),
+                  scratch_fbDiagAdvance.end(), 0.0);
+        std::fill(scratch_fbDiagStrength.begin(),
+                  scratch_fbDiagStrength.end(), 0.0);
+    }
+
+    const CombTapLine &tapLine = ensureCombTapLine(line);
+    if ((int)tapLine.notchCoarse0IRE.size() < width ||
+        (int)tapLine.coarseU2IRE.size() < width ||
+        (int)tapLine.coarseD2IRE.size() < width ||
+        (int)tapLine.hLumaDeltaIRE.size() < width)
+        return;
+
+    const auto &T = configuration.tunables;
+    const double edgeThreshIRE = T.FIELD_LUMA_EDGE_THRESH_IRE;
+    constexpr int kPlateauSamples = 5;
+    constexpr int kPlateauSearchMax = 16;
+    constexpr double kPlateauJitterMaxIRE = 1.2;
+    const double stepThresholdIRE = std::max(2.0, 0.9 * edgeThreshIRE);
+    const double seedThreshIRE = 0.75 * edgeThreshIRE;
+
+    // Everything here is already in IRE, so no rescaling is needed: the
+    // election converts because its rows are composite, not because the
+    // measurement wants composite units.
+    const double *src = tapLine.notchCoarse0IRE.data();
+    const double *rowU = tapLine.coarseU2IRE.data();
+    const double *rowD = tapLine.coarseD2IRE.data();
+
+    auto findPlateauInner = [&](int from, int dir) -> int {
+        for (int step = 1; step <= kPlateauSearchMax; ++step) {
+            const int inner = from + dir * step;
+            const int outer = inner + dir * (kPlateauSamples - 1);
+            if (inner < 0 || inner >= width) break;
+            if (outer < 0 || outer >= width) break;
+            const int b = std::min(inner, outer);
+            const int e = std::max(inner, outer);
+            double lo = src[b], hi = lo;
+            for (int r = b + 1; r <= e; ++r) {
+                lo = std::min(lo, src[r]);
+                hi = std::max(hi, src[r]);
+            }
+            if (hi - lo <= kPlateauJitterMaxIRE) return inner;
+        }
+        return -1;
+    };
+
+    // A plateau is reduced by CHOOSING one of its samples, never by averaging
+    // them, so the reference is a value that was actually observed.
+    auto medoidRange = [&](const double *row, int b, int e) {
+        double buf[kPlateauSamples];
+        int n = 0;
+        for (int r = b; r <= e && n < kPlateauSamples; ++r) buf[n++] = row[r];
+        return coarseCycleMedoid(buf, n);
+    };
+
+    int x = 0;
+    while (x < width) {
+        if (tapLine.hLumaDeltaIRE[x] < seedThreshIRE) { ++x; continue; }
+        const int seedBegin = x;
+        while (x + 1 < width && tapLine.hLumaDeltaIRE[x + 1] >= seedThreshIRE)
+            ++x;
+        const int seedEnd = x;
+        ++x;
+
+        // No settled region on a side means this was texture, not a
+        // transition between two things. Decline.
+        const int leftPlateauEnd = findPlateauInner(seedBegin, -1);
+        const int rightPlateauBegin = findPlateauInner(seedEnd, +1);
+        if (leftPlateauEnd < 0 || rightPlateauBegin < 0) continue;
+        const int runBegin = leftPlateauEnd - (kPlateauSamples - 1);
+        const int runEnd   = rightPlateauBegin + (kPlateauSamples - 1);
+        if (runBegin < 0 || runEnd >= width) continue;
+
+        const double sourceLeft  = medoidRange(src, runBegin, leftPlateauEnd);
+        const double sourceRight = medoidRange(src, rightPlateauBegin, runEnd);
+        const double sourceDelta = sourceRight - sourceLeft;
+        if (std::fabs(sourceDelta) < stepThresholdIRE) continue;
+
+        auto crossingFromRow = [&](const double *row) -> double {
+            double lbuf[kPlateauSamples], rbuf[kPlateauSamples];
+            int ln = 0, rn = 0;
+            for (int r = runBegin; r <= leftPlateauEnd && ln < kPlateauSamples; ++r)
+                lbuf[ln++] = row[r];
+            for (int r = rightPlateauBegin; r <= runEnd && rn < kPlateauSamples; ++r)
+                rbuf[rn++] = row[r];
+            const double lo = coarseCycleMedoid(lbuf, ln);
+            const double hi = coarseCycleMedoid(rbuf, rn);
+            const double delta = hi - lo;
+            // Same step, same SIGN, or it is not the same edge.
+            if (std::fabs(delta) < stepThresholdIRE ||
+                delta * sourceDelta <= 0.0)
+                return std::numeric_limits<double>::quiet_NaN();
+            double prevT = (row[leftPlateauEnd] - lo) / delta;
+            for (int r = leftPlateauEnd + 1; r <= rightPlateauBegin; ++r) {
+                const double t = (row[r] - lo) / delta;
+                if (prevT < 0.5 && t >= 0.5) {
+                    const double frac = std::clamp(
+                        (0.5 - prevT) / std::max(1e-12, t - prevT), 0.0, 1.0);
+                    return (r - 1) + frac;
+                }
+                prevT = t;
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        };
+
+        const double c0 = crossingFromRow(src);
+        const double cU = crossingFromRow(rowU);
+        const double cD = crossingFromRow(rowD);
+        if (!std::isfinite(c0) || !std::isfinite(cU) || !std::isfinite(cD))
+            continue;
+
+        const double upStep = c0 - cU;
+        const double downStep = cD - c0;
+        const double totalShift = std::fabs(cD - cU);
+        const bool monotone = upStep * downStep >= -0.20;
+        const bool local = std::fabs(upStep) <= 4.0 &&
+                           std::fabs(downStep) <= 4.0;
+        if (!monotone || !local || totalShift < 0.75) continue;
+
+        const double strength = std::clamp((totalShift - 0.75) / 3.25, 0.0, 1.0);
+        const double advance = (cD - cU) / 4.0;
+        for (int r = runBegin; r <= runEnd; ++r) {
+            scratch_fbDiagAdvance[r] = advance;
+            scratch_fbDiagStrength[r] = strength;
+        }
+    }
+}
+
 void Comb::FrameBuffer::computeFrameBLine(
     int line,
     std::vector<std::complex<double>> &outFrameIQ,
@@ -2459,6 +2634,10 @@ void Comb::FrameBuffer::computeFrameBLine(
 
     outFrameIQ.resize(width);
     outFrameScalar.resize(width);
+	// The diagonal fact first: the registration below reads it instead of
+	// searching for a shift of its own.
+	measureDiagonalAdvanceLine(line);
+
 	if ((int)scratch_frameBReachUnsafe.size() != width)
 		scratch_frameBReachUnsafe.assign(width, 0);
 	else
@@ -2474,28 +2653,15 @@ void Comb::FrameBuffer::computeFrameBLine(
     if (fbRegProbe && line == first) {
         const long nd = gFbRegStat.dist[0] + gFbRegStat.dist[1] +
                         gFbRegStat.dist[2];
-        if (gFbRegStat.both > 0) {
-            const double pc = 100.0 / (double)gFbRegStat.both;
-            std::fprintf(stderr,
-                "[FBREG] graded %ld cols vs fact: exact %.1f%% | "
-                "missed %.1f%% | falseAim %.1f%% | off1 %.1f%% | "
-                "offMore %.1f%% || cert nonzero %.1f%%, aim nonzero %.1f%%\n",
-                gFbRegStat.both,
-                gFbRegStat.exact * pc, gFbRegStat.missed * pc,
-                gFbRegStat.falseAim * pc, gFbRegStat.offByOne * pc,
-                gFbRegStat.offMore * pc,
-                gFbRegStat.certNonZero * pc, gFbRegStat.aimNonZero * pc);
-        }
         if (nd > 0) {
             const double pd = 100.0 / (double)nd;
             std::fprintf(stderr,
-                "[FBAIM] searched %ld cols: |d|=0 %.1f%% | |d|=1 %.1f%% | "
+                "[FBAIM] aimed %ld cols: |d|=0 %.1f%% | |d|=1 %.1f%% | "
                 "|d|=2 %.1f%%\n",
                 nd, gFbRegStat.dist[0] * pd, gFbRegStat.dist[1] * pd,
                 gFbRegStat.dist[2] * pd);
-        }
-        if (gFbRegStat.both > 0 || nd > 0)
             gFbRegStat = LdcdFbRegStat();
+        }
     }
 
 	// The refusal band is now election evidence, not a Frame-B construction
@@ -2836,64 +3002,27 @@ void Comb::FrameBuffer::computeFrameBLine(
             }
         }
 
-        // THE LOCATOR, ON LUMA (author, 2026-08-08: "the vertical comb needs
-        // to be vertical first. If frame B is going off and searching and
-        // mis-locking it's targets, then it's off mission").
+        // THE LOCATOR IS NOT A SEARCH (author, 2026-08-08: "the vertical
+        // comb needs to be vertical first. If frame B is going off and
+        // searching and mis-locking it's targets, then it's off mission" --
+        // and 2026-09-04: "Aren't 2D combs supposed to use the pixel above
+        // and below, in the column?").
         //
         // The registration asks a LUMA-GEOMETRY question -- where did this
-        // feature go between the line above and the line below -- and the
-        // search below it used to ask that of precleaned IQ. By its own
-        // account that search "would wander on textured content", which is
-        // not a caveat but the material being wrong for the question: in the
-        // IQ domain a lattice is nothing but chroma texture, most of it
-        // manufactured by the very confusion Frame B exists to undo. The
-        // search was steered by its own quarry.
+        // feature go between the line above and the line below. Two searches
+        // have now answered it and both were steered by their own quarry: the
+        // precleaned-IQ argmin, which by its own account "would wander on
+        // textured content" because in the IQ domain a lattice is nothing but
+        // chroma texture; and the notch argmin on 0.5*(r[x-1] + r[x+1]) of
+        // the raw row, whose residue is period-4 in x, so phase-bucket
+        // structure could clear the 8% margin in place of content and flip d
+        // with the bucket.
         //
-        // The elementary notch [1,0,1]/2 on raw is the carrier-free luma view
-        // that keeps the detail. Its magnitude response is |cos w|: at 4fSC
-        // the carrier sits at w = pi/2 where that response is exactly zero,
-        // and it is unity at DC and unity again at Nyquist. So it passes the
-        // finest horizontal detail in the raster untouched in magnitude and
-        // pays only in the band immediately around the carrier -- the
-        // opposite trade from a smoothed platform, which keeps the carrier
-        // out by throwing the detail away.
-        //
-        // Its own faults -- summits inside the band are absent from it, and
-        // it carries the leak doublets -- are the cheap ones here, because
-        // the SAME operator runs on both bracket lines and those artefacts
-        // CORRELATE rather than corrupt. It locates; it never supplies shape.
-        // Nothing downstream reads these rows: the correction waveform is
-        // still the pointwise IQ pair difference at the registered positions.
-        constexpr int kNotchPad = 6;   // window |k|=3 plus sampled |s|=3
-        const int notchWidth = width + 2 * kNotchPad;
-        const double *nU = nullptr;
-        const double *nD = nullptr;
-        if (!ldcdFrameBPinColumn() && rawUpRow && rawDnRow && left >= 1 &&
-            left + width < videoParameters.fieldWidth) {
-            if ((int)scratch_fbNotchUp.size() < notchWidth) {
-                scratch_fbNotchUp.resize(notchWidth);
-                scratch_fbNotchDn.resize(notchWidth);
-            }
-            auto notchAt = [](const quint16 *r, int i) {
-                return 0.5 * (static_cast<double>(r[i - 1]) +
-                              static_cast<double>(r[i + 1]));
-            };
-            for (int x = 0; x < width; ++x) {
-                scratch_fbNotchUp[kNotchPad + x] = notchAt(rawUpRow, left + x);
-                scratch_fbNotchDn[kNotchPad + x] = notchAt(rawDnRow, left + x);
-            }
-            // Edge replication, matching the IQ rows' convention exactly.
-            for (int p = 0; p < kNotchPad; ++p) {
-                scratch_fbNotchUp[p] = scratch_fbNotchUp[kNotchPad];
-                scratch_fbNotchDn[p] = scratch_fbNotchDn[kNotchPad];
-                scratch_fbNotchUp[kNotchPad + width + p] =
-                    scratch_fbNotchUp[kNotchPad + width - 1];
-                scratch_fbNotchDn[kNotchPad + width + p] =
-                    scratch_fbNotchDn[kNotchPad + width - 1];
-            }
-            nU = scratch_fbNotchUp.data() + kNotchPad;
-            nD = scratch_fbNotchDn.data() + kNotchPad;
-        }
+        // Neither is a search any more. measureDiagonalAdvanceLine reads a
+        // monotone crossing progression across the +-2 rows -- a MEASUREMENT,
+        // which raster-locked residue cannot fake because it appears
+        // identically on every row and so shifts no crossing at all. What is
+        // published is an advance, and diagAim below only rounds it.
 
         // THREE DISCIPLINES, LIFTED FROM THE CERTIFIED SEARCH, which measured
         // them necessary: the aim census read 30/37/33 across s=0 / |s|=1 /
@@ -2923,35 +3052,16 @@ void Comb::FrameBuffer::computeFrameBLine(
         //
         // ONE implementation, per the no-duplicate-math law: the fallback
         // registration and the census below both call this.
-        auto notchAim = [&](int x) -> int {
-            constexpr int kFbRegMax = 2;      // adoptable
-            constexpr int kFbRegSearch = 3;   // sampled
-            constexpr double kFbIdentifyIRE = 1.0;
-            double ndev[2 * kFbRegSearch + 1];
-            for (int si = 0; si <= 2 * kFbRegSearch; ++si) {
-                const int s = si - kFbRegSearch;
-                double acc = 0.0;
-                for (int k = -3; k <= 3; ++k)
-                    acc += kWin[k + 3] *
-                           std::fabs(nU[x + k - s] - nD[x + k + s]);
-                ndev[si] = acc / kWinSum;
-            }
-            if (ndev[kFbRegSearch] * invIreScale < kFbIdentifyIRE)
-                return 0;
-            int bestD = 0;
-            double bestDev = ndev[kFbRegSearch] / kRegMargin;
-            for (int si = 0; si <= 2 * kFbRegSearch; ++si) {
-                const int s = si - kFbRegSearch;
-                if (s == 0 || std::abs(s) > kFbRegMax) continue;
-                if (ndev[si] >= ndev[si - 1] ||
-                    ndev[si] >= ndev[si + 1]) continue;
-                if (ndev[si] < bestDev) {
-                    bestDev = ndev[si];
-                    bestD = s;
-                }
-            }
-            return bestD;
+        // THE ADOPTED AIM. A read of the published fact, clamped to the
+        // range a +-1 comb can justify: the detector saturates at totalShift
+        // 4.0, which is one sample per frame line, so |d| > 1 is unreachable
+        // by construction rather than by taste.
+        auto diagAim = [&](int x) -> int {
+            if (x < 0 || x >= (int)scratch_fbDiagAdvance.size()) return 0;
+            const long r = std::lround(scratch_fbDiagAdvance[x]);
+            return (int)std::clamp<long>(r, -1, 1);
         };
+
 
         for (int x = 0; x < width; ++x) {
             if (!haveSignedAlien) {
@@ -2983,59 +3093,32 @@ void Comb::FrameBuffer::computeFrameBLine(
                 }
             }
 
-            // CERTIFIED REGISTRATION FIRST (2026-08-08). Where the frame
-            // carries a fact-grade aim for this column -- measured on the
-            // two bracketing lines' certified, carrier-free luma, published
-            // by buildCertifiedCarrierStage -- take it instead of searching
-            // here. Same quantity, same sign convention (see comb.h); the
-            // difference is the material it was measured on. This search
-            // reads precleaned IQ, and by its own account above is "steered
-            // by chroma texture", which is precisely the wander certified
-            // luma cannot have. The fact exists only on the comp lines of a
-            // covered frame, so the IQ search below still serves every other
-            // line and the un-covered case is unchanged.
+            // THE AIM. Read the diagonal fact, or -- under the retired
+            // A/B only -- search the precleaned IQ.
             //
             // bestSi is set from the adopted d so the correction waveform and
             // the registration fact always use the same shift.
-            const qint8 *certRegRow = certRegistration_line(line);
-            const qint8 certReg = certRegRow ? certRegRow[x] : kCertRegNone;
+            //
+            // The certified-registration preference that stood here is gone
+            // (2026-09-05). It read certRegistration, which exists only on
+            // the comp lines of a COVERED frame -- and since "a covered frame
+            // calls no candidate and holds no election" (2026-08-22) this
+            // function never runs on one. certReg was therefore always absent
+            // and the branch could not fire. Its publication is removed with
+            // it; the search that produced it in buildCertifiedCarrierStage
+            // stays, because that stage consumes the shift itself.
             int bestSi;
-            if (certReg != kCertRegNone) {
-                const int sStarCert = sameIsUp ? -(int)certReg : (int)certReg;
-                bestSi = std::clamp(sStarCert + 2, 0, 4);
-                // GRADE THE ESTIMATOR WHERE THE FACT EXISTS (temporary,
-                // LDCD_PROBE_FBREG=1). Covered comp lines carry both aims, so
-                // the notch search can be scored against certified truth
-                // before it is trusted on the lines that have no truth. Strip
-                // when the question closes.
-                if (fbRegProbe && nU && nD) {
-                    const int aim = notchAim(x);
-                    ++gFbRegStat.both;
-                    if (aim == (int)certReg) ++gFbRegStat.exact;
-                    else if (aim == 0) ++gFbRegStat.missed;
-                    else if (certReg == 0) ++gFbRegStat.falseAim;
-                    else if (std::abs(aim - (int)certReg) == 1)
-                        ++gFbRegStat.offByOne;
-                    else ++gFbRegStat.offMore;
-                    if (certReg != 0) ++gFbRegStat.certNonZero;
-                    if (aim != 0) ++gFbRegStat.aimNonZero;
-                }
-            } else if (nU && nD && !iqRegistration) {
-                // FRAME B'S OWN AIM. Same question, same pairing and the same
-                // sign convention as certRegistration -- the aligned pair is
-                // (up[x-s], dn[x+s]) -- measured on the notch rows above, so
-                // this is the certified search's form running on material
-                // Frame B can compute for itself on any frame. Where the fact
-                // exists it is preferred above; where it does not, this is the
-                // same search rather than a different one, which is what makes
-                // the certified aim a corroborator instead of a crutch. The
-                // three disciplines it carries are documented at notchAim.
-                const int bestD = notchAim(x);
+            if (!iqRegistration) {
+                // FRAME B'S OWN AIM, read rather than searched: the diagonal
+                // fact measured once per line before any candidate ran. The
+                // aligned pair is (up[x-d], dn[x+d]), so the published
+                // advance is already in this convention.
+                const int bestD = diagAim(x);
                 if (fbRegProbe)
                     ++gFbRegStat.dist[std::min(std::abs(bestD), 2)];
-                const int sStarNotch = sameIsUp ? -bestD : bestD;
-                bestSi = std::clamp(sStarNotch + 2, 0, 4);
-            } else if (iqRegistration) {
+                const int sStarDiag = sameIsUp ? -bestD : bestD;
+                bestSi = std::clamp(sStarDiag + 2, 0, 4);
+            } else {
                 // A/B only (LDCD_FB_IQ_REG=1): the retired IQ argmin, kept so
                 // the material change can be measured in one variable.
                 bestSi = 2;
@@ -3049,13 +3132,6 @@ void Comb::FrameBuffer::computeFrameBLine(
                 }
                 if (fbRegProbe)
                     ++gFbRegStat.dist[std::min(std::abs(bestSi - 2), 2)];
-            } else {
-                // No luma locator here (frame edge, or the notch's taps fall
-                // outside the raster). Standing at the detent is the honest
-                // answer: the vertical is what Frame B is for, and a search
-                // with nothing to search on is exactly the mis-locking this
-                // change exists to stop.
-                bestSi = 2;
             }
 
             const int sStar = bestSi - 2;

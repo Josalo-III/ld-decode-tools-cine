@@ -7359,15 +7359,6 @@ static int ldcdRetractedSourceMode()
     return mode;
 }
 
-static bool ldcdPhaseSnapOn()
-{
-    static const bool on = []{
-        const char *e = std::getenv("LDCD_PHASE_SNAP");
-        return !(e && std::atoi(e) == 0);
-    }();
-    return on;
-}
-
 static bool ldcdFactFitOn()
 {
     static const bool on = []{
@@ -10307,7 +10298,6 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     resetStagePlane(combedCarrier_flat, 0.0f);
     resetStagePlane(carrierCorroboration_flat, 0.0f);
     resetStagePlane(carrierEligibility_flat, 0.0f);
-    resetStagePlane(certRegistration_flat, kCertRegNone);
     resetStagePlane(coarseYEvidence_flat, lddecode::FourViewPixelEvidence{});
     if (carrierImpurity_flat.size() < need)
         carrierImpurity_flat.assign(need, 0.0f);
@@ -10319,12 +10309,6 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
 
     const int retractedSource = ldcdRetractedSourceMode();
 
-    std::vector<double> certComp(
-        width, std::numeric_limits<double>::quiet_NaN());
-
-    const bool phaseSnap = ldcdPhaseSnapOn();
-    constexpr double kSnapAmpTauIRE = 3.0;
-    constexpr double kSnapAmpMinIRE = 1.0;
 
     static const bool anchor1D = []{
         const char *e = std::getenv("LDCD_ANCHOR_1D");
@@ -10354,137 +10338,33 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
             : nullptr;
 
         const float *exRowPub = exactCarrierRow(line);
-        const float *exU = (line - 1 >= firstLine)
-            ? exactCarrierRow(line - 1) : nullptr;
-        const float *exD = (line + 1 < lastLine)
-            ? exactCarrierRow(line + 1) : nullptr;
-
-        {
-            std::fill(certComp.begin(), certComp.end(),
-                      std::numeric_limits<double>::quiet_NaN());
-            if (exU && exD &&
-                certifiedDefLine(line - 1) && certifiedDefLine(line + 1)) {
-                const quint16 *rawU = rawbuffer.data()
-                    + static_cast<size_t>(line - 1) * videoParameters.fieldWidth;
-                const quint16 *rawD = rawbuffer.data()
-                    + static_cast<size_t>(line + 1) * videoParameters.fieldWidth;
-                // The two certified luma rows. Carrier-free by conservation,
-                // so everything measured on them below is fact.
-                std::vector<double> lU(width,
-                    std::numeric_limits<double>::quiet_NaN());
-                std::vector<double> lD(width,
-                    std::numeric_limits<double>::quiet_NaN());
-                for (int xi = 0; xi < width; ++xi) {
-                    const float eu = exU[left + xi];
-                    const float ed = exD[left + xi];
-                    if (std::isfinite(eu))
-                        lU[xi] = (double)rawU[left + xi] - (double)eu;
-                    if (std::isfinite(ed))
-                        lD[xi] = (double)rawD[left + xi] - (double)ed;
-                }
-
-                constexpr int kRegMax = 2;            // adoptable
-                constexpr int kRegSearch = 3;         // sampled
-                constexpr double kRegMargin = 1.08;   // Frame B's constant
-                static const double kRegWin[7] =
-                    { 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5 };
-                constexpr double kRegWinSum = 6.0;
-                auto lumaAt = [&](const std::vector<double> &row,
-                                  int j) -> double {
-                    return row[std::clamp(j, 0, width - 1)];
-                };
-                std::vector<int> reg(width, 0);
-                qint8 *regRow = certRegistration_line(line);
-                for (int xi = 0; xi < width; ++xi) {
-                    double dev[2 * kRegSearch + 1];
-                    bool have[2 * kRegSearch + 1];
-                    for (int si = 0; si <= 2 * kRegSearch; ++si) {
-                        const int s = si - kRegSearch;
-                        double acc = 0.0;
-                        bool ok = true;
-                        for (int k = -3; k <= 3 && ok; ++k) {
-                            const double a = lumaAt(lU, xi + k - s);
-                            const double b = lumaAt(lD, xi + k + s);
-                            if (!std::isfinite(a) || !std::isfinite(b))
-                                ok = false;
-                            else
-                                acc += kRegWin[k + 3] * std::fabs(a - b);
-                        }
-                        have[si] = ok;
-                        dev[si] = ok ? acc / kRegWinSum : 0.0;
-                    }
-                    if (!have[kRegSearch]) continue; // no s=0 baseline: no fact
-                    constexpr double kRegIdentifyIRE = 1.0;
-                    if (dev[kRegSearch] * invIreScale < kRegIdentifyIRE) {
-                        reg[xi] = 0;
-                        if (regRow) regRow[xi] = 0;
-                        continue;
-                    }
-                    int bestS = 0;
-                    double bestDev = dev[kRegSearch] / kRegMargin;
-                    for (int si = 0; si <= 2 * kRegSearch; ++si) {
-                        const int s = si - kRegSearch;
-                        if (s == 0 || std::abs(s) > kRegMax) continue;
-                        if (!have[si] || !have[si - 1] || !have[si + 1])
-                            continue;
-                        if (dev[si] >= dev[si - 1] || dev[si] >= dev[si + 1])
-                            continue;
-                        if (dev[si] < bestDev) {
-                            bestDev = dev[si];
-                            bestS = s;
-                        }
-                    }
-                    reg[xi] = bestS;
-                    if (regRow) regRow[xi] = static_cast<qint8>(bestS);
-                }
-
-                std::vector<double> R(width,
-                    std::numeric_limits<double>::quiet_NaN());
-                for (int xi = 0; xi < width; ++xi) {
-                    const int s = reg[xi];
-                    const double lu = lumaAt(lU, xi - s);
-                    const double ld = lumaAt(lD, xi + s);
-                    if (!std::isfinite(lu) || !std::isfinite(ld)) continue;
-                    R[xi] = (double)rawLine[left + xi] - 0.5 * (lu + ld);
-                }
-                constexpr double kT0 = 0.676462;
-                constexpr double kT2 = -0.250000;
-                constexpr double kT4 = -0.088231;
-                std::vector<double> est(width,
-                    std::numeric_limits<double>::quiet_NaN());
-                for (int xi = 0; xi < width; ++xi) {
-                    bool ok = true;
-                    double taps[5];
-                    static const int off[5] = { 0, -2, 2, -4, 4 };
-                    for (int k = 0; k < 5 && ok; ++k) {
-                        const int j = std::clamp(xi + off[k], 0, width - 1);
-                        taps[k] = R[j];
-                        if (!std::isfinite(taps[k])) ok = false;
-                    }
-                    if (!ok) continue;
-                    est[xi] = kT0 * taps[0] +
-                              kT2 * (taps[1] + taps[2]) +
-                              kT4 * (taps[3] + taps[4]);
-                }
-
-                if (phaseSnap) {
-                    std::vector<double> bAlign(width);
-                    ldcdBuildCertBracketAligned(
-                        carrierGrammarLine(line),
-                        carrierGrammarLine(line - 1),
-                        carrierGrammarLine(line + 1),
-                        exU, exD, left, width, bAlign);
-                    ldcdApplyPhaseSnap(est, bAlign, certComp,
-                                       width, irescale,
-                                       kSnapAmpMinIRE, kSnapAmpTauIRE,
-                                       false);
-                } else {
-                    for (int xi = 0; xi < width; ++xi)
-                        certComp[xi] = est[xi];
-                }
-            }
-
-        }
+        // THE COMP-LINE ESTIMATE CHAIN IS GONE (author's verdict,
+        // 2026-09-05: the observation is "notably superior, with less noise
+        // and more vertical detail").
+        //
+        // What stood here built a carrier for a covered frame's comp lines by
+        // interpolating the two certified neighbours' luma, searching a
+        // registration so that interpolation would land on the right content
+        // across a diagonal, and filtering the interpolation's residue back
+        // out with a 5-tap. Three mechanisms in series, each one existing
+        // only to repair the one above it, all downstream of a substitution
+        // the designed shape never asked for: the twins merge to the
+        // certified carrier, that is subtracted to give luma, and Frame C
+        // combs the comp line up to near-certified from there.
+        //
+        // It also contradicted the contract stated at combSource1D_line --
+        // "everywhere else the comb starts with the observation; there is
+        // intentionally no estimate escape hatch" -- since on a covered comp
+        // line the comb started from that estimate rather than from
+        // locked1DSource. Now it does not: a comp line's certifiedCarrier is
+        // the observation, and Frame C ratchets it toward the bracketing
+        // certified def lines. Def lines are untouched either way, their
+        // exact channel being finite before any of this is reached.
+        //
+        // Removed with it: certComp, the aperture registration search that
+        // aimed the interpolation, the 0.676/-0.250/-0.088 corrector, and the
+        // phase snap that ran on its output. ldcdBuildCertBracketAligned and
+        // ldcdApplyPhaseSnap survive -- they have another caller.
 
         const double *obs1D = locked1DSource_line(line);
 
@@ -10499,18 +10379,16 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
         for (int xi = 0; xi < width; ++xi) {
             const float ex = exRowPub ? exRowPub[left + xi]
                                       : std::numeric_limits<float>::quiet_NaN();
+            // Def line: the exact fact. Comp line: the observation.
             const double certifiedCarrier = std::isfinite(ex)
                 ? static_cast<double>(ex)
-                : (std::isfinite(certComp[xi])
-                    ? certComp[xi]
-                    : (obs1D ? obs1D[xi] : 0.0));
+                : (obs1D ? obs1D[xi] : 0.0);
 
             if (anchoredRow)
                 anchoredRow[xi] = certifiedCarrier;
 
             if (retractedRow) {
-                const bool haveFact =
-                    std::isfinite(ex) || std::isfinite(certComp[xi]);
+                const bool haveFact = std::isfinite(ex);
                 if (retractedSource != 4 &&
                     !carrierFitLineSolved(line) && !haveFact) {
                     retractedRow[xi] =
@@ -10528,18 +10406,14 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                 case 4:
                     witnessCarrier = std::isfinite(ex)
                         ? static_cast<double>(ex)
-                        : (std::isfinite(certComp[xi])
-                            ? certComp[xi]
-                            : ((lawBpRow && lawWRow && lawKRow)
-                                ? lawBpRow[xi] * lawWRow[xi] * lawKRow[xi]
-                                : 0.0));
+                        : ((lawBpRow && lawWRow && lawKRow)
+                            ? lawBpRow[xi] * lawWRow[xi] * lawKRow[xi]
+                            : 0.0);
                     break;
                 case 3:
                     witnessCarrier = std::isfinite(ex)
                         ? static_cast<double>(ex)
-                        : (std::isfinite(certComp[xi])
-                            ? certComp[xi]
-                            : static_cast<double>(fitRowPub[xi]));
+                        : static_cast<double>(fitRowPub[xi]);
                     break;
                 default:
                     witnessCarrier = static_cast<double>(wRowPub[xi]) *

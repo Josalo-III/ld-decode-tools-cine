@@ -1250,6 +1250,12 @@ private:
 	// difference vector; fbReg is the chosen registration offset (diagnostic).
 	std::vector<std::complex<double>> scratch_fbPairDiff;
 	std::vector<int> scratch_fbReg;
+	// The diagonal fact, per column, measured once per line before any
+	// candidate runs: signed lateral advance of luma structure in samples per
+	// FRAME line, and the election's strength for the same run. Zero where no
+	// qualifying transition was found, which is the d = 0 detent.
+	std::vector<double> scratch_fbDiagAdvance;
+	std::vector<double> scratch_fbDiagStrength;
 	// Frame B publishes the reach verdict separately from its candidate value.
 	// The candidate keeps the full registered cancellation; FVF consumes this
 	// aperture-level bit to disqualify it (and, in progressive runs, promote
@@ -1268,8 +1274,6 @@ private:
     // lines +-1, edge-replicated with the search's overhang. Luma-domain
     // material for a luma-geometry question; see the search in
     // computeFrameBLine.
-    std::vector<double> scratch_fbNotchUp;
-    std::vector<double> scratch_fbNotchDn;
 		// Shared line scratch planes used by split2D and witness retraction.
 		std::vector<double> scratch_lineWorkA; // Field A scalar / carrier-fit row.
 		std::vector<double> scratch_lineWorkB; // Field gate / witness basis-I row.
@@ -1482,19 +1486,6 @@ private:
 	// independently and agree, which is why one number can serve both.
 	//
 	// Measured on CERTIFIED LUMA (raw - exact on the two bracketing lines),
-	// so it exists only where both brackets are certified: the comp lines of
-	// a covered frame. kCertRegNone elsewhere. That sparsity is honest --
-	// this is a fact, not an estimate, and it declines to exist where the
-	// facts do not. Frame B keeps its own IQ search for the lines this
-	// cannot reach.
-	//
-	// Why fact-grade beats what Frame B computes for itself: Frame B
-	// registers on precleaned IQ, and its own comment records that
-	// maximizing the difference magnitude "is steered by chroma texture...
-	// the search would wander on textured content". Certified luma is
-	// carrier-free by conservation -- there is no chroma in it to wander on.
-	static constexpr qint8 kCertRegNone = 127;
-	std::vector<qint8> certRegistration_flat;
 	// COLLECTED POOL (unfiltered): the sliding four-sample aperture means.
 	//
 	//   lockedApertureMean[v] = mean( raw[left+v .. left+v+3] )
@@ -1694,17 +1685,6 @@ private:
 		return lockedLumaHDeltaIRE_flat.data() + size_t(line) * demodWidth;
 	}
 
-	inline qint8 *certRegistration_line(int line) {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    certRegistration_flat.empty()) return nullptr;
-		return certRegistration_flat.data() + size_t(line) * demodWidth;
-	}
-
-	inline const qint8 *certRegistration_line(int line) const {
-		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    certRegistration_flat.empty()) return nullptr;
-		return certRegistration_flat.data() + size_t(line) * demodWidth;
-	}
 
 	inline double *locked1DSource_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
@@ -2150,6 +2130,11 @@ private:
 
 	void computeFrameALine(int line,
 									std::vector<std::complex<double>> &outFrameIQ);
+	// Measures the diagonal fact for one line into scratch_fbDiagAdvance /
+	// scratch_fbDiagStrength. Reads only the tap line, so it can run before
+	// any candidate exists.
+	void measureDiagonalAdvanceLine(int line);
+
 	void computeFrameBLine(int line,
 								   std::vector<std::complex<double>> &outFrameIQ,
 								   std::vector<double> &outFrameScalar);
