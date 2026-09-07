@@ -470,9 +470,6 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     lddecode::CarrierPhaseRelation downRelation,
     bool allowUp,
     bool allowDown,
-    double centerCarrierTrust,
-    double upCarrierTrust,
-    double downCarrierTrust,
     double invIreScale,
     double minChromaIRE,
     double upRawDiffIRE,
@@ -506,16 +503,6 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     const double upMagIRE = upMagRaw * scale;
     const double downMagIRE = downMagRaw * scale;
     const double chromaFloor = std::max(0.0, minChromaIRE);
-
-    // The reach query has already provided the carrier grammar: a leg only
-    // arrives here with an authorized Same/Opposite relation, and the sign
-    // above puts its IQ vector in center's frame. Endpoint conformance trust is
-    // intentionally not a second color-admission gate here; consumers need the
-    // region fact, including the refusal-to-cross fact, even where trust is not
-    // high enough to command video.
-    (void)centerCarrierTrust;
-    (void)upCarrierTrust;
-    (void)downCarrierTrust;
 
     constexpr double kSameHueDeg = kRegionSameHueDeg;
     constexpr double kDifferentHueDeg = kRegionDifferentHueDeg;

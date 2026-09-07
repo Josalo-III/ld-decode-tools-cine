@@ -15,50 +15,10 @@
 #include "cadencedefs.h"
 #include "comb.h"
 
-#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 
-// TEMPORARY INSTRUMENT (LDCD_PROBE_DIST=1) -- distribution of the temporal
-// similarity distance the agreement curve consumes, so its reward radius and
-// veto threshold are set from THIS distance rather than inherited from the
-// contaminated one they were tuned against. Counts only; cross-thread safe.
-// Strip when the threshold is settled.
 namespace {
-constexpr double kDistEdges[] = {0.5, 1, 2, 3, 4, 5, 6, 7.5, 10, 15, 20, 30, 50};
-constexpr int kDistBins = int(sizeof(kDistEdges) / sizeof(kDistEdges[0])) + 1;
-struct DistCensus {
-    bool on = std::getenv("LDCD_PROBE_DIST") != nullptr;
-    std::atomic<long> bin[kDistBins];
-    std::atomic<long> total{0};
-    DistCensus() { for (auto &b : bin) b.store(0); }
-    void add(double d) {
-        total.fetch_add(1, std::memory_order_relaxed);
-        int k = kDistBins - 1;
-        for (int i = 0; i < kDistBins - 1; ++i)
-            if (d <= kDistEdges[i]) { k = i; break; }
-        bin[k].fetch_add(1, std::memory_order_relaxed);
-    }
-    ~DistCensus() {
-        if (!on) return;
-        const double n = std::max(1L, total.load());
-        std::fprintf(stderr, "[DIST] temporal candidates %ld\n", total.load());
-        long cum = 0;
-        for (int i = 0; i < kDistBins; ++i) {
-            cum += bin[i].load();
-            if (i < kDistBins - 1)
-                std::fprintf(stderr, "   d <= %5.1f IRE : %5.1f%%  (cum %5.1f%%)\n",
-                             kDistEdges[i], 100.0 * bin[i].load() / n,
-                             100.0 * cum / n);
-            else
-                std::fprintf(stderr, "   d >  %5.1f IRE : %5.1f%%\n",
-                             kDistEdges[kDistBins - 2],
-                             100.0 * bin[i].load() / n);
-        }
-    }
-};
-DistCensus g_distCensus;
-
 // The legacy 2D reader is the one default-off consumer that addresses the 1D
 // plane by absolute h, so the buffer setup has to know about it before split2D
 // runs.  One reader, one answer.
@@ -612,32 +572,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
         if (wantLocked) {
             lockedLumaBaseY4_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             lockedLumaSmooth_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
-            // The lurch-sharpened coarse floor is consumed only by the
-            // --luma-witness produceY election. Default reconstructs on the
-            // cheap baseY4 floor. Allocate sharp only under witness so the
-            // baseline path pays neither its buffer nor its build. baseY4 and
-            // the geometry-only smooth/hDelta services stay unconditional.
-            // The comb's coarse rows now consume this platform too (see
-            // getLumaRow in combcandidate.cpp), so the solve is no longer a
-            // witness-only cost.  The aperture pool it reads was already
-            // unconditional; what is added here is the solve itself.
-            if (configuration.yElection.lsc || ldcdSolvedCoarseEnabled())
-                lockedLumaSharp_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
-            else
-                lockedLumaSharp_flat.clear();
-            // The platform solve is its own construction with its own gate;
-            // off, it costs neither buffer nor build.
-            if (ldcdLumaSolveEnabled()) {
-                lockedLumaSolved_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
-                residLaneN_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
-                residLane2_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
-                carrierLicense_flat.assign(size_t(lines + 1) * size_t(width), 1.0f);
-            } else {
-                lockedLumaSolved_flat.clear();
-                residLaneN_flat.clear();
-                residLane2_flat.clear();
-                carrierLicense_flat.clear();
-            }
+            lockedLumaSolved_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            residLaneN_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
+            carrierLicense_flat.assign(size_t(lines + 1) * size_t(width), 1.0f);
             lockedLumaHDeltaIRE_flat.assign(size_t(lines + 1) * size_t(width), 0.0f);
             lockedCornerLeak_flat.assign(size_t(lines + 1) * size_t(width), 0.0);
             // Band facts: filled by buildBandFacts() at the tail of
@@ -736,8 +673,10 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             }
             locked1DParallaxRepairStrength_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DParallaxRepairDelta_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
-            attributionEvidence_flat.assign(
-                size_t(demodLines) * demodWidth, AttributionEvidence{});
+            attributionFacts_flat.assign(
+                size_t(demodLines) * demodWidth, AttributionFacts{});
+            attributionAssessment_flat.assign(
+                size_t(demodLines) * demodWidth, AttributionAssessment{});
         }
         scratch_frameBDirectIQComposite.assign(width, 0.0);
         scratch_frameAAdaptiveIQComposite.assign(width, 0.0);
@@ -939,8 +878,9 @@ void Comb::FrameBuffer::seedCombAttributionPerLine(int line)
     if (width <= 0 || line < 0)
         return;
 
-    AttributionEvidence *row = attributionEvidence_line(line);
-    if (!row)
+    AttributionFacts *facts = attributionFacts_line(line);
+    AttributionAssessment *assessments = attributionAssessment_line(line);
+    if (!facts || !assessments)
         return;
 
     // Carrier metadata lives in carrierGrammar; consumers read it there directly.
@@ -957,14 +897,18 @@ void Comb::FrameBuffer::seedCombAttributionPerLine(int line)
     // CombAttributionAssessment::uncertainClaim = 1.0) and one full-record
     // assignment per pixel, instead of two separate copy-assignments from
     // zero-initialized temporaries.
-    static const AttributionEvidence kFreshRecord{};
+    static const AttributionFacts kFreshFacts{};
+    static const AttributionAssessment kFreshAssessment{};
     for (int rel = 0; rel < width; ++rel) {
-        row[rel] = kFreshRecord;
-        row[rel].assessment.carrierPrior = carrierPrior;
+        facts[rel] = kFreshFacts;
+        assessments[rel] = kFreshAssessment;
+        assessments[rel].carrierPrior = carrierPrior;
     }
 }
 
-void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
+void Comb::FrameBuffer::finalizeAttributionClaims(
+                                                const AttributionFacts &f,
+                                                AttributionAssessment &a,
                                                 double neighborLumaMeanIRE,
                                                 double neighborBaseMeanIRE,
                                                 double lineForwardErrorIRE) const
@@ -972,9 +916,6 @@ void Comb::FrameBuffer::finalizeAttributionClaims(AttributionEvidence &e,
     const auto &T = configuration.tunables;
     AttributionRules rules = lddecode::kDefaultAttributionRules;
     rules.conflictSuppress = T.VET_ATTRIBUTION_CONFLICT_SUPPRESS;
-    const AttributionFacts &f = e.facts;
-    AttributionAssessment &a = e.assessment;
-
     const double crestIRE = f.bandpassFineIRE;
     const double baseIRE = std::max(f.bandpassMidIRE, f.bandpassCoarseIRE);
     const double maxChromaIRE = lddecode::strongestCombChromaIRE(f);
@@ -1174,7 +1115,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // Below this FVF candidate difference, candidates are close enough that frame is preferred (IRE)
     const double FVF_SMALL_DIFF_IRE = (T.FVF_SMALL_DIFF_IRE > 0.0) ? T.FVF_SMALL_DIFF_IRE : 3.0;
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
-    const AttributionEvidence *attrRow = attributionEvidence_line(line);
+    const AttributionFacts *attrFactsRow = attributionFacts_line(line);
+    const AttributionAssessment *attrAssessmentRow =
+        attributionAssessment_line(line);
     const double *attrAuthorityRow =
         ((int)scratch_attrMembershipY.size() >= width)
             ? scratch_attrMembershipY.data()
@@ -1620,9 +1563,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             //   - luma-incursion / cross-color evidence penalizes candidates that depart
             //     from the 1D rail in luma-claimed regions.
             {
-                if (attrRow) {
-                    const auto &facts = attrRow[rel].facts;
-                    const auto &ass   = attrRow[rel].assessment;
+                if (attrFactsRow && attrAssessmentRow) {
+                    const auto &facts = attrFactsRow[rel];
+                    const auto &ass   = attrAssessmentRow[rel];
 
                     const double attrAuthority = attrAuthorityRow
                         ? attrAuthorityRow[rel]
@@ -1853,8 +1796,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // ------------------------------------------------------------
             {
                 const double impulseT =
-                    (attrRow && rel < width)
-                        ? std::clamp(attrRow[rel].facts.lumaImpulseRisk, 0.0, 1.0)
+                    (attrFactsRow && rel < width)
+                        ? std::clamp(attrFactsRow[rel].lumaImpulseRisk, 0.0, 1.0)
                         : 0.0;
             
                 if (impulseT > 0.0) {
@@ -2548,8 +2491,9 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
     if (width <= 0 || !fieldA || !fieldB || line < 0)
         return;
 
-    AttributionEvidence *row = attributionEvidence_line(line);
-    if (!row)
+    AttributionFacts *factsRow = attributionFacts_line(line);
+    AttributionAssessment *assessmentRow = attributionAssessment_line(line);
+    if (!factsRow || !assessmentRow)
         return;
 
     const bool haveFrameScalar = !frameScalar.empty();
@@ -2614,8 +2558,7 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
     if (width > 0) lineMeanFrameCoherence /= static_cast<double>(width);
 
     for (int rel = 0; rel < width; ++rel) {
-        AttributionEvidence &e = row[rel];
-        AttributionFacts &f = e.facts;
+        AttributionFacts &f = factsRow[rel];
 
         const double fa = fieldA[rel];
         const double fb = fieldB[rel];
@@ -2667,18 +2610,18 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
     for (int rel = 0; rel < width; ++rel) {
         const int rm4 = std::max(0, rel - 4);
         const int rp4 = std::min(width - 1, rel + 4);
-        AttributionEvidence &e = row[rel];
-        e.assessment.carrierPrior = lineCarrierPrior;
+        AttributionAssessment &a = assessmentRow[rel];
+        a.carrierPrior = lineCarrierPrior;
 
         finalizeAttributionClaims(
-            e,
+            factsRow[rel], a,
             0.5 * (scratch_attrBandYClaim[rm4] + scratch_attrBandYClaim[rp4]),
             0.5 * (scratch_attrWideCarrier[rm4] + scratch_attrWideCarrier[rp4]),
             lineForwardErrorIRE);
         scratch_attrMembershipY[rel] = std::clamp(
             1.0 -
-                0.65 * e.assessment.attributionConflict -
-                0.35 * e.assessment.uncertainClaim,
+                0.65 * a.attributionConflict -
+                0.35 * a.uncertainClaim,
             0.0,
             1.0);
     }
@@ -3266,14 +3209,6 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
 
-    auto clampH = [&](int idx)->int { return std::clamp(idx, left, right - 1); };
-
-    static const bool blend3D = []{
-        const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
-        return !(e && std::atoi(e) == 0);
-    }();
-
-
     // ---- Acceptance uniformity (user-directed, 2026-07-28) ----
     //
     // The parked failure of the temporal grammar was line-to-line striping,
@@ -3296,7 +3231,6 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
     // Members still face their binary vetoes in pass 1 (getCandidate
     // legality, the 2D-anchored hull), and a convex blend of hull-passing
     // members stays inside the hull.
-    if (blend3D) {
         const int width = right - left;
         if (width <= 0 || firstLine >= lastLine) return;
         const size_t n = static_cast<size_t>(lastLine) * static_cast<size_t>(width);
@@ -3327,6 +3261,8 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
             const TemporalEvidenceStanding standing =
                 temporalEvidenceStanding(line, previousFrame, nextFrame);
+            const TemporalReachPrefill reach =
+                temporalReachPrefill(line, previousFrame, nextFrame);
             for (int h = left; h < right; ++h) {
                 const size_t idx =
                     static_cast<size_t>(line) * width + (h - left);
@@ -3337,10 +3273,10 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
                 qint32 bestIndex; double bestSample;
                 TemporalCandidateSamples ts;
-                getBestCandidate(line, h, previousFrame, nextFrame, standing,
+                getBestCandidate(line, h, previousFrame, nextFrame, standing, reach,
                                  bestIndex, bestSample, &ts);
 
-                const int h0 = clampH(h);
+                const int h0 = h;
                 const int rel0 = h0 - left;
                 const double base1d = (lockedRow && rel0 >= 0)
                     ? lockedRow[rel0]
@@ -3348,95 +3284,22 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
 
                 double outs[4], pens[4];
                 int nT = 0;
-                // OUTPUT HULL, per member (3d-output-hull-fallback-plan.md §2).
-                //
-                // Averages and sane cancellations are interior operations, so
-                // an output beyond the range its INDEPENDENT estimates
-                // establish is manufactured energy by definition. The hull is
-                // therefore built from the seeded 2D result and the opposite
-                // temporal direction's output, and the member's own value is
-                // EXCLUDED -- a self-inclusive hull is vacuous, exactly as
-                // pairwise bounds like |out| <= max(|a|,|b|) are always true
-                // for the difference form.
-                //
-                // This is what lets the cancellation case through. On a
-                // static per-frame misread the two directions corroborate
-                // each other (out_prev ~ out_next = the clean chroma) while
-                // both sit far from the contaminated ref2d, so the member
-                // passes at full strength on its partner's evidence. The
-                // plain distance-to-2D test this replaces could not grant
-                // that: it refused a member for departing from the very
-                // reference the member exists to correct, which is the
-                // "artifact repels its own cure" defect that retired the
-                // deviation veto in the first place. The blend stage was
-                // built after the hull and inherited the member test without
-                // the law.
-                //
-                // With no valid partner the hull degenerates to {ref2d} +-
-                // slack: a conservative distance-to-2D at OUTPUT scale, so a
-                // lone candidate stays checkerboard-safe.
-                //
-                // MEASURED AND DEFAULTED OFF (LDCD_3D_BLEND_HULL=1 to enable).
-                // Census of the gate's own decisions, 25M members per scene:
-                //
-                //                        knit (static)   concert (motion)
-                //   partner valid            68.6%            64.7%
-                //   admit, hull              96.7%            88.1%
-                //   admit, flat cap          99.9%            98.4%
-                //   hull refuses, flat admits 3.2%            10.6%
-                //   flat refuses, hull admits 0.0%             0.3%
-                //
-                // Two readings, and together they retire this as the lever.
-                // The flat cap admits 98-100% -- the blend has never had an
-                // effective member guard at all. And the hull's traffic is
-                // almost entirely EXTRA REFUSAL; the widening that grants the
-                // cancellation certificate fires in 0.0-0.3% of members, so
-                // the mechanism the plan built it for does not occur at a
-                // usable rate. On the knit 63% of its extra refusals had no
-                // partner, i.e. the degenerate ref2d +- slack case doing the
-                // work rather than corroboration.
-                //
-                // Refusing 3.2% of members cost two thirds of 3D's lag-1
-                // cancellation gain (sleeve +0.176 -> +0.064), because a
-                // bound on distance-from-2D preferentially removes the
-                // members that depart from 2D the most -- which are exactly
-                // the ones cancelling the largest misread. That is the same
-                // "artifact repels its own cure" geometry that retired the
-                // deviation veto, and it applies to ANY distance-to-2D bound,
-                // this hull included. The partner term was supposed to be the
-                // escape from it and empirically is not.
-                static const bool blendHull = []{
-                    const char *e = std::getenv("LDCD_3D_BLEND_HULL");
-                    return e && std::atoi(e) != 0;
-                }();
-                auto admit = [&](const TemporalCandidateSamples::Sample &sm,
-                                 const TemporalCandidateSamples::Sample &pt) {
+                // The measured flat output cap is the committed member guard.
+                auto admit = [&](const TemporalCandidateSamples::Sample &sm) {
                     if (nT >= 4 || !sm.valid) return;
                     const double out = (base1d - sm.value) * 0.5;
                     if (!std::isfinite(out)) return;
-
-                    double hullMin = ref2d, hullMax = ref2d;
-                    if (pt.valid) {
-                        const double outPartner = (base1d - pt.value) * 0.5;
-                        if (std::isfinite(outPartner)) {
-                            hullMin = std::min(hullMin, outPartner);
-                            hullMax = std::max(hullMax, outPartner);
-                        }
-                    }
-                    const bool okHull =
-                        (out >= hullMin - slack && out <= hullMax + slack);
-                    const bool okFlat = (std::fabs(out - ref2d) <= memberBound);
-                    if (!(blendHull ? okHull : okFlat)) return;
+                    if (std::fabs(out - ref2d) > memberBound) return;
                     outs[nT] = out; pens[nT] = sm.penalty; ++nT;
                 };
                 const bool gilgolBand =
                     bandRow && bandRow[h - left] != 0;
                 if (!gilgolBand) {
-                    admit(ts.previousField, ts.nextField);
-                    admit(ts.nextField,     ts.previousField);
+                    admit(ts.previousField);
+                    admit(ts.nextField);
                 }
-                admit(ts.previousFrame, ts.nextFrame);
-                admit(ts.nextFrame,     ts.previousFrame);
+                admit(ts.previousFrame);
+                admit(ts.nextFrame);
                 if (nT == 0) continue;
 
                 double pMin = ts.best2DPenalty;
@@ -3476,99 +3339,24 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
             const float *sv = shareV.data() + (size_t)line * width;
             const float *tm = tMean.data() + (size_t)line * width;
             const float *rf = ref.data() + (size_t)line * width;
+            double acc = 0.0;
+            for (int j = 0; j <= std::min(width - 1, kLatRadius); ++j)
+                acc += sv[j];
             for (int x = 0; x < width; ++x) {
-                double acc = 0.0; int cnt = 0;
                 const int a = std::max(0, x - kLatRadius);
                 const int b = std::min(width - 1, x + kLatRadius);
-                for (int j = a; j <= b; ++j) { acc += sv[j]; ++cnt; }
-                const double s = std::clamp(acc / std::max(1, cnt), 0.0, 1.0);
+                const double s = std::clamp(acc / (b - a + 1), 0.0, 1.0);
                 const double v = (1.0 - s) * (double)rf[x] + s * (double)tm[x];
                 if (std::isfinite(v))
                     clpbuffer[2].pixel[line][left + x] = v;
+                if (a == x - kLatRadius)
+                    acc -= sv[a];
+                if (b + 1 < width)
+                    acc += sv[b + 1];
             }
         }
         return;
-    }
 
-    for (int line = firstLine; line < lastLine; ++line) {
-        // Certified cede (construction): temporal machinery stands down on
-        // def lines; the seeded 2D value (= center) stands.
-        if (certifiedOneDLevel() >= 3 && certifiedDefLine(line))
-            continue;
-
-        const TemporalEvidenceStanding standing =
-            temporalEvidenceStanding(line, previousFrame, nextFrame);
-
-        for (int h = left; h < right; ++h) {
-            const int rel = h - left;
-
-
-            qint32 bestIndex;
-            double bestSample;
-            TemporalCandidateSamples temporalSamples;
-
-            // Pass *this as well so getBestCandidate knows context
-            getBestCandidate(line, h, previousFrame, nextFrame, standing,
-                             bestIndex, bestSample, &temporalSamples);
-        
-            const int h0 = clampH(h);
-            const int rel0 = h0 - left;
-            double base1d;
-            const double *lockedRow = configuration.phaseCompensation
-                ? combSource1D_line(line) : nullptr;
-            if (lockedRow && rel0 >= 0)
-            {
-                base1d = lockedRow[rel0];
-            } else {
-                base1d = bucketScalar1D_line(line)[h0];
-            }
-        
-            if (bestIndex < CAND_PREV_FIELD) {
-                 // Best is 1D/2D; keep pre-filled 2D value
-                 // clpbuffer[2] already contains clpbuffer[1]
-            } else {
-                // Temporal carrier estimate: classic (Y+C) - (Y-C) / 2.
-                // This is a point operation on the full-band locked scalar;
-                // there is no horizontal averaging or HF roll-off here.
-                const double outBest = (base1d - bestSample) * 0.5;
-
-                // Bound the winner with estimates independent of the winner:
-                // the seeded 2D result and, when available, the opposite
-                // temporal direction's output. Including outBest itself would
-                // make this guard vacuous in a winner-take-all election.
-                const TemporalCandidateSamples::Sample *partner = nullptr;
-                switch (bestIndex) {
-                case CAND_PREV_FIELD: partner = &temporalSamples.nextField; break;
-                case CAND_NEXT_FIELD: partner = &temporalSamples.previousField; break;
-                case CAND_PREV_FRAME: partner = &temporalSamples.nextFrame; break;
-                case CAND_NEXT_FRAME: partner = &temporalSamples.previousFrame; break;
-                default: break;
-                }
-
-                const double ref2d = clpbuffer[1].pixel[line][h];
-                double hullMin = ref2d;
-                double hullMax = ref2d;
-                if (partner && partner->valid) {
-                    const double outPartner = (base1d - partner->value) * 0.5;
-                    if (std::isfinite(outPartner)) {
-                        hullMin = std::min(hullMin, outPartner);
-                        hullMax = std::max(hullMax, outPartner);
-                    }
-                }
-
-                const double slack = std::max(
-                    0.0, configuration.tunables.TEMPORAL_HULL_SLACK_IRE) * irescale;
-                if (std::isfinite(outBest) && std::isfinite(ref2d) &&
-                    outBest >= hullMin - slack && outBest <= hullMax + slack)
-                {
-                    clpbuffer[2].pixel[line][h] = outBest;
-                }
-                // Outside the hull, retain the full-band 2D value seeded in
-                // clpbuffer[2]. The hull can refuse a temporal replacement,
-                // but it never substitutes a filtered carrier.
-            }
-        }
-    }
 
 }
 // True when this frame holds any dG twin-certified carrier. Sampled
@@ -3661,10 +3449,41 @@ Comb::FrameBuffer::temporalEvidenceStanding(
     return s;
 }
 
+Comb::FrameBuffer::TemporalReachPrefill
+Comb::FrameBuffer::temporalReachPrefill(
+    qint32 lineNumber, const FrameBuffer &previousFrame,
+    const FrameBuffer &nextFrame) const
+{
+    TemporalReachPrefill out;
+    const auto source = scalarReachSource();
+    auto fill = [&](std::array<lddecode::CombReachReply, 4> &dst,
+                    const FrameBuffer &target, int targetLine, int hDelta) {
+        for (int phase = 0; phase < 4; ++phase) {
+            dst[phase] = combReachIndex.queryAgainst(
+                target.combReachIndex,
+                {lineNumber, targetLine, phase, phase + hDelta,
+                 lddecode::CombReachUse::ScalarSignCompare, source});
+        }
+    };
+
+    fill(out.left,          *this,         lineNumber,     -2);
+    fill(out.right,         *this,         lineNumber,      2);
+    fill(out.up,            *this,         lineNumber - 2,  0);
+    fill(out.down,          *this,         lineNumber + 2,  0);
+    fill(out.prevField,     previousFrame, lineNumber - 1,  0);
+    fill(out.selfPrevField, *this,         lineNumber - 1,  0);
+    fill(out.nextField,     nextFrame,     lineNumber + 1,  0);
+    fill(out.selfNextField, *this,         lineNumber + 1,  0);
+    fill(out.prevFrame,     previousFrame, lineNumber,      0);
+    fill(out.nextFrame,     nextFrame,     lineNumber,      0);
+    return out;
+}
+
 void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                                          const FrameBuffer &previousFrame,
                                          const FrameBuffer &nextFrame,
                                          const TemporalEvidenceStanding &standing,
+                                         const TemporalReachPrefill &reach,
                                          qint32 &bestIndex, double &bestSample,
                                          TemporalCandidateSamples *temporalSamples) const
 {
@@ -3682,30 +3501,23 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     for (int i = 0; i < NUM_CANDIDATES; ++i)
         invalidateCandidate(i);
 
-    // LDCD_3D_TEMPORAL_GRAMMAR=1: temporal-grammar candidate rules (see
-    // getCandidate). Default OFF preserves the historical gate behaviour.
-    // Temporal grammar is LIVE (user approval 2026-07-28, render-judged:
-    // "it looked good - and B was less of an outlier"). The historical
-    // striping was the Same/Opposite operation-class mix, now refused in
-    // getCandidate; what remains is the correct fix for the contradictory
-    // gates that kept the frame axis dead. LDCD_3D_TEMPORAL_GRAMMAR=0
-    // restores the old pre-gates for A/B.
-    static const bool temporalGrammar3D = []{
-        const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
-        return !(e && std::atoi(e) == 0);
-    }();
-
     // 1D/2D Candidates (always available via this frame)
-    c[CAND_LEFT]   = getCandidate(lineNumber, h, *this, lineNumber,     h - 2, 0.0);
+    const int phase = h & 3;
+
+    c[CAND_LEFT]   = getCandidate(lineNumber, h, *this, lineNumber, h - 2,
+                                  0.0, &reach.left[phase]);
     src[CAND_LEFT] = this;
 
-    c[CAND_RIGHT]   = getCandidate(lineNumber, h, *this, lineNumber,     h + 2, 0.0);
+    c[CAND_RIGHT]   = getCandidate(lineNumber, h, *this, lineNumber, h + 2,
+                                   0.0, &reach.right[phase]);
     src[CAND_RIGHT] = this;
 
-    c[CAND_UP]   = getCandidate(lineNumber, h, *this, lineNumber - 2, h, LINE_BONUS);
+    c[CAND_UP]   = getCandidate(lineNumber, h, *this, lineNumber - 2, h,
+                                LINE_BONUS, &reach.up[phase]);
     src[CAND_UP] = this;
 
-    c[CAND_DOWN]   = getCandidate(lineNumber, h, *this, lineNumber + 2, h, LINE_BONUS);
+    c[CAND_DOWN]   = getCandidate(lineNumber, h, *this, lineNumber + 2, h,
+                                  LINE_BONUS, &reach.down[phase]);
     src[CAND_DOWN] = this;
 
     const bool frameVerticalAllowed = carrierFrameVerticalAllowed(lineNumber);
@@ -3715,88 +3527,50 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
     // Previous and next field candidates are evaluated independently. A valid
     // previous-field candidate does not require a symmetric next-field candidate.
     if (frameVerticalAllowed && lineNumber - 1 >= videoParameters.firstActiveFrameLine) {
-        if (temporalGrammar3D) {
-            // Cross-frame first: the temporal grammar legalizes it per line
-            // with the correct sign; self-frame is the fallback.
-            c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
-                                              previousFrame, lineNumber - 1, h,
-                                              standing.prevFieldUp);
-            src[CAND_PREV_FIELD] = &previousFrame;
-            if (c[CAND_PREV_FIELD].penalty >= 1000.0) {
-                c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
-                                                  *this, lineNumber - 1, h,
-                                                  standing.selfFieldUp);
-                src[CAND_PREV_FIELD] = this;
-            }
-        } else if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber - 1)) {
-            c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
-                                              previousFrame, lineNumber - 1, h,
-                                              standing.prevFieldUp);
-            src[CAND_PREV_FIELD] = &previousFrame;
-        } else {
+        c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
+                                          previousFrame, lineNumber - 1, h,
+                                          standing.prevFieldUp,
+                                          &reach.prevField[phase]);
+        src[CAND_PREV_FIELD] = &previousFrame;
+        if (c[CAND_PREV_FIELD].penalty >= 1000.0) {
             c[CAND_PREV_FIELD] = getCandidate(lineNumber, h,
                                               *this, lineNumber - 1, h,
-                                              standing.selfFieldUp);
+                                              standing.selfFieldUp,
+                                              &reach.selfPrevField[phase]);
             src[CAND_PREV_FIELD] = this;
         }
     }
 
     // --- Next Field ---
     if (frameVerticalAllowed && lineNumber + 1 < videoParameters.lastActiveFrameLine) {
-        if (temporalGrammar3D) {
-            c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
-                                              nextFrame, lineNumber + 1, h,
-                                              standing.nextFieldDn);
-            src[CAND_NEXT_FIELD] = &nextFrame;
-            if (c[CAND_NEXT_FIELD].penalty >= 1000.0) {
-                c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
-                                                  *this, lineNumber + 1, h,
-                                                  standing.selfFieldDn);
-                src[CAND_NEXT_FIELD] = this;
-            }
-        } else if (carrierLineFlip(lineNumber) == carrierLineFlip(lineNumber + 1)) {
-            c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
-                                              nextFrame, lineNumber + 1, h,
-                                              standing.nextFieldDn);
-            src[CAND_NEXT_FIELD] = &nextFrame;
-        } else {
+        c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
+                                          nextFrame, lineNumber + 1, h,
+                                          standing.nextFieldDn,
+                                          &reach.nextField[phase]);
+        src[CAND_NEXT_FIELD] = &nextFrame;
+        if (c[CAND_NEXT_FIELD].penalty >= 1000.0) {
             c[CAND_NEXT_FIELD] = getCandidate(lineNumber, h,
                                               *this, lineNumber + 1, h,
-                                              standing.selfFieldDn);
+                                              standing.selfFieldDn,
+                                              &reach.selfNextField[phase]);
             src[CAND_NEXT_FIELD] = this;
         }
     }
 
     // --- Temporal Frame Center: Previous Frame ---
     //
-    // Same-line previous/next-frame candidates are only legal when the carrier
-    // line relation matches. If the phase relation differs, the temporal center
-    // candidate is invalid rather than merely expensive.
-    if (temporalGrammar3D ||
-        carrierLineFlip(lineNumber) == previousFrame.carrierLineFlip(lineNumber)) {
-        // Temporal grammar decides legality and sign inside getCandidate.
-        // Historical note: the equal-lineFlip pre-gate combined with the
-        // reach check's Opposite-only requirement kept this candidate
-        // permanently dead; with the env unset that dead state is preserved
-        // as the baseline.
-        c[CAND_PREV_FRAME] = getCandidate(lineNumber, h,
-                                          previousFrame, lineNumber, h,
-                                          standing.prevFrameB);
-        src[CAND_PREV_FRAME] = &previousFrame;
-    } else {
-        invalidateCandidate(CAND_PREV_FRAME);
-    }
+    c[CAND_PREV_FRAME] = getCandidate(lineNumber, h,
+                                      previousFrame, lineNumber, h,
+                                      standing.prevFrameB,
+                                      &reach.prevFrame[phase]);
+    src[CAND_PREV_FRAME] = &previousFrame;
 
     // --- Temporal Frame Center: Next Frame ---
-    if (temporalGrammar3D ||
-        carrierLineFlip(lineNumber) == nextFrame.carrierLineFlip(lineNumber)) {
-        c[CAND_NEXT_FRAME] = getCandidate(lineNumber, h,
-                                          nextFrame, lineNumber, h,
-                                          standing.nextFrameB);
-        src[CAND_NEXT_FRAME] = &nextFrame;
-    } else {
-        invalidateCandidate(CAND_NEXT_FRAME);
-    }
+    c[CAND_NEXT_FRAME] = getCandidate(lineNumber, h,
+                                      nextFrame, lineNumber, h,
+                                      standing.nextFrameB,
+                                      &reach.nextFrame[phase]);
+    src[CAND_NEXT_FRAME] = &nextFrame;
 
     // --- Agreement Reward Shaping ---
     //
@@ -3833,7 +3607,6 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
                 continue;
 
             const double dIRE = c[i].yPen;
-            if (g_distCensus.on) g_distCensus.add(dIRE);
             double delta = 0.0;
 
             if (dIRE <= T.AGREEMENT_REWARD_RADIUS_IRE) {
@@ -4219,10 +3992,12 @@ void Comb::FrameBuffer::overlayMap(const FrameBuffer &previousFrame,
         double *V = componentFrame->v(line);
         const TemporalEvidenceStanding standing =
             temporalEvidenceStanding(line, previousFrame, nextFrame);
+        const TemporalReachPrefill reach =
+            temporalReachPrefill(line, previousFrame, nextFrame);
         for (int h = left; h < right; ++h) {
             qint32 bestIndex;
             double bestSample;
-            getBestCandidate(line, h, previousFrame, nextFrame, standing,
+            getBestCandidate(line, h, previousFrame, nextFrame, standing, reach,
                              bestIndex, bestSample);
             U[h] = shades[bestIndex].u;
             V[h] = shades[bestIndex].v;

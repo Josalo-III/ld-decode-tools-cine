@@ -274,43 +274,10 @@ inline double scheduleAlternationLicense(double signedCorr)
     return t * t * (3.0 - 2.0 * t);
 }
 
-// Decision layer: the single table-owned mapping from the conformance
-// MEASUREMENT to a carrier-trust weight in [0,1].  Every consumer weights by
-// THIS function, so "how much do we trust this as carrier" is uniform; only
-// the action taken with the weight is the consumer's own (a fit weights its
-// least-squares, the interline stage weights its cancellation, the election
-// weights its admission).  Design:
-//   * conformance <= -kLegal  -> w ~ 1 (behaves like legal carrier)
-//   * conformance >= +kIllegal-> w ~ 0 (matches where inversion was demanded)
-//   * a smooth ramp between (no hard step: the fragile single-axis boundary
-//     that flipped verdicts at pixel pitch becomes a gentle slope)
-//   * low confidence pulls w toward the neutral wNeutral rather than letting a
-//     thin vote force either extreme (capped penalty, never an override).
-// Thresholding the legacy enum corresponds to carrierTrust crossing 0.5, so
-// this reduces to the old binary at the high-confidence extremes and only the
-// ambiguous middle changes.
-inline double carrierTrust(double conformance, double confidence)
-{
-    constexpr double kLegal = 0.5;      // conformance at which w reaches ~1
-    constexpr double kIllegal = 0.5;    // conformance at which w reaches ~0
-    constexpr double wNeutral = 0.5;    // trust with no discriminating evidence
-
-    // Smooth ramp from +kIllegal (w=0) down to -kLegal (w=1), centred at 0.
-    const double span = kLegal + kIllegal;
-    double t = (kIllegal - conformance) / (span > 1e-9 ? span : 1.0);
-    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
-    const double wFull = t * t * (3.0 - 2.0 * t); // smoothstep
-
-    // Confidence gates how far the evidence may pull away from neutral.
-    const double c = confidence < 0.0 ? 0.0 : (confidence > 1.0 ? 1.0 : confidence);
-    return wNeutral + c * (wFull - wNeutral);
-}
-
 // Decision layer, luma side: the single table-owned mapping from the
 // conformance MEASUREMENT to a luma-attribution PROOF in [0,1].  This is
-// deliberately NOT the complement of carrierTrust(): trust's graded middle
-// exists so carrier consumers degrade smoothly under ambiguity, but a
-// suppression consumer acting on that middle desaturates genuine chroma --
+// conservative because a suppression consumer acting on ambiguous evidence
+// desaturates genuine chroma --
 // at a hue boundary the correlation windows straddle two hues, no axis can
 // produce a decisive legal vote, and the stored conformance is a weakly
 // positive maxCorr that MEANS "unresolved", not "luma".  The registration
@@ -929,13 +896,6 @@ struct CombAttributionAssessment {
     double uncertainClaim = 1.0;
     double attributionConflict = 0.0;
 };
-
-struct CombAttributionRecord {
-    CombAttributionFacts facts;
-    CombAttributionAssessment assessment;
-};
-
-using CombAttributionEvidence = CombAttributionRecord;
 
 inline double strongestCombChromaIRE(const CombAttributionFacts &f)
 {

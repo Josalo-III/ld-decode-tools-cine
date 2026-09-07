@@ -39,98 +39,16 @@
 #include "decoder.h"
 #include "sourcefield.h"
 
-// The comb's coarse rows read the lurch-solved per-sample platform rather than
-// the block-centre scaffold.  Consulted by the allocation (comb.cpp), the
-// platform build (comblocked.cpp) and the tap line (combcandidate.cpp), so it
-// lives here rather than as a file-local escape in one of the three.
-// LDCD_COARSE_SOLVED=0 restores the scaffold byte-identically.
-inline bool ldcdSolvedCoarseEnabled()
-{
-    static const bool on = []{
-        const char *s = std::getenv("LDCD_COARSE_SOLVED");
-        return !(s && std::atoi(s) == 0);
-    }();
-    return on;
-}
-
-// The luma platform solve. DEFAULT ON, supplanting BOTH older floors -- the
-// block-mean baseY4 and lsc's lurch solve. It was built gated so the two could
-// be graded with it absent; measured against banked conservation truth on the
+// The luma platform solve, supplanting both older floors -- the block-mean
+// baseY4 and the retired lurch solve. Measured against banked conservation truth on the
 // isolated platform it wins on every material, and it does not have to win by
 // much to replace them:
 //
 //     isolated platform, rms IRE      cube     shirt    beach
 //       baseY4 block mean            4.2905   1.7135   2.6237
-//       lsc lurch solve              2.6079   1.0764   1.2848
+//       retired lurch solve          2.6079   1.0764   1.2848
 //       this solve, lurch-weighted   2.5741   1.0393   1.2613
 //
-// LDCD_LUMA_SOLVE=0 restores the previous behaviour exactly: nothing it
-// touches is then allocated, built or read.
-//
-// The three floors, in priority order at the produceY floor site:
-//   LDCD_LUMA_SOLVE=1   the platform solve      (this gate)
-//   --y-election lsc    the lurch solve         (yElection.lsc)
-//   otherwise           baseY4, the block mean
-inline bool ldcdLumaSolveEnabled()
-{
-    static const bool on = []{
-        const char *s = std::getenv("LDCD_LUMA_SOLVE");
-        return !(s && std::atoi(s) == 0);
-    }();
-    return on;
-}
-
-// TEMPORARY instrument (LDCD_CCR_CONF=1): the distribution of schedule
-// non-conformity, split by whether the conservation fact says real chroma is
-// present. Places the two conformity constants on evidence.
-inline bool ldcdCcrConfCensusEnabled()
-{
-    static const bool on = []{
-        const char *s = std::getenv("LDCD_CCR_CONF");
-        return s && std::atoi(s) != 0;
-    }();
-    return on;
-}
-
-// TEMPORARY instrument (LDCD_CCR_VET=1), strip when the question closes:
-// CCR's error against banked truth, stratified by how much colour is actually
-// present. A pooled figure cannot see a return that buys luma accuracy by
-// draining saturation.
-inline bool ldcdCcrVetEnabled()
-{
-    static const bool on = []{
-        const char *s = std::getenv("LDCD_CCR_VET");
-        return s && std::atoi(s) != 0;
-    }();
-    return on;
-}
-
-// CCR checks whether the luma energy is STILL in the chroma after the comb
-// ran, so the same energy is not moved twice.
-//
-// DEFAULT OFF, on measurement. The PRINCIPLE is right; this estimator of
-// "already moved" is not. It uses |preC| - |postC| -- the magnitude drop
-// between the 1D carrier and the comb's -- which conflates two different
-// things: the comb REMOVING luma, and the comb simply producing a better
-// carrier estimate of different magnitude. Two carrier estimates differing in
-// size is not evidence that luma was moved.
-//
-// Measured: it throttles legitimate returns on the cube, where CCR does its
-// real work (CCR alone -13.9% vs no CCR; the check gives 1.3% of that back)
-// while gaining ~0.1% on shirt and beach.
-//
-// A correct estimator has to project the comb's change onto the component the
-// licence identifies as luma, rather than take a magnitude difference of the
-// whole carrier. LDCD_CCR_POSTCOMB=1 to re-enable as written.
-inline bool ldcdCcrPostCombCheck()
-{
-    static const bool on = []{
-        const char *s = std::getenv("LDCD_CCR_POSTCOMB");
-        return s && std::atoi(s) != 0;
-    }();
-    return on;
-}
-
 // The 2D reach and its evidence read the SOLVED luma rather than the block
 // scaffold or a privately-built notch. Default ON: determining a reach from a
 // worse estimate than the one available is the evidence failure the holdout
@@ -251,16 +169,12 @@ public:
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
-        bool lumaWitness = false;
         // Y-election roster (--y-election, 2026-08-20). comb is always
         // seated and is not a member. Bare default reproduces the historic
-        // no-flag render (notch-HF seated, rest off). lumaWitness above is
-        // DERIVED in main.cpp as (rcy || lsc) -- the witness machinery
-        // serves both; nothing below main sets it independently.
+        // no-flag render (notch-HF seated, rest off).
         struct YElection {
             bool ccr = false;   // cross-colour return pair (Y return + mask)
             bool rcy = false;   // retracted carrier Y (witness candidate)
-            bool lsc = false;   // lurch-sharpened coarse platform
             bool ntc = true;    // notch-HF candidate (uncovered frames only)
             bool ice = false;   // RESERVED: iceberg, not yet promoted
         };
@@ -563,7 +477,6 @@ public:
 	// Signal attribution evidence, collected before election. This is not a
 	// scoring model; it records why bandpassed energy looks luma-owned,
 	// chroma-owned, or contested so demod/admission can later act on it.
-	using AttributionEvidence = lddecode::CombAttributionEvidence;
 	using AttributionFacts = lddecode::CombAttributionFacts;
 	using AttributionAssessment = lddecode::CombAttributionAssessment;
 	using AttributionRules = lddecode::AttributionRules;
@@ -582,11 +495,7 @@ public:
 	// This is the comb's own 3D structure. Null when no contiguous predecessor.
 	void buildCarrierAnalysis(FrameBuffer *prevFrame = nullptr);
 	void buildCertifiedCarrierStage(const FrameBuffer *prevF = nullptr);
-	// The luma-witness model (restored to its 2026-07-23 shape, 95e292f).
-	// Gated on configuration.lumaWitness ALONE and complete in itself: it
-	// solves the fit, publishes carrierRetracted and sets
-	// carrierRetractedValid, so no gate placed on the certified family can
-	// withdraw it or leave it half-published.
+	// The retracted-carrier model used by the rcy candidate.
 	void buildLumaWitnessModel();
 
 
@@ -596,8 +505,7 @@ public:
 	// this stage is identically inert wherever the luma foundation does not
 	// bend. It recovers the curvature by deconvolving the KNOWN notch kernel
 	// ([0.25,0.5,0.25] at stride 2), gates the result by carrier-free evidence,
-	// and publishes the predicted leak. DIAGNOSTIC ONLY at present: nothing
-	// consumes lockedCornerLeak_flat, so the render is unchanged.
+	// and publishes the predicted leak for the shared carrier analysis.
 	void buildCornerLeak();
 
 	// Coarse-residual pool and its consumers, shared by the bucket and locked
@@ -623,8 +531,6 @@ public:
 	// successor to the plateau snap above. Consumes the WHOLE membership
 	// sequence as same-phase difference facts rather than pattern-matching
 	// one shape out of it. Writes the platform to yOut[0..width).
-	void solveLurchYCurve(int line, const double *apMean, int meanCount,
-	                      int width, double *yOut);
 	// The luma platform solve: one banded system over the same-phase parallax
 	// facts and both lane diameters. Its own construction and its own gate,
 	// so the two existing floors can be graded without it in the path.
@@ -1209,12 +1115,8 @@ private:
 	// no faster than a legal envelope, so the scaling manufactures no
 	// out-of-band sidebands.
 	std::vector<float> carrierCorroboration_flat;
-	// Graded schedule-conformance participation in [0,1], from the table-owned
-	// carrierTrust() on the scanner's MEASUREMENT (carrierConformance +
-	// support fraction) — never the thresholded enum.  1 = full participant
-	// (legal / unresolved / quiet), 0 = decisively proven schedule-illegal.
-	// The old uint8 projection quantized a smooth vertical correlation to one
-	// bit and made the retraction's engage/disengage flip at line pitch.
+	// Schedule-conformance participation. Legal and unresolved samples remain
+	// participants; samples proven schedule-illegal do not.
 	std::vector<float> carrierEligibility_flat;
 	std::vector<lddecode::FourViewPixelEvidence> coarseYEvidence_flat; // per-pixel four-view evidence
 	bool carrierRetractedValid = false;
@@ -1324,10 +1226,8 @@ private:
 	std::vector<double> scratch_coe_coherence;  // per-line IQ coherence pre-pass (collectCombAttributionEvidence)
 	std::vector<double> scratch_coe_frameIQMag; // pre-computed |frameIQ[r]| magnitudes (collectCombAttributionEvidence)
 		std::vector<double> scratch_lineWorkD; // Generic per-line filter scratch.
-	std::vector<double> scratch_lurchPlatform;   // Lurch solve: moving-coarse registration (the LF platform) per xi
-	std::vector<double> scratch_lurchCurve;    // Lurch solve: whole-line banded-LS Y curve per xi
-	std::vector<double> scratch_lurchWork;     // Lurch solve: Thomas workspace, 2 rows per phase chain
-	std::vector<double> scratch_lurchPin;      // Lurch solve: certified Y where pinned, NaN elsewhere
+	std::vector<double> scratch_lurchPlatform; // Platform solve: moving-coarse registration per xi
+	std::vector<double> scratch_lurchPin;      // Platform solve: fixed-value constraints per xi
 	// Lurch solve: symmetric banded normal matrix, lower half-band 4 stored
 	// row-major as [j*(kLurchBand+1) + d] = A(j, j-d), plus its rhs and the
 	// LDL^T diagonal. Half-bandwidth 4 is set by the same-phase difference
@@ -1416,41 +1316,27 @@ private:
 	// default 1D feasibility repair, luma witness, and diagnostics all consume
 	// this single shared analysis rather than privately reconstructing it.
 		std::vector<lddecode::CarrierAnalysisRecord> carrierAnalysis_flat;
-		std::vector<AttributionEvidence> attributionEvidence_flat; // Attribution facts/assessment per sample.
+		std::vector<AttributionFacts> attributionFacts_flat;
+		std::vector<AttributionAssessment> attributionAssessment_flat;
 	// Default LF platform: one legal carrier-cycle mean per four input
 	// samples, held over that cycle (information-rate Nyquist fSC/2).
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
-	// Centered lurch-sharpened sliding-boxcar coarse: the witness-only LF
-	// platform and authority. Comb supplies middle and provisional top above
-	// this same base; only the top is replaceable. lockedLumaSmooth remains a
-	// geometry service.
-	std::vector<double> lockedLumaSharp_flat;
 	// THE LUMA PLATFORM SOLVE (solveLumaPlatformLine, comblocked.cpp): one
 	// banded system over every carrier-free fact the line affords -- the
 	// same-phase parallax differences AND both lane diameters. A third
-	// construction, gated separately so the two existing floors (baseY4 and
-	// lsc's lurch solve) can be graded in its absence; intended to supplant
-	// both rather than to compete inside either.
+	// construction that supplants the earlier coarse floors.
 	std::vector<double> lockedLumaSolved_flat;
 	// THE RESIDUAL LANE COARSES. Built from resid = raw - solvedPlatform, in
 	// COMPOSITE space, NOT from the 1D bandpass -- so they are an independent
 	// signal rather than an inheritance of 1D's error.
 	//
-	// Both are carrier-cancelling by the diameter property, under the WEAKER
+	// This is carrier-cancelling by the diameter property, under the WEAKER
 	// precondition a lane enjoys: an aperture needs both quadrature lattice
 	// axes stationary across stride 2, a lane needs only its own.
 	//
-	//   residLaneN   1/4 r[x-2] + 1/2 r[x] + 1/4 r[x+2]   x's own lane
-	//   residLane2   1/2 r[x-1]            + 1/2 r[x+1]   the other lane
-	//
-	// KEPT SEPARATE, ALWAYS. Their mean is the four-sample mean, which is
-	// identically zero on the 2fSC component -- and 2fSC is where no carrier
-	// can legally live, so that component is luma by law and these two reads
-	// are the only instruments that see it. They read it with OPPOSITE sign,
-	// so averaging them destroys precisely the degree of freedom they exist
-	// to reach. Published raw; consumers own the decision.
-	std::vector<double> residLaneN_flat, residLane2_flat;
+	//   residLaneN   1/4 r[x-2] + 1/2 r[x] + 1/4 r[x+2]
+	std::vector<double> residLaneN_flat;
 	// THE CARRIER LICENSE — a MINORITY REPORT on 1D, not a replacement for it.
 	//
 	// 1D stays the carrier basis. What this channel does is falsify it at
@@ -1502,8 +1388,7 @@ private:
 	// exactly, and the divergence between the apertures covering one sample is
 	// pure luma with the carrier removed exactly (the coarse-residual parallax).
 	// It is deliberately published raw -- no sharpening, no gating, no absolute
-	// value -- so consumers own the decisions. `lockedLumaSharp` is derived FROM
-	// this pool rather than rebuilding it privately.
+	// value -- so consumers own the decisions.
 	//
 	// Built unconditionally (a running sum, O(1) per sample) because it has
 	// default-path clients, not "just in case".
@@ -1518,7 +1403,7 @@ private:
 	// locked1DRawBandpass. chroma = bp - leak, and Y = raw - chroma, so the
 	// removed leak RETURNS to luma and Y + chroma == raw exactly (the
 	// conservation condition a desaturating suppressor cannot satisfy).
-	// DIAGNOSTIC ONLY for now: no consumer, so the render is unchanged.
+	// Consumed by the shared carrier analysis.
 	std::vector<double> lockedCornerLeak_flat;
 	// BAND FACTS: one head-scan producer (buildBandFacts, the tail of
 	// buildCarrierAnalysis) publishes the per-sample facts band consumers
@@ -1545,20 +1430,12 @@ private:
 		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
 	}
 
-	inline double *lockedLumaSharp_line(int line) {
-		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
-	}
-
 	inline const double *lockedLumaBaseY4_line(int line) const {
 		return lockedLumaBaseY4_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline const double *lockedLumaSmooth_line(int line) const {
 		return lockedLumaSmooth_flat.data() + size_t(line) * demodWidth;
-	}
-
-	inline const double *lockedLumaSharp_line(int line) const {
-		return lockedLumaSharp_flat.data() + size_t(line) * demodWidth;
 	}
 
 	inline float *carrierLicense_line(int line) {
@@ -1578,15 +1455,6 @@ private:
 		if (residLaneN_flat.empty()) return nullptr;
 		return residLaneN_flat.data() + size_t(line) * demodWidth;
 	}
-	inline double *residLane2_line(int line) {
-		if (residLane2_flat.empty()) return nullptr;
-		return residLane2_flat.data() + size_t(line) * demodWidth;
-	}
-	inline const double *residLane2_line(int line) const {
-		if (residLane2_flat.empty()) return nullptr;
-		return residLane2_flat.data() + size_t(line) * demodWidth;
-	}
-
 	inline double *lockedLumaSolved_line(int line) {
 		if (lockedLumaSolved_flat.empty()) return nullptr;
 		return lockedLumaSolved_flat.data() + size_t(line) * demodWidth;
@@ -1831,16 +1699,25 @@ private:
 		return clpbuffer[plane].pixel[line];
 	}
 
-	inline AttributionEvidence *attributionEvidence_line(int line) {
+	inline AttributionFacts *attributionFacts_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    attributionEvidence_flat.empty()) return nullptr;
-		return attributionEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+		    attributionFacts_flat.empty()) return nullptr;
+		return attributionFacts_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
-
-	inline const AttributionEvidence *attributionEvidence_line(int line) const {
+	inline const AttributionFacts *attributionFacts_line(int line) const {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
-		    attributionEvidence_flat.empty()) return nullptr;
-		return attributionEvidence_flat.data() + static_cast<size_t>(line) * demodWidth;
+		    attributionFacts_flat.empty()) return nullptr;
+		return attributionFacts_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline AttributionAssessment *attributionAssessment_line(int line) {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    attributionAssessment_flat.empty()) return nullptr;
+		return attributionAssessment_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
+	inline const AttributionAssessment *attributionAssessment_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    attributionAssessment_flat.empty()) return nullptr;
+		return attributionAssessment_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
 	inline std::uint8_t *fieldBDecisionReason_line(int line) {
@@ -1900,22 +1777,6 @@ private:
 		       anchorCoveredLine[line] != 0;
 	}
 	void buildAnchorCeiling();
-	// TEMPORARY INSTRUMENT (LDCD_PROBE_CARRIERBW=1). Read-only census of the
-	// certified carrier's own transition law. Writes nothing, renders
-	// nothing; strip when the question closes.
-	void probeCarrierBandwidth() const;
-	// TEMPORARY INSTRUMENT (LDCD_PROBE_COMPACT=1). The compact-colour sign
-	// test: do the carrier fit and the notch complement err in opposite
-	// directions at compact features, or reinforce? Read-only.
-	void probeCompactSites() const;
-	// TEMPORARY INSTRUMENT (LDCD_PROBE_SPAN=1). The compact-span locator:
-	// notch-identified chroma regions shorter than 4 samples, censused and
-	// precision-graded against the exact carrier on certified lines.
-	void probeCompactSpans() const;
-	// TEMPORARY INSTRUMENT (LDCD_PROBE_COVTRUTH=1). Covered-frame truth
-	// decomposition: certified carrier vs certified luma at the sites the
-	// uncovered machinery fails on. Read-only.
-	void probeCoveredTruth() const;
 	// BAND FACTS producer, the tail of buildCarrierAnalysis: one scan
 	// publishes what band consumers used to rebuild privately per line
 	// (the notch-HF curves and the parallax consensus). bandWLaw = the
@@ -2159,7 +2020,8 @@ private:
 									   const std::vector<double> &frameScalar,
 									   const std::vector<std::complex<double>> *frameIQ);
 	void seedCombAttributionPerLine(int line);
-	void finalizeAttributionClaims(AttributionEvidence &e,
+	void finalizeAttributionClaims(const AttributionFacts &facts,
+								 AttributionAssessment &assessment,
 								 double neighborLumaMeanIRE = -1.0,
 								 double neighborBaseMeanIRE = -1.0,
 								 double lineForwardErrorIRE = 0.0) const;
@@ -2227,7 +2089,24 @@ private:
 		double prevFrameB  = 0.0;   // previousFrame, whole frame
 		double nextFrameB  = 0.0;   // nextFrame, whole frame
 	};
+	// Grammar answers depend on line pair and one of four sample phases, never
+	// on the individual pixel. Fill this table once before entering an h loop.
+	struct TemporalReachPrefill {
+		std::array<lddecode::CombReachReply, 4> left;
+		std::array<lddecode::CombReachReply, 4> right;
+		std::array<lddecode::CombReachReply, 4> up;
+		std::array<lddecode::CombReachReply, 4> down;
+		std::array<lddecode::CombReachReply, 4> prevField;
+		std::array<lddecode::CombReachReply, 4> selfPrevField;
+		std::array<lddecode::CombReachReply, 4> nextField;
+		std::array<lddecode::CombReachReply, 4> selfNextField;
+		std::array<lddecode::CombReachReply, 4> prevFrame;
+		std::array<lddecode::CombReachReply, 4> nextFrame;
+	};
 	TemporalEvidenceStanding temporalEvidenceStanding(
+		qint32 lineNumber, const FrameBuffer &previousFrame,
+		const FrameBuffer &nextFrame) const;
+	TemporalReachPrefill temporalReachPrefill(
 		qint32 lineNumber, const FrameBuffer &previousFrame,
 		const FrameBuffer &nextFrame) const;
 
@@ -2235,6 +2114,7 @@ private:
 						  const FrameBuffer &previousFrame,
 						  const FrameBuffer &nextFrame,
 						  const TemporalEvidenceStanding &standing,
+						  const TemporalReachPrefill &reach,
 						  qint32 &bestIndex, double &bestSample,
 						  TemporalCandidateSamples *temporalSamples = nullptr) const;
 
@@ -2242,7 +2122,8 @@ private:
 	Candidate getCandidate(qint32 refLineNumber, qint32 refH,
 						   const FrameBuffer &frameBuffer,
 						   qint32 lineNumber, qint32 h,
-						   double adjustPenalty) const;
+						   double adjustPenalty,
+						   const lddecode::CombReachReply *prefilledReach = nullptr) const;
 
 	int demodWidth  = 0;
 	int demodLines  = 0;
@@ -2458,7 +2339,7 @@ private:
     // Persistent triple-buffer: the prev/current/next FrameBuffers are reused
     // across decodeFrames() calls instead of being allocated and zero-filled
     // on every batch.  Each FrameBuffer owns ~180 MB of per-pixel attribution
-    // storage (CombAttributionRecord = ~456 B/pixel × 525 × 760), so per-batch
+    // storage (facts + assessments = ~456 B/pixel × 525 × 760), so per-batch
     // reconstruction was the single largest cost in the locked path (~25 %
     // of decode wall time on M1 Max).  decodeFrames() takes ownership into
     // locals at entry (preserving the existing std::move rotation) and

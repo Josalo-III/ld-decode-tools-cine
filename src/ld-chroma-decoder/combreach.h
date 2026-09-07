@@ -364,9 +364,6 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
     lddecode::CarrierPhaseRelation downRelation,
     bool allowUp,
     bool allowDown,
-    double centerCarrierTrust,
-    double upCarrierTrust,
-    double downCarrierTrust,
     double invIreScale,
     double minChromaIRE,
     // Sharp raw-scalar facts for the first-pass AlienCancel decision. ±2 same-

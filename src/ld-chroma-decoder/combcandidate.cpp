@@ -402,25 +402,6 @@ double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
 // the two.
 // ---------------------------------------------------------------------------
 
-// TEMPORARY INSTRUMENT (LDCD_PROBE_FBREG=1): grade Frame B's own notch aim
-// against the certified aim on covered comp lines, where both exist. The
-// question it answers is whether the disciplined luma search reproduces the
-// fact -- including how often it correctly STAYS at the detent -- before that
-// search is trusted on the lines that carry no fact. Strip when it closes.
-struct LdcdFbRegStat {
-    // Detent distribution of the adopted aim. The shape to look for is
-    // monotonically decreasing; a bin pinned at the adoptable limit would be
-    // a saturating estimator, not a picture.
-    //
-    // There is no grading against fact here, and there cannot be: the only
-    // fact-grade registration lives on covered frames, and a covered frame
-    // calls no candidate. Grade the OUTCOME instead -- --dg-discard against a
-    // banked-truth reference, which removes covered frames so Frame B runs
-    // everywhere.
-    long dist[3] = {0, 0, 0};   // |d| = 0, 1, 2
-};
-thread_local LdcdFbRegStat gFbRegStat;
-
 } // namespace
 
 void Comb::FrameBuffer::invalidateCombTapCache()
@@ -733,20 +714,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     // second difference of coarse0IRE -- reports the block grid as much as the
     // picture, and luma detail finer than a block is invisible to it.
     //
-    // lockedLumaSharp is the same facts without that quantisation:
-    // solveLurchYCurve consumes the WHOLE aperture-membership sequence as
-    // same-phase difference facts and writes a per-sample platform.  Nothing is
-    // condensed on the way -- the memberships enter the solve as constraints.
-    // It was allocated only under --luma-witness because the default path was
-    // not paying for the solve; the coarse rows want it too.
-    //
-    // LDCD_COARSE_SOLVED=0 restores the scaffold byte-identically.
-    // Same three-way priority as the produceY floor: the platform solve when
-    // it is gated on, then lsc's lurch solve, then the scaffold.
-    const bool combUsesSolved =
-        ldcdLumaSolveEnabled() && !lockedLumaSolved_flat.empty();
-    const bool combUsesSharp =
-        ldcdSolvedCoarseEnabled() && !lockedLumaSharp_flat.empty();
+    // The solved platform is the one coarse estimate shared by every client.
+    // A private or legacy coarse here would violate compute-once ownership.
+    const bool combUsesSolved = !lockedLumaSolved_flat.empty();
     auto getLumaRow = [&](int ln)->const double* {
         if (!configuration.phaseCompensation ||
             !lockedLumaCacheValid ||
@@ -757,7 +727,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             return nullptr;
         }
         if (combUsesSolved) return lockedLumaSolved_line(ln);
-        if (combUsesSharp)  return lockedLumaSharp_line(ln);
         return lockedLumaSmooth_line(ln);
     };
 
@@ -817,13 +786,10 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const CombTapScalar &s = tapLine.tap0[rel];
             const double envC = boundedMag(s.comp, s.symMag);
             tapLine.centerEnvelope[rel] = envC;
-            const double carrierTrust = centerAnalysis
-                ? lddecode::carrierTrust(
-                    centerAnalysis[rel].carrierConformance,
-                    centerAnalysis[rel].conformanceUsableAxisFraction)
-                : 0.5;
-            const double admission =
-                std::clamp(2.0 * (carrierTrust - 0.5), 0.0, 1.0);
+            const double admission = centerAnalysis &&
+                centerAnalysis[rel].scheduleConformance ==
+                    lddecode::CarrierScheduleConformance::LegalCarrier
+                ? 1.0 : 0.0;
             tapLine.centerAdmittedChromaT[rel] = admission *
                 std::clamp((envC * invI - 2.0) / 8.0, 0.0, 1.0);
         }
@@ -997,17 +963,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const float *sQUp = smoothedLockedTQ_line(tapLine.lnU2);
             const float *sIDn = smoothedLockedTI_line(tapLine.lnD2);
             const float *sQDn = smoothedLockedTQ_line(tapLine.lnD2);
-            const auto *analysis0 = carrierAnalysis_line(tapLine.ln0);
-            const auto *analysisUp = carrierAnalysis_line(tapLine.lnU2);
-            const auto *analysisDn = carrierAnalysis_line(tapLine.lnD2);
-            auto trustAt = [](const lddecode::CarrierAnalysisRecord *row,
-                              int rel) {
-                return row
-                    ? lddecode::carrierTrust(row[rel].carrierConformance,
-                                             row[rel].conformanceUsableAxisFraction)
-                    : 0.5;
-            };
-
             // ±4 grammar reach and smoothed rows for contour-influence gating.
             const bool have4IQ =
                 tapLine.lnU4 >= 0 && tapLine.lnU4 < demodLines &&
@@ -1016,8 +971,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             bool haveUp4 = false, haveDn4 = false;
             const float *sIUp4 = nullptr, *sQUp4 = nullptr;
             const float *sIDn4 = nullptr, *sQDn4 = nullptr;
-            const lddecode::CarrierAnalysisRecord *analysisUp4 = nullptr;
-            const lddecode::CarrierAnalysisRecord *analysisDn4 = nullptr;
             if (have4IQ && tapLine.haveU4) {
                 up4Reach = combReachIndex.query(
                     {lineNumber, tapLine.lnU4, left, left,
@@ -1026,7 +979,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                     ensureSmoothedLockedRow(tapLine.lnU4);
                     sIUp4 = smoothedLockedTI_line(tapLine.lnU4);
                     sQUp4 = smoothedLockedTQ_line(tapLine.lnU4);
-                    analysisUp4 = carrierAnalysis_line(tapLine.lnU4);
                     haveUp4 = true;
                 }
             }
@@ -1038,7 +990,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                     ensureSmoothedLockedRow(tapLine.lnD4);
                     sIDn4 = smoothedLockedTI_line(tapLine.lnD4);
                     sQDn4 = smoothedLockedTQ_line(tapLine.lnD4);
-                    analysisDn4 = carrierAnalysis_line(tapLine.lnD4);
                     haveDn4 = true;
                 }
             }
@@ -1056,9 +1007,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         downReach.carrierRelation,
                         upReach.allowIQCompare,
                         downReach.allowIQCompare,
-                        trustAt(analysis0, rel),
-                        trustAt(analysisUp, rel),
-                        trustAt(analysisDn, rel),
                         invI,
                         5.0,
                         // Sharp raw ±2 scalar facts: the first-pass AlienCancel
@@ -1084,9 +1032,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                             dn4Reach.carrierRelation,
                             haveUp4,
                             haveDn4,
-                            trustAt(analysis0, rel),
-                            trustAt(analysisUp4, rel),
-                            trustAt(analysisDn4, rel),
                             invI,
                             5.0);
                     tapLine.regionUp4[rel] = region4.up;
@@ -1141,17 +1086,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             const float *sQUp = smoothedLockedTQ_line(tapLine.lnU1);
             const float *sIDn = smoothedLockedTI_line(tapLine.lnD1);
             const float *sQDn = smoothedLockedTQ_line(tapLine.lnD1);
-            const auto *analysis0  = carrierAnalysis_line(tapLine.ln0);
-            const auto *analysisUp = carrierAnalysis_line(tapLine.lnU1);
-            const auto *analysisDn = carrierAnalysis_line(tapLine.lnD1);
-            auto trustAt = [](const lddecode::CarrierAnalysisRecord *row,
-                              int rel) {
-                return row
-                    ? lddecode::carrierTrust(row[rel].carrierConformance,
-                                             row[rel].conformanceUsableAxisFraction)
-                    : 0.5;
-            };
-
             // Relation sign is a LINE fact -- one grammar lookup per leg,
             // hoisted. Zero means the grammar does not authorise the
             // comparison, which the evaluator reports as Unknown and no
@@ -1217,9 +1151,6 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         dn1Reach.carrierRelation,
                         up1Reach.allowIQCompare,
                         dn1Reach.allowIQCompare,
-                        trustAt(analysis0, rel),
-                        trustAt(analysisUp, rel),
-                        trustAt(analysisDn, rel),
                         invI,
                         kFrameBRegionChromaFloorIRE);
 
@@ -2715,26 +2646,6 @@ void Comb::FrameBuffer::computeFrameBLine(
 		std::fill(scratch_frameBReachUnsafe.begin(),
 		          scratch_frameBReachUnsafe.end(), 0);
 
-    static const bool fbRegProbe = []{
-        const char *e = std::getenv("LDCD_PROBE_FBREG");
-        return e && std::atoi(e) == 1;
-    }();
-    // Reported at the head of the next frame's first line, so the print
-    // happens whether or not this frame's last line ceded.
-    if (fbRegProbe && line == first) {
-        const long nd = gFbRegStat.dist[0] + gFbRegStat.dist[1] +
-                        gFbRegStat.dist[2];
-        if (nd > 0) {
-            const double pd = 100.0 / (double)nd;
-            std::fprintf(stderr,
-                "[FBAIM] aimed %ld cols: |d|=0 %.1f%% | |d|=1 %.1f%% | "
-                "|d|=2 %.1f%%\n",
-                nd, gFbRegStat.dist[0] * pd, gFbRegStat.dist[1] * pd,
-                gFbRegStat.dist[2] * pd);
-            gFbRegStat = LdcdFbRegStat();
-        }
-    }
-
 	// The refusal band is now election evidence, not a Frame-B construction
 	// actuator.  Frame B's purpose is the aggressive registered subtraction;
 	// suppressing it here merely republishes the contaminated center.  FVF sees
@@ -3185,8 +3096,6 @@ void Comb::FrameBuffer::computeFrameBLine(
                 // aligned pair is (up[x-d], dn[x+d]), so the published
                 // advance is already in this convention.
                 const int bestD = diagAim(x);
-                if (fbRegProbe)
-                    ++gFbRegStat.dist[std::min(std::abs(bestD), 2)];
                 const int sStarDiag = sameIsUp ? -bestD : bestD;
                 bestSi = std::clamp(sStarDiag + 2, 0, 4);
             } else {
@@ -3201,8 +3110,6 @@ void Comb::FrameBuffer::computeFrameBLine(
                         bestSi = si;
                     }
                 }
-                if (fbRegProbe)
-                    ++gFbRegStat.dist[std::min(std::abs(bestSi - 2), 2)];
             }
 
             const int sStar = bestSi - 2;
@@ -3428,7 +3335,8 @@ bool Comb::FrameBuffer::computeFrameCLine(int line, std::vector<double> &out)
 Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     qint32 refLineNumber, qint32 refH,
     const FrameBuffer &frameBuffer, qint32 lineNumber, qint32 h,
-    double adjustPenalty) const
+    double adjustPenalty,
+    const lddecode::CombReachReply *prefilledReach) const
 {
     Candidate result;
     result.penalty = configuration.candidatePenaltyHardMax;
@@ -3460,74 +3368,32 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     // grammar legality answers identically for either; the historical Bucket
     // mislabel (a workaround for the retired common-phase classification) is
     // no longer needed.  The sample read below follows the same mode switch.
-    const lddecode::CombReachReply phaseReach = combReachIndex.queryAgainst(
-        frameBuffer.combReachIndex,
-        {refLineNumber,
-         lineNumber,
-         refH,
-         h,
-         lddecode::CombReachUse::ScalarSignCompare,
-         scalarReachSource()});
+    const lddecode::CombReachReply phaseReach = prefilledReach
+        ? *prefilledReach
+        : combReachIndex.queryAgainst(
+            frameBuffer.combReachIndex,
+            {refLineNumber,
+             lineNumber,
+             refH,
+             h,
+             lddecode::CombReachUse::ScalarSignCompare,
+             scalarReachSource()});
 
-    // Temporal grammar: the signed relation is absolute (lineFlip derives
-    // from metadata fieldPhaseIDs), so cross-frame replies are temporally
-    // correct. BOTH definite relations are usable by the temporal comb:
-    //   Opposite -> partner scalar carries -C: (base - s)/2 combs.
-    //   Same     -> partner scalar carries +C: negate the stored sample so
-    //               the same downstream math (base - (-s))/2 averages.
-    // Quadrature/unknown remains illegal. The previous form demanded
-    // Opposite while getBestCandidate's frame pre-gate demanded equal
-    // lineFlips (= Same): mutually exclusive, so the frame-axis temporal
-    // comb never ran, and cross-frame field work existed only on the
-    // alternating lines where the heuristics happened to align -- the
-    // line-parity striping on cadence material.
-    // LDCD_3D_TEMPORAL_GRAMMAR=1 enables the temporal-grammar candidate
-    // rules (both relations legal, sign-folded samples, Same-relation bias).
-    // Default OFF: the chroma gain is real but per-pixel temporal ACCEPTANCE
-    // (the hull guard) still varies line-to-line at dense verticals, which
-    // measured net-worse on Y than the old dead-gate state on A/C frames.
-    // The acceptance-uniformity pass is the remaining design work.
-    static const bool temporalGrammar = []{
-        const char *e = std::getenv("LDCD_3D_TEMPORAL_GRAMMAR");
-        return e && std::atoi(e) != 0;
-    }();
-    double relationSign;
     if (!phaseReach.allowScalarSignCompare) {
         result.penalty = 1000.0;
         result.yPen    = 1000.0;
         result.iqPen   = 0.0;
         return result;
     }
-    // A Same-relation partner cannot yield carrier AT ALL: with equal phase
-    // the difference cancels the CARRIER and leaves a luma difference, so
-    // the sign-folded form is a temporal AVERAGE, not a comb -- it keeps the
-    // mean 1D leak that combing cancels. Admitting it alongside Opposite
-    // therefore runs two different physical operations on alternating lines,
-    // which is the line-parity striping that kept this whole path parked
-    // (measured 2026-07-28: acceptance was already uniform at 99.8%/share
-    // 0.95 and smoothing it changed nothing -- the stripes were in the
-    // VALUES, i.e. in the operation class). Opposite is the only path to a
-    // carrier product; content agreement is already gated by the 2D
-    // similarity curve (AGREEMENT_REWARD_*) in getBestCandidate, which is
-    // what makes a cross-frame Opposite partner honest where the picture is
-    // static. LDCD_3D_SAME_RELATION=1 restores the old averaging branch for
-    // A/B only.
-    static const bool allowSameRelation = []{
-        const char *e = std::getenv("LDCD_3D_SAME_RELATION");
-        return e && std::atoi(e) != 0;
-    }();
-    if (phaseReach.carrierRelation == lddecode::CarrierPhaseRelation::Opposite) {
-        relationSign = 1.0;
-    } else if (temporalGrammar && allowSameRelation &&
-               phaseReach.carrierRelation == lddecode::CarrierPhaseRelation::Same) {
-        relationSign = -1.0;
-        adjustPenalty += 3.0;
-    } else {
+    // Only an Opposite relation yields a carrier cancellation. A Same
+    // relation is an average of two different pictures, not a comb.
+    if (phaseReach.carrierRelation != lddecode::CarrierPhaseRelation::Opposite) {
         result.penalty = 1000.0;
         result.yPen    = 1000.0;
         result.iqPen   = 0.0;
         return result;
     }
+    constexpr double relationSign = 1.0;
 
     const int hh = clampH(h);
 
@@ -3628,8 +3494,8 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
     const int coarseW    = demodWidth;
     auto coarseRow = [](const FrameBuffer &fb, int line) -> const double * {
         if (!fb.lockedLumaCacheValid) return nullptr;
-        if (!fb.lockedLumaSharp_flat.empty())
-            return fb.lockedLumaSharp_line(line);
+        if (!fb.lockedLumaSolved_flat.empty())
+            return fb.lockedLumaSolved_line(line);
         if (!fb.lockedLumaBaseY4_flat.empty())
             return fb.lockedLumaBaseY4_line(line);
         return nullptr;

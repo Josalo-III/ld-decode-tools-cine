@@ -174,15 +174,14 @@ struct DecodeTicket
     // analysis runs (N + 2) / N times per emitted frame: 3.00x at N = 1,
     // 1.25x at N = 8.  Batch composition depends only on work-item order, so
     // the decode stays deterministic under --threads.
-    // 12 (2026-08-02, was 8): raised with the witness path's chain
-    // pre-roll deepening (comb.cpp preRollFields 2 -> 6) so the amortized
-    // analysis overhead (N + preRoll) / N stays at its previous ~1.25
-    // level while batch heads -- where every cross-frame chain restarts --
-    // become one-third rarer. LDCD_BATCH overrides for A/B bisection.
+    // Production runs are normally much longer than a second. Twenty-four
+    // frames halves batch-head pre-roll frequency while leaving ample work for
+    // the worker pool on real captures. LDCD_BATCH remains a development
+    // override for controlled performance comparisons.
     qint32 decoderBatchFrames = []{
         const char *s = getenv("LDCD_BATCH");
         const int v = s ? atoi(s) : 0;
-        return v >= 1 ? v : 12;
+        return v >= 1 ? v : 24;
     }();
     qint32 inputFrameNumber  = 1;
     qint32 lastFrameNumber   = 1;

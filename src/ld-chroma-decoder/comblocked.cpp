@@ -197,16 +197,6 @@ inline bool lurchSharpensPlatform()
     return on;
 }
 
-// A/B escape: 0 restores the plateau snap at both platform call sites.
-inline bool lurchSolveEnabled()
-{
-    static const bool on = []{
-        const char *s = std::getenv("LDCD_LURCH_SOLVE");
-        return !(s && std::atoi(s) == 0);
-    }();
-    return on;
-}
-
 inline bool lurchPinEnabled()
 {
     static const bool on = []{
@@ -370,10 +360,6 @@ void Comb::FrameBuffer::phaseLocked()
         !lockedLumaSmooth_flat.empty() &&
         demodWidth == width)
     {
-        // Follow the ALLOCATION, not the witness flag: the comb's coarse rows
-        // are a second client of this platform, so whoever caused it to be
-        // allocated is entitled to have it filled.
-        const bool buildSharp = !lockedLumaSharp_flat.empty();
         const bool buildSolved = !lockedLumaSolved_flat.empty();
 
         for (int line = firstLine; line < lastLine; ++line) {
@@ -441,8 +427,7 @@ void Comb::FrameBuffer::phaseLocked()
                 // carrier can occupy, and they read that component with
                 // opposite sign. No consumer yet -- published raw.
                 double *lnN = residLaneN_line(line);
-                double *ln2 = residLane2_line(line);
-                if (lnN && ln2) {
+                if (lnN) {
                     const quint16 *rl = rawbuffer.data() + (size_t)line * fullWidth;
                     auto resid = [&](int xi) -> double {
                         const int c = std::clamp(xi, 0, width - 1);
@@ -451,48 +436,9 @@ void Comb::FrameBuffer::phaseLocked()
                     for (int xi = 0; xi < width; ++xi) {
                         lnN[xi] = 0.25 * resid(xi - 2) + 0.5 * resid(xi)
                                 + 0.25 * resid(xi + 2);
-                        ln2[xi] = 0.5 * (resid(xi - 1) + resid(xi + 1));
                     }
-
                 }
             }
-
-            if (!buildSharp)
-                continue;
-
-            double *sharp = lockedLumaSharp_line(line);
-            if (width < 4) {
-                std::copy(lockedLumaSmooth_line(line),
-                          lockedLumaSmooth_line(line) + width, sharp);
-                continue;
-            }
-            // Derived FROM the pool above, not a private rebuild.
-            const double *boxcar = apMean;
-
-            if (lurchSolveEnabled()) {
-                solveLurchYCurve(line, boxcar, width - 3, width, sharp);
-            } else {
-                const int lastStart = width - 4; // last legal aperture start
-
-                for (int xi = 0; xi < width; ++xi) {
-                    const bool haveMoving = (xi >= 2 && xi + 2 < width);
-                    const double moving = haveMoving
-                        ? centeredCarrierCycle4Mean(
-                              (double)rawLine[left + xi - 2],
-                              (double)rawLine[left + xi - 1],
-                              (double)rawLine[left + xi],
-                              (double)rawLine[left + xi + 1],
-                              (double)rawLine[left + xi + 2])
-                        : 0.0;
-                    sharp[xi] = coveringCycleMedoid(boxcar, xi, lastStart,
-                                                    haveMoving, moving);
-                }
-                const std::vector<LurchStepRun> corrRuns =
-                    corroborateLurchEdges(line);
-                applyLurchSteps(corrRuns, boxcar, width - 3,
-                                width, 1.0, sharp, nullptr);
-            }
-
         }
         lockedLumaCacheValid = true;
     }
@@ -1229,7 +1175,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         if (!lockedSource)
             continue;
 
-        AttributionEvidence *attribution = attributionEvidence_line(line);
+        AttributionFacts *attribution = attributionFacts_line(line);
         lddecode::CarrierAnalysisRecord *carrierAnalysis =
             carrierAnalysis_line(line);
 
@@ -1446,7 +1392,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             }
 
             if (attribution) {
-                AttributionFacts &facts = attribution[rel].facts;
+                AttributionFacts &facts = attribution[rel];
                 facts.bandpassFineIRE = narrowMag;
                 facts.bandpassCoarseIRE = wideMag;
                 facts.lumaExcursionIRE = gA * narrowMag;
@@ -1574,7 +1520,7 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
             const double chromaMagnitude = boundedMag(i4, q4);
             magnitude[rel] = static_cast<float>(chromaMagnitude);
             if (attribution) {
-                AttributionFacts &facts = attribution[rel].facts;
+                AttributionFacts &facts = attribution[rel];
                 facts.locked1DChromaIRE =
                     chromaMagnitude * invIreScale;
             }
@@ -1699,7 +1645,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                         dnReach.relation,
                         upReach.allow && iUp,
                         dnReach.allow && iDn,
-                        0.5, 0.5, 0.5,
                         invIreScale,
                         5.0);
 
@@ -2247,8 +2192,8 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                 continue;
             }
 
-            const AttributionEvidence *attributionRow =
-                attributionEvidence_line(line);
+            const AttributionFacts *attributionRow =
+                attributionFacts_line(line);
             const float *impurityRow = carrierImpurity_line(line);
             const float *sameRegionRow = regionSamePartner_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
@@ -2314,7 +2259,7 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
                 const double verticalMean = vRow[xi];
                 const double impulse = attributionRow
                     ? std::clamp(
-                          attributionRow[xi].facts.lumaImpulseRisk, 0.0, 1.0)
+                          attributionRow[xi].lumaImpulseRisk, 0.0, 1.0)
                     : 0.0;
                 static const int ccImpulseMode = []{
                     const char *s = std::getenv("LDCD_CC_IMPULSE");
@@ -2988,761 +2933,6 @@ bool Comb::FrameBuffer::certifiedDefLine(int line) const
     return c != 0;
 }
 
-void Comb::FrameBuffer::probeCoveredTruth() const
-{
-    static const bool on = []{
-        const char *e = std::getenv("LDCD_PROBE_COVTRUTH");
-        return e && std::atoi(e) != 0;
-    }();
-    if (!on || !frameHasExactCoverage()) return;
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int width     = right - left;
-    if (width <= 16) return;
-
-    long   n[2] = {0, 0};
-    double sDiscVar[2] = {0, 0};
-    long   nDV[2] = {0, 0};
-    double sCombErr[2] = {0, 0}, sCombDot[2] = {0, 0};
-    double sCombEE[2] = {0, 0}, sCombLL[2] = {0, 0};
-    long   nCE[2] = {0, 0};
-    double sLuma[2] = {0, 0}, sCarr[2] = {0, 0};
-    double sVCohC[2] = {0, 0}, sVCohL[2] = {0, 0};
-    long   nVC[2] = {0, 0};
-    double sRatio[2] = {0, 0};
-
-    std::vector<double> Lc(width), Lu(width), Ld(width);
-    auto lineLuma = [&](int line, std::vector<double> &out) -> bool {
-        if (line < firstLine || line >= lastLine) return false;
-        if (!certifiedDefLine(line)) return false;
-        const float *ex = exactCarrierRow(line);
-        if (!ex) return false;
-        const quint16 *raw = rawbuffer.data() +
-            static_cast<size_t>(line) * videoParameters.fieldWidth;
-        for (int xi = 0; xi < width; ++xi) {
-            const double e = (double)ex[left + xi];
-            if (!std::isfinite(e)) return false;
-            out[xi] = (double)raw[left + xi] - e;
-        }
-        return true;
-    };
-
-    for (int line = firstLine + 2; line < lastLine - 2; ++line) {
-        if (!lineLuma(line, Lc)) continue;
-        const bool haveUp = lineLuma(line - 2, Lu);
-        const bool haveDn = lineLuma(line + 2, Ld);
-        const float *ex  = exactCarrierRow(line);
-        const float *exU = haveUp ? exactCarrierRow(line - 2) : nullptr;
-        const float *exD = haveDn ? exactCarrierRow(line + 2) : nullptr;
-
-        for (int xi = 4; xi < width - 4; ++xi) {
-            const int h = left + xi;
-            // Geometry from certified luma only.
-            const double gx = std::fabs(Lc[xi] - Lc[xi - 2]);
-            double gy = 0.0; int ng = 0;
-            if (haveUp) { gy += std::fabs(Lc[xi] - Lu[xi]); ++ng; }
-            if (haveDn) { gy += std::fabs(Lc[xi] - Ld[xi]); ++ng; }
-            if (ng) gy /= ng;
-            const bool vert = (gx * invIreScale > 8.0) &&
-                              (ng == 2) &&
-                              (gy < 0.35 * gx);
-            const int b = vert ? 1 : 0;
-
-            // Luma's fSC-band content: the +-2 bandpass on Ltrue.
-            const double lumaBand = std::fabs(
-                0.5 * Lc[xi] - 0.25 * (Lc[xi - 2] + Lc[xi + 2]))
-                * invIreScale;
-            // True carrier envelope.
-            const double e0 = (double)ex[h], e1 = (double)ex[h + 1];
-            const double carrEnv = std::hypot(e0, e1) * invIreScale;
-
-            ++n[b];
-            sLuma[b] += lumaBand;
-            sCarr[b] += carrEnv;
-            sRatio[b] += (lumaBand > 1e-6)
-                ? std::min(10.0, carrEnv / lumaBand) : 10.0;
-
-            {
-                const double *ccRow = lockedCarrierComposite_line(line);
-                if (ccRow) {
-                    const double ccErr = (ccRow[h] - e0) * invIreScale;
-                    const double lbpS =
-                        (0.5 * Lc[xi] - 0.25 * (Lc[xi - 2] + Lc[xi + 2]))
-                        * invIreScale;
-                    sCombErr[b] += std::fabs(ccErr);
-                    sCombDot[b] += ccErr * lbpS;
-                    sCombEE[b]  += ccErr * ccErr;
-                    sCombLL[b]  += lbpS * lbpS;
-                    ++nCE[b];
-                }
-            }
-            if (haveUp && haveDn) {
-                const double lu2 = 0.5 * Lu[xi] -
-                    0.25 * (Lu[xi - 2] + Lu[xi + 2]);
-                const double ld2 = 0.5 * Ld[xi] -
-                    0.25 * (Ld[xi - 2] + Ld[xi + 2]);
-                const double lc2 = 0.5 * Lc[xi] -
-                    0.25 * (Lc[xi - 2] + Lc[xi + 2]);
-                sDiscVar[b] += 0.5 *
-                    std::fabs(lc2 - 0.5 * (lu2 + ld2)) * invIreScale;
-                ++nDV[b];
-            }
-
-            // Vertical coherence across the certified +-2 bracket.
-            if (exU && exD) {
-                const double u0 = (double)exU[h], d0 = (double)exD[h];
-                if (std::isfinite(u0) && std::isfinite(d0)) {
-                    const double mid = 0.5 * (u0 + d0);
-                    const double den = std::fabs(e0) + std::fabs(mid);
-                    if (den * invIreScale > 0.5) {
-                        sVCohC[b] += (e0 * mid >= 0.0 ? 1.0 : -1.0) *
-                            std::min(std::fabs(e0), std::fabs(mid)) /
-                            std::max(std::fabs(e0), std::fabs(mid));
-                        // Luma fSC-band, same test.
-                        const double lu = 0.5 * Lu[xi] -
-                            0.25 * (Lu[xi - 2] + Lu[xi + 2]);
-                        const double ld = 0.5 * Ld[xi] -
-                            0.25 * (Ld[xi - 2] + Ld[xi + 2]);
-                        const double lc = 0.5 * Lc[xi] -
-                            0.25 * (Lc[xi - 2] + Lc[xi + 2]);
-                        const double lmid = 0.5 * (lu + ld);
-                        const double lden = std::fabs(lc) + std::fabs(lmid);
-                        if (lden * invIreScale > 0.5) {
-                            sVCohL[b] += (lc * lmid >= 0.0 ? 1.0 : -1.0) *
-                                std::min(std::fabs(lc), std::fabs(lmid)) /
-                                std::max(std::fabs(lc), std::fabs(lmid));
-                            ++nVC[b];
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for (int b = 0; b < 2; ++b) {
-        if (!n[b]) continue;
-        const double inv = 1.0 / (double)n[b];
-        const double invV = nVC[b] ? 1.0 / (double)nVC[b] : 0.0;
-        qInfo().noquote() << QString::asprintf(
-            "COVTRUTH %s n=%7ld  luma-in-band %6.3f IRE  carrier %6.3f IRE  "
-            "carr/luma %5.2f  vCoh carrier %+5.3f  vCoh lumaBand %+5.3f  "
-            "(nVC %ld)",
-            b ? "VERT " : "other", n[b], sLuma[b] * inv, sCarr[b] * inv,
-            sRatio[b] * inv, sVCohC[b] * invV, sVCohL[b] * invV, nVC[b]);
-        if (nCE[b]) {
-            const double invC = 1.0 / (double)nCE[b];
-            const double den = std::sqrt(sCombEE[b] * sCombLL[b]);
-            qInfo().noquote() << QString::asprintf(
-                "COMBTRIAL %s combErr %6.3f IRE  r(combErr, lumaLeak) %+5.3f"
-                "  discOwnVar %6.3f IRE (n %ld)",
-                b ? "VERT " : "other", sCombErr[b] * invC,
-                den > 1e-12 ? sCombDot[b] / den : 0.0,
-                nDV[b] ? sDiscVar[b] / (double)nDV[b] : 0.0, nDV[b]);
-        }
-    }
-}
-void Comb::FrameBuffer::probeCompactSpans() const
-{
-    static const int level = []{
-        const char *e = std::getenv("LDCD_PROBE_SPAN");
-        return e ? std::atoi(e) : 0;
-    }();
-    if (level < 1) return;
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int width     = right - left;
-    if (width <= 16) return;
-
-    constexpr double kStrongIRE = 6.0;
-    constexpr int    kSpanMax   = 3;    // "below 4 pixels in length"
-
-    long spans = 0, spansCert = 0;
-
-    constexpr int kNB = 4;
-    auto bucketOf = [](int L) {
-        return L <= 3 ? 0 : L <= 7 ? 1 : L <= 15 ? 2 : 3;
-    };
-    long   covRuns[kNB] = {0}, covPx[kNB] = {0};
-    long   covHit[7][kNB] = {{0}}, covFrag[7][kNB] = {{0}};
-    double covRatio[7][kNB] = {{0}};
-
-    std::vector<double> env(width), parSpread, envPar;
-    std::vector<std::complex<double>> Zc, Zt;
-    for (int line = firstLine; line < lastLine; ++line) {
-        const double *bpn   = locked1DRawBandpass_line(line);
-        const double *wLaw2 = bandWLaw_line(line);
-        const double *keep2 = bandKeep_line(line, 2);
-        const double *keep1 = bandKeep_line(line, 1);
-        const float  *parI  = parallaxI_line(line);
-        const float  *parQ  = parallaxQ_line(line);
-        if (!bpn || !wLaw2 || !keep2 || !keep1 || !parI || !parQ)
-            continue;
-        // Signed-IQ demod of the band content, this line's own grammar.
-        auto cur = lddecode::carrierGrammarSignedSampleCursor(
-            configuration.phaseCompensation ? carrierGrammarLine(line)
-                                            : nullptr, left);
-        Zc.assign(width, {0.0, 0.0});
-        for (int xi = 0; xi < width; ++xi)
-            Zc[xi] = lddecode::carrierGrammarDemodSignedCompositeTo4fsc(
-                cur, bpn[xi]);
-        for (int xi = 0; xi < width; ++xi)
-            env[xi] = std::hypot(bpn[xi],
-                                 bpn[std::min(xi + 1, width - 1)]) *
-                      invIreScale;
-
-        const double *ap = lockedApertureMean_line(line);
-        parSpread.assign(width, -1.0);
-        envPar.assign(width, 0.0);
-        for (int x = 0; x < width; ++x) {
-            envPar[x] = std::hypot((double)parI[x], (double)parQ[x]) *
-                        invIreScale;
-            if (ap && demodWidth == width) {
-                double lo = 1e18, hi = -1e18; int nv = 0;
-                for (int v = std::max(0, x - 3);
-                     v <= std::min(x, width - 4); ++v) {
-                    lo = std::min(lo, ap[v]);
-                    hi = std::max(hi, ap[v]); ++nv;
-                }
-                if (nv >= 2) parSpread[x] = (hi - lo) * invIreScale;
-            }
-        }
-
-        const bool cert = certifiedDefLine(line);
-        const float *ex = cert ? exactCarrierRow(line) : nullptr;
-
-        if (ex) {
-            auto bpTAt = [&](int h) -> double {
-                const int hm = std::max(left, h - 2);
-                const int hp = std::min(right - 1, h + 2);
-                const double a = ex[h], m = ex[hm], p = ex[hp];
-                if (!std::isfinite(a) || !std::isfinite(m) ||
-                    !std::isfinite(p))
-                    return (double)NAN;
-                return 0.5 * a - 0.25 * (m + p);
-            };
-            auto curT = lddecode::carrierGrammarSignedSampleCursor(
-                configuration.phaseCompensation ? carrierGrammarLine(line)
-                                                : nullptr, left);
-            Zt.assign(width, {(double)NAN, (double)NAN});
-            for (int xi = 0; xi < width; ++xi) {
-                const double v = bpTAt(left + xi);
-                const auto z =
-                    lddecode::carrierGrammarDemodSignedCompositeTo4fsc(
-                        curT, std::isfinite(v) ? v : 0.0);
-                if (std::isfinite(v)) Zt[xi] = z;
-            }
-        }
-
-        if (level >= 3 && ex) {
-            const float *fit = carrierFit_line(line);
-            auto notch1At = [&](int xi, int x1) {
-                return std::hypot(bpn[xi] * wLaw2[xi] * keep1[xi],
-                                  bpn[x1] * wLaw2[x1] * keep1[x1]) *
-                       invIreScale;
-            };
-            auto claimAt = [&](int s, int xi) -> double {
-                const int x1 = std::min(xi + 1, width - 1);
-                switch (s) {
-                case 0:   // fit
-                    if (!fit) return 0.0;
-                    return std::hypot((double)fit[xi], (double)fit[x1]) *
-                           invIreScale;
-                case 1:   // notch +/-2, shipping product
-                    return std::hypot(bpn[xi] * wLaw2[xi] * keep2[xi],
-                                      bpn[x1] * wLaw2[x1] * keep2[x1]) *
-                           invIreScale;
-                case 3:   // notch +/-1, shipping product
-                    return notch1At(xi, x1);
-                case 4:   // parallax-unwound band estimate
-                    return envPar[xi];
-                case 5:   // agreement of the independent witnesses
-                    return std::min(envPar[xi], notch1At(xi, x1));
-                case 6:   // shape law alone: band x wLaw, no testimony
-                    return std::hypot(bpn[xi] * wLaw2[xi],
-                                      bpn[x1] * wLaw2[x1]) * invIreScale;
-                default:  // raw band envelope (the 1D/locator space)
-                    return env[xi];
-                }
-            };
-            int ts = -1;
-            for (int xi = 0; xi <= width; ++xi) {
-                double envT = 0.0;
-                if (xi < width) {
-                    const float ea = ex[left + xi];
-                    const float eb = ex[left + std::min(xi + 1, width - 1)];
-                    if (std::isfinite(ea) && std::isfinite(eb))
-                        envT = std::hypot((double)ea, (double)eb) *
-                               invIreScale;
-                }
-                const bool in = (xi < width) && envT >= kStrongIRE;
-                if (in) { if (ts < 0) ts = xi; continue; }
-                if (ts < 0) continue;
-                const int trs = ts, tre = xi;
-                ts = -1;
-                const int Lt = tre - trs;
-                if (Lt < 2 || Lt > 31) continue;
-                const int b = bucketOf(Lt);
-                ++covRuns[b]; covPx[b] += Lt;
-                for (int s = 0; s < 7; ++s) {
-                    bool prevIn = false;
-                    for (int k = trs; k < tre; ++k) {
-                        const double c = claimAt(s, k);
-                        const float ea = ex[left + k];
-                        const float eb =
-                            ex[left + std::min(k + 1, width - 1)];
-                        const double t =
-                            std::hypot((double)ea, (double)eb) *
-                            invIreScale;
-                        if (t > 1e-9) covRatio[s][b] += c / t;
-                        const bool on = c >= kStrongIRE;
-                        if (on) {
-                            ++covHit[s][b];
-                            if (!prevIn) ++covFrag[s][b];
-                        }
-                        prevIn = on;
-                    }
-                }
-            }
-        }
-
-        int runStart = -1;
-        for (int xi = 0; xi <= width; ++xi) {
-            const bool in = (xi < width) && env[xi] >= kStrongIRE;
-            if (in) { if (runStart < 0) runStart = xi; continue; }
-            if (runStart < 0) continue;
-            const int rs = runStart, re = xi;
-            runStart = -1;
-            const int L = re - rs;
-            if (L > kSpanMax) continue;
-            ++spans;
-            if (!ex) continue;
-
-            if (rs < 3 || re + 3 > width) continue;
-
-            double te = 0.0, teMax = 0.0; int n = 0; bool finite = true;
-            for (int k = rs; k < re; ++k) {
-                const int h = left + k;
-                const float ea = ex[h];
-                const float eb = ex[std::min(h + 1, right - 1)];
-                if (!std::isfinite(ea) || !std::isfinite(eb)) {
-                    finite = false; break;
-                }
-                const double t =
-                    std::hypot((double)ea, (double)eb) * invIreScale;
-                te += t; teMax = std::max(teMax, t); ++n;
-            }
-            if (!finite || n == 0) continue;
-            ++spansCert;
-
-            double parRatio = -1.0;
-            {
-                double s = 0.0; int m = 0;
-                for (int k = rs; k < re; ++k)
-                    if (parSpread[k] >= 0.0 && env[k] > 1e-9) {
-                        s += parSpread[k] / env[k]; ++m;
-                    }
-                if (m) parRatio = s / m;
-            }
-
-            if (level >= 2) {
-                char row[512];
-                int p = std::snprintf(row, sizeof row,
-                    "SPANW %.3f %.3f %d %.3f", te / n, teMax, L, parRatio);
-                for (int k = rs - 3;
-                     k < re + 3 && p < (int)sizeof row - 48; ++k)
-                    p += std::snprintf(row + p, sizeof row - p,
-                        " %.2f %.2f %.2f %.2f",
-                        Zc[k].real() * invIreScale,
-                        Zc[k].imag() * invIreScale,
-                        Zt[k].real() * invIreScale,
-                        Zt[k].imag() * invIreScale);
-                std::fprintf(stderr, "%s\n", row);
-            }
-        }
-    }
-    if (spansCert)
-        qInfo().noquote() << QString::asprintf(
-            "SPANCENSUS seq %d  spans<4 %ld  certified-graded %ld",
-            (int)heldSeq1, spans, spansCert);
-    if (level >= 3) {
-        for (int b = 0; b < kNB; ++b) {
-            if (!covRuns[b]) continue;
-            std::fprintf(stderr,
-                "SPANCOV %d %d %ld %ld  %ld %ld %ld %ld %ld %ld %ld"
-                "  %ld %ld %ld %ld %ld %ld %ld"
-                "  %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                (int)heldSeq1, b, covRuns[b], covPx[b],
-                covHit[0][b], covHit[1][b], covHit[2][b], covHit[3][b],
-                covHit[4][b], covHit[5][b], covHit[6][b],
-                covFrag[0][b], covFrag[1][b], covFrag[2][b], covFrag[3][b],
-                covFrag[4][b], covFrag[5][b], covFrag[6][b],
-                covRatio[0][b] / covPx[b], covRatio[1][b] / covPx[b],
-                covRatio[2][b] / covPx[b], covRatio[3][b] / covPx[b],
-                covRatio[4][b] / covPx[b], covRatio[5][b] / covPx[b],
-                covRatio[6][b] / covPx[b]);
-        }
-    }
-}
-
-void Comb::FrameBuffer::probeCompactSites() const
-{
-    static const bool on = []{
-        const char *e = std::getenv("LDCD_PROBE_COMPACT");
-        return e && std::atoi(e) != 0;
-    }();
-    if (!on || !frameHasExactCoverage()) return;
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    const int wlim      = right - left;
-    if (wlim <= 16) return;
-
-        constexpr double kStrongIRE = 6.0;
-        constexpr int    kCompactMax = 8;
-        constexpr int    kCompactMin = 2;
-        long   nC = 0;
-        double sF = 0.0, sN = 0.0, sB = 0.0;
-        double sFF = 0.0, sNN = 0.0, sFN = 0.0, mF = 0.0, mN = 0.0;
-        std::vector<double> envc;
-        for (int line = firstLine; line < lastLine; ++line) {
-            if (!certifiedDefLine(line)) continue;
-            const float  *ex  = exactCarrierRow(line);
-            const float  *fit = carrierFit_line(line);
-            const double *bp  = locked1DRawBandpass_line(line);
-            if (!ex || !bp || !fit) continue;
-            envc.assign(wlim, 0.0);
-            for (int xi = 0; xi < wlim; ++xi) {
-                const double a = (double)ex[left + xi];
-                const double b = (double)ex[left + std::min(xi + 1, wlim - 1)];
-                envc[xi] = (std::isfinite(a) && std::isfinite(b))
-                    ? std::hypot(a, b) * invIreScale : 0.0;
-            }
-            int xi = 0;
-            while (xi < wlim) {
-                if (envc[xi] < kStrongIRE) { ++xi; continue; }
-                int j = xi;
-                while (j < wlim && envc[j] >= kStrongIRE) ++j;
-                const int len = j - xi;
-                if (len >= kCompactMin && len <= kCompactMax) {
-                    for (int k = xi; k < j; ++k) {
-                        const double e = (double)ex[left + k];
-                        if (!std::isfinite(e)) continue;
-                        const double eF = ((double)fit[k] - e) * invIreScale;
-                        const double eN = (bp[k] - e) * invIreScale;
-                        const double eB = 0.5 * (eF + eN);
-                        ++nC;
-                        sF += std::fabs(eF); sN += std::fabs(eN);
-                        sB += std::fabs(eB);
-                        mF += eF; mN += eN;
-                        sFF += eF * eF; sNN += eN * eN; sFN += eF * eN;
-                    }
-                }
-                xi = j;
-            }
-        }
-        if (nC > 100) {
-            const double inv = 1.0 / (double)nC;
-            const double cf = mF * inv, cn = mN * inv;
-            const double vF = sFF * inv - cf * cf;
-            const double vN = sNN * inv - cn * cn;
-            const double cv = sFN * inv - cf * cn;
-            const double r = (vF > 0 && vN > 0)
-                ? cv / std::sqrt(vF * vN) : 0.0;
-            qInfo().noquote() << QString::asprintf(
-                "NOTCHCOMPACT n=%ld  |fit err| %.3f  |notch err| %.3f  "
-                "|50/50| %.3f  r(fit,notch) %+0.3f", nC, sF * inv, sN * inv,
-                sB * inv, r);
-        }
-}
-
-void Comb::FrameBuffer::probeCarrierBandwidth() const
-{
-    static const bool on = []{
-        const char *e = std::getenv("LDCD_PROBE_CARRIERBW");
-        return e && std::atoi(e) != 0;
-    }();
-    if (!on) return;
-    static const double kStepMinIRE = []{
-        const char *e = std::getenv("LDCD_PROBE_CARRIERBW_STEP");
-        return e ? std::atof(e) : 25.0;
-    }();
-    static const double kFlatIRE = []{
-        const char *e = std::getenv("LDCD_PROBE_CARRIERBW_FLAT");
-        return e ? std::atof(e) : 3.0;
-    }();
-    static const double kContrast = []{
-        const char *e = std::getenv("LDCD_PROBE_CARRIERBW_CONTRAST");
-        return e ? std::atof(e) : 4.0;
-    }();
-
-    constexpr int W    = 8;          // window half-width, lane samples
-    constexpr int M    = 2 * W;      // first-difference length
-    constexpr int NB   = M / 2 + 1;  // reported bins (DC .. lane Nyquist)
-    constexpr int SPAN = M + 1;      // lane samples per window
-    constexpr int FL   = 6;          // plateau length, lane samples
-    constexpr int NANG = 6;          // colour-direction bins over 180 deg
-
-    // Cumulative across the run. Unsynchronised -- run with -t 1.
-    static double accP[2][NB] = {};      // per lane, step-normalised power
-    static double accBlank[NB] = {};     // blank power, absolute IRE^2
-    static double accInv[2] = {};        // sum 1/step^2 over accepted edges
-    static long   accN[2] = {};
-    static long   accNBlank = 0;
-    static double accAngP[NANG][NB] = {};
-    static double accAngInv[NANG] = {};
-    static long   accAngN[NANG] = {};
-    static double accAx[2][NB] = {};
-    static double accAxInv[2] = {};
-    static long   accAxN[2] = {};
-    static long   accTheta[12] = {};     // burst angle histogram, 30 deg bins
-    static double accTheta90 = 0.0;      // mean of theta folded to [0,90)
-    static long   accTheta90N = 0;
-    static long dLines = 0, dWin = 0, dNaN = 0, dFlat = 0, dStep = 0;
-    static double dFlatSeen = 0.0, dStepSeen = 0.0;
-    static long dFlatN = 0, dStepN = 0;
-    static const double kHist[6] = { 5, 10, 15, 20, 25, 35 };
-    static long dHist[6] = {};
-
-    const int firstLine = videoParameters.firstActiveFrameLine;
-    const int lastLine  = videoParameters.lastActiveFrameLine;
-    const int left      = videoParameters.activeVideoStart;
-    const int right     = videoParameters.activeVideoEnd;
-    if (right - left <= 4 * SPAN || firstLine >= lastLine) return;
-
-    // 16-point DFT basis, built once.
-    static const std::array<std::array<double, M>, NB> cosT = []{
-        std::array<std::array<double, M>, NB> t{};
-        for (int m = 0; m < NB; ++m)
-            for (int k = 0; k < M; ++k)
-                t[m][k] = std::cos(2.0 * M_PI * m * k / M);
-        return t;
-    }();
-    static const std::array<std::array<double, M>, NB> sinT = []{
-        std::array<std::array<double, M>, NB> t{};
-        for (int m = 0; m < NB; ++m)
-            for (int k = 0; k < M; ++k)
-                t[m][k] = std::sin(2.0 * M_PI * m * k / M);
-        return t;
-    }();
-
-    std::vector<double> lane[2];
-    for (int line = firstLine; line < lastLine; ++line) {
-        if (!certifiedDefLine(line)) continue;
-        const float *ex = exactCarrierRow(line);
-        if (!ex) continue;
-        dLines++;
-
-        for (int p = 0; p < 2; ++p) {
-            lane[p].clear();
-            for (int h = left + (((left & 1) == p) ? 0 : 1); h < right; h += 2)
-                lane[p].push_back(std::isfinite(ex[h])
-                    ? (double)ex[h] * (((h >> 1) & 1) ? -1.0 : 1.0) * invIreScale
-                    : std::numeric_limits<double>::quiet_NaN());
-        }
-        const int n = (int)std::min(lane[0].size(), lane[1].size());
-        if (n < SPAN) continue;
-
-        int bLabel = -1;
-        {
-            static const double cB[4] = { 1, 0, -1, 0 };
-            static const double sB[4] = { 0, 1, 0, -1 };
-            const int b0 = std::clamp(videoParameters.colourBurstStart, 0,
-                                      videoParameters.fieldWidth);
-            const int b1 = std::clamp(videoParameters.colourBurstEnd, 0,
-                                      videoParameters.fieldWidth);
-            const int cyc = (b1 - b0) / 4;
-            if (cyc >= 2) {
-                const quint16 *rawLine =
-                    rawbuffer.data() + (size_t)line * videoParameters.fieldWidth;
-                double bI = 0.0, bQ = 0.0;
-                for (int h = b0; h < b0 + 4 * cyc; ++h) {
-                    bI += (double)rawLine[h] * cB[h & 3];
-                    bQ += (double)rawLine[h] * sB[h & 3];
-                }
-                if (bI != 0.0 || bQ != 0.0) {
-                    double th = std::atan2(bQ, bI) * 180.0 / M_PI;
-                    if (th < 0.0) th += 360.0;
-                    accTheta[std::clamp((int)(th / 30.0), 0, 11)]++;
-                    double f90 = std::fmod(th, 90.0);
-                    accTheta90 += f90; accTheta90N++;
-                    // Nearer lane A's axis (0 deg) or lane B's (90 deg),
-                    // modulo 180 since an axis has no sign.
-                    const double f180 = std::fmod(th, 180.0);
-                    bLabel = (f180 < 45.0 || f180 >= 135.0) ? 0 : 1;
-                }
-            }
-        }
-
-        for (int k = 0; k + SPAN <= n; ++k) {
-            double step[2] = {0.0, 0.0};
-            bool ok[2] = {false, false};
-            double d[2][M];
-            for (int p = 0; p < 2; ++p) {
-                const double *v = lane[p].data() + k;
-                dWin++;
-                bool finite = true;
-                for (int j = 0; j < SPAN; ++j)
-                    if (!std::isfinite(v[j])) { finite = false; break; }
-                if (!finite) { dNaN++; continue; }
-                // Plateaus: first FL and last FL lane samples, flat.
-                double loL = v[0], hiL = v[0], sL = 0.0;
-                double loR = v[SPAN - FL], hiR = v[SPAN - FL], sR = 0.0;
-                for (int j = 0; j < FL; ++j) {
-                    loL = std::min(loL, v[j]); hiL = std::max(hiL, v[j]);
-                    sL += v[j];
-                    const double r = v[SPAN - FL + j];
-                    loR = std::min(loR, r); hiR = std::max(hiR, r);
-                    sR += r;
-                }
-                const double flatWorst = std::max(hiL - loL, hiR - loR);
-                dFlatSeen += flatWorst; dFlatN++;
-                const double st = (sR - sL) / FL;
-                dStepSeen += std::fabs(st); dStepN++;
-                if (flatWorst > kFlatIRE) { dFlat++; continue; }
-                for (int b = 0; b < 6; ++b)
-                    if (std::fabs(st) >= kHist[b]) dHist[b]++;
-                if (std::fabs(st) < kStepMinIRE ||
-                    std::fabs(st) < kContrast * flatWorst) { dStep++; continue; }
-                for (int j = 0; j < M; ++j) d[p][j] = (v[j + 1] - v[j]) / st;
-                step[p] = st; ok[p] = true;
-            }
-            for (int p = 0; p < 2; ++p) {
-                if (!ok[p]) continue;
-                // PAR when this lane is the one nearer the burst axis.
-                const int ax = (bLabel < 0) ? -1 : ((p == bLabel) ? 0 : 1);
-                for (int m = 0; m < NB; ++m) {
-                    double re = 0.0, im = 0.0;
-                    for (int j = 0; j < M; ++j) {
-                        re += d[p][j] * cosT[m][j];
-                        im -= d[p][j] * sinT[m][j];
-                    }
-                    const double pw = re * re + im * im;
-                    accP[p][m] += pw;
-                    if (ax >= 0) accAx[ax][m] += pw;
-                }
-                accInv[p] += 1.0 / (step[p] * step[p]);
-                accN[p]++;
-                if (ax >= 0) {
-                    accAxInv[ax] += 1.0 / (step[p] * step[p]);
-                    accAxN[ax]++;
-                }
-            }
-            if (ok[0] && ok[1]) {
-                double a = std::atan2(step[1], step[0]);
-                if (a < 0.0) a += M_PI;                 // direction, not sign
-                int ab = (int)(a / M_PI * NANG);
-                ab = std::clamp(ab, 0, NANG - 1);
-                for (int p = 0; p < 2; ++p) {
-                    for (int m = 0; m < NB; ++m) {
-                        double re = 0.0, im = 0.0;
-                        for (int j = 0; j < M; ++j) {
-                            re += d[p][j] * cosT[m][j];
-                            im -= d[p][j] * sinT[m][j];
-                        }
-                        accAngP[ab][m] += re * re + im * im;
-                    }
-                    accAngInv[ab] += 1.0 / (step[p] * step[p]);
-                    accAngN[ab]++;
-                }
-            }
-            if (ok[0] || ok[1]) k += SPAN - 1;   // keep sites independent
-        }
-
-        for (int p = 0; p < 2; ++p) {
-            for (int k = 0; k + SPAN <= n; k += SPAN) {
-                const double *v = lane[p].data() + k;
-                bool finite = true;
-                double lo = v[0], hi = v[0];
-                for (int j = 0; j < SPAN; ++j) {
-                    if (!std::isfinite(v[j])) { finite = false; break; }
-                    lo = std::min(lo, v[j]); hi = std::max(hi, v[j]);
-                }
-                if (!finite || hi - lo > kFlatIRE) continue;
-                for (int m = 0; m < NB; ++m) {
-                    double re = 0.0, im = 0.0;
-                    for (int j = 0; j < M; ++j) {
-                        const double dv = v[j + 1] - v[j];
-                        re += dv * cosT[m][j];
-                        im -= dv * sinT[m][j];
-                    }
-                    accBlank[m] += re * re + im * im;
-                }
-                accNBlank++;
-            }
-        }
-    }
-
-    std::fprintf(stderr,
-        "[CARRIERBW] frame %d  certified lines %ld  windows %ld  ->"
-        " NaN %ld  flat %ld  step %ld  accepted %ld/%ld  blanks %ld\n"
-        "            mean worst-plateau spread %.1f IRE   mean |step|"
-        " %.1f IRE\n",
-        (int)heldSeq1, dLines, dWin, dNaN, dFlat, dStep,
-        accN[0], accN[1], accNBlank,
-        dFlatN ? dFlatSeen / dFlatN : 0.0, dStepN ? dStepSeen / dStepN : 0.0);
-    std::fprintf(stderr, "            flat-window |step| >=");
-    for (int b = 0; b < 6; ++b)
-        std::fprintf(stderr, "  %.0f:%ld", kHist[b], dHist[b]);
-    std::fprintf(stderr, " IRE\n");
-    if (accN[0] + accN[1] == 0) return;
-    const double binMHz = 2.0 * 3.579545 / M;   // lane rate is 2fSC
-    auto report = [&](const char *tag, const double *P, double inv, long nn) {
-        if (nn <= 0) return;
-        char buf[512]; int o = 0;
-        o += std::snprintf(buf + o, sizeof(buf) - o, "  %-10s", tag);
-        for (int m = 0; m < NB - 2; ++m) {
-            const double floorM = accNBlank
-                ? accBlank[m] / accNBlank * (inv / nn) : 0.0;
-            o += std::snprintf(buf + o, sizeof(buf) - o, "%7.3f",
-                               P[m] / nn - floorM);
-        }
-        std::fprintf(stderr, "%s   n=%ld\n", buf, nn);
-    };
-    std::fprintf(stderr,
-        "[CARRIERBW] frame %d  step>=%.0f IRE  flat<=%.1f IRE"
-        "  blanks=%ld\n            bin MHz ", (int)heldSeq1,
-        kStepMinIRE, kFlatIRE, accNBlank);
-    for (int m = 0; m < NB - 2; ++m)
-        std::fprintf(stderr, "%7.2f", m * binMHz);
-    std::fprintf(stderr, "\n");
-    report("lane A", accP[0], accInv[0], accN[0]);
-    report("lane B", accP[1], accInv[1], accN[1]);
-    // Burst-relative axes. If these are no more separated than lane A/B,
-    // the sequence never swapped the axes between lanes.
-    report("burst PAR", accAx[0], accAxInv[0], accAxN[0]);
-    report("burst PERP", accAx[1], accAxInv[1], accAxN[1]);
-    if (accTheta90N) {
-        std::fprintf(stderr,
-            "            burst angle in lane basis: mean %.1f deg mod 90"
-            "   histogram/30deg:", accTheta90 / accTheta90N);
-        for (int b = 0; b < 12; ++b)
-            std::fprintf(stderr, " %ld", accTheta[b]);
-        std::fprintf(stderr, "\n");
-    }
-    for (int a = 0; a < NANG; ++a)
-        if (accAngN[a] > 0) {
-            char t[24];
-            std::snprintf(t, sizeof(t), "dir %d-%d", a * 180 / NANG,
-                          (a + 1) * 180 / NANG);
-            report(t, accAngP[a], accAngInv[a], accAngN[a]);
-        }
-    std::fprintf(stderr,
-        "  ref 2.49MHz 0.982  0.885  0.649  0.337  0.103\n"
-        "  ref 1.50MHz 0.944  0.764  0.472  0.196  0.046   <- encoder law\n"
-        "  ref 1.16MHz 0.904  0.648  0.325  0.100  0.016\n"
-        "  ref 0.93MHz 0.853  0.513  0.193  0.041  0.004\n"
-        "  ref 0.72MHz 0.773  0.338  0.074  0.007  0.000\n"
-        "  ref 0.55MHz 0.653  0.157  0.013  0.000  0.000\n"
-        "  ref 0.41MHz 0.495  0.042  0.001  0.000  0.000\n"
-        "            (rows start at the 0.45 MHz bin; DC is the self-check)\n");
-}
-
 double Comb::FrameBuffer::starSignatureAt(const quint16 *rawLine, int h,
                                           double *flankOut,
                                           double *flankLOut,
@@ -4219,12 +3409,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
 
     if (!anchorCeilingValid) buildAnchorCeiling();
 
-    // TEMPORARY INSTRUMENT (LDCD_PROBE_CARRIERBW=1), off by default.
-    probeCarrierBandwidth();
-    probeCompactSites();
-    probeCompactSpans();
-    probeCoveredTruth();
-
     static const bool electBypass = []{
         const char *s = std::getenv("LDCD_ELECT_BYPASS");
         return s && std::atoi(s) != 0;
@@ -4445,10 +3629,8 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             // Whichever platform is active, isolated: the head alone, with
             // nothing downstream of it. Grading tap for all three floors.
             const double *plat = nullptr;
-            if (ldcdLumaSolveEnabled() && !lockedLumaSolved_flat.empty())
+            if (!lockedLumaSolved_flat.empty())
                 plat = lockedLumaSolved_line(line);
-            else if (!lockedLumaSharp_flat.empty())
-                plat = lockedLumaSharp_line(line);
             else if (!lockedLumaBaseY4_flat.empty())
                 plat = lockedLumaBaseY4_line(line);
             for (int h = left; h < right; ++h)
@@ -4532,26 +3714,11 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             for (int h = left; h < right; ++h)
                 Y[h] = (double)rawLine[h] - (double)certExactRow[h];
         } else if (carrierComp) {
-            // The produceY floor follows the ALLOCATION, not the lsc flag.
-            //
-            // lsc's only effect in the tree was this line -- it swapped the
-            // floor from the block-mean baseY4 to the solved platform. But
-            // main.cpp derives lumaWitness = (rcy || lsc), so asking for the
-            // better floor also switched the whole witness machinery on. The
-            // two are unrelated: one is which luma the reconstruction stands
-            // on, the other is a candidate roster. Following the allocation
-            // separates them, so the floor can be graded on its own.
-            //
-            // Three floors, graded one at a time. The platform solve supplants
-            // both of the others when it is gated on; with it off, lsc and
-            // baseY4 behave exactly as they always did.
-            const bool useSolved =
-                ldcdLumaSolveEnabled() && !lockedLumaSolved_flat.empty();
-            const bool useSharpCoarse =
-                configuration.yElection.lsc && !lockedLumaSharp_flat.empty();
+            // The solved platform is the production floor. The block mean is
+            // retained only as the no-solve fallback.
+            const bool useSolved = !lockedLumaSolved_flat.empty();
             auto coarseFloor_line = [&](int l) -> const double * {
                 if (useSolved)       return lockedLumaSolved_line(l);
-                if (useSharpCoarse)  return lockedLumaSharp_line(l);
                 return lockedLumaBaseY4_line(l);
             };
             const double *coarseRow =
@@ -4596,7 +3763,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
             const float *alienRow = regionAlienPartner_line(line);
-            const AttributionEvidence *attribRow = attributionEvidence_line(line);
+            const AttributionFacts *attribRow = attributionFacts_line(line);
             static const int retractedAdmitMode = []{
                 const char *s = std::getenv("LD_RETRACTED_ADMIT");
                 if (!s) return 0;              // 0 = spatial (default)
@@ -5271,25 +4438,6 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     }
                 }
 
-                if (ccReturn > 0.0 && ldcdCcrPostCombCheck()) {
-                    const float *licRow = carrierLicense_line(line);
-                    if (licRow) {
-                        const double lic =
-                            std::clamp((double)licRow[xi], 0.0, 1.0);
-                        const double preC = std::isfinite(clpLine[h])
-                            ? std::fabs(clpLine[h]) : 0.0;
-                        const double postC = (carrierComp &&
-                                              std::isfinite(carrierComp[xi]))
-                            ? std::fabs(carrierComp[xi]) : preC;
-                        const double lumaE = (1.0 - lic) * preC;
-                        const double removed = std::max(0.0, preC - postC);
-                        const double remaining = (lumaE > 1e-9)
-                            ? std::clamp(1.0 - removed / lumaE, 0.0, 1.0)
-                            : 0.0;
-                        ccReturn *= remaining;
-                    }
-                }
-
                 if (ccReturn > 0.0 && !ccAuditW_flat.empty() &&
                     ccAuditNX > 0) {
                     const double ry = std::clamp(
@@ -5609,7 +4757,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                           (double)analysisRow[xi].conformanceSupportFraction)
                     : 0.0;
                 const double impulseT = attribRow
-                    ? std::clamp(attribRow[xi].facts.lumaImpulseRisk, 0.0, 1.0)
+                    ? std::clamp(attribRow[xi].lumaImpulseRisk, 0.0, 1.0)
                     : 0.0;
                 const double chromaT = std::clamp(
                     (combRemainMag0 * invIreScale -
@@ -5950,233 +5098,7 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                 const bool haveLic = icebergReturnWeight_flat.size() >=
                     (size_t)rLast * demodWidth;
                 std::lock_guard<std::mutex> lk(cMtx);
-                // TEMPORARY (strip when the question closes): where does
-                // schedule non-conformity actually SIT, for false colour
-                // versus real? This block runs under --dg-discard, where
-                // covered frames do not exist -- so CCR is active on every
-                // frame -- and truth comes from the bank, taken from the
-                // covered version of the same fields. That is the only place
-                // the two coexist, and it is what makes these two constants
-                // derivable rather than guessed.
-                //
-                // True carrier = raw - banked truth Y, a conservation fact.
-                if (ldcdCcrConfCensusEnabled()) {
-                    static std::atomic<long long> fn[2] = {};
-                    static std::atomic<long long> fs[2] = {};
-                    static std::atomic<long long> fq[2][6] = {};
-                    static std::atomic<bool> fdone{false};
-                    const quint16 *rw0 = rawbuffer.data();
-                    for (int line = rFirst; line < rLast; ++line) {
-                        const int li = line - rFirst;
-                        if (!R.df[li]) continue;
-                        const int lnN = (line - 2 >= rFirst) ? line - 2
-                                      : (line + 2 <  rLast) ? line + 2 : -1;
-                        if (lnN < 0) continue;
-                        const lddecode::CarrierGrammarState *g0 =
-                            carrierGrammarLine(line);
-                        const lddecode::CarrierGrammarState *gN =
-                            carrierGrammarLine(lnN);
-                        const double *o0 = locked1DSource_line(line);
-                        const double *oN = locked1DSource_line(lnN);
-                        if (!g0 || !gN || !o0 || !oN) continue;
-                        const float *tr = R.ty.data() + (size_t)li * rWidth;
-                        const quint16 *rw =
-                            rw0 + (size_t)line * videoParameters.fieldWidth;
-                        for (int x = 8; x < rWidth - 8; ++x) {
-                            if (!std::isfinite(tr[x])) continue;
-                            if (!std::isfinite(o0[x]) || !std::isfinite(oN[x]))
-                                continue;
-                            const int h = rLeft + x;
-                            const lddecode::CarrierPhaseRelation rel =
-                                lddecode::carrierGrammarSignedPhaseRelation(
-                                    g0, h, gN, h);
-                            if (rel != lddecode::CarrierPhaseRelation::Same &&
-                                rel != lddecode::CarrierPhaseRelation::Opposite)
-                                continue;
-                            const double sgn =
-                                (rel == lddecode::CarrierPhaseRelation::Opposite)
-                                    ? 1.0 : -1.0;
-                            // RELATIVE non-conformity. The bare fold residual
-                            // scales with amplitude -- a large legal carrier
-                            // with any envelope motion leaves a large one --
-                            // so it is an amplitude proxy, not a schedule
-                            // test. Dividing by the local carrier magnitude
-                            // asks the actual question: what FRACTION of this
-                            // energy failed the relation it would have to obey
-                            // to be carrier.
-                            const double mag = std::max(std::fabs(o0[x]),
-                                                        std::fabs(oN[x]));
-                            const double nonConf = (mag > 1e-9)
-                                ? std::fabs(o0[x] + sgn * oN[x]) / mag : 0.0;
-                            const double trueC =
-                                std::fabs((double)rw[h] - (double)tr[x]) / irescale;
-                            const int g = (trueC < 2.0) ? 0
-                                        : (trueC > 10.0) ? 1 : -1;
-                            if (g < 0) continue;
-                            // What does each estimator CLAIM here, against a
-                            // truth of ~0 in the false zone? A carrier reading
-                            // that is independent of this defect must read
-                            // near zero where the conservation fact says there
-                            // is no carrier. One that shares 1D's blind spot
-                            // will claim the lattice just as 1D does.
-                            {
-                                const double *plat2 =
-                                    lockedLumaSolved_flat.empty()
-                                        ? nullptr : lockedLumaSolved_line(line);
-                                const double *ln2 = residLaneN_line(line);
-                                const float *lc2 = carrierLicense_line(line);
-                                if (plat2 && ln2 && lc2) {
-                                    static std::atomic<long long> cn2[2] = {};
-                                    static std::atomic<long long> c1d[2] = {};
-                                    static std::atomic<long long> cin[2] = {};
-                                    static std::atomic<long long> clc[2] = {};
-                                    static std::atomic<long long> cim[2] = {};
-                                    static std::atomic<long long> clh[2][5] = {};
-                                    static std::atomic<bool> cd2{false};
-                                    const double oneDmag =
-                                        std::fabs(o0[x]) / irescale;
-                                    const double indMag =
-                                        std::fabs((double)rw[h] - plat2[x] - ln2[x])
-                                        / irescale;
-                                    // Does parallax actually separate the two
-                                    // zones? If the licence reads the same on
-                                    // false colour as on real, masking the
-                                    // independent by it cannot discriminate,
-                                    // whatever it does to the level.
-                                    const double L =
-                                        std::clamp((double)lc2[x], 0.0, 1.0);
-                                    cn2[g].fetch_add(1, std::memory_order_relaxed);
-                                    c1d[g].fetch_add(
-                                        (long long)std::llround(oneDmag*1000.0),
-                                        std::memory_order_relaxed);
-                                    cin[g].fetch_add(
-                                        (long long)std::llround(indMag*1000.0),
-                                        std::memory_order_relaxed);
-                                    clc[g].fetch_add(
-                                        (long long)std::llround(L*1000.0),
-                                        std::memory_order_relaxed);
-                                    // A smoothstep saturates at both ends, so
-                                    // equal means do not prove equal
-                                    // distributions. The histogram tells a
-                                    // failed MAPPING from a failed MECHANISM.
-                                    {
-                                        const int lb = (L >= 0.99) ? 4
-                                                     : (L >= 0.75) ? 3
-                                                     : (L >= 0.50) ? 2
-                                                     : (L >= 0.25) ? 1 : 0;
-                                        clh[g][lb].fetch_add(
-                                            1, std::memory_order_relaxed);
-                                    }
-                                    cim[g].fetch_add(
-                                        (long long)std::llround(L*indMag*1000.0),
-                                        std::memory_order_relaxed);
-                                    if (cn2[0].load()+cn2[1].load() > 250000 &&
-                                        !cd2.exchange(true)) {
-                                        for (int gg=0; gg<2; ++gg) {
-                                            const long long N = cn2[gg].load();
-                                            qInfo().noquote() << QString(
-                                              "CCR CLAIM %1: truth~%2 | 1D %3 IRE"
-                                              " | indep %4 IRE | licence %5"
-                                              " | masked indep %6 IRE  (n=%7)")
-                                              .arg(gg? "REAL >10":"FALSE <2")
-                                              .arg(gg? ">10":"~0")
-                                              .arg(N? c1d[gg].load()/(1000.0*N):0.0,0,'f',2)
-                                              .arg(N? cin[gg].load()/(1000.0*N):0.0,0,'f',2)
-                                              .arg(N? clc[gg].load()/(1000.0*N):0.0,0,'f',3)
-                                              .arg(N? cim[gg].load()/(1000.0*N):0.0,0,'f',2)
-                                              .arg(N);
-                                            QString hm = QString("CCR LICENCE %1 dist"
-                                              " [<.25 .25-.5 .5-.75 .75-.99 .99+]:")
-                                              .arg(gg? "REAL >10":"FALSE <2");
-                                            for (int bb = 0; bb < 5; ++bb)
-                                                hm += QString(" %1%%")
-                                                  .arg(N? 100.0*clh[gg][bb].load()/N
-                                                        : 0.0, 0, 'f', 1);
-                                            qInfo().noquote() << hm;
-                                        }
-                                    }
-                                }
-                            }
-                            fn[g].fetch_add(1, std::memory_order_relaxed);
-                            fs[g].fetch_add(
-                                (long long)std::llround(nonConf * 1000.0),
-                                std::memory_order_relaxed);
-                            const int q = (nonConf < 0.10) ? 0 : (nonConf < 0.25) ? 1
-                                        : (nonConf < 0.50) ? 2 : (nonConf < 0.80) ? 3
-                                        : (nonConf < 1.20) ? 4 : 5;
-                            fq[g][q].fetch_add(1, std::memory_order_relaxed);
-                        }
-                    }
-                    if ((fn[0].load() + fn[1].load()) > 200000 &&
-                        !fdone.exchange(true)) {
-                        for (int gg = 0; gg < 2; ++gg) {
-                            const long long N = fn[gg].load();
-                            QString m = QString(
-                                "CCR CONF %1: mean ratio %2  dist [<.10 .10-.25 .25-.50 .50-.80 .80-1.2 1.2+]:")
-                                .arg(gg ? "REAL chroma >10" : "FALSE zone <2 ")
-                                .arg(N ? fs[gg].load()/(1000.0*N) : 0.0, 0, 'f', 2);
-                            for (int q = 0; q < 6; ++q)
-                                m += QString(" %1%%").arg(
-                                    N ? 100.0*fq[gg][q].load()/N : 0.0, 0, 'f', 1);
-                            m += QString("  (n=%1)").arg(N);
-                            qInfo().noquote() << m;
-                        }
-                    }
-                }
 
-                // TEMPORARY (strip when the question closes): CCR vetted
-                // against truth, STRATIFIED BY HOW MUCH COLOUR IS THERE.
-                //
-                // Y is the exact complement of chroma, so a pooled Y error can
-                // improve while colour drains -- the gain banked where there
-                // is no colour, the loss taken where there is. Pooling hides
-                // exactly the defect the eye sees. So bin by the TRUE chroma
-                // magnitude (raw - banked truth Y) and read the error in each
-                // bin: if CCR is over-returning it must show as error rising
-                // in the saturated bins while the flat bins improve.
-                if (ldcdCcrVetEnabled()) {
-                    static std::atomic<long long> cn[5] = {};
-                    static std::atomic<long long> ce[5] = {};
-                    static std::atomic<long long> ctot{0};
-                    const quint16 *rw0 = rawbuffer.data();
-                    for (int line = rFirst; line < rLast; ++line) {
-                        const int li = line - rFirst;
-                        if (!R.df[li]) continue;
-                        const double *Yr = componentFrame->y(line);
-                        const float *tr = R.ty.data() + (size_t)li * rWidth;
-                        const quint16 *rw =
-                            rw0 + (size_t)line * videoParameters.fieldWidth;
-                        for (int x = 8; x < rWidth - 8; ++x) {
-                            if (!std::isfinite(tr[x])) continue;
-                            // True chroma at this sample: raw minus true luma.
-                            const double trueC =
-                                std::fabs((double)rw[rLeft + x] - (double)tr[x])
-                                / irescale;
-                            const double err =
-                                std::fabs(Yr[rLeft + x] - (double)tr[x]) / irescale;
-                            const int b = (trueC < 2.0) ? 0 : (trueC < 5.0) ? 1
-                                        : (trueC < 10.0) ? 2 : (trueC < 20.0) ? 3 : 4;
-                            cn[b].fetch_add(1, std::memory_order_relaxed);
-                            ce[b].fetch_add((long long)std::llround(err * 1000.0),
-                                            std::memory_order_relaxed);
-                            ctot.fetch_add(1, std::memory_order_relaxed);
-                        }
-                    }
-                    if (ctot.load(std::memory_order_relaxed) > 200000) {
-                        static std::atomic<bool> cdone{false};
-                        if (!cdone.exchange(true)) {
-                            QString m = "CCR VET: mean |Y-truth| IRE by TRUE CHROMA "
-                                        "[<2 2-5 5-10 10-20 20+ IRE]:";
-                            for (int b = 0; b < 5; ++b) {
-                                const long long N = cn[b].load();
-                                m += QString(" %1(n=%2)")
-                                        .arg(N ? ce[b].load()/(1000.0*N) : 0.0, 0, 'f', 3)
-                                        .arg(N);
-                            }
-                            qInfo().noquote() << m;
-                        }
-                    }
-                }
 
                 for (int line = rFirst; line < rLast; ++line) {
                     const int li = line - rFirst;
@@ -6669,152 +5591,13 @@ void Comb::FrameBuffer::applyLurchSteps(const std::vector<LurchStepRun> &runs,
     }
 }
 
-void Comb::FrameBuffer::solveLurchYCurve(int line, const double *apMean,
-                                         int meanCount, int width,
-                                         double *yOut)
-{
-    if (!apMean || !yOut || width <= 0 || meanCount <= 0)
-        return;
-
-    const int lastStart = meanCount - 1;
-
-    // The moving coarse is built from raw, so the row is resolved before the
-    // platform rather than after it. The guard's early-out stays BELOW the
-    // platform loop, exactly where it was: a line whose raw is unusable still
-    // leaves the platform filled from the aperture pool alone.
-    const int left      = videoParameters.activeVideoStart;
-    const int fullWidth = videoParameters.fieldWidth;
-    const bool rawOk = (line >= 0 && fullWidth > 0 && left >= 0 &&
-                        (size_t)(line + 1) * fullWidth <= rawbuffer.size());
-    const quint16 *rawLine =
-        rawOk ? rawbuffer.data() + (size_t)line * fullWidth : nullptr;
-    const auto raw = [&](int xi) -> double {
-        return (double)rawLine[left + xi];
-    };
-
-    if ((int)scratch_lurchPlatform.size() < width)
-        scratch_lurchPlatform.resize(width);
-    double *platform = scratch_lurchPlatform.data();
-    for (int xi = 0; xi < width; ++xi) {
-        const bool haveMoving = rawOk && xi >= 2 && xi + 2 < width;
-        const double moving = haveMoving
-            ? centeredCarrierCycle4Mean(raw(xi - 2), raw(xi - 1), raw(xi),
-                                        raw(xi + 1), raw(xi + 2))
-            : 0.0;
-        platform[xi] = coveringCycleMedoid(apMean, xi, lastStart,
-                                           haveMoving, moving);
-        yOut[xi]     = platform[xi];
-    }
-
-    if (!rawOk)
-        return;
-
-    if ((int)scratch_lurchPin.size() < width)
-        scratch_lurchPin.resize(width);
-    double *pin = scratch_lurchPin.data();
-    const float *exRow = lurchPinEnabled() ? exactCarrierRow(line) : nullptr;
-    int pinCount = 0;
-    for (int xi = 0; xi < width; ++xi) {
-        pin[xi] = std::numeric_limits<double>::quiet_NaN();
-        if (!exRow)
-            continue;
-        const float e = exRow[left + xi];
-        if (!std::isfinite(e))
-            continue;
-        pin[xi]  = raw(xi) - (double)e;
-        yOut[xi] = pin[xi];
-        ++pinCount;
-    }
-    if (pinCount >= width)
-        return;                     // fully certified: conservation answered
-
-    constexpr double wA = 1.0;
-    const double wc = std::clamp(
-        8.0 * M_PI * lurchPlatformCutoffMHz() / kSampleRateMHz, 1e-4, M_PI);
-    const double wB = 2.0 * (1.0 - std::cos(wc));
-
-    const int maxChain = (width + 3) / 4 + 1;
-    if ((int)scratch_lurchWork.size() < 2 * maxChain)
-        scratch_lurchWork.resize(2 * maxChain);
-    double *cp = scratch_lurchWork.data();
-    double *dp = cp + maxChain;
-
-    const auto solveChains = [&]() {
-        for (int k = 0; k < 4; ++k) {
-            const int N = (width - k + 3) / 4;
-            if (N < 2)
-                continue;
-            for (int n = 0; n < N; ++n) {
-                const int x = k + 4 * n;
-                double diag, lower, upper, rhs;
-                if (std::isfinite(pin[x])) {
-                    diag = 1.0; lower = 0.0; upper = 0.0; rhs = pin[x];
-                } else {
-                    const bool hasNext = (n <= N - 2);
-                    const bool hasPrev = (n >= 1);
-                    diag  = wB + wA * ((hasNext ? 1.0 : 0.0) +
-                                       (hasPrev ? 1.0 : 0.0));
-                    lower = hasPrev ? -wA : 0.0;
-                    upper = hasNext ? -wA : 0.0;
-                    rhs   = wB * platform[x];
-                    if (hasNext) rhs -= wA * (raw(x + 4) - raw(x));
-                    if (hasPrev) rhs += wA * (raw(x) - raw(x - 4));
-                }
-                // Strictly diagonally dominant (diag = wB + sum|off|, wB > 0),
-                // so Thomas is stable with no pivoting.
-                const double denom = diag - lower * (n ? cp[n - 1] : 0.0);
-                const double inv =
-                    (std::fabs(denom) > 1e-12) ? (1.0 / denom) : 0.0;
-                cp[n] = upper * inv;
-                dp[n] = (rhs - lower * (n ? dp[n - 1] : 0.0)) * inv;
-            }
-            yOut[k + 4 * (N - 1)] = dp[N - 1];
-            for (int n = N - 2; n >= 0; --n)
-                yOut[k + 4 * n] = dp[n] - cp[n] * yOut[k + 4 * (n + 1)];
-        }
-    };
-
-    solveChains();
-
-    const double yLo = (double)videoParameters.black16bIre -  25.0 * irescale;
-    const double yHi = (double)videoParameters.black16bIre + 125.0 * irescale;
-
-    for (int pass = 0; pass < 2; ++pass) {
-        int clamped = 0;
-        for (int xi = 0; xi < width; ++xi) {
-            if (std::isfinite(pin[xi]))
-                continue;
-            double nb[2];
-            int nbCount = 0;
-            if (xi - 2 >= 0)    nb[nbCount++] = raw(xi - 2);
-            if (xi + 2 < width) nb[nbCount++] = raw(xi + 2);
-            const lddecode::FeasibleInterval f =
-                lddecode::lumaFeasibleFromPairSums(raw(xi), nb, nbCount,
-                                                   yLo, yHi);
-            if (!f.valid())
-                continue;
-            const double c = f.clamp(yOut[xi]);
-            if (c != yOut[xi]) {
-                pin[xi] = c;
-                ++clamped;
-            }
-        }
-        if (clamped == 0)
-            break;
-        solveChains();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // THE LUMA PLATFORM SOLVE
 //
 // A third construction, not a variant of either floor above it. baseY4 is a
 // block mean -- one value per four samples, held flat across them -- so luma
-// detail finer than a block cannot survive it at all. lsc's lurch solve reads
-// the same-phase parallax facts, but as four independent stride-4 chains that
-// are tied to one another only through `platform`, which is itself an average
-// of two apertures. This solve answers to every carrier-free fact the line
-// affords, in one banded system, and is intended to supplant both.
+// detail finer than a block cannot survive it at all. This solve answers to
+// every carrier-free fact the line affords in one banded system.
 //
 // FACT FAMILIES
 //
@@ -8823,7 +7606,7 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
     carrierRetractedValid = false;
 
     if (!configuration.phaseCompensation ||
-        !configuration.lumaWitness)
+        !configuration.yElection.rcy)
         return;
 
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -8845,18 +7628,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
     static const bool discreteResidualRepair = []{
         const char *s = std::getenv("LDCD_RETRACTED_DISCRETE_REPAIR");
         return !(s && std::atoi(s) == 0);
-    }();
-    static const int crDiagLine = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_LINE");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int crDiagC0 = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_C0");
-        return s ? std::atoi(s) : -1;
-    }();
-    static const int crDiagC1 = []{
-        const char *s = std::getenv("COARSE_RESID_DIAG_C1");
-        return s ? std::atoi(s) : -1;
     }();
 
     if (width <= 0 || firstLine >= lastLine)
@@ -8886,11 +7657,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
     if (carrierAnalysis_flat.size() < need)
         return; // shared analysis must already have been produced
 
-    const bool dumpDead = std::getenv("LDCD_DUMP_DEADZONE") != nullptr;
-    long long dzActive = 0, dzIneligible = 0;
-    long long dzDead = 0, dzDeadIllegal = 0, dzDeadFitStarved = 0;
-    long long dzWinTotal = 0, dzWinInvalid = 0, dzWinRank = 0, dzWinDet = 0;
-
     if ((int)scratch_preI.size()        < width) scratch_preI.resize(width, 0.0);
     if ((int)scratch_preQ.size()        < width) scratch_preQ.resize(width, 0.0);
     if ((int)scratch_lineWorkA.size()   < width) scratch_lineWorkA.resize(width, 0.0);
@@ -8910,7 +7676,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
     double *refinedY   = scratch_lumaSmooth.data();
     double *slideMean4 = scratch_lateralLine.data();
 
-    std::vector<double> winFloor;
     std::vector<double> winI;
     std::vector<double> winQ;
     std::vector<double> winErrorIRE;
@@ -9023,9 +7788,10 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
 
         for (int xi = 0; xi < width; ++xi) {
             const auto &a = analysisRow[xi];
-            partWeight[xi] = std::min(1.0, 2.0 * lddecode::carrierTrust(
-                static_cast<double>(a.carrierConformance),
-                static_cast<double>(a.conformanceSupportFraction)));
+            partWeight[xi] =
+                a.scheduleConformance ==
+                    lddecode::CarrierScheduleConformance::ScheduleIllegal
+                ? 0.0 : 1.0;
             eligibilityRow[xi] = static_cast<float>(partWeight[xi]);
         }
 
@@ -9051,8 +7817,7 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
 
         if (width >= 4) {
             const int meanCount = width - 3;
-            if ((int)winFloor.size() < meanCount) {
-                winFloor.resize(meanCount, 0.0);
+            if ((int)winI.size() < meanCount) {
                 winI.resize(meanCount, 0.0);
                 winQ.resize(meanCount, 0.0);
                 winErrorIRE.resize(meanCount, 0.0);
@@ -9064,21 +7829,14 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
             if ((int)boundaryMark.size() < width)
                 boundaryMark.resize(width, 0);
 
-            for (int s = 0; s < meanCount; ++s) {
-                winFloor[s] =
-                    0.25 * (rawWhole[s + 0] +
-                            rawWhole[s + 1] +
-                            rawWhole[s + 2] +
-                            rawWhole[s + 3]);
-            }
-
-            for (int xi = 0; xi < width; ++xi) {
-                const int s0 = std::clamp(xi - 2, 0, meanCount - 1);
-                const int s1 = std::clamp(xi - 1, 0, meanCount - 1);
-                refinedY[xi] = 0.5 * (winFloor[s0] + winFloor[s1]);
-            }
-            lurchSharpenCoarsePrior(winFloor.data(), meanCount, width,
-                                    refinedY, nullptr);
+            // These aperture means and the per-sample platform are canonical
+            // products of phaseLocked().  The rcy fit consumes them directly;
+            // rebuilding either analysis here violates compute-once ownership.
+            const double *winFloor = lockedApertureMean_line(line);
+            const double *platform = lockedLumaSolved_line(line);
+            if (!platform)
+                platform = lockedLumaSmooth_line(line);
+            std::copy(platform, platform + width, refinedY);
 
             for (int s = 0; s < meanCount; ++s) {
                 double sII = 0.0, sIQ = 0.0, sQQ = 0.0;
@@ -9137,17 +7895,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                 winI[s] = fitI;
                 winQ[s] = fitQ;
                 winFitValid[s] = fitValid ? std::uint8_t{1} : std::uint8_t{0};
-
-                if (dumpDead) {
-                    ++dzWinTotal;
-                    if (!fitValid) {
-                        ++dzWinInvalid;
-                        if (sampleWeight < 2.5)
-                            ++dzWinRank;   // starved of participating weight
-                        else
-                            ++dzWinDet;    // killed by singular normal matrix
-                    }
-                }
 
                 double errSq = 0.0;
                 double basis01 = 0.0; // +-+-
@@ -9328,19 +8075,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
 
                 evidenceRow[xi].viewCount = viewCount;
 
-                if (dumpDead) {
-                    ++dzActive;
-                    if (partWeight[xi] <= 0.0)
-                        ++dzIneligible;
-                    if (viewCount == 0) {
-                        ++dzDead;
-                        if (partWeight[xi] <= 0.0)
-                            ++dzDeadIllegal;
-                        else
-                            ++dzDeadFitStarved;
-                    }
-                }
-
                 for (int v = 0; v < viewCount; ++v) {
                     auto &dst = evidenceRow[xi].views[v];
                     const auto &src = views[v];
@@ -9516,7 +8250,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                 const double baselineCf = cI * bIxi + cQ * bQxi;
                 double cf = baselineCf;
 
-                bool sharedConstraintApplied = false;
                 double sharedDelta = 0.0;
                 const auto &sharedResidual = analysisRow[xi].residual;
                 const int sharedSurvivors = sharedResidual.survivorCount();
@@ -9575,30 +8308,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                         maxDelta);
                     admitCompositeDelta(cI, cQ, sharedDelta);
                     cf += sharedDelta;
-                    sharedConstraintApplied = sharedDelta != 0.0;
-                }
-
-                if (crDiagLine == line && crDiagC0 >= 0 &&
-                    xi >= crDiagC0 &&
-                    xi <= (crDiagC1 < 0 ? crDiagC0 : crDiagC1))
-                {
-                    std::fprintf(stderr,
-                        "CARRIERRETRACTREPAIR line=%d rel=%d before=%.6f "
-                        "after=%.6f applied=%d deltaIRE=%.6f "
-                        "optionCount=%d survivorCount=%d survivorLo=%.6f "
-                        "survivorHi=%.6f movingCompatible=%d discrete=%d "
-                        "nearest=%.6f nearestDistanceIRE=%.6f\n",
-                        line, xi, baselineCf, cf,
-                        sharedConstraintApplied ? 1 : 0,
-                        sharedDelta * invIreScale,
-                        static_cast<int>(sharedResidual.optionCount),
-                        sharedSurvivors,
-                        sharedResidual.survivorLo,
-                        sharedResidual.survivorHi,
-                        sharedResidual.movingCompatible ? 1 : 0,
-                        discreteResidualRepair ? 1 : 0,
-                        nearestSurvivor,
-                        nearestSurvivorDistance * invIreScale);
                 }
 
                 carrierFit[xi] = cf;
@@ -9718,16 +8427,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
         return 1.0 - (t * t * (3.0 - 2.0 * t));
     };
 
-    static const char *pass2DumpPrefix = std::getenv("LDCD_PASS2_DUMP");
-    constexpr int kP2D = 15;
-    std::vector<float> p2dump;
-    if (pass2DumpPrefix)
-        p2dump.assign(static_cast<size_t>(lastLine - firstLine) * kP2D * width,
-                      0.0f);
-    auto p2rec = [&](int line, int ch, int xi, double v) {
-        p2dump[(static_cast<size_t>(line - firstLine) * kP2D + ch) * width +
-               xi] = static_cast<float>(v);
-    };
     constexpr int kNLegs = 4;
     std::vector<double> legGateScratch[kNLegs];
     for (int k = 0; k < kNLegs; ++k)
@@ -9860,13 +8559,9 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                     w = lddecode::scheduleAlternationLicense(
                         corrNum[xi] / corrDen[xi]);
                 wRow[xi] = static_cast<float>(w);
-                if (pass2DumpPrefix)
-                    p2rec(line, 14, xi, w);
             }
         }
-        auto reachGate = [&](int xi, const FitLeg &leg,
-                             double *lumaGateOut = nullptr,
-                             double *carrGateOut = nullptr) {
+        auto reachGate = [&](int xi, const FitLeg &leg) {
             if (!leg.present)
                 return 0.0;
 
@@ -9892,24 +8587,14 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                 (std::sqrt(c0 * c0 + c1 * c1) +
                  std::sqrt(n0 * n0 + n1 * n1)) * invIreScale;
 
-            double lumaGate = softReachGate(lumaDiffIRE, 3.0, 10.0);
+            const double lumaGate = softReachGate(lumaDiffIRE, 3.0, 10.0);
 
             const double carrierSoftIRE = std::max(3.0, 0.25 * carrierAmpIRE);
             const double carrierHardIRE = std::max(10.0, 0.80 * carrierAmpIRE);
-            double carrierGate =
+            const double carrierGate =
                 softReachGate(carrierMismatchIRE,
                               carrierSoftIRE,
                               carrierHardIRE);
-
-            static const bool carrGateEnabled = []{
-                const char *s = std::getenv("LD_P2_CARRGATE");
-                return !(s && s[0] == '0');
-            }();
-            if (!carrGateEnabled)
-                carrierGate = 1.0;
-
-            if (lumaGateOut) *lumaGateOut = lumaGate;
-            if (carrGateOut) *carrGateOut = carrierGate;
             return lumaGate * carrierGate;
         };
 
@@ -9918,19 +8603,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
         for (int xi = 0; xi < width; ++xi) {
             for (int k = 0; k < kNLegs; ++k)
                 legs[k].wRaw[xi] = reachGate(xi, legs[k]);
-            if (pass2DumpPrefix) {
-                p2rec(line, 0, xi, eligRow[xi]);
-                int mask = 0, count = 0;
-                for (int k = 0; k < kNLegs; ++k) {
-                    if (legs[k].present && legs[k].elig[xi] > 0.5f) {
-                        mask |= 1 << k;
-                        ++count;
-                    }
-                    p2rec(line, 3 + k, xi, legs[k].wRaw[xi]);
-                }
-                p2rec(line, 1, xi, count);
-                p2rec(line, 2, xi, mask);
-            }
         }
 
         // Pass B: inline 5-tap smooth + decision blend + combRow output.
@@ -9947,7 +8619,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
             }
 
             double ownedFallback;
-            double p2corrCode = 4.0;       // dump-only: +4 = unobservable
             {
                 const int w0 = std::clamp(xi - 1, 0, width - 4);
                 double e0 = 0.0;
@@ -9959,7 +8630,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                 const double eFloor = 2.0 * ampFloor * ampFloor;
                 if (e0 < eFloor) {
                     ownedFallback = 1.0;   // harmless confiscation
-                    p2corrCode = 3.0;      // dump-only: +3 = quiet operand
                 } else {
                     double dotSum = 0.0, normSum = 0.0;
                     for (int k = 0; k < kNLegs; ++k) {
@@ -9982,19 +8652,10 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                         const double sc = dotSum / normSum;
                         ownedFallback =
                             lddecode::scheduleAlternationLicense(sc);
-                        p2corrCode = sc;
                     } else {
                         ownedFallback = 0.0;  // loud, unobservable: fail closed
                     }
                 }
-
-                static const double ownershipFloor = []{
-                    const char *s = std::getenv("LDCD_OWNERSHIP_FLOOR");
-                    const double v = s ? std::atof(s) : 0.0;
-                    return std::clamp(v, 0.0, 1.0);
-                }();
-                if (ownershipFloor > 0.0)
-                    ownedFallback = std::max(ownedFallback, ownershipFloor);
             }
 
             // Inline 5-tap smooth of each leg's raw gates.
@@ -10063,41 +8724,12 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
                     static_cast<double>(fitRow[xi]) * (1.0 - strength) *
                         ownedFallback * centerParticipation +
                     cancelled * strength);
-
-                if (pass2DumpPrefix)
-                    p2rec(line, 8, xi, neighborFit);
             } else {
                 combRow[xi] = static_cast<float>(
                     centerParticipation *
                     static_cast<double>(fitRow[xi]) * ownedFallback);
             }
 
-            if (pass2DumpPrefix) {
-                double wSumRaw = 0.0;
-                for (int k = 0; k < kNLegs; ++k)
-                    wSumRaw += legs[k].wRaw[xi];
-                p2rec(line, 7, xi, wSumRaw);
-                p2rec(line, 9, xi, std::min(1.0, wSum));
-                p2rec(line, 10, xi, ownedFallback);
-                p2rec(line, 11, xi, p2corrCode);
-                p2rec(line, 12, xi, static_cast<double>(fitRow[xi]));
-                p2rec(line, 13, xi, static_cast<double>(combRow[xi]));
-            }
-        }
-    }
-    if (pass2DumpPrefix) {
-        static std::atomic<int> p2DumpCounter{0};
-        const int n = p2DumpCounter.fetch_add(1);
-        char path[512];
-        std::snprintf(path, sizeof(path), "%s_%03d.bin", pass2DumpPrefix, n);
-        if (FILE *fp = std::fopen(path, "wb")) {
-            const qint32 hdr[6] = {0x50325644, firstLine, lastLine,
-                                   width, kP2D, left};
-            std::fwrite(hdr, sizeof(qint32), 6, fp);
-            std::fwrite(p2dump.data(), sizeof(float), p2dump.size(), fp);
-            std::fclose(fp);
-            std::fprintf(stderr, "PASS2DUMP wrote %s heldSeq=%d/%d\n",
-                         path, heldSeq1, heldSeq2);
         }
     }
 
@@ -10145,28 +8777,6 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
 
     carrierRetractedValid = true;
 
-    if (dumpDead) {
-        auto pct = [](long long a, long long b) {
-            return b > 0 ? 100.0 * static_cast<double>(a)
-                                 / static_cast<double>(b)
-                         : 0.0;
-        };
-        std::fprintf(stderr,
-            "[DEAD] active=%lld ineligible(illegal)=%lld(%.1f%%) "
-            "dead(viewCount==0)=%lld(%.1f%%) [illegal=%lld fitStarved=%lld]\n",
-            dzActive,
-            dzIneligible, pct(dzIneligible, dzActive),
-            dzDead, pct(dzDead, dzActive),
-            dzDeadIllegal, dzDeadFitStarved);
-        std::fprintf(stderr,
-            "[DEAD] windows=%lld invalid=%lld(%.1f%%) [rank(illegal)=%lld det=%lld] "
-            "amplification dead/illegal=%.2fx\n",
-            dzWinTotal, dzWinInvalid, pct(dzWinInvalid, dzWinTotal),
-            dzWinRank, dzWinDet,
-            dzIneligible > 0 ? static_cast<double>(dzDead)
-                                   / static_cast<double>(dzIneligible)
-                             : 0.0);
-    }
     {
         static const char *depPath = std::getenv("LDCD_THEFT_DEP");
         if (depPath && !frameHasExactCoverage()) {
@@ -10289,7 +8899,7 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
 
     resetStagePlane(carrierFit_flat, 0.0f);
     carrierFitLineValid.assign(static_cast<size_t>(lastLine), 0);
-    if (configuration.lumaWitness) {
+    if (configuration.yElection.rcy) {
         resetStagePlane(carrierRetracted_flat, 0.0f);
     } else {
         carrierRetracted_flat.clear();
@@ -10302,7 +8912,7 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     if (carrierImpurity_flat.size() < need)
         carrierImpurity_flat.assign(need, 0.0f);
 
-    if (configuration.lumaWitness && carrierAnalysis_flat.size() < need)
+    if (configuration.yElection.rcy && carrierAnalysis_flat.size() < need)
         return; // shared analysis must already have been produced
     if (!frameHasExactCoverage())
         return;

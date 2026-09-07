@@ -51,7 +51,6 @@ ld-chroma-decoder [options] <input.tbc> <output.rgb>
 - `--chroma-nr <number>`: NTSC: Chroma noise reduction level in dB (default 0.0)
 - `--luma-nr <number>`: Luma noise reduction level in dB (default 0.0)
 - `--ntsc-phase-comp`: NTSC: Adjust phase per-line using burst phase
-- `--luma-witness`: *(deprecated — see `--y-election`)* Adds the `rcy` and `lsc` candidates. Requires `--ntsc-phase-comp`.
 - `--cross-color-return`: *(deprecated — see `--y-election`)* Adds the `ccr` candidate. Transfers detected false chroma back to Y, restoring high-frequency luma detail.
 
 #### NTSC Y-Election (locked mode)
@@ -67,7 +66,6 @@ competes; `--y-election` names which others join it.
 |---|---|---|
 | `ccr` | cross-colour return | False chroma transferred back to luma, restoring high-frequency detail that leaked into the chroma band. Carries the colour-side suppression it pairs with. |
 | `rcy` | retracted carrier Y | An independent view of luma, formed by subtracting a separately modelled carrier instead of the comb's. Contributes near-carrier detail the comb removes. |
-| `lsc` | lurch-sharpened coarse | A sharpened low-frequency platform, so a confirmed luma step lands on one column instead of smearing across four. |
 | `ntc` | notch-HF | A fixed-kernel notch candidate that estimates nothing — it reads the picture and a constant. Seated by default. |
 
 Presets:
@@ -78,10 +76,10 @@ Presets:
 Notes:
 
 - Implies `--ntsc-phase-comp`.
-- A set **fully replaces** the default roster, so `--y-election=rcy,lsc` runs
-  *without* the notch — something the older flags could not express.
-- Cost is not evenly spread. `rcy` and `lsc` bring up the carrier-retraction
-  machinery and dominate the runtime; `ntc` is nearly free.
+- A set **fully replaces** the default roster, so `--y-election=rcy` runs
+  *without* the notch.
+- Cost is not evenly spread. `rcy` brings up the carrier-retraction machinery
+  and dominates the runtime; `ntc` is nearly free.
 
 ```bash
 # everything, without typing three flags

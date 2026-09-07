@@ -244,19 +244,13 @@ int main(int argc, char *argv[])
                                            "also enables the advanced 2D/3D comb and HF luma election, and discrete filtering of I and Q"));
     parser.addOption(ntscPhaseCompOption);
 
-    QCommandLineOption lumaWitnessOption(QStringList() << "luma-witness",
-        QCoreApplication::translate("main",
-            "NTSC locked mode: enable the carrier-retraction luma path and diagnostics "
-            "(deprecated alias for --y-election members rcy,lsc)"));
-    parser.addOption(lumaWitnessOption);
-
     QCommandLineOption yElectionOption(QStringList() << "y-election",
         QCoreApplication::translate("main",
             "NTSC locked mode: select which luma candidates compete to reconstruct "
             "high-frequency detail. The comb's own reconstruction is the base; this "
             "names what joins it. Comma list of: ccr (cross-colour return - false "
             "chroma restored to luma), rcy (retracted carrier Y - the independent "
-            "witness view), lsc (lurch-sharpened coarse platform), ntc "
+            "witness view), ntc "
             "(fixed-kernel notch; the default), ice (iceberg - stolen luma summits "
             "restored from the certified covers; telecine only). Presets: fast = "
             "comb + ntc; max or archival = everything, slowest. A set fully "
@@ -607,7 +601,6 @@ int main(int argc, char *argv[])
             const QString tok = t.trimmed();
             if      (tok == QLatin1String("ccr")) combConfig.yElection.ccr = true;
             else if (tok == QLatin1String("rcy")) combConfig.yElection.rcy = true;
-            else if (tok == QLatin1String("lsc")) combConfig.yElection.lsc = true;
             else if (tok == QLatin1String("ntc")) combConfig.yElection.ntc = true;
             else if (tok == QLatin1String("fast"))
                 combConfig.yElection.ntc = true;
@@ -616,13 +609,12 @@ int main(int argc, char *argv[])
                      tok == QLatin1String("archival")) {
                 combConfig.yElection.ccr = true;
                 combConfig.yElection.rcy = true;
-                combConfig.yElection.lsc = true;
                 combConfig.yElection.ntc = true;
                 combConfig.yElection.ice = true;
             }
             else {
                 qCritical("--y-election: unknown candidate '%s' (valid: "
-                          "ccr, rcy, lsc, ntc, ice; presets: fast, max, "
+                          "ccr, rcy, ntc, ice; presets: fast, max, "
                           "archival)", qPrintable(tok));
                 return -1;
             }
@@ -632,30 +624,13 @@ int main(int argc, char *argv[])
         combConfig.phaseCompensation = true;
     }
 
-    if (parser.isSet(lumaWitnessOption)) {
-        if (!combConfig.phaseCompensation) {
-            qCritical("--luma-witness requires --ntsc-phase-comp");
-            return -1;
-        }
-        combConfig.yElection.rcy = true;
-        combConfig.yElection.lsc = true;
-    }
     if (combConfig.tunables.CC_SUPPRESSION_WEIGHT > 0.0) {
         if (combConfig.tunables.CC_SUPPRESSION_WEIGHT != 1.0)
             qInfo("--cross-color-return: the strength value is retired; "
                   "the committed verdict is binary. Using 1.0.");
         combConfig.yElection.ccr = true;
     }
-    // Derivations: the witness machinery builds the RETRACTED carrier plane,
-    // which is rcy's input and nothing else's. lsc is the coarse platform
-    // floor and needs none of it -- the platform is built by the locked
-    // decomposition pass, not by buildLumaWitnessModel(). The old
-    // (rcy || lsc) derivation predates the Y election and was the half of
-    // that split which never landed: it made a request for the better floor
-    // run the retracted construction with its candidate unseated, which
-    // measured worse than plain default on every material. lsc no longer
-    // drags rcy's machinery in; --luma-witness still asks for both.
-    combConfig.lumaWitness = combConfig.yElection.rcy;
+    // The retracted-carrier machinery exists only for its seated Y candidate.
     combConfig.tunables.CC_SUPPRESSION_WEIGHT =
         combConfig.yElection.ccr ? 1.0 : 0.0;
 
