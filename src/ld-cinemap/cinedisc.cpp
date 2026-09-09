@@ -144,9 +144,7 @@ class CineDiscMeta : public CineDisc {
     const auto vp = disc->m_md->getVideoParameters();
     disc->m_videoFieldLength = vp.fieldWidth * vp.fieldHeight;
 
-    // Use the VideoSystem enum rather than the non-existent isSourcePal field.
-    // PAL_M is a 525-line system and is treated as non-PAL for cadence
-    // purposes.
+    // PAL_M is a 525-line system and is treated as non-PAL for cadence.
     disc->m_isDiscPal = (vp.system == PAL);
     disc->m_numberOfFrames = nFrames;
 

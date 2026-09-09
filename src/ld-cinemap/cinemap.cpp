@@ -102,9 +102,7 @@ CineMap::CineMap(CineDisc* disc, Policy policy)
       m_policy(policy),
       m_md(disc ? &disc->getMetaData() : nullptr) {}
 
-int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
-  Q_UNUSED(threshold);
-
+int CineMap::detectCadence(const QString& tbcFilePath) {
   if (!m_disc || !m_md || m_disc->isDiscPal()) {
     qInfo() << "Skipping cadence detection (PAL or invalid)";
     return 0;
@@ -128,6 +126,9 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
   m_doplGang.assign(totalFields + 1, std::nullopt);
   m_cadenceConfidence.assign(totalFields + 1, 0.0);
   m_certifiedTriples.clear();
+  m_diffCache.clear();
+  m_twinDemodCache.clear();
+  m_noiseFloor = {};
 
   // CAV fast-path
   if (m_disc->isDiscCav()) {
@@ -226,17 +227,11 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
     } else {
       PhaseRun run = solveSegment(sv, segStart, segEnd, cache, mixedness);
 
-      // A video sentinel is a POSITIVE decision, and no negative inference
-      // may make it. The twin census used to gate the classifiers here by
-      // "ruling film out" — but absent twins prove nothing: a look applied
-      // at 29.97, a dissolve, and per-field compositing all destroy twins
-      // while leaving film standing, and measured on Emissary the census
-      // read two confirmed film scenes and two video scrolls identically as
-      // "video". Certified fields confirm; they never disprove. A sentinel
-      // is written only when a verdict names it — the classifiers now paint
-      // solely on the scan's own Interlaced/Progressive verdicts — and what
-      // no verdict claims falls to the anchored healer and then to the
-      // progressive residual.
+      // A video sentinel requires a positive regime verdict. Absent twins do
+      // not rule out film: looks applied at 29.97, dissolves, and per-field
+      // compositing can all destroy twins while leaving film content. Fields
+      // not claimed by a regime verdict remain available to the anchored
+      // healer and progressive residual pass.
       if (run.type == PhaseRun::Type::Interlaced) {
         classifyAsInterlaced(segStart, segEnd, mixedness);
       } else if (run.type == PhaseRun::Type::Progressive) {
@@ -389,9 +384,8 @@ int CineMap::detectCadence(const QString& tbcFilePath, double threshold) {
 
   // What remains unknown after pattern, facts, anchored healing, and cut
   // recovery have all declined is the unanchored residue, and it reads
-  // PROGRESSIVE. The old posture left it unknown to avoid committing on weak
-  // evidence — but downstream, unknown is itself a commitment, and interlace
-  // is never a safe retreat: if the residue is secretly interlaced, the comb
+  // PROGRESSIVE. Downstream, unknown is itself a commitment, and interlace is
+  // not a safe fallback: if the residue is secretly interlaced, the comb
   // we could not find is the same comb the interfield stage cannot find, so
   // the error is bounded by the evidence that failed to exist — while the
   // progressive ID engages the decoder's Frame regime, which is superior
@@ -541,14 +535,10 @@ double CineMap::scoreSpecificPhase(const std::vector<FrameMixedness>& mixed,
   double avgMixed = (mixedCount > 0) ? (mixedSum / mixedCount) : 0.0;
   double avgClean = (cleanCount > 0) ? (cleanSum / cleanCount) : 0.0;
 
-  // Normalised contrast in [-1, 1]. Positive = good fit.
-  //
-  // This was a raw difference, which silently carried the units of whatever
-  // metric fed it — so the healer's fixed acceptance bar meant one thing under
-  // notch and something else entirely under lips. As a ratio it means the same
-  // thing under any metric: the share of the total that separates the
-  // expected-mixed positions from the expected-clean ones. A perfect 3:2 fit
-  // approaches 1, a wrong phase 0.
+  // Normalised contrast in [-1, 1]. Positive means a good fit. The ratio is
+  // independent of the metric's units and measures the share of the total
+  // that separates expected-mixed positions from expected-clean ones. A
+  // perfect 3:2 fit approaches 1, and a wrong phase approaches 0.
   const double total = avgMixed + avgClean;
   if (total <= 1e-9) return 0.0;
   return (avgMixed - avgClean) / total;
@@ -1166,7 +1156,7 @@ void CineMap::solveCavFallback(SourceVideo& sv) {
       solveSegmentCine(sv, segStart, segEnd, cache, mixed);
       continue;  // solveSegmentCine paints directly
     } else {
-      // Tv path (default for now).
+      // TV path.
       run = solveSegment(sv, segStart, segEnd, cache, mixed);
     }
 
@@ -1187,13 +1177,11 @@ void CineMap::solveCavFallback(SourceVideo& sv) {
 
 // 2 in 5 pulldown/mixed frame detection
 
-// We try to provide the solver with the location of the AB and BC frames using
-// two field comparisons We create a per-frame mixedness score from these and
-// compare the scores, seeking a 2-high, 3-low pattern. Lips owns that score: it
+// Locate AB and BC frames from two field comparisons. A per-frame mixedness
+// score is compared for a 2-high, 3-low pattern. Lips owns that score: it
 // masks the image's own vertical detail per pixel, so it answers "does this
 // frame comb" rather than "does this frame have vertical structure". Notch is
-// retained for instruments only — it has no production caller, and measured, it
-// was also the SLOWER of the two.
+// retained for diagnostic instruments only.
 
 double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width,
                                     int height) const {
@@ -1201,9 +1189,9 @@ double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width,
 
   auto d1 = sv.getVideoField(f1);
   auto d2 = sv.getVideoField(f2);
-  // Relaxed size check: allow some headroom for short buffers
-  if (d1.size() < (width * height * 2) / 2 ||
-      d2.size() < (width * height * 2) / 2)
+  const qsizetype expectedSamples =
+      static_cast<qsizetype>(width) * static_cast<qsizetype>(height);
+  if (d1.size() < expectedSamples || d2.size() < expectedSamples)
     return 0.0;
 
   const uint16_t* p1 = reinterpret_cast<const uint16_t*>(d1.constData());
@@ -1226,11 +1214,6 @@ double CineMap::calculateNotchScore(SourceVideo& sv, int f1, int f2, int width,
   double noiseRmsIre = noiseRmsRaw * scaleToIre;
   double adaptiveFloor =
       std::max(2.5, noiseRmsIre * 6.0 * 2.0);  // ~2 of filtered noise
-
-  // Global sensitivity: >1.0 lowers the floor (more sensitive), <1.0 raises it.
-  if (m_notchSensitivity > 0.0) {
-    adaptiveFloor /= m_notchSensitivity;
-  }
 
   // --- ROI setup ---
   const int startX = static_cast<int>(width * 0.10);
@@ -1507,12 +1490,6 @@ std::vector<CineMap::FrameMixedness> CineMap::computeFrameMixedness(
   // combing. A detailed progressive frame normally reads ~zero here where
   // notch read whatever its edges amounted to.
   //
-  // Notch previously ran first as a cheap prefilter, consulting lips only in a
-  // middle band and skipping it entirely once notch exceeded 0.10 — i.e.
-  // bypassing the detail mask in exactly the case where detail was the likely
-  // cause of the large reading. Measured, lips is also the CHEAPER operator
-  // (0.69-0.84x notch over three discs), so the tiering cost accuracy and
-  // bought nothing.
   // Lips does not run on frames that are still in TIME. Its spatial mask is
   // blind to vertically symmetric fine detail — a thin edge sitting on one
   // field's scanline has up equal to down, so the mask reads flat while the
@@ -1794,81 +1771,6 @@ int CineMap::harvestTwinsByPattern(SourceVideo& sv, int segStart, int segEnd,
   }
 
   return pairsFound;
-}
-
-void CineMap::collectClvTwinPairsFromMixedness(
-    const std::vector<FrameMixedness>& mixed, const SegmentCaptureCache& cache,
-    std::vector<std::pair<int, int>>& pairs) const {
-  if (!m_disc || !m_md) return;
-  if (mixed.size() < 2) return;
-
-  // "Clearly mixed" frames. Same per-frame comb question the classifiers ask,
-  // so it reads the same constant rather than carrying its own notch-scaled
-  // one.
-  constexpr double THRESH_MIXED = LIPS_DIFFERENCE;
-
-  const int nFrames = m_disc->getNumberOfFrames();
-
-  // Map frameIndex -> index in mixed vector for convenience if needed,
-  // but here we just use mixed[i].frameIndex directly.
-  for (size_t i = 0; i < mixed.size(); ++i) {
-    if (mixed[i].score < THRESH_MIXED) continue;
-    int f1 = mixed[i].frameIndex;
-    int f0 = f1 - 1;
-    int f2 = f1 + 1;
-    int f3 = f1 + 2;
-    if (f0 < 0 || f3 >= nFrames) continue;
-    if (m_disc->isPadded(f0) || m_disc->isPadded(f1) || m_disc->isPadded(f2) ||
-        m_disc->isPadded(f3))
-      continue;
-
-    // AA vs AB: f0 vs f1
-    int a1 = m_disc->getFirstFieldNumber(f0 + 1);
-    int a2 = m_disc->getSecondFieldNumber(f0 + 1);
-    int ab1 = m_disc->getFirstFieldNumber(f1 + 1);
-    int ab2 = m_disc->getSecondFieldNumber(f1 + 1);
-
-    // BC vs CC: f2 vs f3
-    int bc1 = m_disc->getFirstFieldNumber(f2 + 1);
-    int bc2 = m_disc->getSecondFieldNumber(f2 + 1);
-    int c1 = m_disc->getFirstFieldNumber(f3 + 1);
-    int c2 = m_disc->getSecondFieldNumber(f3 + 1);
-
-    pairs.emplace_back(a1, ab1);
-    pairs.emplace_back(a1, ab2);
-    pairs.emplace_back(a2, ab1);
-    pairs.emplace_back(a2, ab2);
-
-    pairs.emplace_back(bc1, c1);
-    pairs.emplace_back(bc1, c2);
-    pairs.emplace_back(bc2, c1);
-    pairs.emplace_back(bc2, c2);
-  }
-}
-
-void CineMap::harvestClvTwinsForSegment(
-    SourceVideo& sv, int segStart, int segEnd, const SegmentCaptureCache& cache,
-    const std::vector<FrameMixedness>& mixedness) {
-  if (!m_md || !m_disc) return;
-  if (segStart >= segEnd) return;
-  if (mixedness.empty()) return;
-
-  // 1) Generate candidate twin pairs from the AB/BC mixedness pattern
-  std::vector<std::pair<int, int>> pairs;
-  collectClvTwinPairsFromMixedness(mixedness, cache, pairs);
-  if (pairs.empty()) return;
-
-  // 2) Score them. Sparse scorer: any pair quieter than its neighbors is a
-  // clue.
-  //    tryCommitReciprocalGang still gates writes with its own absolute sanity
-  //    check.
-  std::vector<TwinEdge> edges;
-  constexpr double MIN_CLV_CONF = 0.0;
-  buildTwinEdgesForPairs(sv, pairs, edges, MIN_CLV_CONF);
-  if (edges.empty()) return;
-
-  // 3) Write doplGang to metadata with conflict resolution
-  writeTwinEdgesToMetadata(sv, edges);
 }
 
 double CineMap::dgDiffIre(SourceVideo& sv, int seqA, int seqB, int width,
@@ -2672,11 +2574,11 @@ CineMap::TwinDemod CineMap::calculateDemodulatedFieldDiff(SourceVideo& sv,
   // The 180-degree relation that makes the tone double in D also makes it
   // CANCEL in the sum S = field1 + field2, so the same pass measures a second,
   // independent channel (see TwinDemod). D's coherent tone is the MEAN chroma
-  // C1+C2' — until now discarded as nuisance, it is the power meter for the
-  // test. S's coherent tone is the chroma DIFFERENCE C1-C2', which is zero for
-  // a twin no matter how much colour is present. Both magnitudes come from the
-  // same quadrature estimate, so the second channel costs one more prefix-sum
-  // pass over data already in hand.
+  // C1+C2', which is the power meter for the test. S's coherent tone is the
+  // chroma DIFFERENCE C1-C2', which is zero for a twin no matter how much
+  // colour is present. Both magnitudes come from the same quadrature estimate,
+  // so the second channel costs one more prefix-sum pass over data already in
+  // hand.
   constexpr int N = 8;  // window length in samples (2 carrier cycles)
   constexpr int H = N / 2;
 
@@ -2928,13 +2830,7 @@ double CineMap::getAdaptiveTwinThreshold(int f1, int f2) {
   // loose)
   noiseScale = std::clamp(noiseScale, 0.6, 2.5);
 
-  double thr = BASE_THRESHOLD_IRE * noiseScale;
-  // Apply global twin/dG sensitivity: >1.0  more sensitive (lower threshold)
-  if (m_twinSensitivity > 0.0) {
-    thr /= m_twinSensitivity;
-  }
-
-  return thr;
+  return BASE_THRESHOLD_IRE * noiseScale;
 }
 
 double CineMap::twinConfidence(SourceVideo& sv, int seqA, int seqB) {
@@ -3109,17 +3005,6 @@ void CineMap::buildTwinEdgesForPairs(
   }
 }
 
-bool CineMap::hasReciprocalDgEdge(int a, int b) const {
-  if (!m_md || a == b) return false;
-  if (a < 1 || b < 1) return false;
-
-  int total = m_md->getNumberOfFields();
-  if (a > total || b > total) return false;
-
-  if (a >= (int)m_doplGang.size() || b >= (int)m_doplGang.size()) return false;
-  return m_doplGang[a] == b && m_doplGang[b] == a;
-}
-
 CineMap::TwinACInfo CineMap::classifyTwinAC_strict(
     int seqA, int seqB, const SegmentCaptureCache& cache) const {
   TwinACInfo info;
@@ -3206,12 +3091,8 @@ std::vector<CineMap::TwinACInfo> CineMap::harvestACTwinsForSegment_strict(
   // triggers vetting, not a tally: a contradicted claim keeps its vote only
   // if it meets the certified standard — the cancellation test already run by
   // certifyTriplesForSegment — which conservation grants to at most one side
-  // of any contradiction. Uncontradicted claims are NOT vetted; they carry
-  // the sparse solver's ordinary commitment, which is the autosolve's job.
-  //
-  // Measured before this on the Emissary crawl: 656 harvest trios, rich in
-  // mutual contradictions (A and C claimed on shared fields two apart),
-  // outvoting 21 conservation facts at 0.950.
+  // of any contradiction. Uncontradicted claims are not vetted; they carry
+  // the sparse solver's ordinary commitment.
   if (out.size() >= 2) {
     auto lo = [](const TwinACInfo& t) {
       return std::min({t.defSeq, t.compSeq, t.spareSeq});
@@ -3489,7 +3370,6 @@ CineMap::GeometryEvidence CineMap::gatherGeometryEvidenceForPhase(
 
     // Determine the end of first trio and start of next trio in seq space.
     // Use min/max of {spare, comp, def} since this is a triple-field group.
-    int t1_min = std::min({t1.defSeq, t1.compSeq, t1.spareSeq});
     int t1_max = std::max({t1.defSeq, t1.compSeq, t1.spareSeq});
     int t2_min = std::min({t2.defSeq, t2.compSeq, t2.spareSeq});
     int t2_max = std::max({t2.defSeq, t2.compSeq, t2.spareSeq});
@@ -3542,23 +3422,11 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv, int segStartField,
   if (!m_md || !m_disc) return false;
   if (rejectReason) rejectReason->clear();
 
-  // The roster: the harvest's trios, vetted by the spacing tripwire, with
-  // the certified triples added on top.
-  //
-  // An earlier build made this election certified-only, and it dumped what
-  // the autosolve exists to deliver: 3,918 fields that the harvest had been
-  // committing as film — dark shots, static cards, looks that break
-  // cancellation — fell to the residual, every one of them manual work the
-  // user used to get for free. We are a sparse solver on purpose. A
-  // weak-evidence commitment that is right saves a manual pass; one that is
-  // wrong was headed for manual repair anyway; an uncommitted segment is
-  // pure loss either way. So the harvest votes — the tripwire inside
-  // harvestACTwinsForSegment_strict has already removed the claims 3:2
-  // cannot produce (the Emissary crawl's 656 trios were rich in overlapping
-  // A/C contradictions, which is how junk outvoted 21 facts at 0.950), and
-  // what survives carries the ordinary commitment. Certified triples join
-  // the same tally as the strongest members of the roster, deduplicated by
-  // their def field.
+  // The roster combines harvest trios vetted by the spacing tripwire with
+  // certified triples. Harvest votes preserve the sparse solver's ability to
+  // commit dark shots, static cards, and looks that break cancellation. The
+  // tripwire removes contradictory A/C claims; certified triples join the
+  // tally as its strongest members, deduplicated by definitional field.
   std::vector<TwinACInfo> acTwins =
       harvestACTwinsForSegment_strict(segStartField, segEndField, cache);
 
@@ -3858,10 +3726,9 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   //
   // The stretch below rescales whatever spread exists into [0,1], so it cannot
   // tell "no field difference" from "field difference varies" — it manufactures
-  // a pattern from a noise floor. That was survivable while mixedness was notch, whose floor
-  // is the image's own vertical structure and therefore never small. Lips goes
-  // properly to zero on clean content, so without this gate the stretch
-  // amplifies pure numerical noise into confident locks.
+  // a pattern from a noise floor. Lips approaches zero on clean content, so
+  // this gate prevents the stretch from amplifying numerical noise into a
+  // confident lock.
   //
   // Lips is what makes an absolute test legitimate here: it is a residual
   // measured AFTER masking vertical detail and after subtracting its own noise
@@ -4117,8 +3984,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // and a pure frame's fields are the same film frame — zero comb by
   // conservation, whatever the motion. A score vector negative at EVERY
   // phase therefore says no hypothesis leaves the clean positions clean:
-  // comb where film cannot put it. That was always this scanner's interlace
-  // signature; it was being read as "ambiguous" and handed to the harvest.
+  // comb appears where film cannot put it, which is an interlace signature.
   //
   // Three gates, so the verdict is imposed and not retreated to. All five
   // phases negative — the signature itself. Enough frames to constitute a
@@ -4138,14 +4004,9 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // facts can never land here — the facts override in solveSegment converts
   // any non-film verdict back to film, which is what keeps the crawl's
   // segment (its battle triples) on the plate.
-  // A per-disc calibrated motion floor was built and measured here, and it
-  // failed in both directions at once: block minima land in a disc's black
-  // scenes (Emissary read 0.004, letting a static card through), while a
-  // disc without static ground reads its floor ABOVE its own faintest
-  // genuine interlace (Vol read 0.064 against a vouched 0.060 talking-head
-  // shot). The fixed gate stays, and the faintest shots stay manual — the
-  // priced residue of a threshold that must also keep faint FILM (a
-  // talking-head segment measures p90 0.384) out of -2.
+  // A fixed gate avoids tying the decision to per-disc block minima, which can
+  // be set either by black scenes or by faint interlaced motion. Faint shots
+  // remain unclassified when the evidence cannot also exclude faint film.
   // The completing grammar, the author's law: comb 2-in-5 is film, comb
   // everywhere is -2, comb nowhere is -3. The 2-in-5 readings run first
   // (scan lock, bump); what reaches here is the not-2-in-5 class, and this
@@ -4205,11 +4066,9 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
     // harvest junk cannot commit a phase on ground the scan measured and
     // found empty.
     if (allNegative && p90 < PROGRESSIVE_CRASH_P90) {
-      // A widened LIPS check was tried here and was poisoned by letterbox
-      // matte edges (a static matte reads 37 IRE-units of "comb" through the
-      // mask's blind spot), so the whole-frame duty lives in the stillness
-      // gate instead, on the temporal axis mattes cannot touch. By the time
-      // a segment reaches this branch its frames survived that wide gate.
+      // Whole-frame validation belongs to the temporal stillness gate because
+      // widened spatial LIPS measurements are sensitive to static letterbox
+      // edges. Frames reaching this branch have passed that temporal gate.
       r.type = PhaseRun::Type::Progressive;
       r.confidence = 0.70;
       r.reason = "crash-to-no-difference";
@@ -4673,10 +4532,8 @@ CineMap::PhaseRun CineMap::solveSegment(
     //    in the segment, and writes what it confirms to doplGang.
     //
     //    It runs on any phase mixedness can NAME, not only one it could lock.
-    //    Checking a proposed phase cheaply is exactly how an unsure proposal
-    //    should be adjudicated, and that is the case where a fast-out is worth
-    //    the most. Previously this was gated on a lock, so the fast path could
-    //    never fire when it was needed and brute force ran regardless.
+    //    Checking a proposed phase cheaply adjudicates both locked and
+    //    lower-confidence candidates before the brute-force fallback.
     int patternCandidatePhase = mixedPhase;
     if (patternCandidatePhase < 0 && mixInformative) {
       int bestMix = -1;
@@ -5201,8 +5058,6 @@ void CineMap::classifyAsInterlaced(
   if (!m_md) return;
   if (segStartField >= segEndField) return;
   if (mixedness.empty()) return;
-
-  const int spanFields = segEndField - segStartField + 1;
 
   // Fraction of frames with meaningful positive Lips field-difference
   // evidence. This supports the regime verdict; it is not itself a comb test.
@@ -5939,8 +5794,6 @@ CineMap::GrainPhaseElection CineMap::electPhaseByGrain(
   int lo = segStart, hi = segEnd;
   std::array<double, 5> score = {0.0, 0.0, 0.0, 0.0, 0.0};
   std::array<int, 5> counts = {0, 0, 0, 0, 0};
-  int aperture = 0;
-
   while (true) {
     measure(lo, hi, &score, &counts);
     const int minSites = *std::min_element(counts.begin(), counts.end());
@@ -5949,7 +5802,6 @@ CineMap::GrainPhaseElection CineMap::electPhaseByGrain(
     if (lo <= 1 && hi >= totalFields) break;
     lo = std::max(1, lo - ELECT_APERTURE_STEP_FIELDS);
     hi = std::min(totalFields, hi + ELECT_APERTURE_STEP_FIELDS);
-    aperture++;
   }
 
   out.score = score;
@@ -6099,8 +5951,7 @@ std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
     // Deliberately writes NOTHING. A triple that paints its own three fields
     // while an elected phase paints the rest produces correct islands inside a
     // wrong field wherever the two disagree, and the confidence that protects
-    // the island makes the disagreement permanent instead of loud. Measured on
-    // Emissary side 1: 0.00% of cadence steps broken before, 18.76% after.
+    // the island makes the disagreement permanent instead of visible.
     //
     // A fact must set the segment's PHASE, not a few of its values. Until it
     // does, the triples serve as anchors for break placement only.
@@ -6807,13 +6658,6 @@ int CineMap::healContinuity(SourceVideo& sv,
         }
         f.cinemap.cadenceIndexPresumed = false;
 
-        // Clear internal isEditBoundary; we want cadence monotone inside
-        // segment.
-        /* Whitelist needs to have the last word, no after the fact removals
-        if (f.cinemap.isEditBoundary && s != segStartField && s != segEndField)
-        { f.cinemap.isEditBoundary = false;
-            }*/
-
         m_md->updateField(f, s);
         fieldsFixed++;
       }
@@ -6937,79 +6781,6 @@ int CineMap::healProgressiveCadenceIslands(
   return fixedFields;
 }
 
-int CineMap::enforceSteadyCadenceAcrossBoundaries(int maxSpanFields) {
-  if (!m_md) return 0;
-  const int total = m_md->getNumberOfFields();
-  if (total < 3) return 0;
-
-  int fixed = 0;
-
-  // Project a cadenceId from srcSeq to targetSeq by arithmetic step.
-  // The 10-position cycle is preserved; inversion domain is inherited.
-  auto predictCid = [](int srcSeq, int targetSeq, int srcCid) -> int {
-    if (!cadenceKnown(srcCid)) return CADENCE_UNKNOWN;
-    const int delta = targetSeq - srcSeq;
-    const bool inv = cadenceIsInverted(srcCid);
-    int normIdx = cadenceIndex(srcCid);
-    normIdx = ((normIdx + delta) % CADENCE_NTSC_CYCLE + CADENCE_NTSC_CYCLE) %
-              CADENCE_NTSC_CYCLE;
-    return (inv ? CADENCE_NTSC_INVERTED_OFFSET : 0) + normIdx;
-  };
-
-  for (int i = 2; i <= total - 1; ++i) {
-    if (!m_md->getField(i).cinemap.isEditBoundary) continue;
-
-    // Left anchor: field immediately before the boundary.
-    const int leftSeq = i - 1;
-    auto fL = m_md->getField(leftSeq);
-    if (!cadenceKnown(fL.cinemap.cadenceId) ||
-        m_cadenceConfidence[leftSeq] < 0.8)
-      continue;
-
-    // Right anchor: first high-confidence field within maxSpanFields.
-    int rightSeq = -1;
-    for (int j = i; j <= std::min(total, i + maxSpanFields); ++j) {
-      auto fR = m_md->getField(j);
-      if (cadenceKnown(fR.cinemap.cadenceId) && m_cadenceConfidence[j] >= 0.8) {
-        rightSeq = j;
-        break;
-      }
-    }
-    if (rightSeq < 0) continue;
-
-    // Both anchors must project onto each other with zero error.
-    auto fR = m_md->getField(rightSeq);
-    if (predictCid(leftSeq, rightSeq, fL.cinemap.cadenceId) !=
-        fR.cinemap.cadenceId)
-      continue;
-
-    // Fill the gap between the two anchors.
-    for (int s = i; s < rightSeq; ++s) {
-      auto fm = m_md->getField(s);
-      if (fm.pad) continue;
-
-      const int cid = predictCid(leftSeq, s, fL.cinemap.cadenceId);
-      if (!cadenceKnown(cid)) continue;
-
-      if (!cadenceKnown(fm.cinemap.cadenceId) ||
-          m_cadenceConfidence[s] < m_cadenceConfidence[leftSeq]) {
-        fm.cinemap.cadenceId = cid;
-        fm.cinemap.cadenceIndexPresumed = true;
-        m_cadenceConfidence[s] = std::max(m_cadenceConfidence[s], 0.7);
-        m_md->updateField(fm, s);
-        ++fixed;
-      }
-      // isEditBoundary is intentionally not cleared.
-    }
-
-    i = rightSeq;  // skip ahead past the filled span
-  }
-
-  if (fixed > 0) m_disc->refreshFrameCache();
-
-  return fixed;
-}
-
 int CineMap::recoverCutTruncatedAHeads() {
   if (!m_md) return 0;
 
@@ -7060,12 +6831,6 @@ int CineMap::frameIndexForField(int seq) const {
   return -1;
 }
 
-int CineMap::fieldForFrame(int frameIdx) const {
-  if (!m_disc || frameIdx < 0 || frameIdx >= m_disc->getNumberOfFrames())
-    return -1;
-  return m_disc->getFirstFieldNumber(frameIdx + 1);
-}
-
 int CineMap::paintProgressiveResidual(int hardMaxField) {
   if (!m_md) return 0;
 
@@ -7098,21 +6863,6 @@ void CineMap::demoteCadenceRange(int startSeq, int endSeq, double newMaxConf) {
     if (!cadenceKnown(f.cinemap.cadenceId)) continue;
     if (m_cadenceConfidence[i] > newMaxConf) {
       m_cadenceConfidence[i] = newMaxConf;
-      m_md->updateField(f, i);
-    }
-  }
-}
-
-void CineMap::promoteCadenceRange(int startSeq, int endSeq, double newConf) {
-  if (!m_md) return;
-  int total = m_md->getNumberOfFields();
-  startSeq = std::max(1, startSeq);
-  endSeq = std::min(total, endSeq);
-  for (int i = startSeq; i <= endSeq; ++i) {
-    auto f = m_md->getField(i);
-    if (!cadenceKnown(f.cinemap.cadenceId)) continue;
-    if (m_cadenceConfidence[i] < newConf) {
-      m_cadenceConfidence[i] = newConf;
       m_md->updateField(f, i);
     }
   }

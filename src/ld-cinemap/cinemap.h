@@ -30,28 +30,25 @@ class CineMap {
 
   explicit CineMap(CineDisc* disc, Policy policy = Policy::Tv);
 
-  int detectCadence(const QString& tbcFilePath, double threshold);
+  int detectCadence(const QString& tbcFilePath);
 
   // Instrument: dump the per-pair twin measurement for every same-parity d=2
   // pair in [startField, endField] as CSV on stdout. Read-only — no solve, no
-  // metadata write. Exists so the metric can be measured on real material
-  // before it is wired into any decision.
+  // metadata write.
   int probeDgRange(const QString& tbcFilePath, int startField, int endField);
 
-
-  // TEMPORARY INSTRUMENT: per-site twin evidence across a field range.
+  // Instrument: per-site twin evidence across a field range.
   // Each candidate twin is a theory; confirmed, geometry admits exactly one
   // offset, so every site is a vote for that one offset and for no other.
   // This dumps those votes WITH THEIR POSITIONS, so the sequencing can be
-  // read before any code acts on it. Strip when the split arc closes.
+  // inspected together with its position.
   int probeSplitRange(const QString& tbcFilePath, int startField, int endField);
 
-  // TEMPORARY INSTRUMENT: the twin dip measured PER REGION of the frame.
+  // Instrument: the twin dip measured per region of the frame.
   // A composite carries its two cadences in different AREAS -- a set here, a
   // viewscreen there -- while a dissolve lays both across the whole screen
   // evenly. Pooling the frame into one number cannot tell those apart; this
-  // dumps the dip cell by cell so the difference can be seen before any code
-  // acts on it. Strip when the composite question closes.
+  // dumps the dip cell by cell to distinguish the two cases.
   int probeRegionRange(const QString& tbcFilePath, int startField,
                        int endField);
 
@@ -185,7 +182,7 @@ class CineMap {
 
   // Result of validateCavWindowWithDG().
   // cid[frameInGroup][fieldSlot] holds the cadence ID for that field slot
-  // (0=first, 1=second). ok replaces 'valid' to match the working source.
+  // (0=first, 1=second).
   struct CavTwinValidation {
     bool ok = false;
     int cid[5][2] = {};  // cadence IDs per frame (0..4) per field slot (0..1)
@@ -407,15 +404,6 @@ class CineMap {
   int harvestTwinsByPattern(SourceVideo& sv, int segStart, int segEnd,
                             int phaseOffset, const SegmentCaptureCache& cache);
 
-  void collectClvTwinPairsFromMixedness(
-      const std::vector<FrameMixedness>& mixed,
-      const SegmentCaptureCache& cache,
-      std::vector<std::pair<int, int>>& outPairs) const;
-
-  void harvestClvTwinsForSegment(SourceVideo& sv, int segStart, int segEnd,
-                                 const SegmentCaptureCache& cache,
-                                 const std::vector<FrameMixedness>& mixedness);
-
   double dgDiffIre(SourceVideo& sv, int seqA, int seqB, int width, int height);
 
   double demodTwinDiffCached(SourceVideo& sv, int seq1, int seq2, int width,
@@ -455,12 +443,6 @@ class CineMap {
   // lands on exactly two offsets mod 10, five apart and of opposite parity.
   // Real telecine therefore scores ~1.0 while unstructured content scores at
   // chance, which for two of ten offsets is 0.2.
-  //
-  // This replaced an existence test ("are there any two hits five apart") that
-  // was effectively vacuous: at 12 hits among 59 positions, chance alone
-  // supplies about two such pairs, so the test passed on material with no
-  // cadence at all. Measured on DS9-BTS, genuine telecine scored 1.00 while
-  // video scored 0.21-0.42.
   //
   // This matters most for footage that ORIGINATED on film but was composited
   // through a video pipeline: the cadence does not survive that path, so there
@@ -514,10 +496,8 @@ class CineMap {
   double twinConfidence(SourceVideo& sv, int seqA, int seqB);
   double twinConfidence(SourceVideo& sv, int seqA, int seqB,
                         TwinConfDetail& detail);
-  int fieldForFrame(int frameIdx) const;
   void detectCavCadenceBreaks(std::vector<Cav5Group>& groups, SourceVideo& sv);
   void solveCavFallback(SourceVideo& sv);
-  int enforceSteadyCadenceAcrossBoundaries(int maxSpanFields);
   // A cut may remove A-def while leaving the immediately following
   // A-comp/A-spare pair intact.  Preserve that partial-but-real A identity;
   // it is not a licence to project cadence through the edit.
@@ -531,8 +511,6 @@ class CineMap {
                               const std::vector<std::pair<int, int>>& pairs,
                               std::vector<TwinEdge>& outEdges,
                               double minConfidence);
-
-  bool hasReciprocalDgEdge(int a, int b) const;
 
   TwinACInfo classifyTwinAC_strict(int seqA, int seqB,
                                    const SegmentCaptureCache& cache) const;
@@ -591,9 +569,9 @@ class CineMap {
   //
   // A segment that spans a missed cut still elects one phase: the election
   // is a sum, and the larger shot outvotes the smaller. What the sum throws
-  // away is POSITION. The losing shot.s twins are still there, and they are
+  // away is POSITION. The losing shot's twins are still there, and they are
   // all in one place -- so a rival offset whose support forms a contiguous
-  // block, with the winner.s before it, after it, or both, is not noise. It
+  // block, with the winner's before it, after it, or both, is not noise. It
   // is a second cadence, and the boundary between them is an edit that
   // detection missed.
   //
@@ -769,7 +747,6 @@ class CineMap {
   int paintProgressiveResidual(int hardMaxField);
 
   void demoteCadenceRange(int startSeq, int endSeq, double newMaxConf);
-  void promoteCadenceRange(int startSeq, int endSeq, double newConf);
 
   CavTwinValidation validateCavWindowWithDG(SourceVideo& sv, int f0, int f1,
                                             int f2, int f3, int f4);
@@ -913,9 +890,6 @@ class CineMap {
 
   bool m_decisionTraceEnabled = false;
 
-  // Per-run sensitivity overrides (0.0 = use defaults)
-  double m_notchSensitivity = 1.0;
-  double m_twinSensitivity = 1.0;
   vbiProbe::ProbeResult m_vbi;  // decoded VBI for every frame; set by setVbi()
   // Detected duplicate field links used to derive cadenceId assignments.
   std::vector<std::optional<int>>

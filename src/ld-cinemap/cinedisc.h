@@ -52,9 +52,7 @@ class CineDisc {
       const QString& csvSeqNoListWithRanges) = 0;
   virtual int applyCadenceOverrideFieldRange(const QString& rangeSpec) = 0;
 
-  // No-op hook for implementations that maintain a derived frame cache.
-  // CineDiscMeta has no such cache; this exists so CineMap can call it
-  // unconditionally after bulk metadata writes (matching DiscMap usage).
+  // Hook for implementations that maintain a derived frame cache.
   virtual void refreshFrameCache() {}
 };
 

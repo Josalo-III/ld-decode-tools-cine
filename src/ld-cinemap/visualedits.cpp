@@ -56,7 +56,7 @@ FieldDescriptor computeFieldDescriptor(
     return desc;
   }
 
-  // Same IRE normalization as the old 38 quad descriptor
+  // Normalize the descriptor to IRE using the capture's black and white levels.
   const double black = (vp.black16bIre >= 0) ? vp.black16bIre : 0.0;
   const double white =
       (vp.white16bIre > vp.black16bIre) ? vp.white16bIre : 65535.0;
@@ -238,7 +238,7 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     return (it != descCache.end()) ? it->second : dummy;
   };
 
-  // Helper: Max Luma (legacy; for logs)
+  // Maximum cell luma, used in diagnostic logging.
   auto getMaxLuma = [&](const FieldDescriptor& d) -> double {
     if (!d.valid) return 0.0;
     double m = 0.0;

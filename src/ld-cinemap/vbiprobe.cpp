@@ -64,7 +64,7 @@ ProbeResult probe(CineDisc& disc) {
                 << "Check that the source is a valid LaserDisc TBC.";
     result.isDiscCav = false;
   } else {
-    // CAV only if strictly greater, matching DiscMap tie-break behaviour.
+    // A tie is insufficient evidence to classify the disc as CAV.
     result.isDiscCav = (cavCount > clvCount);
   }
 

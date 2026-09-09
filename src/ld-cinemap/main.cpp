@@ -180,7 +180,7 @@ static bool runDetectEditsOnly(CineDisc& disc, const QFileInfo& outputFileInfo,
 //   - Sets isCinemapped flag and writes metadata back to tbcPath + ".db"
 // -----------------------------------------------------------------------------
 static bool runSolveOnly(CineDisc& disc, CineMap::Policy policy,
-                         double threshold, bool decisionTraceEnabled,
+                         bool decisionTraceEnabled,
                          double editSensitivity, double editStrong,
                          double editPeak,
                          const QStringList& cadenceOverrideArgs) {
@@ -190,7 +190,7 @@ static bool runSolveOnly(CineDisc& disc, CineMap::Policy policy,
   CineMap solver(&disc, policy);
   solver.setDecisionTraceEnabled(decisionTraceEnabled);
   solver.setEditParams(editSensitivity, editStrong, editPeak);
-  const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
+  const int locked = solver.detectCadence(disc.getTbcPath());
   qInfo() << "Cadence solver locked" << locked << "field(s).";
 
   if (!applyManualOverrides(disc, QString(), QString(), cadenceOverrideArgs))
@@ -211,7 +211,7 @@ static bool runSolveOnly(CineDisc& disc, CineMap::Policy policy,
 //   - Write JSON
 // -----------------------------------------------------------------------------
 static bool runFullPipeline(CineDisc& disc, const QFileInfo& outputFileInfo,
-                            CineMap::Policy policy, double threshold,
+                            CineMap::Policy policy,
                             bool decisionTraceEnabled, bool editTraceEnabled,
                             double editSensitivity, double editStrong,
                             double editPeak, const QString& editWhitelistArg,
@@ -231,17 +231,17 @@ static bool runFullPipeline(CineDisc& disc, const QFileInfo& outputFileInfo,
 
   applyEditOverrides(disc, editWhitelistArg, editBlacklistArg);
 
-  // 4) Cadence / twin / mixedness solve
+  // 3) Cadence / twin / mixedness solve
   CineMap solver(&disc, policy);
   solver.setDecisionTraceEnabled(decisionTraceEnabled);
   solver.setEditParams(editSensitivity, editStrong, editPeak);
-  const int locked = solver.detectCadence(disc.getTbcPath(), threshold);
+  const int locked = solver.detectCadence(disc.getTbcPath());
   qInfo() << "Cadence solver locked" << locked << "field(s).";
 
   if (!applyManualOverrides(disc, QString(), QString(), cadenceOverrideArgs))
     return false;
 
-  // 5) Set isCinemapped flag so downstream tools know cadence data is present
+  // 4) Mark cadence data as present for downstream tools.
   auto vp = disc.getMetaData().getVideoParameters();
   vp.isCinemapped = true;
   disc.getMetaData().setVideoParameters(vp);
@@ -277,10 +277,6 @@ int main(int argc, char* argv[]) {
 
   QCommandLineOption tvOpt(QStringList() << "tv",
                            "Implement video edited telecine policy.");
-
-  QCommandLineOption thresholdOpt(QStringList() << "threshold",
-                                  "Cadence confidence threshold.", "threshold",
-                                  "0.0");
 
   QCommandLineOption detectEditsOnlyOpt(
       QStringList() << "detect-edits-only",
@@ -394,7 +390,6 @@ int main(int argc, char* argv[]) {
   parser.addOption(reverseOpt);
   parser.addOption(cineOpt);
   parser.addOption(tvOpt);
-  parser.addOption(thresholdOpt);
   parser.addOption(detectEditsOnlyOpt);
   parser.addOption(skipEditsOpt);
   parser.addOption(overrideOnlyOpt);
@@ -446,6 +441,11 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  if (parser.isSet(cineOpt) && parser.isSet(tvOpt)) {
+    qCritical("Error: --cine and --tv are mutually exclusive.");
+    return 1;
+  }
+
   const bool autoConfirm = parser.isSet(yesOpt);
   const bool decisionTraceEnabled = parser.isSet(cinemapTraceOpt);
   const bool editTraceEnabled = parser.isSet(editTraceOpt);
@@ -455,7 +455,6 @@ int main(int argc, char* argv[]) {
   if (parser.isSet(cineOpt)) policy = CineMap::Policy::Cine;
   if (parser.isSet(tvOpt)) policy = CineMap::Policy::Tv;
 
-  const double threshold = parser.value(thresholdOpt).toDouble();
   const double editSensitivity = parser.value(sensitivityOpt).toDouble();
   const double editStrong = parser.value(strongOpt).toDouble();
   const double editPeak = parser.value(peakOpt).toDouble();
@@ -631,7 +630,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (parser.isSet(skipEditsOpt)) {
-    const bool ok = runSolveOnly(*disc, policy, threshold, decisionTraceEnabled,
+    const bool ok = runSolveOnly(*disc, policy, decisionTraceEnabled,
                                  editSensitivity, editStrong, editPeak,
                                  cadenceOverrideArgs);
     return ok ? 0 : 1;
@@ -639,7 +638,7 @@ int main(int argc, char* argv[]) {
 
   // Default: full pipeline
   const bool ok = runFullPipeline(
-      *disc, outputFileInfo, policy, threshold, decisionTraceEnabled,
+      *disc, outputFileInfo, policy, decisionTraceEnabled,
       editTraceEnabled, editSensitivity, editStrong, editPeak, editWhitelistArg,
       editBlacklistArg, cadenceOverrideArgs);
   return ok ? 0 : 1;
