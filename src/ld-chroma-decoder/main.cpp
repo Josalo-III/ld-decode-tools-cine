@@ -326,10 +326,8 @@ int main(int argc, char *argv[])
                                     QCoreApplication::translate("main", "number"));
     parser.addOption(crossColorReturnOption);
 
-    // "Pulldown Awareness" was the original conceptual header for telecine
-    // handling (and the ld-decode-PA repo name). Retired in favour of
-    // ld-cinemap; "no-pa" survives only as an undocumented alias so existing
-    // invocations keep working.
+    // --no-cinemap disables CineMap/telecine handling. --no-pa is a hidden
+    // deprecated alias for the same switch.
     QCommandLineOption noCinemapOption(QStringList() << "no-cinemap",
         QCoreApplication::translate("main", "Disable telecine handling - reverts to original 29.97 video process"));
     parser.addOption(noCinemapOption);
@@ -367,13 +365,9 @@ int main(int argc, char *argv[])
     parser.addPositionalArgument("input", QCoreApplication::translate("main", "Specify input TBC file (- for piped input)"));
     parser.addPositionalArgument("output", QCoreApplication::translate("main", "Specify output file (omit or - for piped output)"));
 
-    // --cross-color-return engages at 1.0 when the flag is given without a
-    // value (user, 2026-08-07). Qt declares it as taking a value, so a bare
-    // flag would otherwise abort process() with "Missing value"; supply the
-    // default here rather than making the value optional, which would make
-    // `--cross-color-return 0.5` swallow 0.5 as a positional argument.
-    // An explicit value, `--cross-color-return=V`, and the flag's absence
-    // (still 0.0) are all unaffected.
+    // --cross-color-return accepts an explicit numeric value. A bare flag is
+    // normalised to 1.0 before Qt parses the command line so it does not consume
+    // a positional argument. Absence leaves the configured strength at 0.0.
     QStringList ccArgs = a.arguments();
     for (int i = 0; i < ccArgs.size(); ++i) {
         if (ccArgs.at(i) != QStringLiteral("--cross-color-return"))
@@ -432,11 +426,8 @@ int main(int argc, char *argv[])
     if (parser.isSet(noCinemapOption) || parser.isSet(noPALegacyOption))
         cadenceConfig.noCinemap = true;
     if (parser.isSet(dgDiscardOption)) cadenceConfig.dgDiscard = true;
-    // Parsed here, with the rest of the cadence options, because both the
-    // --no-cinemap conflict check below and the decoder construction that consumes
-    // combConfig happen before the end of option parsing. Sited further down, as
-    // it was, it reached neither: the check could never fire and the comb never
-    // learned the cadence was imposed.
+    // Resolve --set-cadence with the other cadence options so the conflict
+    // check and decoder construction both see the imposed-cadence state.
     if (parser.isSet(setCadenceOption)) {
         const int val = parser.value(setCadenceOption).toInt();
         if (val < 1 || val > 5) {
@@ -497,8 +488,8 @@ int main(int argc, char *argv[])
                v == "proper-frame-iq" || v == "proper-frame-b" || v == "frame-b-proper") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameBDirectIQ;
     } else if (v == "frame") {
-        // Backward-compat: historically "frame" was ambiguous / repurposed in experiments.
-        // Default it to the precleaned interfield Frame to preserve legacy expectations.
+        // The deprecated "frame" alias resolves to Frame A (the precleaned
+        // interfield variant).
         qWarning() << "two-d-variant=frame is deprecated; use frame-a-adaptive-iq or frame-b-direct-iq";
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ;
     } else if (v == "fvf" || v == "fieldvframe") {
@@ -581,13 +572,11 @@ int main(int argc, char *argv[])
         combConfig.phaseCompensation = true;
     }
 
-    // ---- Y-election roster resolution (2026-08-20) ----
-    // --y-election=SET fully specifies the roster (replacing the bare
-    // default of {ntc}); the legacy flags then OR their members in, so a
-    // legacy invocation is byte-identical to its historic render and
-    // combining forms never subtracts. ccr's strength scalar is retired:
-    // the committed verdict is binary, no measurement ever supported an
-    // intermediate value, and the knob's only lawful settings were 0 and 1.
+    // ---- Y-election roster resolution ----
+    // --y-election=SET fully specifies the roster instead of the default {ntc}.
+    // Compatibility flags then add their members to that roster. CCR membership
+    // is binary at the election layer; CC_SUPPRESSION_WEIGHT remains the
+    // independently parsed suppression-strength control.
     if (parser.isSet(yElectionOption)) {
         combConfig.yElection = Comb::Configuration::YElection{};
         combConfig.yElection.ntc = false;
@@ -768,7 +757,7 @@ int main(int argc, char *argv[])
         outputFormatName = "rgb";
     }
 
-    // Accept explicit pixel format strings as well as legacy names.
+    // Accept explicit pixel-format names and the supported short aliases.
     QString fmt = outputFormatName.trimmed().toLower();
     if (fmt == "y4m") {
         outputConfig.outputY4m = true;

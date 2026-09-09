@@ -297,23 +297,14 @@ CombReachSourceFrame makeBucketScalarReachSource()
     return source;
 }
 
-// The Locked1DScalar source labels locked1DSource: physically it is
-// bandpass(raw) times a flat round-trip scale (~0.994), so the raw carrier
-// orientation — including the physical ±2 field-line alternation — is intact
-// on every line.  It is a phase-preserved carrier and grammar legality
-// decides its reach, same as the bucket scalar.
+// locked1DSource is bandpass(raw) times a flat round-trip scale (~0.994), so
+// physical carrier orientation, including the +/-2 field-line alternation,
+// remains intact. Grammar legality therefore governs scalar reach.
 //
-// The historical "common phase / polarity gone by construction" label on this
-// buffer described a pre-reform pipeline and misled repeatedly.  One caveat
-// from that era is still real and belongs to the source contract:
-//
-//  - A per-sample DEMOD of this scalar with an unsigned sample class yields
-//    IQ that inherits raw signs, NOT Grid4fscIQ.  For interfield IQ use,
-//    demod with carrierGrammarSignedSampleClass (lineFlip folded into the
-//    phase), or read locked1DTI4fsc/TQ4fsc directly.
-//
-// New sites should prefer Grid4fscIQ (IQ caches) over re-deriving IQ from
-// this scalar.
+// Per-sample demodulation with an unsigned sample class yields IQ that retains
+// raw signs, not Grid4fscIQ. Interfield IQ must use
+// carrierGrammarSignedSampleClass (lineFlip folded into phase) or the cached
+// locked1DTI4fsc/TQ4fsc Grid4fscIQ representation.
 CombReachSourceFrame makeLocked1DScalarReachSource()
 {
     CombReachSourceFrame source;
@@ -386,40 +377,6 @@ double magIQ(double i, double q)
     return boundedMag(i, q);
 }
 
-double signedDotNormIQ(double ai, double aq, double bi, double bq)
-{
-    const double ma = magIQ(ai, aq);
-    const double mb = magIQ(bi, bq);
-    if (ma <= 1e-12 || mb <= 1e-12)
-        return 0.0;
-    return dotIQ(ai, aq, bi, bq) / (ma * mb);
-}
-
-double magnitudeRatioGate(double a, double b)
-{
-    const double hi = std::max(a, b);
-    if (hi <= 1e-12)
-        return 0.0;
-    const double r = std::min(a, b) / hi;
-    return ramp(r, 0.55, 0.88);
-}
-
-double oppositeIQFit(double centerI, double centerQ,
-                     double sideI, double sideQ,
-                     double minChromaIRE)
-{
-    const double mc = magIQ(centerI, centerQ);
-    const double ms = magIQ(sideI, sideQ);
-
-    if (mc < minChromaIRE || ms < minChromaIRE)
-        return 0.0;
-
-    const double signedDot = signedDotNormIQ(centerI, centerQ, sideI, sideQ);
-    const double antiPhase = ramp(-signedDot, 0.55, 0.92);
-    const double magFit = magnitudeRatioGate(mc, ms);
-    const double chromaFit = ramp(std::min(mc, ms), minChromaIRE, minChromaIRE + 6.0);
-    return clamp01(antiPhase * magFit * chromaFit);
-}
 
 } // namespace
 
@@ -673,16 +630,11 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
             
 
 
-        // Restored Field-B cede law, now expressed as reach evidence.
-        //
-        // A local SameRegion result is not sufficient authority for Field B
-        // when the signed chroma geometry says the center is materially
-        // separated from both +/-2 legs. This is the shirt/band zipper case:
-        // allowing Field B to comb here manufactures alternating output.
-        //
-        // AlienCancel remains protected when both legs are alien partners,
-        // because that case is the intended cancellation path for coherent
-        // luma/cross-color rather than a saturated chroma-region band.
+        // Field-B cede policy is published as reach evidence. A local
+        // SameRegion verdict does not authorize Field B when signed chroma
+        // geometry materially separates the center from both +/-2 legs.
+        // Dual AlienCancel partners remain a cancellation case rather than a
+        // chroma-region cede.
         const bool destructiveFieldBTriplet =
             saturatedTriplet &&
             centerSeparated &&
@@ -698,9 +650,9 @@ IntrafieldRegionReach evaluateIntrafieldRegionReach(
             out.threeRegion = outerDifferent;
         }
 
-        // Older conservative path: if neither side continues center, and the
-        // center is separated from the two-tap neighborhood, force the missing
-        // labels to Different so the cede fact is explicit.
+        // Conservative cede rule: when neither side continues the center and
+        // the center is separated from the two-tap neighbourhood, promote the
+        // unresolved labels to DifferentRegion.
         if (!upContinues && !downContinues &&
             centerSeparated && (outerCoherent || outerDifferent))
         {

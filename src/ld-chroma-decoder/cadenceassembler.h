@@ -77,7 +77,6 @@ private:
 	std::function<void(qint32)> onFieldReleasedToBaseline;
     std::vector<SyncTrk> syncTrk;
     SyncTrk syncGlobal;
-    int syncRegX = 0, syncRegY = 0;
     long syncAnchorSeq = -1;
     long syncCuts = 0;
     void syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
@@ -138,7 +137,7 @@ private:
 	bool tryEmitPassthroughAtCursor(bool flushMode, bool force = false);
     void processHistory(bool flushMode);
 
-    // NEW: Fully disentangled forced cadence pipeline
+    // Forced-cadence pipeline
     void processWindowForced(bool flushMode);
 
 	    // Mapping helper: setCadence (1..5) -> starting offset in 0..9

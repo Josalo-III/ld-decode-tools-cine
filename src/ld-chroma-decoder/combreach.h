@@ -4,19 +4,14 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Two physical-evidence arms, kept in one translation unit:
+ * Two decoder-local physical-evidence arms:
  *
- *   namespace lddecode        — carrier-grammar reach legality translator
- *                               (CombReachIndex). Answers "is this line-to-line
- *                               operation legal in this signal frame?".
+ *   namespace lddecode         — carrier-grammar reach legality translator
+ *                                (CombReachIndex). Answers whether a line-to-line
+ *                                operation is legal in the declared signal frame.
  *   namespace CombContentReach — image-content observations shared by combs.
- *                               It reports region and contour facts but never
- *                               selects legs, scales a comb, or cedes to 1D.
- *
- * Formerly comb_reach_index.{h,cpp} (in library/tbc) and combcontentreach.{h,cpp}.
- * Merged 2026-06-21: the reach index was used only by ld-chroma-decoder, so it
- * no longer earns a slot in the shared library. See the comb-reach archeology
- * note for the dead-code that was pulled in the same pass.
+ *                                Reports region and contour facts but never
+ *                                selects legs, scales a comb, or cedes to 1D.
  ******************************************************************************/
 
 #pragma once
@@ -298,13 +293,10 @@ struct IntrafieldRegionReach {
     RegionRelation up = RegionRelation::Unknown;
     RegionRelation down = RegionRelation::Unknown;
 
-    // The same two verdicts AS MEASURED, before the Field-B triplet laws at
-    // the foot of the evaluator may promote a leg to DifferentRegion.  Those
-    // promotions are Field B's cede policy expressed as reach evidence, not
-    // observations: they can overwrite a measured SameRegion or AlienCancel.
-    // A consumer that owns a DIFFERENT policy on the same measurements --
-    // Frame B's +/-1 operand admission -- must read these, or it inherits a
-    // cede law written for another comb at another vertical step.
+    // Raw per-leg region observations. Field-B triplet policy may promote the
+    // public up/down verdicts to DifferentRegion without changing these fields.
+    // Consumers with their own admission policy, including Frame B's +/-1
+    // operands, read the measured verdicts rather than Field B's promoted view.
     RegionRelation upMeasured = RegionRelation::Unknown;
     RegionRelation downMeasured = RegionRelation::Unknown;
 

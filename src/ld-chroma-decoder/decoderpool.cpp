@@ -539,20 +539,12 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
             }
         }
         
-        // The seam is a PREFERENCE, never a precondition (author, 2026-08-14:
-        // "take the tidy seam where it exists, take the untidy one where it
-        // doesn't"). A trim that returns the entire fetch makes no forward
-        // progress: inputFrameNumber rewinds by exactly what it advanced, and
-        // this pump refetches the identical fields forever -- a livelock at
-        // 100% CPU under the input mutex, triggered whenever an edit boundary
-        // sits in the scan window of a final partial batch (reproduced on
-        // three discs; the geometry is boundary-at-range-end, so short -s/-l
-        // slices hit it and full decodes almost never do). The no-seam path
-        // below this already hands over an untidy batch, and both downstream
-        // owners digest it: the assembler's window carries partial groups
-        // across pushes (this trim's own set-cadence comment concedes it) and
-        // isSegStart re-adjudicates edit boundaries per work item. So a seam
-        // that cannot be taken with progress is treated as no seam at all.
+        // A cadence seam is preferred but never required. Apply a trim only
+        // when doing so leaves this pump with forward progress; a trim that
+        // would return the entire fetch is discarded and the untidy batch is
+        // accepted. Partial cadence groups remain valid across pushes in the
+        // assembler window, and segment boundaries are adjudicated again when
+        // work items are scheduled.
         if (trimEnd < rawSize) {
             const int fieldsReturned = rawSize - trimEnd;
             if (fieldsReturned / 2 >= fetchFrames) {
@@ -682,23 +674,14 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         return true;
     };
 
-    // Serve a RUN of consecutive frames, not one.
+    // Serve a run of consecutive frames per call. Batching amortises the
+    // decoder's fixed temporal pre-roll over multiple emitted frames while
+    // preserving the same estimator and output order.
     //
-    // The rolling triple-buffer needs {F-1, F, F+1} to emit F, so a call that
-    // emits a single frame must analyse three: measured 3.00 analysed per 1
-    // output in locked 3D (2.00 in 2D), i.e. two thirds of all locked analysis
-    // computed and discarded.  A batch of N amortises the same pre-roll over N
-    // outputs -- (N + 2) / N -- without weakening the estimator anywhere.
-    //
-    // Everything downstream was already batch-shaped: decoder.cpp derives
-    // numFrames from (endIndex - startIndex) and putOutputFrames() walks
-    // startFrameNumber + i.  Only this producer served one at a time.
-    //
-    // Determinism: batch composition depends only on the work-item queue
-    // order, never on which thread asks or how many exist, so the decode stays
-    // reproducible under --threads.  (This is why per-call buffer REUSE was
-    // rejected earlier: round-robin meant a thread rarely held its own
-    // predecessor, and where it did the picture changed with thread count.)
+    // Decoder derives its frame count from (endIndex - startIndex), and the
+    // output path advances from startFrameNumber across the returned run.
+    // Batch membership is determined only by work-item queue order, so it is
+    // independent of which worker thread requests the batch.
     fields.clear();
     for (const auto &pad : paddingHistory) fields.push_back(pad);
     const int paddingSize = fields.size();
@@ -729,7 +712,7 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
     if (servedThisCall == 0)
         startFrameNumber = thisFrameNumber;
 
-    // Keep existing reconstruction metadata if you still want it for debugging / future use.
+    // Record reconstruction metadata for non-24p telecine work.
     if (!cadenceConfig.export24p &&
         wi.kind == CadenceAssembler::WorkItem::Kind::TelecineFrame) {
         FrameReconstructionInfo info;

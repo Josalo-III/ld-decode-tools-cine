@@ -6,6 +6,8 @@
 
 ld-chroma-decoder decodes color (chroma) information from Time Base Corrected (TBC) LaserDisc video files, converting them into standard RGB video suitable for playback and editing. It supports multiple decoding algorithms optimized for PAL and NTSC video systems.
 
+This fork upgrades the ld-decode 7.2 decoder with telecine/CineMap handling.
+
 ## Usage
 
 ### Basic Syntax

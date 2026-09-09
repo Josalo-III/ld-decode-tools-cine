@@ -33,12 +33,6 @@
 
 namespace {
 
-inline double smoothGate01(double t)
-{
-    t = std::clamp(t, 0.0, 1.0);
-    return t * t * (3.0 - 2.0 * t);
-}
-
 inline double centeredEvenWeightMean(const double *values,
                                      const double *prefix,
                                      int width,
@@ -116,22 +110,10 @@ inline double lurchLaneWeight2()
     return w;
 }
 
-// Feasibility sharpening of the coarse. DEFAULT OFF, on measurement.
-//
-// Its two restrictions turned out to be one tautology and one wrong tool. The
-// coarse-residual bound is vacuous against this platform BY CONSTRUCTION: the
-// medoid is one of the covering coarses, so it lies between their min and max,
-// so the carrier it implies is always already inside the bound. That primitive
-// exists to clamp a carrier arriving from an INDEPENDENT source.
-//
-// The bandwidth law is live but pushes the wrong way. A coarse is already
-// carrier-free -- the full-cycle mean removes the carrier exactly -- so a law
-// that EXCLUDES carrier has nothing to take out of it, and can only decide
-// that part of the residual IS carrier. The in-band residual is largely the
-// fSC luma the coarse discarded, so attributing it to carrier is the leak.
-// Measured: cube -35%, shirt and beach 3x WORSE, because the platform stops
-// being a coarse and becomes raw-minus-carrier, carrying the whole
-// carrier-estimation error where a coarse carried none.
+// Optional feasibility sharpening of the coarse, default off
+// (LDCD_FEAS_COARSE=1). It constrains the carrier implied by the coarse against
+// the legal aperture-derived carrier range, then optionally applies the encoder
+// bandwidth law. Disabled, the platform remains the medoid coarse.
 inline bool feasibilitySharpensCoarse()
 {
     static const bool on = []{
@@ -153,16 +135,10 @@ inline bool feasibilityBandStep()
     return on;
 }
 
-// The fifth ballot member -- the moving coarse, centeredCarrierCycle4Mean,
-// weights 1/8 1/4 1/4 1/4 1/8 with its centroid exactly on the sample.
-//
-// It is provably 1/2*(apMean[x-2] + apMean[x-1]) -- the mean of the two centre
-// apertures -- so it contributes NO independent constraint on luma. It is not
-// nothing to a medoid, which is nonlinear: it changes which member wins, and
-// with four members the medoid is degenerate (for sorted a<=b<=c<=d the costs
-// of b and c are both c+d-a-b, identically) so an odd count gives a strict
-// winner. But the lurch weighting also breaks that tie, so whether the member
-// still earns its place is now an open question and this gate answers it.
+// The moving coarse is the fifth medoid-ballot member. It is exactly
+// 0.5*(apMean[x-2] + apMean[x-1]) and therefore adds no independent linear
+// constraint, but it breaks the even-member medoid tie. LDCD_MOVING_COARSE=0
+// removes this ballot member.
 inline bool movingCoarseOnBallot()
 {
     static const bool on = []{
@@ -184,10 +160,8 @@ inline bool lurchLoadsMedoid()
     return on;
 }
 
-// Lurch carves located transitions into the coarse instead. DEFAULT OFF --
-// superseded by feasibility above, which does the same job without asserting
-// a step. Kept reachable (LDCD_LURCH_SHARPEN=1) because lurch's data still has
-// a role to play inside the feasible construction, not in front of it.
+// Optional lurch step carving, default off. LDCD_LURCH_SHARPEN=1 inserts located
+// luma transitions into the selected coarse after the medoid stage.
 inline bool lurchSharpensPlatform()
 {
     static const bool on = []{
@@ -209,9 +183,8 @@ inline bool lurchPinEnabled()
 } // namespace
 
 // Locked-path pre-processing: burst detection, carrier grammar, and luma cache.
-// Parallax ratio: below soft the energy nulls in every aperture like legal
-// carrier (protect); above hard it fails to null (luma, act). Measured
-// populations: colour p50 0.05-0.12, pure luma p50 0.89.
+// Parallax ratio below kCornerParallaxSoft behaves carrier-like; above
+// kCornerParallaxHard it is treated as luma-like evidence.
 static constexpr double kCornerParallaxSoft   = 0.15;
 static constexpr double kCornerParallaxHard   = 0.45;
 
@@ -251,30 +224,15 @@ void Comb::FrameBuffer::phaseLocked()
 
     const bool   floorEnable = configuration.burstFloorEnable;
     const double floorFactor = configuration.burstFloorFactor;
-    const auto  &T           = configuration.tunables;
     constexpr double MIN_PHASE_CONFIDENCE = 1e-6;
 
     // --- Pass 1: burst detection -> carrier grammar ---
     //
-    // Schedule-locked burst pooling (2026-08-23). The three-census audit
-    // established that the per-line burst is the rigid schedule plus
-    // ~0.53 deg of gate noise, with real line-to-line wander bounded
-    // near zero: per-line freshness carries no information, only noise.
-    // So the phase REFERENCE is pooled per field through the exact
-    // schedule (same-field scan lines are 227.5 cycles apart -- a 180 deg
-    // flip per line pair), which divides the reference noise by ~sqrt(N)
-    // and makes it uniform across the field. Per-line facts stay
-    // per-line: carrierScale and phaseConfidence still report each
-    // line's own gate, so downstream trust is unchanged. A line whose
-    // own gate is dead inherits the field's reference (the schedule is
-    // raster law on a TBC'd capture); a line whose gate deviates beyond
-    // the trim is treated as a broken measurement, not a different
-    // carrier. The two fields pool separately -- on covered frames they
-    // are different captures. Eye-approved 2026-08-23 ("more solid");
-    // the per-line fallback below is for a field with no usable gates
-    // at all, not an alternative regime.
-
-    // Pass 1a: per-line gates. Rotated phasor cached, schedule-signed.
+    // Burst phase is pooled separately for each field parity through the NTSC line
+    // schedule. Per-line carrierScale and phaseConfidence remain line-local, while
+    // the phase reference uses the pooled field estimate. Lines with unusable gates
+    // inherit the pooled schedule reference; if an entire field lacks usable gates,
+    // the per-line fallback path supplies the reference.
     std::vector<double> gateC(lastLine, 1.0), gateS(lastLine, 0.0);
     std::vector<double> gateW(lastLine, 0.0);
     for (int line = firstLine; line < lastLine; ++line) {
@@ -288,7 +246,6 @@ void Comb::FrameBuffer::phaseLocked()
         grammar.phaseConfidence =
             std::clamp((grammar.carrierScale - 3.0) / 7.0, 0.0, 1.0);
         grammar.phaseError = 0.0;
-        grammar.affine.valid = false;
         gateC[line] = bc2;
         gateS[line] = bs2;
         gateW[line] = grammar.phaseConfidence;
@@ -717,20 +674,12 @@ void Comb::FrameBuffer::buildCarrierAnalysis(FrameBuffer *prevFrame)
             const double *wLaw = bandWLaw_line(line);
             const double *keep = bandKeep_line(line, 2);
 
-            // THE REACH READS THE SOLVED LUMA.
-            //
-            // hDelta is the lateral-contrast service the 2D reach decides on
-            // -- Frame B's reach exemption, cross-colour, the FVF vertical
-            // regime all consult it. It was measuring contrast on a luma of
-            // its own: a band-law-weighted notch, falling back to the block
-            // scaffold whose second difference is a property of the block
-            // grid rather than the picture.
-            //
-            // Determining a reach from an estimate other than the best one
-            // available is the same evidence failure the holdout convicted at
-            // 1D -- the observation not representing the quantity it is taken
-            // for. The solved platform is built in phaseLocked, which runs
-            // before this pass, so it is simply here to be used.
+        // THE REACH READS THE SOLVED LUMA.
+        //
+        // hDelta is the shared lateral-contrast service used by 2D reach, Frame B
+        // exemption, cross-colour logic, and FVF vertical-regime tests. In locked mode it
+        // is derived from lockedLumaSmooth, the canonical solved platform built before
+        // this pass, so every consumer reads the same luma estimate.
             const double *solvedLuma = ldcdReachUsesSolvedLuma()
                 ? lockedLumaSolved_line(line) : nullptr;
             if (solvedLuma) {
@@ -1529,22 +1478,12 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         if (grammar)
             grammar->projectionValid = false;
 
-        // The locked 1D export is published to locked1DSource_flat above and
-        // is NOT copied onto clpbuffer[0]: that plane means the blind 1D
-        // bandpass in both modes.  Where a consumer addresses the 1D plane by
-        // absolute h (--ntsc1d, the legacy 2D reader) the h-indexed view is
-        // allocated and mirrored here; otherwise there is nothing to mirror.
+        // The locked 1D export is published in locked1DSource_flat and is not copied onto
+        // clpbuffer[0], which remains the blind 1D bandpass in both modes.
         //
-        // EDGE POLICY IS MIRROR (author, 2026-08-28: "the locked mode edge
-        // handling was supposed to be mirroring").  The margin outside the
-        // active region is filled by the same half-sample reflection the
-        // canonical bandpass builder uses (rawMirror in buildCarrierAnalysis)
-        // and that split1D applies to the bucket plane: rel -1 reads rel 0,
-        // rel -2 reads rel 1.  A consumer that steps one sample past the
-        // boundary then gets the designed value instead of a zero -- and
-        // instead of what clpbuffer[0] served it before this plane existed,
-        // which was whatever the previous frame had left in the margin, since
-        // that plane is only ever cleared and written across [left, right).
+        // Consumers that address the locked scalar by absolute h use lockedScalarH_flat.
+        // Its active-video margins mirror the nearest in-range samples, matching the tap
+        // resolver and split1D boundary policy.
         if (double *publishedH = lockedScalarH_line(line)) {
             for (int rel = 0; rel < width; ++rel)
                 publishedH[left + rel] = lockedSource[rel];
@@ -1617,10 +1556,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
                 continue;
 
             for (int rel = 0; rel < width; ++rel) {
-                // Symmetric 7-tap horizontal aggregate, matching the region
-                // evaluator in buildCombTapLine.  Its input is already the
-                // full, integer-centred IQ vector; divide by the complete
-                // weight (6), not by the old per-axis weight (3).
+                // Symmetric 7-tap horizontal aggregate matching the region evaluator in
+                // buildCombTapLine. The integer-centred IQ vector is normalized by the complete
+                // weight, 6.
                 auto fullIQ = [&](const float *iR, const float *qR) {
                     static constexpr double w[7] =
                         {0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5};
@@ -1701,13 +1639,9 @@ void Comb::FrameBuffer::buildCrossColorReturn()
         return s && std::atoi(s) != 0;
     }();
 
-    // Run the detector in the carrier plane's actual coordinates.  The
-    // legacy narrow/wide comparison pools the two interleaved raster lanes
-    // into one IQ magnitude.  In this mode each sample is compared only with
-    // the de-alternated stream to which it belongs; the return machinery
-    // downstream remains unchanged.  The lane-discrete reading is the default;
-    // LDCD_CC_DISCRETE_FITS=0 retains the conflated IQ comparison as an escape
-    // hatch while this detector awaits its larger reform.
+    // Run the detector in the carrier plane's native coordinates. Each sample is
+    // compared only with its de-alternated raster lane. LDCD_CC_DISCRETE_FITS=0
+    // selects the combined-IQ comparison for diagnostic A/B use.
     static const bool ccDiscreteFits = []{
         const char *s = std::getenv("LDCD_CC_DISCRETE_FITS");
         return !(s && std::atoi(s) == 0);
@@ -1788,9 +1722,8 @@ void Comb::FrameBuffer::buildCrossColorReturn()
                 const int li = ccLaneIndex[rel];
                 const int n = static_cast<int>(ccLane[lane].size());
 
-                // The old 16-sample narrow box contains eight samples from
-                // this lane: li-4 .. li+3.  Preserve that physical aperture
-                // and its edge truncation, but never borrow the other lane.
+                // Use the eight-sample lane aperture li-4 .. li+3 with edge truncation; samples
+                // from the other raster lane are never mixed into this fit.
                 const int na = std::clamp(li - kNarrowWin / 4, 0, n);
                 const int nb = std::clamp(
                     na + kNarrowWin / 2, 0, n);
@@ -2182,7 +2115,6 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
         for (int line = firstLine; line < lastLine; ++line) {
             const float *r0 = lockedCcMaskRaw_line(line);
             float *out = lockedCcMask_line(line);
-            const float *exRow2 = exactCarrierRow(line);
             float *prodIRow = lockedProductI_line(line);
             float *prodQRow = lockedProductQ_line(line);
             if (!r0 || !out)
@@ -2194,8 +2126,6 @@ void Comb::FrameBuffer::splitIQlocked(const FrameBuffer *prevF,
 
             const AttributionFacts *attributionRow =
                 attributionFacts_line(line);
-            const float *impurityRow = carrierImpurity_line(line);
-            const float *sameRegionRow = regionSamePartner_line(line);
             const lddecode::CarrierAnalysisRecord *analysisRow =
                 carrierAnalysis_line(line);
             const lddecode::CarrierAnalysisRecord *analysisUpRow =
@@ -4295,83 +4225,24 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                     ? std::clamp((double)ccMaskRow[xi], 0.0, 1.0)
                     : 0.0;
 
-                // THE POST-COMB CHECK -- do not move the energy twice.
+                // THE POST-COMB CHECK -- do not move energy twice.
                 //
-                // CCR returns cross-colour to luma. The carrier licence says
-                // which energy is luma masquerading as carrier: a legal
-                // carrier nulls under every legal four-sample aperture, so
-                // energy that fails to null is not carrier whatever the
-                // demodulation made of it.
+                // CCR returns cross-colour to luma. The carrier license identifies energy that
+                // does not behave like legal carrier under the aperture law, but the comb may
+                // already have removed some of that energy from chroma. The return therefore
+                // uses the post-comb residue:
+                //   preC   = 1D carrier before comb
+                //   postC  = carrier assigned by the comb
+                //   lumaE  = license-owned luma component of preC
+                // The portion already removed by the comb is deducted from lumaE before CCR is
+                // allowed to return anything.
                 //
-                // But the comb runs FIRST, and may already have taken that
-                // energy out of the chroma. Returning it again on the strength
-                // of a licence measured BEFORE the comb would double-move it.
-                // So the test is not "was this luma?" -- it is "is it STILL
-                // in the chroma now?".
-                //
-                //   preC   the chroma before the comb (the 1D carrier)
-                //   postC  the chroma the comb actually assigned
-                //   lumaE  the part of preC the licence calls luma
-                //
-                // Whatever the comb removed comes off lumaE first; CCR is
-                // licensed only for the remainder. When the comb has already
-                // taken it all, the return goes to zero and CCR does nothing
-                // -- which is the correct answer, not an abstention.
-                //
-                // This makes the two consumers independent: comb may act or
-                // not, and this check is right either way, because it reads
-                // what is actually left rather than what was predicted.
-                // SCHEDULE CONFORMITY -- the screen the aperture test lacks.
-                //
-                // Period-4 luma is anti-symmetric at stride 2 exactly as
-                // carrier is, so it nulls in every legal four-sample aperture
-                // and the aperture licence scores it as genuine. That is why
-                // the cube's lattice gets past a purely lateral screen.
-                //
-                // The schedule has no such blind spot. The grammar fixes the
-                // carrier's phase relation between this line and its +-2
-                // neighbour -- Same or Opposite, ASKED, never inferred from
-                // the line distance -- so folding 1D's carrier against that
-                // neighbour by the stated relation must CANCEL if the energy
-                // is carrier. Luma has no reason to obey a schedule it is not
-                // party to: a lattice can imitate the carrier along a line
-                // and still fail to imitate the encoder's line-to-line
-                // alternation.
-                //
-                // So the return also requires non-conformity: the energy
-                // must fail the schedule it would have to obey to be carrier
-                // at all. With the aperture coherence detector this is the
-                // shipped pair -- one lateral character test, one vertical.
-                //
-                // Three other screens were built here and are gone. A
-                // MINORITY REPORT comparing 1D's carrier magnitude against
-                // the independent reading (raw - solvedPlatform -
-                // residLaneN); a SATURATION TAPER on that same independent
-                // magnitude; and a LICENCE KEYING on aperture parallax. All
-                // three were falsified against banked truth under
-                // --dg-discard, and for two related reasons worth keeping:
-                //
-                //   The independent carrier is TWO-THIRDS TRAPPED. residLaneN
-                //   cancels by the diameter property -- r[x+-2] = -r[x] at
-                //   fSC -- and that identity never asks what the energy IS,
-                //   so subcarrier-band LUMA is annihilated exactly as carrier
-                //   is and survives into the complement at full amplitude.
-                //   Where truth says there is no carrier at all, 1D claims
-                //   1.31 IRE and the independent claims 0.88. A witness that
-                //   repeats two thirds of the defendant's error corroborates
-                //   the misparse it was built to falsify.
-                //
-                //   Aperture parallax cannot untrap it. It reads envelope
-                //   MOTION across displaced apertures, and a geometric
-                //   lattice is stationary -- its band energy sits still
-                //   exactly as a carrier's does. Measured, the licence reads
-                //   0.455 on false colour against 0.444 on real, with the
-                //   full distribution matching within a couple of points in
-                //   every bin. It also calls genuine strong colour "luma" 44%
-                //   of the time.
-                //
-                // Record: luma-platform-solve-and-ccr-screens-research-record
-                // -2026-09-04.md. Do not rebuild any of the three.
+                // SCHEDULE CONFORMITY supplies the vertical character test. The carrier grammar
+                // states the Same/Opposite relation between this line and its ±2 neighbour.
+                // Folding the two 1D carriers by that relation must cancel legal raster-scheduled
+                // carrier. CCR requires non-conformity to that schedule as well as lateral
+                // aperture evidence, so period-4 luma that mimics carrier within one line is not
+                // accepted solely on its lateral behavior.
                 if (ccReturn > 0.0) {
                     const CombCarrierGrammar *g0 = carrierGrammarLine(line);
                     const int lnN = (line - 2 >= firstLine) ? line - 2
@@ -4411,23 +4282,10 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                             const double nonConf = (mag > 1e-9)
                                 ? std::fabs(clpLine[h] + sgn * oneN[xi]) / mag
                                 : 0.0;
-                            // A BROAD TAPER ACROSS THE MEASURED POPULATIONS.
-                            //
-                            // Real chroma sits at mean ratio 0.72, the false
-                            // zone at 1.03, so the cuts below are read off the
-                            // census rather than chosen. This is a CHARACTER
-                            // test -- did this energy obey the relation
-                            // carrier must obey -- which is the question
-                            // actually being asked, and it discriminates
-                            // 2.1:1 where a magnitude comparison against the
-                            // independent carrier manages only 1.45:1.
-                            //
-                            // A narrow high-confidence veto (act below 0.25,
-                            // stand aside above 0.40) was tried and is worse:
-                            // the coherence detector is the only screen
-                            // supplying coverage, and a veto that abstains on
-                            // the ambiguous majority leaves the false colour
-                            // standing. The taper is the shipped shape.
+                            // A broad ratio taper converts schedule non-conformity into the return weight.
+                            // The low and high cuts span the measured real-chroma and false-colour
+                            // populations; values inside the interval interpolate continuously rather than
+                            // acting as a hard veto.
                             constexpr double kConfClean  = 0.70; // conforms
                             constexpr double kConfBroken = 1.20; // does not
                             double t = (nonConf - kConfClean) /
@@ -4812,22 +4670,9 @@ void Comb::FrameBuffer::produceY(const FrameBuffer *prevF,
                             const double dd = std::fabs(inHF[k] - dirHF[d]);
                             if (dd < nd) { nd = dd; }
                         }
-                        // No neighbour testimony: charge NOTHING.
-                        // CONSENSUS IS NOT A TERM IN THIS ELECTION (user
-                        // ruling; majority rule is a bankrupt heuristic).
-                        // Two terms were removed 2026-08-24: a median of
-                        // the seated candidates' cleanliness, which set a
-                        // bar each candidate was charged for falling
-                        // below -- the population's own centre pricing
-                        // deviation, moving with the roster, biting
-                        // hardest at HF where the departing candidate is
-                        // the one carrying detail the others lack; and a
-                        // medoid self-anchor, which made every
-                        // candidate's base cost its distance to the most
-                        // consensual member, applied exactly where no
-                        // evidence exists. Neighbour proximity (nd
-                        // against dirHF) is evidence and stays.
-                        // Agreement with the pack is not evidence.
+                        // No neighbour testimony contributes no score. Candidate consensus is not an
+                        // election term; only explicit image evidence such as neighbour proximity
+                        // (nd against dirHF) affects this branch.
                         if (nDir == 0)
                             nd = 0.0;
                         const double proximity01 =
@@ -5594,46 +5439,22 @@ void Comb::FrameBuffer::applyLurchSteps(const std::vector<LurchStepRun> &runs,
 // ---------------------------------------------------------------------------
 // THE LUMA PLATFORM SOLVE
 //
-// A third construction, not a variant of either floor above it. baseY4 is a
-// block mean -- one value per four samples, held flat across them -- so luma
-// detail finer than a block cannot survive it at all. This solve answers to
-// every carrier-free fact the line affords in one banded system.
+// The solve uses every carrier-free fact available on the line in one banded
+// system.
 //
-// FACT FAMILIES
+// SAME PHASE (stride 4, weight wA): x and x+4 have the same carrier phase role, so
+// their raw difference is a luma constraint.
 //
-// SAME PHASE (stride 4, weight wA). x and x+4 are one full cycle apart and so
-// hold the SAME PHASE ROLE: whatever the carrier is doing at one it is doing
-// at the other, so it contributes exactly nothing to their difference, and
-// raw(x+4) - raw(x) is pure luma. It is the membership change at the ends that
-// makes the two signals move against each other -- the carrier is pinned by
-// its own periodicity and luma is not. That is the parallax.
+// THE TWO LANES (weights wN, w2):
+//   yN = 1/4*(y[x-2] + 2y[x] + y[x+2])
+//   y2 = 1/2*(y[x-1] + y[x+1])
+// Each stencil is a diameter on the carrier phase circle and therefore cancels
+// carrier exactly at any phase. The constraints assert equality between the
+// carrier-free combination of y and the same combination of raw; they do not
+// assign the resulting value to a particular sample.
 //
-// THE TWO LANES (weights wN, w2).
-//
-//   yN   1/4*(y[x-2] + 2y[x] + y[x+2])     same lane as x
-//   y2   1/2*(y[x-1] +        y[x+1])      the other lane
-//
-// Each is a DIAMETER on the phase circle -- opposite corners, whose midpoint
-// is the circle's centre at ANY rotation. So the carrier is annihilated by the
-// stencil exactly, at every phase, with no window and no mean over the cycle.
-// Phase invariance here is a property of diameters, not of smoothing.
-//
-// The constraint is NOT "this estimates the luma at x". That reading carries a
-// sagitta bias -- a chord's midpoint sits off the curve by an amount going as
-// the square of the chord width -- and asserting it would inject that bias. It
-// is the exact statement that a combination the carrier CANNOT REACH must read
-// the same on y as it does on raw. Nothing is claimed about where the value
-// belongs, so there is no bias to inject.
-//
-// Both lanes are here because they fail differently. yN spans its diameter
-// symmetrically about x, so envelope GRADIENT cancels and only its curvature
-// leaks; y2's diameter is not centred on a sample it reads, so gradient
-// survives. The aperture pool shares y2's blind spot, which makes yN the
-// member that adds an axis rather than a sixth view of one.
-//
-// Retention, not condensation: every fact enters as its own constraint and the
-// solve answers to all of them at once. Nothing is averaged, and no family is
-// reduced to a summary before the solve sees it.
+// The two lane families have different envelope-error geometry, so both remain
+// separate constraints. No family is condensed to a summary before the solve.
 // ---------------------------------------------------------------------------
 void Comb::FrameBuffer::solveLumaPlatformLine(int line, const double *apMean,
                                               int meanCount, int width,
@@ -5644,14 +5465,13 @@ void Comb::FrameBuffer::solveLumaPlatformLine(int line, const double *apMean,
 
     const int lastStart = meanCount - 1;
 
-    // The moving coarse is built from raw, so the row is resolved before the
-    // platform rather than after it. The guard's early-out stays BELOW the
-    // platform loop, exactly where it was: a line whose raw is unusable still
-    // leaves the platform filled from the aperture pool alone.
+    // The moving coarse is computed directly from raw before the platform solve. A
+    // line whose raw row is unusable can still receive its platform from the aperture
+    // pool before the guard returns.
     const int left      = videoParameters.activeVideoStart;
     const int fullWidth = videoParameters.fieldWidth;
     const bool rawOk = (line >= 0 && fullWidth > 0 && left >= 0 &&
-                        (size_t)(line + 1) * fullWidth <= rawbuffer.size());
+                        (size_t)(line + 1) * fullWidth <= static_cast<size_t>(rawbuffer.size()));
     const quint16 *rawLine =
         rawOk ? rawbuffer.data() + (size_t)line * fullWidth : nullptr;
     const auto raw = [&](int xi) -> double {
@@ -5754,76 +5574,33 @@ void Comb::FrameBuffer::solveLumaPlatformLine(int line, const double *apMean,
 
     // LURCH SHARPENS THE COARSE.
     //
-    // The medoid of five is the coarse luma. Every one of its members is a
-    // mean over four samples, so no member -- and therefore no selection among
-    // them -- can resolve a transition sharper than one window. A step inside
-    // a window is spread across it by construction, and that limit is shared
-    // by all five, so the medoid cannot vote its way out of it.
+    // The medoid members are four-sample means, so their selected coarse cannot place
+    // a transition more sharply than their aperture support. When
+    // LDCD_LURCH_SHARPEN=1, corroborated lurch edges carve those transitions into the
+    // finished coarse after selection. The edge location is the vertical
+    // median-of-three when both adjacent lines provide matching same-sign runs.
     //
-    // Lurch is not another candidate and takes no part in the selection. It
-    // locates the sudden luma changes the coarses cannot see and cuts them
-    // back into the finished coarse -- carving the transition into the
-    // platform rather than choosing between readings of it. Selection first,
-    // sharpening second; the two never mix.
-    //
-    // Edges come from corroborateLurchEdges rather than the raw list: the
-    // median-of-three across the two vertical neighbours, an order statistic
-    // and a selection among measured values, which is what stops the carved
-    // edge saw-toothing line to line on texture noise.
-    //
-    // DEFAULT OFF. A located step is an ASSERTION, and the carrier moves
-    // within limits, which is the width of that assertion's ambiguity. Worse,
-    // a step is broadband, so it supplies values for exactly the fSC and 2fSC
-    // freedoms no coarse can measure -- meaning a misplaced edge writes into
-    // the one subspace where nothing else can contradict it. Feasibility does
-    // the same sharpening job while asserting nothing, so it goes first and
-    // lurch's data waits for a role inside it.
+    // This mode is a post-selection step assertion and is disabled by default.
     if (lurchSharpensPlatform()) {
         const std::vector<LurchStepRun> corrRuns = corroborateLurchEdges(line);
         applyLurchSteps(corrRuns, apMean, meanCount, width, 1.0,
                         platform, nullptr);
     }
 
-    // FEASIBILITY SHARPENS THE COARSE — in composite space, by exclusion.
-    //
-    // The carrier is what luma moves AGAINST, so the reasoning stays in
-    // composite units. Two restrictions apply, in order, and both work the
-    // same way: they bound the CARRIER, and whatever the carrier is forbidden
-    // to hold returns to luma. Neither asserts that anything is there.
+    // FEASIBILITY SHARPENS THE COARSE IN COMPOSITE SPACE.
     //
     // 1. COARSE-RESIDUAL BOUND (carrierFeasibleRange, feasibleband.h).
-    //    A legal carrier sums to zero over every legal four-sample window, so
-    //    each covering coarse is that window's LUMA mean exactly. The four
-    //    windows covering x share x's carrier and differ only in their luma,
-    //    so bounding the luma bounds the carrier:
-    //        carrier <= raw - min_v apMean[v]     (the clean, dark-side bound)
-    //        carrier >= raw - max_v apMean[v]     (the ambiguous bright side)
-    //    This is the membership itself doing the work -- no filter, no
-    //    assumption, and in composite space throughout.
+    //    Legal carrier sums to zero over each four-sample aperture. The covering
+    //    aperture means therefore bound luma and, by subtraction from raw, bound the
+    //    carrier at each sample.
     //
-    // 2. ENCODER BANDWIDTH LAW. What survives (1) must also be expressible:
-    //    legal carrier is Re{C(x) e^{i a(x)} } with the envelope bandlimited,
-    //    because the encoder low-passes chroma before modulating and passes
-    //    luma through untouched. An envelope faster than that is
-    //    INEXPRESSIBLE, so energy there is luma the fit has taken.
+    // 2. ENCODER BANDWIDTH LAW.
+    //    The surviving carrier must be expressible as a band-limited modulation
+    //    envelope. Energy outside that envelope law is assigned back to luma.
+    //    kChromaLawWide is used on both lattice coordinates; these coordinates are
+    //    quadrature lattice axes rather than the decoder's I/Q axes.
     //
-    //    The demod is confined to this step and nothing else -- it is how an
-    //    envelope law is stated at all -- and the platform it returns to is
-    //    composite, which is where the parallax residuals will be read.
-    //
-    //    kChromaLawWide, NOT the encoder's 9-tap uvFilter. That kernel is the
-    //    CREATION filter: legal chroma has already been through it once, and
-    //    applying it again attenuates what is by definition legal (-2.26 dB at
-    //    its own passband edge) while admitting out-of-band energy at only
-    //    -17 dB. A law wants a flat passband and a steep stop; that one has a
-    //    drooping passband and a lazy stop, failing in both directions at once
-    //    (feasibleband.h). The Wide law kernel is flat to 0.01 dB in band and
-    //    -59 dB in stop.
-    //
-    //    WIDE on BOTH coordinates. The lattice axes are quadrature but they
-    //    are not I and Q -- about 24 degrees off -- so a narrow kernel on
-    //    either would clip legal wide-axis carrier. The narrow bound is in any
-    //    case documented as an unjustified placeholder.
+    // Both stages constrain carrier rather than asserting a luma feature directly.
     if (rawOk && feasibilitySharpensCoarse()) {
         if ((int)scratch_platEnvA.size() < width) {
             scratch_platEnvA.resize(width);
@@ -6150,6 +5927,7 @@ static bool ldcdFactFitOn()
     }();
     return on;
 }
+
 static void ldcdApplyPhaseSnap(const std::vector<double> &est,
                                const std::vector<double> &ref,
                                std::vector<double> &out,
@@ -7614,17 +7392,14 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
-    const auto &T       = configuration.tunables;
     static const double parallaxRepairMaxDeltaIRE = []{
         const char *s = std::getenv("LD_1D_PARALLAX_MAX_DELTA_IRE");
         return s ? std::atof(s) : 0.35;
     }();
-    // The residual analysis supplies a discrete set of legal four-sample
-    // carrier readings.  The legacy repair treats the endpoints of that set
-    // as a continuous interval, so a fit can survive in a gap no aperture
-    // actually observed.  Keep this experiment local to the retracted-luma
-    // fit.  The discrete reading is the default pending the larger reform;
-    // LDCD_RETRACTED_DISCRETE_REPAIR=0 retains the interval treatment.
+    // The residual analysis supplies a discrete set of legal four-sample carrier
+    // readings. Retracted-luma repair uses that discrete set by default;
+    // LDCD_RETRACTED_DISCRETE_REPAIR=0 selects interval treatment between the extrema
+    // for diagnostic comparison.
     static const bool discreteResidualRepair = []{
         const char *s = std::getenv("LDCD_RETRACTED_DISCRETE_REPAIR");
         return !(s && std::atoi(s) == 0);
@@ -8869,6 +8644,7 @@ void Comb::FrameBuffer::buildLumaWitnessModel()
 
 void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
 {
+    (void)prevF;
     carrierRetractedValid = false;
     anchoredCarrierProvenance = AnchoredCarrierProvenance::None;
     anchored1DSource_flat.clear();
@@ -8881,7 +8657,6 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int width     = right - left;
-    const auto &T       = configuration.tunables;
 
     if (width <= 0 || firstLine >= lastLine)
         return;
@@ -8939,8 +8714,8 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
                                   + static_cast<size_t>(line) * demodWidth;
         const float *wRowPub = carrierCorroboration_flat.data()
                                + static_cast<size_t>(line) * demodWidth;
-        // The witness publishes its own view now. This loop keeps only
-        // the certified half: anchoredRow, written from certifiedCarrier.
+        // The witness publishes its own view. This loop writes only the certified half:
+        // anchoredRow from certifiedCarrier.
         float *retractedRow = nullptr;
         double *anchoredRow = publishCertified
             ? anchored1DSource_flat.data()
@@ -8948,34 +8723,10 @@ void Comb::FrameBuffer::buildCertifiedCarrierStage(const FrameBuffer *prevF)
             : nullptr;
 
         const float *exRowPub = exactCarrierRow(line);
-        // THE COMP-LINE ESTIMATE CHAIN IS GONE (author's verdict,
-        // 2026-09-05: the observation is "notably superior, with less noise
-        // and more vertical detail").
-        //
-        // What stood here built a carrier for a covered frame's comp lines by
-        // interpolating the two certified neighbours' luma, searching a
-        // registration so that interpolation would land on the right content
-        // across a diagonal, and filtering the interpolation's residue back
-        // out with a 5-tap. Three mechanisms in series, each one existing
-        // only to repair the one above it, all downstream of a substitution
-        // the designed shape never asked for: the twins merge to the
-        // certified carrier, that is subtracted to give luma, and Frame C
-        // combs the comp line up to near-certified from there.
-        //
-        // It also contradicted the contract stated at combSource1D_line --
-        // "everywhere else the comb starts with the observation; there is
-        // intentionally no estimate escape hatch" -- since on a covered comp
-        // line the comb started from that estimate rather than from
-        // locked1DSource. Now it does not: a comp line's certifiedCarrier is
-        // the observation, and Frame C ratchets it toward the bracketing
-        // certified def lines. Def lines are untouched either way, their
-        // exact channel being finite before any of this is reached.
-        //
-        // Removed with it: certComp, the aperture registration search that
-        // aimed the interpolation, the 0.676/-0.250/-0.088 corrector, and the
-        // phase snap that ran on its output. ldcdBuildCertBracketAligned and
-        // ldcdApplyPhaseSnap survive -- they have another caller.
-
+        // Covered comp lines start from the observed locked1DSource and are handled by
+        // Frame C, which ratchets them toward the bracketing certified def lines. Def
+        // lines remain exact certified facts. The generic retraction stage does not
+        // construct a separate interpolated comp-line carrier here.
         const double *obs1D = locked1DSource_line(line);
 
         const double *lawBpRow = nullptr, *lawWRow = nullptr,

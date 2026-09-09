@@ -19,9 +19,9 @@
 #include <cstdio>
 
 namespace {
-// The legacy 2D reader is the one default-off consumer that addresses the 1D
-// plane by absolute h, so the buffer setup has to know about it before split2D
-// runs.  One reader, one answer.
+// LDCD_OLD_SPLIT2D enables the optional diagnostic 2D reader that addresses the
+// 1D plane by absolute h, so buffer setup must account for that consumer before
+// split2D runs.
 bool ldcdOldSplit2D()
 {
     static const bool on = []{
@@ -54,16 +54,6 @@ namespace {
     // chroma amplitude normalization
     constexpr double BUCKET_CHROMA_SCALE = 1.4;
     constexpr double PRODUCT_CHROMA_SCALE = 1.33;
-
-    inline double median4_average_middle(double a, double b, double c, double d)
-    {
-        if (a > b) std::swap(a, b);
-        if (c > d) std::swap(c, d);
-        if (a > c) std::swap(a, c);
-        if (b > d) std::swap(b, d);
-        if (b > c) std::swap(b, c);
-        return 0.5 * (b + c);
-    }
 }
 
 // 3D candidate palette
@@ -205,25 +195,15 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
         previous = std::make_unique<FrameBuffer>(videoParameters, configuration);
     }
 
-    // Chain pre-roll depth (2026-08-02). The anticipated chain, the tone
-    // anchor, and the anchored plane all walk prevF in display order, but
-    // the 2D witness path pre-rolled only ONE frame -- so every cross-frame
-    // chain silently restarted at every batch head (measured: one dead
-    // anticipated chain per 8-frame batch, rendered as a periodic CCR
-    // detector dropout). The pool has ALWAYS delivered two real
-    // look-behind frames (paddingHistory, sequential in frame order under
-    // the queue lock); reach back and load them both so the chain enters
-    // the batch alive. Cost: two extra analysed frames per batch, offset
-    // by the decoderBatchFrames raise (8 -> 12 keeps the (N+k)/N analysis
-    // overhead at its previous level). Determinism holds: batch
-    // composition depends only on queue order, never on thread count.
+    // Pre-roll supplies the temporal history required by the analysis chain. 2D uses
+    // one frame of history; 3D requires two fields on each side, and certified locked
+    // processing extends the pre-roll to satisfy the certified carrier chain. Batch
+    // composition is deterministic and independent of thread count.
     qint32 preRollFields = 2;
     if (configuration.dimensions == 3)
         preRollFields = 4;
-    // Follows the retraction gate below: the certified chain needs the
-    // look-behind, and starving it is the batch-head chain loss. This now
-    // costs two extra analysed frames per batch on any certified run, not
-    // only witness runs.
+    // Certified locked processing requires the additional look-behind used by its
+    // cross-frame analysis chain.
     if (configuration.phaseCompensation &&
         FrameBuffer::certifiedOneDLevel() >= 1)
         preRollFields = 6;
@@ -235,30 +215,16 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
     if (preRollEnv >= 2) preRollFields = preRollEnv;
     const qint32 preStart = startIndex - preRollFields;
 
-    // True when the frame analyzed on the PREVIOUS loop iteration (now
-    // sitting in `current` after rotation) was genuinely loaded this batch —
-    // the guard that keeps the frame-axis conformance test from comparing
-    // against a stale recycled buffer at pre-roll or batch boundaries.
+    // True when the frame analyzed on the preceding loop iteration, now held in
+    // `current`, was genuinely loaded in this batch. This prevents temporal
+    // conformance tests from reading recycled or pre-roll-invalid state.
     bool prevIterAnalyzed = false;
 
-    // NOTE: the buffers persisting across calls invites an obvious
-    // optimisation -- a call that just served frame F leaves them holding
-    // {F-1, F, F+1}, and the next call, serving F+1, needs {F, F+1, F+2}: one
-    // rotation and one new frame rather than a fresh pre-roll.  It was tried
-    // and reverted.  Two things defeat it.  Threads take frames round-robin
-    // with a Comb (and triple-buffer) each, so at -t 8 a thread never holds
-    // its own predecessor and the reuse never fires; measured 0% at -t 8
-    // against 95% at -t 1.  Worse, where it did fire it CHANGED THE PICTURE:
-    // the pre-roll analyses its first frame with a null temporal context
-    // (prevIterAnalyzed starts false), while a reused frame keeps the analysis
-    // it was given with its real predecessor, so -t 1 and -t 8 stopped
-    // agreeing.  Output must not depend on --threads.
-    //
-    // The reuse only becomes available once a thread is handed a RUN of
-    // consecutive frames (upstream's batchFrames, which the cadence rework
-    // reduced to 1).  Batch composition does not depend on thread count, so
-    // that form keeps the decode deterministic.
-
+    // Persistent FrameBuffers reuse storage across calls, but each decodeFrames()
+    // call performs its own pre-roll analysis. Thread scheduling does not guarantee
+    // that a Comb instance receives consecutive frame runs, so analysis context is
+    // reconstructed from the batch history rather than inferred from buffer contents.
+    // This keeps output deterministic across --threads settings.
     for (qint32 fieldIndex = preStart; fieldIndex < endIndex; fieldIndex += 2) {
         // Rotate buffers.
         {
@@ -287,18 +253,11 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 next->phaseLocked();
                 next->buildCarrierAnalysis(
                     prevIterAnalyzed ? current.get() : nullptr);
-                // Corner-leak corrector: consumes the analysis record, the
-                // canonical bandpass and the aperture-mean pool, and
-                // publishes lockedCornerLeak_flat.  It is NO LONGER
-                // diagnostic: buildPhaseCorrected1D subtracts that plane
-                // from the raw bandpass, so an enabled leak reaches the 1D
-                // source and every product below it.  What keeps the
-                // default render unchanged is the opt-in gate
-                // (LDCD_CORNER_LEAK), not an absent consumer -- unset, the
-                // stage returns early and the plane stays zero, which makes
-                // the subtraction a no-op.  Enabling it DOES change output
-                // (verified 2026-08-23).  Cost when enabled is ~11% of a
-                // locked decode, the Van Cittert sweeps dominating.
+                // Corner-leak corrector: consumes the carrier analysis, canonical bandpass, and
+                // aperture-mean pool, then publishes lockedCornerLeak_flat. When
+                // LDCD_CORNER_LEAK is enabled, buildPhaseCorrected1D subtracts this plane from the
+                // raw bandpass before downstream products are built. With the option disabled,
+                // the plane remains zero and the subtraction is a no-op.
                 next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
                 // Presence of certified, not the witness fork.  The ladder
@@ -661,10 +620,9 @@ Comb::FrameBuffer::FrameBuffer(const LdDecodeMetaData::VideoParameters &videoPar
             regionAlienPartner_flat.assign(size_t(demodLines) * demodWidth, 0.0f);
             locked1DRawBandpass_flat.assign(size_t(demodLines) * demodWidth, 0.0);
             locked1DSource_flat.assign(size_t(demodLines) * demodWidth, 0.0);
-            // The h-indexed view of the locked 1D export exists only where a
-            // consumer addresses the 1D plane by absolute h: --ntsc1d, where
-            // the elected comb scalar IS the 1D scalar, and the legacy 2D
-            // reader.  Locked 2D/3D reads clpbuffer[1]/[2] and pays nothing.
+            // The h-indexed locked 1D view is allocated only for consumers that address the
+            // 1D scalar by absolute h: --ntsc1d and the LDCD_OLD_SPLIT2D diagnostic reader.
+            // Locked 2D/3D reads clpbuffer[1]/[2].
             if (configuration.dimensions == 1 || ldcdOldSplit2D()) {
                 lockedScalarH_flat.assign(
                     size_t(demodLines) * videoParameters.fieldWidth, 0.0);
@@ -806,12 +764,9 @@ void Comb::FrameBuffer::loadFields(const SourceField &firstField,
 // 1D horizontal bandpass
 void Comb::FrameBuffer::split1D()
 {
-    // Sample-column windows come from the metadata header, never from
-    // hardcoded columns. MEASURED, on a colourburst study that hardcoded the
-    // burst as h 40..130: those columns caught sync-edge energy, so the study
-    // measured deterministic line structure where it meant to measure jitter.
-    // videoParameters carries colourBurstStart/End (and the active-video
-    // bounds read below) precisely so no consumer has to guess them.
+    // Sample-column windows come from videoParameters metadata. Burst and active-video
+    // bounds are never inferred from hardcoded columns, preventing sync-edge energy
+    // from entering the burst measurement.
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
     const int firstLine = videoParameters.firstActiveFrameLine;
@@ -855,12 +810,9 @@ void Comb::FrameBuffer::split1D()
         if (applyBucketHull)
             applyCarrierFeasibilityHull(line, dst + left);
 
-        // MIRROR THE MARGIN, matching the taps above (h-2 reflects to
-        // left+1 at the boundary) and the locked export's own margin.  The
-        // plane is only ever cleared and written across [left, right), so
-        // anything reading one sample past the boundary used to get whatever
-        // the previous frame left there.  Reflection is the policy everywhere
-        // else in this decoder; a stale sample is not a policy at all.
+        // Mirror the active-video margin to match tap resolution and the locked export.
+        // Out-of-range reads therefore receive the reflected in-range sample rather than
+        // uninitialized or stale storage.
         const int w = right - left;
         for (int h = 0; h < left; ++h)
             dst[h] = dst[left + std::clamp(left - h - 1, 0, w - 1)];
@@ -889,14 +841,9 @@ void Comb::FrameBuffer::seedCombAttributionPerLine(int line)
     const CombCarrierGrammar *grammar = carrierGrammarLine(line);
     const double carrierPrior = carrierPlausibility(grammar);
 
-    // Per-frame reset is the textbook _platform_memmove tax (see perf survey
-    // 2026-06-25): with the triple-buffer fix in place, the per-batch ctor
-    // zero-fill is gone, but this per-line seed still pays roughly the same
-    // memmove cost spread frame by frame. Use a single static default-
-    // initialized template (correctly carries non-zero defaults such as
-    // CombAttributionAssessment::uncertainClaim = 1.0) and one full-record
-    // assignment per pixel, instead of two separate copy-assignments from
-    // zero-initialized temporaries.
+    // Reset per-pixel attribution records from one static default-initialized
+    // template, preserving non-zero defaults such as uncertainClaim = 1.0 while
+    // requiring only one full-record assignment per pixel.
     static const AttributionFacts kFreshFacts{};
     static const AttributionAssessment kFreshAssessment{};
     for (int rel = 0; rel < width; ++rel) {
@@ -1081,11 +1028,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const int firstLine = videoParameters.firstActiveFrameLine;
     const int lastLine  = videoParameters.lastActiveFrameLine;
 
-    // Radius of the horizontal neighbor window used in cross-domain estimation.
-    // Kept local: this is not a tunable in the current header.
-    const int  NEIGH_RAD        = 2;
-
-    // Local constants replacing older/nonexistent tunable names.
+    // Local thresholds for frame-model evaluation.
     const double FRAME_MODEL_BIAS_LOCAL = 0.90;
     const double FRAME_SCALE_BIAS_STRENGTH_PROGRESSIVE_LOCAL =
         T.FVF_SCALE_FINE_FRAME_B_BONUS;
@@ -1112,8 +1055,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // Minimum luma difference between Field A and Field B combs to apply A/B divergence penalty (IRE)
     const double FIELD_DISAGREE_IRE = 6.0;
 
-    // Below this FVF candidate difference, candidates are close enough that frame is preferred (IRE)
-    const double FVF_SMALL_DIFF_IRE = (T.FVF_SMALL_DIFF_IRE > 0.0) ? T.FVF_SMALL_DIFF_IRE : 3.0;
     const int srcBufIndex = configuration.phaseCompensation ? 1 : 0;
     const AttributionFacts *attrFactsRow = attributionFacts_line(line);
     const AttributionAssessment *attrAssessmentRow =
@@ -1334,20 +1275,14 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double fieldLikeStack = 0.5 * (Cpm2 + Cpp2);
         double diff_stack_ire = std::fabs(frameLikeStack - fieldLikeStack) * invI;
 
-        double diff_candA_ire = std::fabs(lumFR - lumFA) * invI;
         double diff_candB_ire = std::fabs(lumFR - lumFB) * invI;
         double frameFieldCandidateDistIRE = diff_candB_ire;
         double frameModelDistIRE = frameFieldCandidateDistIRE;
-        // Field-vetoes-frame divergence guard, kept ONLY for the interlace
-        // regime.  Before ld-cinemap supplied cadence metadata, interfield
-        // divergence was the only protection the fields had, so a frame
-        // candidate that strayed far from the field comb was distrusted.  In the
-        // metadata-driven Frame model regime the frame model is authoritative
-        // (cadence is known), and a frame candidate is SUPPOSED to diverge from
-        // a field comb that cannot resolve fine vertical detail -- vetoing it on
-        // that divergence just re-imposes the field's limits on the frame.  So
-        // this old metric is disabled here, matching the interlace-only field
-        // majority guard further down (already gated on !localUseFrameModel).
+        // Field-vetoes-frame divergence is active only in the interlace regime. In the
+        // metadata-driven progressive regime, frame candidates are allowed to diverge
+        // from field combs because the field geometry cannot represent the same fine
+        // vertical detail. The interlace-only guard remains consistent with the field
+        // majority check below.
         bool frameInsane = !localUseFrameModel &&
                            (frameModelDistIRE > FRAME_MAX_DIST_IRE);
 
@@ -1450,8 +1385,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             scoreB = (1.0 - satScale) * devB + satScale * errB_notch;
             scoreR = (1.0 - satScale) * devR + satScale * errR_notch;
 
-            // Candidate-A special gating is removed. The same-regime buddy
-            // competes through the general candidate machinery only.
+            // Candidate A uses the general candidate machinery without a special gating path.
 
             // ------------------------------------------------------------
             // Model-aware regime scoring.
@@ -1526,17 +1460,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             }
 
             // ------------------------------------------------------------
-            // Saturation regime: in highly saturated regions, Frame is often
-            // the least visually toxic when coherent, but Field B tends to
-            // introduce zipper/alternation more readily than Field A.
-            // Apply a soft bias rather than a hard override.
-            //
-            // OPEN, carried unchanged into the Field A promotion: the heavier
-            // B penalty was seated on FIELD B's zipper habit, and the
-            // progressive seat now holds the comb that asymmetry favoured.
-            // The number is deliberately NOT retuned here -- the promotion is
-            // the single variable under test, and a constant re-derived in the
-            // same edit would hide inside it.  Revisit once the seat is judged.
+            // Saturation regime. In highly saturated regions, coherent frame candidates
+            // receive a soft preference while Field B carries the stronger zipper penalty.
+            // Progressive mode seats Field A in that same-field slot; the scoring constants
+            // remain shared across the roster rather than being candidate-specific.
             // ------------------------------------------------------------
             if (sat_t > 0.0) {
                 // Candidate A gets a mild saturation penalty (underperforms
@@ -1850,11 +1777,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
-            // Preserve the completed ballot for the transition-run election
-            // below.  Sharpness used to modify these scores one pixel at a
-            // time, which allowed Frame B to win the crossing while a softer
-            // candidate won its shoulders.  The final pass consumes the same
-            // scores but awards one candidate to the detector's whole support.
+            // Preserve the completed per-pixel ballot for the transition-run election below.
+            // The run stage chooses one candidate for the detector's full transition support
+            // using these same scores.
             scoreMapA[rel] = scoreA;
             scoreMapB[rel] = scoreB;
             scoreMapFrame[rel] = scoreR;
@@ -2053,12 +1978,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     // ---------------------------------------------------------------------
     // Transition-run election.
     //
-    // The old sharpness term awarded each pixel independently.  On the beach
-    // arm transition that selected Frame B at the crossing and softer field
-    // candidates on its shoulders, synthesising a halo which existed in none
-    // of the candidates.  Detection, scoring and commitment now share one
-    // footprint: the stable plateaus which license the sharpness comparison
-    // also delimit every pixel that receives its winner.
+    // Detection, scoring, and commitment share one footprint. Stable plateaus license
+    // the sharpness comparison and also delimit every pixel that receives the run's
+    // winner, preventing different candidates from being selected independently
+    // across one transition.
     // ---------------------------------------------------------------------
     static const double kSharpWEnv = []{
         const char *e = std::getenv("LDCD_FVF_SHARP_W");
@@ -2069,21 +1992,14 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         : T.FVF_TRANSITION_SHARPNESS_WEIGHT;
 
     if (transitionSharpWeight > 0.0) {
-        // TRANSITIONS ARE WHAT WE SEARCH FOR; PLATEAUS ARE THE QUALIFIER
-        // (author, 2026-08-28).  The seed is the lateral gradient alone.  The
-        // plateau's only job is to demonstrate that what was found is a
-        // transition between two settled regions and not fine texture, and
-        // five flat samples are enough to say so -- there is nothing to grow
-        // beyond that, because the plateau is never the measurement target.
+        // TRANSITIONS ARE THE SEARCH TARGET; PLATEAUS QUALIFY THEM.
         //
-        // Each side DISCOVERS where its plateau begins by walking outward
-        // until five consecutive samples are flat.  Nothing here is a fixed
-        // offset from the crossing, which matters twice over: transitions are
-        // of variable width, and the source row carries its own lateral
-        // support (a narrow notch inside a four-cycle medoid), so a fixed gap
-        // sized against one row silently reads across the edge when the row
-        // changes.  Contamination from either cause presents as non-flatness,
-        // so the search steps past it without being told the support radius.
+        // The lateral gradient seeds a transition. Each side walks outward until it finds
+        // five consecutive flat samples, establishing two settled regions rather than
+        // fine texture. The plateau is evidence of context, not the measurement target,
+        // so its extent is not grown beyond the qualifying run. Variable-width
+        // transitions and source-row support are handled by the outward search rather
+        // than a fixed offset.
         constexpr int kPlateauSamples = 5;
         constexpr int kPlateauSearchMax = 16;
         constexpr double kPlateauJitterMaxIRE = 1.2;
@@ -2501,11 +2417,8 @@ void Comb::FrameBuffer::collectCombAttributionEvidence(
     const bool frameScalarWideEnough =
         haveFrameScalar && (int)frameScalar.size() >= width;
 
-    // Pre-compute |frameIQ[r]| magnitudes once, then derive coherence from
-    // additions instead of redundant hypot calls.  Old path: 4 hypot/pixel in
-    // coherence + 1 in the main loop = 5×width.  New path: 1 for the mag
-    // pre-pass + 1 for the vector-sum magnitude = 2×width; main loop reuses
-    // the pre-computed mag for frameChromaIRE (0 additional).
+    // Pre-compute |frameIQ[r]| once per pixel and reuse it in coherence and chroma
+    // magnitude calculations, avoiding repeated hypot calls in the hot loop.
     const bool haveFrameIQ = frameIQ && !frameIQ->empty();
     const int iqN = haveFrameIQ ? (int)frameIQ->size() : 0;
     const std::complex<double> *frameIQData = haveFrameIQ ? frameIQ->data() : nullptr;
@@ -2692,8 +2605,8 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
     if (!lumaSmooth)
         return;
 
-    // Legacy block-centre scaffold for geometry-only consumers.  Reuse the
-    // already-built coarse instead of averaging raw a second time.
+    // Block-centre scaffold for geometry-only consumers. Reuse the existing coarse
+    // rather than averaging raw again.
     auto blockAvg = [&](int block)->double {
         const int x0 = std::clamp(block * 4, 0, std::max(0, width - 4));
         if (baseY4)
@@ -2721,8 +2634,6 @@ void Comb::FrameBuffer::buildCompositeLumaDecompositionLine(const quint16 *rawLi
     for (int b = 0; b < blockCount - 1; ++b) {
         const double y0 = blockAvg(b);
         const double y1 = blockAvg(b + 1);
-        const double d  = (y1 - y0) * 0.25;
-
         const int xStart = std::max(0, b * 4 + 2);
         const int xEnd   = std::min(width, b * 4 + 6);
 
@@ -2747,14 +2658,10 @@ void Comb::FrameBuffer::split2D()
     const bool wantFvf = (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldVsFrame);
     const bool fvfUseFrameModel = wantFvf && configuration.phaseCompensation &&
         (cadenceId >= 0 || cadenceId == -3);
-    // Progressive palette: Frame A (+/-1) + Field A (+/-2) + Frame B (+/-1).
-    // Field A takes the seat Field B held, because Field A is the same-field
-    // comb that was shown to clear the uncovered cube pillar and it brings an
-    // orthogonal +/-2 geometry to a ballot whose other two members are both
-    // interfield.  Field B stays computed -- it is the preclean ring both
-    // frame combs source from -- it is simply not a candidate here.
-    // LDCD_FVF_FIELD_B_MEMBER=1 restores the former Field B seat as a
-    // one-variable A/B.
+    // Progressive palette: Frame A (±1) + Field A (±2) + Frame B (±1). Field A
+    // provides the orthogonal same-field geometry while Frame B remains available as
+    // the preclean source used by both frame combs. LDCD_FVF_FIELD_B_MEMBER=1 selects
+    // Field B for the same-field ballot seat in diagnostic A/B runs.
     static const bool fvfUseFieldBMember = []{
         const char *e = std::getenv("LDCD_FVF_FIELD_B_MEMBER");
         return e && std::atoi(e) != 0;
@@ -2801,25 +2708,14 @@ void Comb::FrameBuffer::split2D()
         return;
     }
 
-    // LDCD_OLD_SPLIT2D=1: diagnostic A/B only. Runs the classic ld-decode
-    // adaptive 2D kernel (pre-locked, pre-region-grammar) verbatim on the
-    // blind 1D bandpass, bypassing every modern protection. Purpose: render
-    // the UNPROTECTED error catalogue (e.g. the bikini-bottom upper shadow)
-    // that the chroma-boundary band was installed to quash, so the 2D
-    // threshold revisit can compare against what the guards actually buy.
+    // LDCD_OLD_SPLIT2D=1 selects an unprotected blind-bandpass adaptive 2D kernel for
+    // diagnostic A/B renders. It bypasses locked-path region and boundary protections
+    // so the protected path can be compared against the raw 2D behavior.
     if (ldcdOldSplit2D()) {
-        // MIRROR AT THE VERTICAL BOUNDS, NOT A BLACK LINE (author,
-        // 2026-08-28: "Main uses a black line for the bounds, I prefer
-        // mirroring; the black line produces a visible edge change").  A zero
-        // row is a maximal fake difference to a comb, so kp/kn saturate on the
-        // first and last active rows and the decision flips there for a reason
-        // that is not in the picture.  This is the rule resolveSameFieldTap
-        // already applies to the live path -- top row takes D2 for U2, bottom
-        // row takes U2 for D2 -- and the mirrored partner is the same field,
-        // so the ±2 anti-phase relation the comb needs is preserved.  Falling
-        // back to the centre row covers only a frame too short to hold either
-        // partner, where the difference terms go to zero rather than to a
-        // fabricated edge.
+        // Mirror at the vertical active bounds. A missing outward ±2 partner resolves to
+        // the inward same-field partner; only a frame too short to contain either partner
+        // falls back to center. This preserves the required ±2 carrier relation without
+        // introducing a synthetic zero-row edge.
         for (int lineNumber = firstLine; lineNumber < lastLine; lineNumber++) {
             const int prevLn = (lineNumber - 2 >= firstLine) ? lineNumber - 2
                              : (lineNumber + 2 <  lastLine)  ? lineNumber + 2
@@ -2914,32 +2810,15 @@ void Comb::FrameBuffer::split2D()
 
     std::vector<std::complex<double>> frameIQ;
     std::vector<std::complex<double>> frameAIQ;
-    // A COVERED FRAME CALLS NO CANDIDATE AND HOLDS NO ELECTION (user,
-    // 2026-08-22): "split2D must only move the certified carrier into place
-    // and otherwise call nothing for that field, while it calls only Frame C
-    // for comp lines. The election and its candidates are not even called
-    // save for uncovered frames. 1D remains the fallback for the whole
-    // section."
+    // A covered frame does not enter the uncovered-frame candidate election.
+    // Certified def lines pass through the certified center; covered comp lines are
+    // handled only by Frame C. Candidate construction, scoreFieldVsFrame, and comb
+    // attribution are therefore skipped for covered lines.
     //
-    // Frame C was created as the single, independently controllable 2D comb
-    // for covered frames, whose challenge is unlike the uncovered one. It had
-    // been reaching the picture as an emit-stage OVERRIDE -- every candidate
-    // was still built and the election still held, and Frame C then discarded
-    // the result on the lines it owned. Worse, where Frame C declined a comp
-    // line the full election stood. This is the gate that was intended: on a
-    // covered frame the candidates, scoreFieldVsFrame and
-    // collectCombAttributionEvidence are never entered at all, which is also
-    // where the wasted CPU was.
-    //
-    // Skipping the per-line plane writes is safe here: init() reassigns
-    // attributionEvidence_flat to default records per frame under wantLocked,
-    // so a line this path does not write reads as a default record, never a
-    // neighbour's (the 2026-08-16 cross-frame-drag lesson).
-    //
-    // Named candidate renders obey the covered-frame construction too.  A
-    // diagnostic selector can choose a candidate only where candidates are
-    // lawful; covered def lines remain certified facts and covered comp lines
-    // remain Frame C.
+    // Per-frame attribution storage is initialized to default records, so skipped
+    // covered lines read as defaults rather than inherited neighbour state. Named
+    // candidate diagnostics obey the same routing: candidate selectors apply only
+    // where candidate construction is lawful.
     const bool coveredNoElection =
         configuration.phaseCompensation &&
         certifiedOneDLevel() >= 2 &&
@@ -3137,15 +3016,10 @@ void Comb::FrameBuffer::split2D()
                         }
                     }
                 } else if (computeFrameCLine(line, scratch_frameC)) {
-                    // FRAME C (user, 2026-08-22): a covered frame is not an
-                    // election regime. Certified def lines pass through --
-                    // every candidate above already ceded to the certified
-                    // center, so the mix below is unanimous -- and comp
-                    // lines are bootstrapped toward the certified defs by
-                    // the plain Frame C comb. computeFrameCLine owns the
-                    // gate and declines every line that is not a covered
-                    // comp line with a certified leg, so the election below
-                    // is untouched everywhere else.
+                    // FRAME C owns covered comp lines. Certified def lines pass through the center;
+                    // comp lines are bootstrapped toward certified def neighbours by the plain Frame C
+                    // comb. computeFrameCLine declines all other lines, which remain on the ordinary
+                    // path.
                     for (int rel = 0; rel < width; ++rel)
                         emitSelected(rel, scratch_frameC[rel]);
                     if (writeWeights && line < (int)w2d_frame_weight.size())
@@ -3209,28 +3083,14 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
     const int left      = videoParameters.activeVideoStart;
     const int right     = videoParameters.activeVideoEnd;
 
-    // ---- Acceptance uniformity (user-directed, 2026-07-28) ----
+    // ---- Acceptance uniformity ----
     //
-    // The parked failure of the temporal grammar was line-to-line striping,
-    // and its mechanism is now named: getCandidate biases a Same-relation
-    // partner by +3.0 against an Opposite one, and WHICH relation a line
-    // gets alternates with line parity. So the temporal SHARE of the blend
-    // alternated by line -- adjacent lines received different AMOUNTS of
-    // temporal correction. That is the uniform-render law again, in the
-    // acceptance rather than the values.
-    //
-    // The cure follows this codebase's own precedent (the cross-colour
-    // suppression verdict is vertically mixed and laterally boxcar'd into
-    // an envelope before it scales any chroma, so suppression cannot
-    // alias): decide per pixel, then make the DECISION STRENGTH spatially
-    // coherent before it acts. Pass 1 computes each pixel's temporal mean
-    // and its raw share; pass 2 smooths the SHARE FIELD -- a weight, never
-    // the composite -- with a vertical [1,2,1] (which weights the two
-    // parities equally, so a parity-alternating share cannot survive it)
-    // and a lateral boxcar of about one carrier cycle; then it blends.
-    // Members still face their binary vetoes in pass 1 (getCandidate
-    // legality, the 2D-anchored hull), and a convex blend of hull-passing
-    // members stays inside the hull.
+    // Temporal contribution is represented as a share field. Pass 1 computes each
+    // pixel's temporal mean and raw share; pass 2 makes that decision strength
+    // spatially coherent with vertical [1,2,1] mixing and a lateral boxcar of roughly
+    // one carrier cycle, then blends the values. The filter acts on weights, never on
+    // composite samples. Binary candidate legality and the 2D-anchored hull are
+    // enforced before smoothing, and convex blending preserves the hull.
         const int width = right - left;
         if (width <= 0 || firstLine >= lastLine) return;
         const size_t n = static_cast<size_t>(lastLine) * static_cast<size_t>(width);
@@ -3248,16 +3108,10 @@ void Comb::FrameBuffer::split3D(const FrameBuffer &previousFrame,
                 continue;
             const double *lockedRow = configuration.phaseCompensation
                 ? combSource1D_line(line) : nullptr;
-            // GILGOL BAND LAW (user, 2026-08-21: "if vertical neighbors
-            // are allowed they have to submit to the same grail rule we
-            // just applied to the Y election"). The discovered
-            // chroma-boundary band is the transcendent term (Field B
-            // publishes it; the vertical pass smooths it). Inside the
-            // band, the FIELD members -- the temporal blend's vertical
-            // values (line -/+ 1, cross-frame or self-frame fallback) --
-            // are not evidence and take no seat. The FRAME centers reach
-            // along time at the same line and stay lawful, as does the 2D
-            // reference (Field B's own cede already governs it).
+            // CHROMA-BOUNDARY BAND LAW. Inside a published boundary band, vertical FIELD
+            // members are excluded from the temporal blend because their vertical support
+            // crosses the same region boundary. Same-line FRAME centers and the 2D reference
+            // remain eligible.
             const std::uint8_t *bandRow = chromaBoundaryBand_line(line);
             const TemporalEvidenceStanding standing =
                 temporalEvidenceStanding(line, previousFrame, nextFrame);
@@ -3385,27 +3239,11 @@ bool Comb::FrameBuffer::frameHasExactCoverage() const
 }
 
 // 3D Election
-// THE BASELINE IS UNCONDITIONAL (author, 2026-08-08: "Baseline should act as
-// before"; "My mandate for 3D was exclusively about the change in penalties
-// when certified").
 //
-// FIELD_BONUS and FRAME_BONUS are the comb election's own structural
-// preference for a temporal candidate over a line candidate, and they long
-// predate certification. They are granted here with no test of any kind, so
-// material that carries no certification at all -- non-cadence, no-info,
-// LDCD_CERT_1D=0 -- elects exactly as it always did. An earlier form made the
-// grant itself conditional on coverage, which withdrew the preference from
-// every uncovered stream: exactCarrier_flat is allocated all-NaN on every
-// frame, so the isfinite test failed everywhere and both bonuses read zero on
-// material where certification never enters the question. That was outside
-// the mandate.
-//
-// Certification adds an INCREMENT on top, because a certified source is
-// trusted further. It is deliberately small: the 2D similarity curve
-// (AGREEMENT_REWARD_*) already jacks these up where the candidates agree
-// beyond this, and the two must not stack excessively -- which is why the
-// frame bonus was reduced in the first place. Certified totals are -5.0 and
-// -6.0 against the -4.0 / -5.0 baseline.
+// FIELD_BONUS and FRAME_BONUS are unconditional structural preferences of the comb
+// election. Certification adds a separate increment only when the corresponding
+// source carries certified coverage. The certified increment is deliberately
+// small so it does not stack excessively with the agreement-reward curve.
 static constexpr double LINE_BONUS  = -2.0;
 static constexpr double FIELD_BONUS = -4.0;
 static constexpr double FRAME_BONUS = -5.0;
@@ -3574,27 +3412,11 @@ void Comb::FrameBuffer::getBestCandidate(qint32 lineNumber, qint32 h,
 
     // --- Agreement Reward Shaping ---
     //
-    // Old behavior:
-    //
-    //     d = abs(candidate.sample - current clpbuffer[1]) / irescale
-    //
-    // That was a same-pixel scalar chroma/bandpass comparison. It rewarded
-    // temporal candidates for matching the current 2D chroma grid and punished
-    // candidates that diverged from that grid.
-    //
-    // New behavior:
-    //
-    //     d = candidate.yPen
-    //
-    // getCandidate() has already computed yPen from reconstructed luma:
-    //
-    //     Y = raw - clpbuffer[1]
-    //
-    // over a small cross neighborhood. Reusing yPen avoids another comparison
-    // and prevents compact-color checkerboard disagreement in chroma space from
-    // automatically vetoing a picture-compatible temporal candidate. Beyond
-    // the reward lobe, disagreement is deliberately neutral; split3D applies
-    // the independent-estimate output hull after the election.
+    // Agreement distance is candidate.yPen, computed by getCandidate() from
+    // reconstructed luma over the local spatial cross. Reusing yPen keeps the reward
+    // in the luma domain and avoids treating chroma-grid disagreement itself as a
+    // picture disagreement. Beyond the reward lobe, disagreement is neutral; split3D
+    // applies the independent-estimate output hull after election.
     if (configuration.dimensions == 3 && configuration.adaptive) {
         const auto &T = configuration.tunables;
 
@@ -3861,11 +3683,11 @@ void Comb::FrameBuffer::doYNR()
     }
 }
 
-// Final chroma rotation and gain: rotates the I/Q plane by chromaPhase degrees
-// and scales by chromaGain, converting from the internal demod basis to the
-// standard Y'UV colour axes. The locked path now applies the front half of its
-// base hue rotation before filterIQLocked() so the axis-specific FIRs see the
-// expected orientation; the output half here preserves the same total hue.
+// Final chroma rotation and gain rotate the I/Q plane by chromaPhase degrees and
+// scale by chromaGain to produce the standard Y'UV colour axes. In locked mode,
+// the front half of the base hue rotation is applied before filterIQLocked() so
+// the axis-specific FIRs operate in the intended orientation; this stage applies
+// the remaining output rotation.
 void Comb::FrameBuffer::transformIQ(double chromaGain, double chromaPhase)
 {
     if (configuration.phaseCompensation) {

@@ -139,8 +139,7 @@ struct CarrierResidualDiagnostics {
     float optionSamples[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     // Kept as doubles because bounded application policy clamps the original
     // double-precision source to these exact observed survivors. Publishing
-    // them must not introduce a new quantization step versus the pre-extraction
-    // construction.
+    // them preserves the observed precision.
     double survivorLo = 0.0;
     double survivorHi = 0.0;
     float movingResidualSample = 0.0f;
@@ -188,7 +187,7 @@ struct CarrierParallaxDiagnostics {
 // Schedule-conformance verdict, registered at analysis time in grammar
 // coordinates.  Legal carrier must invert across Opposite-relation partners
 // (same-field +/-2 lines; the same line on the neighbouring frame).  Energy
-// that instead MATCHES where the schedule demands inversion is structurally
+// that instead matches where the schedule demands inversion is structurally
 // not carrier — luma by law (near-carrier periodic luma, e.g. a fine static
 // grid).  This is registration-with-rejection: the verdict is a fact of the
 // table, not a downstream confidence score, and consumers convert it via
@@ -206,57 +205,26 @@ struct CarrierAnalysisRecord {
     float carrierImpurity = 0.0f;       // detector output, not transfer policy
     CarrierScheduleConformance scheduleConformance =
         CarrierScheduleConformance::Unresolved;
-    // Graded conformance MEASUREMENT (scanner layer).  carrierConformance in
+    // Graded conformance measurement (scanner layer). carrierConformance in
     // [-1,+1]: relation-signed correlation of carrier-band energy against
     // grammar-certified Opposite partners.  -1 = inverts like ideal carrier;
     // +1 = matches where the schedule demands inversion (luma by law).
-    // conformanceUsableAxisFraction preserves the legacy availability input
-    // consumed by existing comb reach policy. conformanceSupportFraction is
-    // the distinct fraction of the three possible axes SUPPORTING the sign
-    // selected for carrierConformance. Availability alone is not support: one
-    // legal-looking axis among three remains 1/3 in the latter, rather than
-    // receiving full authority merely because three were usable. New ownership
-    // policy should consume the named supporting fraction; changing an existing
-    // consumer requires a separate, candidate-specific validation.
+    // conformanceUsableAxisFraction records the fraction of usable axes.
+    // conformanceSupportFraction records the fraction of possible axes
+    // supporting the selected sign. Availability and support remain separate:
+    // one legal-looking axis is 1/3 support even when all three axes are usable.
     float carrierConformance = 0.0f;
     float conformanceUsableAxisFraction = 0.0f;
     float conformanceSupportFraction = 0.0f;
     // Contradiction is a distinct observation from absence.  This is the
-    // fraction of the three possible axes that decisively voted AGAINST the
+    // fraction of the three possible axes that decisively voted against the
     // sign selected for carrierConformance (e.g. a matching axis when the
     // selected sign is legal-inverting).  An axis that is below the energy
-    // floor or non-decisive abstains and appears in NEITHER fraction.
-    // Collapsing "not observed" and "observed conflicting" into the support
-    // count was the evidence-compression bug that made schedule licenses
-    // demand multi-axis corroboration (a run-length tax in the axis
-    // dimension): one decisive on-schedule inversion IS compatibility, and
-    // only an observed contradiction may revoke it.
+    // floor or non-decisive abstains and appears in neither fraction.
+    // Unobserved axes and observed contradictions are separate outcomes. Only
+    // an observed contradiction can revoke a legal support vote.
     float conformanceContradictionFraction = 0.0f;
 };
-
-// Decision layer: schedule-compatibility LICENSE for subtracting/confiscating
-// a fitted carrier from Y.  Grammar compatibility is not corroboration: one
-// axis observed decisively inverting on schedule licenses the operation at
-// any spatial scale (microscopic runs included), and only an observed
-// decisive contradiction (an axis MATCHING where the schedule demands
-// inversion -- luma by law, e.g. a fine static grid) revokes it.  Absent or
-// abstaining axes do neither.  The graded part is decisiveness of the best
-// supporting axis (same -0.5 vote / -0.9 saturation ramp as
-// carrierLegalProof); the axis COUNT contributes nothing.
-inline double carrierScheduleLicense(double conformance,
-                                     double supportFraction,
-                                     double contradictionFraction)
-{
-    if (contradictionFraction > 0.0)  // observed contradiction: fail closed
-        return 0.0;
-    if (supportFraction <= 0.0)       // nothing observed: no license
-        return 0.0;
-    constexpr double kLegalVote = 0.5;
-    constexpr double kLegalFull = 0.9;
-    double t = (-conformance - kLegalVote) / (kLegalFull - kLegalVote);
-    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
-    return t * t * (3.0 - 2.0 * t);
-}
 
 // Decisiveness ramp shared by schedule-compatibility licenses: input is a
 // relation-signed correlation where -1 means "behaves like legal carrier".
@@ -274,15 +242,15 @@ inline double scheduleAlternationLicense(double signedCorr)
     return t * t * (3.0 - 2.0 * t);
 }
 
-// Decision layer, luma side: the single table-owned mapping from the
-// conformance MEASUREMENT to a luma-attribution PROOF in [0,1].  This is
+// Decision layer, luma side: the table-owned mapping from conformance
+// measurement to a luma-attribution proof in [0,1]. This is
 // conservative because a suppression consumer acting on ambiguous evidence
 // desaturates genuine chroma --
 // at a hue boundary the correlation windows straddle two hues, no axis can
 // produce a decisive legal vote, and the stored conformance is a weakly
-// positive maxCorr that MEANS "unresolved", not "luma".  The registration
+// positive maxCorr that means "unresolved", not "luma". The registration
 // layer's own tie-break is "real chroma is never claimed as luma", so the
-// proof stays ZERO through the entire ambiguous middle and engages only
+// proof stays zero through the ambiguous middle and engages only
 // past +kIllegalVote -- the same threshold at which an axis casts a
 // ScheduleIllegal vote -- ramping smoothly (no verdict flip at pixel pitch)
 // and scaled by confidence so a thin axis set cannot assert a full proof.
@@ -304,10 +272,10 @@ inline double carrierIllegalProof(double conformance, double confidence)
     return c * p;
 }
 
-// Mirror image: certified-legal-carrier proof.  Nonzero only when the
-// bandpass decisively INVERTS across Opposite partners (conformance past
+// Mirror image: certified-legal-carrier proof. Nonzero only when the
+// bandpass decisively inverts across Opposite partners (conformance past
 // the legal vote threshold), i.e. this pixel is proven genuine chroma.
-// Consumers use it as spatial context: ambiguity BORDERING a certified
+// Consumers use it as spatial context: ambiguity bordering a certified
 // region is a hue boundary (protect), ambiguity in a legality desert is
 // actionable.
 inline double carrierLegalProof(double conformance, double confidence)
@@ -391,24 +359,13 @@ inline CarrierResidualDiagnostics analyzeCarrierResidualOptions(
     return out;
 }
 
-// Encoder band-legality revocation (the bandwidth law).  Chroma was
-// bandlimited (nominally 1.3 MHz) BEFORE modulation, so demod-envelope
-// energy outside the legal band cannot be chroma — its chroma claim is
-// revoked by law, no detector consulted.  The revocation is ONE-SIDED: it
-// unclaims chroma; it never asserts luma.  Measured on certified material
-// (2026-07-31): the exact carrier is band-clean beyond 1.3 MHz, and the
-// revoked residue is mostly broadband capture noise — reassigning it to Y
-// without evidence follows raw's noise into the quieter luma.  So the
-// residue moves to Y only on AFFIRMATIVE luma evidence (a temporal
-// certified-luma witness, a star signature, certified continuation);
-// revoked-but-unwitnessed energy is uncertainClaim and abstains — the
-// silent discard is the correct verdict for it, not a loss to be fixed.
-//
-// The witness contract is precision-first ("real chroma is never claimed
-// as luma"): an admissible witness may under-fire freely (abstention is
-// its correct failure mode) but must rarely fire falsely.  A temporal
-// certified-luma tween measured precision 0.70 / claimed-magnitude 0.84
-// at double the deployed pitch — admissible as a WEIGHT, never a value.
+// Encoder band-legality revocation (the bandwidth law). Chroma is bandlimited
+// to the nominal 1.3 MHz legal band before modulation, so demod-envelope
+// energy outside that band cannot be chroma. Revocation is one-sided: it
+// removes a chroma claim but never asserts luma. A residue may move to luma
+// only with affirmative luma evidence; otherwise it remains uncertain.
+// Witnesses are precision-first: they may abstain, but must not claim genuine
+// chroma as luma.
 struct BandRevokedResidueEvidence {
     double residueIRE = 0.0;       // out-of-legal-band envelope magnitude
     double witnessMatchIRE = 0.0;  // witness luma structure at this site
@@ -426,43 +383,6 @@ inline double bandResidueLumaClaim(const BandRevokedResidueEvidence &e)
         return 0.0;
     const double match = std::min(e.witnessMatchIRE, e.residueIRE);
     return clamp01(match / e.residueIRE) * clamp01(e.witnessSupport);
-}
-
-struct CarrierImpurityEvidence {
-    double narrowMagIRE = 0.0;
-    double wideMagIRE = 0.0;
-    double phaseAgreement = 0.0;
-    double carrierCoherence = 0.0;
-    double carrierConflict = 0.0;
-    double lumaMembership = 0.0;
-};
-
-inline double detectCarrierImpurity(const CarrierImpurityEvidence &e)
-{
-    if (e.narrowMagIRE <= 1.5 || e.wideMagIRE >= e.narrowMagIRE)
-        return 0.0;
-
-    const double excessFraction = std::clamp(
-        (e.narrowMagIRE - e.wideMagIRE) /
-            std::max(1.5, e.narrowMagIRE),
-        0.0,
-        1.0);
-
-    const double lumaSupport = std::max(
-        clamp01(e.lumaMembership),
-        clamp01(e.carrierConflict));
-
-    const double coherentChromaProtect =
-        clamp01(e.phaseAgreement) *
-        clamp01(e.carrierCoherence) *
-        (1.0 - clamp01(e.carrierConflict));
-
-    const double classification = std::clamp(
-        0.20 + 0.80 * lumaSupport - 0.65 * coherentChromaProtect,
-        0.0,
-        1.0);
-
-    return excessFraction * classification;
 }
 
 inline FourViewCarrierAttribution buildFourViewCarrierAttribution(
@@ -742,39 +662,6 @@ inline double computeUncertainAttribution(double lumaClaim,
     default:
         return clamp01(1.0 - std::max(clamp01(lumaClaim), clamp01(chromaClaim)));
     }
-}
-
-inline double combinedCarrierChromaCoherence(const AttributionEvidence &e)
-{
-    return std::max({
-        e.carrierChromaCoherence,
-        e.carrierPhaseCoherence,
-        e.compositeChromaCoherence,
-        e.compositeCarrierCoherence,
-        e.compositeLinePatternCoherence,
-        e.compositeFieldCoherence,
-        e.compositeBoundaryCoherence,
-        e.compositeStableSideCoherence,
-        e.carrierPlausibility,
-        e.sidebandCoherence
-    });
-}
-
-inline double combinedEnvelopeChromaCoherence(const AttributionEvidence &e)
-{
-    return std::max({
-        e.iqChromaCoherence,
-        e.iqEnvelopeCoherence,
-        e.chromaEnvelopeCoherence
-    });
-}
-
-inline double strongestChromaCoherence(const AttributionEvidence &e)
-{
-    return std::max({
-        combinedCarrierChromaCoherence(e),
-        combinedEnvelopeChromaCoherence(e)
-    });
 }
 
 inline double combinedAttributionChromaClaim(const AttributionEvidence &e,

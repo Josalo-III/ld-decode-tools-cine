@@ -71,16 +71,12 @@ static inline double combSimilarityFactor(double sim, double start, double full)
     return std::clamp(t, 0.0, 1.0);
 }
 
-// Geometry-only evidence for a compact luma excursion.  This replaces the
-// old fixed +/-2 comparison: an optically broadened star can still be sitting
-// on its own shoulder at two samples, so that aperture measured little or
-// nothing.  Each wider read must show the same background on both sides and
-// stable outer flanks; a step or an extended texture therefore does not become
-// an impulse merely because one radius happens to be symmetric.
-//
-// Carrier legality is intentionally absent here.  This service publishes the
-// luma shape once as lumaImpulseRisk; each downstream consumer combines that
-// named fact with its own carrier evidence and policy.
+// Geometry-only evidence for a compact luma excursion. The detector tests several
+// symmetric radii because an optically broadened impulse may still sit on its own
+// shoulder at a single radius. Each accepted radius requires the same background
+// on both sides and stable outer flanks, excluding steps and extended texture.
+// Carrier legality is intentionally absent: this service publishes only the luma
+// shape evidence for downstream consumers to combine with their own carrier facts.
 static inline double compactLumaExcursionEvidence(
     const double *luma, int x, int width, double invIreScale)
 {
@@ -131,90 +127,25 @@ static inline double compactLumaExcursionEvidence(
 
 namespace {
 
-constexpr std::uint8_t FieldACedeCenter       = 1u << 0;
-constexpr std::uint8_t FieldACedeStrongAsym   = 1u << 1;
-
-std::uint8_t fieldARegionCedeFlags(
-    const CombContentReach::IntrafieldRegionReach &region)
-{
-    using R = CombContentReach::RegionRelation;
-    if (!region.valid) return 0;
-
-    const bool upDifferent = region.up == R::DifferentRegion;
-    const bool downDifferent = region.down == R::DifferentRegion;
-    const bool upSame = region.up == R::SameRegion;
-    const bool downSame = region.down == R::SameRegion;
-    const bool upAlien = region.up == R::AlienCancel;
-    const bool downAlien = region.down == R::AlienCancel;
-    const bool upContinues = upSame || upAlien;
-    const bool downContinues = downSame || downAlien;
-
-    std::uint8_t flags = 0;
-    if (region.centerIsland) flags |= FieldACedeCenter;
-    if (region.strongAsym)
-        flags |= FieldACedeCenter | FieldACedeStrongAsym;
-    if ((upDifferent && !downContinues) ||
-        (downDifferent && !upContinues))
-        flags |= FieldACedeCenter;
-
-    // Preserve Field A's prior refusal thresholds, but keep their ownership
-    // here: Field B is free to evolve a different one-leg policy.
-    constexpr double strongSameMax = 3.25;
-    constexpr double weakSameMax = 4.25;
-    constexpr double rejectMin = 5.25;
-    constexpr double rejectGap = 2.25;
-    auto credibleOneSide = [&](double sameDiff, double rejectDiff) {
-        return sameDiff <= strongSameMax ||
-            (sameDiff <= weakSameMax && rejectDiff >= rejectMin &&
-             rejectDiff - sameDiff >= rejectGap);
-    };
-    if (upDifferent && downSame &&
-        !credibleOneSide(region.downDifferenceIRE, region.upDifferenceIRE))
-        flags |= FieldACedeCenter;
-    if (downDifferent && upSame &&
-        !credibleOneSide(region.upDifferenceIRE, region.downDifferenceIRE))
-        flags |= FieldACedeCenter;
-    if ((upAlien && !downContinues) || (downAlien && !upContinues))
-        flags |= FieldACedeCenter;
-    return flags;
-}
-
 // ---------------------------------------------------------------------------
-// Frame B's ±1 operand admission (user, 2026-08-24).
+// Frame B ±1 operand admission.
 //
-// Frame A's good behaviour is inherent to being an average: its output cannot
-// leave the hull of its operands, so a leg from the wrong chroma region costs
-// half its error and no more. Frame B is the opposite estimator by design --
-// FVF needs the choice -- and a subtractor leaves that hull as a matter of
-// course. With centre at 0, a Same leg at +10 sitting in another region and
-// the Opposite leg at 0, Frame B publishes -5: colour of a sign no
-// participating line carried.
+// Frame B is a subtractive estimator, so an operand from a different chroma region
+// can drive the result outside the hull of the observed lines. Reach therefore
+// controls operand admission rather than scaling correction strength.
 //
-// The one thing that DOES port from Frame A is its separation of powers --
-// "reach decides which complementary observations are safe; it does not scale
-// the midpoint itself". So this is operand ADMISSION, hard, and never a
-// strength scaler. Frame B has already falsified the continuous form: every
-// gate it used to carry (ratioGate, rideGate, midLicense) multiplied the
-// correction, and its own note records the outcome -- "a gate that lingers at
-// half strength subtracts half the alien and leaves a parity-alternating
-// residue: partial correction is the worst geometry".
-//
-// ONE floor governs both rungs below. They answer the same question, and a
-// second threshold would only be a second thing to be wrong. It sits at twice
-// Field B's evidence floor because ±1 partners are one TV line apart and share
-// more content than the ±2 pair, so a separation that convicts at the
-// intrafield step is not yet major here -- the same reasoning that puts
-// FRAME_LUMA_EDGE_THRESH_IRE at 28 against Field's 18.
+// One floor governs both legs. The ±1 partners are one TV line from center, so
+// kFrameBMajorIRE is set above the intrafield region floor. A leg marked
+// DifferentRegion at or above that difference is not admitted to the refusal-band
+// seed; both legs are acted on symmetrically at the band level.
 constexpr double kFrameBMajorIRE = 12.0;
 constexpr double kFrameBRegionChromaFloorIRE = 5.0;
 
-// Independent carrier-free luma evidence.  One differing leg is an ordinary
-// coverage transition; two same-signed departures prove that center itself is
-// outside the rational luma range of its vertical neighbourhood.  Keep each
-// leg beyond the measured 4-5 IRE noise floor, while allowing the island to be
-// asymmetric when the two departures together retain the former 2 * 6 IRE
-// corroboration.  This catches a partial middle band without turning a moving
-// one-sided edge into a Frame B cancellation outage.
+// Independent carrier-free luma evidence. One differing leg is an ordinary
+// coverage transition; two same-signed departures place center outside the
+// rational luma range of its vertical neighbourhood. Each leg must exceed the
+// 5 IRE near-departure floor and the combined departure must reach 12 IRE, which
+// admits asymmetric islands without classifying a one-sided moving edge as one.
 constexpr double kFrameBLumaIslandNearIRE = 5.0;
 constexpr double kFrameBLumaIslandTotalIRE = 12.0;
 
@@ -240,25 +171,14 @@ inline bool frameBLumaIslandSeed(double centerIRE,
            totalDeparture >= kFrameBLumaIslandTotalIRE;
 }
 
-// SYMMETRY LAW (author, 2026-08-25): "If same and opposite alternate per
-// column, they cannot behave differently or the zippers are inevitable."
+// SYMMETRY LAW.
 //
-// The two legs cannot be refused INDIVIDUALLY, because refusing one is not the
-// same operation as refusing the other and never can be. Only the Opposite leg
-// carries the alien with a flipped sign, so it is the only leg that can expose
-// it: refuse the Same leg and centre stands in for it exactly (centre is
-// Same-relation to itself) and the correction keeps full strength; refuse the
-// Opposite leg and there is no alien measurement left at all. Full correction
-// versus none -- and which leg is refused varies per column, so adjacent
-// columns alternate between the two. That alternation is the zipper, and it
-// cannot be symmetrised away: the asymmetry is physical, not a policy choice.
-//
-// So this verdict is a BAND INPUT ONLY. It decides nothing on its own; it
-// contributes to frameBBandSeed, where both legs are refused together and the
-// operation is identical whichever leg fails. Measured on the beach: as a
-// standalone rung it fired on 2.9% of columns, 43-69% of them at a 20-40 IRE
-// lateral luma step -- a per-column asymmetry concentrated exactly along the
-// garment edges where the zippers were seen.
+// Same and Opposite roles alternate by column, so per-leg refusal would produce
+// different operations on adjacent carrier phases. Refusing Same substitutes the
+// center and preserves a full alien estimate; refusing Opposite removes the alien
+// measurement entirely. The verdict is therefore band input only: a failure
+// contributes to frameBBandSeed, where both legs are refused together by any
+// consumer that chooses to cede.
 inline bool frameBLegAdmitted(CombContentReach::RegionRelation measured,
                               double differenceIRE)
 {
@@ -266,34 +186,16 @@ inline bool frameBLegAdmitted(CombContentReach::RegionRelation measured,
              differenceIRE >= kFrameBMajorIRE);
 }
 
-// RELATION-LOCKING: what separates the alien from a chroma region.
+// RELATION LOCKING separates an alien term from a chroma-region transition.
 //
-// The author, 2026-08-24: "the error alternates hue, real chroma alternates
-// phase" -- and of the cheek case, "not regional at all". A region evaluator
-// cannot make that distinction, because it is built to answer "regional?" and
-// the thing it must never convict is not regional at all. On the Opposite leg
-// the two are literally the same measurement: centre reads (C + a) against
-// (C - a), so no hue or magnitude threshold can separate a region break from
-// the very alien the interfield comb exists to cancel.
+// An alien term rides center on the Same leg while displacing the Opposite leg by
+// approximately twice the alien amplitude. A real chroma-region transition has no
+// such relation preference. kFrameBRelationLockRatio identifies this asymmetric
+// difference pattern and exempts relation-locked alien cancellation from the
+// region-boundary interpretation.
 //
-// The separation this file already recorded is that the alien is RELATION-
-// LOCKED: it "leaves the Same leg riding center (dSame ~ 0) while displacing
-// the Opposite leg by twice the alien (dOpp ~ 2a)". Real chroma has no such
-// preference. Measured at the columns being convicted, mean dSame/dOpp:
-//
-//     lateral luma delta   <5    5-10   10-20   20-40   40+
-//     dSame/dOpp          0.83-  0.48-  0.24-   0.10-   0.08-
-//                          1.00   0.67   0.41    0.24    0.11
-//
-// Flat material convicts symmetric differences -- real regions. Jennifer's
-// cheek convicts at 10:1 -- the alien, every time.
-//
-// This is the measurement the retired ratioGate made. What was wrong with that
-// gate was never the measurement but the ACTUATOR: it multiplied the
-// correction, and a lingering half-strength subtraction "leaves a
-// parity-alternating residue: partial correction is the worst geometry". Here
-// the same fact admits or refuses an OPERAND, which is Frame A's separation of
-// powers and the one thing that ports.
+// The measurement is used for binary admission/band evidence only; it never scales
+// Frame B's subtraction strength.
 constexpr double kFrameBRelationLockRatio = 0.5;
 
 // True when the column's vertical difference belongs to the carrier rather
@@ -319,12 +221,9 @@ inline bool frameBBandSeed(const CombContentReach::IntrafieldRegionReach &r,
                            bool sameIsUp,
                            bool lumaIsland)
 {
-    // The alien is never a region boundary. A relation-locked triplet -- Same
-    // leg riding centre while the Opposite leg is displaced by twice the alien
-    // -- is the cross-colour this comb exists to cancel, whatever its hue and
-    // magnitude say. This exemption used to sit on the per-leg rung; it lives
-    // here now, because the band is the only refusal left and it must not be
-    // the thing that stands the comb down at a luma transition.
+// A relation-locked triplet is treated as alien cancellation rather than a region
+// boundary. The exemption is applied at the shared refusal-band seed so the Same
+// and Opposite legs remain symmetric.
     const bool strictThreeRegionViolation =
         !frameBLegAdmitted(r.upMeasured, r.upDifferenceIRE) &&
         !frameBLegAdmitted(r.downMeasured, r.downDifferenceIRE) &&
@@ -353,55 +252,19 @@ inline bool frameBBandSeed(const CombContentReach::IntrafieldRegionReach &r,
     return chromaViolation || lumaIsland;
 }
 
-double fieldContourGate(const CombContentReach::MovingCoarseContour &mc,
-                        bool up)
-{
-    if (!mc.valid) return 1.0;
-    const double trust = up ? mc.upTrust : mc.downTrust;
-    return 0.25 + 0.75 * std::clamp(trust, 0.0, 1.0);
-}
 
 // ---------------------------------------------------------------------------
-// Retained physical record from the removed LDCD_PROBE_FRAMEB census.
+// Frame B registration model.
 //
-// Frame B's job is to cancel vertically-invariant image-locked colour left by
-// 1D without softening the picture.  Its registered signed pair difference
-// estimates that alien directly; Frame A owns the separate midpoint model.
+// Frame B cancels vertically invariant image-locked colour while retaining a
+// registered ±1 pair. Registration is derived from luma geometry, not from the IQ
+// material being cancelled. A diagonal advance is published once per line and
+// Frame B rounds that fact to the integer shift its ±1 aperture can justify.
 //
-// Standing vs alternating decomposition of the blind 1D bandpass at the
-// Frame B (+-1) and Field B (+-2) geometries. Real chroma ALTERNATES
-// between carrier-opposite lines; the bandpass leak of a vertical luma
-// edge is IDENTICAL on every line (same D^2 Y), i.e. STANDING -- and a
-// standing carrier-band component is invisible to a difference comb:
-// center - neighbor = 0. If standing energy dominates at strong image
-// verticals, the un-cancelled 74% is not an authority problem at all.
-//
-// Up/down leak asymmetry at verticals, from the carrier-free aperture
-// means: the alternating alien per line follows that line's lateral
-// luma curvature (leak = -0.25 * D^2_2 Y), so the +-1 midpoint's
-// residual fraction is |D2up - D2dn| / (D2up + D2dn). If this ratio is
-// large, a_up != a_dn and the midpoint CANNOT null the alien -- the
-// 29% delivery is then a model limit, not a licence problem.
-//
-// kappa_FB regression: |pairDiff| (IQ IRE, = the alien SUM the +-1 pair
-// exposes) against (D2u + D2d) (composite IRE, the luma prediction of
-// that same sum). The slope carries BOTH the leak transfer and the
-// fullSignedIQ-vs-composite scale factor, which is exactly what the
-// residual predictor needs. Restricted to strong verticals with a clear
-// alien signature so real vertical chroma difference does not dominate.
-//
-// Sub-sample REGISTRATION between the centre line and each +-1 leg,
-// estimated from carrier-free aperture means only. At a true image
-// vertical the luma at a given x is the same on every line, so any
-// difference is a horizontal shift: delta ~= (Yleg - Yc) / (dY/dx).
-// Split by centre-line parity because under progressive telecine the
-// +-1 legs are the OTHER field -- a field-to-field registration error
-// must therefore alternate sign with parity, while a genuine image
-// slope does not. Leg disagreement was correlated against both the
-// lateral GRADIENT (registration) and the CURVATURE (leak) to separate
-// the two.
-// ---------------------------------------------------------------------------
-
+// The registered pair is interpreted in the center line's carrier relation before
+// forming the signed alien estimate. The correction remains pointwise at the
+// adopted coordinates; registration changes where the pair is sampled, not the
+// estimator's gain.
 } // namespace
 
 void Comb::FrameBuffer::invalidateCombTapCache()
@@ -418,11 +281,9 @@ void Comb::FrameBuffer::invalidateCombTapCache()
               std::uint8_t{0});
 }
 
-// Fill the 7-tap smoothed signed-IQ row for `line` once per frame.  The
-// balanced end-weighted aperture (0.5,1,1,1,1,1,0.5) now smooths the
-// integer-centred baseband products published by buildPhaseCorrected1D.
-// Normalize by its total weight (6): the input already has the full-signed-IQ
-// scale, so no carrier-lattice compensation remains to be done here.
+    // Fill the 7-tap smoothed signed-IQ row for `line` once per frame. The balanced
+    // end-weighted aperture (0.5,1,1,1,1,1,0.5) smooths the integer-centred baseband
+    // products and normalizes by total weight 6, preserving the full signed-IQ scale.
 void Comb::FrameBuffer::ensureSmoothedLockedRow(int line)
 {
     if (line < 0 || line >= demodLines)
@@ -524,15 +385,12 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         return r;
     };
     
-    // Same-field taps use active-boundary mirror resolution.  If the requested
-    // outward partner is missing but the inward same-field partner exists, resolve
-    // to that inward partner.  This restores the old top/bottom behavior:
-    //
+    // Same-field taps use active-boundary mirror resolution. If the requested outward
+    // partner is missing and the inward same-field partner exists, resolve to that
+    // partner:
     //   top active row:    U2 resolves to D2
     //   bottom active row: D2 resolves to U2
-    //
-    // The same rule is applied to ±4 so Field A's wider same-field context does
-    // not silently clamp to arbitrary active lines.
+    // The same rule applies to ±4 taps.
     auto resolveSameFieldTap = [&](int primaryOffset, int mirrorOffset)->ResolvedTap {
         ResolvedTap r;
         r.req = lineNumber + primaryOffset;
@@ -660,16 +518,9 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
 
     auto getCompRow = [&](int ln)->const double* {
         if (ln < first || ln >= last) return nullptr;
-        // Fact-family injection is covered-only. On uncovered frames this is
-        // the ordinary 1D observation; no two-sided estimate may become a tap
-        // base.
-        //
-        // LDCD_TAP_FACTS is gone (2026-08-28).  It selected between
-        // clpbuffer[0] and locked1DSource_line and was described as
-        // post-injection versus pre-injection, but the locked publish copied
-        // one onto the other verbatim over the same active region, so both
-        // branches addressed the same numbers and the escape could not change
-        // a render.  The locked export is now named directly.
+    // Fact-family injection is covered-only. On uncovered frames the tap base is the
+    // ordinary 1D observation; no two-sided certified estimate may replace it.
+    // Covered positions use the certified source selected by the tap-source rules.
         if (configuration.phaseCompensation)
             return locked1DSource_line(ln);
         return bucketScalar1D_line(ln) + left;
@@ -714,8 +565,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     // second difference of coarse0IRE -- reports the block grid as much as the
     // picture, and luma detail finer than a block is invisible to it.
     //
-    // The solved platform is the one coarse estimate shared by every client.
-    // A private or legacy coarse here would violate compute-once ownership.
+    // The solved platform is the single coarse estimate shared by every client;
+    // private alternate coarse construction is not permitted here.
     const bool combUsesSolved = !lockedLumaSolved_flat.empty();
     auto getLumaRow = [&](int ln)->const double* {
         if (!configuration.phaseCompensation ||
@@ -945,15 +796,10 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                 {lineNumber, tapLine.lnD2, left, left,
                  lddecode::CombReachUse::IQCompare, iqSource});
 
-            // Balanced 7-tap horizontal aggregate, memoised per line.  Even
-            // offsets carry one carrier axis and odd offsets the other, so the
-            // 0.5 end weights equalize the axis sums (3:3) and keep the vector
-            // phase-flat.  The narrow 3-tap vector was noise-limited in
-            // low-saturation skin (hue sigma ~25 deg), so the verdicts
-            // flickered at pixel pitch and one-sided combing toggled column to
-            // column — the beaded fringe on garment edges.  Each line's
-            // smoothed row is computed once (ensureSmoothedLockedRow) and
-            // reused by every center that references it as a ±2/±4 partner.
+    // Balanced 7-tap horizontal aggregate, memoised per line. Even offsets carry one
+    // carrier axis and odd offsets the other, so 0.5 end weights equalize the axis
+    // sums (3:3) and keep the vector phase-flat. The wider aperture supplies stable
+    // region-reach evidence while remaining integer-centred.
             ensureSmoothedLockedRow(tapLine.ln0);
             ensureSmoothedLockedRow(tapLine.lnU2);
             ensureSmoothedLockedRow(tapLine.lnD2);
@@ -1009,8 +855,7 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         downReach.allowIQCompare,
                         invI,
                         5.0,
-                        // Sharp raw ±2 scalar facts: the first-pass AlienCancel
-                        // decision (replaces the former Field B weight revive).
+    // Sharp raw ±2 scalar facts feed the first-pass AlienCancel decision.
                         (rel < (int)tapLine.pairU2.size())
                             ? tapLine.pairU2[rel].diffIRE : -1.0,
                         (rel < (int)tapLine.pairD2.size())
@@ -1154,10 +999,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
                         invI,
                         kFrameBRegionChromaFloorIRE);
 
-                // Frame B's own seed replaces the evaluator's Field-B one on
-                // this row.  Both name the same field because the dilation
-                // below is the shared one; the LAW written into it is Frame
-                // B's, and nothing else reads this row.
+    // Frame B publishes its own refusal-band seed on the shared row. The shared
+    // dilation machinery consumes that seed without changing Frame B's law.
                 r.chromaBoundarySeed =
                     frameBBandSeed(r, sameIsUp, lumaIsland);
                 r.chromaBoundaryBand = r.chromaBoundarySeed;
@@ -1241,14 +1084,11 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
         }
     }
 
-    // There is deliberately no amplitude/compactness-based "chroma shape"
-    // exception here.  High-frequency energy defaults to luma.  Physical
-    // appearance (large envelope, narrow span, isolation, proximity to a luma
-    // edge) may limit a reach that already has carrier authority, but it may
-    // never register that energy as carrier or grant an escape from the comb.
-    // Carrier privileges come from the grammar/conformance tables and their
-    // named consumers.  The retired irrationalChroma path violated this rule
-    // by promoting exactly the fine luma structures the decoder must protect.
+    // There is deliberately no amplitude/compactness-based "chroma shape" exception
+    // here. High-frequency energy defaults to luma. Physical appearance may limit a
+    // reach that already has carrier authority, but it cannot itself register energy
+    // as carrier or grant an escape from the comb. Carrier privileges come only from
+    // the grammar/conformance tables and their named consumers.
 
     {
     if (wantContour) {
@@ -1303,9 +1143,8 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
             return tap[c].raw - tap[c].comp;
         };
         auto fillNotchCoarse = [&](const CombTapScalar *tap, double *out) {
-            // One carrier cycle with integer centroid rel.  The former
-            // [rel-1, rel+2] box was centred at rel+0.5, so locked luma and
-            // fallback notch luma described different horizontal positions.
+            // One carrier-cycle aperture with integer centroid at rel, so locked luma and the
+            // fallback notch luma refer to the same horizontal coordinate.
             for (int rel = 0; rel < width; ++rel) {
                 out[rel] = centeredCarrierCycle4Mean(
                     notchLumaAt(tap, rel - 2),
@@ -1538,105 +1377,13 @@ void Comb::FrameBuffer::buildCombTapLine(int lineNumber, CombTapLine &tapLine)
     tapLine.builtFlags = flags;
 }
 
-static inline double clampCarrierToInputCarrierLimits(
-    double v,
-    std::initializer_list<double> inputs,
-    double fallback)
-{
-    double lo = std::numeric_limits<double>::infinity();
-    double hi = -std::numeric_limits<double>::infinity();
-    double maxAbs = 0.0;
-
-    for (double x : inputs) {
-        if (!std::isfinite(x))
-            continue;
-        lo = std::min(lo, x);
-        hi = std::max(hi, x);
-        maxAbs = std::max(maxAbs, std::fabs(x));
-    }
-
-    if (!std::isfinite(lo) || !std::isfinite(hi))
-        return std::isfinite(fallback) ? fallback : 0.0;
-
-    double out = std::isfinite(v) ? v : fallback;
-    if (!std::isfinite(out))
-        out = 0.0;
-
-    out = std::clamp(out, -maxAbs, maxAbs);
-    return std::clamp(out, lo, hi);
-}
-
-static inline double clampScalarTowardCenterHalf(
-    double v,
-    double center,
-    double leg)
-{
-    if (!std::isfinite(v))
-        return std::isfinite(center) ? center : 0.0;
-    if (!std::isfinite(center) || !std::isfinite(leg))
-        return v;
-
-    const double mid = 0.5 * (center + leg);
-    if (center <= leg)
-        return std::clamp(v, center, mid);
-    return std::clamp(v, mid, center);
-}
-
-static inline double clampCarrierToInputLumaRange(
-    double carrier,
-    double centerRaw,
-    std::initializer_list<double> inputLuma,
-    double fallbackCarrier)
-{
-    if (!std::isfinite(centerRaw))
-        return std::isfinite(fallbackCarrier) ? fallbackCarrier : 0.0;
-
-    double lo = std::numeric_limits<double>::infinity();
-    double hi = -std::numeric_limits<double>::infinity();
-    for (double y : inputLuma) {
-        if (!std::isfinite(y))
-            continue;
-        lo = std::min(lo, y);
-        hi = std::max(hi, y);
-    }
-
-    if (!std::isfinite(lo) || !std::isfinite(hi))
-        return std::isfinite(fallbackCarrier) ? fallbackCarrier : 0.0;
-
-    double out = std::isfinite(carrier) ? carrier : fallbackCarrier;
-    if (!std::isfinite(out))
-        out = 0.0;
-
-    const double yOut = std::clamp(centerRaw - out, lo, hi);
-    return centerRaw - yOut;
-}
-
-static inline double clampCarrierToInputLimits(
-    double carrier,
-    double centerRaw,
-    std::initializer_list<double> inputCarrier,
-    std::initializer_list<double> inputLuma,
-    double fallbackCarrier)
-{
-    // Carrier limits keep the comb estimate plausible in its own signal
-    // domain.  Luma limits are applied last because visible failures are
-    // judged after reconstructing Y = rawCenter - carrier.
-    carrier = clampCarrierToInputCarrierLimits(
-        carrier, inputCarrier, fallbackCarrier);
-    return clampCarrierToInputLumaRange(
-        carrier, centerRaw, inputLuma, fallbackCarrier);
-}
-
-
-// Field A - we sample 2 and 4 lines above and below, with the 4s asymmetrically
-// influencing the 2s,and 2s then influencing the evaluated pixel. Strictly intra-field.
-
 void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
                                            double *outFieldLine,
                                            double *outGate)
 {
     const int width = tapLine.width;
-    if (width <= 0 || !outFieldLine || (int)tapLine.tap0.size() < width) return;
+    if (width <= 0 || !outFieldLine || (int)tapLine.tap0.size() < width)
+        return;
 
     if (outGate) std::fill(outGate, outGate + width, 1.0f);
 
@@ -1658,10 +1405,10 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
         const double Cup4 = tapLine.tapU4[rel].comp;
         const double Cdn4 = tapLine.tapD4[rel].comp;
 
-        // Construction and safety have separate jobs.  Field A keeps the
-        // legacy near-leg estimator intact; only hard source/grammar legality
-        // can remove an operand here.  The +/-4 contour below shapes the value
-        // directly instead of throttling the whole filter at ordinary edges.
+        // Construction and safety have separate jobs. Field A keeps the sharp near-leg
+        // estimator; only hard source/grammar legality removes an operand here. The ±4
+        // contour shapes the value directly instead of throttling the filter at ordinary
+        // edges.
         const double reachUp2 = tapLine.pairU2[rel].reachLegalGate;
         const double reachDn2 = tapLine.pairD2[rel].reachLegalGate;
 
@@ -1678,22 +1425,6 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             if (denom > 1e-9) {
                 sc2 = 2.0 / denom;
                 if (sc2 < 1.0) sc2 = 1.0;
-            } else {
-                wUp2 = 0.0;
-                wDn2 = 0.0;
-            }
-        } else {
-            double dMag  = std::fabs(std::fabs(Cup2) - std::fabs(Cdn2));
-            double sumUD = std::fabs(Cup2 + Cdn2);
-
-            // The legacy agreement recovery remains, but it cannot override a
-            // physically illegal leg and it cannot self-certify at the 1D
-            // noise floor.
-            constexpr double kReviveCarrierFloorIRE = 2.0; // 1D noise floor
-            if (sumUD * invIreScale > kReviveCarrierFloorIRE &&
-                dMag - std::fabs(sumUD * 0.2) <= 0.0) {
-                wUp2 = reachUp2;
-                wDn2 = reachDn2;
                 sc2 = 1.0;
             } else {
                 wUp2 = 0.0;
@@ -1743,8 +1474,7 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
         if (outGate) outGate[rel] = gateA;
     }
 
-    // FieldAStats per-line logging remains removed; the per-line spam buried
-    // the active diagnostics.
+    // FieldAStats per-line logging is disabled; active diagnostics remain concise.
 }
 
 // Field B
@@ -1781,11 +1511,10 @@ void Comb::FrameBuffer::computeFieldBLine(int lineNumber,
 
 
 // ============================== FIELD B ====================================
-// Sharp adaptive three-line constructor: center against same-field +/-2.
-// Pair similarity chooses one or both legs; the 3:1 decision preserves the
-// legacy split2D edge shape, and the normalized half-difference preserves full
-// comb authority.  Content-region facts act only as binary admission/cede
-// decisions so unsafe preclean never reaches either Frame constructor.
+// Sharp adaptive three-line constructor: center against same-field ±2. Pair
+// similarity chooses one or both legs; a 3:1 decision avoids averaging a weak,
+// laterally displaced partner into a sharp edge. The normalized half-difference
+// preserves full comb authority for admitted operands.
 static bool ldcdFieldBClean()
 {
     static const bool v = []{
@@ -1877,9 +1606,8 @@ void Comb::FrameBuffer::computeFieldBLineClean(const CombTapLine &tapLine,
                 ? tapLine.intrafieldRegionReach[rel] : unknownRegion;
         if (bandOut) bandOut[rel] = region.chromaBoundaryBand ? 1 : 0;
 
-        // Per side, on the MEASURED evidence -- never the promoted verdicts,
-        // which carry the old policy.  A side is refused on its own account;
-        // the other side is not consulted and never surrenders with it.
+        // Per-side admission reads the measured evidence directly. Promoted region
+        // verdicts are not used to refuse the opposite side.
         const double bound = kBaseIRE + kKappa * hgAt[rel];
         auto sideOk = [&](bool have, bool legal, RR measured, double diffIRE,
                           double coarseNeighbour) {
@@ -2044,13 +1772,11 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     const float *centerRepairStrength =
         locked1DParallaxRepairStrength_line(lineNumber);
 
-    // The measured failure law (docs/comb-failure-arc-log.md).  At +-2 the
-    // grammar's relation is Opposite, so the carrier should have cancelled;
-    // vReachResid2IRE is the remainder the fold cannot explain, and that IS
-    // the violation of the premise this comb rests on.  The cut is in IRE so
-    // it means the same thing on every material.  Derived over 60 frames on
-    // three materials, set where the comb creates no more zipper than the
-    // gates it replaces.  LDCD_FIELDB_LEGACY_GATES=1 restores those gates.
+    // At ±2 the grammar relation is Opposite, so legal carrier should cancel.
+    // vReachResid2IRE measures the remainder the fold cannot explain; above the IRE
+    // threshold that operand no longer satisfies the comb premise. The threshold is
+    // material-independent because the residual is expressed in IRE.
+    // LDCD_FIELDB_LEGACY_GATES=1 selects the alternate region-gate diagnostic path.
     static const double kResidCedeIRE = []{
         const char *e = std::getenv("LDCD_FIELDB_RESID_IRE");
         return e ? std::atof(e) : 3.0;
@@ -2067,29 +1793,14 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
     using RR = CombContentReach::RegionRelation;
     const CombContentReach::IntrafieldRegionReach unknownRegion;
 
-    // THE CARRIER LICENSE, ON THE AVERAGING HALF OF THIS COMB.
+    // THE CARRIER LICENSE APPLIES TO FIELD B'S AVERAGING HALF.
     //
-    // Field B is two operations. `neighbor` is an AVERAGE of the two legs --
-    // an estimate -- and `center - neighbor` is a CANCEL. The two want
-    // opposite things from this evidence.
-    //
-    // A cancelling step needs no help: vertically coherent luma cancels in the
-    // difference by construction, so it stays in luma where it belongs. But an
-    // averaging step pulls whatever its operands contain INTO the result, so a
-    // leg whose energy is luma rather than carrier contributes that luma to
-    // the carrier estimate, and the comb then subtracts it out of the picture.
-    // That is the lateral fine-luma failure the holdout convicted -- worth ~6x
-    // the error of the vertical structure the reach gates were policing.
-    //
-    // So the license scales the leg WEIGHTS, per operand, at the leg's own
-    // line and sample. It is a selection among legal alternatives, not a gate:
-    // a contaminated leg loses the 3x comparison to its clean partner and the
-    // comb goes around it, and only if BOTH legs are refused does the existing
-    // path fall through to centre. Nothing is DQ'd that was legal.
-    //
-    // NOT a cede on low license. The license says 1D is wrong at this sample;
-    // ceding hands the sample to 1D. The asymmetric options -- the other leg
-    // first, centre only as a last resort -- are what avoid that.
+    // Field B first estimates a neighbour from the admitted legs, then cancels that
+    // estimate from center. A leg whose band energy is luma-owned should not be
+    // averaged into the carrier estimate. The license therefore scales leg weights
+    // before the 3:1 selection. It is operand selection, not a cede or a correction
+    // strength control: a weak leg yields to its partner, and center is used only when
+    // both leg weights vanish.
     const float *licUpRow = carrierLicense_line(tapLine.lnU2);
     const float *licDnRow = carrierLicense_line(tapLine.lnD2);
     const bool licenseOnComb = ldcdCombLicenseEnabled() && licUpRow && licDnRow;
@@ -2138,9 +1849,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
                       tapLine.coarseD2IRE[rel]) >= kLumaHardBreakIRE;
 
         const bool bandCede = region.chromaBoundaryBand;
-        // ADMISSION ONLY.  One measured fact replaces the four region gates;
-        // leg SELECTION below is untouched (2026-08-31 -- retiring a gate and
-        // a selection rule together is what crippled the picture before).
+        // ADMISSION ONLY. Residual-law evidence decides whether each operand is available;
+        // the leg-selection rule below is independent.
         const bool residCedeUp =
             residLaw && haveResidUp &&
             tapLine.vReachResid2UpIRE[rel] >= kResidCedeIRE;
@@ -2154,9 +1864,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             ? (downLegal && !residCedeDown)
             : (downLegal && !downBoundary && !downLumaBreak && !bandCede);
 
-        // Field B is the sharp legacy three-line estimator.  Content-region
-        // evidence changes only operand admission; it never scales an admitted
-        // leg or the resulting half-difference.
+        // Field B is a sharp three-line estimator. Content-region evidence changes only
+        // operand admission; it never scales an admitted leg or the resulting
+        // half-difference.
         double wUp = upAdmitted ? tapLine.pairU2[rel].weight : 0.0;
         double wDown = downAdmitted ? tapLine.pairD2[rel].weight : 0.0;
         if (licenseOnComb) {
@@ -2164,9 +1874,9 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             wDown *= std::clamp((double)licDnRow[rel], 0.0, 1.0);
         }
 
-        // Legacy split2D's decisive shape: when one local match is more than
-        // three times stronger, do not average a laterally displaced second
-        // leg into the edge.  This is selection, not a strength throttle.
+        // When one local match is more than three times stronger, select that leg rather
+        // than averaging a laterally displaced weaker partner into the edge. This is
+        // selection, not a strength throttle.
         if (wDown > 3.0 * wUp)
             wUp = 0.0;
         else if (wUp > 3.0 * wDown)
@@ -2232,9 +1942,8 @@ void Comb::FrameBuffer::computeFieldBLine(const CombTapLine &tapLine,
             reason = FieldBReasonCenter;
         }
 
-        // Certified Pass 1.5 repairs are source authority at this sample;
-        // recombining them with unrepaired legs would reinstate the rejected
-        // component. Same law as the legacy path.
+        // Certified Pass 1.5 repairs are source authority at this sample; recombining
+        // them with unrepaired legs would reinstate the rejected component.
         const double appliedRepair = centerRepairStrength
             ? std::clamp(static_cast<double>(centerRepairStrength[rel]), 0.0, 1.0)
             : 0.0;
@@ -2442,42 +2151,21 @@ void Comb::FrameBuffer::computeFrameALine(
                                       outFrameIQ, &reachTapLine);
 }
 
-// Frame B: sharp signed cancellation of image-locked colour inherited from
-// the precleaned 1D center.  The registered ±1 pair estimates the alien term;
-// Frame B subtracts that estimate without blending either neighbour into the
-// picture.  Frame A owns the interfield midpoint candidate.
-// THE DIAGONAL FACT, MEASURED ONCE, BEFORE ANY CANDIDATE RUNS.
+// Frame B performs sharp signed cancellation of image-locked colour from the
+// precleaned 1D center. The registered ±1 pair estimates the alien term; Frame B
+// subtracts that estimate without blending either neighbour into the picture.
+// Frame A owns the interfield midpoint candidate.
 //
-// This is the election's own diagonal test, lifted so Frame B can read it at
-// the moment it needs it. Find the same signed lateral crossing on this row
-// and on both +-2 same-field neighbours, and require its position to progress
-// MONOTONICALLY through the line. That last clause is the whole difference
-// from the argmin search this replaces: phase-bucket residue is raster-locked,
-// so it appears identically on every row and produces no row-to-row crossing
-// shift at all. It cannot fake a monotone progression, and so it cannot steer
-// this aim off the column the way it steered the notch search.
+// THE DIAGONAL FACT IS MEASURED ONCE BEFORE CANDIDATE CONSTRUCTION.
+// measureDiagonalAdvanceLine finds the same signed lateral crossing on center and
+// both ±2 same-field neighbours and requires monotonic progression through the
+// rows. Raster-locked carrier residue does not shift its crossing from row to row,
+// so it cannot create a diagonal advance.
 //
-// It is a measurement, not a search -- there is no shift to try, only a
-// crossing position to read -- so it also costs nothing per candidate shift.
-//
-// UNITS. crossingUp comes from line-2 and crossingDown from line+2: four
-// FRAME line steps. Frame B's legs are +-1, so its per-line advance is a
-// quarter of the measured total, and the published value carries that
-// division. What that means numerically is worth stating, because it is the
-// reason the search was wrong rather than merely mis-fed:
-//
-//     totalShift 0.75 (the detector's floor)   advance 0.19   d = 0
-//     totalShift 2.00                          advance 0.50   d = 1
-//     totalShift 4.00 (the detector's ceiling) advance 1.00   d = 1
-//
-// Across the entire range the election is willing to call diagonal, the
-// correct integer shift for a +-1 comb is 0 for most of it and 1 at the top.
-// d = 2 would need totalShift >= 6, past what this detector can even report,
-// so the old search's +-2 range had nothing to find.
-//
-// Sign: advance > 0 means the feature moves right going down, so the up leg
-// aligns at x - advance and the down leg at x + advance -- which is exactly
-// the (up[x-d], dn[x+d]) convention already in use.
+// The published advance is in samples per frame line. crossingUp and crossingDown
+// span four frame-line steps, so their total displacement is divided by four.
+// Frame B rounds that per-line advance to the integer shift used by its ±1 pair.
+// advance > 0 aligns the up leg at x-d and the down leg at x+d.
 void Comb::FrameBuffer::measureDiagonalAdvanceLine(int line)
 {
     const int left  = videoParameters.activeVideoStart;
@@ -2646,12 +2334,10 @@ void Comb::FrameBuffer::computeFrameBLine(
 		std::fill(scratch_frameBReachUnsafe.begin(),
 		          scratch_frameBReachUnsafe.end(), 0);
 
-	// The refusal band is now election evidence, not a Frame-B construction
-	// actuator.  Frame B's purpose is the aggressive registered subtraction;
-	// suppressing it here merely republishes the contaminated center.  FVF sees
-	// the exact aperture-level verdict through scratch_frameBReachUnsafe and can
-	// give the whole transition run to Frame A.  Keep the former construction
-	// cede as an explicit A/B mode only.
+	// The refusal band is election evidence, not a normal Frame B construction
+	// actuator. Frame B publishes full registered subtraction plus
+	// scratch_frameBReachUnsafe; FVF can disqualify that candidate over the transition
+	// support. LDCD_FB_BAND_CEDE=1 enables pair cede as a diagnostic A/B mode.
 	static const bool frameBBandCede = []{
 		const char *e = std::getenv("LDCD_FB_BAND_CEDE");
 		return e && std::atoi(e) != 0;
@@ -2763,12 +2449,6 @@ void Comb::FrameBuffer::computeFrameBLine(
             if (r) precleanDn = r;
         }
     }
-
-    // Raw bracket rows feed the carrier-free luma registration locator.
-    const quint16 *rawUpRow = haveUpLine
-        ? rawbuffer.constData() + (line - 1) * videoParameters.fieldWidth : nullptr;
-    const quint16 *rawDnRow = haveDnLine
-        ? rawbuffer.constData() + (line + 1) * videoParameters.fieldWidth : nullptr;
 
     auto phaseCursor = [&](int ln) {
         return carrierGrammarSignedSampleCursor(
@@ -2917,8 +2597,8 @@ void Comb::FrameBuffer::computeFrameBLine(
         constexpr double kWinSum = 6.0;
         constexpr double kRegMargin = 1.08;
 
-        // LDCD_FB_IQ_REG=1 restores the retired precleaned-IQ argmin as the
-        // registration, so the change of MATERIAL can be graded on its own.
+        // LDCD_FB_IQ_REG=1 selects the precleaned-IQ argmin registration for diagnostic
+        // A/B comparison with the luma-geometry registration.
         static const bool iqRegistration = []{
             const char *e = std::getenv("LDCD_FB_IQ_REG");
             return e && std::atoi(e) == 1;
@@ -2967,10 +2647,7 @@ void Comb::FrameBuffer::computeFrameBLine(
         const std::complex<double> *pSame = sameIsUp ? pU : pD;
         std::complex<double> *devRows[5] = {nullptr, nullptr, nullptr,
                                             nullptr, nullptr};
-        // Only the retired IQ argmin (LDCD_FB_IQ_REG=1) reads these. Built
-        // unconditionally they were five rows of complex differences per line
-        // feeding 35 complex MACs per pixel, every one of them discarded on a
-        // production render.
+        // The precleaned-IQ argmin rows are required only when LDCD_FB_IQ_REG=1.
         if (haveSignedAlien && iqRegistration) {
             if ((int)scratch_fbDevRows.size() < 5 * rowWidth)
                 scratch_fbDevRows.resize(5 * rowWidth);
@@ -2984,60 +2661,19 @@ void Comb::FrameBuffer::computeFrameBLine(
             }
         }
 
-        // THE LOCATOR IS NOT A SEARCH (author, 2026-08-08: "the vertical
-        // comb needs to be vertical first. If frame B is going off and
-        // searching and mis-locking it's targets, then it's off mission" --
-        // and 2026-09-04: "Aren't 2D combs supposed to use the pixel above
-        // and below, in the column?").
+        // THE LOCATOR IS LUMA GEOMETRY, NOT A CARRIER/IQ SEARCH.
         //
-        // The registration asks a LUMA-GEOMETRY question -- where did this
-        // feature go between the line above and the line below. Two searches
-        // have now answered it and both were steered by their own quarry: the
-        // precleaned-IQ argmin, which by its own account "would wander on
-        // textured content" because in the IQ domain a lattice is nothing but
-        // chroma texture; and the notch argmin on 0.5*(r[x-1] + r[x+1]) of
-        // the raw row, whose residue is period-4 in x, so phase-bucket
-        // structure could clear the 8% margin in place of content and flip d
-        // with the bucket.
+        // measureDiagonalAdvanceLine publishes a monotone crossing progression across the
+        // ±2 rows. The registration consumes that measured advance and rounds it to the
+        // integer aim justified by a ±1 comb. Raster-locked carrier residue has the same
+        // horizontal phase on each row and therefore contributes zero crossing advance.
         //
-        // Neither is a search any more. measureDiagonalAdvanceLine reads a
-        // monotone crossing progression across the +-2 rows -- a MEASUREMENT,
-        // which raster-locked residue cannot fake because it appears
-        // identically on every row and so shifts no crossing at all. What is
-        // published is an advance, and diagAim below only rounds it.
-
-        // THREE DISCIPLINES, LIFTED FROM THE CERTIFIED SEARCH, which measured
-        // them necessary: the aim census read 30/37/33 across s=0 / |s|=1 /
-        // |s|=2 with the largest bin PINNED at the search limit before they
-        // were added, and 59.7/26.4/13.9 -- monotonically decreasing, the
-        // shape a real slope population has -- after. All three push toward
-        // the detent.
+        // The adopted aim is clamped to |d| <= 1 because the detector's maximum published
+        // advance is one sample per frame line. d = 0 is the detent whenever no qualifying
+        // diagonal transition is present.
         //
-        //   SAMPLE WIDER THAN YOU ADOPT. Search runs to +-3, only +-2 may be
-        //     adopted, so every adoptable shift has neighbours on both sides
-        //     and can be REQUIRED to be a genuine interior minimum. The old
-        //     search sampled +-2 and adopted +-2, so the limit shifts could
-        //     not be tested at all and collected the search's failures.
-        //   INTERIOR MINIMUM. A shift stands only if it is strictly better
-        //     than the positions either side of it. A real diagonal makes a
-        //     trough; the near-ties dense fine texture produces do not, and
-        //     this is what separates them.
-        //   IDENTIFIABILITY FLOOR. An aim is only answerable where the two
-        //     rows actually DISAGREE at the detent. Below the floor there is
-        //     nothing for a shift to explain, every shift scores the same to
-        //     within noise, and letting the margin pick among them is reading
-        //     a coin toss as geometry. A clamp on an impossible, not a lever.
-        //
-        // The 8% margin stands on top of all three: d = 0 is the default and
-        // the vertical is Frame A's whole job, so a non-zero aim displaces the
-        // detent only on proof.
-        //
-        // ONE implementation, per the no-duplicate-math law: the fallback
-        // registration and the census below both call this.
-        // THE ADOPTED AIM. A read of the published fact, clamped to the
-        // range a +-1 comb can justify: the detector saturates at totalShift
-        // 4.0, which is one sample per frame line, so |d| > 1 is unreachable
-        // by construction rather than by taste.
+        // One implementation supplies both candidate construction and diagnostics so the
+        // registration fact has a single producer.
         auto diagAim = [&](int x) -> int {
             if (x < 0 || x >= (int)scratch_fbDiagAdvance.size()) return 0;
             const long r = std::lround(scratch_fbDiagAdvance[x]);
@@ -3075,32 +2711,19 @@ void Comb::FrameBuffer::computeFrameBLine(
                 }
             }
 
-            // THE AIM. Read the diagonal fact, or -- under the retired
-            // A/B only -- search the precleaned IQ.
-            //
-            // bestSi is set from the adopted d so the correction waveform and
-            // the registration fact always use the same shift.
-            //
-            // The certified-registration preference that stood here is gone
-            // (2026-09-05). It read certRegistration, which exists only on
-            // the comp lines of a COVERED frame -- and since "a covered frame
-            // calls no candidate and holds no election" (2026-08-22) this
-            // function never runs on one. certReg was therefore always absent
-            // and the branch could not fire. Its publication is removed with
-            // it; the search that produced it in buildCertifiedCarrierStage
-            // stays, because that stage consumes the shift itself.
+            // THE AIM. Normal operation reads the per-line diagonal fact; LDCD_FB_IQ_REG=1
+            // selects the precleaned-IQ argmin diagnostic. bestSi is derived from the adopted
+            // shift so registration metadata and the correction waveform use the same aim.
             int bestSi;
             if (!iqRegistration) {
-                // FRAME B'S OWN AIM, read rather than searched: the diagonal
-                // fact measured once per line before any candidate ran. The
-                // aligned pair is (up[x-d], dn[x+d]), so the published
-                // advance is already in this convention.
+                // FRAME B'S NORMAL AIM reads the diagonal fact measured before candidate
+                // construction. The aligned pair is (up[x-d], dn[x+d]), matching the published
+                // advance convention.
                 const int bestD = diagAim(x);
                 const int sStarDiag = sameIsUp ? -bestD : bestD;
                 bestSi = std::clamp(sStarDiag + 2, 0, 4);
             } else {
-                // A/B only (LDCD_FB_IQ_REG=1): the retired IQ argmin, kept so
-                // the material change can be measured in one variable.
+                // A/B mode (LDCD_FB_IQ_REG=1): use the precleaned-IQ argmin.
                 bestSi = 2;
                 double bestDev = devMag[2] / kRegMargin;
                 for (int si = 0; si < 5; ++si) {
@@ -3122,23 +2745,15 @@ void Comb::FrameBuffer::computeFrameBLine(
 
 			// REACH EVIDENCE (see frameBBandSeed).
 			//
-			// Frame B now always constructs Zsame - Zopp at full strength.
-			// If this registered aperture touches a refusal band, the exact
-			// fact is published separately for FVF: progressive gives Frame A
-			// the unsafe pixel/run, while interlace disqualifies Frame B and
-			// leaves its two field seats live.
+			// Frame B constructs Zsame - Zopp at full strength. If the registered aperture
+			// touches a refusal band, scratch_frameBReachUnsafe publishes that fact to FVF.
+			// Progressive FVF can give the support to Frame A; interlace FVF can disqualify
+			// Frame B while retaining its field alternatives.
 			//
-			// There is still no one-legged rung. Refusing a single leg is not
-			// one operation but two different ones -- centre substitutes for
-			// a refused SAME leg exactly and the correction keeps full
-			// strength, while a refused OPPOSITE leg leaves no alien
-			// measurement at all -- and which leg fails varies per column.
-			// The old band cede therefore remains available only under
-			// LDCD_FB_BAND_CEDE=1 for comparison; it is no longer the
-			// production actuator.
-            //
-            // The coefficient never moves either: the 0.5 applied at the
-            // combine is the reciprocal of the sigma FOLD, not a leg count.
+			// There is no one-leg refusal rung because refusing Same and refusing Opposite
+			// produce physically different estimators. LDCD_FB_BAND_CEDE=1 is the only mode
+			// that cedes both legs together. The 0.5 combine coefficient is the reciprocal of
+			// the sigma fold, not a leg-count-dependent gain.
             bool upAdmit = true;
             bool dnAdmit = true;
             const bool refusePair =
@@ -3150,16 +2765,12 @@ void Comb::FrameBuffer::computeFrameBLine(
                 upAdmit = false;
                 dnAdmit = false;
             }
-			// Outside the opt-in legacy cede BOTH legs always stand. Per-leg
-			// refusal remains forbidden; the unsafe bit above is the separate
-			// election fact.
-
-            // Registration needs a multi-axis aperture, but the correction waveform must retain
-            // the sample that was measured.  Using the seven-tap average here
-            // moved energy away from narrow vertical details: carrier-like
-            // peaks were under-subtracted while adjacent columns received a
-            // correction belonging to their neighbours.  Read the registered
-            // pair pointwise; physical pair reach decides whether it applies.
+			// Without LDCD_FB_BAND_CEDE, both registered legs stand and the unsafe bit remains
+			// separate election evidence.
+			//
+			// Registration may use a multi-axis aperture, but the correction waveform is
+			// sampled pointwise at the registered coordinates so narrow vertical carrier
+			// structure is not spread laterally.
             const std::complex<double> pairDiff =
                 (upAdmit ? pU[x - d] : pC[x]) -
                 (dnAdmit ? pD[x + d] : pC[x]);
@@ -3242,38 +2853,23 @@ void Comb::FrameBuffer::computeFrameBLine(
 }
 
 // ---------------------------------------------------------------------------
-// Frame C: the covered-frame comp-line bootstrap (user, 2026-08-22).
+// Frame C: covered-frame comp-line bootstrap.
 //
-// Covered frames are handled unlike everything else in this file. The
-// certified def lines are conservation fact: they run nothing, and cede to
-// center in any system they are routed through. The comp lines between them
-// are not an election problem -- they are bootstrapped toward the defs.
-// Frame C is that bootstrap: a plain +-1 comb whose legs ARE the certified
-// defs' own published 1D (combSource1D serves the exact fact where the
-// anchored plane is live, the certified construction otherwise).
+// Certified def lines are conservation facts and cede to center. Comp lines
+// between them are bootstrapped toward the def lines rather than entered into the
+// uncovered-frame election. Frame C is a plain ±1 comb whose legs are the
+// certified defs' published 1D sources.
 //
-// It is deliberately not a candidate. No --two-d-variant access, no seat in
-// scoreFieldVsFrame, and none of Frame A/B's trust machinery: correlation
-// ramps, reach, licences and delta caps exist because a MODEL leg's carrier
-// can lie, and a certified leg cannot. The uncovered midpoint law does not
-// apply either: Frame A's 0.5 pull cap solves center C+E against partners
-// C-E, where past-midpoint re-injects inverted alien. Against certified
-// legs the partners carry C, so
-//
+// Frame C is not a scored candidate and does not use Frame A/B correlation,
+// reach, license, or delta-cap policy. With both certified legs it uses p = 0.67;
+// with one certified leg it uses the midpoint p = 0.5:
 //     out = (C + E) + p*(C - (C + E)) = C + (1 - p)*E
 //
-// and p past 0.5 is not overdrive -- it is the ratchet, driving the comp
-// line only one way: toward the certified defs. p = 0.67 with both legs;
-// a lone certified leg (frame edge) combs at the plain midpoint 0.5.
+// Composite scalars retain each line's carrier orientation, so relationSign folds
+// each leg into the center line's orientation before averaging.
 //
-// Sign frame: composite scalars carry each line's raw carrier orientation,
-// so a leg whose grammar lineFlip differs from center's holds matched
-// chroma NEGATED; the relation sign folds it into center's orientation
-// before the average (the intrafield sign-frame lesson, 2026-07-02).
-//
-// Returns false when it does not own the line (uncovered frame, def line,
-// certified family off, no grammar, no certified leg); the caller proceeds
-// to the ordinary election. LDCD_FRAME_C=0 is the A/B escape.
+// Returns false when Frame C does not own the line; the caller then follows the
+// ordinary uncovered-frame path. LDCD_FRAME_C=0 disables this bootstrap.
 // ---------------------------------------------------------------------------
 bool Comb::FrameBuffer::computeFrameCLine(int line, std::vector<double> &out)
 {
@@ -3363,11 +2959,9 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
         return result;
     }
 
-    // Cross-frame ScalarSignCompare on the mode's actual 1D scalar.  Both the
-    // bucket scalar and the locked 1D scalar are PhasePreservedCarrier, so
-    // grammar legality answers identically for either; the historical Bucket
-    // mislabel (a workaround for the retired common-phase classification) is
-    // no longer needed.  The sample read below follows the same mode switch.
+    // Cross-frame ScalarSignCompare uses the mode's actual 1D scalar. Bucket and
+    // locked 1D scalars are PhasePreservedCarrier, so grammar legality is identical;
+    // the sample source follows the same mode switch.
     const lddecode::CombReachReply phaseReach = prefilledReach
         ? *prefilledReach
         : combReachIndex.queryAgainst(
@@ -3397,11 +2991,10 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
 
     const int hh = clampH(h);
 
-    // 1D sample: locked path reads the anchored-aware source (the same
-    // plane split3D's base1d consumes -- fact injection 2026-08-02; falls
-    // back to the phase-corrected blind bandpass when no anchored plane);
-    // bucket path reads clpbuffer[0] directly. relationSign folds the
-    // carrier relation in so every consumer keeps Opposite-form math.
+    // 1D sample: locked mode reads the anchored-aware source, falling back to the
+    // phase-corrected blind bandpass when no anchored plane exists; bucket mode reads
+    // clpbuffer[0]. relationSign folds the carrier relation so consumers use the same
+    // Opposite-form math.
     const double *lockedRow = frameBuffer.configuration.phaseCompensation
         ? frameBuffer.combSource1D_line(lineNumber) : nullptr;
 
@@ -3413,17 +3006,11 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
 
     // --- Luma Penalty with Neighbor Shaping ---
     //
-    // This is the already-paid luma-domain evidence:
-    //
-    //     reconstructed Y = raw - 2D chroma/composite estimate
-    //
-    // It compares current/reference against candidate over a small cross:
-    //
-    //     center line: x-1, x, x+1
-    //     vertical:    y-1, y+1 at x
-    //
-    // getBestCandidate can now reuse result.yPen directly instead of
-    // re-deriving a same-pixel scalar chroma distance from result.sample.
+    // getCandidate computes luma-domain evidence from reconstructed
+    // Y = raw - 2D chroma/composite estimate over a five-point spatial cross:
+    //   center line: x-1, x, x+1
+    //   vertical:    y-1, y+1 at x
+    // getBestCandidate consumes result.yPen directly.
     const quint16 *refRawC  = rawbuffer.data() + refLineNumber * fieldWidth;
     const double  *refClpC  = clpbuffer[1].pixel[refLineNumber];
 
@@ -3472,24 +3059,13 @@ Comb::FrameBuffer::Candidate Comb::FrameBuffer::getCandidate(
 
     // CARRIER-FREE LUMA FOR THE SIMILARITY DISTANCE.
     //
-    // This distance used to be built from raw - clpbuffer[1] -- a per-frame 2D
-    // chroma ESTIMATE. Where that estimate carries a carrier-locked misread it
-    // inverts frame to frame, so a reference and a temporal candidate hold it
-    // with opposite sign and the distance reads about TWICE the misread. The
-    // artifact inflates the very measurement used to judge the candidate that
-    // would cancel it, which is why the old deviation veto self-defeated and
-    // was retired. The defect was in the INPUT, not in the penalty.
+    // The similarity metric uses the coarse luma platform because a legal four-sample
+    // mean cancels carrier exactly. Lurch sharpening improves edge placement while
+    // retaining the smoothing useful for a similarity metric, so per-frame noise does
+    // not dominate content change.
     //
-    // The coarse platform cannot carry it: a legal four-sample mean cancels the
-    // carrier exactly, so the platform is carrier-free by construction. The
-    // lurch-sharpened form is preferred over the plain boxcar because lurch
-    // un-smears the four-sample placement limit, and the smoothness that
-    // remains is wanted here rather than tolerated -- this is a SIMILARITY
-    // metric, and a little smoothing is what stops it reacting to per-frame
-    // noise instead of to real content change.
-    //
-    // Falls back to the old reconstruction only where no coarse exists (bucket
-    // mode), which leaves those paths exactly as they were.
+    // Where no coarse platform exists, the bucket path uses its reconstructed-luma
+    // fallback.
     const int coarseLeft = videoParameters.activeVideoStart;
     const int coarseW    = demodWidth;
     auto coarseRow = [](const FrameBuffer &fb, int line) -> const double * {

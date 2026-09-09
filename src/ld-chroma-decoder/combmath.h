@@ -30,14 +30,9 @@ inline double sin4fsc(int i) { return sin4fsc_data_global[i & 3]; }
 inline double cos4fsc(int i) { return sin4fsc((i + 1) & 3); }
 
 // ---------------------------------------------------------------------------
-// CARRIER LANES — the two coordinate streams a 4fSC carrier plane really is.
-//
-// A carrier-band filter on a 4fSC grid has taps at EVEN offsets only, so it
-// never mixes the two sample lattices. A plane it produced is therefore not
-// one waveform: it is TWO INDEPENDENT COLOUR-COORDINATE STREAMS AT 2fSC,
-// interleaved. Consecutive samples of one lane are 2 samples of 4fSC apart,
-// hence 180 degrees, so de-alternating by (-1)^(h>>1) -- the same expression
-// for both parities -- recovers each stream directly.
+// Carrier lanes are the two interleaved coordinate streams preserved by an
+// even-tap carrier-band filter. Consecutive samples in each lane are two
+// 4fSC samples apart, so de-alternating by (-1)^(h>>1) recovers the stream.
 //
 // Writing c[x] = I*cos(a+33deg) + Q*sin(a+33deg) with a advancing 90deg per
 // sample and theta = a(0) + 33deg, the de-alternated lanes are
@@ -45,61 +40,44 @@ inline double cos4fsc(int i) { return sin4fsc((i + 1) & 3); }
 //     laneA =  I*cos(theta) + Q*sin(theta)
 //     laneB = -I*sin(theta) + Q*cos(theta)
 //
-// i.e. THE LANES ARE THE COLOUR COORDINATES ROTATED BY theta, and nothing
-// else. No information is created or destroyed and no sample moves, so the
-// decomposition is exactly invertible.
+// The lanes are the colour coordinates rotated by theta. No information is
+// created or destroyed, and no sample moves, so the decomposition is
+// invertible.
 //
-// WHY THIS PRIMITIVE EXISTS. The 4fSC demod already in this decoder computes
+// The 4fSC demod computes
 // envI[x] = 2*c[x]*sin4fsc(ph) and envQ[x] = 2*c[x]*cos4fsc(ph). Because
-// sin4fsc is {1,0,-1,0}, envI is NON-ZERO ONLY ON EVEN ph and equals twice
-// the de-alternated even lane; envQ likewise carries the odd lane. They are
-// the lanes with zeros punched into the other parity, and the low-pass that
-// follows is doing two jobs at once: enforcing the bandwidth law AND
-// interpolating across those zeros. Entangling them is why the law's kernel
-// shape could not be changed independently -- sharpen the law and you alter
-// the interpolation, relax the interpolation and you alter the law.
+// sin4fsc is {1,0,-1,0}, envI is non-zero only on even ph and equals twice the
+// de-alternated even lane; envQ likewise carries the odd lane. The low-pass
+// following demodulation both enforces the bandwidth law and interpolates
+// across the punched zeros.
 //
-// Working in lanes separates the two, and the separation is visible in the
-// coefficients rather than being a matter of interpretation. Split the 9-tap
-// envelope kernel by tap parity:
+// Splitting the 9-tap envelope kernel by tap parity gives:
 //
 //   even offsets  0.0021  0.0903  0.3153  0.0903  0.0021   sum 0.5001
 //   odd offsets       0.0191  0.2308  0.2308  0.0191       sum 0.4998
 //
-// The EVEN taps land on real lane samples: that is the law. The ODD taps land
-// on the punched zeros: that is the interpolation. (The near-exact 0.5/0.5
-// split is also where the demod's factor of 2 comes from.) Renormalised, the
-// law a lane actually receives is the 5-tap
+// Even taps land on real lane samples; odd taps interpolate the punched zeros.
+// Renormalised, the lane kernel is:
 //
 //   [0.004199, 0.180564, 0.630474, 0.180564, 0.004199]
 //
 // which reproduces the full-grid response through the passband to within
 // 0.08 dB (-2.21 vs -2.26 at 1.30 MHz, -2.93 vs -3.01 at 1.50).
 //
-// So a full-grid kernel whose taps are even-only IS a lane kernel with every
-// other tap taken, and a lane kernel needs about half the taps for that
-// mechanical reason -- not because a sample rate changed underneath. (A lane
-// does carry one sample per two of 4fSC, but nothing here rests on saying so,
-// and 2fSC is numerically the 4fSC grid's own Nyquist, which invites exactly
-// the rate/Nyquist confusion this note is written to avoid.)
+// A full-grid kernel with even-only taps is therefore a lane kernel with every
+// other tap. The lane sample spacing is two samples on the 4fSC grid; this is
+// a structural property of the interleaving, not a separate rate conversion.
 //
-// THE DECOMPOSITION BOTTOMS OUT AT TWO, and not by convention: there are two
-// lanes because the carrier is a two-component object. Four samples carry
-// both coordinates twice, once positive and once negative; de-alternation
-// undoes the sign and parity separates the coordinates, which exhausts the
-// structure. Splitting a lane again is ordinary decimation with nothing
-// behind it -- two streams with no distinction, half the samples of one
-// coordinate discarded. The licence is spent after one use.
+// The decomposition has exactly two lanes because the carrier has two
+// components. Splitting a lane again would be ordinary decimation and would
+// discard half of one coordinate.
 //
-// hypot(c[x], c[x+1]) is the same conflation in the other direction: a sound
-// magnitude, but it discards the lane split, which is real evidence -- on the
-// certified carrier both lanes are separately FACT.
+// hypot(c[x], c[x+1]) likewise discards the lane split. Both lanes are useful
+// evidence and must remain separate.
 //
-// NOTE ON AXES: these are LANES, not I and Q. Recovering the colour axes
-// needs the rotation by theta above, and theta is a property of the line's
-// burst. This primitive deliberately stops short of naming the axes; a
-// caller that needs I/Q must supply the angle, because handing a lane to a
-// per-axis law under an axis name is the one error neither can detect.
+// These are lanes, not I and Q. Recovering colour axes requires the rotation
+// by theta, which is derived from the line burst. Callers that need I/Q supply
+// that angle explicitly.
 // ---------------------------------------------------------------------------
 
 // De-alternation sign for absolute sample index h. Self-inverse.
@@ -124,39 +102,6 @@ inline void decomposeCarrierLanes(const double *carrier, int h0, int width,
     }
 }
 
-// Exact inverse of decomposeCarrierLanes for the same (h0, width).
-inline void recomposeCarrierLanes(const std::vector<double> &laneA,
-                                  const std::vector<double> &laneB,
-                                  int h0, int width, double *carrier)
-{
-    if (!carrier || width <= 0) return;
-    size_t ia = 0, ib = 0;
-    for (int i = 0; i < width; ++i) {
-        const int h = h0 + i;
-        const bool even = ((h & 1) == 0);
-        const std::vector<double> &lane = even ? laneA : laneB;
-        size_t &idx = even ? ia : ib;
-        if (idx >= lane.size()) return;      // caller mismatched the geometry
-        carrier[i] = lane[idx++] * carrierLaneSign(h);
-    }
-}
-
-// Rotate a lane pair into a colour-axis pair, and back. theta is the angle
-// the lanes are rotated by (see the derivation above); pass the line's own
-// value. These are the only places an axis convention enters.
-inline void laneToAxis(double a, double b, double cosT, double sinT,
-                       double &axWide, double &axNarrow)
-{
-    axWide   = a * cosT - b * sinT;
-    axNarrow = a * sinT + b * cosT;
-}
-inline void axisToLane(double axWide, double axNarrow,
-                       double cosT, double sinT, double &a, double &b)
-{
-    a =  axWide * cosT + axNarrow * sinT;
-    b = -axWide * sinT + axNarrow * cosT;
-}
-
 // Magnitude of a bounded 2-vector: direct sqrt, not std::hypot.  Comb
 // magnitudes are video-domain quantities (sample/IRE scale) whose squares
 // cannot over- or underflow a double, so hypot's IEEE range guarding is
@@ -167,9 +112,7 @@ inline double boundedMag(const std::complex<double> &z) { return boundedMag(z.re
 // Integer-centred reconstruction of a carrier product stream.
 //
 // Product demodulation at 4fSC contains the wanted baseband vector plus an
-// alternating 2fSC image.  A previous/current average rejects that image only
-// by placing the result at h-0.5; applying it at carrier phase h then mixes
-// two different composite coordinates.  The symmetric binomial
+// alternating 2fSC image.  The symmetric binomial
 // aperture below has centroid exactly h and a zero at 2fSC.  Its gain of two
 // preserves this decoder's full-signed-IQ convention (composite remodulation
 // applies the reciprocal 0.5).  Apply it to I and Q independently; it is a
@@ -217,12 +160,9 @@ inline T centeredCarrierCycle4Mean(const T &minus2,
            (minus1 + center + plus1) * 0.25;
 }
 
-// Reduce the complete carrier cycles a sample is a MEMBER of by choosing one
-// of them, never by averaging them.  A mean publishes a value none of the
-// memberships measured, and lets a cycle skewed by an outlier at its far edge
-// pull the result; the medoid returns the membership the others agree with, so
-// what is published was actually observed.  Ties resolve to the lowest index,
-// so the choice is deterministic.
+// Choose one complete carrier-cycle estimate for a sample. A medoid returns an
+// observed membership instead of averaging across memberships. Ties resolve
+// to the lowest index, so the choice is deterministic.
 inline double coarseCycleMedoid(const double *cycles, int count)
 {
     if (count <= 0) return 0.0;
@@ -240,11 +180,9 @@ inline double coarseCycleMedoid(const double *cycles, int count)
 // Weighted medoid: the same selection, with the voters carrying unequal
 // weight.  argmin_i sum_j W_j * |c_i - c_j|.
 //
-// A member whose window straddles a sudden luma change is not wrong about
-// nothing -- it is reporting two parts of the picture at once -- so its
-// opinion should count for less, not be struck out.  Striking members out
-// thins the ballot until the medoid has no majority to out-vote anything
-// with; weighting leaves all five standing and only loads the dice.
+// A member whose window straddles a luma change reports two parts of the
+// picture. Its opinion should count for less, not be discarded, so weighting
+// keeps all members while reducing the influence of that estimate.
 //
 // With every W equal this is exactly coarseCycleMedoid, so the unlurched case
 // is not a special path.
@@ -264,25 +202,22 @@ inline double coarseCycleMedoidWeighted(const double *cycles,
     return cycles[best];
 }
 
-// The coarse a sample stands on: the medoid of the complete carrier cycles it
-// is a MEMBER of. There are FIVE.
+// Select the coarse estimate from the complete carrier cycles containing the
+// sample. Four covering apertures and an optional moving coarse provide the
+// candidates.
 //
 //   four offset apertures   starting at v in {x-3 .. x}, chord centres at
 //                           x-1.5, x-0.5, x+0.5, x+1.5
 //   the moving coarse       centeredCarrierCycle4Mean over [x-2 .. x+2],
 //                           centroid exactly x
 //
-// Each is itself a mean, and unavoidably so: cancelling the carrier requires
-// one complete cycle. What must never happen is averaging the coarses with
-// EACH OTHER -- their disagreement is the sub-block luma, and a mean of them
-// publishes a value no membership measured.
+// Each candidate is a mean over one complete cycle. Candidates are not
+// averaged together because their disagreement is the sub-block luma.
 //
 // They share one weakness: every window reaches four samples wide, so any of
 // them may include picture from a very different part of the image. The medoid
 // is the defence available to a selection -- it excludes the extreme outliers
-// and returns the membership the others agree with. The mean of the two
-// innermost apertures that stood here before had no defence at all against a
-// large delta landing on a window end.
+// and returns the membership the others agree with.
 //
 // Five is also the right count: with an even set the medoid is degenerate --
 // for sorted a<=b<=c<=d the costs of b and c are both c+d-a-b, identically --
@@ -290,19 +225,13 @@ inline double coarseCycleMedoidWeighted(const double *cycles,
 // strict winner. The moving coarse is the member that both breaks the tie and
 // supplies a reading centred on the sample.
 //
-// Out-of-range members are SKIPPED rather than clamped: a clamped duplicate
+// Out-of-range members are skipped rather than clamped; a clamped duplicate
 // would vote twice and bias the selection toward the edge.
 //
-// This is the coarse luma, and it is where lurch's involvement BEGINS rather
-// than ends. Lurch takes no part in the selection -- it is not a member, it
-// does not exclude members, and the ballot is always the full five. What it
-// does is carve the RESULT: the medoid is a reading built from four-sample
-// windows and so cannot resolve a transition sharper than one, and lurch
-// locates exactly those transitions and cuts them back into the finished
-// coarse. Selection first, sharpening second, and the two never mix.
-// `trust`, when supplied, carries one weight per MEMBER SLOT in the order the
-// members are gathered here: the covering apertures v = x-3 .. x that are in
-// range, then the moving coarse.  Null means an unweighted ballot.
+// The moving coarse participates as one candidate but is not otherwise
+// involved in selection. `trust`, when supplied, carries one weight per
+// candidate slot in collection order: covering apertures v = x-3 .. x that
+// are in range, followed by the moving coarse. Null means an unweighted vote.
 inline double coveringCycleMedoid(const double *apMean, int x, int lastStart,
                                   bool haveMovingCoarse, double movingCoarse,
                                   const double *trust = nullptr)
@@ -385,15 +314,6 @@ inline void lockedTo4fsc(double iLocked, double qLocked,
     q4fsc = -iLocked * bsin + qLocked * bcos;
 }
 
-// Rotate common 4fsc IQ back into the line-local locked frame.
-inline void fourfscToLocked(double i4fsc, double q4fsc,
-                            double bcos, double bsin,
-                            double &iLocked, double &qLocked)
-{
-    iLocked = i4fsc * bcos - q4fsc * bsin;
-    qLocked = i4fsc * bsin + q4fsc * bcos;
-}
-
 // Demodulate scalar composite already aligned to the common 4fsc grid.
 inline void demod4fscFromComposite(double v, int h, double &i4fsc, double &q4fsc)
 {
@@ -437,135 +357,6 @@ inline double remodLockedToShiftedComposite(double iLocked, double qLocked, int 
     double i4fsc = 0.0, q4fsc = 0.0;
     lockedTo4fsc(iLocked, qLocked, bcos, bsin, i4fsc, q4fsc);
     return remod4fscToShiftedComposite(i4fsc, q4fsc, h, spLUT, cpLUT, lineScale);
-}
-
-inline void eig2_sym(const double S[2][2], double &l1, double &l2, double V[2][2]);
-
-// General 2x2 polar/affine helpers. The retired residual-Y estimator no longer
-// calls these, but they remain available as representation math; removing that
-// one policy path is not a reason to erase the general primitive.
-inline void clamp_rotation_gain_shear(double R[2][2], double U[2][2],
-                                      double phaseMaxRad, bool allowGain,
-                                      double gMin, double gMax, double shearMax)
-{
-    double phase = std::atan2(R[1][0], R[0][0]);
-    if (std::fabs(phase) > phaseMaxRad) {
-        const double p = (phase < 0.0 ? -phaseMaxRad : phaseMaxRad);
-        const double c = std::cos(p), s = std::sin(p);
-        R[0][0] = c; R[0][1] = -s; R[1][0] = s; R[1][1] = c;
-    }
-
-    double l1, l2, V[2][2];
-    eig2_sym(U, l1, l2, V);
-    double s1 = std::max(0.0, l1), s2 = std::max(0.0, l2);
-    double g = 0.5 * (s1 + s2);
-    const double shear =
-        (g > 1e-12) ? std::fabs(s1 - s2) / g : 0.0;
-
-    if (shear > shearMax && (s1 > 0.0 || s2 > 0.0)) {
-        const double target = g * shearMax;
-        const double avg = 0.5 * (s1 + s2);
-        s1 = avg + 0.5 * target;
-        s2 = avg - 0.5 * target;
-        const double VD[2][2] = {
-            {V[0][0] * s1, V[0][1] * s2},
-            {V[1][0] * s1, V[1][1] * s2}
-        };
-        U[0][0] = VD[0][0] * V[0][0] + VD[0][1] * V[0][1];
-        U[0][1] = VD[0][0] * V[1][0] + VD[0][1] * V[1][1];
-        U[1][0] = VD[1][0] * V[0][0] + VD[1][1] * V[0][1];
-        U[1][1] = VD[1][0] * V[1][0] + VD[1][1] * V[1][1];
-        g = 0.5 * (s1 + s2);
-    }
-
-    if (!allowGain) g = 1.0;
-    else g = std::clamp(g, gMin, gMax);
-    R[0][0] *= g; R[0][1] *= g;
-    R[1][0] *= g; R[1][1] *= g;
-}
-
-inline void mat2_mul(const double A[2][2], const double B[2][2],
-                     double C[2][2])
-{
-    C[0][0] = A[0][0] * B[0][0] + A[0][1] * B[1][0];
-    C[0][1] = A[0][0] * B[0][1] + A[0][1] * B[1][1];
-    C[1][0] = A[1][0] * B[0][0] + A[1][1] * B[1][0];
-    C[1][1] = A[1][0] * B[0][1] + A[1][1] * B[1][1];
-}
-
-inline void mat2_T_mul(const double A[2][2], const double B[2][2],
-                       double C[2][2])
-{
-    C[0][0] = A[0][0] * B[0][0] + A[1][0] * B[1][0];
-    C[0][1] = A[0][0] * B[0][1] + A[1][0] * B[1][1];
-    C[1][0] = A[0][1] * B[0][0] + A[1][1] * B[1][0];
-    C[1][1] = A[0][1] * B[0][1] + A[1][1] * B[1][1];
-}
-
-inline bool mat2_inv(const double M[2][2], double Minv[2][2])
-{
-    const double det = M[0][0] * M[1][1] - M[0][1] * M[1][0];
-    if (std::fabs(det) < 1e-12) return false;
-    const double inv = 1.0 / det;
-    Minv[0][0] =  M[1][1] * inv; Minv[0][1] = -M[0][1] * inv;
-    Minv[1][0] = -M[1][0] * inv; Minv[1][1] =  M[0][0] * inv;
-    return true;
-}
-
-inline void eig2_sym(const double S[2][2], double &l1, double &l2,
-                     double V[2][2])
-{
-    const double a = S[0][0], b = S[0][1], d = S[1][1];
-    const double tr = a + d;
-    const double det = a * d - b * b;
-    const double rt = std::sqrt(std::max(0.0, tr * tr / 4.0 - det));
-    l1 = tr / 2.0 + rt;
-    l2 = tr / 2.0 - rt;
-    if (std::fabs(b) > 1e-12) {
-        V[0][0] = l1 - d; V[1][0] = b;
-        V[0][1] = l2 - d; V[1][1] = b;
-    } else {
-        V[0][0] = 1.0; V[1][0] = 0.0;
-        V[0][1] = 0.0; V[1][1] = 1.0;
-    }
-    for (int j = 0; j < 2; ++j) {
-        const double n = boundedMag(V[0][j], V[1][j]);
-        if (n > 1e-12) {
-            V[0][j] /= n;
-            V[1][j] /= n;
-        }
-    }
-}
-
-inline void sym_inv_sqrt(const double S[2][2], double Sminushalf[2][2])
-{
-    double l1, l2, V[2][2];
-    eig2_sym(S, l1, l2, V);
-    const double d1 = (l1 > 1e-12) ? 1.0 / std::sqrt(l1) : 0.0;
-    const double d2 = (l2 > 1e-12) ? 1.0 / std::sqrt(l2) : 0.0;
-    const double VD[2][2] = {
-        {V[0][0] * d1, V[0][1] * d2},
-        {V[1][0] * d1, V[1][1] * d2}
-    };
-    Sminushalf[0][0] = VD[0][0] * V[0][0] + VD[0][1] * V[0][1];
-    Sminushalf[0][1] = VD[0][0] * V[1][0] + VD[0][1] * V[1][1];
-    Sminushalf[1][0] = VD[1][0] * V[0][0] + VD[1][1] * V[0][1];
-    Sminushalf[1][1] = VD[1][0] * V[1][0] + VD[1][1] * V[1][1];
-}
-
-inline void polar_decompose_2x2(const double A[2][2],
-                                double R[2][2], double U[2][2])
-{
-    double AtA[2][2];
-    mat2_T_mul(A, A, AtA);
-    double AtA_mhalf[2][2];
-    sym_inv_sqrt(AtA, AtA_mhalf);
-    mat2_mul(A, AtA_mhalf, R);
-    const double Rt[2][2] = {
-        {R[0][0], R[1][0]},
-        {R[0][1], R[1][1]}
-    };
-    mat2_mul(Rt, A, U);
 }
 
 // Small median-of-3 helper, used in several places.

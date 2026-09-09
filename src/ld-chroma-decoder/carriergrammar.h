@@ -77,12 +77,6 @@ struct CarrierGrammarSpan {
     double chromaClaim           = 0.0;
 };
 
-// Per-line locked-basis affine (phase-clamped rotation+gain).
-struct CarrierGrammarAffine {
-    double R[2][2] = {{1.0, 0.0}, {0.0, 1.0}};
-    bool   valid   = false;
-};
-
 struct CarrierGrammarDemodCoefficients {
     double ti = 0.0;
     double tq = 0.0;
@@ -139,7 +133,6 @@ struct CarrierGrammarState {
     // Implementation-specific carrier basis for the line.
     std::array<float,4> demodLUTTi = {};
     std::array<float,4> demodLUTTq = {};
-    CarrierGrammarAffine affine    = {};
 
     // Line-level carrier projection summary.
     double carrierModelGain   = 1.0;
@@ -299,41 +292,6 @@ inline bool carrierGrammarLockedDemodCoefficients(
     out.tq = static_cast<double>(grammar->demodLUTTq[out.phase]);
     out.valid = true;
     return true;
-}
-
-inline bool carrierGrammarLockedSignedDemodCoefficients(
-    const CarrierGrammarState *grammar,
-    CarrierGrammarSignedSampleCursor &cursor,
-    CarrierGrammarDemodCoefficients &out)
-{
-    out = {};
-    if (!grammar || !grammar->grammarLocked)
-        return false;
-
-    out.phase = carrierGrammarAdvanceSignedSampleCursor(cursor);
-    out.ti = static_cast<double>(grammar->demodLUTTi[out.phase]);
-    out.tq = static_cast<double>(grammar->demodLUTTq[out.phase]);
-    out.valid = true;
-    return true;
-}
-
-inline bool carrierGrammarHasAffine(const CarrierGrammarState *grammar)
-{
-    return grammar && grammar->affine.valid;
-}
-
-inline void carrierGrammarApplyAffine(const CarrierGrammarState *grammar,
-                                      double &ti,
-                                      double &tq)
-{
-    if (!carrierGrammarHasAffine(grammar))
-        return;
-
-    const CarrierGrammarAffine &affine = grammar->affine;
-    const double ai = affine.R[0][0] * ti + affine.R[0][1] * tq;
-    const double aq = affine.R[1][0] * ti + affine.R[1][1] * tq;
-    ti = ai;
-    tq = aq;
 }
 
 inline CarrierGrammarCompositeRemodPlan carrierGrammarCompositeRemodPlan(

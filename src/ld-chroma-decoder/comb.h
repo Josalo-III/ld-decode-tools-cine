@@ -39,20 +39,10 @@
 #include "decoder.h"
 #include "sourcefield.h"
 
-// The luma platform solve, supplanting both older floors -- the block-mean
-// baseY4 and the retired lurch solve. Measured against banked conservation truth on the
-// isolated platform it wins on every material, and it does not have to win by
-// much to replace them:
-//
-//     isolated platform, rms IRE      cube     shirt    beach
-//       baseY4 block mean            4.2905   1.7135   2.6237
-//       retired lurch solve          2.6079   1.0764   1.2848
-//       this solve, lurch-weighted   2.5741   1.0393   1.2613
-//
-// The 2D reach and its evidence read the SOLVED luma rather than the block
-// scaffold or a privately-built notch. Default ON: determining a reach from a
-// worse estimate than the one available is the evidence failure the holdout
-// convicted at 1D. LDCD_REACH_SOLVED_LUMA=0 restores the old sources.
+// The luma platform solve is the canonical coarse-luma estimate used by 2D reach
+// and its evidence. It solves the carrier-free same-phase and lane constraints
+// in one system rather than constructing a private reach-local estimate.
+// LDCD_REACH_SOLVED_LUMA=0 selects the alternate scaffold/notch evidence sources.
 inline bool ldcdReachUsesSolvedLuma()
 {
     static const bool on = []{
@@ -90,28 +80,10 @@ inline bool ldcdCombLicenseEnabled()
     return on;
 }
 
-// FRAME B STAYS IN THE COLUMN (LDCD_FB_PIN_COLUMN=1). A test, default off.
-//
-// Frame B searches a lateral shift d in {-2..+2} and takes its pair
-// off-column at (up[x-d], dn[x+d]), on the account that a diagonal feature
-// advances between the +-1 lines. But Frame B's stated job is cancelling
-// VERTICALLY-INVARIANT image-locked colour, and a vertically-invariant term
-// has zero diagonal advance by definition -- that is the same sentence twice.
-// The carrier it subtracts is raster-locked, not content-locked, so it does
-// not ride a diagonal at all. d = 0 is already the detent for exactly this
-// reason -- "the vertical is Frame A's whole job" -- and a non-zero aim must
-// clear an 8% margin to displace it.
-//
-// The margin is cleared on notchAt = 0.5*(r[x-1] + r[x+1]) of the RAW row:
-// the two-tap diameter mean, which cancels fSC and nothing else, and whose
-// residue is period-4 in x. So the proof standard for leaving the column can
-// be met by phase-bucket structure rather than by content. d then flips with
-// the bucket, and an off-column-by-one pair resolves a horizontal dark edge
-// one line up on one bucket and one line down on the next -- an alternation
-// with everything combing and nothing ceding.
-//
-// The pin holds the pair in the column so that mechanism can be convicted or
-// exonerated in one render, without arguing about the search's material.
+// LDCD_FB_PIN_COLUMN=1 constrains Frame B registration to d = 0 for diagnostic
+// A/B renders. In the normal path Frame B may adopt the published diagonal
+// advance; the pin forces the registered pair to (up[x], dn[x]) without changing
+// the rest of the estimator.
 inline bool ldcdFrameBPinColumn()
 {
     static const bool on = []{
@@ -121,11 +93,9 @@ inline bool ldcdFrameBPinColumn()
     return on;
 }
 
-// One detected luma step in a coarse aperture-mean sequence (the lurch
-// step-solve's output). PRODUCTION DATA: built once per line per frame from
-// the shared aperture pool (buildLurchStepRuns) and consumed by the witness
-// coarse-sharpener, the edge probes, and (next) the 2D threshold revisit --
-// one scan, many readers, per the no-duplicate-math standard.
+// One detected luma step in a coarse aperture-mean sequence. Built once per line
+// from the shared aperture pool by buildLurchStepRuns and consumed by the active
+// lurch and edge-analysis clients.
 //
 // `gate` is stored at UNIT gain (the raw smoothstep of step size); consumers
 // apply their own gain as clamp(gate * gain, 0, 1), which is exactly the
@@ -157,21 +127,15 @@ public:
         bool   adaptive    = true; // If true, the 3D adaptive candidate selection is used.
         bool   showMap     = false; // If true, produce a diagnostic overlay map (ntsc3d only).
         bool   debugCadence = false; // Draw cadence letter (A, B, C...) on frame
-        // --set-cadence is live. The /AA-is-film, A/A-is-not, A/B-drops-the-A
-        // rule for edit boundaries belongs to the AUTOSOLVE, which is reasoning
-        // from evidence it trusts. A jam is a different beast: the typical
-        // reason to reach for it is that the solve FAILED, and the user is
-        // forcing a cadence only they can see rather than going back to write
-        // metadata overrides. Protecting them from their own count — demoting a
-        // frame because the failed solve marked a cut inside it — takes the
-        // control away that is the entire point of the flag.
+        // --set-cadence is an explicit cadence jam. When imposedCadence is true, the
+        // forced cadence controls frame interpretation directly; autosolve edit-boundary
+        // evidence does not override that imposed count.
         bool imposedCadence = false;
         // Demod plus Y selection: phase locked vs bucket
         // Phase locked is a coherent path that includes HF Y from composite
         bool phaseCompensation = false;
-        // Y-election roster (--y-election, 2026-08-20). comb is always
-        // seated and is not a member. Bare default reproduces the historic
-        // no-flag render (notch-HF seated, rest off).
+        // Y-election roster (--y-election). The comb source is always the baseline and
+        // is not a roster member. The default seats notch-HF only.
         struct YElection {
             bool ccr = false;   // cross-colour return pair (Y return + mask)
             bool rcy = false;   // retracted carrier Y (witness candidate)
@@ -180,12 +144,9 @@ public:
         };
         YElection yElection;
 
-        // Per-axis product gains: multipliers applied to locked I and Q before
-        // filtering.  This is the sole authority for product tuning — do not
-        // reintroduce gain constants in combmath.h.  GQ < 1.0 trims the Q axis
-        // to compensate for the slight chroma ellipse of the locked demod.
-        // (Defaults match the previously live combmath.h values; the old 1.1
-        // here was never read.)
+        // Per-axis product gains multiply locked I and Q before filtering. This is the
+        // sole authority for product tuning. GQ < 1.0 trims the Q axis to compensate for
+        // the slight chroma ellipse of the locked demod.
         double gi_product = 1.0;
         double gq_product = 0.9;
 
@@ -236,15 +197,11 @@ public:
             // 1D / Lateral baseline
             // =========================================================================
             // Cross-color suppression strength (--cross-color-return).
-			// Set in CLI to transfer cross color back to luma.  Scales how
-			// much of the MEASURED contamination gets returned to luma; the
-			// transfer is hard-ceilinged at the evidence itself (aperture gA,
-			// or the vertical-image-detail read where gA under-reads -- see
-			// splitIQlocked/filterIQLocked).  Values above 1.0 only override
-			// a false-positive regionKeep rescue; they can never manufacture
-			// suppression beyond what was measured, so saturated textured
-			// chroma no longer grays out at strength 2. The feature is
-			// opt-in; 0 leaves the ordinary residual-Y path untouched.
+            // Set by the CLI to transfer measured cross-colour contamination back to luma.
+            // The transfer is ceilinged by the evidence itself (aperture gA or the
+            // vertical-image-detail read where gA under-reads; see splitIQlocked/
+            // filterIQLocked). Values above 1.0 only override a false-positive regionKeep
+            // rescue and cannot exceed the measured contamination. 0 disables the feature.
             double CC_SUPPRESSION_WEIGHT    = 0.0;
 
             // =========================================================================
@@ -261,22 +218,22 @@ public:
             double FIELD_VERT_DISAGREE_THRESH_IRE = 8.0; // suppress 2D field output when ±2 line pair disagrees beyond this
 
             double FIELD_LUMA_EDGE_THRESH_IRE = 18.0; // horizontal luma gradient above this suppresses vertical 2D comb
-            double FIELD_B_BEVEL_REACH_PENALTY = 0.45; // RESERVED / inert: retired Field B bevel reach damping; kept for tuning compatibility
+            double FIELD_B_BEVEL_REACH_PENALTY = 0.45; // RESERVED / inert compatibility slot for Field B bevel reach damping
 
             // =========================================================================
             // Frame comb on phase-corrected 1D
             // =========================================================================
-            double FRAME_COMB_STRENGTH        = 1.125; // RESERVED / inert: Frame A now uses a fixed 0.5 midpoint
+            double FRAME_COMB_STRENGTH        = 1.125; // RESERVED / inert: Frame A uses a fixed 0.5 midpoint
             double FRAME_CHROMA_MIN_IRE       = 1.5;   // RESERVED / inert for Frame A
             double FRAME_IQ_RAW_MAX_DELTA_IRE = 70.0;  // RESERVED / inert for Frame A
             double FRAME_IQ_COH_PASS_CORR     = 0.85;  // RESERVED / inert for Frame A
             double FRAME_B_COMB_STRENGTH       = 1.00; // Frame B signed-alien cancellation scale, capped at the measured correction
             double FRAME_B_CHROMA_MIN_IRE      = 1.5;  // Frame B IRE-domain reach-floor minimum
-            double FRAME_B_RAW_MAX_DELTA_IRE   = 100.0; // RESERVED / inert: Frame B no longer performs a midpoint pull
-            double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // RESERVED / inert: retired with Frame B's midpoint blend
-            double FRAME_BEVEL_SAT_PENALTY     = 0.50; // RESERVED / inert: retired with Frame B's midpoint blend
-            double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // RESERVED / inert: retired with Frame B's midpoint blend
-            double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // RESERVED / inert: the gate-side lateral-edge term was removed — a bare hLumaDeltaIRE step cannot separate a straight vertical misread column from a diagonal boundary, so it only stripped bevel protection off diagonals. Vertical-column restore now lives in the combine's partner-verified crossColorExempt (computeFrameBLine). Kept for ABI/tuning; not read by the reach gate.
+            double FRAME_B_RAW_MAX_DELTA_IRE   = 100.0; // RESERVED / inert compatibility slot for Frame B midpoint-pull tuning
+            double FRAME_B_BEVEL_REACH_PENALTY = 1.0;  // RESERVED / inert compatibility slot
+            double FRAME_BEVEL_SAT_PENALTY     = 0.50; // RESERVED / inert compatibility slot
+            double FRAME_LUMA_EDGE_THRESH_IRE  = 28.0; // RESERVED / inert compatibility slot
+            double FRAME_BEVEL_XCOL_PENALTY    = 1.0;  // RESERVED / inert compatibility slot. Frame B lateral-edge handling uses the partner-verified crossColorExempt in computeFrameBLine; this field is not read by the reach gate.
 
             // =========================================================================
             // FVF (Field vs Frame) scoring
@@ -352,37 +309,22 @@ public:
             // 3D candidate / vet / Y path
             // =========================================================================
             // Similarity curve for temporal candidate scoring in getBestCandidate.
-            // Let d be the mean absolute reconstructed-luma difference over
-            // the centered five-point spatial cross in getCandidate():
-            //   d ≤ AGREEMENT_REWARD_RADIUS_IRE  → reward: −AGREEMENT_REWARD_MAX·(1−(d/r)²)
-            //   d > AGREEMENT_REWARD_RADIUS_IRE  → neutral
-            //
-            // d is the CARRIER-FREE coarse distance (see getCandidate). Its
-            // old form, raw − clpbuffer[1], carried the per-frame chroma
-            // misread with opposite sign in reference and candidate, so it
-            // read about twice the misread and inflated the very measurement
-            // used to judge the candidate that would cancel it.
-            //
-            // The veto branch was retired 2026-07-13 for that reason,
-            // RESTORED 2026-08-06 once the input defect was gone, and removed
-            // again the same day: on the carrier-free distance it moved 2.7%
-            // of samples by up to ~68 codes without earning the change. The
-            // objection that motivated it still stands on paper — a
-            // reward-only curve cannot refuse, and beyond the lobe a partner
-            // disagreeing by 30 IRE merely loses its bonus — so if the duty is
-            // wanted back, place the region from the CARRIER-FREE
-            // distribution (LDCD_PROBE_DIST censuses it) rather than
-            // inheriting thresholds tuned against the contaminated one. The
-            // same caution applies to the reward lobe's own radius below.
-            //
+            // Let d be the mean absolute carrier-free reconstructed-luma difference over the
+            // centered five-point spatial cross in getCandidate():
+            //   d <= AGREEMENT_REWARD_RADIUS_IRE -> reward:
+            //        -AGREEMENT_REWARD_MAX * (1 - (d/r)^2)
+            //   d >  AGREEMENT_REWARD_RADIUS_IRE -> neutral
+            // The curve is reward-only: disagreement outside the lobe earns no reward and is
+            // handled by independent legality/hull policy rather than by a population-based
+            // veto.
             // Output-side bounding does not carry this duty either: the
-            // split3D member hull was measured (see its census) and defaults
+            // split3D member hull defaults
             // off, because any distance-to-2D bound preferentially refuses the
             // members cancelling the largest misread.
             double AGREEMENT_REWARD_RADIUS_IRE = 7.5; // half-width of the reward lobe (IRE)
             double AGREEMENT_REWARD_MAX        = 3.3; // peak reward at d=0 (penalty units, scaled by adaptThreshold)
-            double AGREEMENT_VETO_BASE         = 7.0; // RETIRED / inert: retained for tuning compatibility
-            double deviationPenalty            = 3.3; // RETIRED / inert: retained for tuning compatibility
+            double AGREEMENT_VETO_BASE         = 7.0; // RESERVED / inert compatibility slot
+            double deviationPenalty            = 3.3; // RESERVED / inert compatibility slot
             double TEMPORAL_HULL_SLACK_IRE      = 1.5; // output may exceed the independent 2D/partner hull by this much
 
             // produceY local HF election.  A candidate earns this capped
@@ -394,11 +336,8 @@ public:
             // carrier reduction under measured cross-colour. Raw and smoothed
             // detector values remain separately observable in diagnostics.
             double PRODUCE_Y_CC_RETURN_EVIDENCE_CAP_IRE = 3.0;
-            // PRODUCE_Y_PHASE_PENALTY_IRE was removed 2026-08-24 with the
-            // election's consensus terms: it scaled the charge a candidate
-            // paid for its carrier-basis cleanliness falling below the
-            // MEDIAN of the seated candidates, so it had no meaning once
-            // the population's centre stopped being a reference.
+            // Candidate cleanliness is evaluated directly by the active scoring terms; there
+            // is no population-median phase-cleanliness penalty.
             double FRAME_IQ_COLUMN_PHASE_ALIGN_MAX_DEG = 10.0; // clamp for neighbor IQ column phase alignment in frame candidates
 
             // Attribution-informed Y reassignment: returns bandpassed energy to Y when
@@ -536,14 +475,11 @@ public:
 	// so the two existing floors can be graded without it in the path.
 	void solveLumaPlatformLine(int line, const double *apMean, int meanCount,
 	                           int width, double *yOut);
-	// Vertical snap corroboration: the lurch-snap was the last per-line hard
-	// quantizer -- run.edge jitters +-0.5-1 px line to line on texture noise
-	// and saw-tooths bright vertical contours. For each run with a matching
-	// run (same step sign, within kLurchMatchPx) on BOTH adjacent lines, the
-	// snap edge becomes the MEDIAN-OF-THREE -- an order statistic, a
-	// selection among measured values, never a mean. One or no matches leave
-	// the line's own edge standing. Returns an adjusted COPY for the snap
-	// consumers; the canonical lists stay raw measurement.
+	// Vertical snap corroboration stabilizes a lurch edge with matching same-sign
+	// runs on both adjacent lines. The published edge is the median of the three
+	// measured positions; with fewer than two matches, the line's own edge stands.
+	// The function returns an adjusted copy and leaves the canonical run lists
+	// unchanged.
 	std::vector<LurchStepRun> corroborateLurchEdges(int line) const;
 	void applyCarrierFeasibilityHull(int line, double *carrierAtLeft);
 	// Coarse-residual parallax for one line: ratioOut[x] is the spread of the
@@ -563,7 +499,7 @@ public:
 	void buildCertifiedCarrierLadder(const FrameBuffer *prevF = nullptr);
 	// Sync-tone actuator: on UNCOVERED frames, rotate the FIT's carrier
 	// phase toward the tracker reference (in-batch covered anchor advanced
-	// by the shipped rate). The fit is a MODEL product — rotating it is
+	// by the configured cadence rate). The fit is a MODEL product -- rotating it is
 	// lawful — and the rotation is the exact 4fsc quadrature identity
 	// (cos d·s + sin d·q, q[h] = 0.5(s[h-1]-s[h+1])), an all-pass phase
 	// shift at fsc: no demod/remod round-trip, no waveform substitution.
@@ -629,28 +565,15 @@ public:
 	                       double *flankROut = nullptr,
 	                       bool *carrierRunVetoOut = nullptr) const;
 
-	// ---- Certified-field anchoring (user design, 2026-07-30) ----
-	// "I don't see a future where one signal wins it. 1D should be
-	// selectively replaced with certified fields at the def positions, and
-	// both Field and Frame combs should cede to center on those fields."
-	// Three stages, one escape (LDCD_CERT_1D=0 disables; =1 head only,
-	// =2 head + field/frame construction cede, default 3 = + temporal):
-	//   1. buildPhaseCorrected1D pass 3a: the 1D scalar IS the certified
-	//      carrier on def lines (per-sample repair holes keep the model).
-	//      Every derived product — demod caches, clpbuffer[0], CCR notch,
-	//      produceY's 1D candidate — inherits truth at the head.
-	//   2. COMB CONSTRUCTION cede (computeFieldALine / computeFieldBLine /
-	//      computeFrameBLine / the Frame A build): on def lines every
-	//      candidate is CONSTRUCTED as the center — upstream of all three
-	//      elections, which run untouched. This is what the comp lines'
-	//      one-way comb actually reads: preclean and partner consumers get
-	//      the certified center, not a comb-mangled copy of it.
-	//   3. split3D construction: temporal members are not evaluated on def
-	//      lines; the seeded 2D (= center) stands.
-	// This is the completion of lesson #1 from the twin-field doc: head
-	// injection alone DOUBLED chroma line-alternation because the combs
-	// kept mixing exact against model across parities — the cede is the
-	// half that was missing.
+	// Certified-field anchoring has three stages, controlled by LDCD_CERT_1D
+	// (0 = disabled, 1 = head only, 2 = head plus field/frame construction cede,
+	// 3 = plus temporal handling).
+	// 1. buildPhaseCorrected1D publishes the certified carrier at def positions;
+	//    per-sample repair holes retain the model.
+	// 2. Field A, Field B, Frame A, and Frame B construct def-line candidates as the
+	//    certified center, so downstream preclean and partner reads see that source.
+	// 3. split3D does not evaluate temporal members on def lines; the seeded 2D
+	//    certified center stands.
 	static int certifiedOneDLevel();      // env-resolved once
 	bool certifiedDefLine(int line) const; // any finite exact sample in active
 	mutable std::vector<qint8> certifiedLineCache; // -1 unknown / 0 / 1
@@ -659,9 +582,9 @@ public:
 	// consumes its zero carrier, and the normal chroma filter renders raw - Y.
 	void buildStarFootprint(const FrameBuffer *prevF,
 	                        const FrameBuffer *nextF);
-	// Sync-tone increments shipped by the assembler (per field; see
-	// SourceField::dgSyncIncrement). Kept per source field; consumers
-	// compose with their own in-batch anchor measurement.
+	// Sync-tone increments supplied by the assembler per field
+	// (SourceField::dgSyncIncrement). Consumers combine them with their in-batch
+	// anchor measurement.
 	QVector<float> syncIncFirst, syncIncSecond;
 	// Cadence position of each source field, kept alongside its payload.
 	// The sync anchor is always a def, so the anchor's position is
@@ -758,23 +681,16 @@ private:
 	SourceVideo::Data rawbuffer;
 	qint32 firstFieldPhaseID  = 0;
 	qint32 secondFieldPhaseID = 0;
-	using LineAffine = lddecode::CarrierGrammarAffine;
 	using CombCarrierGrammar = lddecode::CarrierGrammarState;
 	struct SamplePlane {
 		alignas(64) double pixel[MAX_HEIGHT][MAX_WIDTH];
 	} clpbuffer[3];
-	// clpbuffer[0]: 1D scalar plane, filled by split1D() (blind 1D bandpass).
-	//               ONE MEANING, BOTH MODES.  The locked path used to
-	//               publish its phase-corrected 1D export over this plane, so
-	//               the buffer meant two different things depending on
-	//               phaseCompensation and the blind bandpass was unreachable
-	//               downstream in locked mode.  The locked export now lives
-	//               only in locked1DSource_flat (rel-indexed), with
-	//               lockedScalarH_flat as its h-indexed view where one is
-	//               needed.
-	// clpbuffer[1]: 2D candidate plane, filled by split2D().
-	// clpbuffer[2]: 3D temporal refinement plane, filled by split3D().
-
+	// clpbuffer[0]: blind 1D scalar plane filled by split1D(), with the same meaning
+	//               in bucket and locked modes.
+	// locked1DSource_flat: locked-path 1D scalar, rel-indexed.
+	// lockedScalarH_flat: h-indexed view of the locked scalar where required.
+	// clpbuffer[1]: 2D candidate plane filled by split2D().
+	// clpbuffer[2]: 3D temporal refinement plane filled by split3D().
 	struct CombTapScalar {
 		double raw = 0.0;
 		double comp = 0.0;
@@ -994,7 +910,7 @@ private:
 	// not the cross-line comb contract.
 	std::vector<float> demodTI4fsc_flat;
 	std::vector<float> demodTQ4fsc_flat;
-	// Precomputed magnitude service retained for legacy local evidence.
+	// Precomputed magnitude service for local IQ evidence.
 	std::vector<float> demodIQMag4fsc_flat;
 	// Canonical pre-comb IQ: separate full-scale I and Q, low-passed with a
 	// symmetric integer-centred aperture and registered to locked1DSource[h].
@@ -1042,21 +958,16 @@ private:
 	// mask is the conservation fact — the audit grades the DETECTOR, and a
 	// fact grading itself is vacuous.
 	std::vector<float> ccDetectorVerdict_flat;
-	// Regional fact-audit of the detector (built in splitIQlocked pass 2,
-	// consumed by produceY's Y-return ONLY — the suppression duty keeps
-	// the full mask; auditing it with Y-return honesty squelched
-	// legitimate suppression, the two-duties conflict measured +10%
-	// covered chroma alternation).
+	// Regional detector audit built in splitIQlocked pass 2 and consumed only by
+	// produceY's Y-return path. Chroma suppression uses the full suppression mask;
+	// the Y-return audit is intentionally a separate duty.
 	std::vector<float> ccAuditW_flat;
 	int ccAuditNX = 0, ccAuditNY = 0;
 	// Band-revoked residue with an affirmed luma claim (attributiondefs
-	// bandResidueLumaClaim), in composite units: w·(src − legalCarrier)
-	// per sample on uncovered frames, zero elsewhere. Built in
-	// splitIQlocked's legal-band application stage; consumed by produceY
-	// as a VALUE folded into the returned-Y candidate — never written
-	// into carrierComp (the elected scalar is ONE object; a second,
-	// numerically different copy inside the election rendered as dot
-	// fringing at garment edges, 2026-07-31).
+	// bandResidueLumaClaim), in composite units: w*(src - legalCarrier) per sample on
+	// uncovered frames, zero elsewhere. Built in splitIQlocked's legal-band stage and
+	// consumed by produceY as a value in the returned-Y candidate; it is never written
+	// into carrierComp, which remains the single elected carrier scalar.
 	std::vector<float> bandResidueY_flat;
 	inline const float *bandResidueY_line(int line) const {
 		if (bandResidueY_flat.empty() || demodWidth <= 0 ||
@@ -1162,10 +1073,9 @@ private:
 	// qualifying transition was found, which is the d = 0 detent.
 	std::vector<double> scratch_fbDiagAdvance;
 	std::vector<double> scratch_fbDiagStrength;
-	// Frame B publishes the reach verdict separately from its candidate value.
-	// The candidate keeps the full registered cancellation; FVF consumes this
-	// aperture-level bit to disqualify it (and, in progressive runs, promote
-	// Frame A) wherever the old construction would have ceded both operands.
+	// Frame B publishes the reach verdict separately from its candidate value. The
+	// candidate retains full registered cancellation; FVF consumes this aperture-
+	// level bit to disqualify Frame B and, in progressive runs, prefer Frame A.
 	std::vector<std::uint8_t> scratch_frameBReachUnsafe;
     // Prepass working rows: edge-replicated padded copies of the three
     // demodded IQ rows (padding reproduces the clamp-to-edge indexing, so
@@ -1184,10 +1094,8 @@ private:
 		std::vector<double> scratch_lineWorkA; // Field A scalar / carrier-fit row.
 		std::vector<double> scratch_lineWorkB; // Field gate / witness basis-I row.
 		std::vector<double> scratch_lineWorkC; // Field B scalar / flattened row.
-	// FVF divergence cluster: per-pixel condition DATA, pooled once per line and
-	// consumed by the election (central management). Pure information — no
-	// decisions live here; the consumer acts. Per-line now; promote to a 3-deep
-	// ring when a 2D consumer needs the ±1 neighbours.
+	// FVF divergence cluster: per-pixel condition data pooled once per line and
+	// consumed by the election. No decision is made by the producer.
 	struct CombConditionEvidence {
 		double satIRE          = 0.0;  // IQ magnitude (saturation test)
 		double combDivergence  = 0.0;  // |fieldB-frameB| smoothed (IQ/comb domain)
@@ -1270,39 +1178,28 @@ private:
 	std::vector<std::uint8_t> chromaBoundaryBand_flat;
 		// Flat per-sample locked-path buffers (line-major: demodLines x demodWidth).
 		//
-		// locked1DSource_flat is the locked-path video 1D scalar, declared as
-		// the Locked1DScalar reach source (PhasePreservedCarrier).  Physically
-		// it is the restrained native bandpass itself: no IQ round trip and no
-		// fractional resampling.  Raw carrier orientation is intact on every
-		// line.  The retired
-		// "common phase / polarity gone by construction" label described a
-		// pre-reform pipeline and misled repeatedly.
+		// locked1DSource_flat is the locked-path 1D scalar and is classified as
+		// Locked1DScalar / PhasePreservedCarrier. It is the restrained native bandpass:
+		// no IQ round trip, no fractional resampling, and physical carrier orientation is
+		// preserved on every line.
 		//
-		// Rules for new code:
-		//  1. Prefer locked1DTI4fsc/TQ4fsc (Grid4fscIQ, phase-preserved and
-		//     integer-centred on the matching scalar sample) for any operation
-		//     that needs polarity in IQ.
-		//  2. If this scalar must be demodded for interfield IQ use, demod with
-		//     carrierGrammarSignedSampleClass (lineFlip folded into the phase)
-		//     to land in Grid4fscIQ.  An unsigned demod yields IQ that inherits
-		//     raw signs: interfield (±1) IQ cancels then see real chroma as
-		//     anti-phased, flip it, and preserve alien Y — the 2fsc luma
-		//     checker in Frame B's locked path came from exactly this.
-		//  3. Intrafield (±2 same-field) scalar combs on this buffer are
-		//     legitimate: same-field neighbors share lineFlip and the physical
-		//     carrier alternation is preserved in the scalar.
-		//  4. Cross-line legality is not decided here: ask CombReachIndex with
-		//     scalarReachSource(); grammar answers per line pair.
+		// Cross-line rules:
+		//   1. Use locked1DTI4fsc/TQ4fsc (Grid4fscIQ, phase-preserved and
+		//      integer-centred) for operations that require IQ polarity.
+		//   2. If the scalar must be demodulated for interfield IQ, use
+		//      carrierGrammarSignedSampleClass so lineFlip is folded into the phase and
+		//      the result lands in Grid4fscIQ.
+		//   3. Intrafield +/-2 scalar combs are valid because same-field neighbours share
+		//      lineFlip while retaining the physical carrier alternation.
+		//   4. Cross-line legality is decided by CombReachIndex through
+		//      scalarReachSource(); it is not inferred from this buffer alone.
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
 		std::vector<double> locked1DSource_flat;
-		// H-INDEXED VIEW of locked1DSource_flat, in clpbuffer geometry
-		// (fieldWidth stride), for the sites that address the active comb scalar
-		// by absolute h.  Allocated ONLY where such a site can read the 1D
-		// plane: locked --ntsc1d (where the active comb source IS the 1D
-		// scalar) and the LDCD_OLD_SPLIT2D legacy reader.  The shipping locked
-		// 2D/3D path reads clpbuffer[1]/[2] and never allocates this, so it
-		// costs nothing there.  Empty means "not this configuration", never
-		// "not yet built".
+		// H-indexed view of locked1DSource_flat in clpbuffer geometry (fieldWidth stride).
+		// It is allocated only for configurations that address the 1D scalar by absolute
+		// h: locked --ntsc1d and the LDCD_OLD_SPLIT2D diagnostic reader. Locked 2D/3D
+		// reads clpbuffer[1]/[2] and does not allocate this view. Empty means the current
+		// configuration does not require it.
 		std::vector<double> lockedScalarH_flat;
 		std::vector<float> locked1DParallaxRepairStrength_flat; // [0,1] actual Pass-1.5 applied repair strength
 		// Signed Pass-1.5 applied repair delta (signal units) per sample.
@@ -1322,10 +1219,9 @@ private:
 	// samples, held over that cycle (information-rate Nyquist fSC/2).
 	std::vector<double> lockedLumaBaseY4_flat;
 	std::vector<double> lockedLumaSmooth_flat;
-	// THE LUMA PLATFORM SOLVE (solveLumaPlatformLine, comblocked.cpp): one
-	// banded system over every carrier-free fact the line affords -- the
-	// same-phase parallax differences AND both lane diameters. A third
-	// construction that supplants the earlier coarse floors.
+	// THE LUMA PLATFORM SOLVE (solveLumaPlatformLine, comblocked.cpp): one banded
+	// system over the line's carrier-free same-phase parallax differences and both
+	// lane diameters.
 	std::vector<double> lockedLumaSolved_flat;
 	// THE RESIDUAL LANE COARSES. Built from resid = raw - solvedPlatform, in
 	// COMPOSITE space, NOT from the 1D bandpass -- so they are an independent
@@ -1372,8 +1268,8 @@ private:
 	// Sign convention, shared with Frame B's own search (computeFrameBLine):
 	// a feature at column x on this line sits at x-s on the line above and
 	// x+s on the line below, so the aligned pair is (up[x-s], dn[x+s]).
-	// Frame B's registered `d` IS this s -- the two were derived
-	// independently and agree, which is why one number can serve both.
+	// Frame B's registered `d` uses this same signed advance convention.
+	// One published advance therefore serves both registration consumers.
 	//
 	// Measured on CERTIFIED LUMA (raw - exact on the two bracketing lines),
 	// COLLECTED POOL (unfiltered): the sliding four-sample aperture means.
@@ -1405,17 +1301,14 @@ private:
 	// conservation condition a desaturating suppressor cannot satisfy).
 	// Consumed by the shared carrier analysis.
 	std::vector<double> lockedCornerLeak_flat;
-	// BAND FACTS: one head-scan producer (buildBandFacts, the tail of
-	// buildCarrierAnalysis) publishes the per-sample facts band consumers
-	// used to rebuild privately per line:
+	// BAND FACTS: buildBandFacts publishes the shared per-sample band evidence:
 	//   bandWLaw    -- encoder-law loudness bound on the canonical bandpass
-	//   bandKeep1/2 -- notch testimony ramp at the interfield (+-1) and
-	//                  same-field (+-2) partner reaches
-	//   bandHeard1/2 -- testimony was actually consulted there. keep == 0
-	//                  is a VERDICT only where heard is set; otherwise it
-	//                  is an absence of evidence and raw stands
-	//   parallaxI/Q -- deviation-weighted consensus of the four aperture
-	//                  views' carrier coordinates (raw units, common IQ)
+	//   bandKeep1/2 -- notch testimony ramp at the interfield (+/-1) and
+	//                  same-field (+/-2) reaches
+	//   bandHeard1/2 -- whether testimony was consulted; keep == 0 is a verdict only
+	//                   where heard is set, otherwise it is absence of evidence
+	//   parallaxI/Q -- deviation-weighted consensus of the four aperture views'
+	//                  carrier coordinates in the common IQ frame
 	std::vector<double> bandWLaw_flat;
 	std::vector<double> bandKeep1_flat, bandKeep2_flat;
 	std::vector<quint8> bandHeard1_flat, bandHeard2_flat;
@@ -1466,21 +1359,10 @@ private:
 
 	// THE PLATFORM THE ICEBERG TWEEN IS ANCHORED ON.
 	//
-	// The tween needs one luma platform for three jobs -- banked from the
-	// covered frame, read from both neighbours, and read at the centre row
-	// where platformAgrees vets the correspondence -- and all three must be
-	// the SAME estimate or the vet compares vintages rather than positions.
-	// Hence one accessor, not three call sites naming a plane.
-	//
-	// It is the solved platform wherever the solve ran, and the smooth
-	// estimate otherwise. That is the swap: the origin of a vector process
-	// is exactly where a better estimate compounds, and the correspondence
-	// vet gets stricter for the same reason. Isolated rms IRE against the
-	// banked truth, cube/shirt/beach: smooth's own floor 4.2905/1.7135/2.6237
-	// against the solve's 2.5741/1.0393/1.2613.
-	//
-	// Eye verdict 2026-09-04: the solved origin is better. The A/B gate that
-	// carried the swap is gone; the solve is the origin wherever it ran.
+	// The tween uses one luma platform for the covered-frame bank, both neighbour
+	// reads, and the center-row platformAgrees correspondence test. icebergPlatform_line
+	// returns lockedLumaSolved when available and lockedLumaSmooth otherwise, so all
+	// three roles use the same estimate for a given frame.
 	inline const double *icebergPlatform_line(int line) const {
 		if (!lockedLumaSolved_flat.empty())
 			return lockedLumaSolved_flat.data() + size_t(line) * demodWidth;
@@ -1577,11 +1459,8 @@ private:
 	AnchoredCarrierProvenance anchoredCarrierProvenance =
 		AnchoredCarrierProvenance::None;
 
-	// The chained anticipated-reference luma plane that stood here is REMOVED
-	// (2026-08-08) with its only consumer, the anticipated rung; see the
-	// record in buildCertifiedCarrierStage. The sync tone (applyToneToFit) was
-	// the part of that work worth keeping and does not read this.
-
+	// The sync-tone path (applyToneToFit) is independent of any anticipated-reference
+	// luma plane and reads only its current fit inputs.
 	inline const double *anchoredCarrierStorage_line(int line) const {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    anchored1DSource_flat.empty()) return nullptr;
@@ -1648,10 +1527,9 @@ private:
 		return locked1DParallaxRepairDelta_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
-	// The blind 1D bandpass from split1D(), h-indexed.  This is now its
-	// meaning in BOTH modes -- in locked mode it is the pre-locked-head
-	// observation, not the locked export.  A consumer that wants the locked
-	// scalar must ask for it by name.
+	// Blind 1D bandpass from split1D(), h-indexed. In locked mode this remains the
+	// pre-locked-head observation; consumers that need the locked scalar use the
+	// named locked source.
 	inline const double *bucketScalar1D_line(int line) const {
 		return clpbuffer[0].pixel[line];
 	}
@@ -1755,14 +1633,10 @@ private:
 	}
 	// 1 = this frame line is a merged-twin (exact-covered) line: PINNED.
 	// Empty on frames without coverage.
-	// Anchor FLOOR: the lower jaw of the envelope law (author, 2026-08-10:
-	// the constraint "is supposed to resist delta excess, and sanding off
-	// these features is a big delta" -- an envelope the encoder could not
-	// have swelled that fast, it also could not have collapsed that fast).
-	// Same geometry as the ceiling; 0 = no authority. Built from the same
-	// certified envelope, ERODED (min-pooled) where the ceiling dilated,
-	// min-of-brackets where the ceiling took max: a floor must survive
-	// anchor drift by shrinking, and both bracketing covers must vouch.
+	// Anchor floor: lower bound of the certified envelope law. It has the same
+	// geometry as the ceiling; 0 means no authority. The floor is eroded where the
+	// ceiling dilates and takes min-of-brackets where the ceiling takes max, so both
+	// bracketing covers must support the lower bound.
 	std::vector<float> anchorFloor_flat;
 	inline const float *anchorFloorRow(int line) const {
 		if (line < 0 || anchorFloor_flat.empty()) return nullptr;
@@ -1777,23 +1651,12 @@ private:
 		       anchorCoveredLine[line] != 0;
 	}
 	void buildAnchorCeiling();
-	// BAND FACTS producer, the tail of buildCarrierAnalysis: one scan
-	// publishes what band consumers used to rebuild privately per line
-	// (the notch-HF curves and the parallax consensus). bandWLaw = the
-	// encoder-law loudness bound on the canonical bandpass; bandKeep1/2 =
-	// the grammar-schedule testimony at the interfield (+-1) and
-	// same-field (+-2) partner reaches, under the PRESUMPTION OF LUMA:
-	// nothing is subtracted unless partners positively confirm carrier, so
-	// a thin feature the schedule cannot vouch against is never touched
-	// (the phaser-beam dash class, made impossible rather than tuned
-	// away). The notch-HF carrier object remains bp*wLaw*keep, sampled
-	// from the flats. bandHeard marks samples where testimony was actually
-	// consulted: keep == 0 there is a VERDICT ("partners convicted this as
-	// luma"); elsewhere it is an absence of evidence, and a consumer that
-	// seats the construction must tell the two apart (the second publishes
-	// raw with its carrier intact). Reach 2 is the same-field neighbour
-	// with the shipped fixed anti-phase form; reach 1 is the interfield
-	// partner, vertically half as far and the opposite phase of a
+	// BAND FACTS producer at the tail of buildCarrierAnalysis. One scan publishes
+	// bandWLaw, bandKeep1/2, bandHeard1/2, and parallax consensus for all band
+	// consumers. The notch-HF carrier is bp*wLaw*keep. bandHeard distinguishes a
+	// negative verdict (heard && keep == 0) from absence of testimony. Reach 2 is the
+	// same-field partner under the fixed anti-phase form; reach 1 is the interfield
+	// partner under the grammar-stated relation.
 	// line-alternating artifact, so a collapsed sample's +-1 partner is
 	// the intact one; its confirming correlation sign comes from the
 	// grammar per column, never from the reach. parallaxI/Q is the
@@ -1981,10 +1844,10 @@ private:
 	void computeFieldBLine(int lineNumber,
 						  double *outFieldLine,
 						  std::uint8_t *outReasonLine = nullptr);
-	// Clean-slate Field B experiment (LDCD_FIELDB_CLEAN=1).  It applies
-	// per-side content evidence directly and uses +-4 coarse luma to restore
-	// the gradient missing from a one-sided +-2 cancel.  It deliberately omits
-	// the shipped path's accumulated cede and recovery policy.
+	// LDCD_FIELDB_CLEAN=1 selects a diagnostic Field B construction that applies
+	// per-side content evidence directly and uses +-4 coarse luma to restore the
+	// gradient missing from a one-sided +-2 cancel. It omits the normal cede and
+	// recovery policy.
 	void computeFieldBLineClean(const CombTapLine &tapLine,
 	                            double *outFieldLine,
 	                            std::uint8_t *outReasonLine);
@@ -2066,21 +1929,12 @@ private:
 		return (width > 0) ? getNotchLumaEven2(vec.data(), rel, width) : 0.0;
 	}
 		
-	// TEMPORAL STANDING, RESOLVED ONCE PER LINE (author, 2026-08-08: "hoist
-	// it and build the data for quick lookups. Less potential for unique
-	// results").
-	//
-	// Every term is a per-LINE or per-FRAME property -- which line of which
-	// frame is twin-certified, and whether a neighbour frame is covered at
-	// all -- so all of it is constant across the h loop. Resolving it per
-	// column cost a scan per candidate per sample AND let the grant flip
-	// column to column inside one line, which is a per-column decision in
-	// an election that has to render a line uniformly. One verdict per
-	// line, applied to every column of that line identically.
-	//
-	// The members carry the FINISHED bonus, not an increment, so the
-	// baseline grant cannot be lost by a caller forgetting to add it back:
-	// getBestCandidate never names the constants at all.
+	// TEMPORAL STANDING, RESOLVED ONCE PER LINE.
+	// Every term is a per-line or per-frame property: which line is twin-certified
+	// and whether a neighbouring frame is covered. The verdict is therefore constant
+	// across the h loop and is applied uniformly to every column of the line.
+	// Members carry the finished bonus, so callers do not reconstruct baseline plus
+	// increment locally.
 	struct TemporalEvidenceStanding {
 		double prevFieldUp = 0.0;   // previousFrame @ lineNumber - 1
 		double selfFieldUp = 0.0;   // *this         @ lineNumber - 1
@@ -2336,15 +2190,10 @@ private:
 	};
 };
 
-    // Persistent triple-buffer: the prev/current/next FrameBuffers are reused
-    // across decodeFrames() calls instead of being allocated and zero-filled
-    // on every batch.  Each FrameBuffer owns ~180 MB of per-pixel attribution
-    // storage (facts + assessments = ~456 B/pixel × 525 × 760), so per-batch
-    // reconstruction was the single largest cost in the locked path (~25 %
-    // of decode wall time on M1 Max).  decodeFrames() takes ownership into
-    // locals at entry (preserving the existing std::move rotation) and
-    // returns them at exit; updateConfiguration() resets them so a config
-    // change re-allocates with the new geometry.
+    // Persistent triple-buffer: prev/current/next FrameBuffers reuse their allocated
+    // storage across decodeFrames() calls. decodeFrames() takes ownership into local
+    // pointers for rotation and returns them at exit. updateConfiguration() resets the
+    // buffers so changed geometry or mode is rebuilt with the active configuration.
     std::unique_ptr<FrameBuffer> persistentNext;
     std::unique_ptr<FrameBuffer> persistentCurrent;
     std::unique_ptr<FrameBuffer> persistentPrevious;

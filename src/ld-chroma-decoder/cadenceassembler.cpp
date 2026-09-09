@@ -21,17 +21,13 @@
 #include <cstdint>
 #include <utility>
 
-// TEMPORARY INSTRUMENT (LDCD_DG_DENY=A|C, 2026-08-20). Selective dG-merge
-// denial for the cross-luma calibration harness. --dg-discard turns the merge
-// off wholesale, which breaks the covered-frame proxy two ways: the frame
-// under test loses its facts (wanted) but so does every neighbour (not
-// wanted -- the iceberg witness and the sync tone need intact covers within
-// reach). Covered frames alternate A, C, A, C in output order, so denying one
-// LETTER denies every other covered frame while its +-2 covered neighbours
-// keep their facts. Two runs (=A, =C) cover the whole population. A denied
-// merge takes exactly the per-pair dg-discard path: spare released to
-// baseline, no certified plane, no tone anchor captured. Unset = inert.
-// Strip when the cross-luma question closes.
+// LDCD_DG_DENY=A|C selectively denies dG merging for one covered-frame
+// cadence letter while leaving neighbouring covered frames intact. Covered A
+// and C frames alternate in output order, so selecting one letter denies every
+// other covered frame while its +-2 covered neighbours retain their merge
+// facts. A denied pair follows the same path as --dg-discard for that pair:
+// the spare is released to baseline, no certified plane is emitted, and no
+// sync-tone anchor is captured. Unset is inert.
 static bool dgDenySelective(char letter)
 {
     static const int mode = []{
@@ -73,54 +69,39 @@ namespace {
     // Merge a doplGang A/C spare field into its definitional partner.
     //
     // The def and spare are twin captures of the same film field with
-    // opposite subcarrier phase, so per sample the conservation identities
-    // hold exactly:
+    // opposite subcarrier phase, so per sample the conservation identities are
     //     luma    Lhat = (def + spare) / 2
     //     carrier chat = (def - spare) / 2   -- already in DEF phase
-    // No burst detection, demodulation, or sign decision is needed: chat IS
-    // the def-phase carrier by construction. The merged sample is
+    // No burst detection, demodulation, or sign decision is required for this
+    // split. The emitted sample is
     //     merged = Lhat + BP(chat)
-    // where BP is a linear-phase carrier-band filter (taps at 0/+-2/+-4)
-    // with H(fsc) = H(fsc +- 1.3 MHz) = 1 and H(DC) = H(2fsc) = 0. Signal
-    // content is preserved on both sides of the split -- carrier-band luma
-    // (thin lines) stays in Lhat while the carrier stays in BP(chat), which
-    // a single capture cannot separate -- and twin noise is averaged (-3 dB)
-    // everywhere outside the carrier band. There is deliberately no
-    // per-sample branch: an earlier form selected raw def-or-spare samples
-    // by IQ distance to a complement reference, which inserted 180-degree-
-    // shifted spare carrier into saturated chroma (dotted tractor beam).
+    // where BP is a linear-phase carrier-band filter (taps at 0/+-2/+-4) with
+    // H(fsc) = H(fsc +- 1.3 MHz) = 1 and H(DC) = H(2fsc) = 0. Carrier-band
+    // luma remains in Lhat, carrier remains in BP(chat), and twin noise is
+    // averaged outside the carrier band.
     //
-    // Sanity (pass 1): for true twins the out-of-band part of chat is pure
-    // twin noise, so |chat - BP(chat)| above threshold marks real mismatch
-    // (motion, edit, mis-pairing). Reject the pair when the outlier
-    // fraction exceeds cfg.dgMaxOutlierFrac and no merge occurs.
+    // Pass 1 tests twin integrity with the out-of-band residual
+    // |chat - BP(chat)|. Samples above threshold are mismatches attributable
+    // to motion, edits, mis-pairing, or capture defects. The whole pair is
+    // rejected when their fraction exceeds cfg.dgMaxOutlierFrac.
     //
-    // Per-sample error correction (user design, 2026-07-28): whole-merge
-    // rejection stays for GROSS mismatch (a large share of the image
-    // differs -- the merge would hurt more than help). For the minor
-    // disagreements that survive the gate (dropouts, disc errors), the
-    // out-of-band residual localises the error and the COMPLEMENT field
-    // arbitrates which twin is wrong: the twin more dissimilar to the
-    // average of the comp pixels above and below is held to be the error,
-    // and the other twin's data stands. Phase law of the comparison: the
-    // comp lines bracketing a def line both carry carrier ANTIPHASE to the
-    // def line (adjacent frame lines are 180 degrees; the two comp
-    // neighbours are mutually cophased), so the raw comp average R is a
-    // fair reference for SPARE directly, while DEF must be compared to R
-    // with its carrier flipped -- 2*boxcar(R) - R, the boxcar being
-    // carrier-free. Without the flip the test is biased toward spare
-    // wherever carrier is vertically coherent, which would re-insert
-    // 180-degree carrier through the arbitration (the old dotted-beam bug
-    // by another door). Errors can be luma or colour; the comparison sees
-    // both because it is per-sample against a phase-matched reference.
-    // Repair at an error sample: the good twin supplies its half of the
-    // conservation pair, the carrier is refilled from the nearest valid
-    // same-phase samples (+-4k, one full cycle apart -- lawful under the
-    // bandwidth law), and the exact-carrier side channel is DENIED within
-    // the BP aperture of any error (no conservation fact there).
+    // For a pair that passes the whole-field test, minor disagreements are
+    // repaired per error run. Def, spare, and the two bracketing complement
+    // rows are demodulated independently; the complement IQ rows are then
+    // averaged to the def line's vertical position. The run-integrated IQ
+    // distance to that complement reference decides which twin is the outlier.
     //
-    // Emits the exact-carrier side channel: exact = merged - Lhat = BP(chat),
-    // the carrier of the emitted sample as a conservation fact.
+    // The accepted twin supplies its own composite sample. A good DEF sample
+    // is already in emitted phase and is copied directly. A good SPARE sample
+    // is reflected about R, the raw average of the bracketing complement rows,
+    // to express its antiphase carrier in DEF phase. The repair sets
+    // Lhat = R and chat = kept - R, then rebuilds BP(chat) across the line.
+    // The exact-carrier side channel is denied within the BP aperture of each
+    // repair because the emitted carrier there is reconstructed rather than an
+    // exact twin-conservation fact.
+    //
+    // Where no repair aperture is present, the exact-carrier side channel is
+    // exact = merged - Lhat = BP(chat).
     static bool mergeDgPairWithSanity(const LdDecodeMetaData::VideoParameters& vp,
                                      const CadenceAssembler::Configuration& cfg,
                                      SourceField& def,
@@ -135,10 +116,8 @@ namespace {
         const int width = vp.fieldWidth;
         if (width <= 0) return false;
 
-        // SourceField::data is QVector<quint16>: size() is the SAMPLE count.
-        // (A previous form treated it as a byte buffer and divided by
-        // sizeof(quint16); the geometry guard below then always tripped and
-        // the merge was silently dead.)
+        // SourceField::data is QVector<quint16>, so size() is the sample
+        // count and the geometry checks operate directly on that count.
         if (def.data.size() != spare.data.size()) return false;
         if (def.data.size() <= 0) return false;
 
@@ -158,12 +137,9 @@ namespace {
 
         const double ireScale = (vp.white16bIre - vp.black16bIre) / 100.0;
         if (!(ireScale > 0.0)) return false;
-        // Twin-disagreement threshold: above this the sample is CORRECTED
-        // from the good twin rather than averaged. 6.0 IRE is the author's
-        // value from the pre-VCS cadence_assembler (2025-12-11) and has never
-        // moved. It was briefly a user knob (--dg-outlier-thresh); the merge's
-        // per-sample arbitration was reworked since, and exposing the
-        // threshold is neither necessary nor desirable.
+        // Twin-disagreement threshold: samples above 6.0 IRE are repaired
+        // from the accepted twin rather than averaged. The threshold is an
+        // internal part of the merge policy rather than a user-facing control.
         constexpr double kDgOutlierThreshIre = 6.0;
         const double outlierThreshCode = kDgOutlierThreshIre * ireScale;
         const double maxOutlierFrac    = std::clamp(cfg.dgMaxOutlierFrac, 0.0, 1.0);
@@ -199,29 +175,12 @@ namespace {
             }
         };
 
-        // Twin sanity counts PICTURE only.
-        //
-        // getFirstActiveLine() lands on field line 20, which is still
-        // blanking, and field line 21 carries closed captions / VITC /
-        // other disc metadata on both fields. That data is not picture: it
-        // legitimately differs between the two captures, so counting it as
-        // twin disagreement convicts fields whose image is perfectly sound.
-        // Measured across five scenes, every "one-line fault" the sanity
-        // test found sat on field line 21 and nowhere else -- a full-width
-        // caption line read as damage, on every disc tested.
-        //
-        // Count from the first line of NTSC image. The merge itself still
-        // processes these lines; only the verdict ignores them.
-        // Expressed relative to the active range, not as an absolute line
-        // number: y0 itself is still blanking and y0+1 carries the caption,
-        // so image begins at y0+2. Measured on the exported frame -- rows 0-1
-        // flat at black, rows 2-3 bimodal caption data with steep
-        // transitions, rows 4+ picture. An absolute constant got this wrong
-        // by a line because the def field's parity moves the mapping.
-        // getFirstActiveLine() lands ON the caption line -- verified against
-        // the exported frame: y0 maps to output rows 2-3 (bimodal caption
-        // data), y0+1 to rows 4-5 (picture), and output rows 0-1 sit below
-        // the merge's active range entirely. One line to skip, not two.
+        // Twin sanity counts picture only. getFirstActiveLine() maps to the
+        // non-picture caption/VITC field line for this path, so exactly one
+        // field line is skipped before the sanity census and merge emission.
+        // The offset is relative to y0 because field parity changes the mapping
+        // to exported frame rows. Non-picture data is therefore neither counted
+        // as twin damage nor merged with the other capture.
         constexpr int kNonImageFieldLines = 1;   // the caption line
         const int ys = y0 + kNonImageFieldLines;
         if (ys >= y1) return false;
@@ -268,17 +227,13 @@ namespace {
                             uI(width), uQ(width), vI(width), vQ(width),
                             cI(width), cQ(width);
 
-        // Twin phase capture (the dump instrument has since been removed;
-        // this feeds the sync tracker).
-        // BURST-RELATIVE carrier phase per capture: burst and carrier are
-        // both fsc, so (carrier phase - own burst phase) is a pure number
-        // per capture, comparable across any stream positions with no
-        // lattice bookkeeping. The def/spare pair is the same picture at
-        // two capture moments, so the difference of their burst-relative
-        // phases is a MOTION-FREE sample of the sequence drift -- the
-        // anticipation curve's slope measured by conservation, not
-        // estimated by tracking. (Anchor density alone would not have
-        // warranted this; the exact derivative does.)
+        // Twin phase capture feeds the sync tracker.
+        // BURST-RELATIVE carrier phase per capture is (carrier phase - own burst
+        // phase), which is comparable across stream positions without lattice
+        // bookkeeping. Def and spare contain the same picture at two capture
+        // moments, so the difference of their burst-relative phases provides a
+        // motion-free sample of sequence drift directly from the conservation
+        // pair.
         double phCI = 0, phCQ = 0;             // pooled chat IQ (def coords)
         double phDBI = 0, phDBQ = 0, phSBI = 0, phSBQ = 0; // burst pools
         long phN = 0;
@@ -322,11 +277,10 @@ namespace {
             // (455.0 cycles per field-line pitch), so the pools are
             // coherent with the plain sample-class basis.
             {
-                // Consecutive FIELD rows are consecutive scan lines:
-                // 227.5 cycles apart, so the carrier flips 180 degrees per
-                // row. Sign the pools by row parity or they cancel (first
-                // build measured 0.02 IRE pooled amplitude -- pure
-                // cancellation residue).
+                // Consecutive field rows are consecutive scan lines and are
+                // 227.5 carrier cycles apart, so their carrier signs alternate.
+                // Apply row parity before pooling so adjacent rows add
+                // coherently instead of cancelling.
                 const double rs = (lf & 1) ? -1.0 : 1.0;
                 const quint16* dl = defp + (size_t)lf * width;
                 const quint16* sl = sparep + (size_t)lf * width;
@@ -362,12 +316,6 @@ namespace {
                     h = std::clamp(h, activeLeft, activeRight - 1);
                     return 0.5 * ((double)ru[h] + (double)rd[h]);
                 };
-                // Phase-balanced carrier-free mean of R at h (0.5,1,1,1,0.5)/4.
-                auto Rmean = [&](int h) {
-                    return (0.5 * R(h - 2) + R(h - 1) + R(h) + R(h + 1) +
-                            0.5 * R(h + 2)) * 0.25;
-                };
-
                 std::copy(chat.begin(), chat.end(), chatFix.begin());
                 std::copy(lhat.begin(), lhat.end(), lhatFix.begin());
 
@@ -376,16 +324,12 @@ namespace {
 
                 // Demodulate FIRST, interpolate SECOND.
                 //
-                // The comp field has no line at the def line's height --
-                // a field carries half the frame's lines -- so the two
-                // bracketing comp rows are averaged to reach that height.
-                // That is positional interpolation and nothing else. Done
-                // in COMPOSITE it also cancels the carrier, because
-                // adjacent scan lines sit 227.5 cycles apart, which is why
-                // the old form had to reflect def about the mean to put a
-                // carrier term back. Demodulated per row and averaged
-                // afterwards, the result keeps the comp's chroma at that
-                // height and both twins compare against it directly.
+                // The comp field has no sample row at the def line's vertical
+                // position, so the two bracketing comp rows are interpolated
+                // after demodulation. Composite-domain interpolation would also
+                // cancel their antiphase carrier; demodulating each row first
+                // preserves the comp chroma while the subsequent average
+                // performs only the required positional interpolation.
                 static const double kCB[4] = { 1, 0, -1, 0 };
                 static const double kSB[4] = { 0, 1, 0, -1 };
                 auto demodRow = [&](const quint16* row, int scanLine,
@@ -421,21 +365,14 @@ namespace {
                     cQ[x] = 0.5 * (vQ[x] + uQ[x]);
                 }
 
-                // No phase correction on either twin: whatever offset comp
-                // carries is common to both comparisons, so it cancels out
-                // of "which twin is closer". Measured over 52 lines, def
-                // and spare always took the SAME sign against comp and were
-                // never opposed, so a per-twin correction could only ever
-                // scale both sides of the same inequality.
-                //
-                // Caveat on that measurement: the demod is a 4-tap mean of
-                // value x basis, which rejects luma only where luma is flat
-                // across the window. Both twins carry the same luma, so the
-                // agreement above may be luma correlation rather than proof
-                // about carrier phase. It is sufficient to show the
-                // correction was inert here; it is NOT a claim about the
-                // def/spare phase relation, which the (def-spare)/2 =
-                // carrier framework answers with far better evidence.
+                // No per-twin phase correction is applied. Both twins are
+                // evaluated in the same demodulation basis against the same
+                // interpolated comp reference, so any phase offset carried by
+                // that reference is common to both distances and cancels from
+                // the closer-twin decision. This comparison is only an
+                // arbitration metric; the def/spare carrier relationship is
+                // defined independently by the conservation identity
+                // (def - spare) / 2.
 
                 // Arbitrate per error RUN: whichever twin's chroma sits
                 // closer to the comp's at that height is signal; the
@@ -544,33 +481,29 @@ namespace {
 
 // CadenceAssembler — telecine pulldown consolidation for ld-chroma-decoder.
 //
-// CadenceAssembler accepts a stream of SourceFields tagged with cadence
-// metadata from ld-cinemap and assembles them into WorkItems for the comb
-// decoder. Three operating modes are supported:
+// CadenceAssembler accepts SourceFields with cadence metadata and assembles
+// them into WorkItems for the comb decoder. It supports three operating modes:
 //
-// Autosolve (default): uses cadenceId assignments written by ld-cinemap to
-//   identify and pair definitional, complement, and spare fields into film
-//   frames. Spare fields (A-trailing, C-leading) are merged into the
-//   definitional field via dG pixel averaging where the sanity check passes,
-//   or released to baseline passthrough if not.
+// Autosolve (default): cadenceId assignments identify definitional,
+//   complement, and spare roles. Definitional/complement fields are paired into
+//   film frames; A-trailing and C-leading spares are conservation-merged into
+//   their definitional fields when twin sanity passes, otherwise the spare is
+//   released to baseline passthrough.
 //
-// Forced cadence (--set-cadence): bypasses ld-cinemap's solve entirely and
-//   imposes a naive A-B-C-D pattern on the incoming field stream. Useful when
-//   cadence metadata is absent or unreliable.
+// Forced cadence (--set-cadence): field roles are assigned from the imposed
+//   A-B-C-D cycle position rather than cadenceId evidence.
 //
-// Output path: in normal telecine mode, WorkItems carry TelecineFrame or
-//   PassthroughFrame kind and are delivered to DecoderPool for comb decoding.
-//   With --export-24p, film frames are emitted as FilmFrame kind (one per
-//   unique film frame, no spare expansion). Fields that cannot be placed into
-//   a film frame are released to baseline so DecoderPool can emit them as
-//   plain video without gaps in the output stream.
+// Output: normal telecine mode emits TelecineFrame and PassthroughFrame work.
+//   --export-24p emits one FilmFrame per reconstructed film frame without spare
+//   expansion. Fields that cannot be placed in a film frame are released to
+//   baseline so the original video stream remains complete.
 //
 // CadenceAssembler Implementation
 CadenceAssembler::CadenceAssembler(const LdDecodeMetaData::VideoParameters& vp,
                                    const Configuration& cfg,
                                    std::function<void(qint32)> onBaseline)
-    : videoParameters(vp), config(cfg),
-      onFieldReleasedToBaseline(std::move(onBaseline))
+    : onFieldReleasedToBaseline(std::move(onBaseline)),
+      videoParameters(vp), config(cfg)
 {
 }
 
@@ -605,23 +538,18 @@ void CadenceAssembler::markHistoryConsumed(int pos)
     history[pos].consumed = true;
 }
 
-// Release a consumed entry's sample planes while leaving its slot, and its
-// metadata, in place.  history is indexed POSITIONALLY and seqNoToHistoryIndex
-// stores those positions, so erasing an entry would invalidate every stored
-// index -- which is why the front has never been pruned, and why a side-long
-// render ends up carrying every field it has ever seen.
+// Release a consumed entry's sample planes while leaving its positional slot
+// and metadata intact. seqNoToHistoryIndex stores positions in history, so
+// entries are not erased and those indices remain stable.
 //
-// Nothing reads a consumed entry's samples: nextUnconsumedIndex skips it, and
-// findComplementPos and tryConsumeSpare both refuse it outright.  The two
-// callers are the only consumption paths that do NOT move the field out of
-// history, and both hand it to the baseline decoder, which reloads the field
-// from the TBC rather than borrowing this copy.  From that point the planes are
-// dead weight.
+// No active reader needs sample planes from a consumed entry:
+// nextUnconsumedIndex skips it, while complement/spare lookup refuses consumed
+// entries. Consumption paths that hand ownership to baseline cause DecoderPool
+// to reload the source field from TBC rather than use this stored copy.
 //
-// Call only AFTER any move out of history.  markHistoryConsumed deliberately
-// runs BEFORE the move because it needs the seqNo, so this must never be folded
-// into it -- that would empty the field before the comb ever receives it.
-// Fresh containers rather than clear(): clear() keeps the capacity.
+// Call this only after any required move from history. markHistoryConsumed()
+// runs before a move because it still needs seqNo; payload release is therefore
+// a separate operation. Replacing the containers also releases their capacity.
 void CadenceAssembler::releaseHistoryPayload(int pos)
 {
     if (pos < 0 || pos >= history.size()) return;
@@ -658,17 +586,13 @@ void CadenceAssembler::push(const QVector<SourceField>& newFields)
 {
     if (config.setCadence != 0 && !config.noCinemap) {
         if (config.reverseFieldOrder) {
-            // -r delivers each capture frame second-field-first, so the field
-            // stream arrives with every pair TRANSPOSED (seq 3,2,5,4,7,6...),
-            // not merely offset. Restore ascending order before counting: the
-            // imposed cycle is a statement about cadence slots, and a
-            // transposed stream cannot be modelled by any starting offset. Left
-            // transposed, the twin merge takes a B field as the spare and the
-            // real spare is assembled into a frankenframe with B — precisely
-            // the failure -r exists to correct. Pushes are frame-aligned (the
-            // batch trim is skipped in forced mode), so a pair here is one
-            // capture frame; an odd tail cannot arise, and if it ever did it
-            // passes through rather than desyncing every later pair.
+            // -r presents each capture frame second-field-first, so each pair
+            // arrives transposed (seq 3,2,5,4,7,6...). Restore ascending order
+            // before forced-cadence counting because the imposed cycle is
+            // defined on cadence slots, not on transposed storage order.
+            // Pushes are frame-aligned in forced mode, so each pair here is one
+            // capture frame. Any unexpected odd tail is passed through rather
+            // than allowed to shift all subsequent slot assignments.
             const int n = newFields.size();
             int i = 0;
             for (; i + 1 < n; i += 2) {
@@ -707,9 +631,9 @@ void CadenceAssembler::flush()
 
 bool CadenceAssembler::hasWork() const { return !workQueue.empty(); }
 
-// Sync-tone tracker update at a dG anchor. Alpha-beta on per-region
-// (phase, rate); twin-integrity gate (a pair whose captures disagree is
-// distrusted wholesale); cut reset on frame-median innovation.
+// Sync-tone tracker update at a dG anchor. The alpha-beta state tracks phase
+// and rate per region; twin integrity gates anchor admission, and a cut resets
+// the tracker on frame-median innovation.
 void CadenceAssembler::syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
                                          const std::vector<double>& regI,
                                          const std::vector<double>& regQ,
@@ -773,9 +697,8 @@ void CadenceAssembler::syncTrackerUpdate(int anchorSeq, double twinDriftDeg,
         const double mz = std::hypot(cI, cQ);
         T.zI = cI / mz; T.zQ = cQ / mz;
     }
-    // Global tone: pooled across all usable regions -- the coordinate with
-    // measurable signal (regional increments are zero-mean noise on the
-    // beach; the +-6 deg segment curve is global).
+    // Global tone is pooled across all usable regions to provide a common
+    // measurable phase-rate coordinate alongside the per-region tracker state.
     {
         double gI = 0, gQ = 0;
         for (int r = 0; r < nReg; ++r) {
@@ -922,14 +845,12 @@ int CadenceAssembler::forcedStartIndex() const
     const int n = std::clamp(config.setCadence, 1, 5);
     int base = 2 * (n - 1);
 
-    // -r inverts upper-field-first to lower-field-first: the same inverted
-    // dominance ld-cinemap records as cadenceIds 10..19. That regime is a pure
-    // relabel of the same index layout — cinemap detects it by which side of the
-    // TBC frame grid the spare falls on, which is to say the pattern sits ONE
-    // FIELD over. So this +1 is the stream alignment, and the stamped cids move
-    // into the inverted space to carry the dominance downstream (see
-    // processWindowForced). An earlier form added 5 — half a cycle — which
-    // landed three of the five values on slots the loop had no handler for.
+    // -r maps upper-field-first input to the lower-field-first cadence regime
+    // represented by cadenceIds 10..19. The cadence index layout itself is
+    // unchanged, but the transposed stream sits one field later, so +1 supplies
+    // the stream alignment. processWindowForced() stamps the corresponding
+    // inverted cadenceIds so downstream code can recover both the normalised
+    // role index and the asserted dominance.
     if (config.reverseFieldOrder) base = (base + 1) % CADENCE_NTSC_CYCLE;
     return base;
 }
@@ -976,29 +897,22 @@ int CadenceAssembler::findComplementPos(int i0) const {
     return pos;
 }
 
-// Forced cadence (jam) mode: the user insists on a specific cadence pattern
-// regardless of what ld-cinemap detected. Fields are consumed in strict
-// A-B-C-D sequence driven by setCadence (which names the cycle position of
-// the render's first frame) with no cadenceId validation — every incoming
-// field is assigned its position by counting, not by metadata. This is the
-// path for jamming against the grain: multicadence composites where one
-// pattern won the autosolve and the others need their own scoped render.
+// Forced cadence (jam) mode: the user supplies the cadence pattern directly.
+// Fields are consumed in strict A-B-C-D order from setCadence, which names the
+// cycle position of the render's first frame. cadenceId evidence does not veto
+// or alter the asserted role assignment.
 //
-// Two invariants make the counting safe to hand to a user:
+// Two invariants govern consumption:
 //
-//   1. No slot can stall. Every slot either starts a defined film frame or is
-//      an orphan head that releases ONE field to baseline and advances. An
-//      earlier form had handlers for six of the ten slots and simply broke out
-//      of the loop on the rest, so a start landing on slot 4 consumed nothing
-//      forever and flush discarded the whole render — --set-cadence 3 wrote a
-//      zero-byte file and reported success.
+//   1. Every slot makes progress. A slot either begins a defined film group or
+//      releases one orphan field to baseline and advances.
 //
-//   2. No field is dropped silently. Anything that cannot be placed goes to
-//      baseline so DecoderPool still emits it as plain video; the old flush
-//      path cleared the window outright, leaving holes in the output.
+//   2. Every real field retains an output path. Anything that cannot be placed
+//      in the asserted film group is released to baseline rather than dropped.
 //
-// A group is never consumed until it is complete: taking the A pair while its
-// spare was still in the next push cost one certified cover per batch.
+// A film group is consumed only when all fields required by that group are
+// present, so push boundaries cannot separate a definitional field from its
+// required spare.
 void CadenceAssembler::processWindowForced(bool flushMode)
 {
     if (config.noCinemap) return;
@@ -1013,9 +927,8 @@ void CadenceAssembler::processWindowForced(bool flushMode)
     // dominance for an inverted render.
     const int regime = config.reverseFieldOrder ? CADENCE_NTSC_INVERTED_OFFSET : 0;
 
-    // A jam is the user's assertion against the evidence, so the tool has to
-    // be able to show which real field landed in which asserted role. (The
-    // slot-by-slot trace instrument that did so has since been removed.)
+    // Forced cadence is authoritative: field roles come from the asserted
+    // slot sequence rather than from cadence evidence.
 
     auto cycleIndex = [&](qint64 consumed) -> int {
         int idx = int((start + (consumed % CADENCE_NTSC_CYCLE)) % CADENCE_NTSC_CYCLE);

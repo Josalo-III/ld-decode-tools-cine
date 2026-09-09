@@ -152,7 +152,7 @@ struct DecodeTicket
 
 	void submitProcessedFieldPair(qint32 seq1, qint32 seq2, bool isUpgrade);
 	bool assembleResolvedPairToFrame(qint32 seq1, qint32 seq2, OutputFrame& frame) const;
-	// transitional worker bookkeeping; ownership remains seq-based
+    // Worker tickets are keyed by decode frame number; output ownership remains seq-based.
 	QMap<qint32, DecodeTicket> decodeTicketsByFrameNumber;
 
     Decoder &decoder;
@@ -169,15 +169,10 @@ struct DecodeTicket
     QMutex inputMutex;
     qint32 decoderLookBehind = 0;
     qint32 decoderLookAhead  = 0;
-    // Consecutive frames served per getInputFrames() call.  The rolling
-    // triple-buffer costs a fixed 2-frame pre-roll per call, so the locked
-    // analysis runs (N + 2) / N times per emitted frame: 3.00x at N = 1,
-    // 1.25x at N = 8.  Batch composition depends only on work-item order, so
-    // the decode stays deterministic under --threads.
-    // Production runs are normally much longer than a second. Twenty-four
-    // frames halves batch-head pre-roll frequency while leaving ample work for
-    // the worker pool on real captures. LDCD_BATCH remains a development
-    // override for controlled performance comparisons.
+    // Consecutive frames served per getInputFrames() call. Batching amortises
+    // the decoder's fixed temporal pre-roll while preserving queue order and
+    // deterministic output under --threads. The default is 24 frames;
+    // LDCD_BATCH overrides it with any value >= 1.
     qint32 decoderBatchFrames = []{
         const char *s = getenv("LDCD_BATCH");
         const int v = s ? atoi(s) : 0;
