@@ -169,14 +169,15 @@ struct DecodeTicket
     QMutex inputMutex;
     qint32 decoderLookBehind = 0;
     qint32 decoderLookAhead  = 0;
-    // Consecutive frames served per getInputFrames() call. Batching amortises
-    // the decoder's fixed temporal pre-roll while preserving queue order and
-    // deterministic output under --threads. The default is 24 frames;
+    // Consecutive frames served per getInputFrames() call.  Keep the production
+    // default at the pre-optimization value: a worker does not return output
+    // until its whole batch is decoded, so larger batches visibly starve a
+    // downstream pipe even when aggregate throughput improves.
     // LDCD_BATCH overrides it with any value >= 1.
     qint32 decoderBatchFrames = []{
         const char *s = getenv("LDCD_BATCH");
         const int v = s ? atoi(s) : 0;
-        return v >= 1 ? v : 24;
+        return v >= 1 ? v : 12;
     }();
     qint32 inputFrameNumber  = 1;
     qint32 lastFrameNumber   = 1;

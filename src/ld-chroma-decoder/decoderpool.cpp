@@ -585,7 +585,6 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
         const int Nhave = (int)buildingSeg24p.size();
 
         if (cadenceConfig.emitMax24p) {
-            qInfo() << "emit-max-24p: preserving" << Nhave << "frames (no drops)";
             for (auto &w : buildingSeg24p) scheduled24p.push_back(std::move(w));
             framesScheduled24p += Nhave;
             buildingSeg24p.clear();
