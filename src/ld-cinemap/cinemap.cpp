@@ -4453,6 +4453,58 @@ CineMap::PhaseRun CineMap::solveSegment(
   // same-parity d=2 twin.  Conversely, a crash to negligible/uniform Lips is
   // only a progressive candidate until those same film tests decline it.
   run = scanForPhaseRun(mixedness, segStartField, segEndField, cache);
+
+  // The raster scan is allowed to identify interlace, but it is not allowed
+  // to suppress the field-repeat measurement that distinguishes 3:2 film
+  // from interlaced motion.  Fast-moving, low-grain film can put positive
+  // field difference at every raster phase while still carrying an exact d=2
+  // twin on one stable cadence position.  The Borg-cube shot on Emissary
+  // (fields 5505..5609) is the canonical failure: the scan called it -2 and
+  // the early verdict below skipped twin harvesting altogether, despite one
+  // repeated-field position recurring every five frames.
+  //
+  // Run the existing wholesale d=2 harvest only for an interlace candidate.
+  // Its reciprocal-pair conflict handling and strict A/C geometry remain the
+  // admission test; a clear geometry lock is film evidence and outranks the
+  // raster interpretation.  Genuine interlace with scattered quiet pairs
+  // continues to the -2 verdict because it cannot form that geometry.
+  if (run.type == PhaseRun::Type::Interlaced) {
+    const int harvested = static_cast<int>(
+        harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2).size());
+    DgLock geometry;
+    QString rejectReason;
+    if (tryLockByDgGeometry(sv, segStartField, segEndField, cache, geometry,
+                            &rejectReason)) {
+      run.type = PhaseRun::Type::Pulldown32;
+      run.phaseOffset = geometry.phaseOffset;
+      run.confidence = geometry.confidence;
+      run.phaseScores = geometry.phaseScores;
+      run.phaseScoresInformative = geometry.phaseScoresInformative;
+      run.reason = QStringLiteral("interlace-veto-d2-geometry");
+
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: INTERLACE_D2_VETO fields [%1..%2] "
+                   "harvested=%3 phase=%4 conf=%5 result=film")
+                   .arg(segStartField)
+                   .arg(segEndField)
+                   .arg(harvested)
+                   .arg(geometry.phaseOffset)
+                   .arg(geometry.confidence, 0, 'f', 3);
+      }
+    } else if (m_decisionTraceEnabled) {
+      qInfo().noquote()
+          << QString(
+                 "CineMap decision: INTERLACE_D2_VETO fields [%1..%2] "
+                 "harvested=%3 result=interlaced reason=%4")
+                 .arg(segStartField)
+                 .arg(segEndField)
+                 .arg(harvested)
+                 .arg(rejectReason);
+    }
+  }
+
   if (run.type == PhaseRun::Type::Progressive ||
       run.type == PhaseRun::Type::Pulldown32) {
     int certifiedTwins = 0;
