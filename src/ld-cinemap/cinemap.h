@@ -124,6 +124,11 @@ class CineMap {
     // that made a raw-field window unusable. A superset sum: wideScore is
     // never below score, so no centre-window verdict can be lost to it.
     double wideScore = 0.0;
+
+    // The frame is still in TIME: both same-parity d=2 pairs sit under the
+    // twin floor on the active raster. A still frame neither combs nor
+    // moves, and says nothing about the source.
+    bool still = false;
   };
 
   // A candidate twin pair with its diff and confidence score.

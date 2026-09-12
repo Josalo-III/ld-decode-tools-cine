@@ -1391,26 +1391,23 @@ double CineMap::calculateLipsScore(SourceVideo& sv, int f1, int f2, int width,
   const double scaleToIre =
       (white > black) ? (100.0 / (white - black)) : (100.0 / 65535.0);
 
-  // Lips ROI (Center-Lower), or the ACTIVE raster (760x480-class) inset 5%
-  // for whole-frame reads. The active bounds come from the decoder's own
-  // metadata: a percentage of the raw field swallows vertical blanking, and
-  // line-21 captions flicker per field — an unmatted static title card read
-  // a wide-lips floor of 23 from that junk alone.
+  // Lips ROI (Center-Lower), or the ACTIVE raster (760x480-class) inset
+  // 2.5% each side for whole-frame reads. The active bounds come from the
+  // decoder's own metadata: a percentage of the raw field swallows vertical
+  // blanking, and line-21 captions flicker per field — an unmatted static
+  // title card read a wide floor of 23 from that junk alone.
   int startX, endX, startY, endY;
   if (fullRaster) {
-    const auto& vpa = m_md->getVideoParameters();
-    const int ax0 = (vpa.activeVideoStart > 0) ? vpa.activeVideoStart : 0;
-    const int ax1 = (vpa.activeVideoEnd > ax0) ? vpa.activeVideoEnd : width;
+    const int ax0 = (vp.activeVideoStart > 0) ? vp.activeVideoStart : 0;
+    const int ax1 = (vp.activeVideoEnd > ax0) ? vp.activeVideoEnd : width;
     const int ay0 =
-        (vpa.firstActiveFieldLine > 0) ? vpa.firstActiveFieldLine : 0;
+        (vp.firstActiveFieldLine > 0) ? vp.firstActiveFieldLine : 0;
     const int ay1 =
-        (vpa.lastActiveFieldLine > ay0) ? vpa.lastActiveFieldLine : height;
-    const int mx = (ax1 - ax0) / 40;  // 2.5% inset each side
-    const int my = (ay1 - ay0) / 40;
-    startX = ax0 + mx;
-    endX = ax1 - mx;
-    startY = ay0 + my;
-    endY = ay1 - my;
+        (vp.lastActiveFieldLine > ay0) ? vp.lastActiveFieldLine : height;
+    startX = ax0 + (ax1 - ax0) / 40;
+    endX = ax1 - (ax1 - ax0) / 40;
+    startY = ay0 + (ay1 - ay0) / 40;
+    endY = ay1 - (ay1 - ay0) / 40;
   } else {
     startX = static_cast<int>(width * 0.20);
     endX = static_cast<int>(width * 0.80);
@@ -1418,49 +1415,155 @@ double CineMap::calculateLipsScore(SourceVideo& sv, int f1, int f2, int width,
     endY = static_cast<int>(height * 0.80);
   }
 
-  double totalLipsEnergy = 0.0;
+  // The comb, measured on the WOVEN frame. Field 1 is the upper parity, so
+  // woven line 2k is F1[k] and woven line 2k+1 is F2[k]. A comb is the
+  // geometry the eye calls combing at a moving edge:
+  //   TOOTH        a line brighter than BOTH vertical neighbours, or darker
+  //                than both, by more than the noise floor. Because the two
+  //                neighbours are the same field, the picture's own gradient
+  //                is already subtracted: a static edge is a step, not a tooth.
+  //   ALTERNATION  down a column, N consecutive teeth each the opposite of
+  //                the one above (bright, dark, bright, dark). A hairline is
+  //                one tooth; fabric weave is several teeth in no order.
+  //                Neither chains.
+  //   RUN          the same alternating chain present in M adjacent columns,
+  //                to exclude single-pixel speckle. The extent that proves an
+  //                edge is DOWN the edge, not along the row: a stem moved one
+  //                pixel makes a band one column wide and as tall as the
+  //                stem, so the row run stays small and the chain carries the
+  //                proof. Measured: a title creeping into place reads 0 of 36
+  //                frames at 4 lines / 8 columns and 32 of 36 at 8 / 2; at
+  //                4 / 1 grain alone floods the bridge (164 over-two windows
+  //                against 0 at 8 / 2); stills and the explosion stay at
+  //                zero either way.
+  // Only pixels inside a chain of >= N lines that also sits in a run of >= M
+  // columns contribute, and they contribute the square of the tooth height.
+  // Notch had the frame and the vertical stack but took the magnitude before
+  // stacking, so it stacked prominence, not alternation; lips compared a
+  // field against an interpolation of the other and never saw the frame.
+  // Two band shapes, either proves a comb:
+  //   TALL   a vertical edge moved a little sideways: a band one or two
+  //          columns wide and as tall as the edge (8 lines, 2 columns).
+  //   WIDE   a horizontal edge moved two or more lines up or down (a scroll):
+  //          a band as tall as the move and as wide as the edge (4 lines,
+  //          8 columns). The opening scroll reads 146 combing frames by this
+  //          shape and 0 by the tall one; the creeping title the reverse.
+  constexpr int TALL_MIN_LINES = 8;
+  constexpr int TALL_MIN_RUN_PX = 2;
+  constexpr int WIDE_MIN_LINES = 4;
+  constexpr int WIDE_MIN_RUN_PX = 8;
+  constexpr double COMB_NOISE_FLOOR_IRE = 2.0;
 
-  // Reuse bucket buffers
-  std::vector<double> Y1_m1(width), Y1_p1(width);
-  std::vector<double> Y2_0(width);
+  const int fy0 = std::max(1, startY);
+  const int fy1 = std::min(height - 1, endY);
+  if (fy1 <= fy0) return 0.0;
+  const int wy0 = 2 * fy0;        // first woven line examined (F1[fy0])
+  const int wy1 = 2 * fy1;        // one past the last: F1[fy1] excluded
+  const int nW = wy1 - wy0 + 2;   // plus one line above and below for the
+                                  // bracket
+  // Luma for every woven line in the window, one line above and below, in
+  // one flat buffer.
+  std::vector<double> Wbuf(static_cast<size_t>(nW) * width);
+  std::vector<double> lineTmp(width);
+  auto W = [&](int i) -> const double* {
+    return Wbuf.data() + static_cast<size_t>(i) * width;
+  };
+  for (int i = 0; i < nW; ++i) {
+    const int wl = wy0 - 1 + i;
+    const int k = wl / 2;
+    const uint16_t* src = ((wl & 1) == 0) ? p1 : p2;
+    computeLumaLine_Bucket(src + k * width, lineTmp, width);
+    std::copy(lineTmp.begin(), lineTmp.end(),
+              Wbuf.begin() + static_cast<std::ptrdiff_t>(i) * width);
+  }
 
-  // Stride 1 for maximum detail resolution on lips
-  for (int y = startY; y < endY; y += 2) {
-    if (y < 1 || y >= height - 1) continue;
-
-    // Get Demodulated Luma (removes 4fsc pattern)
-    computeLumaLine_Bucket(p1 + (y - 1) * width, Y1_m1,
-                           width);  // Field 1 (Upper)
-    computeLumaLine_Bucket(p1 + (y + 1) * width, Y1_p1,
-                           width);                        // Field 1 (Lower)
-    computeLumaLine_Bucket(p2 + y * width, Y2_0, width);  // Field 2 (Center)
-
-    for (int x = startX; x < endX; x++) {
-      // 1. Calculate "Spatial Mask" (Complexity of Field 1)
-      // If F1 has a vertical edge here, prediction is hard.
-      double spatialDetail = std::abs(Y1_m1[x] - Y1_p1[x]) * scaleToIre;
-
-      // 2. Calculate "Temporal Error" (Combing)
-      // Predict F2 as average of F1 lines
-      double pred = (Y1_m1[x] + Y1_p1[x]) * 0.5;
-      double temporalDiff = std::abs(Y2_0[x] - pred) * scaleToIre;
-
-      // 3. The Filter (Difference - Mask)
-      // We only care if the Temporal Error is significantly larger than Spatial
-      // Detail. This allows us to detect motion *on* edges, provided the motion
-      // artifact is stronger than the static edge gradient.
-
-      double noiseFloor = 2.0;  // Basic noise floor for demodulated luma
-
-      // If temporal diff is huge (combing) and spatial is small (flat area),
-      // Metric is huge. If temporal diff is moderate and spatial is moderate
-      // (static edge), Metric is ~0.
-      double metric = temporalDiff - std::max(spatialDetail, noiseFloor);
-
-      if (metric > 0.0) {
-        // Square it to emphasize the deviation
-        totalLipsEnergy += (metric * metric);
+  // Tooth direction and height per (woven line, column). dir: +1 bright
+  // tooth, -1 dark tooth, 0 none.
+  const int nLines = nW - 2;
+  const int nCols = endX - startX;
+  if (nLines < WIDE_MIN_LINES || nCols < WIDE_MIN_RUN_PX) return 0.0;
+  std::vector<int8_t> dir(static_cast<size_t>(nLines) * nCols, 0);
+  std::vector<float> amp(static_cast<size_t>(nLines) * nCols, 0.0f);
+  for (int i = 0; i < nLines; ++i) {
+    const double* up = W(i);
+    const double* c = W(i + 1);
+    const double* dn = W(i + 2);
+    for (int x = startX; x < endX; ++x) {
+      const double dUp = (c[x] - up[x]) * scaleToIre;
+      const double dDn = (c[x] - dn[x]) * scaleToIre;
+      const size_t idx = static_cast<size_t>(i) * nCols + (x - startX);
+      if (dUp > COMB_NOISE_FLOOR_IRE && dDn > COMB_NOISE_FLOOR_IRE) {
+        dir[idx] = 1;
+        amp[idx] = static_cast<float>(std::min(dUp, dDn));
+      } else if (dUp < -COMB_NOISE_FLOOR_IRE && dDn < -COMB_NOISE_FLOOR_IRE) {
+        dir[idx] = -1;
+        amp[idx] = static_cast<float>(std::min(-dUp, -dDn));
       }
+    }
+  }
+
+  // Alternation: the length of the direction-flipping chain each pixel
+  // belongs to, down its column.
+  std::vector<uint8_t> chainLen(static_cast<size_t>(nLines) * nCols, 0);
+  for (int cx = 0; cx < nCols; ++cx) {
+    int chainStart = -1;
+    int8_t prev = 0;
+    auto closeChain = [&](int endExclusive) {
+      if (chainStart >= 0) {
+        const int len = std::min(255, endExclusive - chainStart);
+        for (int i = chainStart; i < endExclusive; ++i)
+          chainLen[static_cast<size_t>(i) * nCols + cx] =
+              static_cast<uint8_t>(len);
+      }
+      chainStart = -1;
+      prev = 0;
+    };
+    for (int i = 0; i < nLines; ++i) {
+      const int8_t d = dir[static_cast<size_t>(i) * nCols + cx];
+      if (d == 0) {
+        closeChain(i);
+      } else if (prev != 0 && d == -prev) {
+        prev = d;  // the flip continues the chain
+      } else {
+        closeChain(i);  // a tooth that repeats its direction starts anew
+        chainStart = i;
+        prev = d;
+      }
+    }
+    closeChain(nLines);
+  }
+
+  // Run: along each woven line, a stretch of >= M adjacent columns whose
+  // chains are >= N lines, for either band shape. A pixel counts once.
+  std::vector<uint8_t> comb(static_cast<size_t>(nLines) * nCols, 0);
+  auto markRuns = [&](int minLines, int minRun) {
+    for (int i = 0; i < nLines; ++i) {
+      const size_t row = static_cast<size_t>(i) * nCols;
+      int runStart = -1;
+      auto closeRun = [&](int endExclusive) {
+        if (runStart >= 0 && endExclusive - runStart >= minRun)
+          for (int cx = runStart; cx < endExclusive; ++cx) comb[row + cx] = 1;
+        runStart = -1;
+      };
+      for (int cx = 0; cx < nCols; ++cx) {
+        if (chainLen[row + cx] >= minLines) {
+          if (runStart < 0) runStart = cx;
+        } else {
+          closeRun(cx);
+        }
+      }
+      closeRun(nCols);
+    }
+  };
+  markRuns(TALL_MIN_LINES, TALL_MIN_RUN_PX);
+  markRuns(WIDE_MIN_LINES, WIDE_MIN_RUN_PX);
+
+  // Energy is the square of the tooth height, as lips was.
+  double totalLipsEnergy = 0.0;
+  for (size_t k = 0; k < comb.size(); ++k) {
+    if (comb[k]) {
+      const double a = amp[k];
+      totalLipsEnergy += a * a;
     }
   }
 
@@ -1524,7 +1627,10 @@ std::vector<CineMap::FrameMixedness> CineMap::computeFrameMixedness(
           sv, f2, f2 + 2, vp.fieldWidth, vp.fieldHeight, /*fullRaster=*/true);
       if (a.valid && b.valid && a.grainIre < stillIre &&
           b.grainIre < stillIre) {
-        results.push_back({fi, 0.0, 0.0});
+        FrameMixedness still;
+        still.frameIndex = fi;
+        still.still = true;
+        results.push_back(still);
         continue;
       }
     }
@@ -3701,6 +3807,36 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   const double p10 = percentile(0.10);
   const double p50 = percentile(0.50);
   const double p90 = percentile(0.90);
+
+  constexpr double COMB_FRAME_FLOOR = 0.5;
+  constexpr int INTERLACE_MIN_WINDOWS = 3;  // one burst of three frames
+  constexpr int INTERLACE_MIN_FRAMES = 15;
+  // Comb nowhere is progressive only when the picture MOVES: a progressive
+  // source with motion changes frame to frame and never combs (the sparks
+  // shot moves in 52 of 53 frames, the flash in 19 of 19), while a still
+  // film shot neither combs nor moves (three reaction shots, a grain-
+  // stripped composite and every black run: 0 moving frames) and says
+  // nothing about its source — it abstains and the sparse solve heals it
+  // from the neighbours. The same minimum as the run length.
+  constexpr int PROGRESSIVE_MIN_MOVING = INTERLACE_MIN_FRAMES;
+
+  int combFrames = 0;
+  int overTwoWindows = 0;
+  int movingFrames = 0;
+  {
+    std::vector<uint8_t> combs(static_cast<size_t>(numFrames), 0);
+    for (int i = 0; i < numFrames; ++i) {
+      combs[i] = (mixed[i].wideScore > COMB_FRAME_FLOOR) ? 1 : 0;
+      combFrames += combs[i];
+      if (!mixed[i].still) movingFrames++;
+    }
+    for (int i = 0; i + 5 <= numFrames; ++i) {
+      int c = 0;
+      for (int j = i; j < i + 5; ++j) c += combs[j];
+      if (c > 2) overTwoWindows++;
+    }
+  }
+
   const double denom = std::max(1e-9, (p90 - p10));
 
   // The verdict amplitude, on the active raster: comb anywhere in the
@@ -3737,45 +3873,66 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // lips 0.028 while every genuine lock had max lips >= 0.189 — this sits in
   // that gap.
   if (percentile(1.0) < LIPS_SILENCE) {
-    // This is the only absolute progressive candidate: Lips found no
-    // meaningful field difference anywhere in the window.  It is not yet a
-    // verdict. solveSegment subjects it to the deviation formation and to
-    // same-parity d=2 twin evidence before allowing -3 to be painted.
-    run.type = PhaseRun::Type::Progressive;
-    run.confidence = 0.70;
-    run.reason = "silence-progressive-candidate";
+    // Comb nowhere. Over a run long enough to mean it, that is the
+    // progressive verdict; a silent sliver between two film locks abstains
+    // and takes its cadence from its neighbours, as the sparse solve always
+    // has.
+    if (numFrames >= INTERLACE_MIN_FRAMES &&
+        movingFrames >= PROGRESSIVE_MIN_MOVING) {
+      run.type = PhaseRun::Type::Progressive;
+      run.confidence = 0.70;
+      run.reason = "comb-nowhere";
+    } else {
+      run.type = PhaseRun::Type::Unknown;
+      run.reason = "silence";
+    }
 
     if (m_decisionTraceEnabled) {
       qInfo().noquote()
           << QString(
                  "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
-                 "result=progressive-candidate reason=silence maxLips=%4 "
-                 "threshold=%5")
+                 "result=%6 reason=silence maxLips=%4 threshold=%5")
                  .arg(startField)
                  .arg(endField)
                  .arg(numFrames)
                  .arg(percentile(1.0), 0, 'f', 6)
-                 .arg(LIPS_SILENCE, 0, 'f', 4);
+                 .arg(LIPS_SILENCE, 0, 'f', 4)
+                 .arg(run.type == PhaseRun::Type::Progressive ? "progressive"
+                                                              : "unknown");
     }
 
     return run;
   }
 
   if ((p90 - p10) < 1e-6) {
-    run.type = PhaseRun::Type::Unknown;
-    run.reason = "flat-mixedness";
+    // Flat can be comb nowhere with one combing frame at a join (a cut the
+    // detector missed puts the next shot's first mixed frame in the window).
+    // The count decides, as it does for silence: no combing frame over a
+    // run long enough to mean it is the progressive verdict; otherwise
+    // abstain.
+    if (numFrames >= INTERLACE_MIN_FRAMES && combFrames == 0 &&
+        movingFrames >= PROGRESSIVE_MIN_MOVING) {
+      run.type = PhaseRun::Type::Progressive;
+      run.confidence = 0.70;
+      run.reason = "comb-nowhere";
+    } else {
+      run.type = PhaseRun::Type::Unknown;
+      run.reason = "flat-mixedness";
+    }
 
     if (m_decisionTraceEnabled) {
       qInfo().noquote()
           << QString(
                  "CineMap decision: MIXEDNESS_SCAN fields [%1..%2] frames=%3 "
-                 "result=unknown reason=flat-mixedness p10=%4 p50=%5 p90=%6")
+                 "result=%7 reason=flat-mixedness p10=%4 p50=%5 p90=%6")
                  .arg(startField)
                  .arg(endField)
                  .arg(numFrames)
                  .arg(p10, 0, 'f', 6)
                  .arg(p50, 0, 'f', 6)
-                 .arg(p90, 0, 'f', 6);
+                 .arg(p90, 0, 'f', 6)
+                 .arg(run.type == PhaseRun::Type::Progressive ? "progressive"
+                                                              : "unknown");
     }
 
     return run;
@@ -4007,19 +4164,18 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // A fixed gate avoids tying the decision to per-disc block minima, which can
   // be set either by black scenes or by faint interlaced motion. Faint shots
   // remain unclassified when the evidence cannot also exclude faint film.
-  // The completing grammar, the author's law: comb 2-in-5 is film, comb
-  // everywhere is -2, comb nowhere is -3. The 2-in-5 readings run first
-  // (scan lock, bump); what reaches here is the not-2-in-5 class, and this
-  // gate is the everywhere/nowhere line at the meaningful-comb scale.
-  // Measured across two discs: everything vouched -2 carries p90 >= 1.51;
-  // everything vouched away from -2 tops out at 0.94 (a grain-dead composite
-  // shot whose faint video-rate comb the author priced as -3, and faint film
-  // talking heads at 0.07-0.38). 1.2 sits between with 1.27x margin each
-  // way. Below it, comb-nowhere material falls through to the election and
-  // the progressive residue.
-  constexpr double INTERLACE_P90_MIN = 1.2;
-  constexpr int INTERLACE_MIN_FRAMES = 15;
-
+  // The completing grammar, the author's law: comb 2-in-5 is film, any more
+  // than that is interlace, none is progressive. The 2-in-5 readings run
+  // first (scan lock, bump); what reaches here is the not-2-in-5 class, and
+  // this reading COUNTS. A frame combs when its active-raster comb clears
+  // the floor; a five-frame window with more than two combing frames is
+  // impossible for 3:2, where any five consecutive frames hold exactly two.
+  // Interlace combs in RUNS (every frame while something moves), so nearly
+  // every combing frame sits in an over-two window; film that drifts off
+  // its cycle combs in PAIRS five apart, so only a small fraction does.
+  // Measured (wide, floor 0.5): Fraker's hand 26 comb frames / 19 over-two
+  // windows, the 11209 interview 3/3; Naked City 33/5, the falls 22/3, the
+  // bridge 37/0; stills, explosion, flash tail 0/0.
   auto interlaceThirdReading = [&](PhaseRun r) -> PhaseRun {
     if (r.type != PhaseRun::Type::Unknown) return r;
 
@@ -4054,55 +4210,43 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
       return r;
     }
 
-    // The progressive crash. P is a demanding verdict: the sparse film
-    // solve stays ahead of it because the human eye still beats the
-    // software and sees combing the metrics missed — film keeps the
-    // material correctable, progressive forecloses it. So mere low scores
-    // go to film, and P fires only on a true crash to "no difference":
-    // measured, the crash class reads p90 0.060-0.074 (an interview whose
-    // only motion is below every instrument, a faint film talking head)
-    // while the low-score class starts at 0.319. The bar at 0.15 carries
-    // 2x margin to both. Skips the election like the -2 verdict does, so
-    // harvest junk cannot commit a phase on ground the scan measured and
-    // found empty.
-    if (allNegative && p90 < PROGRESSIVE_CRASH_P90) {
-      // Whole-frame validation belongs to the temporal stillness gate because
-      // widened spatial LIPS measurements are sensitive to static letterbox
-      // edges. Frames reaching this branch have passed that temporal gate.
+    // Comb nowhere, over a run long enough to mean it: progressive. A
+    // shorter silent span abstains and takes its neighbours' cadence.
+    if (numFrames >= INTERLACE_MIN_FRAMES && combFrames == 0 &&
+        movingFrames >= PROGRESSIVE_MIN_MOVING) {
       r.type = PhaseRun::Type::Progressive;
       r.confidence = 0.70;
-      r.reason = "crash-to-no-difference";
-
+      r.reason = "comb-nowhere";
       if (m_decisionTraceEnabled) {
         qInfo().noquote()
             << QString(
-                 "CineMap decision: MIXEDNESS_PROGRESSIVE fields [%1..%2] "
-                 "frames=%3 lipsP90=%4 wideP90=%5 result=progressive-candidate")
+                   "CineMap decision: MIXEDNESS_PROGRESSIVE fields [%1..%2] "
+                   "frames=%3 combFrames=0 wideP90=%4 result=progressive")
                    .arg(startField)
                    .arg(endField)
                    .arg(numFrames)
-                   .arg(p90, 0, 'f', 4)
                    .arg(wideP90, 0, 'f', 4);
       }
       return r;
     }
 
-    if (allNegative && numFrames >= INTERLACE_MIN_FRAMES &&
-        wideP90 >= INTERLACE_P90_MIN) {
+    // Comb in more than two of five, in runs: interlace.
+    if (allNegative && overTwoWindows >= INTERLACE_MIN_WINDOWS &&
+        overTwoWindows * 2 >= combFrames) {
       r.type = PhaseRun::Type::Interlaced;
       r.confidence = 0.75;
-      r.reason = "no-phase-leaves-pures-clean";
-
+      r.reason = "comb-more-than-2-in-5";
       if (m_decisionTraceEnabled) {
         qInfo().noquote()
             << QString(
                    "CineMap decision: MIXEDNESS_INTERLACE fields [%1..%2] "
-                   "frames=%3 avgW=%4 wideP90=%5 scores={%6} result=interlaced")
+                   "frames=%3 combFrames=%4 overTwoWindows=%5 scores={%6} "
+                   "result=interlaced")
                    .arg(startField)
                    .arg(endField)
                    .arg(numFrames)
-                   .arg(avgW, 0, 'f', 4)
-                   .arg(wideP90, 0, 'f', 4)
+                   .arg(combFrames)
+                   .arg(overTwoWindows)
                    .arg(phaseArrayString(phaseScores, -1));
       }
     }
@@ -4532,18 +4676,17 @@ CineMap::PhaseRun CineMap::solveSegment(
                    .arg(certifiedTwins);
       }
     } else {
+      // The deviation formation may NAME a phase for a progressive candidate
+      // or confirm a lips lock; it never overturns one. A 3:2 mixedness lock,
+      // however sparse, prohibits -3: the bridge (19424-19760) reads lips
+      // 2-in-5 at ~10 while the deviation aperture sees within == across
+      // (17.8 / 17.8, zero sites) because the 29.97 blur is texture to it.
+      // A witness that is blind on a shot cannot disprove that shot.
       const PhaseRun deviation =
           scanForDeviationRun(sv, segStartField, segEndField, cache);
-      if (deviation.type == PhaseRun::Type::Pulldown32) {
+      if (deviation.type == PhaseRun::Type::Pulldown32 &&
+          run.type != PhaseRun::Type::Pulldown32) {
         run = deviation;
-      } else if (run.type == PhaseRun::Type::Pulldown32) {
-        // Lips difference alone can mistake coherent, textured kinetics for
-        // pulldown displacement.  With neither actual deviation at the two
-        // proposed mixed positions nor a d=2 duplicate, film is unproved.
-        run.type = PhaseRun::Type::Progressive;
-        run.phaseOffset = 0;
-        run.confidence = 0.70;
-        run.reason = QStringLiteral("lips-film-unconfirmed");
       }
     }
   }
@@ -5111,28 +5254,13 @@ void CineMap::classifyAsInterlaced(
   if (segStartField >= segEndField) return;
   if (mixedness.empty()) return;
 
-  // Fraction of frames with meaningful positive Lips field-difference
-  // evidence. This supports the regime verdict; it is not itself a comb test.
-  int highMixedFrames = 0;
-  for (const auto& m : mixedness) {
-    if (m.score > LIPS_DIFFERENCE) {
-      highMixedFrames++;
-    }
-  }
-  const double fracHigh = (mixedness.empty())
-                              ? 0.0
-                              : static_cast<double>(highMixedFrames) /
-                                    static_cast<double>(mixedness.size());
-
-  // Require more than ~2/5 frames with significant mixedness
-  if (fracHigh < 0.4) {
-    // Not "busy" enough to confidently call interlaced
-    return;
-  }
-
-  // At this point, mixedness suggests "lots of comb, no clear 3:2".
-  // We assume genuine 59.94i. Paint cadenceId = -2 across the span
-  // but only where cadenceId is still Unknown (-1).
+  // The verdict was reached in the scan by the count — comb in more than
+  // two of five, in runs. Interlace combs only while something moves, so a
+  // mostly-still interview combs in a minority of its frames and that
+  // minority IS the verdict; a fraction gate here re-decided it (the
+  // onscreen scroll, 146 combing frames of 467, was declined and fell to
+  // the residual). The painter paints, on free ground only.
+  (void)mixedness;
   const int total = m_md->getNumberOfFields();
   int start = std::max(1, segStartField);
   int end = std::min(total, segEndField);
@@ -5162,26 +5290,9 @@ void CineMap::classifyAsProgressive(
   if (segStartField >= segEndField) return;
   if (mixedness.empty()) return;
 
-  // Fraction of frames that comb — the mirror of classifyAsInterlaced's test,
-  // and deliberately a fraction rather than a maximum. A max-based test lets a
-  // single frame veto a whole span, and the frame it usually trips on is the
-  // cut at the shot boundary, whose two fields genuinely straddle different
-  // content. A shot of unique progressive film frames should read ~zero on lips
-  // throughout its body regardless of what happens at its ends.
-  int combedFrames = 0;
-  for (const auto& m : mixedness) {
-    if (m.score > LIPS_DIFFERENCE) combedFrames++;
-  }
-  const double fracCombed = mixedness.empty()
-                                ? 0.0
-                                : static_cast<double>(combedFrames) /
-                                      static_cast<double>(mixedness.size());
-
-  // Require the span to be overwhelmingly comb-free. The gap either side is
-  // wide: classifyAsInterlaced needs >= 0.40 to call 59.94i.
-  if (fracCombed > 0.10) {
-    return;
-  }
+  // The verdict was reached in the scan: comb nowhere over a run long enough
+  // to mean it. The painter paints, on free ground only.
+  (void)mixedness;
 
   // In addition, check that we don't see existing film structure (cadenceKnown)
   // across much of the span; if some fields are already film, leave them.
