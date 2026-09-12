@@ -189,18 +189,25 @@ int CineMap::detectCadence(const QString& tbcFilePath) {
     auto mixedness = computeFrameMixedness(sv, segStart, segEnd);
 
     if (m_policy == Policy::Cine) {
-      solveSegmentCine(sv, segStart, segEnd, cache, mixedness);
+      const std::vector<CineRun> cineRuns =
+          solveSegmentCine(sv, segStart, segEnd, cache, mixedness);
 
-      PhaseRun dummyRun;
-      dummyRun.type = PhaseRun::Type::Pulldown32;
-      dummyRun.phaseOffset = 0;
-      dummyRun.endField = segEnd;
-      dummyRun.confidence = 0.8;
-
-      // This run's phase can reach the metadata through the healer and the
-      // final paint, so it must carry the facts' phase where facts exist —
-      // otherwise a downstream repaint could undo what the facts just set.
-      {
+      // Each run is its own solved segment. A segment cine has split holds
+      // two schedules, and one summary of it carried the majority's phase
+      // (Civil Defense: 22 triples to 9) through the healer and the final
+      // paint back over the minority's fields — the break was placed at
+      // 88233 by the facts and then painted through. The run's phase is
+      // measured from the first frame it painted, as PhaseRun expects.
+      // A segment with no run at all keeps the sparse commitment: one
+      // summary carrying the facts' phase where facts exist, which the
+      // healer and the final paint resolve. Reporting it unknown sent
+      // 31,091 fields of Civil Defense to the progressive residual.
+      if (cineRuns.empty()) {
+        PhaseRun sparse;
+        sparse.type = PhaseRun::Type::Pulldown32;
+        sparse.phaseOffset = 0;
+        sparse.endField = segEnd;
+        sparse.confidence = 0.8;
         int segAnchor = -1;
         for (int s = segStart; s <= segEnd; ++s) {
           if (cache.validSeq(s)) {
@@ -210,10 +217,42 @@ int CineMap::detectCadence(const QString& tbcFilePath) {
         }
         const int factPhase =
             certifiedPhaseForRange(segStart, segEnd, segAnchor);
-        if (factPhase >= 0) dummyRun.phaseOffset = factPhase;
+        if (factPhase >= 0) sparse.phaseOffset = factPhase;
+        solvedSegments.push_back({segStart, segEnd, sparse, mixedness});
       }
-
-      solvedSegments.push_back({segStart, segEnd, dummyRun, mixedness});
+      // The first run's report reaches back to the segment head and the
+      // last run's forward to its tail, re-anchored, so the ground the
+      // whole-segment summary used to cover still reaches the healer and
+      // the final paint (17,181 fields fell to the residual without this).
+      std::vector<CineRun> reported = cineRuns;
+      if (!reported.empty()) {
+        CineRun& first = reported.front();
+        if (first.startField > segStart && cache.validSeq(first.startField) &&
+            cache.validSeq(segStart)) {
+          const int shift = cache.cap[first.startField].frameIndex -
+                            cache.cap[segStart].frameIndex;
+          first.phase =
+              normalizePhase(static_cast<long long>(first.phase) + shift, 5);
+          first.startField = segStart;
+        }
+        reported.back().endField = std::max(reported.back().endField, segEnd);
+      }
+      for (const CineRun& r : reported) {
+        PhaseRun run;
+        run.type = PhaseRun::Type::Pulldown32;
+        run.phaseOffset = r.phase;
+        run.endField = r.endField;
+        run.confidence = 0.8;
+        std::vector<FrameMixedness> slice;
+        for (const auto& m : mixedness) {
+          if (!cache.validSeq(r.startField) || !cache.validSeq(r.endField))
+            break;
+          if (m.frameIndex >= cache.cap[r.startField].frameIndex &&
+              m.frameIndex <= cache.cap[r.endField].frameIndex)
+            slice.push_back(m);
+        }
+        solvedSegments.push_back({r.startField, r.endField, run, slice});
+      }
     } else {
       PhaseRun run = solveSegment(sv, segStart, segEnd, cache, mixedness);
 
@@ -4919,12 +4958,13 @@ CineMap::PhaseRun CineMap::solveSegment(
   return run;
 }
 
-void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
-                               int segEndField,
-                               const SegmentCaptureCache& cache,
-                               const std::vector<FrameMixedness>& mixedness) {
-  if (!m_md || !m_disc || segStartField >= segEndField) return;
-  if (mixedness.empty()) return;
+std::vector<CineMap::CineRun> CineMap::solveSegmentCine(
+    SourceVideo& sv, int segStartField, int segEndField,
+    const SegmentCaptureCache& cache,
+    const std::vector<FrameMixedness>& mixedness) {
+  std::vector<CineRun> painted;
+  if (!m_md || !m_disc || segStartField >= segEndField) return painted;
+  if (mixedness.empty()) return painted;
 
   FieldOrderPolicy fo;
   fo.reverse = m_disc->getReverseFieldOrder();
@@ -4937,7 +4977,7 @@ void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
       break;
     }
   }
-  if (startFrameIdx < 0) return;
+  if (startFrameIdx < 0) return painted;
 
   // Convert a 0-based frame-index span to a field sequence span.
   auto frameRangeToFieldRange = [&](int frameStartIdx, int frameEndIdx,
@@ -5066,7 +5106,169 @@ void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
   if (currentPhase >= 0 && runLength >= MIN_RUN_FRAMES)
     runs.push_back({runStartFrame, series.back().frameIndex, currentPhase});
 
-  if (runs.empty()) return;
+  // -----------------------------------------------------------------
+  // 2b. Change-points from the certified lattice.
+  //
+  // The mixedness series can name a break late: where the incoming shot
+  // barely moves, its comb is faint and the local election needs a cycle
+  // or two before a run forms (Civil Defense 88231 was placed at 88245).
+  // The certified triples already hold the answer as fact: they march on
+  // one 5-frame schedule up to the cut and on another after it, and the
+  // step between the last triple of one schedule and the first of the next
+  // IS the break. A schedule is the triple's phase carried back to frame 0;
+  // two triples agree when that carries to the same value. A schedule
+  // needs a formation to count — the same five the phase override asks of
+  // a lattice (certifiedPhaseForRange): on Civil Defense fifty of
+  // fifty-five two-schedule segments had a minority of two or three
+  // triples, the fluke class near-static video certifies, and seventy-one
+  // "schedules" of two stood on the disc; the real cut is 22 against 9.
+  //
+  // Runs from the mixedness series are split at these change-points, and
+  // a schedule that no mixedness run reaches becomes a run of its own.
+  // chooseBreakField then places each break inside the bracket the two
+  // triples leave between them, as it does for every other break.
+  auto scheduleKey = [](int phase, int frame) {
+    return normalizePhase(static_cast<long long>(phase) - frame, 5);
+  };
+  auto phaseAt = [&](int key, int frame) {
+    return normalizePhase(static_cast<long long>(key) + frame, 5);
+  };
+
+  struct Lattice {
+    int firstFrame = -1;
+    int lastFrame = -1;
+    int key = -1;
+    int count = 0;
+  };
+  std::vector<Lattice> lattices;
+  {
+    std::vector<const CertifiedTriple*> inSeg;
+    for (const auto& t : m_certifiedTriples) {
+      if (t.loSeq < segStartField || t.loSeq + 2 > segEndField) continue;
+      if (t.anchorFrame < 0) continue;
+      inSeg.push_back(&t);
+    }
+    std::sort(inSeg.begin(), inSeg.end(),
+              [](const CertifiedTriple* a, const CertifiedTriple* b) {
+                return a->loSeq < b->loSeq;
+              });
+    for (const CertifiedTriple* t : inSeg) {
+      const int key = scheduleKey(t->phase, t->anchorFrame);
+      if (!lattices.empty() && lattices.back().key == key) {
+        lattices.back().lastFrame = t->anchorFrame;
+        lattices.back().count++;
+      } else {
+        lattices.push_back({t->anchorFrame, t->anchorFrame, key, 1});
+      }
+    }
+    // Triples short of a formation between two agreeing lattices are
+    // absorbed; short of one anywhere else they are dropped. Only
+    // formations name a schedule.
+    constexpr int LATTICE_FORMATION = 5;
+    std::vector<Lattice> formed;
+    for (const Lattice& l : lattices) {
+      if (l.count >= LATTICE_FORMATION) {
+        if (!formed.empty() && formed.back().key == l.key) {
+          formed.back().lastFrame = l.lastFrame;
+          formed.back().count += l.count;
+        } else {
+          formed.push_back(l);
+        }
+      }
+    }
+    lattices.swap(formed);
+  }
+
+  if (lattices.size() >= 2) {
+    // Split any run that spans a lattice change-point.
+    std::vector<Run> split;
+    for (const Run& r : runs) {
+      Run cur = r;
+      for (size_t li = 1; li < lattices.size(); ++li) {
+        const int cp = lattices[li].firstFrame;  // first frame of the new
+                                                  // schedule
+        if (cp > cur.frameStart && cp <= cur.frameEnd) {
+          split.push_back({cur.frameStart, cp - 1,
+                           phaseAt(lattices[li - 1].key, cur.frameStart)});
+          cur = {cp, cur.frameEnd, phaseAt(lattices[li].key, cp)};
+        }
+      }
+      split.push_back(cur);
+    }
+    runs.swap(split);
+  }
+
+  // A run inside a formation takes the formation's schedule: facts outrank
+  // the election here as they do at paint time, and a run that kept its own
+  // elected phase against the lattice it sits in would earn a break between
+  // two spans that paint one schedule (Civil Defense 88245).
+  for (Run& r : runs) {
+    const int runLen = r.frameEnd - r.frameStart + 1;
+    int bestOverlap = 0;
+    const Lattice* best = nullptr;
+    for (const Lattice& l : lattices) {
+      const int overlap = std::min(r.frameEnd, l.lastFrame) -
+                          std::max(r.frameStart, l.firstFrame) + 1;
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = &l;
+      }
+    }
+    // Majority of the run inside one formation: the formation names it.
+    if (best && bestOverlap * 2 >= runLen)
+      r.phase = phaseAt(best->key, r.frameStart);
+  }
+
+  // Schedules no mixedness run reaches become runs of their own.
+  for (const Lattice& l : lattices) {
+    bool covered = false;
+    for (const Run& r : runs) {
+      if (l.firstFrame <= r.frameEnd && l.lastFrame >= r.frameStart) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered)
+      runs.push_back({l.firstFrame, l.lastFrame, phaseAt(l.key, l.firstFrame)});
+  }
+  std::sort(runs.begin(), runs.end(),
+            [](const Run& a, const Run& b) { return a.frameStart < b.frameStart; });
+
+  // Adjacent runs on one schedule are one run; a break between them would
+  // be a break between nothing and itself.
+  {
+    std::vector<Run> merged;
+    for (const Run& r : runs) {
+      if (!merged.empty() &&
+          scheduleKey(merged.back().phase, merged.back().frameStart) ==
+              scheduleKey(r.phase, r.frameStart)) {
+        merged.back().frameEnd = std::max(merged.back().frameEnd, r.frameEnd);
+      } else {
+        merged.push_back(r);
+      }
+    }
+    runs.swap(merged);
+  }
+
+  if (m_decisionTraceEnabled && lattices.size() >= 2) {
+    QString desc;
+    for (const Lattice& l : lattices)
+      desc += QString(" [%1..%2 key=%3 n=%4]")
+                  .arg(l.firstFrame)
+                  .arg(l.lastFrame)
+                  .arg(l.key)
+                  .arg(l.count);
+    qInfo().noquote() << QString(
+                             "CineMap decision: CINE_LATTICE fields [%1..%2] "
+                             "schedules=%3 runs=%4:%5")
+                             .arg(segStartField)
+                             .arg(segEndField)
+                             .arg(lattices.size())
+                             .arg(runs.size())
+                             .arg(desc);
+  }
+
+  if (runs.empty()) return painted;
 
   // -----------------------------------------------------------------
   // 3. Insert cadence boundaries at run transitions and paint cadence.
@@ -5159,7 +5361,9 @@ void CineMap::solveSegmentCine(SourceVideo& sv, int segStartField,
     applyCadenceToSegment(fs, fe,
                           /*isLock=*/true, phase,
                           /*fillCid=*/CADENCE_UNKNOWN, CINE_RUN_CONF, cache);
+    painted.push_back({fs, fe, phase});
   }
+  return painted;
 }
 
 void CineMap::classifyAsInterlaced(

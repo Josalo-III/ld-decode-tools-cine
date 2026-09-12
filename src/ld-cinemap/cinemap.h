@@ -704,9 +704,20 @@ class CineMap {
 
   CavGroupSignature analyseCavGroup(Cav5Group& g, SourceVideo& sv);
 
-  void solveSegmentCine(SourceVideo& sv, int segStart, int segEnd,
-                        const SegmentCaptureCache& cache,
-                        const std::vector<FrameMixedness>& mixedness);
+  // A run cine painted: its field span after the breaks were placed, and
+  // its phase measured from the first frame it painted. The caller reports
+  // each run as its own solved segment, because a segment cine has split
+  // is no longer one thing, and a single summary of it would carry the
+  // majority's phase back over the minority's fields.
+  struct CineRun {
+    int startField = 0;
+    int endField = 0;
+    int phase = 0;
+  };
+  std::vector<CineRun> solveSegmentCine(
+      SourceVideo& sv, int segStart, int segEnd,
+      const SegmentCaptureCache& cache,
+      const std::vector<FrameMixedness>& mixedness);
 
   PhaseRun scanForPhaseRun(const std::vector<FrameMixedness>& mixed,
                            int startField, int endField,
