@@ -269,6 +269,7 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
   struct CorrResult {
     double corr = 0.0;
     bool informative = false;
+    bool bothFlat = false;  // neither field carries contrast: empty ground
   };
 
   auto computeCorrelation = [&](const FieldDescriptor& a,
@@ -293,8 +294,24 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
       denB += db * db;
     }
 
-    // flat => corr not informative (do NOT treat as "strong low corr evidence")
-    if (denA < 0.1 || denB < 0.1) return r;
+    // Flat => corr not informative (do NOT treat as "strong low corr
+    // evidence"). Flat means the nine cells lack CONTRAST: a blown-out flash
+    // frame with every cell at 88-97 IRE passed a 0.1 variance floor (a third
+    // of an IRE of spread) and its Pearson of glow read 0.22, which the
+    // structural lane took as a break. Structure is spread relative to level,
+    // not spread in absolute IRE — an absolute floor took structure away
+    // from dark scenes (spread 3-5 on a 10 IRE picture, a quarter of the
+    // level) and left it on the white-out (spread 6-9 on 90, a twelfth).
+    // Measured: the dark scene's cuts 0.20-0.25, the flash frames
+    // 0.070-0.085, the real cuts around the flash 0.15-0.25 (the cut out of
+    // the sparks shot reads 0.1496 on its outgoing side). 0.12 carries 1.4x
+    // to the flash and 1.25x to that cut.
+    constexpr double CORR_MIN_CONTRAST = 0.12;
+    const double contrastA = (meanA > 1e-6) ? std::sqrt(denA / 9.0) / meanA : 0.0;
+    const double contrastB = (meanB > 1e-6) ? std::sqrt(denB / 9.0) / meanB : 0.0;
+    r.bothFlat = (contrastA < CORR_MIN_CONTRAST && contrastB < CORR_MIN_CONTRAST);
+    if (contrastA < CORR_MIN_CONTRAST || contrastB < CORR_MIN_CONTRAST)
+      return r;
 
     r.corr = num / (std::sqrt(denA) * std::sqrt(denB));
     r.informative = true;
@@ -574,6 +591,20 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
 
     const double eCorr = corrEvidence(corr, corrInfo);
 
+    // No contrast on either side: empty ground, the white-out twin of a
+    // black run. Nothing structural can be said about it, and an energy
+    // change across it is a flash or a fade, not a cut (a flash decay
+    // committed twice on energy lanes alone once its correlation was rightly
+    // declared uninformative). A cut into or out of a flash has contrast on
+    // one side and keeps its lanes.
+    if (cr.bothFlat) {
+      if (LOG_VERBOSE_REJECT || dbg) {
+        qInfo().nospace() << "EditDetector: no-contrast reject at field " << i
+                          << " p90=" << p90Ire;
+      }
+      continue;
+    }
+
     // -------------------------------------------------------------------------
     // Detection lane weights.
     //
@@ -667,14 +698,27 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
       if (reason.isEmpty()) reason = "1strongCell_highPeak";
     }
 
+    // The diffuse-energy lanes do not vote against an informative correlation
+    // above the structural lane's own continuity line: a whole-frame change
+    // on a picture whose light and dark regions stay where they are is a
+    // flash, a fade or a grade, not a cut (a flash decay committed at corr
+    // 0.886 on a sixth of a real cut's energy). Cuts still commit on cell
+    // structure and on correlation collapse.
+    // Three or more strong cells is distributed structure and keeps its
+    // vote; the block applies where the diffuse lanes would carry the
+    // commit on their own.
+    const bool continuousByCorr =
+        corrInfo && corr >= 0.85 && ds.strongCells <= 1;
+
     // Lane: very high total energy (diffuse whole-frame change)
-    if (W.hugeTotal > 0.0 && ds.total > threshold * 6.0) {
+    if (W.hugeTotal > 0.0 && !continuousByCorr && ds.total > threshold * 6.0) {
       evidenceScore += W.hugeTotal;
       if (reason.isEmpty()) reason = "hugeTotal";
     }
 
     // Lane: very high chroma energy change (colour-only cut)
-    if (W.hugeChroma > 0.0 && ds.totalChroma > threshold * 4.0) {
+    if (W.hugeChroma > 0.0 && !continuousByCorr &&
+        ds.totalChroma > threshold * 4.0) {
       evidenceScore += W.hugeChroma;
       if (reason.isEmpty()) reason = "hugeChroma";
     }
@@ -828,6 +872,7 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     commitBoundary(targetField, "visual", p90Ire, domMode, reason, corr,
                    corrInfo, eCorr, evidenceScore, ds, lumaPrev, lumaCurr,
                    motionFrames, motionStrong);
+
   }
 
   sourceVideo.close();
