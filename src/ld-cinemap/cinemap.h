@@ -37,13 +37,6 @@ class CineMap {
   // metadata write.
   int probeDgRange(const QString& tbcFilePath, int startField, int endField);
 
-  // Instrument: per-site twin evidence across a field range.
-  // Each candidate twin is a theory; confirmed, geometry admits exactly one
-  // offset, so every site is a vote for that one offset and for no other.
-  // This dumps those votes WITH THEIR POSITIONS, so the sequencing can be
-  // inspected together with its position.
-  int probeSplitRange(const QString& tbcFilePath, int startField, int endField);
-
   // Instrument: the twin dip measured per region of the frame.
   // A composite carries its two cadences in different AREAS -- a set here, a
   // viewscreen there -- while a dissolve lays both across the whole screen
@@ -503,10 +496,6 @@ class CineMap {
                         TwinConfDetail& detail);
   void detectCavCadenceBreaks(std::vector<Cav5Group>& groups, SourceVideo& sv);
   void solveCavFallback(SourceVideo& sv);
-  // A cut may remove A-def while leaving the immediately following
-  // A-comp/A-spare pair intact.  Preserve that partial-but-real A identity;
-  // it is not a licence to project cadence through the edit.
-  int recoverCutTruncatedAHeads();
   // Attempts to commit a reciprocal doplGang link between fields a and b.
   // cacheOrNull: if provided, enforces strict A/C geometry before committing.
   bool tryCommitReciprocalGang(SourceVideo& sv, int a, int b, double hysteresis,
@@ -569,49 +558,6 @@ class CineMap {
   std::vector<TwinSite> twinSitesForPhase(SourceVideo& sv, int segStart,
                                           int segEnd, int phaseOffset,
                                           const SegmentCaptureCache& cache);
-
-  // Where a segment holds two cadences, and what to do about it.
-  //
-  // A segment that spans a missed cut still elects one phase: the election
-  // is a sum, and the larger shot outvotes the smaller. What the sum throws
-  // away is POSITION. The losing shot's twins are still there, and they are
-  // all in one place -- so a rival offset whose support forms a contiguous
-  // block, with the winner's before it, after it, or both, is not noise. It
-  // is a second cadence, and the boundary between them is an edit that
-  // detection missed.
-  //
-  // Noise cannot imitate this. A wrong offset scores on scattered singletons
-  // and interleaves with the winner at chance; measured against a lightning
-  // storm that flashes for three hundred fields without a cut, no rival ever
-  // fell below chance, while a real second shot sat an order of magnitude
-  // under it.
-  struct CadenceSegregation {
-    bool found = false;
-    int outgoingPhase = -1;
-    int incomingPhase = -1;
-    int outgoingLastField = -1;   // last site the outgoing cadence held
-    int incomingFirstField = -1;  // first site the incoming cadence held
-
-    // True when the two cadences were BOTH saturated across a span, which
-    // is what a dissolve is: a blended field is A*a + B*(1-a), so A's twins
-    // still cancel in the A component and B's in the B component, and both
-    // lattices stay whole. Such a span holds two answers, not none.
-    bool dissolve = false;
-    int zoneStart = -1;  // the contested span, when there is one
-    int zoneEnd = -1;
-    int outgoingBins = 0;  // how durably each side held the picture
-    int incomingBins = 0;
-  };
-
-  CadenceSegregation findCadenceSegregation(SourceVideo& sv, int segStart,
-                                            int segEnd,
-                                            const SegmentCaptureCache& cache);
-
-  // Act on a segregation: for a cut, rescan for the edit between the two
-  // evidence sites and impose one there if the rescan comes up empty; for a
-  // dissolve, place it in the middle of the insoluble span.
-  int splitSegregatedSegments(SourceVideo& sv, int hardMaxField,
-                              const SegmentCaptureCache& cache);
 
   // The five phases, scored against each other by how quiet their own twin
   // sites are. No candidate is disqualified and nothing is thresholded.
@@ -798,38 +744,9 @@ class CineMap {
   Policy m_policy = Policy::Tv;
   LdDecodeMetaData* m_md =
       nullptr;  // non-owning alias of m_disc->getMetaData()
-  // A site speaks only when it is quieter than its own neighbours; this is
-  // the log ratio at which it is counted as having spoken at all.
-  static constexpr double SEGREGATION_VOTE_DIP = -0.05;
 
-  // The picture is read in bins, and each bin is owned by whichever offset
-  // holds the largest share of the sites it could hold. Twenty-five fields
-  // is five sites per offset -- enough to be owned, short enough to place
-  // the boundary within.
-  static constexpr int SEGREGATION_BIN_FIELDS = 25;
 
-  // A bin is CONTESTED when the runner-up comes this close to the owner.
-  // A dissolve saturates both cadences at once, so its bins are ties; noise
-  // never comes near, because a rival that cannot lead a single bin has not
-  // shown a cadence at all.
-  static constexpr double SEGREGATION_CONTEST_FRAC = 0.8;
 
-  // A cadence that holds a shot accounts for very nearly ALL the twin sites
-  // it predicts, because in 3:2 every frame has a twin at its own site.
-  // Ownership well below that is a different situation, not a weaker version
-  // of the same one.
-  //
-  // The case that matters is a frame carrying two sources at once: a set on
-  // one cadence and, on a viewscreen within it, video on another. Each
-  // cadence owns only the part of the frame it occupies, so neither can
-  // account for all its sites, and ownership flips bin to bin as one region
-  // or the other happens to dominate the residual. Both run the whole shot,
-  // so there is no moment where one gives way to the other and nothing for
-  // a boundary to mark -- splitting such a shot would cut it in an
-  // arbitrary place and gain nothing. Two half-owned bins in a row would
-  // otherwise pose as a transition; requiring the owner to hold nearly all
-  // its sites is what tells a shot apart from a composite.
-  static constexpr double SEGREGATION_MIN_OWN_OCCUPANCY = 0.8;
 
   // OPEN: composites are still split, and should not be.
   //
@@ -868,26 +785,10 @@ class CineMap {
   //
   // Left out of the path rather than left in it half-working.
 
-  // Ownership has to last to mean anything. This is the shortest run of
-  // bins that counts as a side holding the picture, not the shortest shot
-  // the solver will accept -- a shot is admitted on its evidence, not its
-  // length.
-  static constexpr int SEGREGATION_MIN_RUN_BINS = 2;
 
-  // Enough votes that a contiguous run is a claim rather than an accident.
-  static constexpr int SEGREGATION_MIN_VOTES = 5;
 
-  // Alternations as a fraction of what random interleaving would give. This
-  // is a comparison against a null model, not a bar: measured, a real second
-  // shot sits near 0.08 while a lightning storm with no cut in it never fell
-  // below 1.09, so the two populations do not approach each other.
-  static constexpr double SEGREGATION_MAX_RATIO = 0.35;
 
-  // A title sequence can hold several dissolves in one span; each pass takes
-  // the strongest case and re-reads the segmentation.
-  static constexpr int SEGREGATION_MAX_PASSES = 12;
 
-  int countEditBoundaries(int fromField, int toField) const;
 
   double m_editSensitivity = 8.0;
   double m_editStrong = 1.5;
