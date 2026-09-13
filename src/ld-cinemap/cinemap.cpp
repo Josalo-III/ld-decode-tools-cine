@@ -3768,7 +3768,7 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
 
   constexpr double COMB_FRAME_FLOOR = 0.5;
   constexpr int INTERLACE_MIN_WINDOWS = 3;  // one burst of three frames
-  constexpr int INTERLACE_MIN_FRAMES = 15;
+  constexpr int INTERLACE_MIN_FRAMES = SCAN_MIN_FRAMES;
   // Comb nowhere is progressive only when the picture MOVES: a progressive
   // source with motion changes frame to frame and never combs (the sparks
   // shot moves in 52 of 53 frames, the flash in 19 of 19), while a still
@@ -4978,6 +4978,52 @@ CineMap::PhaseRun CineMap::solveSegment(
   return run;
 }
 
+std::vector<CineMap::Lattice> CineMap::latticeFormations(int segStart,
+                                                          int segEnd) const {
+  auto scheduleKey = [](int phase, int frame) {
+    return normalizePhase(static_cast<long long>(phase) - frame, 5);
+  };
+
+  std::vector<const CertifiedTriple*> inSeg;
+  for (const auto& t : m_certifiedTriples) {
+    if (t.loSeq < segStart || t.loSeq + 2 > segEnd) continue;
+    if (t.anchorFrame < 0) continue;
+    inSeg.push_back(&t);
+  }
+  std::sort(inSeg.begin(), inSeg.end(),
+            [](const CertifiedTriple* a, const CertifiedTriple* b) {
+              return a->loSeq < b->loSeq;
+            });
+
+  std::vector<Lattice> groups;
+  for (const CertifiedTriple* t : inSeg) {
+    const int key = scheduleKey(t->phase, t->anchorFrame);
+    if (!groups.empty() && groups.back().key == key) {
+      groups.back().lastFrame = t->anchorFrame;
+      groups.back().count++;
+    } else {
+      groups.push_back({t->anchorFrame, t->anchorFrame, key, 1});
+    }
+  }
+
+  // Triples short of a formation between two agreeing formations are
+  // absorbed; short of one anywhere else they are dropped. Only formations
+  // name a schedule: on Civil Defense fifty of fifty-five two-schedule
+  // segments had a minority of two or three triples, the fluke class
+  // near-static video certifies; the real cut there is 22 against 9.
+  std::vector<Lattice> formed;
+  for (const Lattice& l : groups) {
+    if (l.count < LATTICE_FORMATION) continue;
+    if (!formed.empty() && formed.back().key == l.key) {
+      formed.back().lastFrame = l.lastFrame;
+      formed.back().count += l.count;
+    } else {
+      formed.push_back(l);
+    }
+  }
+  return formed;
+}
+
 std::vector<CineMap::CineRun> CineMap::solveSegmentCine(
     SourceVideo& sv, int segStartField, int segEndField,
     const SegmentCaptureCache& cache,
@@ -5154,50 +5200,8 @@ std::vector<CineMap::CineRun> CineMap::solveSegmentCine(
     return normalizePhase(static_cast<long long>(key) + frame, 5);
   };
 
-  struct Lattice {
-    int firstFrame = -1;
-    int lastFrame = -1;
-    int key = -1;
-    int count = 0;
-  };
-  std::vector<Lattice> lattices;
-  {
-    std::vector<const CertifiedTriple*> inSeg;
-    for (const auto& t : m_certifiedTriples) {
-      if (t.loSeq < segStartField || t.loSeq + 2 > segEndField) continue;
-      if (t.anchorFrame < 0) continue;
-      inSeg.push_back(&t);
-    }
-    std::sort(inSeg.begin(), inSeg.end(),
-              [](const CertifiedTriple* a, const CertifiedTriple* b) {
-                return a->loSeq < b->loSeq;
-              });
-    for (const CertifiedTriple* t : inSeg) {
-      const int key = scheduleKey(t->phase, t->anchorFrame);
-      if (!lattices.empty() && lattices.back().key == key) {
-        lattices.back().lastFrame = t->anchorFrame;
-        lattices.back().count++;
-      } else {
-        lattices.push_back({t->anchorFrame, t->anchorFrame, key, 1});
-      }
-    }
-    // Triples short of a formation between two agreeing lattices are
-    // absorbed; short of one anywhere else they are dropped. Only
-    // formations name a schedule.
-    constexpr int LATTICE_FORMATION = 5;
-    std::vector<Lattice> formed;
-    for (const Lattice& l : lattices) {
-      if (l.count >= LATTICE_FORMATION) {
-        if (!formed.empty() && formed.back().key == l.key) {
-          formed.back().lastFrame = l.lastFrame;
-          formed.back().count += l.count;
-        } else {
-          formed.push_back(l);
-        }
-      }
-    }
-    lattices.swap(formed);
-  }
+  const std::vector<Lattice> lattices =
+      latticeFormations(segStartField, segEndField);
 
   if (lattices.size() >= 2) {
     // Split any run that spans a lattice change-point.
@@ -6509,10 +6513,248 @@ int CineMap::healContinuity(SourceVideo& sv,
   }
 
   // ---------------------------
-  // Phase 2: Intra-segment steady-cadence enforcement
+  // Phase 1b: the lattice split — a film segment that holds two schedules
   // ---------------------------
+  //
+  // --tv scopes one cadence per shot between detected edits, and a video
+  // transition the picture detector misses leaves two shots in one
+  // segment: the election is a sum, the larger shot outvotes the smaller,
+  // and the smaller wears the wrong phase (Civil Defense 88231, a D frame
+  // painted A). The split is not a hunt and not a re-election — the sparse
+  // solve's window is what rescues thin shots, and a false split costs
+  // exactly that. It fires only on FACT: two formations of certified
+  // triples on different schedules inside one film segment
+  // (latticeFormations, five triples each). The break is placed by
+  // chooseBreakField in the bracket the two triples leave, each side is
+  // repainted with its own formation's schedule, and Phase 2 then enforces
+  // steadiness per side. Film to film only: a field that carries a
+  // sentinel is not touched, and a segment that is not film is not read.
   FieldOrderPolicy fo;
   fo.reverse = m_disc->getReverseFieldOrder();
+
+  auto phaseAt = [](int key, int frame) {
+    return normalizePhase(static_cast<long long>(key) + frame, 5);
+  };
+  auto firstFrameOf = [&](int fs, int fe) -> int {
+    for (int s = fs; s <= fe; ++s)
+      if (cache.validSeq(s)) return cache.cap[s].frameIndex;
+    return -1;
+  };
+  // applyCadenceToSegment's lock arithmetic, restricted to film ground.
+  auto paintFilmSchedule = [&](int fs, int fe, int phaseOffset,
+                               double conf) -> int {
+    const int anchor = firstFrameOf(fs, fe);
+    if (anchor < 0) return 0;
+    int painted = 0;
+    for (int s = fs; s <= fe; ++s) {
+      if (!cache.validSeq(s)) continue;
+      auto f = m_md->getField(s);
+      if (f.pad || f.cinemap.cadenceId < 0) continue;
+      const int frameIdx = cache.cap[s].frameIndex;
+      const int pos = normalizePhase(
+          static_cast<long long>(frameIdx - anchor) + phaseOffset, 5);
+      auto [c1, c2] = fo.cavCadenceIdsForFrameInGroup(pos);
+      const int f1 = m_disc->getFirstFieldNumber(frameIdx + 1);
+      const int f2 = m_disc->getSecondFieldNumber(frameIdx + 1);
+      auto [t1, t2] = fo.temporalOrder(f1, f2);
+      int cid = CADENCE_UNKNOWN;
+      if (s == t1) cid = c1;
+      else if (s == t2) cid = c2;
+      if (cid == CADENCE_UNKNOWN || cid == f.cinemap.cadenceId) continue;
+      f.cinemap.cadenceId = cid;
+      f.cinemap.cadenceIndexPresumed = false;
+      m_cadenceConfidence[s] = std::max(m_cadenceConfidence[s], conf);
+      m_md->updateField(f, s);
+      painted++;
+    }
+    return painted;
+  };
+
+  {
+    std::vector<SegmentResult> rebuilt;
+    rebuilt.reserve(segments.size());
+    for (const SegmentResult& seg : segments) {
+      if (seg.run.type != PhaseRun::Type::Pulldown32 ||
+          seg.run.confidence < 0.7) {
+        rebuilt.push_back(seg);
+        continue;
+      }
+      const std::vector<Lattice> lattices =
+          latticeFormations(seg.startField, seg.endField);
+      if (lattices.size() < 2) {
+        rebuilt.push_back(seg);
+        continue;
+      }
+
+      // Place the breaks, one per change-point.
+      struct Piece {
+        int fs, fe, key;
+      };
+      std::vector<Piece> pieces;
+      int start = seg.startField;
+      for (size_t li = 1; li < lattices.size(); ++li) {
+        const Lattice& out = lattices[li - 1];
+        const Lattice& in = lattices[li];
+        const BreakSchedule outgoing{out.firstFrame,
+                                     phaseAt(out.key, out.firstFrame), false};
+        const BreakSchedule incoming{in.firstFrame,
+                                     phaseAt(in.key, in.firstFrame), false};
+        const int seq = chooseBreakField(sv, in.firstFrame, outgoing, incoming);
+        if (seq <= start || seq > seg.endField) continue;
+        auto fld = m_md->getField(seq);
+        if (!fld.pad && !fld.cinemap.isEditBoundary &&
+            !fld.cinemap.isEditVetoed) {
+          fld.cinemap.assertEditBoundary();
+          m_md->updateField(fld, seq);
+        }
+        pieces.push_back({start, seq - 1, out.key});
+        start = seq;
+      }
+      pieces.push_back({start, seg.endField, lattices.back().key});
+      if (pieces.size() < 2) {
+        rebuilt.push_back(seg);
+        continue;
+      }
+
+      int repainted = 0;
+      for (const Piece& p : pieces) {
+        const int anchor = firstFrameOf(p.fs, p.fe);
+        if (anchor < 0) continue;
+        const int phase = phaseAt(p.key, anchor);
+        repainted += paintFilmSchedule(p.fs, p.fe, phase, seg.run.confidence);
+
+        SegmentResult piece;
+        piece.startField = p.fs;
+        piece.endField = p.fe;
+        piece.run = seg.run;
+        piece.run.phaseOffset = phase;
+        piece.run.endField = p.fe;
+        piece.run.reason = QStringLiteral("lattice-split");
+        for (const auto& m : seg.mixedness) {
+          const int lastFrame = firstFrameOf(p.fe, p.fe);
+          if (m.frameIndex >= anchor && (lastFrame < 0 || m.frameIndex <= lastFrame))
+            piece.mixedness.push_back(m);
+        }
+        rebuilt.push_back(piece);
+      }
+      changes += repainted;
+
+      if (m_decisionTraceEnabled) {
+        QString desc;
+        for (const Lattice& l : lattices)
+          desc += QString(" [%1..%2 key=%3 n=%4]")
+                      .arg(l.firstFrame)
+                      .arg(l.lastFrame)
+                      .arg(l.key)
+                      .arg(l.count);
+        QString cuts;
+        for (size_t pi = 1; pi < pieces.size(); ++pi)
+          cuts += QString(" %1").arg(pieces[pi].fs);
+        qInfo().noquote() << QString(
+                                 "CineMap decision: HEAL_LATTICE_SPLIT fields "
+                                 "[%1..%2] schedules=%3 breaks=%4 repainted=%5:%6")
+                                 .arg(seg.startField)
+                                 .arg(seg.endField)
+                                 .arg(lattices.size())
+                                 .arg(cuts.trimmed())
+                                 .arg(repainted)
+                                 .arg(desc);
+      }
+    }
+    segments.swap(rebuilt);
+  }
+
+  // ---------------------------
+  // Phase 1c: the lattice join — a formation that spans a sliver
+  // ---------------------------
+  //
+  // The inverse of the split. False edits inside one shot (a strobe, a
+  // flash) cut it into slivers too short to carry a scan, and a sliver
+  // named from a weak estimate wears a phase its neighbours' facts deny:
+  // Civil Defense 89003-89174 is one schedule of seventeen certified
+  // triples and three slivers inside it were named offsets 1, 2 and 0 on
+  // margins of 0.165, 0.035 and 0.104. Where the triples of the segment
+  // before and the segment after a sliver form ONE formation on one
+  // schedule, the sliver is inside that cadence and takes it. Film to film
+  // only, and only across a sliver: a segment too short to carry its own
+  // scan, with no formation of its own. A segment that can carry a scan
+  // owns its verdict whether or not its twins certify — a quiet-grained
+  // shot certifies nothing (its neighbours cancel too) and still locks on
+  // its geometry and pattern; Emissary 5936-6055 did so at 0.95 and was
+  // repainted with its neighbours' schedule when "no formation" alone was
+  // the gate.
+  {
+    for (size_t i = 1; i + 1 < segments.size(); ++i) {
+      SegmentResult& mid = segments[i];
+      if (mid.run.type != PhaseRun::Type::Pulldown32 &&
+          mid.run.type != PhaseRun::Type::Unknown)
+        continue;
+      const int midFirst = firstFrameOf(mid.startField, mid.endField);
+      const int midLast = firstFrameOf(mid.endField, mid.endField);
+      if (midFirst < 0 || midLast < 0) continue;
+      if (midLast - midFirst + 1 >= SCAN_MIN_FRAMES) continue;
+      if (!latticeFormations(mid.startField, mid.endField).empty()) continue;
+
+      // Reach outward through film neighbours until one formation spans
+      // the sliver — a strobe stretch can leave several segments without a
+      // triple between the lattice's two halves (Civil Defense 89012 to
+      // 89082). Any second schedule in the window ends the search: the
+      // sliver may then sit at a real change, and that is the split's
+      // business, not the join's.
+      constexpr int JOIN_REACH = 4;
+      Lattice spanning;
+      bool haveSpanning = false;
+      double conf = 0.0;
+      for (int reach = 1; reach <= JOIN_REACH && !haveSpanning; ++reach) {
+        if (i < static_cast<size_t>(reach) || i + reach >= segments.size())
+          break;
+        const SegmentResult& left = segments[i - reach];
+        const SegmentResult& right = segments[i + reach];
+        if (left.run.type != PhaseRun::Type::Pulldown32 ||
+            right.run.type != PhaseRun::Type::Pulldown32)
+          break;
+        const std::vector<Lattice> across =
+            latticeFormations(left.startField, right.endField);
+        if (across.size() > 1) break;
+        if (across.empty()) continue;
+        const Lattice& l = across.front();
+        if (l.firstFrame <= midFirst && l.lastFrame >= midLast) {
+          spanning = l;
+          haveSpanning = true;
+          conf = std::max(left.run.confidence, right.run.confidence);
+        }
+      }
+      if (!haveSpanning) continue;
+      const Lattice& l = spanning;
+
+      const int phase = phaseAt(l.key, midFirst);
+      const int repainted =
+          paintFilmSchedule(mid.startField, mid.endField, phase, conf);
+      mid.run.type = PhaseRun::Type::Pulldown32;
+      mid.run.phaseOffset = phase;
+      mid.run.confidence = conf;
+      mid.run.reason = QStringLiteral("lattice-join");
+      changes += repainted;
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote() << QString(
+                                 "CineMap decision: HEAL_LATTICE_JOIN fields "
+                                 "[%1..%2] formation=[%3..%4 key=%5 n=%6] "
+                                 "phase=%7 repainted=%8")
+                                 .arg(mid.startField)
+                                 .arg(mid.endField)
+                                 .arg(l.firstFrame)
+                                 .arg(l.lastFrame)
+                                 .arg(l.key)
+                                 .arg(l.count)
+                                 .arg(phase)
+                                 .arg(repainted);
+      }
+    }
+  }
+
+  // ---------------------------
+  // Phase 2: Intra-segment steady-cadence enforcement
+  // ---------------------------
 
   auto enforceWithinSegment = [&](int segStartField, int segEndField,
                                   int phaseOffset) -> int {

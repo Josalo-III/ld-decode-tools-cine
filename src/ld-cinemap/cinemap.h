@@ -717,6 +717,25 @@ class CineMap {
   // each run as its own solved segment, because a segment cine has split
   // is no longer one thing, and a single summary of it would carry the
   // majority's phase back over the minority's fields.
+  // Certified triples grouped by 5-frame schedule. A schedule is a triple's
+  // phase carried back to frame 0; a formation is five or more triples on
+  // one schedule, the same five certifiedPhaseForRange asks of a lattice.
+  // Two formations on different schedules inside one segment are two
+  // cadences, and the step between the last triple of one and the first of
+  // the next is a break. Read by --cine's run detector and by the healer's
+  // lattice split.
+  struct Lattice {
+    int firstFrame = -1;
+    int lastFrame = -1;
+    int key = -1;  // phase at frame 0
+    int count = 0;
+  };
+  static constexpr int LATTICE_FORMATION = 5;
+  // The shortest run the count verdicts will speak on; a segment shorter
+  // than this cannot carry its own scan.
+  static constexpr int SCAN_MIN_FRAMES = 15;
+  std::vector<Lattice> latticeFormations(int segStart, int segEnd) const;
+
   struct CineRun {
     int startField = 0;
     int endField = 0;
