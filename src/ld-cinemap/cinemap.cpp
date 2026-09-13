@@ -3670,6 +3670,10 @@ bool CineMap::tryLockByDgGeometry(SourceVideo& sv, int segStartField,
   outLock.phaseOffset = bestP;
   outLock.baseOffset = 0;
   outLock.confidence = 0.90;
+  outLock.twins = count[bestP];
+  // score = agreeing - 0.25 * disagreeing over count twins.
+  outLock.agreeing = static_cast<int>(
+      std::lround((score[bestP] + 0.25 * count[bestP]) / 1.25));
 
   if (m_decisionTraceEnabled) {
     qInfo().noquote()
@@ -4571,8 +4575,24 @@ CineMap::PhaseRun CineMap::solveSegment(
         harvestTwinEdges(sv, segStartField, segEndField, /*maxDist=*/2).size());
     DgLock geometry;
     QString rejectReason;
-    if (tryLockByDgGeometry(sv, segStartField, segEndField, cache, geometry,
-                            &rejectReason)) {
+    // Recurring means recurring: 3:2 repeats a field twice in every five
+    // frames, and the Borg cube carries 21 twins on one phase where the
+    // span predicts 21. A geometry lock among scattered pairs is not that —
+    // Fraker's hand on Vol (2085-2538, interlaced, 57 combing frames) was
+    // overturned by 4 twins where the span predicts 91, 2 of them agreeing,
+    // once the absolute certification floor stopped handing the spacing
+    // vet a 8/8 tie of flukes. Half of prediction on the winning phase.
+    const double predictedTwins = 0.4 * static_cast<double>(mixedness.size());
+    const bool locked = tryLockByDgGeometry(sv, segStartField, segEndField,
+                                            cache, geometry, &rejectReason);
+    const bool recurring =
+        locked && geometry.agreeing >= 0.5 * predictedTwins;
+    if (locked && !recurring) {
+      rejectReason = QStringLiteral("twins-not-recurring %1 of %2 predicted")
+                         .arg(geometry.agreeing)
+                         .arg(predictedTwins, 0, 'f', 0);
+    }
+    if (recurring) {
       run.type = PhaseRun::Type::Pulldown32;
       run.phaseOffset = geometry.phaseOffset;
       run.confidence = geometry.confidence;
@@ -5791,50 +5811,103 @@ std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
   std::vector<CertifiedTriple> out;
   if (!m_md || !m_disc) return out;
 
-  const NoiseFloor& nf = calibrateTwinFloor(sv);
-  if (!nf.valid) return out;
-
-  // The geometry operating point: this asks which position a pair occupies,
-  // and surplus hits blur the very structure being read.
-  const double floorIre = nf.ire * FLOOR_MULT_GEOMETRY;
-  if (!(floorIre > 0.0)) return out;
-
   const auto& vp = m_md->getVideoParameters();
   const int totalFields = m_md->getNumberOfFields();
 
-  auto cancels = [&](int a, int b) -> bool {
-    if (a < 1 || b < 1 || a > totalFields || b > totalFields) return false;
-    const TwinDemod m =
-        demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
-    if (!m.valid) return false;
-    return m.grainIre < floorIre;
-  };
-
-  // Neighbour grain, for the backing test. Returns -1 where unmeasurable.
-  auto neighbourGrain = [&](int a, int b) -> double {
+  // Pair grain, -1 where unmeasurable.
+  auto grain = [&](int a, int b) -> double {
     if (a < 1 || b < 1 || a > totalFields || b > totalFields) return -1.0;
     const TwinDemod m =
         demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
     return m.valid ? m.grainIre : -1.0;
   };
 
-  // Film grain animates between film frames, so a real twin's non-twin
-  // neighbours are LOUD; a fluke certified from a noise dip on near-static
-  // video has neighbours resting at the floor. Three times the raw floor
-  // splits the measured populations with room on both sides.
-  const double grainBackIre = nf.ire * 3.0;
+  // A twin is a DIP: its pair grain against its own parity's neighbours,
+  // not against any level. Film grain animates between film frames, so a
+  // real twin's non-twin neighbours are loud beside it whatever the shot's
+  // level; frozen content has no dip, and a fluke on near-static video has
+  // neighbours resting beside it (1.1-1.4x). Three times splits the
+  // measured populations with room on both sides. An absolute floor
+  // (1.35x the disc's noise floor) certified nothing in a quiet shot whose
+  // twins read 0.99-1.27 against neighbours of 4.5-14 (Emissary 5936-6055),
+  // and the shot then wore its neighbours' schedule.
+  const double dip = TWIN_DIP_RATIO;
+
+  // The same dip at the segment's scale. On a locked-off shot with fine
+  // grain no single pair stands out (Vol 4773-5226: every pair within
+  // 1.42x of its neighbours, the band video flukes occupy), yet the two
+  // repeat positions of the ten-field cycle sit 25% below the other eight
+  // in EVERY one of 45 cycles. Median pair grain by position, the best of
+  // the five lattices {k, k+5}, the weaker of its two positions against the
+  // median of the other eight: Vol's stills 1.27 and 1.28, its moving film
+  // 1.6 to 11, its interlaced video 0.998 to 1.025 (the two lowest
+  // positions there are not even five apart). A pair on that lattice
+  // certifies when its own grain is below the segment's non-lattice level.
+  std::array<std::vector<double>, 10> byPos;
+  for (int s = segStart; s + 2 <= segEnd; ++s) {
+    const double gt = grain(s, s + 2);
+    if (gt >= 0.0) byPos[s % 10].push_back(gt);
+  }
+  auto median = [](std::vector<double> v) -> double {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return n == 0 ? -1.0 : (n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]));
+  };
+  int latticeK = -1;
+  double latticeRatio = 0.0;
+  double latticeLevel = -1.0;
+  {
+    bool enough = true;
+    std::array<double, 10> med;
+    for (int i = 0; i < 10; ++i) {
+      if (byPos[i].size() < 3) enough = false;
+      med[i] = median(byPos[i]);
+    }
+    if (enough) {
+      for (int k = 0; k < 5; ++k) {
+        std::vector<double> others;
+        for (int i = 0; i < 10; ++i)
+          if (i != k && i != k + 5) others.push_back(med[i]);
+        const double lat = std::max(med[k], med[k + 5]);
+        if (!(lat > 0.0)) continue;
+        const double r = median(others) / lat;
+        if (r > latticeRatio) {
+          latticeRatio = r;
+          latticeK = k;
+          latticeLevel = median(others);
+        }
+      }
+    }
+  }
+  const bool latticeDip = latticeK >= 0 && latticeRatio >= LATTICE_DIP_RATIO;
+  if (m_decisionTraceEnabled && latticeK >= 0) {
+    qInfo().noquote() << QString(
+                             "CineMap decision: TWIN_LATTICE fields [%1..%2] "
+                             "k=%3 ratio=%4 level=%5 result=%6")
+                             .arg(segStart)
+                             .arg(segEnd)
+                             .arg(latticeK)
+                             .arg(latticeRatio, 0, 'f', 3)
+                             .arg(latticeLevel, 0, 'f', 3)
+                             .arg(latticeDip ? "lattice" : "none");
+  }
 
   for (int s = segStart; s + 2 <= segEnd; ++s) {
     // Geometry first: it costs nothing and rejects most positions outright.
     const TwinACInfo ac = classifyTwinAC_strict(s, s + 2, cache);
     if (ac.role == TwinACRole::Unknown) continue;
 
-    if (!cancels(s, s + 2)) continue;
-
-    // Frozen content cancels everywhere; a twin stands out from its own
-    // parity's neighbours.
-    if (cancels(s - 2, s)) continue;
-    if (cancels(s + 2, s + 4)) continue;
+    const double gt = grain(s, s + 2);
+    if (!(gt >= 0.0)) continue;
+    const double gl = grain(s - 2, s);
+    const double gr = grain(s + 2, s + 4);
+    bool pairDip = !(gl < 0.0 && gr < 0.0);
+    if (gl >= 0.0 && gl < gt * dip) pairDip = false;
+    if (gr >= 0.0 && gr < gt * dip) pairDip = false;
+    const bool onLattice =
+        latticeDip && (s % 10 == latticeK || s % 10 == latticeK + 5) &&
+        gt < latticeLevel;
+    if (!pairDip && !onLattice) continue;
 
     // Never overlap one fact with another: two overlapping triples are a
     // contradiction, and the first one keeps the ground.
@@ -5849,14 +5922,7 @@ std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
     t.spareSeq = ac.spareSeq;
     t.aType = (ac.role == TwinACRole::AType);
     t.anchorFrame = cache.cap[s].frameIndex;
-
-    {
-      const double gl = neighbourGrain(s - 2, s);
-      const double gr = neighbourGrain(s + 2, s + 4);
-      const double gmin =
-          (gl >= 0.0 && gr >= 0.0) ? std::min(gl, gr) : std::max(gl, gr);
-      t.grainBacked = (gmin >= grainBackIre);
-    }
+    t.grainBacked = true;  // the dip IS the backing
 
     // A's def frame is group position 0 and its spare trails, so the triple
     // opens on position 0. C's spare leads from the BC frame, so its triple

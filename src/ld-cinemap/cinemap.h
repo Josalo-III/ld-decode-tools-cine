@@ -212,6 +212,10 @@ class CineMap {
     // sidestepping the per-detector margin gate.
     std::array<double, 5> phaseScores = {0.0, 0.0, 0.0, 0.0, 0.0};
     bool phaseScoresInformative = false;
+
+    // Twins voting, and how many of them sit on the winning phase.
+    int twins = 0;
+    int agreeing = 0;
   };
 
   // Evidence accumulator for validatePhaseGeometry() /
@@ -326,6 +330,10 @@ class CineMap {
   // the ~20% that 3:2 predicts).
   static constexpr double FLOOR_MULT_RECALL = 2.00;
   static constexpr double FLOOR_MULT_GEOMETRY = 1.35;
+  // A certified twin's neighbours carry at least this many times its grain.
+  static constexpr double TWIN_DIP_RATIO = 3.0;
+  // The segment's two repeat positions against its other eight, in aggregate.
+  static constexpr double LATTICE_DIP_RATIO = 1.15;
 
   // Lips owns mixedness, but it is field difference rather than a comb
   // detector. It masks the image's own vertical detail per pixel, subtracts
