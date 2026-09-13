@@ -36,6 +36,19 @@ struct FieldDescriptor {
   // from notch to lips: an average is not the question. Blackness is a
   // statement that NOTHING peaks above black, and only a peak can say it.
   double peakIre = 0.0;
+
+  // The picture itself, sampled for Pearson: every eighth sample (a 4fsc
+  // pair averaged, so the subcarrier cancels) on every fourth line of the
+  // title-safe window, ~5,700 points. Sampled, never averaged into cells —
+  // the nine cell means are a separate measure. Pearson over these points
+  // sees WHERE the edges are; Pearson over the nine means sees only where
+  // the light is, and two matched close-ups on one set share that
+  // (46192/46193 read 0.94 on nine cells, 0.65 on the picture). Measured
+  // against twice this density on 875 commits: p90 difference 0.009,
+  // worst 0.032, identical on every edit where the picture decided.
+  std::vector<float> picture;
+  int pictureW = 0;
+  int pictureH = 0;
 };
 
 struct DeltaStats {
@@ -133,6 +146,23 @@ FieldDescriptor computeFieldDescriptor(
     }
   }
 
+  // Picture pass, for Pearson on the picture.
+  {
+    constexpr int SX = 8, SY = 4;
+    desc.pictureW = (x1 - 2 - x0) / SX;
+    desc.pictureH = (y1 - y0) / SY;
+    desc.picture.resize(static_cast<size_t>(desc.pictureW) * desc.pictureH);
+    size_t k = 0;
+    for (int py = 0; py < desc.pictureH; ++py) {
+      const uint16_t* rowPtr = fieldData + (y0 + py * SY) * width;
+      for (int px = 0; px < desc.pictureW; ++px) {
+        const int x = x0 + px * SX;
+        desc.picture[k++] = static_cast<float>(
+            0.5 * (sampleToIre(rowPtr[x]) + sampleToIre(rowPtr[x + 2])));
+      }
+    }
+  }
+
   // Peak pass. At 4fsc, samples x and x+2 are 180 degrees apart in subcarrier
   // phase, so their mean cancels it — the peak is then a luma peak rather than
   // a chroma excursion, and a lone hot sample is halved rather than believed.
@@ -202,7 +232,26 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
   const double RAMP_TOTAL_MULT = 4.0;
   const double RAMP_RATIO_MAX = 1.3;
   const int RAMP_HALF_WINDOW = 4;
+
+  // A flash departs and returns; a cut steps and stays. The author's rule,
+  // measured 2026-08-18 on two discs: Necessary Evil's lightning leaves the
+  // shot by 17-30 IRE and is back within a few fields, its cut at 3425
+  // steps to 15 and holds; Civil Defense's strobes leave by 12-26 and
+  // return, its cut at 88231 steps to 12.8 and holds at sigma 0.09 over
+  // twelve fields. Magnitude inverts on both discs (the flash is the larger
+  // excursion), so the test is never size: it is whether the picture comes
+  // back. Twelve fields is the hold both cuts showed; a return to within
+  // half the candidate's own departure is the picture coming back.
+  const int TRANSIENT_HOLD_FIELDS = 12;
+  const double TRANSIENT_RETURN_FRAC = 0.5;  // and never above threshold
   const int CONTEXT_HALF_SPAN = 6;
+  // How far a candidate must be the largest step: two film frames each
+  // side. Camera shake is not uniform seam to seam (Emissary s1 3303-3500
+  // runs 18-88 IRE), so the nearest seam alone does not speak for the
+  // shot; swept 3/6/8/10/12 on that shot: 13/7/5/3/3 commits, and the
+  // three at 10 are the shot's genuine outliers. Two edges of one event
+  // never compete: a step into flat white is not a step (below).
+  const int SIDE_REACH = 10;
   const double MOTION_STRONG_CELL_FRAC = 0.40;
 
   // Black-span segmentation (IRE; endpoints must be black themselves)
@@ -269,6 +318,9 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     double corr = 0.0;
     bool informative = false;
     bool bothFlat = false;  // neither field carries contrast: empty ground
+    bool intoFlat = false;  // the later field has no contrast: into a white-out
+    double pictureCorr = 0.0;  // Pearson over the sampled picture
+    bool pictureInfo = false;
   };
 
   auto computeCorrelation = [&](const FieldDescriptor& a,
@@ -309,12 +361,41 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     const double contrastA = (meanA > 1e-6) ? std::sqrt(denA / 9.0) / meanA : 0.0;
     const double contrastB = (meanB > 1e-6) ? std::sqrt(denB / 9.0) / meanB : 0.0;
     r.bothFlat = (contrastA < CORR_MIN_CONTRAST && contrastB < CORR_MIN_CONTRAST);
+    r.intoFlat = (contrastB < CORR_MIN_CONTRAST);
     if (contrastA < CORR_MIN_CONTRAST || contrastB < CORR_MIN_CONTRAST)
       return r;
 
     r.corr = num / (std::sqrt(denA) * std::sqrt(denB));
     r.informative = true;
     return r;
+  };
+
+  // Pearson on the picture. The nine-cell Pearson answers "same lighting
+  // layout"; this one answers "same picture".
+  auto pictureCorrelation = [&](const FieldDescriptor& a,
+                                const FieldDescriptor& b, CorrResult& r) {
+    if (!a.valid || !b.valid) return;
+    if (a.picture.size() != b.picture.size() || a.picture.empty()) return;
+    const size_t n = a.picture.size();
+    double ma = 0.0, mb = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      ma += a.picture[i];
+      mb += b.picture[i];
+    }
+    ma /= n;
+    mb /= n;
+    double num = 0.0, da2 = 0.0, db2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double da = a.picture[i] - ma;
+      const double db = b.picture[i] - mb;
+      num += da * db;
+      da2 += da * da;
+      db2 += db * db;
+    }
+    // A picture with under one IRE of rms structure is empty ground.
+    if (da2 < n || db2 < n) return;
+    r.pictureCorr = num / (std::sqrt(da2) * std::sqrt(db2));
+    r.pictureInfo = true;
   };
 
   auto corrEvidence = [&](double corr, bool informative) -> double {
@@ -369,25 +450,90 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     return ds;
   };
 
+  // Transient. A flash makes two candidates: the departure, whose picture
+  // comes back to the field before it within the hold window; and the
+  // return, whose picture IS a coming-back to a field within the hold
+  // window behind it. Either is a transient. A cut is neither: the picture
+  // after it stays away from the picture before it for the whole hold.
+  // "Back" is absolute, not a fraction of the candidate's departure: the
+  // field before a cut can itself be a strobe frame, which inflates the
+  // departure and makes a genuine cut look like a half-return (Civil
+  // Defense 88278). The picture is back when it matches a recent field as
+  // closely as continuous fields match — the detector's own change
+  // threshold, the level below which it calls nothing a change.
+  auto isTransient = [&](int idx) -> bool {
+    if (idx - 1 < 1 || !safeValid(idx - 1) || !safeValid(idx)) return false;
+    const FieldDescriptor& prev = getDesc(idx - 1);
+    const FieldDescriptor& cur = getDesc(idx);
+    const double d0 = computeBoostedStats(prev, cur).total;
+    if (d0 <= 0.0) return false;
+    const double back = std::min(TRANSIENT_RETURN_FRAC * d0, threshold);
+    // Departure: does the picture ahead return to prev?
+    for (int off = 1; off <= TRANSIENT_HOLD_FIELDS; ++off) {
+      if (idx + off > totalFields || !safeValid(idx + off)) break;
+      if (computeBoostedStats(prev, getDesc(idx + off)).total < back)
+        return true;
+    }
+    // Return: is cur a coming-back to a picture behind prev?
+    for (int off = 2; off <= TRANSIENT_HOLD_FIELDS + 1; ++off) {
+      if (idx - off < 1 || !safeValid(idx - off)) break;
+      if (computeBoostedStats(getDesc(idx - off), cur).total < back)
+        return true;
+    }
+    return false;
+  };
+
+  // Every comparison in this detector is field to previous field. An edit
+  // is between two adjacent fields, so that is the measure of it; and on
+  // 3:2 film the pairs inside a film frame read zero, so each film-frame
+  // seam is counted exactly once and a candidate is judged against the
+  // OTHER seams around it. Camera motion recurs at every seam; a cut is
+  // unique. Same-parity pairs (i-2, i) were fragile here: whether such a
+  // pair spanned a seam or sat inside a 3-field frame depended only on the
+  // candidate's slot in the 10-field cycle, so the same motion committed at
+  // one cadence position and not the next (Emissary s1 3303-3500, one
+  // shaky shot, 17 commits on the slots with a zero beside them and none
+  // on its heaviest seams).
+  // A step INTO a flat field — picture to white-out — is a lighting event,
+  // not a picture event: a flash always begins inside a shot. It is neither
+  // a candidate nor a competitor. Emissary 3937's white-out is not a cut
+  // (the author's ruling), and 3860's real cut lost dominance to the
+  // explosion white-out six fields after it, which then committed in its
+  // place. A step OUT of a flat field keeps its lanes: a shot can end in
+  // white (3805 is the cut out of the 3785-3804 explosion shot; 3941 heads
+  // a shot out of a decayed white-out). A decay that returns to its own
+  // shot is the transient veto's, below.
+  auto stepAt = [&](int j) -> DeltaStats {
+    if (j < 2 || !safeValid(j) || !safeValid(j - 1)) return DeltaStats();
+    if (computeCorrelation(getDesc(j - 1), getDesc(j)).intoFlat)
+      return DeltaStats();
+    return computeBoostedStats(getDesc(j - 1), getDesc(j));
+  };
+  auto isSeam = [&](const DeltaStats& d) -> bool {
+    return d.total > threshold;
+  };
+
+  // Ramp: the candidate and the two nearest seams on each side are all of
+  // one size — a dissolve, or motion recurring seam after seam.
   auto isRampContext = [&](int idx) -> bool {
-    if (idx - 2 * RAMP_HALF_WINDOW < 1 ||
-        idx + 2 * RAMP_HALF_WINDOW > totalFields)
-      return false;
-    for (int off = -2 * RAMP_HALF_WINDOW; off <= 2 * RAMP_HALF_WINDOW;
-         off += 2) {
-      if (!safeValid(idx + off)) return false;
+    std::vector<double> mags;
+    mags.push_back(stepAt(idx).total);
+    for (int dir = -1; dir <= 1; dir += 2) {
+      int found = 0;
+      for (int off = 1; off <= 2 * RAMP_HALF_WINDOW && found < 2; ++off) {
+        const int j = idx + dir * off;
+        if (j < 2 || j > totalFields) return false;
+        if (!safeValid(j) || !safeValid(j - 1)) return false;
+        const DeltaStats d = stepAt(j);
+        if (!isSeam(d)) continue;
+        mags.push_back(d.total);
+        ++found;
+      }
+      if (found < 2) return false;
     }
 
-    DeltaStats d1 = computeBoostedStats(getDesc(idx - 4), getDesc(idx - 2));
-    DeltaStats d2 = computeBoostedStats(getDesc(idx - 2), getDesc(idx));
-    DeltaStats d3 = computeBoostedStats(getDesc(idx), getDesc(idx + 2));
-    DeltaStats d4 = computeBoostedStats(getDesc(idx + 2), getDesc(idx + 4));
-
-    const double mags[4] = {d1.total, d2.total, d3.total, d4.total};
-    const double maxMag =
-        std::max(std::max(mags[0], mags[1]), std::max(mags[2], mags[3]));
-    const double minMag =
-        std::min(std::min(mags[0], mags[1]), std::min(mags[2], mags[3]));
+    const double maxMag = *std::max_element(mags.begin(), mags.end());
+    const double minMag = *std::min_element(mags.begin(), mags.end());
 
     if (maxMag < threshold * RAMP_TOTAL_MULT) return false;
     if (minMag <= 0.0) return false;
@@ -396,7 +542,8 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     if (LOG_RAMP_VETO && ramp) {
       tbcDebugStream().nospace()
           << "EditDetector: ramp veto at field " << idx << " mags=[" << mags[0]
-          << "," << mags[1] << "," << mags[2] << "," << mags[3] << "]";
+          << "," << mags[1] << "," << mags[2] << "," << mags[3] << ","
+          << mags[4] << "]";
     }
     return ramp;
   };
@@ -454,7 +601,9 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     }
 
     // Demand Paging
-    const int neededUpTo = std::min(totalFields, i + CONTEXT_HALF_SPAN);
+    const int neededUpTo = std::min(
+        totalFields, i + std::max(CONTEXT_HALF_SPAN,
+                                  SIDE_REACH + TRANSIENT_HOLD_FIELDS));
     while (maxReadFrame < neededUpTo) {
       maxReadFrame++;
       LdDecodeMetaData::Field field = md.getField(maxReadFrame);
@@ -475,7 +624,10 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     }
 
     // Cache Pruning
-    const int pruneThreshold = i - 12;
+    // A competitor up to SIDE_REACH away is itself tested for transience,
+    // and that test looks TRANSIENT_HOLD_FIELDS beyond it on both sides.
+    const int pruneThreshold =
+        i - (SIDE_REACH + TRANSIENT_HOLD_FIELDS + 2);
     auto cacheIt = descCache.begin();
     while (cacheIt != descCache.end() && cacheIt->first < pruneThreshold) {
       cacheIt = descCache.erase(cacheIt);
@@ -483,9 +635,9 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
 
     // Fast echo pre-check
     if (i - lastEditFrame < 2) continue;
-    if (!safeValid(i) || !safeValid(i - 2)) continue;
+    if (!safeValid(i) || !safeValid(i - 1)) continue;
 
-    const FieldDescriptor& d_prev = getDesc(i - 2);
+    const FieldDescriptor& d_prev = getDesc(i - 1);
     const FieldDescriptor& d_curr = getDesc(i);
 
     // Robust blackness metric (p90 cell mean in IRE)
@@ -573,7 +725,14 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
 
     const DeltaStats ds = computeBoostedStats(d_prev, d_curr);
 
-    const CorrResult cr = computeCorrelation(d_prev, d_curr);
+    CorrResult cr = computeCorrelation(d_prev, d_curr);
+    pictureCorrelation(d_prev, d_curr, cr);
+    // Two competing correlations. The nine-cell Pearson is the general
+    // one: it does not see motion, so at a matched false-alarm rate among
+    // energetic continuous fields (2%) it catches 83% of cuts where the
+    // picture Pearson catches 55%. The picture Pearson sees composition,
+    // and so also motion; its power is the case the cells are blind to,
+    // and it votes there in its own lane below.
     const double corr = cr.corr;
     const bool corrInfo = cr.informative;
 
@@ -582,13 +741,13 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
 
     const double eCorr = corrEvidence(corr, corrInfo);
 
-    // No contrast on either side: empty ground, the white-out twin of a
-    // black run. Nothing structural can be said about it, and an energy
-    // change across it is a flash or a fade, not a cut (a flash decay
-    // committed twice on energy lanes alone once its correlation was rightly
-    // declared uninformative). A cut into or out of a flash has contrast on
-    // one side and keeps its lanes.
-    if (cr.bothFlat) {
+    // No contrast ahead: empty ground, the white-out twin of a black run.
+    // Nothing structural can be said across it, and an energy change into
+    // it is a flash or a fade, not a cut (a flash decay committed twice on
+    // energy lanes alone once its correlation was rightly declared
+    // uninformative; Emissary 3937's white-out is not a cut). A cut OUT of
+    // a flash has contrast ahead and keeps its lanes (3805).
+    if (cr.bothFlat || cr.intoFlat) {
       if (LOG_VERBOSE_REJECT || dbg) {
         qInfo().nospace() << "EditDetector: no-contrast reject at field " << i
                           << " p90=" << p90Ire;
@@ -662,6 +821,41 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     }
 
     // Lane: very low corr + modest energy
+    // pictureBreak — the lighting layout is kept (cells >= 0.85) and the
+    //   picture is not (picture Pearson < 0.70), with energy. A cut between
+    //   two matched close-ups on one set: same key, same set, different
+    //   composition (Emissary 46193: cells 0.94, picture 0.66, total 55;
+    //   46033: 0.91 / 0.59 / 81). The cells cannot see it by construction —
+    //   nine means of the same lighting — and no other lane reaches the
+    //   line on it. Measured on 25,059 energetic continuous fields: 843
+    //   carry this signature, most of them motion, and the dominance and
+    //   continuity vetoes downstream adjudicate them as they do every lane.
+    //   And a cut is an ISOLATED decorrelation: the picture is still before
+    //   it and still after it. The four A/B cuts sit between neighbouring
+    //   pairs at 0.995-0.997; the battle's motion, which reads the same
+    //   0.5-0.7 on the cut pair, has a median neighbour of 0.71 and only 7
+    //   of 80 such candidates still on both sides at 0.95.
+    if (corrInfo && corr >= 0.85 && cr.pictureInfo && cr.pictureCorr < 0.70 &&
+        ds.total > threshold) {
+      // Still on both sides: every adjacent pair within three fields, which
+      // on 3:2 always reaches the neighbouring seam.
+      bool stillAround = true;
+      for (int j = i - 3; j <= i + 3 && stillAround; ++j) {
+        if (j == i) continue;
+        if (j < 2 || j > totalFields || !safeValid(j) || !safeValid(j - 1)) {
+          stillAround = false;
+          break;
+        }
+        CorrResult n;
+        pictureCorrelation(getDesc(j - 1), getDesc(j), n);
+        if (!n.pictureInfo || n.pictureCorr < 0.95) stillAround = false;
+      }
+      if (stillAround) {
+        evidenceScore += 1.0;
+        if (reason.isEmpty()) reason = "pictureBreak";
+      }
+    }
+
     if (W.strongCorrCut > 0.0 && corrInfo && corr < 0.60) {
       if (ds.total > threshold * 1.0) {
         evidenceScore += W.strongCorrCut;
@@ -694,10 +888,20 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     // on a picture whose light and dark regions stay where they are is a
     // flash, a fade or a grade, not a cut (a flash decay committed at corr
     // 0.886 on a sixth of a real cut's energy). Cuts still commit on cell
-    // structure and on correlation collapse.
-    // Three or more strong cells is distributed structure and keeps its
-    // vote; the block applies where the diffuse lanes would carry the
-    // commit on their own.
+    // structure and on correlation collapse. Three or more strong cells is
+    // distributed structure and keeps its vote; the block applies where the
+    // diffuse lanes would carry the commit on their own.
+    //
+    // The continuity this reads is the PICTURE's, not the nine cells': a
+    // flash keeps the picture (structure survives, only the level moves;
+    // measured p50 0.80 on 136 flashes) and a cut between two matched
+    // close-ups on one set loses it (46193: cells 0.94, picture 0.65) while
+    // keeping the nine cells' lighting layout. Tried on the cells alone
+    // with the transient veto standing in: 41 strobe commits admitted and
+    // 46193 still short. On the picture the cut population reads p50 0.59
+    // / p90 0.84 and the flash population p50 0.80 / p10 0.46; the line at
+    // 0.75 sits between their medians, and a flash below it that reaches
+    // the commit line is the transient veto's to catch by time.
     const bool continuousByCorr =
         corrInfo && corr >= 0.85 && ds.strongCells <= 1;
 
@@ -722,33 +926,62 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
                           << " corr=" << corr << " corrInfo=" << corrInfo
                           << " eCorr=" << eCorr << " total=" << ds.total
                           << " peak=" << ds.peak << " strong=" << ds.strongCells
-                          << " chroma=" << ds.totalChroma << " p90=" << p90Ire;
+                          << " chroma=" << ds.totalChroma << " p90=" << p90Ire
+                          << " pcorr=" << cr.pictureCorr
+                          << " pinfo=" << cr.pictureInfo;
       }
       continue;
     }
 
     // ---- Context & Motion Analysis ----
-    const DeltaStats sideBefore =
-        computeBoostedStats(getDesc(i - 4), getDesc(i - 2));
-    const DeltaStats sideAfter =
-        computeBoostedStats(getDesc(i), getDesc(i + 2));
+    // Sides: the other steps within three fields (always reaches the
+    // neighbouring seam on 3:2). Context: within CONTEXT_HALF_SPAN. Only
+    // steps that are steps count as motion; the pairs inside a film frame
+    // are silent and say nothing about motion either way.
+    double sidePeak = 0.0;
+    double sideTotal = 0.0;
+    double sideChroma = 0.0;
 
-    const double sidePeak = std::max(sideBefore.peak, sideAfter.peak);
-    const double sideTotal = std::max(sideBefore.total, sideAfter.total);
-    const double sideChroma =
-        std::max(sideBefore.totalChroma, sideAfter.totalChroma);
-
-    const int ctxStart = std::max(5, i - CONTEXT_HALF_SPAN);
-    const int ctxEnd = std::min(totalFields - 2, i + CONTEXT_HALF_SPAN);
+    const int reach = std::max(CONTEXT_HALF_SPAN, SIDE_REACH);
+    const int ctxStart = std::max(2, i - reach);
+    const int ctxEnd = std::min(totalFields, i + reach);
 
     int motionFrames = 0;
     int motionStrong = 0;
     double ctxTotalMax = 0.0;
 
+    // A flash's edges are not picture events and do not compete: the head
+    // of Emissary's shaky shot (6395, 69 IRE at corr 0.52) lost dominance
+    // to a strobe nine fields before it that the transient veto had
+    // already thrown out. Unless the candidate is INSIDE the flash: a
+    // strobe train's edges each return and are all transients, and the
+    // one edge whose picture drifted too far to return is not a cut for
+    // being the last one standing (Civil Defense 89129). Transients on
+    // both sides of the candidate within reach mean the train is the
+    // candidate's own event, and then it competes.
+    bool transientBefore = false, transientAfter = false;
+    std::vector<int> transientAt;
+    for (int j = std::max(2, i - SIDE_REACH); j <= std::min(totalFields, i + SIDE_REACH); ++j) {
+      if (j == i || !safeValid(j) || !safeValid(j - 1)) continue;
+      if (!isSeam(stepAt(j)) || !isTransient(j)) continue;
+      transientAt.push_back(j);
+      (j < i ? transientBefore : transientAfter) = true;
+    }
+    const bool insideFlash = transientBefore && transientAfter;
+
     for (int j = ctxStart; j <= ctxEnd; ++j) {
       if (j == i) continue;  // exclude candidate itself
-      if (!safeValid(j) || !safeValid(j - 2)) continue;
-      const DeltaStats dj = computeBoostedStats(getDesc(j - 2), getDesc(j));
+      if (!safeValid(j) || !safeValid(j - 1)) continue;
+      const DeltaStats dj = stepAt(j);
+      if (!insideFlash &&
+          std::find(transientAt.begin(), transientAt.end(), j) != transientAt.end())
+        continue;
+      if (std::abs(j - i) <= SIDE_REACH) {
+        sidePeak = std::max(sidePeak, dj.peak);
+        sideTotal = std::max(sideTotal, dj.total);
+        sideChroma = std::max(sideChroma, dj.totalChroma);
+      }
+      if (!isSeam(dj) || std::abs(j - i) > CONTEXT_HALF_SPAN) continue;
       motionFrames++;
       if (dj.strongCells >= 2) motionStrong++;
       ctxTotalMax = std::max(ctxTotalMax, dj.total);
@@ -767,7 +1000,7 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
 
     if (dynamicMotionContext) {
       domMode = "motion";
-      const double motionThreshold = std::max(ctxTotalMax, sideTotal) * 1.2;
+      const double motionThreshold = std::max(ctxTotalMax, sideTotal) * 1.3;
       dominant = (ds.total > motionThreshold);
     } else {
       domMode = "normal";
@@ -787,9 +1020,8 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
 
     if (dbg) {
       qInfo().nospace() << "DBG" << DBG_FIELD
-                        << " v[-4,-2,i,+2]=" << safeValid(i - 4) << ","
-                        << safeValid(i - 2) << "," << safeValid(i) << ","
-                        << safeValid(i + 2) << " p90=" << p90Ire
+                        << " v[-1,i]=" << safeValid(i - 1) << ","
+                        << safeValid(i) << " p90=" << p90Ire
                         << " isChange=" << isChange << " reason=" << reason
                         << " corr=" << corr << " corrInfo=" << corrInfo
                         << " eCorr=" << eCorr
@@ -811,6 +1043,15 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
       if (LOG_RAMP_VETO && (LOG_VERBOSE_REJECT || LOG_CANDIDATES || dbg)) {
         qInfo().nospace() << "EditDetector: ramp veto commit@field " << i
                           << " reason=" << reason;
+      }
+      continue;
+    }
+
+    if (isTransient(i)) {
+      if (LOG_COMMITS || LOG_CANDIDATES || dbg) {
+        qInfo().nospace() << "EditDetector: transient veto at field " << i
+                          << " reason=" << reason << " total=" << ds.total
+                          << " corr=" << corr << " pcorr=" << cr.pictureCorr;
       }
       continue;
     }
@@ -863,6 +1104,11 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     commitBoundary(targetField, "visual", p90Ire, domMode, reason, corr,
                    corrInfo, eCorr, evidenceScore, ds, lumaPrev, lumaCurr,
                    motionFrames, motionStrong);
+    if (LOG_COMMITS || LOG_CANDIDATES) {
+      qInfo().nospace() << "EditDetector: PCORR atField=" << targetField
+                        << " cells=" << cr.corr << " picture=" << cr.pictureCorr
+                        << " pictureInfo=" << cr.pictureInfo;
+    }
 
   }
 
