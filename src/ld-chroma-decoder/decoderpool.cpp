@@ -78,7 +78,12 @@ bool DecoderPool::process()
         cadenceConfig,
         [this](qint32 seqNo) {
             // Called under inputMutex (from pumpAssembler inside getInputFrames).
-            if (!cadenceConfig.export24p && !cadenceConfig.noCinemap)
+            // Default 24p drops what the assembler releases. Max 24p drops
+            // nothing: a field with no film partner (a shot that opens on
+            // an orphan spare) passes through as its video frame, edit
+            // flag and all, and the restorer decides.
+            if ((!cadenceConfig.export24p || cadenceConfig.emitMax24p) &&
+                !cadenceConfig.noCinemap)
                 enqueueBaselinePassthrough(seqNo);
         }
     );
@@ -663,11 +668,22 @@ bool DecoderPool::getInputFrames(qint32 &startFrameNumber, QList<SourceField> &f
             CadenceAssembler::WorkItem in = std::move(workItems.front());
             workItems.pop_front();
 
+            lastCadenceIndex24p = getCadenceIdx(in);
+
+            // Max 24p drops nothing, so it has no reason to wait for the
+            // segment: the drop scheduler needs a whole segment to choose
+            // its drops, and buffering for it held the first frame back
+            // until the first edit boundary — the whole head of the disc.
+            if (cadenceConfig.emitMax24p) {
+                scheduled24p.push_back(std::move(in));
+                ++framesScheduled24p;
+                continue;
+            }
+
             if (isSegStart(in) && !buildingSeg24p.empty()) {
                 finalizeSegment24p();
             }
 
-            lastCadenceIndex24p = getCadenceIdx(in);
             buildingSeg24p.push_back(std::move(in));
         }
         return true;

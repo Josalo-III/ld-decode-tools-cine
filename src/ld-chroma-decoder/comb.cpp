@@ -403,25 +403,28 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
             const char labelTop    = fieldLabel(cidTop);
             const char labelBottom = fieldLabel(cidBottom);
 
-            const bool pureFrame =
+            // One letter is a film frame assembled from its own two fields;
+            // that is what a correct assembly looks like and it reads as
+            // one. A leading '/' is an edit: this frame heads a new shot.
+            // Two letters mean the frame holds two different things, and
+            // the '/' then sits where the cut falls. Drawing both letters
+            // whenever a flag was present read as the frame having been
+            // split ("B/B" at Emissary 3381, a whole film frame B).
+            const bool sameFrame =
                 (labelTop == labelBottom) &&
                 (cidTop >= lddecode::kCadenceProgressive) &&
-                (cidBottom >= lddecode::kCadenceProgressive) &&
-                !editTop &&
-                !editBottom;
+                (cidBottom >= lddecode::kCadenceProgressive);
+            const bool edit = editTop || editBottom;
 
             int numChars = 0;
-
-            if (editTop)
-                ++numChars; // leading '/'
-
-            ++numChars;     // top label
-
-            if (!pureFrame) {
-                if (editBottom && !editTop)
-                    ++numChars; // middle '/'
-
-                ++numChars;     // bottom label
+            if (sameFrame) {
+                if (edit) ++numChars;   // leading '/'
+                ++numChars;             // the one label
+            } else {
+                if (editTop) ++numChars;                // leading '/'
+                ++numChars;                             // top label
+                if (editBottom && !editTop) ++numChars; // middle '/'
+                ++numChars;                             // bottom label
             }
 
             const int totalW = pad + numChars * (charW + pad);
@@ -434,15 +437,13 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 xOff += charW + pad;
             };
 
-            if (editTop)
-                drawNext('/');
-
-            drawNext(labelTop);
-
-            if (!pureFrame) {
-                if (editBottom && !editTop)
-                    drawNext('/');
-
+            if (sameFrame) {
+                if (edit) drawNext('/');
+                drawNext(labelTop);
+            } else {
+                if (editTop) drawNext('/');
+                drawNext(labelTop);
+                if (editBottom && !editTop) drawNext('/');
                 drawNext(labelBottom);
             }
         }
