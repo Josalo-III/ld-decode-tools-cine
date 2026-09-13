@@ -9,6 +9,7 @@
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QFile>
 #include <QFileInfo>
 #include <QTextStream>
 #include <QtGlobal>
@@ -92,7 +93,25 @@ static bool writeMetadata(CineDisc& disc, const QFileInfo& outputFileInfo,
                           const char* failureMessage) {
   markCinemapInUse(disc);
 
+  // The metadata is never updated in place. The file that was read is set
+  // aside as <db>.cbup and a fresh file is written, as ld-process-vits keeps
+  // its .vbup: a fresh file carries exactly what is in memory, and the
+  // previous state is one rename away. An in-place update appended the
+  // keyless drop_outs table to itself on every save (3,813 rows to 62
+  // million in thirteen saves; a 2 GB file and a twelve-minute write).
   const QString dbOutPath = metadataOutputPath(disc, outputFileInfo);
+  if (QFileInfo::exists(dbOutPath)) {
+    const QString backupPath = dbOutPath + ".cbup";
+    if (QFileInfo::exists(backupPath) && !QFile::remove(backupPath)) {
+      qWarning() << "Could not replace previous backup" << backupPath;
+      return false;
+    }
+    if (!QFile::rename(dbOutPath, backupPath)) {
+      qWarning() << "Could not move" << dbOutPath << "to" << backupPath;
+      return false;
+    }
+    qInfo() << "Previous metadata kept as" << backupPath;
+  }
   if (!disc.getMetaData().write(dbOutPath)) {
     qWarning() << failureMessage;
     return false;
@@ -456,6 +475,33 @@ int main(int argc, char* argv[]) {
   const QStringList cadenceOverrideArgs = parser.values(cadenceOverrideOpt);
 
   // -------------------------------------------------------------------------
+  // --clear-all-flags asks before anything is opened or scanned: the answer
+  // depends on nothing but the flags, and the disc load and VBI probe that
+  // used to precede it are minutes on a long disc.
+  // -------------------------------------------------------------------------
+  if (parser.isSet(clearAllFlagsOpt) && parser.isSet(clearEditsOpt)) {
+    qCritical(
+        "Error: --clear-all-flags and --clear-edits are mutually exclusive.");
+    return 1;
+  }
+
+  if (parser.isSet(clearAllFlagsOpt)) {
+    const bool modeFollows = parser.isSet(detectEditsOnlyOpt) ||
+                             parser.isSet(skipEditsOpt) ||
+                             parser.isSet(overrideOnlyOpt);
+    const bool runPipeline =
+        modeFollows ||
+        confirmPrompt(QString("Clearing all flags (edit boundaries/cadenceId) "
+                              "AND all manual edit vetoes. Continue?"),
+                      autoConfirm);
+
+    if (!runPipeline) {
+      qInfo() << "Aborted.";
+      return 0;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Construct CineDisc
   // -------------------------------------------------------------------------
   std::unique_ptr<CineDisc> disc =
@@ -555,29 +601,10 @@ int main(int argc, char* argv[]) {
   }
 
   // -------------------------------------------------------------------------
-  // --clear-all-flags / --clear-edits
+  // --clear-all-flags / --clear-edits (the question was asked above, before
+  // the disc was opened)
   // -------------------------------------------------------------------------
-  if (parser.isSet(clearAllFlagsOpt) && parser.isSet(clearEditsOpt)) {
-    qCritical(
-        "Error: --clear-all-flags and --clear-edits are mutually exclusive.");
-    return 1;
-  }
-
   if (parser.isSet(clearAllFlagsOpt)) {
-    const bool modeFollows = parser.isSet(detectEditsOnlyOpt) ||
-                             parser.isSet(skipEditsOpt) ||
-                             parser.isSet(overrideOnlyOpt);
-    const bool runPipeline =
-        modeFollows ||
-        confirmPrompt(QString("Clearing all flags (edit boundaries/cadenceId) "
-                              "AND all manual edit vetoes. Continue?"),
-                      autoConfirm);
-
-    if (!runPipeline) {
-      qInfo() << "Aborted.";
-      return 0;
-    }
-
     segmenter::clearAllFlags(*disc);
   }
 
