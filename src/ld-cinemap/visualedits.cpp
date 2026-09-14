@@ -244,6 +244,18 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
   // half the candidate's own departure is the picture coming back.
   const int TRANSIENT_HOLD_FIELDS = 12;
   const double TRANSIENT_RETURN_FRAC = 0.5;  // and never above threshold
+  // The picture is also back when it matches a recent field as closely as
+  // that field's own neighbours match it, whatever the energy says: the
+  // nine-cell difference is boosted in the dark, and a 16 IRE shot coming
+  // back one IRE dimmer after a bright transient reads 19 boosted IRE
+  // (Civil Defense 88229) while a real cut between two dark shots can
+  // read 13 (88278, itself a return). The nine cells alone cannot serve —
+  // two matched close-ups on one set read 0.95 on them, and the A/B
+  // dialogue cuts vetoed as returns — so the match is the picture
+  // Pearson, held to the continuous level the reference field shows
+  // against its own neighbour: 0.7 on a 16 IRE frame, 0.995 on a lit set.
+  const double TRANSIENT_RETURN_CORR = 0.95;      // cells
+  const double TRANSIENT_RETURN_SLACK = 0.05;     // below the field's own level
   const int CONTEXT_HALF_SPAN = 6;
   // How far a candidate must be the largest step: two film frames each
   // side. Camera shake is not uniform seam to seam (Emissary s1 3303-3500
@@ -468,17 +480,44 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     const double d0 = computeBoostedStats(prev, cur).total;
     if (d0 <= 0.0) return false;
     const double back = std::min(TRANSIENT_RETURN_FRAC * d0, threshold);
+    // The picture path only speaks of a departure: the measured flashes
+    // leave by 12-26 IRE (Necessary Evil's lightning, Civil Defense's
+    // strobes). A motion step of 9 IRE whose picture matches its neighbour
+    // is continuity, not a return.
+    const bool departed_ok = d0 >= 1.5 * threshold;
+    // ref is the field the picture may have come back to. The level is
+    // what ref matches inside its own shot at the same distance (dist
+    // fields on the far side of the transient); and a return comes back
+    // CLOSER to ref than the departed picture was — a motion seam's
+    // picture also matches its neighbour at the shot's level, but it never
+    // left, and it is not a return.
+    auto isBack = [&](int ref, int dist, const FieldDescriptor& departedPic,
+                      const FieldDescriptor& other) {
+      const FieldDescriptor& a = getDesc(ref);
+      if (computeBoostedStats(a, other).total < back) return true;
+      if (!departed_ok) return false;
+      CorrResult c = computeCorrelation(a, other);
+      if (!c.informative || c.corr < TRANSIENT_RETURN_CORR) return false;
+      pictureCorrelation(a, other, c);
+      if (!c.pictureInfo) return false;
+      const int own = (ref < idx) ? ref - dist : ref + dist;
+      if (own < 1 || own > totalFields || !safeValid(own)) return false;
+      CorrResult level, gone;
+      pictureCorrelation(a, getDesc(own), level);
+      pictureCorrelation(a, departedPic, gone);
+      if (!level.pictureInfo || !gone.pictureInfo) return false;
+      return c.pictureCorr >= level.pictureCorr - TRANSIENT_RETURN_SLACK &&
+             c.pictureCorr >= gone.pictureCorr + TRANSIENT_RETURN_SLACK;
+    };
     // Departure: does the picture ahead return to prev?
     for (int off = 1; off <= TRANSIENT_HOLD_FIELDS; ++off) {
       if (idx + off > totalFields || !safeValid(idx + off)) break;
-      if (computeBoostedStats(prev, getDesc(idx + off)).total < back)
-        return true;
+      if (isBack(idx - 1, off + 1, cur, getDesc(idx + off))) return true;
     }
     // Return: is cur a coming-back to a picture behind prev?
     for (int off = 2; off <= TRANSIENT_HOLD_FIELDS + 1; ++off) {
       if (idx - off < 1 || !safeValid(idx - off)) break;
-      if (computeBoostedStats(getDesc(idx - off), cur).total < back)
-        return true;
+      if (isBack(idx - off, off, prev, cur)) return true;
     }
     return false;
   };
