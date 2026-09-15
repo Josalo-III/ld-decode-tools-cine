@@ -6811,9 +6811,24 @@ int CineMap::healContinuity(SourceVideo& sv,
       if (s == t2) return cadenceIndex(c2);
       return -1;
     };
-    auto isTwinPair = [&](int key, int s) -> bool {
+    // The role the schedule predicts for the pair (s, s+2): A at 0/2, C
+    // at 5/7, none otherwise.
+    auto predictedRole = [&](int key, int s) -> TwinACRole {
       const int a = idxUnder(key, s), b = idxUnder(key, s + 2);
-      return (a == 0 && b == 2) || (a == 5 && b == 7);
+      if (a == 0 && b == 2) return TwinACRole::AType;
+      if (a == 5 && b == 7) return TwinACRole::CType;
+      return TwinACRole::Unknown;
+    };
+    auto isTwinPair = [&](int key, int s) -> bool {
+      return predictedRole(key, s) != TwinACRole::Unknown;
+    };
+    // The pair is a twin only as certification would have it: the strict
+    // A/C geometry agrees with the role the schedule predicts, and the
+    // grain dips.
+    auto isTwinAs = [&](int key, int s) -> bool {
+      const TwinACRole want = predictedRole(key, s);
+      if (want == TwinACRole::Unknown) return false;
+      return classifyTwinAC_strict(s, s + 2, cache).role == want;
     };
     auto grain = [&](int a, int b) -> double {
       const TwinDemod m =
@@ -6844,6 +6859,7 @@ int CineMap::healContinuity(SourceVideo& sv,
       pairs = 0;
       for (int s = mid.startField; s <= mid.endField; ++s) {
         if (!isTwinPair(key, s)) continue;
+        if (!isTwinAs(key, s)) return false;
         const double g = grain(s, s + 2);
         if (!(g >= 0.0)) return false;
         if (g * LATTICE_DIP_RATIO > level) return false;
