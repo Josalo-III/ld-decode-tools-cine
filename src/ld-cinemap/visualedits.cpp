@@ -980,6 +980,7 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     double sidePeak = 0.0;
     double sideTotal = 0.0;
     double sideChroma = 0.0;
+    double sideCorrMin = 2.0;  // lowest informative correlation among competitors
 
     const int reach = std::max(CONTEXT_HALF_SPAN, SIDE_REACH);
     const int ctxStart = std::max(2, i - reach);
@@ -1019,6 +1020,10 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
         sidePeak = std::max(sidePeak, dj.peak);
         sideTotal = std::max(sideTotal, dj.total);
         sideChroma = std::max(sideChroma, dj.totalChroma);
+        if (isSeam(dj)) {
+          const CorrResult cj = computeCorrelation(getDesc(j - 1), getDesc(j));
+          if (cj.informative) sideCorrMin = std::min(sideCorrMin, cj.corr);
+        }
       }
       if (!isSeam(dj) || std::abs(j - i) > CONTEXT_HALF_SPAN) continue;
       motionFrames++;
@@ -1052,6 +1057,23 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
                    (ds.peak >= sidePeak * effectivePeakFactor) ||
                    (ds.totalChroma >= sideChroma * 1.4);
       }
+    }
+
+    // Dominance by correlation. The test is never size: a cut is the
+    // smallest of three events inside four fields at Emissary 3764 — the
+    // frame line steps 138 IRE at corr -0.06, the explosion already going
+    // behind the captain steps 186 at 0.56 one field on, and its flash 370
+    // at 0.85 three fields on. By energy the cut can never dominate; by
+    // correlation it is the only break there is. An ANTI-correlated
+    // candidate — the nine-cell light layout inverted, which no camera
+    // move inside a shot produces (dark whiplash reads 0.16, a pyrotechnic
+    // igniting 0.24) — is dominant when it undercuts every competitor in
+    // reach by DOMINANCE_CORR_MARGIN.
+    constexpr double DOMINANCE_CORR_MARGIN = 0.3;
+    if (!dominant && corrInfo && corr < 0.0 && sideCorrMin <= 1.0 &&
+        corr <= sideCorrMin - DOMINANCE_CORR_MARGIN) {
+      dominant = true;
+      domMode = "correlation";
     }
 
     const bool ramp = isRampContext(i);
