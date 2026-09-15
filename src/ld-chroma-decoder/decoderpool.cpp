@@ -78,12 +78,13 @@ bool DecoderPool::process()
         cadenceConfig,
         [this](qint32 seqNo) {
             // Called under inputMutex (from pumpAssembler inside getInputFrames).
-            // Default 24p drops what the assembler releases. Max 24p drops
-            // nothing: a field with no film partner (a shot that opens on
-            // an orphan spare) passes through as its video frame, edit
-            // flag and all, and the restorer decides.
-            if ((!cadenceConfig.export24p || cadenceConfig.emitMax24p) &&
-                !cadenceConfig.noCinemap)
+            // 24p, default and max alike, drops what the assembler
+            // releases. Passing a released field through as its video
+            // frame (tried for max) put that frame behind the new shot's
+            // first film frame — queueAssemblerWorkAheadOfBaselines orders
+            // for the non-24p path, where output order comes from the
+            // disc frame number, and 24p emits in queue order.
+            if (!cadenceConfig.export24p && !cadenceConfig.noCinemap)
                 enqueueBaselinePassthrough(seqNo);
         }
     );
