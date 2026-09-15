@@ -957,6 +957,31 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
       if (reason.isEmpty()) reason = "hugeChroma";
     }
 
+    // Two correlations, both continuous, and an energy lane has found a
+    // lighting change, not a cut: the nine means say the light is laid out
+    // as before, the picture says the edges are where they were, and only
+    // the level moved. A lamp switching in a held shot (Emissary 18086,
+    // 18110, 18149: cells 0.95, picture 0.85-0.93), a dark seam whose
+    // cells wobble under 0.85 with no cell moving 12 IRE (17503, picture
+    // 0.89), a strobe (3163 at 0.97/0.93). The calibration puts continuous
+    // picture at p1 0.73 and cuts at p50 0.59; two matched close-ups on
+    // one set read 0.6 and keep their pictureBreak. Nineteen commits on
+    // each disc carried this signature, none of them a cut.
+    const bool bothContinuous =
+        corrInfo && corr >= 0.85 && cr.pictureInfo && cr.pictureCorr >= 0.85;
+    const bool zeroCellStructural =
+        reason == "structuralBreak_corrWeighted" && ds.strongCells == 0 &&
+        cr.pictureInfo && cr.pictureCorr >= 0.85;
+    if (evidenceScore >= EVIDENCE_COMMIT_THRESHOLD &&
+        reason != "pictureBreak" && (bothContinuous || zeroCellStructural)) {
+      if (LOG_VERBOSE_REJECT || dbg) {
+        qInfo().nospace() << "EditDetector: lighting reject at field " << i
+                          << " reason=" << reason << " corr=" << corr
+                          << " pcorr=" << cr.pictureCorr;
+      }
+      continue;
+    }
+
     const bool isChange = (evidenceScore >= EVIDENCE_COMMIT_THRESHOLD);
 
     if (!isChange) {
