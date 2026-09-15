@@ -6777,6 +6777,160 @@ int CineMap::healContinuity(SourceVideo& sv,
   }
 
   // ---------------------------
+  // Phase 1d: the edit heal — a sliver on the shot next door's lattice
+  // ---------------------------
+  //
+  // A flash edge four fields into a shot is committed as an edit and the
+  // shot's first fields become a sliver of their own (Emissary 3764: the
+  // cut at 7527, the explosion's flash at 7531, and between them the
+  // orphan B2 and a covered C). Joe: "7531 should get healed, because the
+  // twins before it match the pattern that follows, not the pattern
+  // before." The sliver cannot certify anything by itself — its twin's
+  // neighbours lie across the cut on one side and across the very flag
+  // in question on the other — so the evidence is the neighbour's lattice
+  // extended over it: under the following shot's schedule the sliver
+  // holds a twin position, and that pair's grain dips below the following
+  // segment's non-twin level by LATTICE_DIP_RATIO, as every pair on that
+  // lattice does. Then the flag is the flash, not a cut, and the sliver is
+  // the shot's head. The mirror case, a flash edge just before a shot
+  // ends, heals toward the preceding shot. Only slivers, only where the
+  // neighbour has a formation and the far neighbour's schedule disagrees:
+  // one shot in five shares its schedule with the next by chance, and a
+  // real cut between two such shots keeps its flag.
+  {
+    const auto& vp = m_md->getVideoParameters();
+    auto idxUnder = [&](int key, int s) -> int {
+      if (!cache.validSeq(s)) return -1;
+      const int frameIdx = cache.cap[s].frameIndex;
+      const int pos = normalizePhase(static_cast<long long>(key) + frameIdx, 5);
+      auto [c1, c2] = fo.cavCadenceIdsForFrameInGroup(pos);
+      const int f1 = m_disc->getFirstFieldNumber(frameIdx + 1);
+      const int f2 = m_disc->getSecondFieldNumber(frameIdx + 1);
+      auto [t1, t2] = fo.temporalOrder(f1, f2);
+      if (s == t1) return cadenceIndex(c1);
+      if (s == t2) return cadenceIndex(c2);
+      return -1;
+    };
+    auto isTwinPair = [&](int key, int s) -> bool {
+      const int a = idxUnder(key, s), b = idxUnder(key, s + 2);
+      return (a == 0 && b == 2) || (a == 5 && b == 7);
+    };
+    auto grain = [&](int a, int b) -> double {
+      const TwinDemod m =
+          demodTwinCached(sv, a, b, vp.fieldWidth, vp.fieldHeight);
+      return m.valid ? m.grainIre : -1.0;
+    };
+    auto formationKey = [&](const SegmentResult& seg) -> int {
+      if (seg.run.type != PhaseRun::Type::Pulldown32) return -1;
+      const std::vector<Lattice> f =
+          latticeFormations(seg.startField, seg.endField);
+      return (f.size() == 1) ? f.front().key : -1;
+    };
+    // The neighbour's non-twin level under its key.
+    auto levelOf = [&](const SegmentResult& seg, int key) -> double {
+      std::vector<double> v;
+      for (int s = seg.startField; s + 2 <= seg.endField; ++s) {
+        if (isTwinPair(key, s)) continue;
+        const double g = grain(s, s + 2);
+        if (g >= 0.0) v.push_back(g);
+      }
+      if (v.size() < 4) return -1.0;
+      std::sort(v.begin(), v.end());
+      return v[v.size() / 2];
+    };
+    // Every twin position the key predicts inside the sliver dips.
+    auto sliverOnLattice = [&](const SegmentResult& mid, int key,
+                               double level, int& pairs) -> bool {
+      pairs = 0;
+      for (int s = mid.startField; s <= mid.endField; ++s) {
+        if (!isTwinPair(key, s)) continue;
+        const double g = grain(s, s + 2);
+        if (!(g >= 0.0)) return false;
+        if (g * LATTICE_DIP_RATIO > level) return false;
+        ++pairs;
+      }
+      return pairs > 0;
+    };
+    auto clearEdit = [&](int seq) {
+      auto fld = m_md->getField(seq);
+      if (!fld.cinemap.isEditBoundary) return;
+      fld.cinemap.isEditBoundary = false;
+      m_md->updateField(fld, seq);
+    };
+
+    for (size_t i = 1; i + 1 < segments.size();) {
+      SegmentResult& mid = segments[i];
+      const int midFirst = firstFrameOf(mid.startField, mid.endField);
+      const int midLast = firstFrameOf(mid.endField, mid.endField);
+      if (midFirst < 0 || midLast < 0 ||
+          midLast - midFirst + 1 >= SCAN_MIN_FRAMES) {
+        ++i;
+        continue;
+      }
+      const SegmentResult& left = segments[i - 1];
+      const SegmentResult& right = segments[i + 1];
+      const int leftKey = formationKey(left);
+      const int rightKey = formationKey(right);
+
+      int mergeWith = 0;  // +1 right, -1 left
+      int pairs = 0;
+      double level = -1.0;
+      if (rightKey >= 0 && rightKey != leftKey) {
+        level = levelOf(right, rightKey);
+        if (level > 0.0 && sliverOnLattice(mid, rightKey, level, pairs))
+          mergeWith = +1;
+      }
+      if (mergeWith == 0 && leftKey >= 0 && leftKey != rightKey) {
+        level = levelOf(left, leftKey);
+        if (level > 0.0 && sliverOnLattice(mid, leftKey, level, pairs))
+          mergeWith = -1;
+      }
+      if (mergeWith == 0) {
+        ++i;
+        continue;
+      }
+
+      const int key = (mergeWith > 0) ? rightKey : leftKey;
+      const int flagSeq = (mergeWith > 0) ? right.startField : mid.startField;
+      const SegmentResult& keep = (mergeWith > 0) ? right : left;
+      const int phase = phaseAt(key, midFirst);
+      const int repainted = paintFilmSchedule(mid.startField, mid.endField,
+                                              phase, keep.run.confidence);
+      clearEdit(flagSeq);
+      changes += repainted + 1;
+      if (m_decisionTraceEnabled) {
+        qInfo().noquote()
+            << QString(
+                   "CineMap decision: HEAL_EDIT fields [%1..%2] twins=%3 "
+                   "level=%4 key=%5 joins=%6 cleared=%7 repainted=%8")
+                   .arg(mid.startField)
+                   .arg(mid.endField)
+                   .arg(pairs)
+                   .arg(level, 0, 'f', 2)
+                   .arg(key)
+                   .arg(mergeWith > 0 ? "next" : "previous")
+                   .arg(flagSeq)
+                   .arg(repainted);
+      }
+
+      if (mergeWith > 0) {
+        SegmentResult merged = right;
+        merged.startField = mid.startField;
+        merged.run.phaseOffset = phase;  // the schedule at its new head
+        merged.mixedness.clear();
+        segments[i + 1] = merged;
+        segments.erase(segments.begin() + i);
+      } else {
+        SegmentResult merged = left;
+        merged.endField = mid.endField;
+        merged.mixedness.clear();
+        segments[i - 1] = merged;
+        segments.erase(segments.begin() + i);
+      }
+    }
+  }
+
+  // ---------------------------
   // Phase 2: Intra-segment steady-cadence enforcement
   // ---------------------------
 
