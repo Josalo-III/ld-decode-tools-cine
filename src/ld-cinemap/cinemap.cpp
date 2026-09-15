@@ -4631,10 +4631,30 @@ CineMap::PhaseRun CineMap::solveSegment(
         certifiedTwins++;
     }
 
-    if (certifiedTwins > 0) {
-      // A progressive source has no repeated field at d=2.  Return a P
-      // candidate to the film election, where the twin geometry can name its
-      // phase; an already named Lips film phase simply retains its proposal.
+    // A progressive source has no repeated field at d=2 — but one certified
+    // twin in a segment is a fluke, not a cadence. The twins must recur as
+    // 3:2 recurs, two in every five frames: half of the span's prediction,
+    // the same standard the interlace veto holds. Emissary's sparks shot
+    // (3860-3912, progressive, comb 0.0) went to film on a single certified
+    // triple and a geometry lock of three scattered twins where 53 frames
+    // predict 21; the still with the screen (74197-74349) carries 65.
+    const double predictedTwins = 0.4 * static_cast<double>(mixedness.size());
+    const bool twinsRecur = certifiedTwins >= 0.5 * predictedTwins;
+    if (certifiedTwins > 0 && !twinsRecur && m_decisionTraceEnabled) {
+      qInfo().noquote()
+          << QString(
+                 "CineMap decision: PROGRESSIVE_D2_VETO fields [%1..%2] "
+                 "declined: %3 certified of %4 predicted")
+                 .arg(segStartField)
+                 .arg(segEndField)
+                 .arg(certifiedTwins)
+                 .arg(predictedTwins, 0, 'f', 0);
+    }
+
+    if (certifiedTwins > 0 && twinsRecur) {
+      // Return a P candidate to the film election, where the twin geometry
+      // can name its phase; an already named Lips film phase simply retains
+      // its proposal.
       if (run.type == PhaseRun::Type::Progressive) {
         run.type = PhaseRun::Type::Unknown;
         run.confidence = 0.0;
@@ -5903,8 +5923,12 @@ std::vector<CineMap::CertifiedTriple> CineMap::certifyTriplesForSegment(
 
     const double gt = grain(s, s + 2);
     if (!(gt >= 0.0)) continue;
-    const double gl = grain(s - 2, s);
-    const double gr = grain(s + 2, s + 4);
+    // Neighbours inside the segment only: across an edit the pair
+    // difference is the cut, not grain, and the first pair of a shot
+    // "dipped" against it (Emissary 3860, a progressive explosion, gave a
+    // certified triple at its head and went to film).
+    const double gl = (s - 2 >= segStart) ? grain(s - 2, s) : -1.0;
+    const double gr = (s + 4 <= segEnd) ? grain(s + 2, s + 4) : -1.0;
     bool pairDip = !(gl < 0.0 && gr < 0.0);
     if (gl >= 0.0 && gl < gt * dip) pairDip = false;
     if (gr >= 0.0 && gr < gt * dip) pairDip = false;
