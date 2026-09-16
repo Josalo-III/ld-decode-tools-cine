@@ -3778,13 +3778,32 @@ CineMap::PhaseRun CineMap::scanForPhaseRun(
   // from the neighbours. The same minimum as the run length.
   constexpr int PROGRESSIVE_MIN_MOVING = INTERLACE_MIN_FRAMES;
 
+  // A frame combs when it stands above the segment's own comb bed, not
+  // only above a fixed floor — relative to the surrounds, as the dips are.
+  // A near-still pulldown shot under a progressive phaser animation (Civil
+  // Defense 45916-45978) reads a bed of ~1 with peaks of 2-4 every five
+  // frames; the fixed floor sat under the bed, every frame counted as
+  // combing, the 2-in-5 drowned and all five phases went negative.
+  double combFloor = COMB_FRAME_FLOOR;
+  {
+    // The bed is the moving frames'; a still frame has no comb to speak of.
+    std::vector<double> wv;
+    wv.reserve(mixed.size());
+    for (const auto& m : mixed)
+      if (!m.still) wv.push_back(m.wideScore);
+    if (!wv.empty()) {
+      std::nth_element(wv.begin(), wv.begin() + wv.size() / 2, wv.end());
+      combFloor = std::max(COMB_FRAME_FLOOR, 2.0 * wv[wv.size() / 2]);
+    }
+  }
+
   int combFrames = 0;
   int overTwoWindows = 0;
   int movingFrames = 0;
   {
     std::vector<uint8_t> combs(static_cast<size_t>(numFrames), 0);
     for (int i = 0; i < numFrames; ++i) {
-      combs[i] = (mixed[i].wideScore > COMB_FRAME_FLOOR) ? 1 : 0;
+      combs[i] = (mixed[i].wideScore > combFloor) ? 1 : 0;
       combFrames += combs[i];
       if (!mixed[i].still) movingFrames++;
     }
