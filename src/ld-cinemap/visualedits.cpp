@@ -972,6 +972,33 @@ int analyseVisualEdits(CineDisc& disc, double threshold, double strongFactor,
     const bool zeroCellStructural =
         reason == "structuralBreak_corrWeighted" && ds.strongCells == 0 &&
         cr.pictureInfo && cr.pictureCorr >= 0.85;
+    // A consistent majority undermines the case for a cut. Unlike the comb,
+    // which counts only differences, the detector also counts what stayed:
+    // a cut moves nearly every lit ninth of the frame (7527, 88231, 89003,
+    // 89175: one of nine within 2 IRE), while an actor moving in a held
+    // shot (11084: five of nine quiet), a lamp lifting one column (36117:
+    // five), or something flickering in a dim room (Civil Defense 47776:
+    // seven cells exactly unchanged, and a correlation of -0.36 from the
+    // two that moved) leaves most of the lit frame where it was. Black
+    // cells (under 5 IRE on both sides) testify to nothing and are not
+    // counted. Joe: "most of the frame should correlate."
+    int litCells = 0, quietCells = 0;
+    for (int k = 0; k < 9; ++k) {
+      if (std::max(d_prev.cells[k], d_curr.cells[k]) < 5.0) continue;
+      ++litCells;
+      if (std::abs(d_prev.cells[k] - d_curr.cells[k]) < 2.0) ++quietCells;
+    }
+    const bool quietMajority = litCells >= 4 && 2 * quietCells >= litCells;
+    if (evidenceScore >= EVIDENCE_COMMIT_THRESHOLD && reason != "pictureBreak" &&
+        quietMajority) {
+      if (LOG_VERBOSE_REJECT || dbg) {
+        qInfo().nospace() << "EditDetector: quiet-majority reject at field " << i
+                          << " reason=" << reason << " quiet=" << quietCells
+                          << "/" << litCells;
+      }
+      continue;
+    }
+
     if (evidenceScore >= EVIDENCE_COMMIT_THRESHOLD &&
         reason != "pictureBreak" && (bothContinuous || zeroCellStructural)) {
       if (LOG_VERBOSE_REJECT || dbg) {
