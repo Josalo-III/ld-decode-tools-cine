@@ -1425,7 +1425,6 @@ void Comb::FrameBuffer::computeFieldALine(const CombTapLine &tapLine,
             if (denom > 1e-9) {
                 sc2 = 2.0 / denom;
                 if (sc2 < 1.0) sc2 = 1.0;
-                sc2 = 1.0;
             } else {
                 wUp2 = 0.0;
                 wDn2 = 0.0;
@@ -2911,14 +2910,47 @@ bool Comb::FrameBuffer::computeFrameCLine(int line, std::vector<double> &out)
 
     constexpr double kFrameCPull = 0.67;
     constexpr double kFrameCPullOneSided = 0.5;
-    const double p = (sU && sD) ? kFrameCPull : kFrameCPullOneSided;
+    constexpr int kFrameCGuardRadius = 4;
+    static const double kFrameCLegDisagreementIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEC_GUARD_IRE");
+        return e ? std::atof(e) : 8.0;
+    }();
+    static const double kFrameCLegDisagreementTauIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEC_GUARD_TAU_IRE");
+        return e ? std::atof(e) : 4.0;
+    }();
 
     if ((int)out.size() < width) out.resize(width);
     for (int rel = 0; rel < width; ++rel) {
         const double c = sC[rel];
-        const double target = (sU && sD)
-            ? 0.5 * (sgnU * sU[rel] + sgnD * sD[rel])
-            : (sU ? sgnU * sU[rel] : sgnD * sD[rel]);
+        double p = (sU && sD) ? kFrameCPull : kFrameCPullOneSided;
+        double target = sU ? sgnU * sU[rel] : sgnD * sD[rel];
+        if (sU && sD) {
+            target = 0.5 * (sgnU * sU[rel] + sgnD * sD[rel]);
+
+            // The certified legs are clean observations, so their aligned
+            // disagreement is direct evidence that this vertical reach crosses
+            // a chroma transition. Make the decision uniform over a short
+            // horizontal band; otherwise the carrier lattice can turn the
+            // guard into alternating one-pixel beads.
+            double disagreementIRE = 0.0;
+            const int lo = std::max(0, rel - kFrameCGuardRadius);
+            const int hi = std::min(width - 1, rel + kFrameCGuardRadius);
+            for (int x = lo; x <= hi; ++x) {
+                disagreementIRE = std::max(
+                    disagreementIRE,
+                    std::fabs(sgnU * sU[x] - sgnD * sD[x]) * invIreScale);
+            }
+            // Alignment is used only for this measurement. The comb target
+            // below remains the existing signed neighbour average; only its
+            // pull is reduced by the transition guard.
+            const double guard = std::clamp(
+                (kFrameCLegDisagreementIRE +
+                 kFrameCLegDisagreementTauIRE - disagreementIRE) /
+                    kFrameCLegDisagreementTauIRE,
+                0.0, 1.0);
+            p *= guard;
+        }
         out[rel] = c + p * (target - c);
     }
     return true;

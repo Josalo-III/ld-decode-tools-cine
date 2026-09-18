@@ -991,80 +991,6 @@ void Comb::FrameBuffer::buildCornerLeak()
 
 }
 
-static void ldcdApplyPhaseSnap(const std::vector<double> &est,
-                               const std::vector<double> &ref,
-                               std::vector<double> &out,
-                               int width, double irescale,
-                               double ampMinIRE, double ampTauIRE,
-                               bool clampRatio,
-                               const double *gate = nullptr);
-
-static void ldcdSideCoherenceAlpha(const std::vector<double> &a,
-                                   const std::vector<double> &b,
-                                   int width, std::vector<double> &alpha)
-{
-    constexpr int kSnapHalf = 4;
-    static const int cB[4] = { 1, 0, -1, 0 };
-    static const int sB[4] = { 0, 1, 0, -1 };
-    std::fill(alpha.begin(), alpha.end(), 0.0);
-    for (int xi = kSnapHalf; xi < width - kSnapHalf; ++xi) {
-        double aI = 0, aQ = 0, bI = 0, bQ = 0;
-        bool ok = true;
-        for (int k = xi - kSnapHalf; k <= xi + kSnapHalf && ok; ++k) {
-            if (!std::isfinite(a[k]) || !std::isfinite(b[k])) {
-                ok = false; break;
-            }
-            const double w =
-                (k == xi - kSnapHalf || k == xi + kSnapHalf) ? 0.5 : 1.0;
-            const int ph = k & 3;
-            aI += w * a[k] * cB[ph]; aQ += w * a[k] * sB[ph];
-            bI += w * b[k] * cB[ph]; bQ += w * b[k] * sB[ph];
-        }
-        if (!ok) continue;
-        const double ma = std::hypot(aI, aQ);
-        const double mb = std::hypot(bI, bQ);
-        const double mr = std::hypot(aI + bI, aQ + bQ);
-        const double coh = mr / (ma + mb + 1e-12);
-        alpha[xi] = std::clamp((coh - 0.55) / 0.30, 0.0, 1.0);
-    }
-}
-
-static void ldcdBuildCertBracketAligned(
-    const lddecode::CarrierGrammarState *gC,
-    const lddecode::CarrierGrammarState *gU,
-    const lddecode::CarrierGrammarState *gD,
-    const float *exU, const float *exD,
-    int left, int width, std::vector<double> &bAlign,
-    std::vector<double> *legUOut = nullptr,
-    std::vector<double> *legDOut = nullptr)
-{
-    std::fill(bAlign.begin(), bAlign.end(),
-              std::numeric_limits<double>::quiet_NaN());
-    if (legUOut) std::fill(legUOut->begin(), legUOut->end(),
-                           std::numeric_limits<double>::quiet_NaN());
-    if (legDOut) std::fill(legDOut->begin(), legDOut->end(),
-                           std::numeric_limits<double>::quiet_NaN());
-    if (!gC || !gU || !gD || !exU || !exD) return;
-    for (int xi = 0; xi < width; ++xi) {
-        const int h = left + xi;
-        const float eu = exU[h];
-        const float ed = exD[h];
-        if (!std::isfinite(eu) || !std::isfinite(ed)) continue;
-        const auto rU = lddecode::carrierGrammarSignedPhaseRelation(gC, h, gU, h);
-        const auto rD = lddecode::carrierGrammarSignedPhaseRelation(gC, h, gD, h);
-        double sU, sD;
-        if (rU == lddecode::CarrierPhaseRelation::Opposite) sU = -1.0;
-        else if (rU == lddecode::CarrierPhaseRelation::Same) sU = 1.0;
-        else continue;
-        if (rD == lddecode::CarrierPhaseRelation::Opposite) sD = -1.0;
-        else if (rD == lddecode::CarrierPhaseRelation::Same) sD = 1.0;
-        else continue;
-        bAlign[xi] = 0.5 * (sU * (double)eu + sD * (double)ed);
-        if (legUOut) (*legUOut)[xi] = sU * (double)eu;
-        if (legDOut) (*legDOut)[xi] = sD * (double)ed;
-    }
-}
-
 void Comb::FrameBuffer::buildPhaseCorrected1D()
 {
     const int first = videoParameters.firstActiveFrameLine;
@@ -1114,7 +1040,6 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
     std::vector<double> preI(width + 1), preQ(width + 1);
     std::vector<double> env(width), preEnv(width + 1);
     std::vector<double> nativeI4(width), nativeQ4(width);
-    std::vector<double> snapEst(width), snapOut(width), snapRef(width);
 
     for (int line = first; line < last; ++line) {
         const quint16 *rawLine =
@@ -1397,38 +1322,9 @@ void Comb::FrameBuffer::buildPhaseCorrected1D()
         }
         }   // end of the comp-line estimate; def lines skipped all of it
 
-        static const bool certHeadPhaseOn = []{
-            const char *e = std::getenv("LDCD_CERT_PHASE");
-            return !(e && std::atoi(e) == 0);
-        }();
-        if (certHeadPhaseOn && certifiedOneDLevel() >= 1 &&
-            frameHasExactCoverage() && !certifiedDefLine(line) &&
-            line - 1 >= first && line + 1 < last) {
-            std::vector<double> legU(width), legD(width), hueAlpha(width);
-            ldcdBuildCertBracketAligned(
-                carrierGrammarLine(line),
-                carrierGrammarLine(line - 1),
-                carrierGrammarLine(line + 1),
-                exactCarrierRow(line - 1), exactCarrierRow(line + 1),
-                left, width, snapRef, &legU, &legD);
-            std::copy(restrainedLine, restrainedLine + width, snapEst.begin());
-            std::fill(snapOut.begin(), snapOut.end(),
-                      std::numeric_limits<double>::quiet_NaN());
-            ldcdApplyPhaseSnap(snapEst, snapRef, snapOut, width, irescale,
-                               1.0, 3.0, false);
-            ldcdSideCoherenceAlpha(legU, legD, width, hueAlpha);
-            constexpr int kAr = 4;
-            for (int xi = 0; xi < width; ++xi) {
-                double acc = 0.0; int n = 0;
-                for (int j = std::max(0, xi - kAr);
-                     j <= std::min(width - 1, xi + kAr); ++j) {
-                    acc += hueAlpha[j]; ++n;
-                }
-                const double al = acc / std::max(1, n);
-                restrainedLine[xi] = al * snapOut[xi] +
-                                     (1.0 - al) * snapEst[xi];
-            }
-        }
+        // Comp lines retain the line-local observation. Certified vertical
+        // construction belongs exclusively to Frame C in split2D; applying it
+        // here would also alter 1D and stack a second reach under Frame C.
 
         for (int rel = 0; rel < width; ++rel) {
             const int h = left + rel;
@@ -5928,50 +5824,6 @@ static bool ldcdFactFitOn()
     return on;
 }
 
-static void ldcdApplyPhaseSnap(const std::vector<double> &est,
-                               const std::vector<double> &ref,
-                               std::vector<double> &out,
-                               int width, double irescale,
-                               double ampMinIRE, double ampTauIRE,
-                               bool clampRatio,
-                               const double *gate)
-{
-    constexpr int kSnapHalf = 4;
-    for (int xi = kSnapHalf; xi < width - kSnapHalf; ++xi) {
-        double eI = 0.0, eQ = 0.0, rI = 0.0, rQ = 0.0;
-        bool ok = true;
-        for (int k = xi - kSnapHalf; k <= xi + kSnapHalf && ok; ++k) {
-            const double b = ref[k];
-            if (!std::isfinite(b)) { ok = false; break; }
-            if (!std::isfinite(est[k])) { ok = false; break; }
-            static const int cB[4] = { 1, 0, -1, 0 };
-            static const int sB[4] = { 0, 1, 0, -1 };
-            const double w =
-                (k == xi - kSnapHalf || k == xi + kSnapHalf) ? 0.5 : 1.0;
-            const int ph = k & 3;
-            eI += w * est[k] * cB[ph]; eQ += w * est[k] * sB[ph];
-            rI += w * b * cB[ph];      rQ += w * b * sB[ph];
-        }
-        if (!ok) continue;
-        const double aRefRaw = std::hypot(rI, rQ);
-        const double aRef = aRefRaw * 0.25;
-        if (aRef < ampMinIRE * irescale) continue;
-        const double aEstRaw = std::hypot(eI, eQ);
-        double ratio = aEstRaw / aRefRaw;
-        if (clampRatio) ratio = std::clamp(ratio, 0.5, 2.0);
-        const double snapped = ratio * ref[xi];
-        // Ramp from the floor, continuous at it -- a step in a blend
-        // weight is a contour.
-        double sf = 1.0 - std::exp(
-            -(aRef - ampMinIRE * irescale) /
-             (ampTauIRE * irescale));
-        if (gate) sf *= std::clamp(gate[xi], 0.0, 1.0);
-        out[xi] = sf * snapped + (1.0 - sf) * est[xi];
-    }
-    for (int xi = 0; xi < width; ++xi)
-        if (!std::isfinite(out[xi]))
-            out[xi] = est[xi];
-}
 
 namespace {
 double ldcdP6WindowLag(const double *est, const double *ref,

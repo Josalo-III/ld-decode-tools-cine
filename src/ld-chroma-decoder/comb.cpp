@@ -2684,18 +2684,14 @@ void Comb::FrameBuffer::split2D()
 
     if (width <= 0 || firstLine >= lastLine) return;
 
+    // Explicit line-only diagnostic: copy the 1D source through the 2D
+    // output path without constructing Frame C or any other vertical comb.
     if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::Line) {
-        static const bool useLockedRawBandpassLine = [] {
-            const char *s = std::getenv("LD_LINE_USE_LOCKED_RAW_BANDPASS");
-            return s && std::atoi(s) != 0;
-        }();
         for (int line = firstLine; line < lastLine; ++line) {
             double *dst = clpbuffer[1].pixel[line];
             const double *lockedRow = nullptr;
             if (configuration.phaseCompensation) {
-                lockedRow = useLockedRawBandpassLine
-                    ? locked1DRawBandpass_line(line)
-                    : combSource1D_line(line);
+                lockedRow = locked1DSource_line(line);
             }
             if (lockedRow) {
                 for (int rel = 0; rel < width; ++rel) dst[left + rel] = lockedRow[rel];
@@ -2709,10 +2705,43 @@ void Comb::FrameBuffer::split2D()
         return;
     }
 
-    // LDCD_OLD_SPLIT2D=1 selects an unprotected blind-bandpass adaptive 2D kernel for
-    // diagnostic A/B renders. It bypasses locked-path region and boundary protections
-    // so the protected path can be compared against the raw 2D behavior.
-    if (ldcdOldSplit2D()) {
+    // Covered and uncovered frames have mutually exclusive constructors.
+    // Certified def lines pass through; only Frame C may reach vertically on
+    // comp lines. Disabling Frame C leaves their 1D source intact, never an
+    // ordinary candidate or election. Named combs cannot override coverage.
+    if (configuration.phaseCompensation && certifiedOneDLevel() >= 2 &&
+        frameHasExactCoverage()) {
+        for (int line = firstLine; line < lastLine; ++line) {
+            if (line >= demodLines) continue;
+            double *dstCov = clpbuffer[1].pixel[line];
+            const double *srcCov = nullptr;
+            float wCov = 0.0f;
+            if (certifiedDefLine(line)) {
+                // Def lines are conservation fact: move the certified carrier
+                // into place and comb with nothing. No luma to cancel.
+                srcCov = locked1DSource_line(line);
+            } else if (computeFrameCLine(line, scratch_frameC)) {
+                srcCov = scratch_frameC.data();
+                wCov = 0.9f;
+            }
+            // 1D is the fallback for the whole section -- a comp line Frame C
+            // declines takes the ordinary 1D, never an election.
+            if (!srcCov) srcCov = combSource1D_line(line);
+            if (srcCov)
+                for (int rel = 0; rel < width; ++rel)
+                    dstCov[left + rel] = srcCov[rel];
+            if (writeWeights && line < (int)w2d_frame_weight.size())
+                std::fill(w2d_frame_weight[line].begin(),
+                          w2d_frame_weight[line].end(), wCov);
+        }
+        return;
+    }
+
+    // Bucket decoding uses the standalone adaptive bandpass comb: matching
+    // same-phase luma leakage cancels, while opposite-phase chroma survives.
+    // The newer candidates and their election belong to the locked path.
+    // LDCD_OLD_SPLIT2D=1 also selects this kernel for locked diagnostic renders.
+    if (!configuration.phaseCompensation || ldcdOldSplit2D()) {
         // Mirror at the vertical active bounds. A missing outward ±2 partner resolves to
         // the inward same-field partner; only a frame too short to contain either partner
         // falls back to center. This preserves the required ±2 carrier relation without
@@ -2811,46 +2840,8 @@ void Comb::FrameBuffer::split2D()
 
     std::vector<std::complex<double>> frameIQ;
     std::vector<std::complex<double>> frameAIQ;
-    // A covered frame does not enter the uncovered-frame candidate election.
-    // Certified def lines pass through the certified center; covered comp lines are
-    // handled only by Frame C. Candidate construction, scoreFieldVsFrame, and comb
-    // attribution are therefore skipped for covered lines.
-    //
-    // Per-frame attribution storage is initialized to default records, so skipped
-    // covered lines read as defaults rather than inherited neighbour state. Named
-    // candidate diagnostics obey the same routing: candidate selectors apply only
-    // where candidate construction is lawful.
-    const bool coveredNoElection =
-        configuration.phaseCompensation &&
-        certifiedOneDLevel() >= 2 &&
-        frameHasExactCoverage();
-
     for (int line = firstLine; line < lastLine; ++line) {
         if (line >= demodLines) continue;
-
-        if (coveredNoElection) {
-            double *dstCov = clpbuffer[1].pixel[line];
-            const double *srcCov = nullptr;
-            float wCov = 0.0f;
-            if (certifiedDefLine(line)) {
-                // Def lines are conservation fact: move the certified carrier
-                // into place and comb with nothing. No luma to cancel.
-                srcCov = locked1DSource_line(line);
-            } else if (computeFrameCLine(line, scratch_frameC)) {
-                srcCov = scratch_frameC.data();
-                wCov = 0.9f;
-            }
-            // 1D is the fallback for the whole section -- a comp line Frame C
-            // declines takes the ordinary 1D, never an election.
-            if (!srcCov) srcCov = combSource1D_line(line);
-            if (srcCov)
-                for (int rel = 0; rel < width; ++rel)
-                    dstCov[left + rel] = srcCov[rel];
-            if (writeWeights && line < (int)w2d_frame_weight.size())
-                std::fill(w2d_frame_weight[line].begin(),
-                          w2d_frame_weight[line].end(), wCov);
-            continue;
-        }
 
         ensureCombTapLine(line);
         const CombTapLine &tapLine = tapLineCache[precleanRingSlot(line)];
@@ -3016,16 +3007,6 @@ void Comb::FrameBuffer::split2D()
                             w2d_frame_weight[line][rel] = 0.35f;
                         }
                     }
-                } else if (computeFrameCLine(line, scratch_frameC)) {
-                    // FRAME C owns covered comp lines. Certified def lines pass through the center;
-                    // comp lines are bootstrapped toward certified def neighbours by the plain Frame C
-                    // comb. computeFrameCLine declines all other lines, which remain on the ordinary
-                    // path.
-                    for (int rel = 0; rel < width; ++rel)
-                        emitSelected(rel, scratch_frameC[rel]);
-                    if (writeWeights && line < (int)w2d_frame_weight.size())
-                        std::fill(w2d_frame_weight[line].begin(),
-                                  w2d_frame_weight[line].end(), 0.9f);
                 } else {
                     // MEASURED, on the produceY-level oracle: a
                     // mean-of-contestants comparison can look close while
