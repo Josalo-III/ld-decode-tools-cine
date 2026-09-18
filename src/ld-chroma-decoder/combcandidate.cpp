@@ -1993,6 +1993,15 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     const bool verticalAllowed = carrierFrameVerticalAllowed(line);
     const bool haveUpLine = verticalAllowed && (line - 1 >= first);
     const bool haveDnLine = verticalAllowed && (line + 1 < last);
+    static const double frameAGuardIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_GUARD_IRE");
+        return e ? std::atof(e) : 8.0;
+    }();
+    static const double frameAGuardTauIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_GUARD_TAU_IRE");
+        return e ? std::atof(e) : 4.0;
+    }();
+    constexpr int frameAGuardRadius = 4;
 
     for (int x = 0; x < width; ++x) {
         const std::complex<double> center = centerIQ[x];
@@ -2018,7 +2027,24 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
 
         const std::complex<double> complement =
             (upIQ[x] * upReach + dnIQ[x] * dnReach) / legWeight;
-        outFrameIQ[x] = 0.5 * (center + complement);
+        double guard = 1.0;
+        if (upReach > 0.0 && dnReach > 0.0 &&
+            std::isfinite(frameAGuardIRE) && frameAGuardTauIRE > 0.0) {
+            double disagreementIRE = 0.0;
+            const int lo = std::max(0, x - frameAGuardRadius);
+            const int hi = std::min(width - 1, x + frameAGuardRadius);
+            for (int k = lo; k <= hi; ++k)
+                disagreementIRE = std::max(disagreementIRE,
+                    std::abs(upIQ[k] - dnIQ[k]) * invIreScale);
+            guard = std::clamp(
+                (frameAGuardIRE + frameAGuardTauIRE - disagreementIRE) /
+                    frameAGuardTauIRE,
+                0.0, 1.0);
+        }
+        // The IQ alignment is used only for the leg-disagreement measurement;
+        // Frame A's midpoint target remains unchanged. Guarding reduces the
+        // complementary contribution toward the center without retuning it.
+        outFrameIQ[x] = center + 0.5 * guard * (complement - center);
     }
 }
 // Frame A: reach-gated midpoint comb fed by the Field B preclean ring.
