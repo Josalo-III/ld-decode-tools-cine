@@ -1969,7 +1969,7 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     std::vector<std::complex<double>> &upIQ,
     std::vector<std::complex<double>> &dnIQ,
     std::vector<std::complex<double>> &outFrameIQ,
-    const CombTapLine *reachTapLine)
+    const CombTapLine *reachTapLine, bool applyGuard)
 {
     const int first = videoParameters.firstActiveFrameLine;
     const int last  = videoParameters.lastActiveFrameLine;
@@ -2028,7 +2028,9 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         const std::complex<double> complement =
             (upIQ[x] * upReach + dnIQ[x] * dnReach) / legWeight;
         double guard = 1.0;
-        if (upReach > 0.0 && dnReach > 0.0 &&
+        // A-zero asks for no guard: it is a referent, and the guard would pull
+        // it toward its own centre on exactly the contrasts being judged.
+        if (applyGuard && upReach > 0.0 && dnReach > 0.0 &&
             std::isfinite(frameAGuardIRE) && frameAGuardTauIRE > 0.0) {
             double disagreementIRE = 0.0;
             const int lo = std::max(0, x - frameAGuardRadius);
@@ -2174,6 +2176,71 @@ void Comb::FrameBuffer::computeFrameALine(
 
     computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
                                       outFrameIQ, &reachTapLine);
+}
+
+// The identifier costs a referent per line, and nothing consumes it yet, so
+// it answers to one switch that also governs whether A-zero is built at all.
+static bool frameBCheckerEnabled()
+{
+    static const bool on = []{
+        const char *e = std::getenv("LDCD_FB_CHECKER");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+// A-zero, built the way Frame A is built and from the same helper, but on the
+// non-precleaned rows and with the guard off. Preclean's reach runs through
+// Field B, which has the checkerboard fault of its own, so precleaned Frame A
+// cannot referee that fault. A-zero reaches only +-1 and is a convex mix of
+// its three rows, so it cannot construct alternation -- whatever alternation
+// it carries is in the picture. It keeps much of the alien luma Frame B
+// cancels and smooths some of it, which is why it is the reference and not
+// the preferred output.
+void Comb::FrameBuffer::buildFrameAZeroLine(int line)
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int width = videoParameters.activeVideoEnd - left;
+    if (width <= 0) return;
+    if (!frameBCheckerEnabled()) return;
+    if ((int)scratch_frameA0Composite.size() != width)
+        scratch_frameA0Composite.assign(width, 0.0);
+    std::fill(scratch_frameA0Composite.begin(),
+              scratch_frameA0Composite.end(),
+              std::numeric_limits<double>::quiet_NaN());
+    if (line - 1 < first || line + 1 >= last) return;
+
+    for (int k = 0; k < 3; ++k) {
+        const double *source = locked1DSource_line(line + k - 1);
+        if (!source) return;
+        if ((int)scratch_a0Raw[k].size() != width) scratch_a0Raw[k].resize(width);
+        auto cur = carrierGrammarSignedSampleCursor(
+            configuration.phaseCompensation ? carrierGrammarLine(line + k - 1)
+                                            : nullptr, left);
+        for (int x = 0; x < width; ++x)
+            scratch_a0Raw[k][x] =
+                carrierGrammarDemodSignedCompositeTo4fsc(cur, source[x]);
+        centerCarrierProductRowInPlace(scratch_a0Raw[k].data(), width);
+    }
+
+    const CombTapLine &tap = ensureCombTapLine(line);
+    computeIQFrameAFromPreparedVectors(line, scratch_a0Raw[1], scratch_a0Raw[0],
+                                       scratch_a0Raw[2], scratch_a0Out, &tap,
+                                       false);
+    if ((int)scratch_a0Out.size() < width) return;
+
+    // Remodulated back through the signed phase, the same round trip Frame A
+    // and Frame B both take, so all three land in one plane.
+    auto remod = carrierGrammarSignedSampleCursor(
+        configuration.phaseCompensation ? carrierGrammarLine(line) : nullptr,
+        left);
+    for (int x = 0; x < width; ++x)
+        scratch_frameA0Composite[x] =
+            carrierGrammarRemodSigned4fscToComposite(
+                remod, scratch_a0Out[x].real(), scratch_a0Out[x].imag()) *
+            invIreScale;
 }
 
 // Frame B performs sharp signed cancellation of image-locked colour from the
@@ -2353,6 +2420,12 @@ void Comb::FrameBuffer::computeFrameBLine(
 	// searching for a shift of its own.
 	measureDiagonalAdvanceLine(line);
 
+	// Cleared every line: the seed is written only where the pair exists, so
+	// a stale row would otherwise be read as this line's fact.
+	if ((int)scratch_fbBandSeed.size() != width)
+		scratch_fbBandSeed.assign(width, 0);
+	else
+		std::fill(scratch_fbBandSeed.begin(), scratch_fbBandSeed.end(), 0);
 	if ((int)scratch_frameBReachUnsafe.size() != width)
 		scratch_frameBReachUnsafe.assign(width, 0);
 	else
@@ -2785,7 +2858,9 @@ void Comb::FrameBuffer::computeFrameBLine(
                 frameBBandAt(&reachTapLine, x) ||
                 frameBBandAt(reachTapUp, x) ||
                 frameBBandAt(reachTapDn, x);
-			scratch_frameBReachUnsafe[x] = refusePair ? 1 : 0;
+			// The content seed is held apart and adjudicated after the line
+			// is built; the physical fact below still writes the flag directly.
+			scratch_fbBandSeed[x] = refusePair ? 1 : 0;
 			if (frameBBandCede && refusePair) {
                 upAdmit = false;
                 dnAdmit = false;
@@ -2873,6 +2948,108 @@ void Comb::FrameBuffer::computeFrameBLine(
             lddecode::carrierGrammarAdvanceRemodCursor(gridRemodCursor);
         }
 
+    }
+
+    // =====================================================================
+    // THE CHECKERBOARD VERDICT.
+    //
+    // Frame B is left to be Frame B: nothing above cedes to 1D, and the
+    // content band seed no longer disqualifies the comb on its own. What
+    // disqualifies it is evidence that it has actually degraded into the
+    // checkerboard class, which is identified here and published for the
+    // election to adjudicate.
+    //
+    // A-ZERO is the reference, not production Frame A: production Frame A is
+    // precleaned, preclean reaches through Field B, and Field B has this same
+    // fault, so it cannot referee it. Measured against the certified carrier,
+    // precleaned Frame A's own alternation peaks at 0.83% of samples over 2
+    // IRE at 15-30 degrees -- worse there than Frame B -- which is that
+    // contamination showing. A-zero cannot construct alternation at all.
+    //
+    // Alternation in the difference is Frame B's artifact -- and the
+    // difference is what must be taken, because both planes are composite
+    // and a composite carrier at 4fSC is itself a four-sample alternation.
+    // Measuring each plane's alternation separately reads its carrier
+    // (correlation with the certified artifact +0.12); measuring the
+    // difference reads the artifact (+0.75 at contrasts along the line).
+    //
+    // Orientation says WHOSE the alternation is -- Frame B's where the
+    // contrast runs along the line, Frame A's where the line crosses it (0.75
+    // against 0.37 correlation with each comb's own certified error at 0-15
+    // degrees). It is deliberately NOT a condition here: as a gate it isolated
+    // the class but missed too much of it to disqualify on.
+    //
+    // Operating point measured 2026-10-27/28 over 169,789,175 samples against
+    // the certified carrier. At 1.0 IRE this flags 0.561% of samples and holds
+    // 97.48% of the severe class -- identical to the 2.744% content seed to
+    // two decimals -- and 86.58% of the visible class against the seed's
+    // 88.61%. An orientation gate was tried and dropped: at a fixed amplitude
+    // it cost recall (86.8% to 74.3%) for class purity the identifier does not
+    // need.
+    //
+    // WHY THIS ONLY IDENTIFIES. Narrowing the DQ to this population was built
+    // and measured: 0.3820% of elected samples above 2 IRE at 0.5 and 0.3754%
+    // at 1.0, against 0.3274% for the seed alone, with the severe count rising
+    // from 80,547 to about 100,000. The election switches award roughly every
+    // three samples, so a narrower DQ adds more alternation by switching than
+    // it removes. The identifier is sound; the actuator was not.
+    // =====================================================================
+    static const double checkerAltIRE = []{
+        const char *e = std::getenv("LDCD_FB_CHECKER_IRE");
+        return e ? std::atof(e) : 1.0;
+    }();
+
+    // ReachUnsafe keeps exactly the meaning it had: the content seed, plus the
+    // physical fact already written during construction. The identifier below
+    // does not touch it.
+    for (int x = 0; x < width; ++x)
+        if (scratch_fbBandSeed[x]) scratch_frameBReachUnsafe[x] = 1;
+
+    if (!frameBCheckerEnabled()) return;
+    if ((int)scratch_frameBCheckerboard.size() != width)
+        scratch_frameBCheckerboard.assign(width, 0);
+    else
+        std::fill(scratch_frameBCheckerboard.begin(),
+                  scratch_frameBCheckerboard.end(), 0);
+
+    // A-zero needs only the 1D source rows, so it is available wherever the
+    // pair itself is -- including rosters that never construct Frame A. Where
+    // the line sits at the active boundary it is not, and the content seed
+    // then stands as it did before: an availability condition, not a hedge.
+    const bool haveFrameA =
+        (int)scratch_frameA0Composite.size() == width &&
+        std::isfinite(scratch_frameA0Composite[0]);
+
+    if (!haveFrameA) {
+        // No referent on this line, so no verdict. ReachUnsafe above is
+        // unaffected either way.
+    } else {
+        if ((int)scratch_fbCheckerAlt.size() != width) {
+            scratch_fbCheckerAlt.assign(width, 0.0);
+            scratch_fbSmoothed.assign(width, 0.0);
+        }
+        // Parity-modulated A/B difference, then the 5-tap binomial: what
+        // survives is the part alternating sample to sample, and a step
+        // cannot masquerade as alternation.
+        for (int x = 0; x < width; ++x) {
+            const double d = outFrameScalar[x] * invIreScale -
+                             scratch_frameA0Composite[x];
+            scratch_fbCheckerAlt[x] = ((x & 1) == 0) ? d : -d;
+        }
+        for (int x = 0; x < width; ++x) {
+            double acc = 0.0;
+            static const double k5[5] = {1.0/16, 4.0/16, 6.0/16, 4.0/16, 1.0/16};
+            for (int t = -2; t <= 2; ++t) {
+                const int xx = std::clamp(x + t, 0, width - 1);
+                acc += k5[t + 2] * scratch_fbCheckerAlt[xx];
+            }
+            scratch_fbSmoothed[x] = std::abs(acc);
+        }
+        for (int x = 0; x < width; ++x) {
+            if (!scratch_fbBandSeed[x]) continue;
+            if (scratch_fbSmoothed[x] >= checkerAltIRE)
+                scratch_frameBCheckerboard[x] = 1;
+        }
     }
 
 }

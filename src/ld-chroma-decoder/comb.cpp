@@ -1821,17 +1821,13 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     if (scoreA < scoreB) pickCandidate(0, FA, 0.25f);
                     else                 pickCandidate(1, FB, 0.35f);
                 }
-            } else if (chromaMagIRE > CHROMA_STRONG_IRE && vIRE > VERT_THRESH_IRE) {
-                // Strong chroma with vertical contrast indicates per-line alternation
-                // that Frame is well-suited to suppress.  It may enter without
-                // the normal decisive margin, but the interfield candidates
-                // remain live choices when their merit scores are better.
-                if (frameHasBestScore)
-                    pickCandidate(2, FR, 0.8f);
-                else {
-                    if (scoreA <= scoreB) pickCandidate(0, FA, 0.25f);
-                    else                  pickCandidate(1, FB, 0.35f);
-                }
+            // The strong-chroma/vertical-contrast admission is gone. It let
+            // Frame B in without the normal margin on exactly the contrasts
+            // that run along the line -- the ones where Frame B either cancels
+            // the alternation cleanly or checkerboards. Removing it measured
+            // inert on that class, and the ordinary merit comparison below is
+            // left to handle the case; which samples checkerboard is published
+            // as evidence by scratch_frameBCheckerboard, not acted on here.
             } else {
                 if (scoreR + 1e-12 < scoreA * 0.85 &&
                          scoreR + 1e-12 < scoreB * 0.85)
@@ -1857,8 +1853,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     const bool hystOk =
 						!frameReachUnsafe &&
                         (chromaMagIRE <= SAT_FALLBACK_START) &&
-                        !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) &&
-                        !((chromaMagIRE > CHROMA_STRONG_IRE) && (vIRE > VERT_THRESH_IRE));
+                        !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0);
 
                     if (hystOk) {
                         auto candScore = [&](int c)->double {
@@ -1992,7 +1987,18 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         ? kSharpWEnv
         : T.FVF_TRANSITION_SHARPNESS_WEIGHT;
 
-    if (transitionSharpWeight > 0.0) {
+    // THE REGION IS NOT THE REWARD. This stage locates a transition and
+    // awards its whole support to one candidate; that commitment is what stops
+    // the election alternating between candidates across a transition, which
+    // constructs a checkerboard of its own whatever the source of sharpness.
+    // It also carries the reach-unsafe DQ. So it runs on its own switch, and
+    // the sharpness weight only scales the reward inside it: a zero weight
+    // removes the reward, never the region.
+    static const bool runStageOn = []{
+        const char *e = std::getenv("LDCD_FVF_RUN_STAGE");
+        return !(e && std::atoi(e) == 0);
+    }();
+    if (runStageOn) {
         // TRANSITIONS ARE THE SEARCH TARGET; PLATEAUS QUALIFY THEM.
         //
         // The lateral gradient seeds a transition. Each side walks outward until it finds
@@ -2276,10 +2282,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
             bool frameRunEligible = true;
             bool frameReachUnsafe = false;
-            double maxVertIRE = 0.0;
             for (int r = awardBegin; r <= awardEnd; ++r) {
                 frameRunEligible = frameRunEligible && frameEligible[r] != 0;
-                maxVertIRE = std::max(maxVertIRE, vertContrastIRE(r));
 				if (r < (int)scratch_frameBReachUnsafe.size() &&
 					scratch_frameBReachUnsafe[r] != 0)
 					frameReachUnsafe = true;
@@ -2327,20 +2331,15 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     diagonalStrength;
             }
 
-            // Correct orientation: lateral contrast supplies the stable-step
-            // sharpness measurement above, where Frame B's narrower crossing
-            // can win without an identity bonus.  Between-line disagreement
-            // instead raises the prior for progressive Frame A, whose reach
-            // is the safe construction.
-            if (localUseFrameModel && std::isfinite(meritA)) {
-                const double verticalSafetyPrior = std::clamp(
-                    (maxVertIRE - VERT_THRESH_IRE) /
-                        std::max(1e-9, VERT_THRESH_IRE),
-                    0.0, 1.0);
-                meritA *= 1.0 -
-                    std::clamp(T.FVF_VERT_FRAME_A_BONUS, 0.0, 0.9) *
-                    verticalSafetyPrior * (1.0 - diagonalStrength);
-            }
+            // Blame follows the contrast angle, but neither axis carries a
+            // prior any more. Between-line disagreement no longer raises
+            // Frame A's prior: that term measured inert, and precleaned Frame
+            // A is not the clean candidate on that axis in any case. A
+            // penalty on the opposite axis -- the line crossing the contrast,
+            // where Frame A smooths the 1D line-alternating error that Frame
+            // B cancels -- was tried here and measured inert as well (80,546
+            // severe samples against 80,547 without it). Neither is kept as
+            // an unused knob.
 
             int runWinner = -1;
             double bestMerit = std::numeric_limits<double>::infinity();
@@ -2951,6 +2950,8 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameBCompute) {
+            // The referent first: Frame B's checkerboard verdict reads it.
+            buildFrameAZeroLine(line);
             computeFrameBLine(line, frameIQ, scratch_frameBDirectIQComposite);
         }
 

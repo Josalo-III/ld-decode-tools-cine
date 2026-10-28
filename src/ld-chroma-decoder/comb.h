@@ -263,21 +263,33 @@ public:
             double FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS = 0.12;
 
             // Edge-regime biasing for the 4-member election.
-            double FVF_VERT_FIELD_A_PENALTY  = 0.16; // Field A penalty under vertical contrast (±2 comb produces crosstalk)
-            double FVF_VERT_FRAME_A_BONUS    = 0.16; // Frame A (precleaned) bonus under vertical contrast (unaffected by vertical luma)
-            double FVF_HEDGE_FIELD_B_PENALTY = 0.0; // Field B penalty at horizontal luma edges (zipper risk)
-            double FVF_HEDGE_FRAME_B_BONUS   = 0.18; // Frame B bonus at horizontal luma edges (interframe is stable there)
+            // Contrasts running along the line now carry no regime bias. The
+            // vertical prior that favoured Frame A there measured inert
+            // (80,547 severe samples against 80,725 without it), and
+            // precleaned Frame A is not the clean candidate on that axis in
+            // any case: its own alternation peaks just off it, at 0.2629% of
+            // samples above 2 IRE against Frame B's 0.1414%, inherited from
+            // Field B through preclean. Frame B's degradation there is
+            // identified by scratch_frameBCheckerboard, which disqualifies
+            // nothing; three further terms on these axes were declared here
+            // and applied nowhere, and are gone.
             // Election-only reward when the same signed edge crosses at a
             // coherent sub-line progression on the neighbouring same-field
             // rows. Frame B renders that geometry smoothly where Frame A can
             // staircase it; ordinary vertical disagreement is not enough.
             double FVF_DIAGONAL_FRAME_B_BONUS = 0.14;
 
-            // Transition-run sharpness reward strength. The plateau detector
-            // supplies both the comparison and the complete commitment
-            // footprint, so the election cannot mix a sharp crossing with a
-            // softer candidate's shoulders. LDCD_FVF_SHARP_W overrides.
-            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.16;
+            // Transition-run sharpness REWARD strength -- the reward only.
+            // The plateau detector supplies the comparison and the complete
+            // commitment footprint, so the election cannot mix a sharp
+            // crossing with a softer candidate's shoulders; that REGION is a
+            // separate thing on LDCD_FVF_RUN_STAGE and runs regardless,
+            // because the commitment is what prevents alternating awards
+            // whatever the source of sharpness. Awarding the fastest
+            // transition fights the located-transition verdict, so the reward
+            // is pulled; it measured inert either way.
+            // LDCD_FVF_SHARP_W restores it.
+            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.0;
 
             // Saturation regime biasing.
             double FVF_SAT_FIELD_A_PEN   = 0.06; // Field A penalty in high saturation
@@ -1067,6 +1079,29 @@ private:
 	// difference vector; fbReg is the chosen registration offset (diagnostic).
 	std::vector<std::complex<double>> scratch_fbPairDiff;
 	std::vector<int> scratch_fbReg;
+	// The content band seed, kept apart from the physical reach fact so the
+	// checkerboard test can narrow the content half without ever touching
+	// physical availability -- different classes, different authority.
+	std::vector<quint8> scratch_fbBandSeed;
+	// The checkerboard identifier, published alongside ReachUnsafe and
+	// consumed by nothing. It is NOT a disqualification: narrowing the DQ with
+	// it measured 15-17% more alternation in the elected output, because the
+	// election switches award about every three samples and that switching
+	// adds more than the narrower DQ removes. The class is isolated here so
+	// handling can be chosen separately.
+	std::vector<quint8> scratch_frameBCheckerboard;
+	std::vector<double> scratch_fbCheckerAlt;
+	std::vector<double> scratch_fbSmoothed;
+	// A-zero: the midpoint of the NON-precleaned +-1 rows, in IRE composite.
+	// Preclean draws on Field B, which carries the checkerboard fault, so
+	// precleaned Frame A is not a clean referent for it. A-zero reaches +-1
+	// only and is a convex mix of its three rows, so it cannot construct the
+	// fault; it is noisy and soft, and it smooths some of the alien Frame B
+	// cancels, which is why it is a referent and not a candidate.
+	std::vector<double> scratch_frameA0Composite;
+	std::vector<std::complex<double>> scratch_a0Raw[3];
+	std::vector<std::complex<double>> scratch_a0Out;
+	void buildFrameAZeroLine(int line);
 	// The diagonal fact, per column, measured once per line before any
 	// candidate runs: signed lateral advance of luma structure in samples per
 	// FRAME line, and the election's strength for the same run. Zero where no
@@ -1876,7 +1911,8 @@ private:
 											   std::vector<std::complex<double>> &upIQ,
 											   std::vector<std::complex<double>> &dnIQ,
 											   std::vector<std::complex<double>> &outFrameIQ,
-											   const CombTapLine *reachTapLine = nullptr);
+											   const CombTapLine *reachTapLine = nullptr,
+											   bool applyGuard = true);
 	void collectCombAttributionEvidence(int line,
 									   const double *fieldA,
 									   const double *fieldB,
