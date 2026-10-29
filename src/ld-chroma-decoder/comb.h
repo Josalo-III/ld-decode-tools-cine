@@ -20,6 +20,7 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -170,6 +171,10 @@ public:
             FieldAContour,    // Field A: contour-aware same-field +/-2 comb with +/-4 support
             FieldBSimple,     // Field B: direct same-field +/-2 comb
             FrameAAdaptiveIQ, // Frame A: precleaned, reach-gated interframe midpoint comb
+            FrameA0,          // Frame A0: the same midpoint on the NON-precleaned +-1 rows,
+                              // guard off. A convex mix of three rows, so it cannot construct
+                              // alternation; noisy and soft, which is why it referees rather
+                              // than ships. Selectable so it can be looked at directly.
             FrameBDirectIQ,   // Frame B: direct interframe IQ comb with IRE-domain reach-floor inputs
             // FVF (Default). Three-way election; the ballot is regime-set:
             //   progressive -- Frame A (+/-1), Field A (+/-2), Frame B (+/-1)
@@ -243,10 +248,28 @@ public:
             // Spatial neighbor shaping: pulls the FVF winner toward the local majority decision.
             double FVF_SHAPE_STRENGTH = 0.85; // 0 = disabled, 1 = full neighbor pull
 
-            // Candidate-relative same-phase topology penalty.  This does not
-            // alter a candidate: it only makes an isolated horizontal zipper
-            // costlier when another seated candidate renders the site cleanly.
-            double FVF_NEIGHBOR_ZIPPER_WEIGHT = 0.24;
+            // Cost for distance from Frame A inside the region the
+            // checkerboard identifier flags. Frame A is the measure there
+            // (A-zero carries alternations of its own); this replaces the
+            // disqualification that used to fire in that region, and leaves
+            // every candidate on the ballot. Per IRE of distance from Frame A.
+            // LDCD_FVF_FRAME_A_W overrides.
+            double FVF_FRAME_A_SIMILARITY_WEIGHT = 0.48;
+
+            // The interlace counterpart: in the same region the roster has no
+            // Frame A, so 1D is the measure, per IRE of distance from 1D, and
+            // a sample where no seat comes within the standard cedes to 1D
+            // verbatim. LDCD_FVF_1D_W and LDCD_FVF_1D_STANDARD_IRE override.
+            double FVF_1D_SIMILARITY_WEIGHT = 0.48;
+            double FVF_1D_STANDARD_IRE = 1.0;
+
+            // The lesser alien-luma stage: luma steps from
+            // FVF_ALIEN_LUMA_LO_IRE up to the full regime's threshold, ramped
+            // from zero. Per IRE of distance from Frame B at full ramp: Frame A
+            // and Field B pay the full weight, Field A half.
+            // LDCD_FVF_ALIEN_W and LDCD_FVF_ALIEN_LO_IRE override.
+            double FVF_ALIEN_LUMA_LO_IRE = 8.0;
+            double FVF_ALIEN_LUMA_WEIGHT = 0.48;
 
             // Scale-regime biasing. The scale estimate is a horizontal proxy derived from
             // Frame B IQ magnitude, then applied as evidence for the vertical-reach election.
@@ -263,16 +286,16 @@ public:
             double FVF_SCALE_COARSE_DUAL4_FIELD_A_BONUS = 0.12;
 
             // Edge-regime biasing for the 4-member election.
-            // Contrasts running along the line now carry no regime bias. The
-            // vertical prior that favoured Frame A there measured inert
-            // (80,547 severe samples against 80,725 without it), and
-            // precleaned Frame A is not the clean candidate on that axis in
-            // any case: its own alternation peaks just off it, at 0.2629% of
-            // samples above 2 IRE against Frame B's 0.1414%, inherited from
-            // Field B through preclean. Frame B's degradation there is
-            // identified by scratch_frameBCheckerboard, which disqualifies
-            // nothing; three further terms on these axes were declared here
-            // and applied nowhere, and are gone.
+            //
+            // Contrasts running along the line carry no constant regime bias:
+            // the vertical prior that favoured Frame A there measured inert
+            // (80,547 severe samples against 80,725 without it). That axis is
+            // governed instead by the seed region's measure (Frame A in
+            // progressive, 1D in interlace; see FVF_FRAME_A_SIMILARITY_WEIGHT).
+            // Contrasts the line crosses are the hedge's: Frame B is admitted
+            // there on best score without the ordinary margin. Three further
+            // terms on these axes were declared here and applied nowhere, and
+            // are gone.
             // Election-only reward when the same signed edge crosses at a
             // coherent sub-line progression on the neighbouring same-field
             // rows. Frame B renders that geometry smoothly where Frame A can
@@ -286,10 +309,13 @@ public:
             // separate thing on LDCD_FVF_RUN_STAGE and runs regardless,
             // because the commitment is what prevents alternating awards
             // whatever the source of sharpness. Awarding the fastest
-            // transition fights the located-transition verdict, so the reward
-            // is pulled; it measured inert either way.
-            // LDCD_FVF_SHARP_W restores it.
-            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.0;
+            // transition is not the same as awarding the one that adheres to
+            // the located transition, and the latter is what the perpendicular
+            // case wants -- but pulling the reward measured inert on
+            // alternation (80,546 severe samples against 80,547) and it does
+            // serve the parallel case, so it stays in place until something
+            // better than "fastest" is built. LDCD_FVF_SHARP_W overrides.
+            double FVF_TRANSITION_SHARPNESS_WEIGHT = 0.16;
 
             // Saturation regime biasing.
             double FVF_SAT_FIELD_A_PEN   = 0.06; // Field A penalty in high saturation
@@ -301,7 +327,7 @@ public:
             // FVF / Model interaction tuning
             // =========================================================================
             // Penalty for a candidate being far from the regime model
-            // (Frame B in progressive; Field B in interlace). Larger → more model dominance.
+            // (Frame B in progressive; Field A in interlace). Larger → more model dominance.
             double FVF_MODEL_PRIMARY_WEIGHT = 0.33;
             // Cross-domain candidates pay model-distance only past this deadband
             // (IRE).  Inside the deadband the cross-domain comb is considered
@@ -312,7 +338,7 @@ public:
 
             // Multiplicative cost advantage for the model-domain candidate in its own regime.
             // < 1.0 → model candidate gets a cheaper score.
-            double FIELD_MODEL_BIAS = 0.50; // interlace: Field B costs less
+            double FIELD_MODEL_BIAS = 0.50; // interlace: Field A, the model, costs less
 
             // > 1.0 → Frame candidate costs slightly more when regime is clearly interlace.
             double FRAME_IN_INTERLACE_PENALTY = 1.10;
@@ -532,6 +558,7 @@ public:
 	                             double gateGain = 1.0) const;
 	void buildPhaseCorrected1D();
 	void split2D();
+	void buildLumaEdgeIndex();
 	void copy2DTo3D();
 	void split3D(const FrameBuffer &previousFrame,
 				 const FrameBuffer &nextFrame);
@@ -1078,20 +1105,16 @@ private:
 	// staircase).  fbPairDiff holds the diagonal-registered, window-normalized
 	// difference vector; fbReg is the chosen registration offset (diagnostic).
 	std::vector<std::complex<double>> scratch_fbPairDiff;
+	std::vector<double> scratch_fbGuardIRE;
 	std::vector<int> scratch_fbReg;
 	// The content band seed, kept apart from the physical reach fact so the
 	// checkerboard test can narrow the content half without ever touching
 	// physical availability -- different classes, different authority.
 	std::vector<quint8> scratch_fbBandSeed;
-	// The checkerboard identifier, published alongside ReachUnsafe and
-	// consumed by nothing. It is NOT a disqualification: narrowing the DQ with
-	// it measured 15-17% more alternation in the elected output, because the
-	// election switches award about every three samples and that switching
-	// adds more than the narrower DQ removes. The class is isolated here so
-	// handling can be chosen separately.
+	// The checkerboard identifier: the content band seed, built against no
+	// comb. It is NOT a disqualification; it marks where the election charges
+	// the other seats for their distance from Frame A.
 	std::vector<quint8> scratch_frameBCheckerboard;
-	std::vector<double> scratch_fbCheckerAlt;
-	std::vector<double> scratch_fbSmoothed;
 	// A-zero: the midpoint of the NON-precleaned +-1 rows, in IRE composite.
 	// Preclean draws on Field B, which carries the checkerboard fault, so
 	// precleaned Frame A is not a clean referent for it. A-zero reaches +-1
@@ -1229,6 +1252,18 @@ private:
 		//   4. Cross-line legality is decided by CombReachIndex through
 		//      scalarReachSource(); it is not inferred from this buffer alone.
 		std::vector<double> locked1DRawBandpass_flat; // raw pass-1 bp[x] before locked cleanup/remod
+		// Located luma-step events, one plane, active-width rows.  A luma step
+		// of amplitude A puts the exact doublet [-A/4,-A/4,+A/4,+A/4] into the
+		// pass-1 bandpass and nothing elsewhere, so the step's POSITION is
+		// recoverable from the bandpass where the schedule isolates it.  The
+		// stored value is the step's AMPLITUDE IN IRE, signed, measured in the
+		// luma domain rather than the carrier band: the detected item is luma,
+		// so it is published as luma.  Zero where no step is located.
+		//
+		// Built at the 1D stage from one line, horizontally, with no vertical
+		// reach and no candidate, election or certified input, so every
+		// downstream consumer sees the same fact and none of them influenced it.
+		std::vector<float> lumaEdgeIRE_flat;
 		std::vector<double> locked1DSource_flat;
 		// H-indexed view of locked1DSource_flat in clpbuffer geometry (fieldWidth stride).
 		// It is allocated only for configurations that address the 1D scalar by absolute
@@ -1526,6 +1561,11 @@ private:
 		return locked1DSource_flat.data() + static_cast<size_t>(line) * demodWidth;
 	}
 
+	inline const float *lumaEdgeIRE_line(int line) const {
+		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
+		    lumaEdgeIRE_flat.empty()) return nullptr;
+		return lumaEdgeIRE_flat.data() + static_cast<size_t>(line) * demodWidth;
+	}
 	inline double *locked1DRawBandpass_line(int line) {
 		if (demodWidth <= 0 || line < 0 || line >= demodLines ||
 		    locked1DRawBandpass_flat.empty()) return nullptr;
@@ -1893,6 +1933,14 @@ private:
 
 	void computeFrameALine(int line,
 									std::vector<std::complex<double>> &outFrameIQ);
+	std::vector<std::complex<double>> scratch_selUpIQ;
+	std::vector<std::complex<double>> scratch_selDnIQ;
+	void selectFrameALegsByParity(
+		int line, int width, int left, bool verticalAllowed,
+		const double *scalar0, const double *scalarUp, const double *scalarDn);
+	std::vector<std::complex<double>> scratch_rawCenterIQ;
+	std::vector<std::complex<double>> scratch_rawUpIQ;
+	std::vector<std::complex<double>> scratch_rawDnIQ;
 	// Measures the diagonal fact for one line into scratch_fbDiagAdvance /
 	// scratch_fbDiagStrength. Reads only the tap line, so it can run before
 	// any candidate exists.
@@ -1911,8 +1959,8 @@ private:
 											   std::vector<std::complex<double>> &upIQ,
 											   std::vector<std::complex<double>> &dnIQ,
 											   std::vector<std::complex<double>> &outFrameIQ,
-											   const CombTapLine *reachTapLine = nullptr,
-											   bool applyGuard = true);
+												   const CombTapLine *reachTapLine = nullptr,
+	                                               bool applyGuard = true);
 	void collectCombAttributionEvidence(int line,
 									   const double *fieldA,
 									   const double *fieldB,

@@ -280,7 +280,7 @@ int main(int argc, char *argv[])
     QCommandLineOption twoDVariantOption(
         QStringList() << QCoreApplication::translate("main", "two-d-variant"),
         QCoreApplication::translate("main",
-            "Select 2D comb variant: line | fielda | fieldb | framea | frameb | "
+            "Select 2D comb variant: line | fielda | fieldb | framea | framea0 | frameb | "
             "fvf (default). line=phase corrected 1D, Fields are intrafield, "
             "Frames are interfield, FVF is an election amongst them"),
         QCoreApplication::translate("main", "variant"),
@@ -481,6 +481,9 @@ int main(int argc, char *argv[])
                v == "preclean-frame-iq" || v == "frame-preclean" ||
                v == "preclean-frame" || v == "framea") {
         combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameAAdaptiveIQ;
+    } else if (v == "frame-a0" || v == "framea0" || v == "a0" ||
+               v == "frame-a-raw" || v == "raw-framea") {
+        combConfig.twoDVariant = Comb::Configuration::TwoDVariant::FrameA0;
     } else if (v == "frame-b-direct-iq" || v == "direct-frame-iq" ||
                v == "locked-frame-iq" || v == "frameb" || v == "frame-b" || v == "frame-b-preclean" ||
                v == "frame-raw" || v == "raw-frame" ||

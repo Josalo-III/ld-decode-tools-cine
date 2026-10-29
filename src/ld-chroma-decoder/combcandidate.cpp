@@ -25,8 +25,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <array>
 #include <limits>
+#include <mutex>
 
 // -------------------------------------------------------------------------
 
@@ -1963,6 +1966,42 @@ static inline double cmag(const std::complex<double> &z) { return boundedMag(z);
 // already sharpened each field and placed all three operands in the same IQ
 // coordinate.  Reach decides which complementary observations are safe; it
 // does not scale the midpoint itself.
+namespace {
+// Nearest point of the segment [a,b] to p, and of the triangle conv{a,b,c}.
+inline std::complex<double> probeSegProj(std::complex<double> p,
+                                         std::complex<double> a,
+                                         std::complex<double> b)
+{
+    const std::complex<double> d = b - a;
+    const double l2 = std::norm(d);
+    if (!(l2 > 0.0)) return a;
+    double t = ((p - a).real() * d.real() + (p - a).imag() * d.imag()) / l2;
+    return a + std::clamp(t, 0.0, 1.0) * d;
+}
+inline std::complex<double> probeTriProj(std::complex<double> p,
+                                         std::complex<double> a,
+                                         std::complex<double> b,
+                                         std::complex<double> c)
+{
+    const auto cr = [](std::complex<double> o, std::complex<double> u,
+                       std::complex<double> v) {
+        return (u - o).real() * (v - o).imag() - (u - o).imag() * (v - o).real();
+    };
+    const double s1 = cr(a, b, p), s2 = cr(b, c, p), s3 = cr(c, a, p);
+    if ((s1 >= 0.0 && s2 >= 0.0 && s3 >= 0.0) ||
+        (s1 <= 0.0 && s2 <= 0.0 && s3 <= 0.0))
+        return p;
+    std::complex<double> best = probeSegProj(p, a, b);
+    double bd = std::abs(p - best);
+    for (const auto &e : {std::pair{b, c}, std::pair{c, a}}) {
+        const std::complex<double> q = probeSegProj(p, e.first, e.second);
+        const double d = std::abs(p - q);
+        if (d < bd) { bd = d; best = q; }
+    }
+    return best;
+}
+}  // namespace
+
 void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     int line,
     const std::vector<std::complex<double>> &centerIQ,
@@ -2003,6 +2042,47 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
     }();
     constexpr int frameAGuardRadius = 4;
 
+    // LDCD_FRAMEA_GATE=parity measures the PARITY-FLIPPING part of the leg
+    // disagreement instead of its magnitude. The defect the gate exists to
+    // prevent is the +-1 legs disagreeing by parity, so the comb's decision
+    // flips along x; a plain vertical edge disagrees strongly without flipping
+    // and is no reason to give up the vertical reach. Architecture is unchanged
+    // -- same +-4 dilation, same linear ramp -- so only the measured quantity
+    // differs. Thresholds are in IRE of parity disagreement, which is a much
+    // smaller scale than the magnitude the shipped gate reads.
+    static const bool parityGate = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_GATE");
+        return e && !std::strcmp(e, "parity");
+    }();
+    static const double frameAParityIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_PARITY_IRE");
+        return e ? std::atof(e) : 0.25;
+    }();
+    static const double frameAParityTauIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_PARITY_TAU_IRE");
+        const double v = e ? std::atof(e) : 0.5;
+        return v > 0.0 ? v : 0.5;
+    }();
+    // Parity amplitude of (up - dn), smoothed by a 5-tap binomial so a step
+    // edge does not register while a sustained flip does. Computed once per
+    // line; the gate then dilates it exactly as the magnitude gate dilates its
+    // own measurement.
+    std::vector<double> parityRow;
+    if (parityGate) {
+        static const double k5[5] = {1.0/16, 4.0/16, 6.0/16, 4.0/16, 1.0/16};
+        std::vector<std::complex<double>> m(width);
+        for (int x = 0; x < width; ++x) {
+            const double sgn = (x & 1) ? -1.0 : 1.0;
+            m[x] = sgn * (upIQ[x] - dnIQ[x]);
+        }
+        parityRow.assign(width, 0.0);
+        for (int x = 2; x < width - 2; ++x) {
+            std::complex<double> acc{};
+            for (int t = -2; t <= 2; ++t) acc += k5[t+2] * m[x+t];
+            parityRow[x] = std::abs(acc) * invIreScale;
+        }
+    }
+
     for (int x = 0; x < width; ++x) {
         const std::complex<double> center = centerIQ[x];
         double upReach = 0.0;
@@ -2028,9 +2108,18 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         const std::complex<double> complement =
             (upIQ[x] * upReach + dnIQ[x] * dnReach) / legWeight;
         double guard = 1.0;
-        // A-zero asks for no guard: it is a referent, and the guard would pull
-        // it toward its own centre on exactly the contrasts being judged.
-        if (applyGuard && upReach > 0.0 && dnReach > 0.0 &&
+        if (applyGuard && upReach > 0.0 && dnReach > 0.0 && parityGate &&
+            std::isfinite(frameAParityIRE)) {
+            double parityIRE = 0.0;
+            const int lo = std::max(0, x - frameAGuardRadius);
+            const int hi = std::min(width - 1, x + frameAGuardRadius);
+            for (int k = lo; k <= hi; ++k)
+                parityIRE = std::max(parityIRE, parityRow[k]);
+            guard = std::clamp(
+                (frameAParityIRE + frameAParityTauIRE - parityIRE) /
+                    frameAParityTauIRE,
+                0.0, 1.0);
+        } else if (applyGuard && upReach > 0.0 && dnReach > 0.0 &&
             std::isfinite(frameAGuardIRE) && frameAGuardTauIRE > 0.0) {
             double disagreementIRE = 0.0;
             const int lo = std::max(0, x - frameAGuardRadius);
@@ -2049,6 +2138,220 @@ void Comb::FrameBuffer::computeIQFrameAFromPreparedVectors(
         outFrameIQ[x] = center + 0.5 * guard * (complement - center);
     }
 }
+// Located luma-step index.
+//
+// Three facts make this possible from one line with no vertical reach:
+//   - the pass-1 bandpass is exactly sin^2(w): unity at fSC, zero at DC and
+//     Nyquist, and it does not distort chroma (measured gain 1.000);
+//   - a luma step of amplitude A therefore enters it as the compact doublet
+//     [-A/4, -A/4, +A/4, +A/4] over x0-2..x0+1 and zero elsewhere, which is
+//     phase-agnostic in the raw domain -- the familiar line-to-line sign flip
+//     appears only once the demod LUT flips;
+//   - four samples is one carrier cycle, so chroma recurs against itself at
+//     +-4 while the doublet does not.  The centred non-recurrence
+//     bp[x] - (bp[x-4] + bp[x+4])/2 therefore cancels steady carrier of ANY
+//     amplitude or bandwidth, including video-origin chroma far outside the
+//     film gamut, and retains what failed to recur.
+//
+// The doublet's sign change sits between x0-1 and x0, which is what locates
+// the step.  Measured against conservation truth on certified def lines, the
+// located position lands within one sample of the exact luma step on 95-96%
+// of all steps and 99.8-100% of steps at or above 32 IRE.
+//
+// It is published in IRE as a LUMA amplitude, taken from the complementary
+// notch rather than from the carrier band: the detected item is luma, and a
+// consumer comparing its own luma transition against this needs no conversion
+// and inherits no half-sample offset from the bandpass domain.
+void Comb::FrameBuffer::buildLumaEdgeIndex()
+{
+    const int first = videoParameters.firstActiveFrameLine;
+    const int last  = videoParameters.lastActiveFrameLine;
+    const int left  = videoParameters.activeVideoStart;
+    const int width = videoParameters.activeVideoEnd - left;
+    if (!configuration.phaseCompensation || width <= 16 ||
+        demodWidth <= 0 || demodLines <= 0)
+        return;
+    if ((int)lumaEdgeIRE_flat.size() != demodLines * demodWidth)
+        lumaEdgeIRE_flat.assign((size_t)demodLines * demodWidth, 0.0f);
+    else
+        std::fill(lumaEdgeIRE_flat.begin(), lumaEdgeIRE_flat.end(), 0.0f);
+    if (rawbuffer.size() <= 0) return;
+
+    // The atom, and its appearance under the non-recurrence operator.
+    //
+    // A unit luma step at x0 enters the pass-1 bandpass as the exact doublet
+    // [-1/4, -1/4, +1/4, +1/4] over x0-2..x0+1 and nothing elsewhere. Steady
+    // carrier of any amplitude or bandwidth recurs against itself at +-4, one
+    // full cycle, so the centred non-recurrence bp[x] - (bp[x-4]+bp[x+4])/2
+    // removes legal chroma and keeps the atom. KSPAN covers the atom's own
+    // four samples spread by that operator's +-4 reach: x0-6 .. x0+5.
+    //
+    // A SIGN-CHANGE SEARCH CANNOT DO THIS JOB. Two edges two or three samples
+    // apart -- a wire, a strap, the cube's structure -- put overlapping
+    // doublets into the band, and their sum partially cancels, so the feature
+    // either shows no crossing or shows one in the wrong place. That is the
+    // recorded reason lurch is blind at thin verticals and gate-based attempts
+    // left them untouched. Superposition of atoms is linear and exact, so the
+    // decomposition resolves them natively: matching pursuit takes the
+    // strongest atom, subtracts its own contribution, and looks again.
+    constexpr int KLO = -6, KHI = 5, KSPAN = KHI - KLO + 1;
+    static const std::array<double, KSPAN> kernel = [] {
+        std::array<double, KSPAN> d{}, k{};
+        // unit doublet at index -KLO
+        const int c = -KLO;
+        d[c - 2] = -0.25; d[c - 1] = -0.25; d[c] = 0.25; d[c + 1] = 0.25;
+        for (int i = 0; i < KSPAN; ++i) {
+            double v = d[i];
+            if (i - 4 >= 0)     v -= 0.5 * d[i - 4];
+            if (i + 4 < KSPAN)  v -= 0.5 * d[i + 4];
+            k[i] = v;
+        }
+        return k;
+    }();
+    static const double kernelEnergy = [] {
+        double e = 0.0;
+        for (double v : kernel) e += v * v;
+        return e > 0.0 ? e : 1.0;
+    }();
+    // A stopping rule, not a content gate: matching pursuit must terminate.
+    static const double residualFloorIRE = [] {
+        const char *e = std::getenv("LDCD_LUMA_EDGE_FLOOR_IRE");
+        const double v = e ? std::atof(e) : 2.0;
+        return v > 0.0 ? v : 2.0;
+    }();
+    static const int maxAtomsPerLine = [] {
+        const char *e = std::getenv("LDCD_LUMA_EDGE_MAX");
+        const int v = e ? std::atoi(e) : 192;
+        return v > 0 ? v : 192;
+    }();
+
+    std::vector<double> prox(width, 0.0), notch(width, 0.0), resid(width, 0.0);
+    for (int line = first; line < last && line < demodLines; ++line) {
+        const double *bp = locked1DRawBandpass_line(line);
+        float *out = lumaEdgeIRE_flat.data() + (size_t)line * demodWidth;
+        if (!bp) continue;
+        const quint16 *rawRow =
+            rawbuffer.data() + (size_t)line * videoParameters.fieldWidth;
+
+        // Below the waterline: the luma the bandpass never sees. It carries the
+        // levels the fast transitions move BETWEEN, which is what tells a wire
+        // returning to its base level from a step that lands somewhere new.
+        for (int x = 0; x < width; ++x)
+            notch[x] = ((double)rawRow[left + x] - bp[x]) * invIreScale;
+        std::fill(prox.begin(), prox.end(), 0.0);
+        for (int x = 4; x + 4 < width; ++x)
+            prox[x] = (bp[x] - 0.5 * (bp[x - 4] + bp[x + 4])) * invIreScale;
+        resid = prox;
+
+        for (int n = 0; n < maxAtomsPerLine; ++n) {
+            int bestX = -1;
+            double bestA = 0.0;
+            for (int x = 8; x + 8 < width; ++x) {
+                double dot = 0.0;
+                for (int i = 0; i < KSPAN; ++i)
+                    dot += kernel[i] * resid[x + KLO + i];
+                const double amp = dot / kernelEnergy;
+                if (std::fabs(amp) > std::fabs(bestA)) { bestA = amp; bestX = x; }
+            }
+            if (bestX < 0 || std::fabs(bestA) < residualFloorIRE) break;
+            for (int i = 0; i < KSPAN; ++i)
+                resid[bestX + KLO + i] -= bestA * kernel[i];
+            // Reconcile the atom's amplitude with the level change the notch
+            // reports across the atom's own support. The bandpass sees the
+            // summit; the notch says what it moved from and to. Where they
+            // disagree the notch governs, because it is the domain the step
+            // actually lives in.
+            const double levelChange = notch[bestX + 3] - notch[bestX - 4];
+            const double published =
+                (std::fabs(levelChange) > 1e-9 &&
+                 ((levelChange > 0.0) == (bestA > 0.0)))
+                    ? 0.5 * (bestA + levelChange)
+                    : bestA;
+            if (std::fabs((double)out[bestX]) < std::fabs(published))
+                out[bestX] = (float)published;
+        }
+    }
+}
+
+// Leg sourcing by parity disagreement.
+//
+// Preclean's value is noise reduction, and the midpoint inherits noise from its
+// CENTRE, so the centre keeps preclean unconditionally. Its wider reach is a
+// liability only on the +-1 legs, which cross the contrast: where precleaning
+// the legs RAISES the parity-flipping part of their mutual disagreement, that
+// reach carried in something not germane to the local area the tighter raw
+// sampling defines, and the raw legs are the better observation there.
+//
+// The decision is a soft ramp, not a per-sample switch: a hard switch is itself
+// a per-column decision and would bead. Near-ties blend, so the result is
+// continuous in the evidence. Both operands are facts about the legs, measured
+// before any comb output exists, so nothing reads its own content, and both
+// candidates are legal observations -- this selects between them, it restrains
+// neither.
+//
+// The disagreement the guard measures is taken from whatever legs it is handed,
+// so handing it the quieter pair lets it stay open without altering its own
+// criterion. Deference to 1D falls out of the sourcing, not out of a looser gate.
+void Comb::FrameBuffer::selectFrameALegsByParity(
+    int line, int width, int left, bool verticalAllowed,
+    const double *scalar0, const double *scalarUp, const double *scalarDn)
+{
+    using IQ = std::complex<double>;
+    if ((int)scratch_selUpIQ.size() != width) scratch_selUpIQ.resize(width);
+    if ((int)scratch_selDnIQ.size() != width) scratch_selDnIQ.resize(width);
+    // Without a vertical reach or a raw observation there is nothing to select
+    // between; the precleaned legs stand.
+    if (!verticalAllowed || !scalar0 || !scalarUp || !scalarDn) {
+        scratch_selUpIQ = scratch_upIQ;
+        scratch_selDnIQ = scratch_dnIQ;
+        return;
+    }
+    static const double tauIRE = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_SELECT_TAU_IRE");
+        const double v = e ? std::atof(e) : 0.25;
+        return v > 0.0 ? v : 0.25;
+    }();
+
+    if ((int)scratch_rawUpIQ.size() != width) scratch_rawUpIQ.resize(width);
+    if ((int)scratch_rawDnIQ.size() != width) scratch_rawDnIQ.resize(width);
+    auto rawU = carrierGrammarSignedSampleCursor(
+        configuration.phaseCompensation ? carrierGrammarLine(line - 1) : nullptr, left);
+    auto rawD = carrierGrammarSignedSampleCursor(
+        configuration.phaseCompensation ? carrierGrammarLine(line + 1) : nullptr, left);
+    for (int x = 0; x < width; ++x) {
+        scratch_rawUpIQ[x] = carrierGrammarDemodSignedCompositeTo4fsc(rawU, scalarUp[x]);
+        scratch_rawDnIQ[x] = carrierGrammarDemodSignedCompositeTo4fsc(rawD, scalarDn[x]);
+    }
+    centerCarrierProductRowInPlace(scratch_rawUpIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_rawDnIQ.data(), width);
+
+    // Parity-flipping part of each leg pair's disagreement. The 5-tap binomial
+    // on the parity-modulated difference keeps a sustained flip and rejects a
+    // step, so an ordinary vertical edge does not read as parity disagreement.
+    static const double k5[5] = {1.0/16, 4.0/16, 6.0/16, 4.0/16, 1.0/16};
+    std::vector<IQ> mClean(width), mRaw(width);
+    for (int x = 0; x < width; ++x) {
+        const double sgn = (x & 1) ? -1.0 : 1.0;
+        mClean[x] = sgn * (scratch_upIQ[x] - scratch_dnIQ[x]);
+        mRaw[x]   = sgn * (scratch_rawUpIQ[x] - scratch_rawDnIQ[x]);
+    }
+    for (int x = 0; x < width; ++x) {
+        double w = 0.0;
+        if (x >= 2 && x < width - 2) {
+            IQ sc{}, sr{};
+            for (int t = -2; t <= 2; ++t) {
+                sc += k5[t+2] * mClean[x+t];
+                sr += k5[t+2] * mRaw[x+t];
+            }
+            const double pClean = std::abs(sc) * invIreScale;
+            const double pRaw   = std::abs(sr) * invIreScale;
+            w = std::clamp((pClean - pRaw) / tauIRE, 0.0, 1.0);
+        }
+        scratch_selUpIQ[x] = scratch_upIQ[x] + w * (scratch_rawUpIQ[x] - scratch_upIQ[x]);
+        scratch_selDnIQ[x] = scratch_dnIQ[x] + w * (scratch_rawDnIQ[x] - scratch_dnIQ[x]);
+    }
+}
+
 // Frame A: reach-gated midpoint comb fed by the Field B preclean ring.
 void Comb::FrameBuffer::computeFrameALine(
     int line,
@@ -2174,12 +2477,87 @@ void Comb::FrameBuffer::computeFrameALine(
     centerCarrierProductRowInPlace(scratch_upIQ.data(), width);
     centerCarrierProductRowInPlace(scratch_dnIQ.data(), width);
 
+    // LDCD_FRAMEA_RULE selects what restrains Frame A. "guard" is the shipped
+    // disagreement guard and the default. "none" is the bare precleaned
+    // midpoint. "reachable" holds that midpoint inside the locus Frame A could
+    // have produced from the non-precleaned rows: since A0 is the raw midpoint,
+    // that locus is the segment from the raw centre to A0. "triangle" is the
+    // looser literal hull of the three raw rows. Preclean's clarity is kept in
+    // every case; only where the result lands is bounded.
+    static const int frameARule = [] {
+        const char *e = std::getenv("LDCD_FRAMEA_RULE");
+        // The shipped guard remains the default: the parity-selected sourcing
+        // below was measured against it on the full beach span and did not pay.
+        if (!e || !*e) return 0;
+        if (!std::strcmp(e, "selected")) return 5;
+        if (!std::strcmp(e, "guard")) return 0;
+        if (!std::strcmp(e, "none")) return 1;
+        if (!std::strcmp(e, "reachable")) return 2;
+        if (!std::strcmp(e, "triangle")) return 3;
+        if (!std::strcmp(e, "mixed")) return 4;
+        return 0;
+    }();
+
+    if (frameARule == 0) {
+        computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
+                                          outFrameIQ, &reachTapLine);
+        return;
+    }
+
+    if (frameARule == 5) {
+        selectFrameALegsByParity(line, width, left, verticalAllowed,
+                                 scalar0, scalarUp, scalarDn);
+        computeIQFrameAFromPreparedVectors(line, scratch_centerIQ,
+                                          scratch_selUpIQ, scratch_selDnIQ,
+                                          outFrameIQ, &reachTapLine);
+        return;
+    }
+
     computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_upIQ, scratch_dnIQ,
-                                      outFrameIQ, &reachTapLine);
+                                      outFrameIQ, &reachTapLine, false);
+    if (frameARule == 1) return;
+
+    // The raw rows carry no +-2 contribution, so the locus they allow is what
+    // Frame A can justify from the centre and its +-1 legs alone.
+    if ((int)scratch_rawCenterIQ.size() != width) scratch_rawCenterIQ.resize(width);
+    if ((int)scratch_rawUpIQ.size() != width) scratch_rawUpIQ.resize(width);
+    if ((int)scratch_rawDnIQ.size() != width) scratch_rawDnIQ.resize(width);
+    if (!scalar0) return;
+    auto rawC = phaseCursor(line), rawU = phaseCursor(line - 1), rawD = phaseCursor(line + 1);
+    for (int x = 0; x < width; ++x) {
+        scratch_rawCenterIQ[x] =
+            carrierGrammarDemodSignedCompositeTo4fsc(rawC, scalar0[x]);
+        scratch_rawUpIQ[x] = scalarUp
+            ? carrierGrammarDemodSignedCompositeTo4fsc(rawU, scalarUp[x])
+            : scratch_rawCenterIQ[x];
+        scratch_rawDnIQ[x] = scalarDn
+            ? carrierGrammarDemodSignedCompositeTo4fsc(rawD, scalarDn[x])
+            : scratch_rawCenterIQ[x];
+    }
+    centerCarrierProductRowInPlace(scratch_rawCenterIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_rawUpIQ.data(), width);
+    centerCarrierProductRowInPlace(scratch_rawDnIQ.data(), width);
+    if (frameARule == 4) {
+        // Precleaned centre, raw legs: keep the noise reduction where the
+        // midpoint inherits it, drop the wider reach only on the crossing legs.
+        computeIQFrameAFromPreparedVectors(line, scratch_centerIQ, scratch_rawUpIQ,
+                                          scratch_rawDnIQ, outFrameIQ, &reachTapLine, false);
+        return;
+    }
+    std::vector<std::complex<double>> rawMid;
+    computeIQFrameAFromPreparedVectors(line, scratch_rawCenterIQ, scratch_rawUpIQ,
+                                      scratch_rawDnIQ, rawMid, &reachTapLine, false);
+    if ((int)rawMid.size() != width || (int)outFrameIQ.size() != width) return;
+    for (int x = 0; x < width; ++x) {
+        outFrameIQ[x] = frameARule == 2
+            ? probeSegProj(outFrameIQ[x], scratch_rawCenterIQ[x], rawMid[x])
+            : probeTriProj(outFrameIQ[x], scratch_rawCenterIQ[x],
+                           scratch_rawUpIQ[x], scratch_rawDnIQ[x]);
+    }
 }
 
-// The identifier costs a referent per line, and nothing consumes it yet, so
-// it answers to one switch that also governs whether A-zero is built at all.
+// One switch for the checkerboard identifier, which also governs whether
+// A-zero is built for the Frame A0 output variant.
 static bool frameBCheckerEnabled()
 {
     static const bool on = []{
@@ -2188,6 +2566,7 @@ static bool frameBCheckerEnabled()
     }();
     return on;
 }
+
 
 // A-zero, built the way Frame A is built and from the same helper, but on the
 // non-precleaned rows and with the guard off. Preclean's reach runs through
@@ -2420,12 +2799,8 @@ void Comb::FrameBuffer::computeFrameBLine(
 	// searching for a shift of its own.
 	measureDiagonalAdvanceLine(line);
 
-	// Cleared every line: the seed is written only where the pair exists, so
-	// a stale row would otherwise be read as this line's fact.
-	if ((int)scratch_fbBandSeed.size() != width)
-		scratch_fbBandSeed.assign(width, 0);
-	else
-		std::fill(scratch_fbBandSeed.begin(), scratch_fbBandSeed.end(), 0);
+	if ((int)scratch_fbGuardIRE.size() != width)
+		scratch_fbGuardIRE.assign(width, 0.0);
 	if ((int)scratch_frameBReachUnsafe.size() != width)
 		scratch_frameBReachUnsafe.assign(width, 0);
 	else
@@ -2436,10 +2811,31 @@ void Comb::FrameBuffer::computeFrameBLine(
 	// actuator. Frame B publishes full registered subtraction plus
 	// scratch_frameBReachUnsafe; FVF can disqualify that candidate over the transition
 	// support. LDCD_FB_BAND_CEDE=1 enables pair cede as a diagnostic A/B mode.
+	static const int frameBGuardMode = []{
+		const char *e = std::getenv("LDCD_FRAMEB_GUARD");
+		if (!e || !*e) return 0;
+		if (!std::strcmp(e, "framea")) return 1;
+		if (!std::strcmp(e, "curvature")) return 2;
+		return 0;
+	}();
+	static const double frameBGuardIRE = []{
+		const char *e = std::getenv("LDCD_FRAMEB_GUARD_IRE");
+		return e ? std::atof(e) : 8.0;
+	}();
+	static const double frameBGuardTauIRE = []{
+		const char *e = std::getenv("LDCD_FRAMEB_GUARD_TAU_IRE");
+		return e ? std::atof(e) : 4.0;
+	}();
 	static const bool frameBBandCede = []{
 		const char *e = std::getenv("LDCD_FB_BAND_CEDE");
 		return e && std::atoi(e) != 0;
 	}();
+	// Cleared every line: the seed is written only where the pair exists, so
+	// a stale row would otherwise be read as this line's fact.
+	if ((int)scratch_fbBandSeed.size() != width)
+		scratch_fbBandSeed.assign(width, 0);
+	else
+		std::fill(scratch_fbBandSeed.begin(), scratch_fbBandSeed.end(), 0);
     // Certified cede (construction): on a def line the Frame B candidate IS
     // the center; IQ from the stage-1 locked products of the same scalar.
     if (certifiedOneDLevel() >= 2 && certifiedDefLine(line)) {
@@ -2782,6 +3178,8 @@ void Comb::FrameBuffer::computeFrameBLine(
         for (int x = 0; x < width; ++x) {
             if (!haveSignedAlien) {
                 scratch_fbPairDiff[x] = std::complex<double>(0.0, 0.0);
+                if ((int)scratch_fbGuardIRE.size() == width)
+                    scratch_fbGuardIRE[x] = 0.0;
                 scratch_fbReg[x] = 0;
                 continue;
             }
@@ -2871,11 +3269,20 @@ void Comb::FrameBuffer::computeFrameBLine(
 			// Registration may use a multi-axis aperture, but the correction waveform is
 			// sampled pointwise at the registered coordinates so narrow vertical carrier
 			// structure is not spread laterally.
-            const std::complex<double> pairDiff =
-                (upAdmit ? pU[x - d] : pC[x]) -
-                (dnAdmit ? pD[x + d] : pC[x]);
+            const std::complex<double> upTerm = upAdmit ? pU[x - d] : pC[x];
+            const std::complex<double> dnTerm = dnAdmit ? pD[x + d] : pC[x];
+            const std::complex<double> pairDiff = upTerm - dnTerm;
             scratch_fbPairDiff[x] = pairDiff;
             scratch_fbReg[x] = d;
+            // Guard evidence at the registered coordinates. Mode 1 is Frame A's
+            // criterion, which for Frame B is just the magnitude of its own
+            // alien estimate. Mode 2 is the vertical curvature the pair-sum
+            // approximation leaves behind, which is what makes the estimate
+            // wrong rather than merely large.
+            if (frameBGuardMode != 0 && (int)scratch_fbGuardIRE.size() == width)
+                scratch_fbGuardIRE[x] = (frameBGuardMode == 1)
+                    ? std::abs(pairDiff) * invIreScale
+                    : std::abs(upTerm + dnTerm - 2.0 * pC[x]) * invIreScale;
 
 
         }
@@ -2909,9 +3316,31 @@ void Comb::FrameBuffer::computeFrameBLine(
 				scratch_frameBReachUnsafe[x] = 1;
 
             if (pairLegalGate > 0.0) {
+                // LDCD_FRAMEB_GUARD attenuates the cancellation, as the Frame A
+                // guard attenuates Frame A's complement.
+                //   framea    : Frame A's own criterion, |up - dn|. Measured
+                //               here for the A/B, but note it reads Frame B's
+                //               SIGNAL -- the pair difference IS the alien
+                //               estimate -- not Frame B's risk.
+                //   curvature : |up + dn - 2*centre|, the second-order vertical
+                //               error the pair-sum approximation actually
+                //               carries, which is what can make the estimate
+                //               wrong rather than merely large.
+                double fbGuard = 1.0;
+                if (frameBGuardMode != 0) {
+                    const double tau = frameBGuardTauIRE > 0.0 ? frameBGuardTauIRE : 4.0;
+                    double evidenceIRE = 0.0;
+                    const int lo = std::max(0, x - 4);
+                    const int hi = std::min(width - 1, x + 4);
+                    if ((int)scratch_fbGuardIRE.size() == width)
+                        for (int k = lo; k <= hi; ++k)
+                            evidenceIRE = std::max(evidenceIRE, scratch_fbGuardIRE[k]);
+                    fbGuard = std::clamp(
+                        (frameBGuardIRE + tau - evidenceIRE) / tau, 0.0, 1.0);
+                }
                 const std::complex<double> corr =
                     ((0.5 * alienSign) * scratch_fbPairDiff[x]) *
-                    (cancelStrength * pairLegalGate);
+                    (cancelStrength * pairLegalGate * fbGuard);
                 if (std::isfinite(corr.real()) && std::isfinite(corr.imag()))
                     Zc = Z0 - corr;
             }
@@ -2951,106 +3380,43 @@ void Comb::FrameBuffer::computeFrameBLine(
     }
 
     // =====================================================================
-    // THE CHECKERBOARD VERDICT.
+    // THE CHECKERBOARD IDENTIFIER IS THE CONTENT BAND SEED.
     //
-    // Frame B is left to be Frame B: nothing above cedes to 1D, and the
-    // content band seed no longer disqualifies the comb on its own. What
-    // disqualifies it is evidence that it has actually degraded into the
-    // checkerboard class, which is identified here and published for the
-    // election to adjudicate.
+    // It is the identifier that drove the old disqualification, and it tested
+    // well in the rounds where Frame A was first weighed as the alternative.
+    // It reads IntrafieldRegionReach -- up, centre and down in separated
+    // regions, or a luma island -- so it fires where the +-1 REACH crosses a
+    // contrast, which is a contrast running along the line, and that is
+    // exactly where Frame B manufactures checkerboards.
     //
-    // A-ZERO is the reference, not production Frame A: production Frame A is
-    // precleaned, preclean reaches through Field B, and Field B has this same
-    // fault, so it cannot referee it. Measured against the certified carrier,
-    // precleaned Frame A's own alternation peaks at 0.83% of samples over 2
-    // IRE at 15-30 degrees -- worse there than Frame B -- which is that
-    // contamination showing. A-zero cannot construct alternation at all.
+    // It is built against no comb. The alternation measure that replaced it
+    // took Frame B's difference from A-zero, and before that from precleaned
+    // Frame A; a comb cannot referee another comb's defect, and A-zero carries
+    // alternations of its own.
     //
-    // Alternation in the difference is Frame B's artifact -- and the
-    // difference is what must be taken, because both planes are composite
-    // and a composite carrier at 4fSC is itself a four-sample alternation.
-    // Measuring each plane's alternation separately reads its carrier
-    // (correlation with the certified artifact +0.12); measuring the
-    // difference reads the artifact (+0.75 at contrasts along the line).
+    // THERE IS NO CONTENT DISQUALIFICATION. The region drives the Frame A
+    // similarity cost in the election instead, so every candidate stays on the
+    // ballot. The old DQ's FOOTPRINT was its fault, not the region: it was
+    // applied in the transition-run stage, so one flagged column installed
+    // seat 0 across a whole line-crossed transition. A per-sample cost cannot
+    // seize a run.
     //
-    // Orientation says WHOSE the alternation is -- Frame B's where the
-    // contrast runs along the line, Frame A's where the line crosses it (0.75
-    // against 0.37 correlation with each comb's own certified error at 0-15
-    // degrees). It is deliberately NOT a condition here: as a gate it isolated
-    // the class but missed too much of it to disqualify on.
-    //
-    // Operating point measured 2026-10-27/28 over 169,789,175 samples against
-    // the certified carrier. At 1.0 IRE this flags 0.561% of samples and holds
-    // 97.48% of the severe class -- identical to the 2.744% content seed to
-    // two decimals -- and 86.58% of the visible class against the seed's
-    // 88.61%. An orientation gate was tried and dropped: at a fixed amplitude
-    // it cost recall (86.8% to 74.3%) for class purity the identifier does not
-    // need.
-    //
-    // WHY THIS ONLY IDENTIFIES. Narrowing the DQ to this population was built
-    // and measured: 0.3820% of elected samples above 2 IRE at 0.5 and 0.3754%
-    // at 1.0, against 0.3274% for the seed alone, with the severe count rising
-    // from 80,547 to about 100,000. The election switches award roughly every
-    // three samples, so a narrower DQ adds more alternation by switching than
-    // it removes. The identifier is sound; the actuator was not.
+    // LDCD_FB_DQ=seed restores the disqualification, for comparison only.
     // =====================================================================
-    static const double checkerAltIRE = []{
-        const char *e = std::getenv("LDCD_FB_CHECKER_IRE");
-        return e ? std::atof(e) : 1.0;
+    static const bool dqSeed = []{
+        const char *e = std::getenv("LDCD_FB_DQ");
+        return e && !std::strcmp(e, "seed");
     }();
 
-    // ReachUnsafe keeps exactly the meaning it had: the content seed, plus the
-    // physical fact already written during construction. The identifier below
-    // does not touch it.
-    for (int x = 0; x < width; ++x)
-        if (scratch_fbBandSeed[x]) scratch_frameBReachUnsafe[x] = 1;
-
+    if (dqSeed) {
+        for (int x = 0; x < width; ++x)
+            if (scratch_fbBandSeed[x]) scratch_frameBReachUnsafe[x] = 1;
+    }
     if (!frameBCheckerEnabled()) return;
     if ((int)scratch_frameBCheckerboard.size() != width)
         scratch_frameBCheckerboard.assign(width, 0);
-    else
-        std::fill(scratch_frameBCheckerboard.begin(),
-                  scratch_frameBCheckerboard.end(), 0);
-
-    // A-zero needs only the 1D source rows, so it is available wherever the
-    // pair itself is -- including rosters that never construct Frame A. Where
-    // the line sits at the active boundary it is not, and the content seed
-    // then stands as it did before: an availability condition, not a hedge.
-    const bool haveFrameA =
-        (int)scratch_frameA0Composite.size() == width &&
-        std::isfinite(scratch_frameA0Composite[0]);
-
-    if (!haveFrameA) {
-        // No referent on this line, so no verdict. ReachUnsafe above is
-        // unaffected either way.
-    } else {
-        if ((int)scratch_fbCheckerAlt.size() != width) {
-            scratch_fbCheckerAlt.assign(width, 0.0);
-            scratch_fbSmoothed.assign(width, 0.0);
-        }
-        // Parity-modulated A/B difference, then the 5-tap binomial: what
-        // survives is the part alternating sample to sample, and a step
-        // cannot masquerade as alternation.
-        for (int x = 0; x < width; ++x) {
-            const double d = outFrameScalar[x] * invIreScale -
-                             scratch_frameA0Composite[x];
-            scratch_fbCheckerAlt[x] = ((x & 1) == 0) ? d : -d;
-        }
-        for (int x = 0; x < width; ++x) {
-            double acc = 0.0;
-            static const double k5[5] = {1.0/16, 4.0/16, 6.0/16, 4.0/16, 1.0/16};
-            for (int t = -2; t <= 2; ++t) {
-                const int xx = std::clamp(x + t, 0, width - 1);
-                acc += k5[t + 2] * scratch_fbCheckerAlt[xx];
-            }
-            scratch_fbSmoothed[x] = std::abs(acc);
-        }
-        for (int x = 0; x < width; ++x) {
-            if (!scratch_fbBandSeed[x]) continue;
-            if (scratch_fbSmoothed[x] >= checkerAltIRE)
-                scratch_frameBCheckerboard[x] = 1;
-        }
-    }
+    for (int x = 0; x < width; ++x)
+        scratch_frameBCheckerboard[x] = scratch_fbBandSeed[x] ? 1 : 0;
 
 }
 

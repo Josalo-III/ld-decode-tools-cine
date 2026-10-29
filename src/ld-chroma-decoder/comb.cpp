@@ -260,6 +260,7 @@ void Comb::decodeFrames(const QVector<SourceField> &inputFields,
                 // the plane remains zero and the subtraction is a no-op.
                 next->buildCornerLeak();
                 next->buildPhaseCorrected1D();
+                next->buildLumaEdgeIndex();
                 // Presence of certified, not the witness fork.  The ladder
                 // publishes its carrier plane directly; luma-witness may
                 // additionally ask the same stage for its private view.
@@ -1144,6 +1145,17 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
     const double SAT_FALLBACK_START = 6.0;
     const double SAT_FALLBACK_FULL  = 20.0;
     double prev_sat_t = 0.0;
+    double prevInterfieldIRE = 0.0;
+
+    // Carrier-free luma of a composite row: [1,2,1]/4 at +-2 cancels the
+    // carrier, which inverts every two samples.
+    const double FIELD_DIVERGE_IRE = 6.0;
+    const double *srcRow0 = clpbuffer[srcBufIndex].pixel[line] + left;
+    auto notchRow = [&](const double *row, int rel) -> double {
+        const int lo = std::clamp(rel - 2, 0, width - 1);
+        const int hi = std::clamp(rel + 2, 0, width - 1);
+        return 0.25 * (row[lo] + 2.0 * row[rel] + row[hi]);
+    };
 
     // Core Logic of Field Vs Frame
     // Progressive uses the frame regime; interlace uses the field regime.
@@ -1276,7 +1288,12 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double fieldLikeStack = 0.5 * (Cpm2 + Cpp2);
         double diff_stack_ire = std::fabs(frameLikeStack - fieldLikeStack) * invI;
 
-        double diff_candB_ire = std::fabs(lumFR - lumFB) * invI;
+        // Each regime has a model, and the other regime's seat is measured
+        // against it: Frame B in progressive, where Field A (seat B) pays;
+        // Field A in interlace, where Frame B pays. Either way the distance
+        // is between Frame B and Field A.
+        const double lumModelField = localUseFrameModel ? lumFB : lumFA;
+        double diff_candB_ire = std::fabs(lumFR - lumModelField) * invI;
         double frameFieldCandidateDistIRE = diff_candB_ire;
         double frameModelDistIRE = frameFieldCandidateDistIRE;
         // Field-vetoes-frame divergence is active only in the interlace regime. In the
@@ -1290,8 +1307,23 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         // Management veto is consumed here, but its construction stays outside FVF.
         bool managementVeto = (cadenceId == -2);
 
-        bool b2VertCoherent = !managementVeto && !frameInsane;
-        double targetModel = localUseFrameModel ? FR_s : FB_s;
+        // b2VertCoherent: the two fields agree here, so the interlace regime
+        // may take Frame B's +-1 work. It compares this line's carrier-free
+        // luma with the mean of the opposite field's lines above and below,
+        // smoothed over two samples; past FIELD_DIVERGE_IRE the fields show
+        // different moments and +-1 would mix them. Interlace only: in
+        // progressive both fields are one film frame and Frame B is the model.
+        const double interfieldIRE = std::fabs(
+            0.5 * (notchRow(srcUp1, rel) + notchRow(srcDn1, rel)) -
+            notchRow(srcRow0, rel)) * invI;
+        const double smoothedInterfieldIRE = (rel > 0)
+            ? 0.5 * (interfieldIRE + prevInterfieldIRE)
+            : interfieldIRE;
+        prevInterfieldIRE = interfieldIRE;
+        bool b2VertCoherent = !managementVeto && !frameInsane &&
+            (localUseFrameModel ||
+             smoothedInterfieldIRE < FIELD_DIVERGE_IRE);
+        double targetModel = localUseFrameModel ? FR_s : FA_s;
 
         double diff_fvf_ire = diff_stack_ire;
         diffFVF[rel] = diff_fvf_ire;
@@ -1317,6 +1349,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         double hIRE = (rel < (int)tapLine.hLumaDeltaIRE.size())
             ? tapLine.hLumaDeltaIRE[rel]
             : 0.0;
+        // A fast luma step: it puts alien luma in 1D's bandpass. Keyed on the
+        // step alone; the old +-1/+-2 stack test measured field divergence,
+        // which b2VertCoherent now carries.
+        const bool alienLumaStep = hIRE > HEDGE_THRESH_IRE;
 
 
         FvfModelMetrics metrics;
@@ -1330,7 +1366,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         metrics.verticalBoundaryIRE = hIRE;
         metrics.horizontalBoundaryIRE = vIRE;
         metrics.fieldFrameDivergenceIRE = diff_fvf_ire;
-        metrics.interfieldDistinctIRE = 0.0;
+        metrics.interfieldDistinctIRE = smoothedInterfieldIRE;
         metrics.frameToFieldModelIRE = diff_candB_ire;
         metrics.frameToBestFieldIRE = frameFieldCandidateDistIRE;
         metrics.frameModel = localUseFrameModel;
@@ -1340,6 +1376,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
         int    idx   = 1;
         double val   = FB;
         float  shade = 0.35f;
+        bool   oneDCede = false;
         double scoreA = std::numeric_limits<double>::quiet_NaN();
         double scoreB = std::numeric_limits<double>::quiet_NaN();
         double scoreR = std::numeric_limits<double>::quiet_NaN();
@@ -1353,7 +1390,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     if (localUseFrameModel)
                         return frameB2[std::clamp(r, 0, width - 1)];
                     else
-                        return candidateB[std::clamp(r, 0, width - 1)];
+                        return candidateAData[std::clamp(r, 0, width - 1)];
                 };
                 double m_l = getM(rel - 1);
                 double m_r = getM(rel + 1);
@@ -1397,9 +1434,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // candidate on this ballot whose geometry is orthogonal to the
             // model's, so its distance from the model is what it must earn
             // its win against.
-            // Interlace treats Field B as the model, lets Field A participate
-            // on its own image-shaping merits, and gives Frame B only a small
-            // score bump when it is very close to Field B.
+            // Interlace treats Field A as the model -- Field B carries errors
+            // of its own -- lets Field B participate on its own image-shaping
+            // merits, and gives Frame B only a small score bump when it is
+            // very close to Field A.
             // ------------------------------------------------------------
             if (localUseFrameModel) {
                 const double modelDistanceIRE = std::max(
@@ -1414,10 +1452,12 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 const double closeFrameBonus = std::clamp(
                     1.0 - (diff_candB_ire / std::max(1e-9, T.FVF_SMALL_DIFF_IRE)),
                     0.0, 1.0);
-                scoreB *= T.FIELD_MODEL_BIAS;
+                scoreA *= T.FIELD_MODEL_BIAS;
                 scoreR += T.FVF_MODEL_PRIMARY_WEIGHT * diff_candB_ire;
                 scoreR *= T.FRAME_IN_INTERLACE_PENALTY;
-                scoreR *= (1.0 - 0.08 * closeFrameBonus);
+                // Frame B is rewarded in interlace only where the fields agree.
+                if (b2VertCoherent)
+                    scoreR *= (1.0 - 0.08 * closeFrameBonus);
             }
 
             if (haveFrameIQForMag && rel < frameIQN) {
@@ -1452,7 +1492,8 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
                 double frameBonus = frameScaleBiasStrength * fineFrac;
                 frameBonus *= (1.0 - FRAME_COARSE_CLAMP * coarseFrac);
-                scoreR *= (1.0 - frameBonus);
+                if (b2VertCoherent)
+                    scoreR *= (1.0 - frameBonus);
 
                 if (!fineDominant) {
                     const double bias = std::clamp(coarseFrac - midFrac, -1.0, 1.0);
@@ -1543,55 +1584,11 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                             scoreR *= (1.0 - chromaReward * rAlign);
                         }
             
-                        // Cross-color / luma-incursion pressure:
-                        // This is the detection side you asked about. It enters as a
-                        // luma-pressure term, not as checkerboard suppression.
-                        const double incursionFromFacts = std::clamp(
-                            std::max(facts.lumaIncursionRiskIRE,
-                                     facts.lumaExcursionIRE) / 12.0,
-                            0.0, 1.0);
-            
-                        const double parallaxPressure = std::clamp(
-                            std::max(facts.carrierParallaxLatticeRiskIRE,
-                                     facts.carrierParallaxYSpreadIRE) / 12.0,
-                            0.0, 1.0);
-            
-                        const double residualPressure = std::clamp(
-                            std::max(facts.residualFitErrorIRE,
-                                     ass.lumaResidual) / 12.0,
-                            0.0, 1.0);
-            
-                        const double crossColorPressure = std::clamp(
-                            std::max(incursionFromFacts,
-                                     std::max(parallaxPressure, residualPressure)),
-                            0.0, 1.0);
-            
-                        const double lumaPressure = std::clamp(
-                            std::max(lumaClaim,
-                                     std::max(ass.lumaRisk,
-                                              std::max(ass.lumaShapeContinuation,
-                                                       crossColorPressure))),
-                            0.0, 1.0);
-            
-                        if (lumaPressure > 0.0) {
-                            // Penalize candidates that move away from the 1D rail in a
-                            // luma-claimed / cross-color-claimed region.
-                            const double denom = std::max(3.0, cMag);
-            
-                            const double aTrespass =
-                                std::clamp(std::fabs(aMag - cMag) / denom, 0.0, 1.0);
-                            const double bTrespass =
-                                std::clamp(std::fabs(bMag - cMag) / denom, 0.0, 1.0);
-                            const double rTrespass =
-                                std::clamp(std::fabs(rMag - cMag) / denom, 0.0, 1.0);
-            
-                            const double lumaPenalty =
-                                0.16 * attrAuthority * lumaPressure;
-            
-                            scoreA *= (1.0 + lumaPenalty * aTrespass);
-                            scoreB *= (1.0 + lumaPenalty * bTrespass);
-                            scoreR *= (1.0 + lumaPenalty * rTrespass);
-                        }
+                        // No luma side. The former luma-incursion term charged
+                        // each seat its chroma-magnitude distance from 1D, but
+                        // 1D's bandpass carries the alien luma Frame B cancels,
+                        // so distance from 1D there is Frame B doing its job.
+                        // A luma term returns only on a measure that is not 1D.
                     }
                 }
             }
@@ -1656,61 +1653,6 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     scoreR *= (1.0 + wAnchor * anchorPenalty(dR));
                 }
 
-                // The consensus anchor above is intentionally withdrawn at a
-                // strong transition, but that also leaves election-generated
-                // horizontal zippers unopposed there.  Add a separate
-                // candidate-topology fact which is safe at a true edge:
-                // compare center with its same-carrier-phase +/-4 neighbours,
-                // and give the test authority only when those neighbours agree.
-                // A real crossing makes them disagree; an alternating tooth
-                // leaves two agreeing neighbours on the other side of center.
-                const int xm4 = std::max(0, rel - 4);
-                const int xp4 = std::min(width - 1, rel + 4);
-                auto zipperRisk = [&](double center,
-                                      double leftSamePhase,
-                                      double rightSamePhase) {
-                    const double neighborDisagreementIRE =
-                        std::fabs(leftSamePhase - rightSamePhase) * invI;
-                    const double agreementAuthority = 1.0 - std::clamp(
-                        (neighborDisagreementIRE - 1.5) / (6.0 - 1.5),
-                        0.0,
-                        1.0);
-
-                    const double lo =
-                        std::min(leftSamePhase, rightSamePhase);
-                    const double hi =
-                        std::max(leftSamePhase, rightSamePhase);
-                    const double hullExcursionIRE =
-                        ((center < lo) ? (lo - center)
-                         : (center > hi) ? (center - hi)
-                                         : 0.0) * invI;
-                    const double excursion = std::clamp(
-                        (hullExcursionIRE - 1.0) / (6.0 - 1.0),
-                        0.0,
-                        1.0);
-                    return agreementAuthority * excursion;
-                };
-
-                const double riskA = zipperRisk(
-                    FA, candidateAData[xm4], candidateAData[xp4]);
-                const double riskB = zipperRisk(
-                    FB, candidateB[xm4], candidateB[xp4]);
-                const double riskR = zipperRisk(
-                    FR, frameB2[xm4], frameB2[xp4]);
-                const double cleanestRisk = std::min({riskA, riskB, riskR});
-                const double zipperWeight =
-                    std::max(0.0, T.FVF_NEIGHBOR_ZIPPER_WEIGHT);
-
-                // Relative-only: if every candidate carries the same narrow
-                // legitimate detail, none can self-certify the others as bad.
-                // Where one seat avoids the tooth, only the tooth-producing
-                // seats pay.  Output remains the untouched elected candidate.
-                scoreA *= 1.0 + zipperWeight *
-                    std::max(0.0, riskA - cleanestRisk);
-                scoreB *= 1.0 + zipperWeight *
-                    std::max(0.0, riskB - cleanestRisk);
-                scoreR *= 1.0 + zipperWeight *
-                    std::max(0.0, riskR - cleanestRisk);
             }
             // ------------------------------------------------------------
             // Impulse scoring.
@@ -1753,7 +1695,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     scoreB *= impulsePenalty(bM);
                     scoreR *= impulsePenalty(rM);
             
-                    if (!frameInsane && !managementVeto && rM <= minM + 0.25) {
+                    if (b2VertCoherent && rM <= minM + 0.25) {
                         scoreR *= (1.0 - IMPULSE_FRAME_BONUS * impulseT);
                     }
                 }
@@ -1778,6 +1720,117 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 }
             }
 
+            // ------------------------------------------------------------
+            // THE SEED REGION'S MEASURE.
+            //
+            // Inside the region the checkerboard identifier (the content band
+            // seed) flags, each regime has a measure the seats pay for
+            // deviating from.
+            //
+            // PROGRESSIVE: Frame A. A-zero (the non-precleaned midpoint) was
+            // the measure before, and measured on program material it is not
+            // the clean referee it was taken for: it carries mild alternations
+            // of its own where Frame A carries none. Seat A IS Frame A, so it
+            // sits at zero distance and the other two pay their distance from
+            // it. Relative only; nothing is removed from the ballot.
+            //
+            // INTERLACE: 1D, as measure and as award. The roster seats no
+            // Frame A, and both field combs carry their own alternation here,
+            // so every seat pays its distance from 1D, and where no seat comes
+            // within the standard the sample is a plain cede to 1D -- 1D
+            // verbatim, no blend.
+            // ------------------------------------------------------------
+            if (rel < (int)scratch_frameBCheckerboard.size() &&
+                scratch_frameBCheckerboard[rel] != 0)
+            {
+                if (localUseFrameModel) {
+                    const double fa = FA * invI;
+                    const double dB = std::fabs(FB * invI - fa);
+                    const double dR = std::fabs(FR * invI - fa);
+                    static const double kFrameAWEnv = []{
+                        const char *e = std::getenv("LDCD_FVF_FRAME_A_W");
+                        return e ? std::atof(e) : -1.0;
+                    }();
+                    const double w = std::max(0.0, kFrameAWEnv >= 0.0
+                        ? kFrameAWEnv : T.FVF_FRAME_A_SIMILARITY_WEIGHT);
+                    scoreB *= 1.0 + w * dB;
+                    scoreR *= 1.0 + w * dR;
+                } else {
+                    const double c = L1 * invI;
+                    const double dA = std::fabs(FA * invI - c);
+                    const double dB = std::fabs(FB * invI - c);
+                    const double dR = std::fabs(FR * invI - c);
+                    static const double k1DWEnv = []{
+                        const char *e = std::getenv("LDCD_FVF_1D_W");
+                        return e ? std::atof(e) : -1.0;
+                    }();
+                    static const double k1DStandardEnv = []{
+                        const char *e = std::getenv("LDCD_FVF_1D_STANDARD_IRE");
+                        return e ? std::atof(e) : -1.0;
+                    }();
+                    const double w = std::max(0.0, k1DWEnv >= 0.0
+                        ? k1DWEnv : T.FVF_1D_SIMILARITY_WEIGHT);
+                    const double standardIRE = k1DStandardEnv >= 0.0
+                        ? k1DStandardEnv : T.FVF_1D_STANDARD_IRE;
+                    scoreA *= 1.0 + w * dA;
+                    scoreB *= 1.0 + w * dB;
+                    scoreR *= 1.0 + w * dR;
+                    oneDCede = dA > standardIRE && dB > standardIRE &&
+                               (frameInsane || managementVeto ||
+                                dR > standardIRE);
+                }
+            }
+
+            // ------------------------------------------------------------
+            // THE LESSER ALIEN-LUMA STAGE.
+            //
+            // Below the full regime's threshold a luma step still puts some
+            // alien luma in 1D's bandpass, so the regime's order applies here
+            // as a charge instead of an override, ramped from zero at
+            // FVF_ALIEN_LUMA_LO_IRE to full at the regime's threshold.
+            //
+            // WHY, in terms of what the combs do -- if a rebuild changes any
+            // of these behaviours, this order is wrong and must be revisited:
+            // Frame B CANCELS the alien luma and pays nothing; Field A is
+            // second and pays its distance from Frame B at half weight;
+            // Frame A SMOOTHS it, and Field B carries errors of its own, so
+            // both pay at full weight. Distance, not a flat factor: a seat
+            // that already agrees with Frame B is not charged.
+            //
+            // Only where Frame B may stand -- reach-safe, not vetoed, and in
+            // interlace only where the fields agree. Elsewhere it is no
+            // reference, and the plain score decides.
+            // ------------------------------------------------------------
+            {
+                static const double kAlienWEnv = []{
+                    const char *e = std::getenv("LDCD_FVF_ALIEN_W");
+                    return e ? std::atof(e) : -1.0;
+                }();
+                static const double kAlienLoEnv = []{
+                    const char *e = std::getenv("LDCD_FVF_ALIEN_LO_IRE");
+                    return e ? std::atof(e) : -1.0;
+                }();
+                const double lo = kAlienLoEnv >= 0.0
+                    ? kAlienLoEnv : T.FVF_ALIEN_LUMA_LO_IRE;
+                const bool frameMayStand =
+                    b2VertCoherent &&
+                    !(rel < (int)scratch_frameBReachUnsafe.size() &&
+                      scratch_frameBReachUnsafe[rel] != 0);
+                if (!alienLumaStep && hIRE > lo &&
+                    HEDGE_THRESH_IRE > lo && frameMayStand) {
+                    const double ramp = std::clamp(
+                        (hIRE - lo) / (HEDGE_THRESH_IRE - lo), 0.0, 1.0);
+                    const double w = ramp * std::max(0.0, kAlienWEnv >= 0.0
+                        ? kAlienWEnv : T.FVF_ALIEN_LUMA_WEIGHT);
+                    // Seat A is Frame A in progressive, Field A in interlace;
+                    // seat B is Field A in progressive, Field B in interlace.
+                    const double wA = localUseFrameModel ? w : 0.5 * w;
+                    const double wB = localUseFrameModel ? 0.5 * w : w;
+                    scoreA *= 1.0 + wA * std::fabs(FA - FR) * invI;
+                    scoreB *= 1.0 + wB * std::fabs(FB - FR) * invI;
+                }
+            }
+
             // Preserve the completed per-pixel ballot for the transition-run election below.
             // The run stage chooses one candidate for the detector's full transition support
             // using these same scores.
@@ -1797,8 +1850,9 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             };
 
             // Context may establish that Frame B is safe and relevant, but it
-            // must not settle the election by itself.  The candidate still has
-            // to beat both interfield combs on the accumulated merit score.
+            // must not settle the election by itself.  Frame B still has to
+            // beat both other seats on the accumulated merit score -- Frame A
+            // and Field A in progressive, Field A and Field B in interlace.
             const bool frameHasBestScore =
 				!frameInsane && !managementVeto && !frameReachUnsafe &&
                 scoreR + 1e-12 < scoreA &&
@@ -1812,36 +1866,48 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 			// bit only removes Frame B; the two field seats keep competing.
 			if (localUseFrameModel && frameReachUnsafe) {
 				pickCandidate(0, FA, 0.25f);
-			} else if (hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0) {
-                double dF1 = std::fabs(lumFR - L1) * invI;
-                if (dF1 <= 3.5 && frameFieldCandidateDistIRE <= 5.0 &&
-                    frameHasBestScore)
+			} else if (alienLumaStep) {
+                // THE ALIEN-LUMA REGIME. It trumps the score.
+                //
+                // WHY, in terms of what the combs do -- if a rebuild changes
+                // any of these behaviours, this order is wrong and must be
+                // revisited: a fast luma step puts luma in 1D's bandpass.
+                // Frame B CANCELS that alien luma and is best by far; Field A
+                // is second; Frame A SMOOTHS it, leaving its residue as
+                // softness across the step, and is last. So Frame B takes the
+                // step wherever it may stand at all -- reach-safe, not vetoed,
+                // and in interlace only where the fields agree -- and Field A
+                // takes it otherwise. Frame A and Field B do not.
+                //
+                // No closeness test against 1D or Field A: 1D's bandpass
+                // carries the alien luma Frame B cancels, so distance from
+                // either here is Frame B doing its job, not evidence against it.
+                if (frameEligible[rel] && b2VertCoherent)
                     pickCandidate(2, FR, 0.75f);
-                else {
-                    if (scoreA < scoreB) pickCandidate(0, FA, 0.25f);
-                    else                 pickCandidate(1, FB, 0.35f);
-                }
-            // The strong-chroma/vertical-contrast admission is gone. It let
-            // Frame B in without the normal margin on exactly the contrasts
-            // that run along the line -- the ones where Frame B either cancels
-            // the alternation cleanly or checkerboards. Removing it measured
-            // inert on that class, and the ordinary merit comparison below is
-            // left to handle the case; which samples checkerboard is published
-            // as evidence by scratch_frameBCheckerboard, not acted on here.
-            } else {
-                if (scoreR + 1e-12 < scoreA * 0.85 &&
-                         scoreR + 1e-12 < scoreB * 0.85)
-                    pickCandidate(2, FR, 0.8f);
-                else if (scoreA < scoreB * 0.8)
+                else if (localUseFrameModel)
+                    pickCandidate(1, FB, 0.35f);
+                else
                     pickCandidate(0, FA, 0.25f);
-                else {
-                    double dFL = std::fabs(lumFB - L1) * invI;
-                    double dRL = std::fabs(lumFR - L1) * invI;
-                    if (frameHasBestScore && dRL + 3.0 < dFL)
-                        pickCandidate(2, FR, 0.75f);
-                    else
-                        pickCandidate(1, FB, 0.35f);
-                }
+            // There is no admission for contrasts running along the line.
+            // The strong-chroma/vertical-contrast admission let Frame B in
+            // without the normal margin there -- where Frame B either cancels
+            // the alternation cleanly or checkerboards -- and removing it
+            // measured inert on that class. That axis is handled in the score
+            // instead, by the seed region's measure above.
+            } else {
+                // The lowest score wins. The margins that stood here (Frame B
+                // needing a 15% lead, seat A winning outright with a 20% lead,
+                // a 1D fallback) named seats, not image facts, and outlived
+                // every rebuild of the combs they named. Preferences belong
+                // in the scores, where each states the image property behind
+                // it. An exact tie between the field seats goes to Field A.
+                if (frameHasBestScore)
+                    pickCandidate(2, FR, 0.8f);
+                else if (scoreA < scoreB ||
+                         (scoreA == scoreB && !localUseFrameModel))
+                    pickCandidate(0, FA, 0.25f);
+                else
+                    pickCandidate(1, FB, 0.35f);
             }
 
             // Subtle hysteresis (switch veto) in soft regions
@@ -1853,7 +1919,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     const bool hystOk =
 						!frameReachUnsafe &&
                         (chromaMagIRE <= SAT_FALLBACK_START) &&
-                        !(hIRE > HEDGE_THRESH_IRE && diff_stack_ire > 5.0);
+                        !alienLumaStep;
 
                     if (hystOk) {
                         auto candScore = [&](int c)->double {
@@ -1886,6 +1952,14 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     }
                 }
             }
+        }
+
+        // The interlace seed-region cede is the award of last resort: no
+        // seat met the 1D standard, so 1D stands, verbatim.
+        if (oneDCede) {
+            idx   = 3;
+            val   = L1;
+            shade = 0.0f;
         }
 
         winner[rel]   = idx;
@@ -1924,6 +1998,10 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             int C = winner[rel];
             int R = winner[rel + 1];
 
+            // A 1D cede is where no seat met the standard; it is neither
+            // smoothed away nor spread to a seat that did.
+            if (L == 3 || C == 3 || R == 3) continue;
+
             if (L == R && C != L) {
                 w2[rel] = L;
                 changed = true;
@@ -1936,6 +2014,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 int idx = winner[rel];
                 if      (idx == 0) { outVal[rel] = candidateA[rel]; outShade[rel] = 0.25f; }
                 else if (idx == 1) { outVal[rel] = candidateB[rel];  outShade[rel] = 0.35f; }
+                else if (idx == 3) { outVal[rel] = sample1D(rel);   outShade[rel] = 0.0f;  }
                 else               { outVal[rel] = frameB2[rel]; outShade[rel] = 0.8f;  }
             }
         }
@@ -1962,6 +2041,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                 if (cntF > 0 && (cntA + cntB) > 0) {
                     int blockIdx = (cntA >= cntB) ? 0 : 1;
                     for (int r = b; r < e; ++r) {
+                        if (winner[r] == 3) continue;  // a 1D cede stands
                         winner[r] = blockIdx;
                         if (blockIdx == 0) { outVal[r] = candidateA[r]; outShade[r] = 0.25f; }
                         else               { outVal[r] = candidateB[r]; outShade[r] = 0.35f; }
@@ -2078,6 +2158,7 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
 
         auto installRunWinner = [&](int runWinner, int b, int e) {
             for (int x = b; x <= e; ++x) {
+                if (winner[x] == 3) continue;  // a 1D cede stands
                 winner[x] = runWinner;
                 if (runWinner == 0) {
                     outVal[x] = candidateA[x];
@@ -2331,15 +2412,15 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
                     diagonalStrength;
             }
 
-            // Blame follows the contrast angle, but neither axis carries a
-            // prior any more. Between-line disagreement no longer raises
-            // Frame A's prior: that term measured inert, and precleaned Frame
-            // A is not the clean candidate on that axis in any case. A
-            // penalty on the opposite axis -- the line crossing the contrast,
-            // where Frame A smooths the 1D line-alternating error that Frame
-            // B cancels -- was tried here and measured inert as well (80,546
-            // severe samples against 80,547 without it). Neither is kept as
-            // an unused knob.
+            // Blame follows the contrast angle, but the run carries no axis
+            // prior. Between-line disagreement no longer raises Frame A's
+            // prior here: that term measured inert. A penalty on Frame A on
+            // the opposite axis -- the line crossing the contrast -- was tried
+            // here and measured inert as well (80,546 severe samples against
+            // 80,547 without it). Neither is kept as an unused knob. The
+            // per-sample ballot does carry the axes: the hedge admits Frame B
+            // where the line crosses a luma contrast, and the seed region's
+            // measure governs contrasts running along the line.
 
             int runWinner = -1;
             double bestMerit = std::numeric_limits<double>::infinity();
@@ -2370,7 +2451,28 @@ void Comb::FrameBuffer::scoreFieldVsFrame(
             // No plateau-valid candidate means no transition-level fact.  The
             // ordinary per-pixel ballot remains untouched in that case.
             if (runWinner >= 0) {
-                installRunWinner(runWinner, awardBegin, awardEnd);
+                // THE BLOCK GRANT.
+                //
+                // Awarding the whole transition to one seat was never about
+                // line-crossed contrasts as such: it exists to stop the
+                // election making its own checkers by alternating its decision
+                // across a transition. The lateral run is simply the unit it
+                // used for that coherence.
+                //
+                // The A-zero term is expected to do that job per sample
+                // instead: a seat that departs from the referee is marked down
+                // wherever it departs, so the decision has no reason to
+                // alternate between a seat that agrees with A-zero and one
+                // that does not. If that holds, the block grant is redundant
+                // -- and it is what let one reach-crossed column carry a whole
+                // line-crossed transition. Off by default on that basis;
+                // LDCD_FVF_BLOCK=1 restores it, and the author's eye decides.
+                static const bool blockGrant = []{
+                    const char *e = std::getenv("LDCD_FVF_BLOCK");
+                    return e && std::atoi(e) != 0;
+                }();
+                if (blockGrant)
+                    installRunWinner(runWinner, awardBegin, awardEnd);
                 committedThrough = awardEnd;
             }
         }
@@ -2950,8 +3052,6 @@ void Comb::FrameBuffer::split2D()
         }
 
         if (needFrameBCompute) {
-            // The referent first: Frame B's checkerboard verdict reads it.
-            buildFrameAZeroLine(line);
             computeFrameBLine(line, frameIQ, scratch_frameBDirectIQComposite);
         }
 
@@ -2984,7 +3084,27 @@ void Comb::FrameBuffer::split2D()
         };
 
         {
-            if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldAContour) {
+            if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FrameA0) {
+                // Frame A0 as the output, so it can be judged by eye rather
+                // than by its distance to anything. Stored in IRE for the
+                // checkerboard verdict's threshold, so it converts back to the
+                // composite units clpbuffer[1] carries.
+                buildFrameAZeroLine(line);
+                const double toComposite =
+                    (invIreScale > 0.0) ? (1.0 / invIreScale) : 0.0;
+                for (int rel = 0; rel < width; ++rel) {
+                    const double v0 =
+                        (rel < (int)scratch_frameA0Composite.size() &&
+                         std::isfinite(scratch_frameA0Composite[rel]))
+                            ? scratch_frameA0Composite[rel] * toComposite
+                            : 0.0;
+                    emitSelected(rel, v0);
+                }
+                if (writeWeights)
+                    std::fill(w2d_frame_weight[line].begin(),
+                              w2d_frame_weight[line].end(), 0.0f);
+            }
+            else if (configuration.twoDVariant == Comb::Configuration::TwoDVariant::FieldAContour) {
                 for (int rel = 0; rel < width; ++rel) emitSelected(rel, scratch_lineWorkA[rel]);
                 if (writeWeights) std::fill(w2d_frame_weight[line].begin(), w2d_frame_weight[line].end(), 0.0f);
             }
